@@ -70,7 +70,11 @@ from omnigent.host.frames import (
 from omnigent.llms.context_window import resolve_effective_context_window
 from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.models.model_metadata import concrete_reported_model
-from omnigent.native.failure_telemetry import FailureContext, normalize_failure_context
+from omnigent.native.failure_telemetry import (
+    FailureContext,
+    normalize_failure_context,
+    provider_error_context_from_text,
+)
 from omnigent.native.input_diagnostics import (
     input_attributes,
     log_input_event,
@@ -129,6 +133,7 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import (
+    LEVEL_EDIT,
     LEVEL_READ,
     local_single_user_enabled,
 )
@@ -157,6 +162,7 @@ from omnigent.server.managed_hosts import (
     parse_repo_workspace,
     read_managed_repo_workspaces,
 )
+from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
@@ -390,6 +396,8 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
+    SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
     pinned_label_key,
@@ -3515,6 +3523,11 @@ async def _enrich_terminal_status_with_subagent_output(
     if status == "failed":
         context = normalize_failure_context(data.get("failure_context"))
         context.setdefault("failure_source", "external_status")
+        wire_detail = data.get("output")
+        if not isinstance(wire_detail, str) or not wire_detail.strip():
+            wire_detail = data.get("failure_detail")
+        for key, value in provider_error_context_from_text(wire_detail).items():
+            context.setdefault(key, value)
         data = {**data, "failure_context": context}
     current_turn_only = status == "failed" or data.get("turn_outcome") == "cancelled"
     existing = data.get("output")
@@ -4005,6 +4018,9 @@ async def _wait_for_host_reconnect(
         await asyncio.sleep(min(0.1, remaining))
 
 
+_HOST_RUNNER_STARTUP_POLL_S = 1.0
+
+
 async def _wait_for_host_bound_runner_client(
     session_id: str,
     runner_router: RunnerRouter | None,
@@ -4015,78 +4031,117 @@ async def _wait_for_host_bound_runner_client(
     runner_exit_reports: RunnerExitReports | None,
     host_conn: HostConnection,
     host_registry: HostRegistry,
+    conversation_store: ConversationStore | None = None,
 ) -> httpx.AsyncClient | None:
+    """Wait for this runner, extending startup only for an explicit pending sign-in.
+
+    Host liveness can end the ordinary grace early for a dead or untracked
+    process. A bounded sign-in wait keeps the same binding and input until
+    authentication finishes; old hosts retain the ordinary startup budget.
+    Stop, rebind, cancellation and process exit still end the wait promptly.
+
+    :param conversation_store: Optional binding check while sign-in is pending.
     """
-    Wait for a host-bound runner to connect, ending early if the host
-    reports it already gone.
+    from omnigent.runner.identity import RUNNER_SIGN_IN_PENDING_WAIT_S
 
-    Races the connect grace (:func:`_wait_for_runner_client`) against a
-    one-shot ``host.runner_status`` query, because they answer different
-    questions and either can settle the outcome first:
-
-    * The runner connecting — or a crash report — resolves the wait exactly
-      as :func:`_wait_for_runner_client` does. This is ground truth and
-      always wins when it lands first.
-    * Concurrently, the host — the authoritative owner of runner-process
-      liveness — may report the runner ``dead`` or ``unknown`` (stopped,
-      crashed, or lost to a host restart). That means it will never
-      connect, so the wait ends immediately and the caller relaunches
-      without burning the rest of the grace.
-
-    Running the query *alongside* the wait rather than before it is what
-    keeps the query strictly a speed-up: a host that is too old to answer,
-    slow, or silent (verdict ``None`` / ``"alive"``) never shortcuts the
-    wait, so the connect grace runs its normal course with no added
-    latency.
-
-    :param session_id: Session/conversation identifier.
-    :param runner_router: The ``RunnerRouter`` instance, or ``None``.
-    :param tunnel_registry: The server's ``TunnelRegistry``, or ``None``.
-    :param runner_id: Runner id expected to connect.
-    :param timeout_s: Maximum seconds to wait for the connect.
-    :param runner_exit_reports: Crash-report store consulted by the
-        connect wait to abort early on a reported death.
-    :param host_conn: Live host connection to query for liveness.
-    :param host_registry: Registry used to enqueue the query frame.
-    :returns: The runner HTTP client if it connected, otherwise ``None``
-        (timed out, crash report, or host-confirmed dead/unknown).
-    """
-    connect_task = asyncio.ensure_future(
-        _wait_for_runner_client(
-            session_id,
-            runner_router,
-            tunnel_registry,
-            runner_id=runner_id,
-            timeout_s=timeout_s,
-            runner_exit_reports=runner_exit_reports,
+    def wait_for_connection(budget_s: float) -> asyncio.Task[httpx.AsyncClient | None]:
+        return asyncio.create_task(
+            _wait_for_runner_client(
+                session_id,
+                runner_router,
+                tunnel_registry,
+                runner_id=runner_id,
+                timeout_s=budget_s,
+                runner_exit_reports=runner_exit_reports,
+            )
         )
-    )
-    status_task = asyncio.ensure_future(
-        _query_host_runner_status(host_conn, host_registry, runner_id)
-    )
+
+    async def query_status(*, pause: bool = False) -> str | None:
+        if pause:
+            await asyncio.sleep(_HOST_RUNNER_STARTUP_POLL_S)
+        return await _query_host_runner_status(host_conn, host_registry, runner_id)
+
+    async def check_pending_owner() -> None:
+        if _intentional_stop_sessions.get(session_id) == runner_id:
+            raise OmnigentError(
+                "The session was stopped while waiting for host sign-in; send the message again.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
+        if conversation_store is not None:
+            current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if current is None or current.runner_id != runner_id:
+                raise OmnigentError(
+                    "session runner binding changed while waiting for host sign-in; retry",
+                    code=ErrorCode.WRONG_REPLICA,
+                )
+
+    connect_task = wait_for_connection(timeout_s)
+    status_task = asyncio.create_task(query_status())
+    sign_in_deadline: float | None = None
+    waiting_for_sign_in = False
     try:
-        done, _pending = await asyncio.wait(
-            {connect_task, status_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        # The connect settling is authoritative (client, timeout, or crash
-        # report) — the host's opinion no longer matters once it lands.
-        if connect_task in done:
-            return connect_task.result()
-        # Only the status query has resolved so far.
-        if status_task.result() in ("dead", "unknown"):
-            # Host confirms the runner will never connect — stop waiting.
-            return None
-        # No verdict ("alive" or an unavailable/too-old/slow host): let the
-        # connect grace run to its natural conclusion.
-        return await connect_task
+        while True:
+            done, _pending = await asyncio.wait(
+                {connect_task, status_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if sign_in_deadline is not None:
+                await check_pending_owner()
+            if connect_task in done:
+                client = connect_task.result()
+                if client is not None:
+                    return client
+                if waiting_for_sign_in:
+                    return None
+                if (
+                    runner_exit_reports is not None
+                    and runner_exit_reports.get(runner_id) is not None
+                ):
+                    return None
+                if host_registry.get(host_conn.host_id) is not host_conn:
+                    return None
+                if status_task not in done:
+                    # A responsive host may have entered sign-in between polls.
+                    status_task.cancel()
+                    await asyncio.gather(status_task, return_exceptions=True)
+                    status_task = asyncio.create_task(query_status())
+                    await status_task
+                if status_task.result() != "sign_in_pending":
+                    return None
+            status = status_task.result()
+            if status in ("dead", "unknown"):
+                return None
+            if sign_in_deadline is None and status not in {"alive", "sign_in_pending"}:
+                return await connect_task
+            if status == "sign_in_pending" and not waiting_for_sign_in:
+                if sign_in_deadline is None:
+                    sign_in_deadline = time.monotonic() + RUNNER_SIGN_IN_PENDING_WAIT_S
+                await check_pending_owner()
+                budget_s = sign_in_deadline - time.monotonic()
+                if budget_s <= 0:
+                    return None
+                connect_task.cancel()
+                await asyncio.gather(connect_task, return_exceptions=True)
+                connect_task = wait_for_connection(budget_s)
+                waiting_for_sign_in = True
+            elif status == "alive" and waiting_for_sign_in:
+                # Sign-in finished; normal startup must now make progress.
+                assert sign_in_deadline is not None
+                budget_s = min(timeout_s, max(0.0, sign_in_deadline - time.monotonic()))
+                connect_task.cancel()
+                await asyncio.gather(connect_task, return_exceptions=True)
+                connect_task = wait_for_connection(budget_s)
+                waiting_for_sign_in = False
+            if (
+                sign_in_deadline is not None
+                and host_registry.get(host_conn.host_id) is not host_conn
+            ):
+                return None
+            status_task = asyncio.create_task(query_status(pause=True))
     finally:
-        outstanding = [t for t in (connect_task, status_task) if not t.done()]
+        outstanding = [task for task in (connect_task, status_task) if not task.done()]
         for task in outstanding:
             task.cancel()
         if outstanding:
-            # Drain the cancelled task(s); return_exceptions swallows the
-            # CancelledError so cleanup never masks the real return/raise.
             await asyncio.gather(*outstanding, return_exceptions=True)
 
 
@@ -4682,6 +4737,7 @@ async def ensure_runner_connected(
                     runner_exit_reports=getattr(app_state, "runner_exit_reports", None),
                     host_conn=host_conn,
                     host_registry=host_registry,
+                    conversation_store=conversation_store,
                 )
                 if runner_client is not None:
                     return runner_client, await _reread()
@@ -4748,17 +4804,210 @@ async def ensure_runner_connected(
             )
 
         if runner_client is None:
-            runner_client = await _wait_for_runner_client(
-                session_id,
-                runner_router,
-                tunnel_registry,
-                runner_id=relaunched_runner_id,
-                timeout_s=_facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
-                runner_exit_reports=getattr(app_state, "runner_exit_reports", None),
-            )
+            if (
+                host_registry is not None
+                and host_conn is not None
+                and relaunched_runner_id is not None
+            ):
+                runner_client = await _wait_for_host_bound_runner_client(
+                    session_id,
+                    runner_router,
+                    tunnel_registry,
+                    runner_id=relaunched_runner_id,
+                    timeout_s=_facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
+                    runner_exit_reports=getattr(app_state, "runner_exit_reports", None),
+                    host_conn=host_conn,
+                    host_registry=host_registry,
+                    conversation_store=conversation_store,
+                )
+            else:
+                runner_client = await _wait_for_runner_client(
+                    session_id,
+                    runner_router,
+                    tunnel_registry,
+                    runner_id=relaunched_runner_id,
+                    timeout_s=_facade._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S,
+                    runner_exit_reports=getattr(app_state, "runner_exit_reports", None),
+                )
             conv = await _reread()
 
     return runner_client, conv
+
+
+def _side_chat_source_id(conv: Conversation) -> str | None:
+    """Return the source session whose runner a side chat shares, if any."""
+    if conv.kind != "default" or conv.host_id is not None:
+        return None
+    labels = conv.labels or {}
+    source_id = labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
+    if labels.get(SIDE_CHAT_LABEL_KEY) != "1" or not source_id or source_id == conv.id:
+        return None
+    return source_id
+
+
+_SIDE_CHAT_RECOVERY_ATTEMPTS = 3
+
+
+async def _may_edit_side_chat_source(
+    source_id: str,
+    *,
+    conversation_store: ConversationStore,
+    user_id: str | None,
+    permission_store: PermissionStore | None,
+    source: Conversation | None = None,
+) -> bool:
+    """Return whether the caller may relaunch a side chat's source runner.
+
+    Recovery restarts the source's runner, so it needs the same edit access a
+    message to the source would. Always ``True`` when auth is off.
+    """
+    if permission_store is None:
+        return True
+    return await asyncio.to_thread(
+        check_session_access,
+        user_id,
+        source_id,
+        LEVEL_EDIT,
+        permission_store,
+        conversation_store,
+        source,
+    )
+
+
+async def _recover_side_chat_runner_via_source(
+    side_chat: Conversation,
+    *,
+    app_state: Any,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+    user_id: str | None,
+    permission_store: PermissionStore | None,
+    raise_host_refusal: bool = False,
+) -> tuple[httpx.AsyncClient | None, Conversation]:
+    """
+    Rebind a side chat whose shared runner is gone to its source's live runner.
+
+    A side chat has no host of its own; its runner belongs to the source
+    session. This brings that runner back with :func:`ensure_runner_connected`
+    (relaunching it on the source's host when needed), revalidates the source,
+    and rebinds the side chat atomically so concurrent rebindings are
+    preserved. The caller must initialize the side chat on the returned
+    runner. Recovery requires edit access to the source and, like an explicit
+    runner attach, ownership of the runner the side chat would use; a runner
+    owned by another user raises ``FORBIDDEN`` with that explanation.
+    """
+    source_id = _side_chat_source_id(side_chat)
+    if source_id is None:
+        return None, side_chat
+    source = await asyncio.to_thread(conversation_store.get_conversation, source_id)
+    if source is None:
+        return None, side_chat
+    if not await _may_edit_side_chat_source(
+        source_id,
+        conversation_store=conversation_store,
+        user_id=user_id,
+        permission_store=permission_store,
+        source=source,
+    ):
+        return None, side_chat
+    for _ in range(_SIDE_CHAT_RECOVERY_ATTEMPTS):
+        # Checked per attempt: a retry's fresh source row can name another host.
+        if (
+            runner_router is not None
+            and source.host_id is not None
+            and await asyncio.to_thread(runner_router.host_is_on_another_replica, source.host_id)
+        ):
+            raise OmnigentError(
+                "side chat runner is connected to another server replica",
+                code=ErrorCode.WRONG_REPLICA,
+            )
+        source_client, source = await ensure_runner_connected(
+            session_id=source_id,
+            conv=source,
+            app_state=app_state,
+            conversation_store=conversation_store,
+            runner_router=runner_router,
+            raise_host_refusal=raise_host_refusal,
+        )
+        if source_client is None or source.runner_id is None:
+            return None, side_chat
+        # A concurrent recovery may have advanced the source past the snapshot
+        # ensure_runner_connected returned. Retry against the fresh row so the
+        # side chat follows the source instead of binding a superseded runner.
+        live_source = await asyncio.to_thread(conversation_store.get_conversation, source_id)
+        if live_source is None:
+            return None, side_chat
+        if live_source.runner_id != source.runner_id:
+            source = live_source
+            continue
+        if user_id is not None and runner_router is not None:
+            runner_owner = runner_router.runner_owner(source.runner_id)
+            if runner_owner is not None and runner_owner != user_id:
+                _logger.info(
+                    "Side chat %s not recovered: source runner %s has another owner",
+                    side_chat.id,
+                    source.runner_id,
+                    extra={"session_id": side_chat.id},
+                )
+                raise OmnigentError(
+                    "This side chat can't reconnect: its parent session runs on "
+                    "another user's runner.",
+                    code=ErrorCode.FORBIDDEN,
+                )
+        if source.runner_id != side_chat.runner_id:
+            try:
+                if side_chat.runner_id is None:
+                    # Absent-only bind: a concurrent recovery wins the
+                    # NULL → runner transition instead of being overwritten.
+                    await asyncio.to_thread(
+                        conversation_store.set_runner_id, side_chat.id, source.runner_id
+                    )
+                    refreshed = await asyncio.to_thread(
+                        conversation_store.get_conversation, side_chat.id
+                    )
+                    if refreshed is None:
+                        return None, side_chat
+                    side_chat = refreshed
+                else:
+                    # Compare-and-swap: a concurrent rebind of the side chat
+                    # wins, and the store returns its row either way.
+                    side_chat = await asyncio.to_thread(
+                        conversation_store.replace_runner_id,
+                        side_chat.id,
+                        source.runner_id,
+                        expected_runner_id=side_chat.runner_id,
+                    )
+            except ConversationNotFoundError:
+                return None, side_chat
+            if side_chat.runner_id != source.runner_id:
+                _logger.info(
+                    "Side chat %s kept concurrent binding %s",
+                    side_chat.id,
+                    side_chat.runner_id,
+                    extra={"session_id": side_chat.id},
+                )
+            else:
+                _logger.info(
+                    "Side chat %s rebound to source %s runner %s",
+                    side_chat.id,
+                    source_id,
+                    source.runner_id,
+                    extra={"session_id": side_chat.id},
+                )
+        if side_chat.runner_id is None:
+            return None, side_chat
+        return (
+            await _get_runner_client(side_chat.id, runner_router, conversation=side_chat),
+            side_chat,
+        )
+    _logger.warning(
+        "Side chat %s recovery gave up after %d attempts; source %s kept changing runners",
+        side_chat.id,
+        _SIDE_CHAT_RECOVERY_ATTEMPTS,
+        source_id,
+        extra={"session_id": side_chat.id},
+    )
+    return None, side_chat
 
 
 def _recorded_repo_workspaces(
