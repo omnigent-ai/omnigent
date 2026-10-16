@@ -610,6 +610,35 @@ def test_resolve_cli_binary_returns_none_when_absent(monkeypatch, tmp_path):
     assert _platform.resolve_cli_binary("tool", env_var="OMNIGENT_TESTCLI_PATH") is None
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "geteuid") or os.geteuid() == 0,
+    reason="needs a non-root user so a mode-0o000 directory is actually unsearchable",
+)
+def test_resolve_cli_binary_skips_unsearchable_fallback_dir(monkeypatch, tmp_path):
+    """A fallback dir that exists but can't be searched reads as "CLI not there",
+    and resolution keeps scanning later dirs instead of raising. A root-owned
+    0700 /usr/local/bin makes Path.is_file() raise PermissionError on 3.12/3.13.
+    """
+    locked = tmp_path / "locked-bin"
+    locked.mkdir()
+    locked.chmod(0o000)
+    good = tmp_path / "good-bin"
+    good.mkdir()
+    tool = good / "tool"
+    tool.write_text("#!/bin/sh\n")
+    tool.chmod(0o755)
+    try:
+        monkeypatch.setattr(_platform.shutil, "which", lambda name: None)
+        # An unsearchable dir alone resolves to "not found", not PermissionError.
+        monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (locked,))
+        assert _platform.resolve_cli_binary("tool") is None
+        # A later searchable dir is still reached after the unsearchable one.
+        monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (locked, good))
+        assert _platform.resolve_cli_binary("tool") == str(tool)
+    finally:
+        locked.chmod(0o700)
+
+
 def test_resolve_cli_binary_warns_on_bad_override(monkeypatch, tmp_path, caplog):
     """A set-but-unresolvable override warns (so a misconfig surfaces) and then
     falls back to PATH rather than launching nothing."""
