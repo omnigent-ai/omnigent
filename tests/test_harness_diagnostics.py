@@ -386,9 +386,18 @@ def test_detect_sign_in_prompt_does_not_treat_an_auth_shaped_hostname_as_the_end
         "Open the following URL to sign in:\nhttps://dbcert.example.com/x\n"
         "Signed in as someone@example.com.\nAgent ready.\n",
         "Sign in to continue:\n  code: HQ7M-2KPD\n",
+        "Sign in to continue\nEnter code 12345678\n",
+        "Sign in to continue:\n  code: abcd-1234\n",
         "https://signin.example.com/device",
     ],
-    ids=["moved-past-prompt", "completed-prompt", "cued-code", "bare-endpoint"],
+    ids=[
+        "moved-past-prompt",
+        "completed-prompt",
+        "cued-code",
+        "cued-numeric-code",
+        "cued-lowercase-code",
+        "bare-endpoint",
+    ],
 )
 def test_contains_sign_in_material_outlives_an_actionable_prompt(screen: str) -> None:
     """Material a stale or partial prompt leaves on screen still counts as sign-in material."""

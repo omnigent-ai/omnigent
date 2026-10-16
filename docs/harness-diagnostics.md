@@ -277,10 +277,11 @@ logging failure cannot replace the startup error or skip teardown.
 A native TUI that stays on screen without becoming interactive leaves records of
 what its pane shows, so a session start held by a launcher step (a login
 refresh, an update prompt, a wrapper waiting on the network) can be attributed.
-The runner's readiness observer logs `terminal_interactive_slow` once, 20 s after
-the terminal is registered (never later than a third of the 180 s readiness
-deadline), and `terminal_interactive_unobserved` when the deadline passes with
-the pane still running. Codex's `agent_startup_pending` record is written when
+The runner's readiness observer logs `terminal_interactive_slow` once at INFO,
+20 s after the terminal is registered (never later than a third of the 180 s
+readiness deadline), and `terminal_interactive_unobserved` at WARNING when the
+deadline passes with the pane still running. Most slow starts still succeed,
+which is why the early record stays below WARNING. Codex's `agent_startup_pending` record is written when
 the thread-start budget expires behind a live pane.
 
 Records of a running pane carry `sign_in_prompt_detected`. With capture enabled
@@ -290,8 +291,9 @@ excerpt (the last 40 lines and 4,000 characters). The excerpt is also appended
 to the log message, so the runner's local log under `~/.omnigent/logs/runner/`
 carries it without a structured exporter. An actionable sign-in prompt is
 reported only as the flag, and the tail is withheld whenever any sign-in
-material (an address or a device code, even from a prompt the launcher has
-moved past) is on screen, so one-time codes stay out of logs. The early
+material is on screen: a sign-in address, or a line mentioning a code beside
+sign-in wording, even from a prompt the launcher has moved past. One-time codes
+therefore stay out of logs. The early
 record exists so a runner lost before the deadline, for example by a host
 restart, still leaves the pane on record. A pane that has already stopped is
 described by its exit records instead; with capture disabled these records stay

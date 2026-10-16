@@ -152,8 +152,9 @@ def contains_sign_in_material(screen: str | None) -> bool:
     :func:`detect_sign_in_prompt` rejects a prompt the launcher has moved past,
     but the address and one-time code it printed are still on screen and still
     secret. Diagnostics that export pane text use this broader check to decide
-    whether the text may be logged at all. A code-shaped token counts only
-    beside sign-in wording: "Claude Code" is on most launcher lines.
+    whether the text may be logged at all. A line that mentions a code counts
+    only beside sign-in wording, whatever the code looks like: "Claude Code" is
+    on most launcher lines.
 
     :param screen: ANSI-stripped terminal screen text, or ``None``.
     :returns: ``True`` when any sign-in material is on screen.
@@ -165,9 +166,7 @@ def contains_sign_in_material(screen: str | None) -> bool:
     if endpoints or cued:
         return True
     return any(
-        _SIGN_IN_CODE_LINE.search(line)
-        and _SIGN_IN_CUE.search(_nearby(lines, index))
-        and _SIGN_IN_CODE.search(_SIGN_IN_URL.sub(" ", line))
+        _SIGN_IN_CODE_LINE.search(line) and _SIGN_IN_CUE.search(_nearby(lines, index))
         for index, line in enumerate(lines)
     )
 
