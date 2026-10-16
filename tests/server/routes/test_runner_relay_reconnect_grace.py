@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from types import SimpleNamespace
 
 import httpx
@@ -173,6 +173,129 @@ async def test_persistent_natural_eof_exhausts_disconnect_grace(
         session_stream.close(session_id)
 
 
+class _RetiredRunnerTransport(httpx.MockTransport):
+    """Mock tunnel transport for a runner whose tunnel this server retired at ``retired_at``."""
+
+    def __init__(
+        self, handler: Callable[[httpx.Request], httpx.Response], clock: _RelayClock
+    ) -> None:
+        super().__init__(handler)
+        self._clock = clock
+        self.retired_at: float | None = 0.0
+
+    def retire_window_remaining(self, window_s: float) -> float:
+        if self.retired_at is None:
+            return 0.0
+        return max(0.0, self.retired_at + window_s - self._clock.now)
+
+
+@pytest.mark.asyncio
+async def test_retired_runner_keeps_relay_retrying_through_rehome_window(
+    db_uri: str,
+    relay_clock: _RelayClock,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A runner this server retired gets the re-home window, not the 10 s grace.
+
+    Same drop pattern as the persistent-EOF test, which gives up after 3
+    attempts at t=14; here the relay keeps retrying until the 30 s window ends.
+    """
+    monkeypatch.setattr(orchestration, "RUNNER_REHOME_GRACE_S", 30.0, raising=False)
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation()
+    session_id = conversation.id
+    orchestration._session_status_cache[session_id] = "running"
+    attempts = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        del request
+        nonlocal attempts
+        attempts += 1
+        relay_clock.now += 4.0
+        return httpx.Response(
+            200,
+            stream=_NaturalEofStream(b'data: {"type":"session.status","status":"running"}\n\n'),
+        )
+
+    try:
+        async with httpx.AsyncClient(
+            base_url="http://runner", transport=_RetiredRunnerTransport(respond, relay_clock)
+        ) as client:
+            await asyncio.wait_for(
+                orchestration._relay_runner_stream(session_id, client, store), timeout=10
+            )
+        assert attempts == 6
+        assert relay_clock.now == pytest.approx(29.0)
+        outcome = next(
+            record
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "runner_stream_disconnected"
+        )
+        assert outcome.attributes["grace_s"] == 26.0
+        # Nothing re-stamped the runner elsewhere, so the usual give-up still fails it.
+        assert orchestration._session_status_cache[session_id] == "failed"
+    finally:
+        orchestration._session_status_cache.pop(session_id, None)
+        orchestration._session_active_response_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_retired_runner_live_elsewhere_at_the_grace_is_not_failed_later(
+    db_uri: str,
+    relay_clock: _RelayClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retired runner adopted elsewhere stands the relay down at the 10 s grace.
+
+    The adopter later drops it ordinarily, clearing its stamp at t=24, before
+    this relay's 30 s re-home window ends; failing the turn then would cut
+    the adopter's own grace short.
+    """
+    import time
+
+    monkeypatch.setattr(orchestration, "RUNNER_REHOME_GRACE_S", 30.0, raising=False)
+    store = SqlAlchemyConversationStore(db_uri)
+    runner_id = "runner-adopted"
+    session_id = store.create_conversation(runner_id=runner_id).id
+    adopted_at = int(time.time())
+    monkeypatch.setattr(
+        "omnigent.server.session_live_state.last_liveness_stamp",
+        lambda _runner_id: adopted_at - 60,
+    )
+    store.touch_runner_liveness([runner_id], adopted_at)
+    orchestration._session_status_cache[session_id] = "running"
+    attempts = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        del request
+        nonlocal attempts
+        attempts += 1
+        relay_clock.now += 4.0
+        if relay_clock.now >= 20.0:
+            store.clear_runner_liveness(runner_id)
+        return httpx.Response(
+            200,
+            stream=_NaturalEofStream(b'data: {"type":"session.status","status":"running"}\n\n'),
+        )
+
+    try:
+        async with httpx.AsyncClient(
+            base_url="http://runner", transport=_RetiredRunnerTransport(respond, relay_clock)
+        ) as client:
+            await asyncio.wait_for(
+                orchestration._relay_runner_stream(session_id, client, store), timeout=10
+            )
+        assert attempts == 3
+        assert relay_clock.now == pytest.approx(14.0)
+        assert orchestration._session_status_cache.get(session_id) is None
+    finally:
+        orchestration._session_status_cache.pop(session_id, None)
+        orchestration._session_active_response_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stopped_runner", [None, "runner-current", "runner-old"])
 async def test_natural_eof_matches_intent_to_the_relay_runner(
@@ -336,6 +459,93 @@ async def test_an_unrecovered_stream_still_exhausts_its_grace(
         persisted = store.get_conversation(session_id)
         assert persisted is not None
         assert persisted.labels["omnigent.last_task_error_code"] == "runner_disconnected"
+    finally:
+        orchestration._session_status_cache.pop(session_id, None)
+        orchestration._session_active_response_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream_ready", [False, True])
+async def test_retirement_after_brief_reconnect_extends_existing_relay_deadline(
+    db_uri: str,
+    relay_clock: _RelayClock,
+    monkeypatch: pytest.MonkeyPatch,
+    stream_ready: bool,
+) -> None:
+    """A prior ordinary outage cannot shorten a later server retirement's window."""
+    monkeypatch.setattr(orchestration, "RUNNER_REHOME_GRACE_S", 30.0, raising=False)
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = store.create_conversation().id
+    orchestration._session_status_cache[session_id] = "running"
+    attempts = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        del request
+        nonlocal attempts
+        attempts += 1
+        relay_clock.now += 4.0
+        frames = [b'data: {"type":"session.status","status":"running"}\n\n']
+        if attempts == 2:
+            transport.retired_at = relay_clock.now
+            if stream_ready:
+                frames.insert(0, b'data: {"type":"session.heartbeat"}\n\n')
+        return httpx.Response(200, stream=_NaturalEofStream(*frames))
+
+    transport = _RetiredRunnerTransport(respond, relay_clock)
+    transport.retired_at = None
+    try:
+        async with httpx.AsyncClient(base_url="http://runner", transport=transport) as client:
+            await asyncio.wait_for(
+                orchestration._relay_runner_stream(session_id, client, store), timeout=10
+            )
+        assert transport.retired_at == 9.0
+        assert attempts == 8
+        assert relay_clock.now == pytest.approx(39.0)
+        assert orchestration._session_status_cache[session_id] == "failed"
+    finally:
+        orchestration._session_status_cache.pop(session_id, None)
+        orchestration._session_active_response_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream_ready", [False, True])
+async def test_reconnect_clears_retirement_extension_before_an_ordinary_drop(
+    db_uri: str,
+    relay_clock: _RelayClock,
+    monkeypatch: pytest.MonkeyPatch,
+    stream_ready: bool,
+) -> None:
+    """A reconnect closes the handoff window even before its first heartbeat."""
+    monkeypatch.setattr(orchestration, "RUNNER_REHOME_GRACE_S", 30.0)
+    store = SqlAlchemyConversationStore(db_uri)
+    session_id = store.create_conversation().id
+    orchestration._session_status_cache[session_id] = "running"
+    attempts = 0
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        del request
+        nonlocal attempts
+        attempts += 1
+        relay_clock.now += 4.0
+        frames = [b'data: {"type":"session.status","status":"running"}\n\n']
+        if attempts == 2:
+            # A local registration clears the registry's retirement record.
+            transport.retired_at = None
+            if stream_ready:
+                frames.insert(0, b'data: {"type":"session.heartbeat"}\n\n')
+        return httpx.Response(200, stream=_NaturalEofStream(*frames))
+
+    transport = _RetiredRunnerTransport(respond, relay_clock)
+    try:
+        async with httpx.AsyncClient(base_url="http://runner", transport=transport) as client:
+            await asyncio.wait_for(
+                orchestration._relay_runner_stream(session_id, client, store), timeout=10
+            )
+        assert attempts == (4 if stream_ready else 3)
+        assert relay_clock.now == pytest.approx(19.0 if stream_ready else 14.0)
+        assert orchestration._session_status_cache[session_id] == "failed"
     finally:
         orchestration._session_status_cache.pop(session_id, None)
         orchestration._session_active_response_cache.pop(session_id, None)

@@ -3511,7 +3511,10 @@ def create_app(
         A runner confirmed live on another replica (via
         :func:`_runner_live_on_another_replica_from_conversations`) skips it too: that
         replica's tunnel is authoritative now, and this one's registry
-        only ever knew about its own connections.
+        only ever knew about its own connections. A runner whose tunnel this
+        server retired and that is live nowhere else when the lease expires
+        gets the rest of :data:`RUNNER_REHOME_GRACE_S` before these checks,
+        since it may still be reconnecting to another replica.
 
         :param runner_id: The disconnected runner's id.
         :param reference_stamp: This replica's own last liveness stamp for
@@ -3524,6 +3527,7 @@ def create_app(
         """
         from omnigent.server.routes.sessions import (
             RUNNER_DISCONNECT_GRACE_S,
+            RUNNER_REHOME_GRACE_S,
             _mark_runner_sessions_offline,
             _note_runner_idle_shutdown,
             _relinquish_session_live_state,
@@ -3537,6 +3541,18 @@ def create_app(
         reconnected = await tunnel_registry.wait_for_runner(
             runner_id, timeout_s=RUNNER_DISCONNECT_GRACE_S
         )
+        # A runner this server retired may still be reconnecting to another
+        # replica. Unless it is live there already, give it the rest of its
+        # handoff window before the checks below.
+        rehome_s = tunnel_registry.retire_window_remaining(runner_id, RUNNER_REHOME_GRACE_S)
+        if reconnected is None and rehome_s > 0 and not shutdown_state.server_shutting_down():
+            bound = await asyncio.to_thread(
+                conversation_store.list_conversations_by_runner_id, runner_id
+            )
+            if not _runner_live_on_another_replica_from_conversations(
+                bound, runner_id, reference_stamp
+            ):
+                reconnected = await tunnel_registry.wait_for_runner(runner_id, timeout_s=rehome_s)
         if shutdown_state.server_shutting_down():
             _logger.info(
                 "Runner %s dropped because this server is shutting down; skipping offline-marking",
