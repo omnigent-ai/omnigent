@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 
 from fastapi import (
     APIRouter,
     Query,
     Request,
 )
+from fastapi.responses import StreamingResponse
 
+from omnigent.export import EntryNumbering, header_from_session
+from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -37,6 +41,7 @@ from omnigent.server.routes._sessions.common import (
     get_server_runner_router,
     set_server_runner_router,
 )
+from omnigent.server.routes._sessions.helpers import _resolve_harness, _resolve_llm_model
 from omnigent.server.routes._sessions.orchestration import (
     _child_session_summaries_from_conversations,
 )
@@ -55,8 +60,104 @@ def register_items_routes(
     agent_store: AgentStore,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    agent_cache: AgentCache | None = None,
 ) -> None:
     """Register the items routes on router."""
+
+    @router.get(
+        "/sessions/{session_id}/export",
+        # response_model=None: returns a StreamingResponse, not a model.
+        response_model=None,
+        responses={
+            200: {
+                "description": (
+                    "The session as an ``omnigent.transcript/1`` file: one JSON "
+                    "object per line, header first, then one entry per item."
+                ),
+                "content": {"application/x-ndjson": {"schema": {"type": "string"}}},
+            },
+        },
+    )
+    async def export_session_transcript(
+        request: Request,
+        session_id: str,
+    ) -> StreamingResponse:
+        """
+        Stream the session as a portable, versioned transcript.
+
+        Builds the same ``omnigent.transcript/1`` file as ``omnigent session
+        export`` (see ``docs/session-export.md``) server-side, paging the
+        items so a long session never has to fit in memory at once.
+
+        :param request: Inbound HTTP request; carries the caller identity
+            used to authorize READ on the session.
+        :param session_id: Session/conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :returns: An ``application/x-ndjson`` download named
+            ``<session_id>.jsonl``.
+        :raises OmnigentError: 403 if the caller lacks READ; 404 if no
+            session exists.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise _session_not_found()
+
+        def _session_snapshot() -> dict[str, object]:
+            """Resolve the header fields the way the session snapshot does."""
+            agent = agent_store.get(conv.agent_id) if conv.agent_id else None
+            return {
+                "id": conv.id,
+                "created_at": conv.created_at,
+                "title": conv.title,
+                "agent_name": agent.name if agent is not None else None,
+                "agent_id": conv.agent_id,
+                "harness": _resolve_harness(
+                    conv, agent_store=agent_store, agent_cache=agent_cache
+                ),
+                "llm_model": _resolve_llm_model(
+                    conv, agent_store=agent_store, agent_cache=agent_cache
+                ),
+                "workspace": conv.workspace,
+                "parent_session_id": conv.parent_conversation_id,
+                "root_conversation_id": conv.root_conversation_id,
+                "harness_override": conv.harness_override,
+                "model_override": conv.model_override,
+                "reasoning_effort": conv.reasoning_effort,
+                "cost_control_mode_override": conv.cost_control_mode_override,
+                "terminal_launch_args": conv.terminal_launch_args,
+            }
+
+        header = header_from_session(await asyncio.to_thread(_session_snapshot))
+
+        async def _lines() -> AsyncIterator[str]:
+            yield header.to_line() + "\n"
+            numbering = EntryNumbering()
+            after: str | None = None
+            while True:
+                page = await asyncio.to_thread(
+                    conversation_store.list_items,
+                    session_id,
+                    limit=500,
+                    after=after,
+                    order="asc",
+                )
+                for item in page.data:
+                    yield numbering.entry(item.to_api_dict()).to_line() + "\n"
+                if not page.has_more:
+                    break
+                after = page.last_id
+
+        return StreamingResponse(
+            _lines(),
+            media_type="application/x-ndjson",
+            headers={"Content-Disposition": f'attachment; filename="{conv.id}.jsonl"'},
+        )
 
     @router.get(
         "/sessions/{session_id}/items",
