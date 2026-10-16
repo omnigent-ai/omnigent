@@ -1133,7 +1133,7 @@ def create_auth_router(
                     device_grant_store,
                     user_id=pending.user_id,
                     cookie_secret=config.cookie_secret,
-                )
+                ).refresh_token
             except Exception:
                 _logger.exception("native sign-in: refresh grant issuance failed")
         return JSONResponse(status_code=200, content=content, headers=NO_STORE_HEADERS)
