@@ -1173,7 +1173,18 @@ async def test_relay_preserves_failure_reported_during_intentional_teardown(
     session_id = "aa251103f45c42da8b471d1f6b12b54a"
     runner_id = "runner-failing-during-stop"
     error = {"code": "native_turn_error", "message": "Harness failed before teardown."}
-    event = {"type": "session.status", "status": "failed", "error": error}
+    event = {
+        "type": "session.status",
+        "status": "failed",
+        "error": error,
+        "failure_context": {
+            "failure_id": "err_synthetic_relay",
+            "failure_source": "native_terminal_start",
+            "exception_type": "RuntimeError",
+            "exception_cause_type": "ReadTimeout",
+            "origin": "forged",
+        },
+    }
     gate = asyncio.Event()
     runner = _ScriptedThenDropRunnerClient([f"data: {json.dumps(event)}\n\n"], gate)
     store = _RecordingLabelStore(live_status="running")
@@ -1190,8 +1201,16 @@ async def test_relay_preserves_failure_reported_during_intentional_teardown(
         collector = await start_session_stream_collector(session_id)
         if intentional:
             sessions_module._intentional_stop_sessions[session_id] = runner_id
-        gate.set()
-        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        with capture_debug_rows("server") as rows:
+            gate.set()
+            await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        [failure] = [r for r in rows if r["event_name"] == "session_turn_failed"]
+        attrs = failure["attributes"]
+        assert isinstance(attrs, dict)
+        assert attrs["failure_id"] == "err_synthetic_relay"
+        assert attrs["exception_cause_type"] == "ReadTimeout"
+        assert attrs["origin"] == "relayed_runner_status"
 
         status = await asyncio.wait_for(collector.queue.get(), timeout=_TASK_TIMEOUT_S)
         assert status["type"] == "session.status"
