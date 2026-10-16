@@ -2437,7 +2437,7 @@ def _redirect_claude_transcript_to_current_project(
     if source is None:
         raise click.ClickException(
             f"Claude transcript {external_session_id!r} was not found under "
-            f"{_CLAUDE_PROJECTS_DIR}."
+            f"{_claude_projects_dir()}."
         )
     target_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = target.with_suffix(".jsonl.tmp")
@@ -2694,12 +2694,13 @@ def _find_claude_transcript(
     """
     if not _CLAUDE_SESSION_ID_RE.fullmatch(external_session_id):
         return None
-    if not _CLAUDE_PROJECTS_DIR.is_dir():
+    projects_dir = _claude_projects_dir()
+    if not projects_dir.is_dir():
         return None
     matches: list[Path] = []
     filename = f"{external_session_id}.jsonl"
     excluded = exclude.resolve() if exclude is not None else None
-    for project_dir in _CLAUDE_PROJECTS_DIR.iterdir():
+    for project_dir in projects_dir.iterdir():
         if not project_dir.is_dir():
             continue
         candidate = project_dir / filename
@@ -2711,18 +2712,31 @@ def _find_claude_transcript(
     return matches[0]
 
 
+def _claude_projects_dir() -> Path:
+    """
+    Return the directory Claude Code keeps its project transcripts in.
+
+    Mirrors Claude's own resolution: ``$CLAUDE_CONFIG_DIR/projects`` when set,
+    otherwise ``~/.claude/projects``.
+
+    :returns: The projects directory (not guaranteed to exist).
+    """
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(configured).expanduser() / "projects" if configured else _CLAUDE_PROJECTS_DIR
+
+
 def _claude_project_dir_for_cwd(cwd: Path) -> Path:
     """
     Return Claude's project transcript directory for *cwd*.
 
     Claude Code stores transcripts under
-    ``~/.claude/projects/<sanitized-cwd>/``. The observed sanitizer
-    replaces non-alphanumeric path characters with ``-``.
+    ``<projects dir>/<sanitized-cwd>/`` (see :func:`_claude_projects_dir`).
+    The observed sanitizer replaces non-alphanumeric path characters with ``-``.
 
     :param cwd: Absolute cwd, e.g. ``Path("/home/me/repo")``.
     :returns: Claude project transcript directory.
     """
-    return _CLAUDE_PROJECTS_DIR / _sanitize_claude_project_name(str(cwd))
+    return _claude_projects_dir() / _sanitize_claude_project_name(str(cwd))
 
 
 def _sanitize_claude_project_name(path: str) -> str:

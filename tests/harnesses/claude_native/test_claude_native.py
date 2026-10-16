@@ -5908,16 +5908,17 @@ async def test_resolve_cold_resume_args_resumes_a_copy_while_a_background_job_ru
     the background"), and the job keeps appending to the original transcript,
     so the resume must leave that file alone and launch a copy under a new id.
     A later resume while the job still runs reuses that copy and rebuilds it.
+    Both live in ``$CLAUDE_CONFIG_DIR/projects``, where that Claude reads them.
     """
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    projects = tmp_path / "claude-projects"
+    config_dir = tmp_path / "claude-config"
+    projects = config_dir / "projects"
     project_dir = projects / claude_native._sanitize_claude_project_name(str(workspace.resolve()))
     live_transcript = project_dir / "claude-uuid-abc.jsonl"
     project_dir.mkdir(mode=0o700, parents=True)
     live_line = json.dumps({"type": "user", "sessionId": "claude-uuid-abc"}) + "\n"
     live_transcript.write_text(live_line, encoding="utf-8")
-    config_dir = tmp_path / "claude-config"
     (config_dir / "sessions").mkdir(parents=True)
     (config_dir / "sessions" / f"{os.getppid()}.json").write_text(
         json.dumps({"sessionId": "claude-uuid-abc", "kind": "bg", "jobId": "ab12cd34"}),
@@ -5953,7 +5954,9 @@ async def test_resolve_cold_resume_args_resumes_a_copy_while_a_background_job_ru
         raise AssertionError(f"unexpected request {request.method} {request.url}")
 
     monkeypatch.chdir(workspace)
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    # Claude keeps transcripts in its config dir, never in the home default.
+    default_projects = tmp_path / "home-claude-projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", default_projects)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -5987,6 +5990,7 @@ async def test_resolve_cold_resume_args_resumes_a_copy_while_a_background_job_ru
     assert sorted(path.name for path in project_dir.iterdir()) == sorted(
         [live_transcript.name, copy_transcript.name]
     )
+    assert not default_projects.exists()
 
 
 def test_resume_copy_id_is_fresh_while_a_live_claude_has_the_copy_open(
@@ -6081,13 +6085,13 @@ async def test_resolve_cold_resume_args_keeps_a_held_transcript_when_history_is_
     """Unreachable history while a job holds the session fails, never resuming the original."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    projects = tmp_path / "claude-projects"
+    config_dir = tmp_path / "claude-config"
+    projects = config_dir / "projects"
     project_dir = projects / claude_native._sanitize_claude_project_name(str(workspace.resolve()))
     project_dir.mkdir(mode=0o700, parents=True)
     live_transcript = project_dir / "claude-uuid-abc.jsonl"
     live_line = json.dumps({"type": "user", "sessionId": "claude-uuid-abc"}) + "\n"
     live_transcript.write_text(live_line, encoding="utf-8")
-    config_dir = tmp_path / "claude-config"
     (config_dir / "sessions").mkdir(parents=True)
     (config_dir / "sessions" / f"{os.getppid()}.json").write_text(
         json.dumps({"sessionId": "claude-uuid-abc", "kind": "bg"}), encoding="utf-8"
@@ -6111,7 +6115,9 @@ async def test_resolve_cold_resume_args_keeps_a_held_transcript_when_history_is_
         return httpx.Response(500, json={"error": {"code": "internal_error"}})
 
     monkeypatch.chdir(workspace)
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    # Claude keeps transcripts in its config dir, never in the home default.
+    default_projects = tmp_path / "home-claude-projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", default_projects)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -6120,6 +6126,7 @@ async def test_resolve_cold_resume_args_keeps_a_held_transcript_when_history_is_
 
     assert live_transcript.read_text(encoding="utf-8") == live_line
     assert [path.name for path in project_dir.iterdir()] == [live_transcript.name]
+    assert not default_projects.exists()
 
 
 @pytest.mark.asyncio
