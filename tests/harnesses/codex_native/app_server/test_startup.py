@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import socket
 import sys
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import psutil
 import pytest
@@ -17,6 +20,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.codex_egress import CertificateFailure
 from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
+    CodexAppServerSilentStartTimeout,
     CodexNativeAppServer,
 )
 from omnigent.harnesses.codex_native.bridge import (
@@ -26,7 +30,9 @@ from omnigent.harnesses.codex_native.bridge import (
 from omnigent.process_logging import HARNESS_STDERR_ENABLED_ENV_VAR
 from tests.harnesses.codex_native.app_server._support import (
     _disable_codex_startup_rpc,
+    _fake_trust_policy_hooks,
     _FakeStartupClient,
+    _set_codex_version,
     _test_app_server,
 )
 
@@ -71,6 +77,295 @@ async def test_start_reuses_initialized_readiness_client_for_hook_trust(
     try:
         assert trusted_with == [startup_client]
         assert startup_client.close_calls == 1
+    finally:
+        await server.close()
+
+
+@dataclass
+class _RespawnHarness:
+    """A start()-ready server whose spawn, readiness and teardown are mocked."""
+
+    server: CodexNativeAppServer
+    spawn_calls: list[str] = field(default_factory=list)
+    kill_calls: list[object] = field(default_factory=list)
+    socket_present_at_spawn: list[bool] = field(default_factory=list)
+
+
+_SILENT_PID = 4242
+_SILENT_STDERR = ["api_key=synthetic-token-marker"]
+
+
+def _silent_timeout(server: CodexNativeAppServer) -> CodexAppServerSilentStartTimeout:
+    """Leave ``server`` holding a live, never-listening process and build its timeout."""
+    proc_mock = AsyncMock()
+    proc_mock.returncode = None
+    proc_mock.pid = _SILENT_PID
+    proc_mock.wait = AsyncMock()
+    server.proc = proc_mock
+    server.recent_stderr = list(_SILENT_STDERR)
+    return CodexAppServerSilentStartTimeout(
+        "Timed out after 60s waiting for the Codex app-server at ws://127.0.0.1:43121: "
+        f"[Errno 111] Connect call failed; stderr={' | '.join(_SILENT_STDERR)}",
+        sum(len(line.encode()) for line in _SILENT_STDERR),
+        "ConnectionRefusedError",
+    )
+
+
+def _respawn_harness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    readiness: Callable[[CodexNativeAppServer], Awaitable[_FakeStartupClient]],
+) -> _RespawnHarness:
+    """
+    Build the mocked server shared by the silent-start respawn tests.
+
+    :param tmp_path: Test temp directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param readiness: Replacement for ``_wait_until_ready`` scripting each attempt.
+    :returns: The server plus the spawn and termination calls it made.
+    """
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    _set_codex_version(monkeypatch, (0, 147, 0))
+    monkeypatch.setattr(CodexNativeAppServer, "_wait_until_ready", readiness)
+    monkeypatch.setattr(CodexNativeAppServer, "_trust_policy_hooks", _fake_trust_policy_hooks)
+    harness = _RespawnHarness(
+        _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
+    )
+
+    async def _spawn_spy(self: CodexNativeAppServer, resolved_listen: str) -> None:
+        harness.spawn_calls.append(resolved_listen)
+        harness.socket_present_at_spawn.append(self.socket_path.exists())
+        proc_mock = AsyncMock()
+        proc_mock.returncode = None
+        proc_mock.pid = _SILENT_PID + len(harness.spawn_calls)
+        proc_mock.wait = AsyncMock()
+        self.proc = proc_mock
+        self.recent_stderr = []
+        self.stderr_task = None
+
+    monkeypatch.setattr(CodexNativeAppServer, "_spawn_app_server_process", _spawn_spy)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server._terminate_process_tree",
+        harness.kill_calls.append,
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server._kill_process_tree", lambda *args: None
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.unregister_codex_native_process",
+        lambda *args: None,
+    )
+    return harness
+
+
+@pytest.mark.parametrize(
+    ("listen_url", "capture_enabled"),
+    [("ws://127.0.0.1:43121", True), (None, False)],
+    ids=["ws-capture-on", "unix-capture-off"],
+)
+async def test_start_respawns_on_silent_startup_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    listen_url: str | None,
+    capture_enabled: bool,
+) -> None:
+    """One silent timeout respawns on the same transport and drops the first attempt's state."""
+    monkeypatch.setenv(HARNESS_STDERR_ENABLED_ENV_VAR, "1" if capture_enabled else "0")
+    startup_client = _FakeStartupClient()
+    readiness_calls: list[int] = []
+    stale_failure = CertificateFailure(evidence="certificate expired", expired=True)
+
+    async def _ready_with_respawn(_self: CodexNativeAppServer) -> _FakeStartupClient:
+        readiness_calls.append(len(readiness_calls) + 1)
+        if len(readiness_calls) > 1:
+            return startup_client
+        timeout = _silent_timeout(_self)
+        # Leftovers of the silent attempt must not outlive it: a TLS line it
+        # printed, and a socket file it may have created.
+        _self.certificate_failure = stale_failure
+        record_certificate_failure(_self.bridge_dir, stale_failure)
+        _self.socket_path.write_text("stale")
+        raise timeout
+
+    harness = _respawn_harness(tmp_path, monkeypatch, _ready_with_respawn)
+    server = harness.server
+    server.listen_url = listen_url
+    resolved_listen = listen_url or f"unix://{server.socket_path}"
+
+    with caplog.at_level(logging.WARNING):
+        await server.start()
+    try:
+        # Callers hand the pre-start transport to the TUI and forwarder, so the
+        # respawn must reuse it.
+        assert harness.spawn_calls == [resolved_listen, resolved_listen]
+        assert server.listen_url == listen_url
+        assert len(readiness_calls) == 2
+        assert len(harness.kill_calls) == 1
+        assert server.certificate_failure is None
+        assert read_certificate_failure(tmp_path / "bridge") is None
+        # Only a unix transport owns the socket path, so only it unlinks the
+        # stale file before the second spawn.
+        assert harness.socket_present_at_spawn == [False, listen_url is not None]
+        # Exactly one respawn event, describing the silent process; its stderr
+        # reaches the log only through the opt-in, redacted snapshot.
+        records = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "codex_app_server_silent_start_respawn"
+        ]
+        assert len(records) == 1
+        attributes = records[0].attributes
+        assert attributes["exception_type"] == "CodexAppServerSilentStartTimeout"
+        assert attributes["app_server_state"] == "running"
+        assert attributes["app_server_pid"] == _SILENT_PID
+        assert attributes["recent_stderr_bytes"] == len(_SILENT_STDERR[0])
+        assert attributes["last_error_type"] == "ConnectionRefusedError"
+        assert attributes["stderr_capture_enabled"] is capture_enabled
+        if capture_enabled:
+            assert attributes["stderr_tail"] == "api_key=[REDACTED]"
+        else:
+            assert "stderr_tail" not in attributes
+        serialized = json.dumps({"message": records[0].getMessage(), "attributes": attributes})
+        assert "synthetic-token-marker" not in serialized
+    finally:
+        await server.close()
+
+
+async def test_start_fails_on_second_silent_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second silent timeout fails start() with a plain RuntimeError and no third spawn."""
+
+    async def _always_timeout(_self: CodexNativeAppServer) -> _FakeStartupClient:
+        raise _silent_timeout(_self)
+
+    harness = _respawn_harness(tmp_path, monkeypatch, _always_timeout)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await harness.server.start()
+
+    assert type(excinfo.value) is RuntimeError
+    assert isinstance(excinfo.value.__cause__, CodexAppServerSilentStartTimeout)
+    assert len(harness.spawn_calls) == 2
+    # Both attempts were torn down: the silent one before the respawn, the
+    # replacement by start()'s failure cleanup.
+    assert len(harness.kill_calls) == 2
+
+
+_SILENT_THEN_LISTENING_APP_SERVER = '''\
+"""Fake ``codex app-server``: alive but silent on spawn 1, listening on spawn 2."""
+import asyncio
+import json
+import os
+import socket
+import sys
+import time
+from pathlib import Path
+
+from websockets.asyncio.server import serve
+
+state_dir = Path(os.environ["FAKE_APP_SERVER_STATE_DIR"])
+attempt = len(list(state_dir.glob("attempt-*"))) + 1
+(state_dir / f"attempt-{attempt}").write_text(str(os.getpid()))
+host, port = sys.argv[sys.argv.index("--listen") + 1].removeprefix("ws://").split(":")
+if attempt == 1:
+    # Bound but never listening: connects are refused; the sleep outlasts the
+    # test's readiness budget without lingering if teardown ever regresses.
+    with socket.socket() as held:
+        held.bind((host, int(port)))
+        time.sleep(30)
+    sys.exit(0)
+
+
+async def handle(connection):
+    async for raw in connection:
+        message = json.loads(raw)
+        if "id" in message:
+            await connection.send(json.dumps({"id": message["id"], "result": {}}))
+
+
+async def main():
+    async with serve(handle, host, int(port)):
+        await asyncio.Future()
+
+
+asyncio.run(main())
+'''
+
+
+def _free_port_outside_the_ephemeral_range() -> int:
+    """
+    Pick a free loopback port that ``bind(("127.0.0.1", 0))`` never hands out.
+
+    Linux auto-allocates from 32768 upward and macOS/Windows from 49152, so a
+    low, PID-shifted range keeps parallel workers' ephemeral ports away from
+    this one and reduces collisions; availability remains racy until the child
+    binds.
+
+    :returns: A bindable port between 20000 and 29999.
+    """
+    for port in range(20000 + os.getpid() % 9000, 30000):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError("no free loopback port between 20000 and 29999")
+
+
+async def test_start_respawns_a_silent_app_server_on_the_same_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real app-server that never listens is replaced on the URL callers already hold."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    monkeypatch.setattr(codex_native_app_server, "_APP_SERVER_READY_TIMEOUT_SECONDS", 3.0)
+    _set_codex_version(monkeypatch, (0, 147, 0))
+    monkeypatch.setattr(CodexNativeAppServer, "_trust_policy_hooks", _fake_trust_policy_hooks)
+
+    state_dir = tmp_path / "app-server-state"
+    state_dir.mkdir()
+    script = tmp_path / "fake_app_server.py"
+    script.write_text(_SILENT_THEN_LISTENING_APP_SERVER)
+    codex = tmp_path / "codex"
+    codex.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n')
+    codex.chmod(0o755)
+    listen_url = f"ws://127.0.0.1:{_free_port_outside_the_ephemeral_range()}"
+
+    server = _test_app_server(
+        tmp_path,
+        tmp_path / "codex-home",
+        tmp_path / "bridge",
+        workspace,
+        env={"FAKE_APP_SERVER_STATE_DIR": str(state_dir)},
+    )
+    server.codex_path = str(codex)
+    server.listen_url = listen_url
+
+    await server.start()
+    try:
+        assert sorted(path.name for path in state_dir.iterdir()) == ["attempt-1", "attempt-2"]
+        assert server.listen_url == listen_url
+        silent_pid = int((state_dir / "attempt-1").read_text())
+        # close() awaited the child, so it is reaped, not merely terminated.
+        assert not psutil.pid_exists(silent_pid)
+        assert server.proc is not None and server.proc.returncode is None
+        # The runner and ``omnigent codex`` connect with the URL they captured
+        # before start(); the replacement must answer there.
+        client = CodexAppServerClient(ws_url=listen_url, client_name="omnigent-test")
+        await client.connect()
+        await client.close()
     finally:
         await server.close()
 
@@ -437,7 +732,7 @@ async def test_wait_until_ready_timeout_reports_listen_target_and_budget(
             # Each refused probe costs 25 s of virtual time: three attempts
             # exhaust the 60 s budget without a real wait.
             clock["offset"] += 25.0
-            raise OSError("[Errno 111] Connect call failed ('127.0.0.1', 57045)")
+            raise ConnectionRefusedError(111, "Connect call failed ('127.0.0.1', 57045)")
 
         async def close(self) -> None:
             self.close_calls += 1
@@ -459,6 +754,7 @@ async def test_wait_until_ready_timeout_reports_listen_target_and_budget(
     )
     server.listen_url = listen_url
     server.proc = Mock(returncode=None)
+    server.recent_stderr = ["sample", "stderr"]
 
     with pytest.raises(RuntimeError) as excinfo:
         await server._wait_until_ready()
@@ -473,6 +769,33 @@ async def test_wait_until_ready_timeout_reports_listen_target_and_budget(
     assert (str(server.socket_path) in message) is (listen_url is None)
     assert len(clients) == 3
     assert all(client.close_calls == 1 for client in clients)
+    # Alive but never listening: the respawnable subclass carries the stderr tail
+    # size and the class of the last failed probe.
+    assert type(excinfo.value) is codex_native_app_server.CodexAppServerSilentStartTimeout
+    assert excinfo.value.recent_stderr_bytes == len("samplestderr")
+    assert excinfo.value.last_error_type == "ConnectionRefusedError"
+
+
+async def test_wait_until_ready_fails_at_once_when_the_process_exited(tmp_path: Path) -> None:
+    """An exited app-server raises a plain RuntimeError, never the respawnable subclass."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = _test_app_server(
+        tmp_path,
+        tmp_path / "codex-home",
+        tmp_path / "bridge",
+        workspace,
+    )
+    server.proc = Mock(returncode=1)
+    server.recent_stderr = ["Exit error"]
+
+    with pytest.raises(RuntimeError, match="exited early: Exit error") as excinfo:
+        await server._wait_until_ready()
+
+    assert type(excinfo.value) is RuntimeError
+    assert not isinstance(excinfo.value, codex_native_app_server.CodexAppServerSilentStartTimeout)
 
 
 async def test_standalone_hook_trust_closes_client_when_connect_fails(
