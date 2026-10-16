@@ -184,7 +184,7 @@ blaxel = ["blaxel>=0.4.1,<0.5"]
 boxlite = ["boxlite>=0.9.5,<1"]
 # Microsandbox launcher: local libkrun microVMs with an optional embedded SDK.
 # Require 0.6.9 for upstream bug fixes and pin the beta SDK's minor version.
-microsandbox = ["microsandbox>=0.6.9,<0.7"]
+microsandbox = ["microsandbox>=0.6.9,<0.8"]
 # CoreWeave Sandbox launcher (`omnigent sandbox --provider cwsandbox` and
 # server-managed `sandbox.provider: cwsandbox`).
 # Same lazy-import posture as above. Pre-1.0 SDK: pin minor.
@@ -383,7 +383,7 @@ test = [
     # monkeypatch of ``sessions._get_runner_client`` into later tests
     # on the same xdist worker and flaked the WS-tunnel suite (the
     # "Runner stream relay exited before becoming ready" 503s).
-    "pytest-rerunfailures==16.3",
+    "pytest-rerunfailures==16.7",
     "filelock>=3.0",
     # Cloud-service mocks for the artifact-store / Cloudflare integration
     # tests: moto is the standard S3-compatible mock (used for R2), respx is
@@ -394,7 +394,7 @@ test = [
     "boto3>=1.30,<2",
     # The Cloudflare D1 SQLAlchemy dialect, exercised by the D1 FTS integration
     # test (tests/db/test_d1_fts_dialect.py) via respx + sqlite3.
-    "sqlalchemy-cloudflare-d1==0.3.10",
+    "sqlalchemy-cloudflare-d1==0.4.1",
 ]
 dev = [
     { include-group = "lint" },
