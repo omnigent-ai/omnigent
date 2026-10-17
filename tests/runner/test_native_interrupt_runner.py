@@ -10,7 +10,9 @@ no-handler fall-through contract (antigravity/opencode), and the 503 mapping.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +21,8 @@ from typing import Any
 import pytest
 from fastapi.responses import Response
 
+from omnigent.runner.native import interrupt as interrupt_mod
+from omnigent.runner.native import orchestration
 from omnigent.runner.native.interrupt import NativeInterruptRunner
 
 
@@ -108,6 +112,29 @@ def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any
     }
     kwargs.update(overrides)
     return NativeInterruptRunner(**kwargs), captured
+
+
+@pytest.fixture
+async def register_parked_forwarder() -> AsyncIterator[Callable[[str], asyncio.Task[None]]]:
+    """Register a never-finishing forwarder task for a session; cancel any survivor on teardown."""
+    registered: list[tuple[str, asyncio.Task[None]]] = []
+
+    def _register(session_id: str) -> asyncio.Task[None]:
+        async def _parked() -> None:
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(_parked(), name=f"forwarder-{session_id}")
+        orchestration._register_auto_forwarder_task(session_id, task)
+        registered.append((session_id, task))
+        return task
+
+    yield _register
+    for session_id, task in registered:
+        if orchestration._AUTO_FORWARDER_TASKS.get(session_id) is task:
+            del orchestration._AUTO_FORWARDER_TASKS[session_id]
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
 
 def test_native_cancel_capability_follows_stop_registry() -> None:
@@ -425,8 +452,9 @@ async def test_uniform_stop_kills_tears_down_and_goes_idle(
 @pytest.mark.asyncio
 async def test_uniform_stop_kill_failure_returns_503_without_idle(
     monkeypatch: pytest.MonkeyPatch,
+    register_parked_forwarder: Callable[[str], asyncio.Task[None]],
 ) -> None:
-    """A failed kill returns 503 and does NOT publish idle (no lie to the UI)."""
+    """A failed kill returns 503 without idle (no lie to the UI) and keeps the forwarder."""
     import json
 
     import omnigent.harnesses.hermes_native.bridge as hermes_bridge
@@ -438,11 +466,15 @@ async def test_uniform_stop_kill_failure_returns_503_without_idle(
     monkeypatch.setattr(hermes_bridge, "kill_session", _boom)
 
     runner, captured = _make_runner()
+    forwarder = register_parked_forwarder("conv_h")
     resp = await runner.stop("hermes-native", "conv_h")
 
     assert resp is not None and resp.status_code == 503
     assert json.loads(bytes(resp.body))["error"] == "hermes_native_stop_failed"
     assert [e for _, e in captured["published"] if e.get("status") == "idle"] == []
+    # The pane may still be running, so its forwarder must keep mirroring.
+    assert not forwarder.done()
+    assert orchestration._AUTO_FORWARDER_TASKS["conv_h"] is forwarder
 
 
 @pytest.mark.asyncio
@@ -477,8 +509,9 @@ async def test_codex_interrupt_noop_when_no_bridge_state() -> None:
 @pytest.mark.asyncio
 async def test_claude_stop_is_idempotent_without_advertised_tmux(
     monkeypatch: pytest.MonkeyPatch,
+    register_parked_forwarder: Callable[[str], asyncio.Task[None]],
 ) -> None:
-    """An already-absent Claude pane still completes stop teardown."""
+    """An already-absent Claude pane still completes stop teardown, forwarder included."""
     import omnigent.harnesses.claude_native.bridge as claude_bridge
     from omnigent.runner.native import interrupt as interrupt_mod
 
@@ -495,17 +528,22 @@ async def test_claude_stop_is_idempotent_without_advertised_tmux(
     monkeypatch.setattr(claude_bridge, "kill_session", _absent)
 
     runner, captured = _make_runner()
+    forwarder = register_parked_forwarder("conv_cn")
     resp = await runner.stop("claude-native", "conv_cn")
 
     assert isinstance(resp, Response) and resp.status_code == 204
     assert captured["wakes"] == [("conv_cn", "cancelled", None)]
+    assert forwarder.cancelled()
+    assert "conv_cn" not in orchestration._AUTO_FORWARDER_TASKS
 
 
 @pytest.mark.asyncio
 async def test_claude_stop_kill_failure_returns_503_without_idle(
     monkeypatch: pytest.MonkeyPatch,
+    register_parked_forwarder: Callable[[str], asyncio.Task[None]],
 ) -> None:
-    """A Claude kill ``RuntimeError`` is 503; only ``TmuxSessionNotAdvertised`` is 204."""
+    """A Claude kill ``RuntimeError`` is 503 and keeps the forwarder; only
+    ``TmuxSessionNotAdvertised`` is 204."""
     import json
 
     import omnigent.harnesses.claude_native.bridge as claude_bridge
@@ -524,12 +562,16 @@ async def test_claude_stop_kill_failure_returns_503_without_idle(
     monkeypatch.setattr(claude_bridge, "kill_session", _boom)
 
     runner, captured = _make_runner()
+    forwarder = register_parked_forwarder("conv_cn")
     resp = await runner.stop("claude-native", "conv_cn")
 
     assert resp is not None and resp.status_code == 503
     assert json.loads(bytes(resp.body))["error"] == "claude_native_stop_failed"
     assert captured["wakes"] == []
     assert [e for _, e in captured["published"] if e.get("status") == "idle"] == []
+    # The pane may still be running, so its forwarder must keep mirroring.
+    assert not forwarder.done()
+    assert orchestration._AUTO_FORWARDER_TASKS["conv_cn"] is forwarder
 
 
 @pytest.mark.asyncio
@@ -560,3 +602,41 @@ async def test_claude_interrupt_resolves_bridge_id_and_injects(
     # No optimistic 'cancelled': the outcome is unknown until an edge lands.
     assert captured["wakes"] == []
     assert runner.take_pending_interrupt("conv_cl")[0] is True
+
+
+@pytest.mark.parametrize("agent_key", ["claude", *interrupt_mod._UNIFORM_STOP])
+@pytest.mark.asyncio
+async def test_stop_cancels_registered_transcript_forwarder(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_key: str,
+    register_parked_forwarder: Callable[[str], asyncio.Task[None]],
+) -> None:
+    """Every stop handler releases the session's forwarder task, not just the uniform ones."""
+    import importlib
+
+    session_id = f"conv_stop_{agent_key}"
+    if agent_key == "claude":
+        import omnigent.harnesses.claude_native.bridge as claude_bridge
+
+        async def _fake_bridge_id(*, server_client: Any, session_id: str) -> str:
+            del server_client
+            return session_id
+
+        monkeypatch.setattr(interrupt_mod, "_claude_native_bridge_id_for_session", _fake_bridge_id)
+        monkeypatch.setattr(claude_bridge, "bridge_dir_for_bridge_id", lambda bridge_id: bridge_id)
+        monkeypatch.setattr(claude_bridge, "kill_session", lambda bridge_dir, *, timeout_s: None)
+    else:
+        module = importlib.import_module(interrupt_mod._UNIFORM_STOP[agent_key].module)
+        monkeypatch.setattr(module, "bridge_dir_for_session_id", lambda conv: conv)
+        monkeypatch.setattr(module, "kill_session", lambda bridge_dir, *, timeout_s: None)
+
+    task = register_parked_forwarder(session_id)
+    runner, _ = _make_runner()
+    resp = await runner.stop(f"{agent_key}-native", session_id)
+
+    assert isinstance(resp, Response) and resp.status_code == 204
+    assert task.cancelled(), (
+        f"{agent_key}-native stop returned 204 but left forwarder task "
+        f"{task.get_name()} running; it would keep polling until the runner exits"
+    )
+    assert session_id not in orchestration._AUTO_FORWARDER_TASKS

@@ -683,6 +683,7 @@ class NativeInterruptRunner:
                 },
             )
         await self._teardown_session_terminals(conv_id)
+        await _cancel_auto_forwarder_task(conv_id)
         self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
         # The kill is confirmed, so this ``cancelled`` is truthful and settles
         # any interrupt still waiting on its outcome.
