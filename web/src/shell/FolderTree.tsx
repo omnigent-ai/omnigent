@@ -1,6 +1,13 @@
-import { ChevronRightIcon, FolderIcon, FolderOpenIcon } from "lucide-react";
+import { ChevronRightIcon, FolderIcon, FolderOpenIcon, UploadIcon } from "lucide-react";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { RefObject } from "react";
+import {
+  droppedUploadFiles,
+  resolveUploadTarget,
+  useWorkspaceUpload,
+  WorkspaceUploadRootIndicator,
+} from "./WorkspaceUploads";
+import { useTreeUploadDrop } from "./useTreeUploadDrop";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   type DirectoryResult,
@@ -738,6 +745,38 @@ function FolderTreeInner({
     getItemKey: (index) => flatRows[index]?.key ?? index,
   });
 
+  const upload = useWorkspaceUpload();
+  const setTreeDirectory = upload?.setTreeDirectory;
+  useEffect(() => {
+    setTreeDirectory?.(browseLocation);
+    return () => setTreeDirectory?.(null);
+  }, [setTreeDirectory, browseLocation]);
+  const { active: dropActive, hover: dropHover } = useTreeUploadDrop(scrollElementRef, {
+    enabled:
+      !!upload?.enabled && !!visibleTree?.length && !searchQuery.trim() && !isLoading && !isError,
+    directory: browseLocation,
+    onFiles: (droppedFiles, event) =>
+      upload?.enqueue(
+        droppedUploadFiles(event, droppedFiles),
+        resolveUploadTarget(event, browseLocation),
+      ),
+    onExpand: togglePath,
+  });
+  const dropRoot = scrollElementRef.current?.closest<HTMLElement>("[data-upload-drop-root]");
+  const dropFeedback = (
+    <>
+      <span className="sr-only" role="status" aria-live="polite">
+        {dropActive && dropHover ? `Upload to ${dropHover.directory || "workspace root"}` : ""}
+      </span>
+      {dropActive && dropHover && dropRoot && upload && !dropHover.folderRow && (
+        <WorkspaceUploadRootIndicator
+          container={dropRoot}
+          destination={dropHover.directory || upload.destination}
+        />
+      )}
+    </>
+  );
+
   // Once a revealed directory's row exists in the flat tree (its ancestors'
   // lazy listings have landed), smooth-scroll it into view and start the
   // highlight flash — exactly once. Re-runs as `flatRows` changes so it can
@@ -901,6 +940,7 @@ function FolderTreeInner({
                   dirtyDirMap={dirtyDirMap}
                   onNavigateDir={onNavigateDir}
                   highlighted={row.kind === "node" && row.key === revealedPath}
+                  dropHighlighted={dropHover?.folderRow?.dataset.dropDir === row.key}
                 />
               )}
             </div>
@@ -920,6 +960,7 @@ function FolderTreeInner({
           {spacer}
         </div>
       )}
+      {dropFeedback}
     </TooltipProvider>
   );
 }
@@ -976,6 +1017,7 @@ function FileRowItem({
     <li className="list-none">
       <div
         onContextMenu={reveal.onContextMenu}
+        data-drop-dir={path.split("/").slice(0, -1).join("/")}
         className={cn(
           "group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-0.5 pr-1",
           isDeleted ? "opacity-50" : "hover:bg-muted",
@@ -1106,6 +1148,7 @@ function SearchDirRow({
     <li className="list-none">
       <div
         onContextMenu={reveal.onContextMenu}
+        data-drop-dir={file.path}
         className="group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-0.5 pr-1 pl-2 hover:bg-muted"
       >
         <button
@@ -1184,6 +1227,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
   dirtyDirMap,
   onNavigateDir,
   highlighted = false,
+  dropHighlighted = false,
 }: {
   node: TreeNode;
   depth: number;
@@ -1197,6 +1241,7 @@ const TreeNodeRow = memo(function TreeNodeRow({
   onNavigateDir?: (relativePath: string) => void;
   /** Briefly flash this row — used when a folder is revealed from search. */
   highlighted?: boolean;
+  dropHighlighted?: boolean;
 }) {
   const reveal = useRevealMenu(node.type === "file" ? null : node.path, true);
   if (node.type === "file") {
@@ -1226,8 +1271,12 @@ const TreeNodeRow = memo(function TreeNodeRow({
     // toggle rather than nesting one button inside another.
     <div
       onContextMenu={reveal.onContextMenu}
+      data-drop-dir={node.path}
+      data-drop-folder=""
+      data-upload-hover={dropHighlighted ? "" : undefined}
       className={cn(
-        "group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-0.5 pr-1 hover:bg-muted",
+        "group relative flex w-full min-w-0 items-center gap-1.5 rounded-md py-0.5 pr-1",
+        dropHighlighted ? "bg-info/10" : "hover:bg-muted",
         // Reveal flash: reuse the chat nav-jump ring pulse so a folder opened
         // from search catches the eye briefly, then settles.
         highlighted && "animate-user-msg-flash",
@@ -1243,8 +1292,16 @@ const TreeNodeRow = memo(function TreeNodeRow({
         aria-expanded={open}
       >
         <span className="relative flex size-3.5 shrink-0 items-center justify-center">
-          <span className="flex transition-opacity group-hover/folder:opacity-0 group-focus-visible/folder:opacity-0">
-            {open ? (
+          <span
+            className={cn(
+              "flex transition-opacity",
+              !dropHighlighted &&
+                "group-hover/folder:opacity-0 group-focus-visible/folder:opacity-0",
+            )}
+          >
+            {dropHighlighted ? (
+              <UploadIcon className="size-3.5 text-foreground" />
+            ) : open ? (
               <FolderOpenIcon className="size-3.5 text-muted-foreground" />
             ) : (
               <FolderIcon className="size-3.5 text-muted-foreground" />
@@ -1252,12 +1309,22 @@ const TreeNodeRow = memo(function TreeNodeRow({
           </span>
           <ChevronRightIcon
             className={cn(
-              "absolute size-3.5 text-muted-foreground opacity-0 transition-[transform,opacity] group-hover/folder:opacity-100 group-focus-visible/folder:opacity-100",
+              "absolute size-3.5 text-muted-foreground opacity-0 transition-[transform,opacity]",
+              !dropHighlighted &&
+                "group-hover/folder:opacity-100 group-focus-visible/folder:opacity-100",
               open && "rotate-90",
             )}
           />
         </span>
-        <span className={cn("min-w-0 flex-1 truncate text-ui", dirDotClass)}>{node.name}/</span>
+        <span
+          className={cn(
+            "min-w-0 flex-1 truncate text-ui",
+            dirDotClass,
+            dropHighlighted && "text-foreground",
+          )}
+        >
+          {node.name}/
+        </span>
         {dirStatus && (
           <span
             className={cn("flex shrink-0 items-center justify-center", ROW_STATUS_SLOT_CLASS)}

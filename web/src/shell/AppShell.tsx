@@ -119,6 +119,7 @@ import {
   type FileNavigationGuard,
 } from "./FileViewerContext";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
+import { UploadWindowGuard } from "@/components/UploadWindowGuard";
 import type { ChangedSort } from "./FlatFileList";
 import { PullRequestPanel } from "./PullRequestPanel";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
@@ -2323,6 +2324,7 @@ export function AppShell() {
 
   return (
     <FileViewerContext.Provider value={fileViewerContextValue}>
+      <UploadWindowGuard />
       <TerminalFirstContextProvider value={terminalFirstContextValue}>
         <ForkDialogContextProvider value={forkDialogContextValue}>
           {/* `app-shell` paints the near-white brand gradient canvas (see

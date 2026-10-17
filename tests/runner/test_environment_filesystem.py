@@ -2864,3 +2864,49 @@ async def test_default_read_still_follows_a_symlink_into_a_read_grant(tmp_path: 
             await fs.read("escape/note.txt")
     finally:
         os_env.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("view", ["filesystem", "search", "changes"])
+async def test_upload_staging_hidden(
+    client: httpx.AsyncClient, workspace: Path, app: FastAPI, view: str
+) -> None:
+    """Staging never appears in listings, index search or changed files."""
+    hidden = "model.3mf.omnigent-upload-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.part"
+    (workspace / hidden).write_bytes(b"partial")
+    (workspace / "model.3mf").write_bytes(b"visible")
+    app.state.filesystem_registry.record_change(hidden, "write", "conv_test")
+    app.state.filesystem_registry.record_change("model.3mf", "write", "conv_test")
+    directory = "folder.omnigent-upload-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.part"
+    (workspace / directory).mkdir()
+    (workspace / directory / "visible.txt").write_bytes(b"visible")
+    (workspace / directory / hidden).write_bytes(b"partial")
+    for path in (directory + "/visible.txt", directory + "/" + hidden):
+        app.state.filesystem_registry.record_change(path, "write", "conv_test")
+    visible = ["notes.part", "x.omnigent-upload-notanid.part", ".x.omnigent-upload-notanid.part"]
+    for name in visible:
+        (workspace / name).write_bytes(b"visible")
+        app.state.filesystem_registry.record_change(name, "write", "conv_test")
+    base = f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+    response = await client.get(base + "/" + view, params={"limit": 500, "q": "."})
+    assert response.status_code == 200
+    names = {e["name"] for e in response.json()["data"]}
+    assert "model.3mf" in names
+    assert hidden not in names
+    assert set(visible) <= names
+    paths = {e["path"] for e in response.json()["data"]}
+    assert directory + "/" + hidden not in paths
+    if view == "filesystem":
+        assert directory in paths
+        nested = (await client.get(base + "/filesystem/" + directory)).json()
+        assert {e["name"] for e in nested["data"]} == {"visible.txt"}
+    else:
+        assert directory + "/visible.txt" in paths
+    if view == "search":
+        assert directory in paths
+        indexed = search_indexed_paths(
+            workspace,
+            [hidden, directory, directory + "/visible.txt", directory + "/" + hidden],
+            ".",
+        )
+        assert {e.path for e in indexed} == {directory, directory + "/visible.txt"}

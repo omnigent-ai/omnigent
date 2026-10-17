@@ -64,6 +64,7 @@ import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
 import { WorkspaceTabsScroller } from "./WorkspaceTabsScroller";
 import { FilesPanel } from "./FilesPanel";
+import { WorkspaceUploadDropRoot, WorkspaceUploadProvider, UploadsTray } from "./WorkspaceUploads";
 import { FileViewer } from "./FileViewer";
 import { PullRequestPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
@@ -1541,24 +1542,27 @@ function WorkspacePanelImpl({
             <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
           ) : (
             showFilesPanel && (
-              <FilesPanel
-                frameless
-                onFileSelect={openFileViewer}
-                flatView={rightRailTab === "changes"}
-                showHidden={filesPanelShowHidden}
-                onShowHiddenChange={onShowHiddenChange}
-                sort={filesPanelSort}
-                onSortChange={onSortChange}
-              />
+              <WorkspaceUploadDropRoot>
+                <FilesPanel
+                  frameless
+                  onFileSelect={openFileViewer}
+                  flatView={rightRailTab === "changes"}
+                  showHidden={filesPanelShowHidden}
+                  onShowHiddenChange={onShowHiddenChange}
+                  sort={filesPanelSort}
+                  onSortChange={onSortChange}
+                />
+              </WorkspaceUploadDropRoot>
             )
           )}
         </div>
+        <UploadsTray visible={open && !isMobile} />
       </div>
     </aside>
   );
   return (
     <>
-      {rail}
+      <WorkspaceUploadProvider sessionId={conversationId}>{rail}</WorkspaceUploadProvider>
       {/* The rail is `hidden` on phones, so the drawer renders beside it. A
         portal to the body would escape the embed's scoped styles. */}
       {isMobile && (

@@ -42,6 +42,7 @@ import {
 import { type ChangedSort, FlatFileList } from "./FlatFileList";
 import { FolderTree } from "./FolderTree";
 import { useScrollRestore } from "./useScrollRestore";
+import { UploadPicker } from "./WorkspaceUploads";
 
 interface FilesPanelProps {
   onFileSelect: (path: string) => void;
@@ -499,6 +500,7 @@ export function FilesPanel({
           </TooltipProvider>
         )}
         <div className="ml-auto flex items-center gap-[2px]">
+          <UploadPicker directory={locationParam} />
           {!flatView && workingDir && (
             // Its own provider: the header has no TooltipProvider ancestor
             // (each control here brings one), unlike the file rows.
