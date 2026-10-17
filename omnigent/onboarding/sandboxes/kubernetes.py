@@ -209,6 +209,9 @@ _POD_READY_REQUEST_TIMEOUT_S: float = 10.0
 _DELETE_MAX_ATTEMPTS: int = 3
 _DELETE_BACKOFF_S: float = 1.0
 
+_RESUME_DELETE_TIMEOUT_S: float = 120.0
+_RESUME_DELETE_POLL_S: float = 1.0
+
 # Job-level retry budget (lifetime, shared across init AND main containers).
 # Under OnFailure the kubelet restart counter is monotonic for the Pod's whole
 # life, so init-container retries (e.g. transient git clone failures) consume
@@ -1316,11 +1319,15 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
 
     # ── config / clients ────────────────────────────────────
 
-    def _load_clients(self) -> tuple[k8s_client.CoreV1Api, k8s_client.BatchV1Api]:
+    def _load_clients(
+        self, *, retries: int | None = None
+    ) -> tuple[k8s_client.CoreV1Api, k8s_client.BatchV1Api]:
         """
         Return the (lazily built) ``CoreV1Api`` and ``BatchV1Api``, loading
         cluster config into an isolated :class:`~kubernetes.client.Configuration`.
 
+        :param retries: Override transport retries when building a new client;
+            ``None`` keeps the SDK default. Cached clients are unchanged.
         :returns: The cached ``(CoreV1Api, BatchV1Api)`` bound to the isolated config.
         :raises click.ClickException: When neither config source is available.
         """
@@ -1347,6 +1354,8 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                 "ServiceAccount token; out of cluster, set a kubeconfig "
                 f"(KUBECONFIG or {KUBECONFIG_ENV_VAR}). Underlying error: {exc}"
             ) from exc
+        if retries is not None:
+            cfg.retries = retries
         self._api_client = client.ApiClient(cfg)
         self._core = client.CoreV1Api(self._api_client)
         self._batch = client.BatchV1Api(self._api_client)
@@ -2048,10 +2057,65 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
 
         :param sandbox_id: The dormant Job name to recreate.
         :raises click.ClickException: On an API delete failure other than
-            not-found.
+            not-found, or when Job deletion cannot be confirmed in time.
         """
         click.echo(f"▸ Resuming Kubernetes sandbox '{sandbox_id}'")
         self.terminate(sandbox_id)
+        self._wait_for_job_deleted(sandbox_id)
+
+    def _wait_for_job_deleted(self, sandbox_id: str) -> None:
+        """
+        Wait for the old Job to release its name before recreation.
+
+        Foreground deletion can leave a Job visible after DELETE returns.
+        This wait starts after :meth:`terminate`; it is not a total wake budget.
+
+        :param sandbox_id: The Job name to reuse.
+        :raises click.ClickException: On a non-retryable API error or timeout.
+        """
+        _ensure_sdk()
+        from kubernetes.client.rest import ApiException
+        from urllib3.exceptions import HTTPError, InvalidHeader
+        from urllib3.util.retry import Retry
+
+        namespace = self._resolve_namespace()
+        deadline = time.monotonic() + _RESUME_DELETE_TIMEOUT_S
+        last_observation = "no Job read completed"
+        self._close_clients()
+        try:
+            # This loop owns retries, including the API's Retry-After delay.
+            _, batch = self._load_clients(retries=0)
+            while (remaining := deadline - time.monotonic()) > 0:
+                poll_delay = _RESUME_DELETE_POLL_S
+                try:
+                    batch.read_namespaced_job(
+                        sandbox_id,
+                        namespace,
+                        _request_timeout=min(_POD_READY_REQUEST_TIMEOUT_S, remaining),
+                    )
+                    last_observation = "Job still present"
+                except ApiException as exc:
+                    status = exc.status
+                    if status == 404:
+                        return
+                    if status not in (429, 503):
+                        raise click.ClickException(
+                            _format_api_error("check deletion of sandbox job", sandbox_id, exc)
+                        ) from exc
+                    last_observation = f"last check failed: {_api_reason(exc)}"
+                    retry_after = (exc.headers or {}).get("Retry-After")
+                    with contextlib.suppress(InvalidHeader):
+                        poll_delay = max(poll_delay, Retry().parse_retry_after(retry_after or "0"))
+                except HTTPError as exc:
+                    last_observation = f"last check failed: {_api_reason(exc)}"
+                remaining = max(0.0, deadline - time.monotonic())
+                time.sleep(min(poll_delay, remaining))
+            raise click.ClickException(
+                f"Timed out confirming deletion of sandbox job '{sandbox_id}' within "
+                f"{_RESUME_DELETE_TIMEOUT_S:g}s; {last_observation}"
+            )
+        finally:
+            self._close_clients()
 
     def _delete_with_retry(self, kind: str, name: str, delete: Callable[[], object]) -> None:
         """
