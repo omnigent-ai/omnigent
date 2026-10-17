@@ -2,8 +2,8 @@
 
 Decides which pull request a request is about (the selected or first tracked
 PR, else the PR of the workspace's branch) and which git provider serves it,
-and keeps the session's tracked PRs and their cached titles. Every step that
-talks to a forge goes through that provider's
+and keeps the session's tracked PRs, open ones first, with their cached titles
+and states. Every step that talks to a forge goes through that provider's
 :class:`~omnigent.runner.git_providers.PullRequestFacet`.
 """
 
@@ -33,6 +33,7 @@ from omnigent.runner.git_providers import (
     PR_DIFF_OBJECT,
     ProviderCapabilities,
     PullRequestFacet,
+    PullRequestStateLookup,
     local_git,
     unsupported_remote_info,
 )
@@ -261,6 +262,12 @@ def _pr_title(pr: object) -> str | None:
     return title.strip() or None
 
 
+def _pr_state(pr: object) -> str | None:
+    """Return the upper-cased state of an info payload's ``pr``, or ``None``."""
+    state = pr.get("state") if isinstance(pr, dict) else None
+    return (state.upper() or None) if isinstance(state, str) else None
+
+
 def _title_facets(root: str, entries: list[SessionPullRequest]) -> dict[str, PullRequestFacet]:
     """Map each tracked provider whose titles can be looked up now to its facet."""
     facets: dict[str, PullRequestFacet] = {}
@@ -286,6 +293,7 @@ def _session_prs_with_titles(
     facets = _title_facets(root, entries)
     now = time.time()
     titles: dict[str, str | None] = {}
+    states: dict[str, str | None] = {}
     timed_out_urls: set[str] = set()
     pending: list[SessionPullRequest] = []
     for entry in entries:
@@ -301,6 +309,9 @@ def _session_prs_with_titles(
             title = _pr_title(info.get("pr"))
             if stale or (title is not None and title != entry.title):
                 titles[entry.url] = title
+            # The selected PR's state arrives with its details on every poll.
+            if (state := _pr_state(info.get("pr"))) and state != entry.state:
+                states[entry.url] = state
         elif stale:
             pending.append(entry)
 
@@ -308,28 +319,36 @@ def _session_prs_with_titles(
     pending.sort(key=lambda entry: entry.title_checked_at)
     deadline = min(request_deadline, time.monotonic() + _PR_TITLE_LOOKUP_SECONDS)
 
-    def fetch_title(entry: SessionPullRequest) -> tuple[str, str | None, bool] | None:
+    def fetch_title(entry: SessionPullRequest) -> tuple[str, str | None, str | None, bool] | None:
         if time.monotonic() >= deadline:
             return None
+        facet = facets[entry.provider]
         try:
-            title, timed_out = facets[entry.provider].pr_title(root, entry, deadline)
+            if isinstance(facet, PullRequestStateLookup):
+                title, state, timed_out = facet.pr_title_and_state(root, entry, deadline)
+            else:
+                title, timed_out = facet.pr_title(root, entry, deadline)
+                state = None
         except Exception:  # noqa: BLE001 — keep the existing cache when an optional lookup fails
             _logger.warning("Git provider %s failed in pr_title", entry.provider, exc_info=True)
             return None
-        return entry.url, title, timed_out
+        return entry.url, title, state, timed_out
 
     may_cache = time.monotonic() < request_deadline
     if pending and time.monotonic() < deadline:
         with ThreadPoolExecutor(max_workers=min(4, len(pending))) as executor:
             for result in executor.map(fetch_title, pending):
                 if result is not None:
-                    url, title, timed_out = result
+                    url, title, state, timed_out = result
                     titles[url] = title
+                    states[url] = state
                     if timed_out:
                         timed_out_urls.add(url)
-    if titles and may_cache:
+    if (titles or states) and may_cache:
         try:
-            registry.update_titles(titles, timestamp=now, timed_out_urls=timed_out_urls)
+            registry.update_titles(
+                titles, timestamp=now, timed_out_urls=timed_out_urls, states=states
+            )
         except (OSError, ValueError, FileLockTimeout):
             _logger.debug("Could not cache session PR titles", exc_info=True)
 
@@ -337,6 +356,7 @@ def _session_prs_with_titles(
         {
             **entry.model_dump(),
             "title": titles.get(entry.url) or entry.title,
+            "state": states.get(entry.url) or entry.state,
             "provider_display": provider_display(entry.provider),
         }
         for entry in entries
@@ -362,8 +382,10 @@ def _associate_discovered_pr(
                     if facet is not None:
                         facet.on_inferred_pr(root, inferred)
                     title = _pr_title(pr)
-                    if title is not None:
-                        registry.update_titles({inferred.url: title})
+                    registry.update_titles(
+                        {inferred.url: title} if title is not None else {},
+                        states={inferred.url: _pr_state(pr)},
+                    )
                 except Exception:  # noqa: BLE001 — metadata cannot undo a valid association
                     _logger.warning("Could not cache discovered PR metadata", exc_info=True)
             else:

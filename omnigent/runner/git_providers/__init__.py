@@ -333,6 +333,26 @@ class PullRequestFacet(Protocol):
         ...
 
 
+@runtime_checkable
+class PullRequestStateLookup(Protocol):
+    """An optional :class:`PullRequestFacet` method that reads a PR's title and state at once.
+
+    When a facet has it, the orchestrator calls it instead of ``pr_title`` and
+    caches the state, so the session's open PRs are listed and selected first.
+    """
+
+    def pr_title_and_state(
+        self, root: str, reference: PullRequestRef, deadline: float
+    ) -> tuple[str | None, str | None, bool]:
+        """Look up one PR's title and state, giving up at ``deadline``. Never raises.
+
+        :returns: ``(title, state, timed_out)`` as :meth:`PullRequestFacet.pr_title`,
+            where ``state`` is ``"OPEN"``, ``"MERGED"``, ``"CLOSED"``, or ``None``
+            when the lookup failed.
+        """
+        ...
+
+
 def unsupported_remote_info(host: str) -> dict[str, Any]:
     """Return the info payload for a workspace whose git remote no provider recognizes.
 
