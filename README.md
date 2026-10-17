@@ -213,14 +213,16 @@ release) pointing here. To update:
 
 ```bash
 omni upgrade            # detects how you installed, drains & stops the local
-                        # server, then runs the matching upgrade command
+                        # server, runs the matching upgrade command, then
+                        # restarts the server + host on the new version
 omni upgrade --check    # just report whether a newer release is available
 ```
 
 `omni upgrade` waits for in-flight agent sessions to finish before stopping the
-local server (pass `--force` to stop them immediately); the next `omni` command
-brings the server back up on the new version. Source checkouts update with
-`git pull` instead. Silence the notice with `OMNIGENT_NO_UPDATE_CHECK=1`.
+local server (pass `--force` to stop them immediately), then brings the server
+and host daemon it stopped back up on the new version (pass `--no-restart` to
+leave them down). Source checkouts update with `git pull` instead. Silence the
+notice with `OMNIGENT_NO_UPDATE_CHECK=1`.
 
 The check queries your configured package index — honoring `UV_INDEX_URL` /
 `PIP_INDEX_URL` and your `uv.toml` / `pip.conf` (default PyPI), so private
