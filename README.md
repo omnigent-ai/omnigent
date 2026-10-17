@@ -305,9 +305,9 @@ Using OpenClaw? See the [OpenClaw integration guide](docs/openclaw.md) to import
 its coding agents or drive a live OpenClaw Gateway session over ACP.
 
 <details>
-<summary>Grok Build and Devin</summary>
+<summary>Grok Build, Devin, and Mirror</summary>
 
-Two more coding agents are built in but have no `omnigent <name>` launcher of
+Three more coding agents are built in but have no `omnigent <name>` launcher of
 their own, because each ships a CLI that holds its own login. Install the vendor
 CLI, log in with it, then name the harness:
 
@@ -321,13 +321,23 @@ omnigent run --harness grok           # 'grok-build' also works
 curl -fsSL https://cli.devin.ai/install.sh | bash
 devin auth login
 omnigent run --harness devin
+
+# Mirror (Reflection AI); needs a build that includes `mirror acp`
+curl -fsSL https://raw.githubusercontent.com/reflection-oss/mirror-beta/main/install.sh | bash
+mirror                                # first run: sign in, accept the notices
+omnigent run --harness mirror
 ```
 
-Both speak the [Agent Client Protocol](https://agentclientprotocol.com) over
-stdio, and Omnigent stores no credential for either — each CLI reads back the
-login it wrote to disk. That also means `--model` is refused rather than
-silently dropped: both run their account-default model. To pin one, configure an
-`acp:` agent whose command passes the vendor's own model flag.
+All three speak the [Agent Client Protocol](https://agentclientprotocol.com)
+over stdio, and Omnigent stores no credential for any of them — each CLI reads
+back the login it wrote to disk. That also means `--model` is refused rather
+than silently dropped: each runs its account-default model. To pin one,
+configure an `acp:` agent whose command passes the vendor's own model flag.
+
+Mirror records the usage and folder notices per project directory on an
+interactive run, so start `mirror` once inside each workspace you want Omnigent
+to drive before using the harness there. Its ACP server configures MCP on its
+own and ignores Omnigent's MCP server.
 
 Use the vendor login rather than an API key. A builtin ACP row has no
 `env_passthrough` of its own, and `XAI_API_KEY` is not in the host-to-runner

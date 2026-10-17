@@ -1752,6 +1752,7 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
         "Devin",
         "Grok Build",
         "Jcode",
+        "Mirror",
         "Copilot",
         "Kiro",
         "Kimi Code",
@@ -1923,7 +1924,7 @@ def test_setup_imports_openclaw_agents(isolated_config) -> None:
 
     # 16 is the OpenClaw import row: hiding Devin's builtin ACP row moved every
     # row after it one lower (see the dispatch table's note).
-    stdin = "\n".join(["16", "", "", "q"]) + "\n"
+    stdin = "\n".join(["17", "", "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -1945,7 +1946,7 @@ def test_setup_imports_openclaw_agents_from_user_selected_path(isolated_config) 
         encoding="utf-8",
     )
 
-    stdin = "\n".join(["16", "", str(selected), "", "q"]) + "\n"
+    stdin = "\n".join(["17", "", str(selected), "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -1962,7 +1963,7 @@ def test_setup_rejects_user_selected_unrelated_file(isolated_config) -> None:
     selected = isolated_config / "package.json"
     selected.write_text('{"name": "unrelated"}', encoding="utf-8")
 
-    stdin = "\n".join(["16", "", str(selected), "2", "q"]) + "\n"
+    stdin = "\n".join(["17", "", str(selected), "2", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -2154,16 +2155,17 @@ def test_overview_truncates_long_status_for_narrow_terminal(isolated_config, mon
         ("8", "_manage_qwen_harness"),
         ("9", "_manage_goose_harness"),
         # 10 is Devin's NATIVE row (devin-native), in the slot its builtin ACP
-        # row used to hold. The ACP path is deprecated (not offered), so 11-12
-        # are the remaining builtin ACP CLI rows (Grok Build, Jcode; sorted by
-        # id); every row after them sits one lower.
+        # row used to hold. The ACP path is deprecated (not offered), so 11-13
+        # are the remaining builtin ACP CLI rows (Grok Build, Jcode, Mirror;
+        # sorted by id); every row after them sits one lower.
         ("10", "_manage_devin_harness"),
         ("11", "_show_acp_cli_harness"),
         ("12", "_show_acp_cli_harness"),
-        ("13", "_manage_copilot_harness"),
-        ("14", "_manage_kiro_harness"),
-        ("15", "_manage_kimi_harness"),
-        ("17", "_add_acp_agent"),
+        ("13", "_show_acp_cli_harness"),
+        ("14", "_manage_copilot_harness"),
+        ("15", "_manage_kiro_harness"),
+        ("16", "_manage_kimi_harness"),
+        ("18", "_add_acp_agent"),
     ],
 )
 def test_overview_dispatches_to_correct_manager(
