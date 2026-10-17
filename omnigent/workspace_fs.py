@@ -47,6 +47,7 @@ from omnigent.runner import pr_resource
 from omnigent.runner.environment_filesystem import (
     _SEARCH_SCAN_BUDGET,
     _glob_to_regex,
+    _path_query,
     _validate_path,
     entry_payload,
     index_search,
@@ -297,6 +298,7 @@ class WorkspaceReader:
         self,
         query: str,
         *,
+        path: str = "",
         include: str | None = None,
         exclude: str | None = None,
         limit: int = 500,
@@ -304,7 +306,13 @@ class WorkspaceReader:
         """Search files by substring + glob filters, like the runner.
 
         :param query: Case-insensitive substring matched against name and
-            relative path.  Whitespace-only yields an empty result.
+            relative path.  A path-shaped query (containing ``/``) is also
+            matched, after :func:`_path_query` normalization, against the
+            entry's absolute path — mirroring the runner's matcher.
+            Whitespace-only yields an empty result.
+        :param path: Directory to search under, relative to the workspace
+            root (``""`` = whole workspace). Entry paths in the result are
+            relative to it, matching the runner's scoped search.
         :param include: Comma-separated include globs (VSCode/Cursor
             subset), e.g. ``"*.ts,src/**"``.
         :param exclude: Comma-separated exclude globs.
@@ -314,10 +322,13 @@ class WorkspaceReader:
             ones from the latest ``git status`` when one has run; a budgeted
             walk always runs too so ignored files stay findable, and
             ``truncated`` says if it ran out.
+        :raises WorkspaceReaderError: 400 when *path* escapes the root.
         """
         q = query.strip().lower()
         if not q:
             return {"object": "list", "data": [], "has_more": False}
+        qp = _path_query(q)
+        start = self._resolve(path)
 
         include_patterns = split_glob_list(include)
         exclude_patterns = split_glob_list(exclude)
@@ -330,8 +341,8 @@ class WorkspaceReader:
         # latest ``git status`` adds untracked files past the budget.
         indexed = index_search(
             self._registry,
-            self._root,
-            "",
+            start,
+            _validate_path(path) if path else "",
             q,
             include=include_patterns,
             exclude=exclude_patterns,
@@ -347,12 +358,12 @@ class WorkspaceReader:
         truncated = False
         stop = False
 
-        # os.walk is handed the absolute root, so an entry's path relative to
+        # os.walk is handed the absolute search start, so an entry's path relative to
         # it is a slice of dirpath -- no per-entry relpath(), whose abspath()
         # work used to dominate the walk's runtime.
         # rstrip: a bare root ("/", "C:\\") already ends in the separator the
         # slice skips.
-        cut = len(str(self._root).rstrip(os.sep)) + 1
+        cut = len(str(start).rstrip(os.sep)) + 1
 
         def rel(dirpath: str, name: str) -> str:
             # Entries always use '/', like the git-index paths they merge with.
@@ -361,6 +372,16 @@ class WorkspaceReader:
                 rel_dir = rel_dir.replace(os.sep, "/")
             return f"{rel_dir}/{name}" if rel_dir else name
 
+        def hit(name: str, p: str, full: str) -> bool:
+            if q in name.lower() or q in p.lower():
+                return True
+            if qp is None:
+                return False
+            # Path-shaped queries also match the entry's absolute path, so a
+            # pasted absolute path or a subpath crossing the search root still
+            # finds it — same rule as the runner's sandboxed matcher.
+            return qp in p.lower() or qp in os.path.abspath(full).lower()
+
         def match(dirpath: str, name: str, *, is_dir: bool) -> None:
             # A directory carries no byte size; a file stats for size + mtime.
             p = rel(dirpath, name)
@@ -368,7 +389,7 @@ class WorkspaceReader:
                 return
             if inc and not any(r.match(p) for r in inc):
                 return
-            if q not in name.lower() and q not in p.lower():
+            if not hit(name, p, os.path.join(dirpath, name)):
                 return
             try:
                 st = (Path(dirpath) / name).stat()
@@ -445,7 +466,7 @@ class WorkspaceReader:
         # under an earlier-sorted real dir would still swallow the whole budget
         # before the walk reached a later top-level dir. Pass 2 drains the
         # deferred roots only if budget remains. Mirrors the runner's walk.
-        scan(str(self._root), True)
+        scan(str(start), True)
         while deferred and not stop:
             scan(deferred.popleft(), False)
         # When the walk stops early it is always because scan() tripped the
