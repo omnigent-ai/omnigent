@@ -2031,6 +2031,50 @@ def test_scheduled_wake_not_marked_for_post_compaction_output(tmp_path: Path) ->
     assert result.current_response_id == "resp_prev_turn"
 
 
+@pytest.mark.parametrize("turn", ["settled", "stopped", "active"])
+def test_subagent_handback_is_not_a_scheduled_wake(tmp_path: Path, turn: str) -> None:
+    """
+    A subagent hand-back after the parent's turn ended opens its own turn.
+
+    That holds once the turn settled and in the gap between its ``Stop`` and
+    the settle. The parent's reply must not get the scheduled-wake marker; a
+    hand-back that lands mid-turn stays in the active turn.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        _transcript_line(
+            {
+                "type": "user",
+                "uuid": "handback",
+                "isMeta": True,
+                "origin": {"kind": "peer", "handback": True, "senderTaskId": "agent-1"},
+                "message": {"role": "user", "content": _TEAMMATE_MESSAGE},
+            }
+        )
+        + _transcript_line(_assistant_text_entry("reply", "the subagent finished")),
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path,
+        0,
+        start_line=0,
+        agent_name="claude-native-ui",
+        current_response_id="resp_prev_turn",
+        settled_response_id="resp_prev_turn" if turn == "settled" else None,
+        stopped_response_id="resp_prev_turn" if turn == "stopped" else None,
+    )
+
+    handback, reply = result.items
+    assert handback.subagent_return_id == "agent-1"
+    assert handback.opens_turn is (turn != "active")
+    assert reply.data["content"][0]["text"] == "the subagent finished"
+    if turn != "active":
+        assert handback.response_id == reply.response_id != "resp_prev_turn"
+    else:
+        assert reply.response_id == "resp_prev_turn"
+
+
 def test_scheduled_wake_skips_tool_results_and_real_prompts(tmp_path: Path) -> None:
     """
     Only assistant output triggers the wake; other entries behave as before.

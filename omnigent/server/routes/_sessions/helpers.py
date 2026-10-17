@@ -6224,6 +6224,9 @@ async def _launch_runner_on_host_locked(
                 inference_config=(
                     conv.inference_snapshot["runtime_config"] if conv.inference_snapshot else None
                 ),
+                # After /clear the previous runner serves the replacement
+                # session; the row is unbound, so nothing is superseded.
+                superseded_runner_id=superseded_runner_id or "",
             )
         )
         try:

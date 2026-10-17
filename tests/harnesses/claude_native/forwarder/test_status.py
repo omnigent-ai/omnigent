@@ -432,6 +432,161 @@ def test_stop_failure_detail_uses_transcript_api_error_without_warning(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status_failure", [False, True])
+async def test_background_shell_launch_carries_the_count_through_an_interrupt(
+    tmp_path: Path, status_failure: bool
+) -> None:
+    """
+    A shell launched in a turn later cut off by Esc (no ``Stop``) is still counted.
+
+    The launch republishes the shells the previous ``Stop`` named plus the new
+    one, since the server replaces its cached detail with each positive count.
+    A failed count post holds the batch, so the next poll retries it once.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    earlier = [
+        {"type": "user", "uuid": "earlier", "message": {"role": "user", "content": "first"}},
+        {"type": "assistant", "uuid": "reply", "message": {"role": "assistant", "content": "ok"}},
+    ]
+    records = [
+        {"type": "user", "uuid": "prompt", "message": {"role": "user", "content": "go"}},
+        {
+            "type": "assistant",
+            "uuid": "launch",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_bg",
+                        "name": "Bash",
+                        "input": {
+                            "command": "sleep 40",
+                            "description": "Wait a bit",
+                            "run_in_background": True,
+                        },
+                    }
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "launched",
+            "toolUseResult": {"backgroundTaskId": "bhr10wb5b"},
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_bg",
+                        "content": "Command running in background with ID: bhr10wb5b.",
+                    }
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "interrupt",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "[Request interrupted by user for tool use]"}
+                ],
+            },
+        },
+    ]
+    transcript_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in earlier), encoding="utf-8"
+    )
+    earlier_shell = {"id": "a1", "type": "shell", "status": "running", "command": "make watch"}
+    for event in (
+        {"hook_event_name": "SessionStart", "transcript_path": str(transcript_path)},
+        {"hook_event_name": "Stop", "background_tasks": [earlier_shell]},
+    ):
+        record_hook_event(bridge_dir, {**event, "session_id": "claude-session"})
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript_path,
+        line_cursor=0,
+        byte_offset=0,
+        cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(transcript_path, 0),
+    )
+    statuses: list[dict[str, Any]] = []
+    item_ids: list[str] = []
+    fail_next_status = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal fail_next_status
+        payload = json.loads(request.content.decode("utf-8"))
+        if payload["type"] == "external_session_status":
+            if fail_next_status and "background_task_count" in payload["data"]:
+                fail_next_status = False
+                return httpx.Response(503)
+            statuses.append(payload["data"])
+        else:
+            item_ids.append(payload["data"]["source_id"])
+        return httpx.Response(202, json={})
+
+    dedupe = forwarder._ForwardDedupeState()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as client:
+
+        async def forward_items() -> None:
+            nonlocal state
+            state = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_abc",
+                bridge_dir=bridge_dir,
+                agent_name="claude-native-ui",
+                state=state,
+                retry_tracker=forwarder._PostRetryTracker(),
+                dedupe=dedupe,
+            )
+
+        await forward_items()
+        await forwarder._forward_available_status_events(
+            client=client,
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            state=forwarder.HookForwardState(event_cursor=0, byte_offset=0),
+            retry_tracker=forwarder._PostRetryTracker(),
+            dedupe=dedupe,
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+            response_id=state.current_response_id,
+        )
+        with transcript_path.open("a", encoding="utf-8") as handle:
+            handle.writelines(json.dumps(record) + "\n" for record in records)
+        fail_next_status = status_failure
+        for _ in range(2):
+            await forward_items()
+
+    assert [(data["status"], data.get("background_task_count")) for data in statuses] == [
+        ("idle", 1),
+        ("running", None),
+        # The shell left running by the previous turn plus the one just launched.
+        ("running", 2),
+        ("idle", None),
+    ]
+    # Every count names its shells, so a reload cannot show an empty popover.
+    for data in statuses:
+        if data.get("background_task_count"):
+            assert len(data["background_tasks"]) == data["background_task_count"]
+    assert statuses[2]["background_tasks"] == [
+        earlier_shell,
+        {
+            "id": "bhr10wb5b",
+            "type": "shell",
+            "status": "running",
+            "description": "Wait a bit",
+            "command": "sleep 40",
+        },
+    ]
+    assert len(item_ids) == len(set(item_ids)) == 6
+
+
 async def test_forwarder_posts_idle_with_count_when_stop_has_background_tasks(
     tmp_path: Path,
 ) -> None:

@@ -721,6 +721,169 @@ async def test_subagent_idle_observation_preserves_timing_and_deduplication(
             assert len(status_events) == count
 
 
+async def test_subagent_lull_inside_a_tool_call_is_not_idle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child quiet inside an unanswered tool call stays running, even after restart."""
+    now = 1000.0
+    monkeypatch.setattr(
+        forwarder, "time", SimpleNamespace(time=lambda: now, monotonic=time.monotonic)
+    )
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.touch()
+    child_path = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="sleeper",
+        agent_type="general-purpose",
+        description="long sleep",
+        tool_use_id="toolu_sleeper",
+    )
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "sleeper": forwarder.SubagentEntry(
+                subagent_id="sleeper", child_conversation_id="conv_child"
+            )
+        }
+    )
+    status_events: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        if isinstance(body, list):
+            return httpx.Response(202, json=[{"item_id": "item"} for _ in body])
+        status_events.append(body)
+        return httpx.Response(202, json={"queued": False})
+
+    def append(entry_type: str, content: list[dict[str, Any]]) -> None:
+        with child_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "isSidechain": True,
+                        "type": entry_type,
+                        "uuid": f"{entry_type}-{len(status_events)}",
+                        "message": {"role": entry_type, "content": content},
+                    }
+                )
+                + "\n"
+            )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+
+        async def tick() -> None:
+            nonlocal state
+            state = await forwarder._forward_available_subagents(
+                client=client,
+                parent_session_id="conv_parent",
+                bridge_dir=bridge_dir,
+                transcript_path=transcript_path,
+                state=state,
+                agent_name="claude-native-ui",
+                start_retry_tracker=forwarder._PostRetryTracker(),
+                item_retry_tracker=forwarder._PostRetryTracker(),
+                status_retry_tracker=forwarder._PostRetryTracker(),
+                status_capability=forwarder._SubagentStatusCapability(),
+            )
+
+        append(
+            "assistant",
+            [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_sleep",
+                    "name": "Bash",
+                    "input": {"command": "sleep 30"},
+                }
+            ],
+        )
+        await tick()
+        assert status_events == [
+            {"type": "external_session_status", "data": {"status": "running"}}
+        ]
+        now += forwarder._SUBAGENT_IDLE_THRESHOLD_S * 4
+        await tick()
+        state = forwarder._read_subagent_forward_state(bridge_dir)
+        await tick()
+        assert len(status_events) == 1
+
+        append("user", [{"type": "tool_result", "tool_use_id": "toolu_sleep", "content": "done"}])
+        await tick()
+        now += forwarder._SUBAGENT_IDLE_THRESHOLD_S + 0.001
+        await tick()
+        assert status_events[-1] == {"type": "subagent.status", "data": {"idle": True}}
+
+
+async def test_background_subagent_keeps_its_child_across_clear(tmp_path: Path) -> None:
+    """After /clear a running child's continuation file still feeds its original child row."""
+    state = forwarder.SubagentForwardState(
+        subagents={
+            "bg": forwarder.SubagentEntry(
+                subagent_id="bg",
+                child_conversation_id="conv_child",
+                byte_offset=512,
+                last_status="running",
+            ),
+            "done": forwarder.SubagentEntry(
+                subagent_id="done", child_conversation_id="conv_done", last_status="idle"
+            ),
+        }
+    )
+    survivors = forwarder._subagents_surviving_clear(state)
+    assert list(survivors.subagents) == ["bg"]
+    assert survivors.subagents["bg"].byte_offset == 0
+
+    # Claude writes the rest of the child under the replacement transcript.
+    new_transcript = tmp_path / "new-session.jsonl"
+    new_transcript.touch()
+    continuation = new_transcript.parent / new_transcript.stem / "subagents" / "agent-bg.jsonl"
+    continuation.parent.mkdir(parents=True)
+    continuation.write_text(
+        json.dumps(
+            {
+                "isSidechain": True,
+                "type": "assistant",
+                "uuid": "after-clear",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "finished after clear"}],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    posts: list[tuple[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        posts.append((request.url.path, body))
+        if isinstance(body, list):
+            return httpx.Response(202, json=[{"item_id": "item"} for _ in body])
+        return httpx.Response(202, json={"queued": False})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://ap"
+    ) as client:
+        await forwarder._forward_available_subagents(
+            client=client,
+            parent_session_id="conv_new_parent",
+            bridge_dir=tmp_path / "bridge",
+            transcript_path=new_transcript,
+            state=survivors,
+            agent_name="claude-native-ui",
+            start_retry_tracker=forwarder._PostRetryTracker(),
+            item_retry_tracker=forwarder._PostRetryTracker(),
+            status_retry_tracker=forwarder._PostRetryTracker(),
+            status_capability=forwarder._SubagentStatusCapability(),
+        )
+
+    assert {path for path, _ in posts} == {"/v1/sessions/conv_child/events"}
+    assert "finished after clear" in json.dumps(posts)
+
+
 async def test_subagent_idle_unsupported_cache_covers_other_children(tmp_path: Path) -> None:
     """One old-server rejection suppresses other children's idle events, not failures."""
     transcript_path = tmp_path / "session.jsonl"
