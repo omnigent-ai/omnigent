@@ -7,6 +7,10 @@ selection and its refresh behaviour are asserted in one place.
 
 from __future__ import annotations
 
+import contextlib
+import os
+import shlex
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -545,3 +549,258 @@ def test_the_sdk_path_bounds_and_restores_the_network_timeout(
     databricks_token._sdk_bearer(None, "https://example.databricks.com")
     assert seen["during"] == databricks_token._SDK_NETWORK_TIMEOUT_S
     assert socket.getdefaulttimeout() == before
+
+
+def _controlled_databricks_cli(tmp_path: Path) -> Path:
+    """Put a controlled ``databricks`` CLI on ``PATH`` that logs every call and mints nothing.
+
+    :returns: The invocation log, one ``argv`` line per call (absent until the first call).
+    """
+    log = tmp_path / "databricks-cli-calls.log"
+    cli = tmp_path / "bin" / "databricks"
+    cli.parent.mkdir()
+    # The SDK only discovers a ``databricks`` on PATH that is larger than 1 MiB.
+    padding = "#\n" * 600_000
+    cli.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {shlex.quote(str(log))}\n"
+        'case "$*" in version*) '
+        'echo \'{"Version":"1.14.1","Major":1,"Minor":14,"Patch":1}\'; exit 0;; esac\n'
+        'echo "Error: databricks OAuth is not configured for this host" >&2\n'
+        "exit 1\n" + padding
+    )
+    cli.chmod(0o755)
+    return log
+
+
+@contextlib.contextmanager
+def _workspace_without_metadata() -> Iterator[str]:
+    """Serve a workspace URL whose every endpoint is a 404.
+
+    Newer databricks-sdk releases probe ``<host>/.well-known/databricks-config``
+    while constructing a ``Config`` and retry an unreachable host for minutes.
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _NotFound(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_error(404)
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _NotFound)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _pin_sdk_resolution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, config: str, bin_dir: Path
+) -> None:
+    for name in list(os.environ):
+        if name.startswith("DATABRICKS_"):
+            monkeypatch.delenv(name)
+    (tmp_path / "databrickscfg").write_text(config)
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "databrickscfg"))
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
+def _cli_auth_token_calls(log: Path) -> list[str]:
+    if not log.exists():
+        return []
+    return [line for line in log.read_text().splitlines() if line.startswith("auth token")]
+
+
+@pytest.mark.posix_only
+def test_the_sdk_fallback_leaves_cli_authentication_to_the_caller(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The entrypoint only runs after the generated helper's own ``databricks auth
+    token`` attempts yielded nothing. A U2M profile with no cached login must then
+    resolve to no bearer without the SDK spawning ``databricks auth token`` again:
+    that repeat (a forced refresh on newer SDKs) re-rotates the shared OAuth grant
+    and delays the harness's authentication."""
+    from omnigent.inner import databricks_token
+
+    log = _controlled_databricks_cli(tmp_path)
+    with _workspace_without_metadata() as host:
+        _pin_sdk_resolution(monkeypatch, tmp_path, f"[agent]\nhost = {host}\n", log.parent / "bin")
+        rc = databricks_token.main(["--host", host, "--profile", "agent"])
+    assert rc == 0
+    assert _cli_auth_token_calls(log) == []
+
+
+@pytest.mark.posix_only
+def test_the_sdk_fallback_still_resolves_a_profile_pinned_pat_without_the_cli(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Positive control: the SDK's own credential sources stay available to the
+    fallback. A profile-pinned PAT resolves and the CLI is never consulted."""
+    from omnigent.inner import databricks_token
+
+    log = _controlled_databricks_cli(tmp_path)
+    with _workspace_without_metadata() as host:
+        config = f"[pat]\nhost = {host}\ntoken = dapi-pinned\n"
+        _pin_sdk_resolution(monkeypatch, tmp_path, config, log.parent / "bin")
+        resolved = databricks_token._sdk_bearer("pat", host)
+    assert resolved == (host, "dapi-pinned")
+    assert _cli_auth_token_calls(log) == []
+
+
+@contextlib.contextmanager
+def _workspace_with_oauth_issuer() -> Iterator[tuple[str, list[dict[str, list[str]]]]]:
+    """Serve a workspace whose OIDC discovery and token endpoint are local.
+
+    Yields the workspace URL and the grants its token endpoint received. The
+    SDK's own discovery runs over HTTP against this host; only the IdP is controlled.
+    """
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs
+
+    grants: list[dict[str, list[str]]] = []
+    base = ""
+
+    class _Issuer(BaseHTTPRequestHandler):
+        def _reply(self, payload: dict[str, object]) -> None:
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self) -> None:
+            if self.path == "/.well-known/databricks-config":
+                self._reply({"oidc_endpoint": f"{base}/oidc"})
+            elif self.path == "/oidc/.well-known/oauth-authorization-server":
+                self._reply(
+                    {
+                        "issuer": base,
+                        "authorization_endpoint": f"{base}/oidc/v1/authorize",
+                        "token_endpoint": f"{base}/oidc/v1/token",
+                    }
+                )
+            else:
+                self.send_error(404)
+
+        def do_POST(self) -> None:
+            if self.path != "/oidc/v1/token":
+                self.send_error(404)
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            grants.append(parse_qs(self.rfile.read(length).decode()))
+            self._reply(
+                {"access_token": "sp-access-token", "token_type": "Bearer", "expires_in": 3600}
+            )
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Issuer)
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield base, grants
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize(
+    ("profile", "config"),
+    [
+        pytest.param(
+            "agent",
+            "[agent]\nhost = {host}\nauth_type = databricks-cli\n",
+            id="profile-pinned-to-the-cli",
+        ),
+        pytest.param(None, "", id="host-only"),
+    ],
+)
+def test_the_sdk_fallback_skips_the_cli_for_a_cli_profile_and_a_host_lookup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, profile: str | None, config: str
+) -> None:
+    """``auth_type = databricks-cli`` names only the strategy the fallback excludes,
+    and the unprofiled ``--host`` lookup installs the same filtered chain. Neither
+    may spawn ``databricks auth token`` again; the SDK reports that no strategy
+    applied (a crash inside the strategy would raise something else)."""
+    from omnigent.inner import databricks_token
+
+    log = _controlled_databricks_cli(tmp_path)
+    with _workspace_without_metadata() as host:
+        _pin_sdk_resolution(monkeypatch, tmp_path, config.format(host=host), log.parent / "bin")
+        # The unprofiled path keeps ambient cloud credentials by design; none may
+        # satisfy an earlier strategy here.
+        for name in databricks_token._ambient_credential_env_vars():
+            monkeypatch.delenv(name, raising=False)
+        with pytest.raises(ValueError):
+            databricks_token._sdk_bearer(profile, host)
+    assert _cli_auth_token_calls(log) == []
+
+
+@pytest.mark.posix_only
+def test_the_sdk_fallback_still_completes_a_service_principal_exchange_without_the_cli(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Positive control through the real SDK: an OAuth M2M profile still discovers
+    the workspace's OIDC endpoints and completes the client-credentials exchange,
+    its own secret outranks an ambient PAT, and the CLI is never consulted."""
+    from omnigent.inner import databricks_token
+
+    log = _controlled_databricks_cli(tmp_path)
+    with _workspace_with_oauth_issuer() as (host, grants):
+        config = (
+            f"[sp]\nhost = {host}\nclient_id = sp-client\nclient_secret = sp-secret\n"
+            "disable_async_token_refresh = true\n"
+        )
+        _pin_sdk_resolution(monkeypatch, tmp_path, config, log.parent / "bin")
+        monkeypatch.setenv("DATABRICKS_TOKEN", "ambient-other-identity")
+        resolved = databricks_token._sdk_bearer("sp", host)
+    assert resolved == (host, "sp-access-token")
+    assert [grant["grant_type"] for grant in grants] == [["client_credentials"]]
+    assert _cli_auth_token_calls(log) == []
+
+
+@pytest.fixture(autouse=True)
+def _restore_ambient_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The entrypoint pops every SDK credential variable straight out of
+    ``os.environ``; register the ones present so monkeypatch puts them back."""
+    from omnigent.inner import databricks_token
+
+    try:
+        names = databricks_token._ambient_credential_env_vars()
+    except ImportError:  # no databricks-sdk: the entrypoint scrubs nothing
+        return
+    for name in names:
+        if name in os.environ:
+            monkeypatch.setenv(name, os.environ[name])
+
+
+@pytest.mark.posix_only
+def test_the_controlled_cli_is_what_the_sdk_default_chain_would_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Canary for the quiet-log assertions above: the SDK's unfiltered default
+    chain does discover the controlled CLI on ``PATH`` and runs ``auth token``
+    through it, so an empty log means the fallback excluded that strategy."""
+    from databricks.sdk.config import Config
+
+    from omnigent.inner import databricks_token
+
+    log = _controlled_databricks_cli(tmp_path)
+    with _workspace_without_metadata() as host:
+        _pin_sdk_resolution(monkeypatch, tmp_path, "", log.parent / "bin")
+        # Ambient cloud credentials would satisfy an earlier strategy in the chain.
+        for name in databricks_token._ambient_credential_env_vars():
+            monkeypatch.delenv(name, raising=False)
+        with pytest.raises(ValueError):
+            Config(host=host)
+    assert len(_cli_auth_token_calls(log)) >= 1
