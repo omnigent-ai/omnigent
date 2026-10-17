@@ -137,6 +137,47 @@ def session_title_instructions(config: Mapping[str, Any]) -> str | None:
     return value
 
 
+_runner_tunnel_binary_body_cache: tuple[Path, tuple[int, int, int, int], bool] | None = None
+
+
+def runner_tunnel_binary_request_body() -> bool:
+    """Cache successful kill-switch reads by metadata; retry failures without a rewrite."""
+    global _runner_tunnel_binary_body_cache
+    path = resolve_config_path()
+    if path is None:
+        _runner_tunnel_binary_body_cache = None
+        return True
+    path = path.absolute()
+    cached = _runner_tunnel_binary_body_cache
+    try:
+        stat = path.stat()
+        signature = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino)
+        if cached is not None and cached[:2] == (path, signature):
+            return cached[2]
+        with open(path, encoding="utf-8") as handle:
+            data = yaml.safe_load(handle)
+    except FileNotFoundError:
+        _runner_tunnel_binary_body_cache = None
+        return True
+    except (OSError, yaml.YAMLError) as exc:
+        logger.warning("server config %s unreadable/invalid: %s — retrying kill switch", path, exc)
+        return cached[2] if cached is not None and cached[0] == path else True
+    if not isinstance(data, dict):
+        logger.warning("server config %s is not a mapping — retrying kill switch", path)
+        return cached[2] if cached is not None and cached[0] == path else True
+    raw = data.get("runner_tunnel_binary_request_body")
+    enabled = True
+    if isinstance(raw, bool):
+        enabled = raw
+    elif raw is not None:
+        logger.warning(
+            "server config runner_tunnel_binary_request_body must be a bool; using true"
+        )
+    _runner_tunnel_binary_body_cache = path, signature, enabled
+    logger.info("loaded server config from %s", path)
+    return enabled
+
+
 def _config_positive_int(key: str, default: int) -> int:
     """Read a positive-int setting from the server config, else *default*.
 
@@ -713,3 +754,66 @@ def branding_logo_asset(variant: str = "main") -> BrandingAsset | None:
 def branding_config() -> dict[str, Any]:
     """Branding block surfaced by ``GET /v1/info`` for the web UI."""
     return load_branding_snapshot().config()
+
+
+def workspace_upload_max_file_bytes() -> int:
+    """Return the workspace upload max file bytes setting."""
+    return _config_positive_int("workspace_upload_max_file_bytes", 1073741824)
+
+
+def workspace_upload_chunk_initial_bytes() -> int:
+    """Return the workspace upload chunk initial bytes setting."""
+    return _config_positive_int("workspace_upload_chunk_initial_bytes", 1048576)
+
+
+def workspace_upload_chunk_max_bytes() -> int:
+    """Return the workspace upload chunk max bytes setting."""
+    return max(
+        256 * 1024,
+        min(_config_positive_int("workspace_upload_chunk_max_bytes", 8388608), 16 * 1024**2),
+    )
+
+
+def workspace_upload_max_files_per_batch() -> int:
+    """Return the workspace upload max files per batch setting."""
+    return _config_positive_int("workspace_upload_max_files_per_batch", 100)
+
+
+def workspace_upload_max_batch_bytes() -> int:
+    """Return the workspace upload max batch bytes setting."""
+    return _config_positive_int("workspace_upload_max_batch_bytes", 5368709120)
+
+
+def workspace_upload_max_open_per_session() -> int:
+    """Return the workspace upload max open per session setting."""
+    return _config_positive_int("workspace_upload_max_open_per_session", 16)
+
+
+def workspace_upload_max_open_bytes_per_session() -> int:
+    """Return the workspace upload max open bytes per session setting."""
+    return _config_positive_int("workspace_upload_max_open_bytes_per_session", 5368709120)
+
+
+def workspace_upload_parallel_files() -> int:
+    """Return the workspace upload parallel files setting."""
+    return _config_positive_int("workspace_upload_parallel_files", 2)
+
+
+def workspace_upload_chunk_timeout_s() -> int:
+    """Return the workspace upload chunk timeout s setting."""
+    return _config_positive_int("workspace_upload_chunk_timeout_s", 60)
+
+
+def workspace_upload_finalize_timeout_s() -> int:
+    """Return the workspace upload finalize timeout s setting."""
+    return _config_positive_int("workspace_upload_finalize_timeout_s", 120)
+
+
+def workspace_upload_staging_idle_ttl_s() -> int:
+    """Return the workspace upload staging idle ttl s setting."""
+    return _config_positive_int("workspace_upload_staging_idle_ttl_s", 3600)
+
+
+def workspace_upload_staging_max_age_s() -> int:
+    """Return the workspace upload staging max age s setting."""
+    return _config_positive_int("workspace_upload_staging_max_age_s", 86400)

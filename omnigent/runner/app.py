@@ -7283,6 +7283,20 @@ def create_runner_app(
     _require_os_env = _resource_routes.require_os_env
     _resolve_conversation_id = _resource_routes.resolve_conversation_id
 
+    from omnigent.inner.os_env import OSEnvironment
+    from omnigent.runner.workspace_upload import register_upload_routes, upload_state_path
+
+    async def _upload_environment(session_id: str, environment_id: str) -> OSEnvironment:
+        agent_spec = await _require_os_env(session_id)
+        return resource_registry.resolve_environment(session_id, environment_id, agent_spec)
+
+    register_upload_routes(
+        app,
+        resolve_environment=_upload_environment,
+        resolve_registry=_resolve_session_fs_registry,
+        state_path=upload_state_path(runner_workspace),
+    )
+
     _native_controls = build_native_controls(
         _active_turns=_active_turns,
         _background_tasks=_background_tasks,
