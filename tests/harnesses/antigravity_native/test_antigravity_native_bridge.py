@@ -1074,6 +1074,64 @@ def test_draft_in_input_region_detects_collapsed_paste_placeholder() -> None:
     assert not _mod._draft_in_input_region(submitted, "Find the current weather", baseline)
 
 
+def test_draft_in_input_region_detects_needle_split_across_a_wrap() -> None:
+    """A needle split across agy's own word-wrap is still detected.
+
+    agy wraps composer text itself, so the verification needle can span rows even
+    when tmux joins terminal-wrapped lines; rows captured from an 80-column pane.
+    """
+    sep = "─" * 80
+    baseline = _mod._agy_input_region(f"{sep}\n>\n{sep}")
+    content = (
+        "[Attached: /data/.omnigent/attachments/0ce1f3f0edd2e9ab677e00516b0d1ffe/"
+        "image_c63e5e84ed21.png]\n"
+        "I am in YOU!  Omnigent!!!!"
+    )
+    needle = _mod._submit_needle(content)
+    assert content.splitlines()[0].startswith(needle)
+    # agy wraps after "[Attached:", so no single rendered row contains the needle.
+    pane = (
+        f"{sep}\n"
+        "> [Attached:\n"
+        "  /data/.omnigent/attachments/0ce1f3f0edd2e9ab677e00516b0d1ffe/image_c63e5e84ed\n"
+        "  21.png]\n"
+        "  I am in YOU!  Omnigent!!!!\n"
+        f"{sep}"
+    )
+    assert _mod._draft_in_input_region(pane, needle, baseline)
+
+
+def test_draft_in_input_region_wrap_fallback_does_not_match_unrelated_text() -> None:
+    """The wrap-tolerant fallback still needs the needle's content, not just a changed composer."""
+    sep = "─" * 80
+    baseline = _mod._agy_input_region(f"{sep}\n>\n{sep}")
+    pane = f"{sep}\n> some completely unrelated leftover draft\n{sep}"
+    assert not _mod._draft_in_input_region(pane, "[Attached: /data/.omnige", baseline)
+    # Normalizing whitespace must not shrink a needle into an incidental substring
+    # or let concatenated words stand in for the needle's words.
+    assert _mod._submit_needle("a  b") == "a  b"
+    assert not _mod._draft_in_input_region(f"{sep}\n> tab\n{sep}", "a  b", baseline)
+    assert not _mod._draft_in_input_region(f"{sep}\n> notable\n{sep}", "not able", baseline)
+    # The same words split by a wrap at their space still match.
+    assert _mod._draft_in_input_region(f"{sep}\n> not\n  able\n{sep}", "not able", baseline)
+
+
+def test_draft_in_input_region_rejects_stale_same_root_attachment_at_baseline() -> None:
+    """A stale draft naming another attachment under the same root is rejected by the baseline.
+
+    Every attachment under one root shares the 24-char needle, which the per-row and
+    wrap checks would both accept; an unchanged composer never counts as the new draft.
+    """
+    sep = "─" * 80
+    stale = (
+        f"{sep}\n> [Attached:\n"
+        "  /data/.omnigent/attachments/0ce1f3f0edd2e9ab677e00516b0d1ffe/other.png]\n"
+        f"{sep}"
+    )
+    baseline = _mod._agy_input_region(stale)
+    assert not _mod._draft_in_input_region(stale, "[Attached: /data/.omnige", baseline)
+
+
 def test_inject_user_message_via_tui_submits_a_collapsed_paste(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1320,6 +1378,29 @@ def test_draft_in_input_region_keeps_prompt_text_with_status_words() -> None:
     needle = _mod._submit_needle(content)
     pane = f"{sep}\n> {content}\n{sep}\n? for shortcuts"
     assert _mod._draft_in_input_region(pane, needle, baseline)
+
+
+def test_draft_in_input_region_matches_word_wrapped_attachment_line() -> None:
+    """A long ``[Attached: <path>]`` first line that agy word-wraps is still a rendered draft.
+
+    Composer rows captured from a real agy 1.2.4 pane 115 columns wide: the only
+    internal space follows the colon, so no single row carries the needle even
+    though the whole draft is visible. A web attachment turn must not be reported
+    as "never rendered" for that; the fresh composer after submit still reads as
+    the draft being gone.
+    """
+    sep = "─" * 115
+    path = (
+        "/tmp/omnigent-osenv-ntantkpg/omnigent-pytest-fohvp937/attachments/"
+        "fd7fa3a610aa62ef9e26825a0e7b76f9/fork-attachment.png"
+    )
+    content = f"[Attached: {path}]\nhello"
+    needle = _mod._submit_needle(content)
+    baseline = _mod._agy_input_region(f"{sep}\n>\n{sep}\n? for shortcuts")
+    pane = f"{sep}\n> [Attached:\n  {path[:112]}\n  {path[112:]}]\n  hello\n{sep}\n? for shortcuts"
+    assert _mod._draft_in_input_region(pane, needle, baseline)
+    submitted = f"{sep}\n> [Attached: {path}]\n  hello\n{sep}\n>\n{sep}\nesc to cancel"
+    assert not _mod._draft_in_input_region(submitted, needle, baseline)
 
 
 def test_draft_in_input_region_matches_short_message_by_composer_change() -> None:

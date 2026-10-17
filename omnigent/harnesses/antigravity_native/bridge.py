@@ -1084,6 +1084,8 @@ _AGY_ACTIVE_MARKER = "esc to cancel"
 # so both the render gate and the submit verification key off the placeholder
 # appearing and then leaving the composer.
 _AGY_PASTE_PLACEHOLDER_RE = re.compile(r"\[Pasted text #\d+[^\]]*\]")
+# Normalizes agy's word-wrap breaks to single spaces for the fallback needle match.
+_WHITESPACE_RE = re.compile(r"\s+")
 # agy's notice when a turn is submitted before its startup account-eligibility
 # check settles. The composer footer mounts ~3s after launch but eligibility is
 # not settled for ~7-9s, and a turn landing in that window is CONSUMED (the draft
@@ -1404,6 +1406,10 @@ def _draft_in_input_region(pane: str, needle: str, baseline_region: str) -> bool
     ``"ok"``), any draft-like content in a composer that differs from the
     pre-paste baseline counts as present — so short messages are still render- and
     submit-verified by composer state instead of being submitted blind.
+
+    agy word-wraps a long first line (such as ``[Attached: <path>]``) at its own
+    pane width, so the needle can span composer rows: the per-row checks run
+    first and a whitespace-normalized comparison of the joined rows is the fallback.
     """
     region = _agy_input_region(pane)
     if region == baseline_region:
@@ -1416,12 +1422,19 @@ def _draft_in_input_region(pane: str, needle: str, baseline_region: str) -> bool
     normalized_needle = needle.strip() if needle else ""
     if not normalized_needle:
         return bool(candidates)
-    return any(
+    if any(
         line == normalized_needle
         or line.startswith(normalized_needle)
         or normalized_needle in line
         for line in candidates
-    )
+    ):
+        return True
+    # A word-wrap splits the needle at a space, so compare the rows joined by single
+    # spaces; word boundaries stay intact. This only adds "draft present" verdicts
+    # (it can delay a submit, never confirm one) and rejects a short needle.
+    haystack = _WHITESPACE_RE.sub(" ", " ".join(candidates))
+    joined_needle = _WHITESPACE_RE.sub(" ", normalized_needle)
+    return len(joined_needle.replace(" ", "")) >= 4 and joined_needle in haystack
 
 
 def _agy_draft_candidate_lines(region: str) -> list[str]:
