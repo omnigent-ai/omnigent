@@ -35,11 +35,16 @@ build the SPA and record via `OMNIGENT_E2E_RECORD_DIR` per
 Link the actual after-clip, not just the repro run and a manual "run it yourself"
 command. Omit the after-clip **only**
 for a genuine, named environmental blocker (recorder tooling missing, fixture
-won't come online after the SPA build, `api`-surface facet with nothing to film) —
+won't come online after the SPA build, `api`-surface facet with nothing to film
+and no UI/CLI caller that exposes it) —
 and when you omit it, **say which blocker, with the evidence**, in both the PR's
 Demo section and the handoff (a `recordings` prose note, or `maintainer_review`).
-A missing upstream before-clip is never that blocker. Never report an after-clip
-you didn't actually produce, and never drop it silently.
+A missing upstream before-clip is never that blocker.
+A `recording_unavailable_reason` that describes pending work ("is being attempted
+during the review wait") does not pass this gate: if you deferred the clip to
+Step 4, film it now, or replace the promise with the recorder command you ran and
+its observed result. Never report an after-clip you didn't actually produce, and
+never drop it silently.
 
 **First, submit your final review** per the verdict rule in 2A.5 (review path
 only): **approve** when you were a pure reviewer and the PR is `fixed` (you pushed
