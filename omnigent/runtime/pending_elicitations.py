@@ -379,7 +379,8 @@ def reset_for_tests() -> None:
     production callers — there is no legitimate use case for
     wiping the index at runtime.
     """
-    global _observer
+    global _observer, _count_persist_hook
     with _lock:
         _pending.clear()
     _observer = None
+    _count_persist_hook = None
