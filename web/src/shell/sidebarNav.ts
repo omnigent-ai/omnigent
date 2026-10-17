@@ -1,7 +1,7 @@
 import type { Conversation, SessionSortBy } from "@/hooks/useConversations";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { getOptimisticTitle } from "@/lib/optimisticTitles";
-import { PROJECT_LABEL_KEY, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import { isInProject, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 
 export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation-ids";
 
@@ -180,11 +180,7 @@ export function sessionBelongsToProject(
   project: { id: string | null; name: string },
   viewerId: string | null,
 ): boolean {
-  return (
-    isOwnedByViewer(conversation, viewerId) &&
-    ((project.id !== null && conversation.project_id === project.id) ||
-      conversation.labels?.[PROJECT_LABEL_KEY] === project.name)
-  );
+  return isOwnedByViewer(conversation, viewerId) && isInProject(conversation, project);
 }
 
 export function conversationDisplayLabel(conversation: Conversation): string {

@@ -54,6 +54,8 @@ def test_session_rename_streams_to_open_tabs(
     - The server didn't diff the rename into a ``changed`` frame, or the
       client didn't merge it / trigger the title reconcile
       (``_emit_deltas`` / ``mergeItemsIntoPages`` regression).
+    - The client refetched its session lists for a pushed rename instead
+      of applying the row in place (``SessionUpdatesProvider`` regression).
 
     If the stream were dead the rename would still surface — but only via
     the 45-60 s HTTP fallback poll, so a sub-20 s assertion would time
@@ -85,6 +87,9 @@ def test_session_rename_streams_to_open_tabs(
         # match could be an initial snapshot rather than a live delivery.
         expect(tab_a.locator(row)).to_be_visible()
         expect(tab_b.locator(row)).to_be_visible()
+        # Let the initial-load requests settle before counting.
+        tab_a.wait_for_timeout(2_000)
+        list_hits = _count_session_list_requests(tab_a)
 
         # A third client renames the session over the API — no browser
         # action triggers it, so any UI change is server-pushed.
@@ -100,6 +105,11 @@ def test_session_rename_streams_to_open_tabs(
         # delivers this fast; a dead stream times out here.
         expect(tab_a.locator(row)).to_contain_text(marker, timeout=20_000)
         expect(tab_b.locator(row)).to_contain_text(marker, timeout=20_000)
+        # The pushed row is applied in place: a rename can't change which
+        # sidebar lists hold the session, so it must not refetch them. Wait
+        # out the provider's 250 ms reconcile debounce before asserting.
+        tab_a.wait_for_timeout(1_500)
+        assert list_hits == [], f"pushed rename refetched session lists: {list_hits}"
     finally:
         tab_a_ctx.close()
         tab_b_ctx.close()
