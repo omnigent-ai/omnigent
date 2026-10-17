@@ -246,6 +246,28 @@ export const CMD_LEFT_LINE_START = "\x01"; // Ctrl-A: cursor to line start
 export const CMD_RIGHT_LINE_END = "\x05"; // Ctrl-E: cursor to line end
 
 /**
+ * True when an in-flight IME composition owns *event*'s printable key.
+ *
+ * Keeps printable composing keys away from xterm's premature-finalization
+ * path without cancelling IME input, so the line is committed once at
+ * ``compositionend``. Functional keys, keyCode 229, and Ctrl/Meta/Alt chords
+ * keep their existing paths.
+ *
+ * :param event: Browser keyboard event from xterm's custom key handler.
+ * :returns: ``true`` when the handler must claim the event for the IME.
+ */
+export function compositionOwnsKeyEvent(event: KeyboardEvent): boolean {
+  return (
+    event.isComposing &&
+    event.keyCode !== 229 &&
+    event.key.length === 1 &&
+    !event.ctrlKey &&
+    !event.metaKey &&
+    !event.altKey
+  );
+}
+
+/**
  * Return the terminal bytes to send for a browser key event.
  *
  * Two key families need synthesized bytes because neither xterm.js nor the
@@ -842,6 +864,8 @@ export class TerminalSession {
     });
 
     this.term.attachCustomKeyEventHandler((e) => {
+      // No preventDefault: the IME must still receive the key it owns.
+      if (compositionOwnsKeyEvent(e)) return false;
       const payload = terminalKeyEventPayload(e);
       if (payload === null) return true;
       // xterm invokes this handler for keydown, keypress, and keyup.
