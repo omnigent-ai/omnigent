@@ -120,14 +120,34 @@ RUN pip install --index-url ${PYPI_INDEX_URL} --no-cache-dir uv
 
 WORKDIR /build
 
-# Manifests + SDK path-deps first so the install layer caches across
-# pure source edits.
-COPY pyproject.toml setup.py uv.lock ./
+# Manifests first so lock validation and dependency export cache across source
+# edits. The workspace member manifests are needed to validate the shared lock.
+COPY pyproject.toml setup.py uv.lock uv.toml ./
+COPY .github/triage_v2/pyproject.toml ./.github/triage_v2/pyproject.toml
+COPY integrations/slack/pyproject.toml ./integrations/slack/pyproject.toml
+COPY sdks/python-client/pyproject.toml ./sdks/python-client/pyproject.toml
+COPY sdks/ui/pyproject.toml ./sdks/ui/pyproject.toml
 # License + third-party attribution travel into the published images (the host
 # and runtime targets COPY /build below), since the image redistributes the
 # dependency bytes baked in by the install step.
 COPY LICENSE NOTICE ./
+# Validate without the package-index override so a mirror cannot influence
+# lock freshness checks.
+RUN uv lock --check --python /usr/local/bin/python
+
+# Standalone venv copied out as one directory. VIRTUAL_ENV keeps uv out of the
+# slim image's system Python.
+RUN python -m venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:${PATH}"
+
+# Editable local dependencies must exist before installing the exported set.
 COPY sdks/ ./sdks/
+RUN uv export --frozen --no-dev --no-emit-project --no-emit-workspace \
+      --output-file /tmp/locked-requirements.txt \
+ && uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} \
+      --no-config --no-deps -r /tmp/locked-requirements.txt
+
 COPY omnigent/ ./omnigent/
 # The built-in polly agent's packaged bundle (omnigent/resources/examples/
 # polly) is a symlink into the top-level examples/ tree. Ship examples/ so the
@@ -135,23 +155,14 @@ COPY omnigent/ ./omnigent/
 # polly (the seeder skips it when its bundle is absent). ~120K of YAML.
 COPY examples/ ./examples/
 
-# Standalone venv we can copy out as a single directory. VIRTUAL_ENV
-# tells uv to install into this venv (not the slim image's system
-# Python) — without it, uv falls back to system Python and the
-# copied /opt/venv lands in the runtime stage empty.
-RUN python -m venv /opt/venv
-ENV VIRTUAL_ENV=/opt/venv \
-    PATH="/opt/venv/bin:${PATH}"
-
-# Sync installs the locked dependencies and sibling SDK path sources. Install
-# the root project editable without dependencies so pip cannot re-resolve them.
-RUN uv sync --active --locked --no-dev --no-install-project \
-      --index-url ${PYPI_INDEX_URL} \
- && uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} --no-deps -e .
+# Install the root project editable without allowing pip to resolve outside
+# the exported lock pins.
+RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} \
+      --no-config --no-deps -e .
 
 # ── Server builder ──────────────────────────────────────
-# Server-only additions on top of the shared builder: the SPA bundle
-# and the Postgres driver.
+# Server-only additions on top of the shared builder: the SPA bundle and
+# provider-specific locked dependencies.
 FROM builder AS server-builder
 
 ARG PYPI_INDEX_URL=https://pypi.org/simple
@@ -163,24 +174,10 @@ COPY --from=web-builder /web/omnigent/server/static/web-ui ./omnigent/server/sta
 RUN test -f ./omnigent/server/static/web-ui/index.html \
     || (echo "ERROR: SPA bundle missing after web-builder stage — check the web build." && exit 1)
 
-# Optional managed-sandbox provider extras for the SERVER (the launcher imports
-# the provider SDK — e.g. the kubernetes client for `sandbox.provider:
-# kubernetes`). Off by default; the runner host image needs none of these. Build
-# with `--build-arg OMNIGENT_EXTRAS=kubernetes` (comma-separate for several).
+# Optional managed-sandbox provider extras for the SERVER. Build with
+# `--build-arg OMNIGENT_EXTRAS=kubernetes` (comma-separate for several).
 ARG OMNIGENT_EXTRAS=
-RUN if [ -n "${OMNIGENT_EXTRAS}" ]; then \
-        extras="$(printf '%s' "${OMNIGENT_EXTRAS}" | sed 's/,/ --extra /g')"; \
-        uv sync --active --locked --no-dev --no-install-project \
-            --index-url ${PYPI_INDEX_URL} --extra postgres --extra ${extras}; \
-    else \
-        uv sync --active --locked --no-dev --no-install-project \
-            --index-url ${PYPI_INDEX_URL} --extra postgres; \
-    fi \
- && uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} --no-deps -e .
-
-# Keep the explicit server driver install; the locked postgres extra above
-# means this remains a no-op unless the server driver needs repairing.
-RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'psycopg[binary]>=3.1,<4'
+RUN python -c 'import os, subprocess; extras = [x.strip() for x in os.environ.get("OMNIGENT_EXTRAS", "").split(",") if x.strip()]; cmd = ["uv", "export", "--frozen", "--no-dev", "--no-emit-project", "--no-emit-workspace", "--extra", "postgres"]; [cmd.extend(("--extra", extra)) for extra in extras]; cmd.extend(("--output-file", "/tmp/locked-requirements.txt")); subprocess.run(cmd, check=True); subprocess.run(["uv", "pip", "install", "--no-cache-dir", "--index-url", os.environ["PYPI_INDEX_URL"], "--no-config", "--no-deps", "-r", "/tmp/locked-requirements.txt"], check=True)'
 
 # ── Node alias stage ─────────────────────────────────────
 # Pure alias so the host stage can COPY node out of a version-pinned
