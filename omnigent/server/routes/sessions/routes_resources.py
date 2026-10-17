@@ -121,7 +121,7 @@ class _RunnerStreamResponse(StreamingResponse):
     """
 
     def __init__(self, upstream: httpx.Response, *, headers: Mapping[str, str]) -> None:
-        super().__init__(upstream.aiter_raw(), headers=headers)
+        super().__init__(upstream.aiter_raw(), status_code=upstream.status_code, headers=headers)
         self._upstream = upstream
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -400,7 +400,14 @@ def register_resources_routes(
             )
         try:
             resp = await runner_client.send(
-                runner_client.build_request("GET", runner_path, timeout=_download_timeout),
+                runner_client.build_request(
+                    "GET",
+                    runner_path,
+                    timeout=_download_timeout,
+                    headers={"Range": request.headers["range"]}
+                    if "range" in request.headers
+                    else {},
+                ),
                 stream=True,
             )
         except (httpx.HTTPError, ConnectionError) as exc:
@@ -408,13 +415,18 @@ def register_resources_routes(
                 status_code=502,
                 detail="runner download endpoint unavailable",
             ) from exc
-        if resp.status_code == 200 and "content-disposition" in resp.headers:
+        if (
+            resp.status_code == 416
+            and resp.headers.get("content-range", "").startswith("bytes */")
+        ) or (resp.status_code in (200, 206) and "content-disposition" in resp.headers):
             skip_gzip(request)
             forwarded = {
                 name: resp.headers[name]
                 for name in (
                     "content-type",
                     "content-length",
+                    "content-range",
+                    "accept-ranges",
                     "content-encoding",
                     "content-disposition",
                     "cache-control",

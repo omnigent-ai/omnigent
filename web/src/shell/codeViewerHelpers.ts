@@ -86,6 +86,9 @@ const BINARY_EXTENSIONS = new Set([
   "eot",
   "mp3",
   "mp4",
+  "m4v",
+  "mov",
+  "ogv",
   "wav",
   "ogg",
   "webm",
@@ -97,6 +100,11 @@ const BINARY_EXTENSIONS = new Set([
 export function isBinaryPath(path: string): boolean {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
   return BINARY_EXTENSIONS.has(ext);
+}
+
+export function isVideoFile(path: string, contentType?: string | null): boolean {
+  if (contentType?.startsWith("video/")) return true;
+  return ["mp4", "m4v", "webm", "mov", "ogv"].includes(path.split(".").pop()?.toLowerCase() ?? "");
 }
 
 /** Jupyter notebooks get a read-only rendered preview (with raw-JSON source as
