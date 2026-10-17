@@ -19,7 +19,7 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from omnigent.db.utils import generate_agent_id
+from omnigent.db.utils import generate_agent_id, get_or_create_engine, make_managed_session_maker
 from omnigent.entities import USER_SESSION_TITLE_MAX_CHARS
 from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
 from omnigent.runner import create_runner_app
@@ -98,6 +98,39 @@ async def test_get_session(
     assert resp.status_code == 200
     body = resp.json()
     assert body["id"] == session_id
+
+
+@pytest.mark.parametrize("failure", ["statement", "decode"])
+async def test_get_session_survives_agent_row_read_failure(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    """A failing agent-row read drops only the agent metadata; the snapshot and harness survive."""
+    from sqlalchemy import text
+
+    SqlAlchemyConversationStore(db_uri).update_conversation(session_id, harness_override="pi")
+    # A read maker on the same engine joins the request's shared read scope, so
+    # the failure aborts the shared transaction the way a real query failure would.
+    read = make_managed_session_maker(get_or_create_engine(db_uri))
+
+    def failing_get(self: SqlAlchemyAgentStore, agent_id: str) -> None:
+        if failure == "decode":
+            # What decode_agent_kind raises for an unknown stored kind code.
+            raise ValueError("unknown agent kind code")
+        with read() as session:
+            session.execute(text("SELECT * FROM table_that_does_not_exist"))
+
+    monkeypatch.setattr(SqlAlchemyAgentStore, "get", failing_get)
+    resp = await client.get(f"/v1/sessions/{session_id}")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["id"] == session_id
+    assert body["harness"] == "pi"
+    assert body.get("agent_name") is None
+    assert body.get("llm_model") is None
 
 
 async def test_get_session_not_found(client: httpx.AsyncClient) -> None:
