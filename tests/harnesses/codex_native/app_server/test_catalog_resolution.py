@@ -211,6 +211,10 @@ def test_resolve_databricks_codex_model_matches_servable_ids(
             "omnigent.models.databricks_model_discovery.discover_databricks_codex_models",
             return_value=servable,
         ),
+        patch(
+            "omnigent.models.databricks_model_discovery.first_served_codex_model",
+            return_value=None,
+        ),
     ):
         assert (
             _resolve_databricks_codex_model("https://h.example.com", "prof", None)
@@ -269,3 +273,129 @@ def test_resolve_databricks_codex_model_discovery_failure_warns_without_tracebac
         "host logging mirrors it to the user's terminal"
     )
     assert "databricks auth login --profile prof" in warning.getMessage()
+
+
+def test_resolve_databricks_codex_model_prefers_a_route_served_default() -> None:
+    """An implicit default skips listing entries the codex route does not serve.
+
+    Some workspaces (Azure) advertise GPT ids in the Unity Catalog listing
+    that the Codex Responses route 404s, so the ranked default must be
+    validated against the route: the first served candidate wins, and when
+    the probe cannot discriminate the ranked default stands. An explicit
+    request is never probed — the gateway's error beats a substitution.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from omnigent.harnesses.codex_native.app_server import _resolve_databricks_codex_model
+
+    servable = ("system.ai.gpt-5-6-sol", "system.ai.gpt-5-5", "system.ai.glm-5-2")
+    with (
+        patch(
+            "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+            return_value=SimpleNamespace(token="tok"),
+        ),
+        patch(
+            "omnigent.models.databricks_model_discovery.discover_databricks_codex_models",
+            return_value=servable,
+        ),
+        patch(
+            "omnigent.models.databricks_model_discovery.first_served_codex_model",
+            return_value="system.ai.glm-5-2",
+        ) as probe,
+    ):
+        assert (
+            _resolve_databricks_codex_model("https://h.example.com", "prof", None)
+            == "system.ai.glm-5-2"
+        )
+        probe.assert_called_once_with("https://h.example.com", "tok", servable)
+
+        # An explicit request bypasses the probe entirely.
+        probe.reset_mock()
+        assert (
+            _resolve_databricks_codex_model("https://h.example.com", "prof", "databricks-gpt-5-5")
+            == "system.ai.gpt-5-5"
+        )
+        probe.assert_not_called()
+
+    # A probe that cannot discriminate keeps the ranked default.
+    for indeterminate in (None, RuntimeError("probe blew up")):
+        with (
+            patch(
+                "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+                return_value=SimpleNamespace(token="tok"),
+            ),
+            patch(
+                "omnigent.models.databricks_model_discovery.discover_databricks_codex_models",
+                return_value=servable,
+            ),
+            patch(
+                "omnigent.models.databricks_model_discovery.first_served_codex_model",
+                **(
+                    {"side_effect": indeterminate}
+                    if isinstance(indeterminate, Exception)
+                    else {"return_value": indeterminate}
+                ),
+            ),
+        ):
+            assert (
+                _resolve_databricks_codex_model("https://h.example.com", "prof", None)
+                == "system.ai.gpt-5-6-sol"
+            )
+
+    # A single-candidate listing needs no probe — there is nothing to skip to.
+    with (
+        patch(
+            "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+            return_value=SimpleNamespace(token="tok"),
+        ),
+        patch(
+            "omnigent.models.databricks_model_discovery.discover_databricks_codex_models",
+            return_value=("system.ai.gpt-5-6-sol",),
+        ),
+        patch(
+            "omnigent.models.databricks_model_discovery.first_served_codex_model",
+        ) as probe,
+    ):
+        assert (
+            _resolve_databricks_codex_model("https://h.example.com", "prof", None)
+            == "system.ai.gpt-5-6-sol"
+        )
+        probe.assert_not_called()
+
+
+def test_resolve_databricks_codex_model_skips_probe_when_discovery_fails() -> None:
+    """A ucode-state fallback keeps its ranked default without a route probe.
+
+    When live discovery fails, the token has not been proven against ``host``,
+    so probing it would spend the launch budget on a listing the route just
+    rejected. The resolver must take the cached ucode-state default directly.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from omnigent.harnesses.codex_native.app_server import _resolve_databricks_codex_model
+
+    cached = ("system.ai.gpt-5-6-sol", "system.ai.glm-5-2")
+    with (
+        patch(
+            "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+            return_value=SimpleNamespace(token="tok"),
+        ),
+        patch(
+            "omnigent.models.databricks_model_discovery.discover_databricks_codex_models",
+            side_effect=RuntimeError("listing rejected the token"),
+        ),
+        patch(
+            "omnigent.onboarding.ucode_state.read_ucode_state",
+            return_value=SimpleNamespace(codex_models=cached),
+        ),
+        patch(
+            "omnigent.models.databricks_model_discovery.first_served_codex_model",
+        ) as probe,
+    ):
+        assert (
+            _resolve_databricks_codex_model("https://h.example.com", "prof", None)
+            == "system.ai.gpt-5-6-sol"
+        )
+        probe.assert_not_called()
