@@ -8,6 +8,8 @@ import pytest
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, WritePathSpec
 from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.terminals import TerminalRegistry
+from tests.runner.helpers import make_test_terminal_instance
 
 
 @pytest.fixture
@@ -50,16 +52,69 @@ async def test_terminal_consumers_close_before_owner(spec, tmp_path, monkeypatch
     from unittest.mock import AsyncMock
 
     closed = []
-    terminals = Mock()
-    terminals.cleanup_conversation = AsyncMock(side_effect=lambda *a: closed.append("terminals"))
+    terminals = TerminalRegistry()
+    instance = make_test_terminal_instance("bash", "main", tmp_path)
+    monkeypatch.setattr(
+        instance, "close", AsyncMock(side_effect=lambda: closed.append("terminals"))
+    )
+    terminals._by_conversation["session"] = {("bash", "main"): instance}
     registry = SessionResourceRegistry(terminal_registry=terminals, runner_workspace=tmp_path)
     shared = Mock()
     shared.close.side_effect = lambda: closed.append("owner")
     monkeypatch.setattr(registry, "_create_primary_env", Mock(return_value=shared))
     registry._resolve_primary("session", spec)
+    assert terminals.get("session", "bash", "main") is instance
     await registry.cleanup_session("session")
     assert closed == ["terminals", "owner"]
     assert "session" not in registry._primary_env_specs
+    assert terminals.get("session", "bash", "main") is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_keeps_replacement_terminal_and_primary_owner(spec, tmp_path, monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    closing, release = asyncio.Event(), asyncio.Event()
+    closed = []
+    terminals = TerminalRegistry()
+    old = make_test_terminal_instance("bash", "main", tmp_path)
+    fresh = make_test_terminal_instance("bash", "main", tmp_path)
+
+    async def close_old():
+        closing.set()
+        await release.wait()
+        closed.append("terminals")
+
+    monkeypatch.setattr(old, "close", close_old)
+    monkeypatch.setattr(fresh, "close", AsyncMock())
+    terminals._by_conversation["session"] = {("bash", "main"): old}
+    registry = SessionResourceRegistry(terminal_registry=terminals, runner_workspace=tmp_path)
+    original_owner, fresh_owner = Mock(), Mock()
+    original_owner.close.side_effect = lambda: closed.append("owner")
+    monkeypatch.setattr(
+        registry, "_create_primary_env", Mock(side_effect=[original_owner, fresh_owner])
+    )
+    assert registry._resolve_primary("session", spec) is original_owner
+    cleanup = asyncio.create_task(registry.cleanup_session("session"))
+    try:
+        await asyncio.wait_for(closing.wait(), 5)
+        assert terminals.get("session", "bash", "main") is None
+        assert registry._resolve_primary("session", spec) is fresh_owner
+        terminals._by_conversation["session"] = {("bash", "main"): fresh}
+        release.set()
+        await asyncio.wait_for(cleanup, 5)
+        assert closed == ["terminals", "owner"]
+        assert terminals.get("session", "bash", "main") is fresh
+        assert registry._primary_envs["session"] is fresh_owner
+        assert "session" in registry._primary_env_specs
+        original_owner.close.assert_called_once()
+        fresh_owner.close.assert_not_called()
+        fresh.close.assert_not_called()
+    finally:
+        release.set()
+        await asyncio.gather(cleanup, return_exceptions=True)
+        await registry.cleanup_session("session")
 
 
 def test_harness_spawn_transports_prepared_session_namespace(spec, tmp_path, monkeypatch):

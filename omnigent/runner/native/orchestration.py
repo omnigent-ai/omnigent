@@ -90,12 +90,15 @@ from omnigent.runner.resource_registry import (
     PI_NATIVE_TERMINAL_ROLE,
     QWEN_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
+    require_current_terminal_launch,
+    terminal_launch_fence,
 )
 from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
 )
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 from omnigent.spec.types import AgentSpec
+from omnigent.terminals.registry import TerminalLaunchSupersededError
 
 _logger = logging.getLogger("omnigent.runner.app")
 
@@ -193,7 +196,9 @@ class _CodexNativeModelOptionsNotReady(RuntimeError):
     """Raised when Codex model options are requested before bridge startup."""
 
 
-async def _cancel_auto_forwarder_task(session_id: str) -> None:
+async def _cancel_auto_forwarder_task(
+    session_id: str, *, expected: asyncio.Task[object] | None = None
+) -> None:
     """
     Cancel and await the session's registered transcript forwarder, if any.
 
@@ -205,10 +210,19 @@ async def _cancel_auto_forwarder_task(session_id: str) -> None:
     for external conversation items).
 
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :param expected: Cancel only this launch's task when a successor owns the slot.
     :returns: None.
     """
-    task = _AUTO_FORWARDER_TASKS.pop(session_id, None)
+    if expected is None:
+        require_current_terminal_launch()
+        task = _AUTO_FORWARDER_TASKS.pop(session_id, None)
+    else:
+        task = expected
+        if _AUTO_FORWARDER_TASKS.get(session_id) is expected:
+            _AUTO_FORWARDER_TASKS.pop(session_id, None)
     if task is None or task.done():
+        if expected is None:
+            require_current_terminal_launch()
         return
     task.cancel()
     # asyncio.wait absorbs the CancelledError and bounds the wait on a hung cancellation.
@@ -219,9 +233,31 @@ async def _cancel_auto_forwarder_task(session_id: str) -> None:
             session_id,
             _AUTO_FORWARDER_CANCEL_TIMEOUT_S,
         )
+    if expected is None:
+        require_current_terminal_launch()
 
 
-async def teardown_codex_native_app_server(session_id: str) -> None:
+@dataclasses.dataclass(frozen=True)
+class CodexNativeCleanup:
+    """Exact native backend handles captured before reset teardown yields."""
+
+    server: CodexNativeAppServer | None
+    forwarder: asyncio.Task[object] | None
+    bridge_dir: Path | None
+
+
+def capture_codex_native_cleanup(session_id: str) -> CodexNativeCleanup:
+    server = _AUTO_CODEX_APP_SERVERS.get(session_id)
+    return CodexNativeCleanup(
+        server,
+        _AUTO_FORWARDER_TASKS.get(session_id) if server is not None else None,
+        _AUTO_CODEX_BRIDGE_DIRS.get(session_id),
+    )
+
+
+async def teardown_codex_native_app_server(
+    session_id: str, *, captured: CodexNativeCleanup | None = None
+) -> None:
     """
     Tear down a host-spawned codex-native session's app-server subprocess.
 
@@ -237,24 +273,24 @@ async def teardown_codex_native_app_server(session_id: str) -> None:
     the remembered launch directory is retired.
 
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+    :param captured: Ownership captured before an earlier teardown await.
     :returns: None.
     """
-    app_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
-    bridge_dir = _AUTO_CODEX_BRIDGE_DIRS.get(session_id)
-    if app_server is None:
-        _AUTO_CODEX_BRIDGE_DIRS.pop(session_id, None)
-        return
-    await _cancel_auto_forwarder_task(session_id)
+    captured = captured or capture_codex_native_cleanup(session_id)
+    app_server, bridge_dir = captured.server, captured.bridge_dir
+    if captured.forwarder is not None:
+        await _cancel_auto_forwarder_task(session_id, expected=captured.forwarder)
     registered_server = _AUTO_CODEX_APP_SERVERS.get(session_id)
-    if registered_server is app_server:
+    if app_server is not None and registered_server is app_server:
         _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
     # Forwarder cleanup can retire its own backend; a newer launch can reuse its path.
     if (registered_server is None or registered_server is app_server) and (
         _AUTO_CODEX_BRIDGE_DIRS.get(session_id) is bridge_dir
     ):
         _AUTO_CODEX_BRIDGE_DIRS.pop(session_id, None)
-    with contextlib.suppress(Exception):
-        await app_server.close()
+    if app_server is not None:
+        with contextlib.suppress(Exception):
+            await app_server.close()
 
 
 async def teardown_all_codex_native_app_servers() -> None:
@@ -390,10 +426,50 @@ def codex_native_bridge_dir(session_id: str) -> Path:
     return _AUTO_CODEX_BRIDGE_DIRS.get(session_id) or bridge_dir_for_bridge_id(session_id)
 
 
+def _pop_codex_app_server_if_owned(session_id: str, app_server: CodexNativeAppServer) -> None:
+    if _AUTO_CODEX_APP_SERVERS.get(session_id) is app_server:
+        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+
+def _require_current_codex_launch(is_current: Callable[[], bool] | None) -> None:
+    if is_current is not None and not is_current():
+        raise TerminalLaunchSupersededError("session reset superseded this Codex launch")
+
+
+async def _start_codex_app_server_for_launch(
+    session_id: str,
+    app_server: CodexNativeAppServer,
+    is_current: Callable[[], bool] | None,
+    subagent_router: SubagentRouter | None = None,
+    turn_router: TurnRouter | None = None,
+) -> None:
+    try:
+        _require_current_codex_launch(is_current)
+        await app_server.start()
+        _require_current_codex_launch(is_current)
+    except BaseException:
+        with contextlib.suppress(Exception):
+            await app_server.close()
+        if subagent_router is not None:
+            with contextlib.suppress(Exception):
+                await _shutdown_session_router_async(session_id, subagent_router)
+        if turn_router is not None:
+            with contextlib.suppress(Exception):
+                await _shutdown_session_turn_router_async(session_id, turn_router)
+        raise
+    _AUTO_CODEX_APP_SERVERS[session_id] = app_server
+
+
 # Background OpenCode ``opencode serve`` instances for host-spawned
 # opencode-native runners, kept referenced so they aren't garbage-collected
 # mid-run (mirrors ``_AUTO_CODEX_APP_SERVERS``).
 _AUTO_OPENCODE_SERVERS: dict[str, OpenCodeNativeServer] = {}
+
+
+def _pop_opencode_server_if_owned(session_id: str, server: OpenCodeNativeServer) -> None:
+    if _AUTO_OPENCODE_SERVERS.get(session_id) is server:
+        _AUTO_OPENCODE_SERVERS.pop(session_id, None)
+
 
 # Bound repeated terminal GET miss logs from tight client poll loops.
 _TERMINAL_LOOKUP_MISS_LOG_INTERVAL_S = 10.0
@@ -1593,6 +1669,7 @@ async def _auto_create_opencode_terminal(
         session_id=session_id,
         server_client=server_client,
     )
+    require_current_terminal_launch()
     workspace = str(launch_config.workspace)
     bridge_dir = prepare_bridge_dir(session_id)
     # Seed the token the shared ``serve-mcp`` reads at boot (idempotent) so the
@@ -1608,6 +1685,7 @@ async def _auto_create_opencode_terminal(
     if leftover is not None:
         with contextlib.suppress(Exception):
             await leftover.close()
+    require_current_terminal_launch()
     clear_bridge_state(bridge_dir)
 
     model_override = launch_config.model_override or _opencode_native_model_from_spec(agent_spec)
@@ -1775,6 +1853,7 @@ async def _auto_create_opencode_terminal(
     # spawned server sees both. The per-session XDG_CONFIG_HOME override
     # hides the user's ~/.config/opencode/opencode.jsonc, so without this
     # merge, custom providers with non-default base URLs are invisible.
+    require_current_terminal_launch()
     config = maybe_merge_user_provider_config(config)
 
     if config:
@@ -1796,13 +1875,20 @@ async def _auto_create_opencode_terminal(
             explicit_bridge_dir=bridge_dir,
             await_notify=False,
         )
+    require_current_terminal_launch()
 
     server = OpenCodeNativeServer(
         bridge_dir=bridge_dir,
         workspace=launch_config.workspace,
         extra_env=policy_env or None,
     )
-    await server.start()
+    try:
+        await server.start()
+        require_current_terminal_launch()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            await server.close()
+        raise
     _AUTO_OPENCODE_SERVERS[session_id] = server
 
     try:
@@ -1846,6 +1932,7 @@ async def _auto_create_opencode_terminal(
         finally:
             await client.aclose()
 
+        require_current_terminal_launch()
         write_bridge_state(
             bridge_dir,
             OpenCodeNativeBridgeState(
@@ -1862,7 +1949,7 @@ async def _auto_create_opencode_terminal(
     except BaseException:
         # Include cancellation; remove ownership before closing so a close failure
         # cannot leave a stale entry or replace the startup error.
-        _AUTO_OPENCODE_SERVERS.pop(session_id, None)
+        _pop_opencode_server_if_owned(session_id, server)
         with contextlib.suppress(Exception):
             await server.close()
         raise
@@ -1873,6 +1960,8 @@ async def _auto_create_opencode_terminal(
     # supervisor closes the ``opencode serve`` subprocess when forwarding
     # ends (cancelled on session teardown), mirroring the codex forwarder's
     # ``finally`` — else one server orphans per session.
+    forwarder_task: asyncio.Task[object] | None = None
+    require_current_terminal_launch()
     if server_client is not None:
         forwarder = OpenCodeNativeForwarder(
             session_id=session_id,
@@ -1933,8 +2022,9 @@ async def _auto_create_opencode_terminal(
         )
     except BaseException:
         # Terminal startup failure or cancellation must also release the server.
-        await _cancel_auto_forwarder_task(session_id)
-        _AUTO_OPENCODE_SERVERS.pop(session_id, None)
+        if forwarder_task is not None:
+            await _cancel_auto_forwarder_task(session_id, expected=forwarder_task)
+        _pop_opencode_server_if_owned(session_id, server)
         with contextlib.suppress(Exception):
             await server.close()
         raise
@@ -1968,13 +2058,9 @@ async def _supervise_opencode_forwarder(
     try:
         await forwarder.run()
     finally:
-        leftover = _AUTO_OPENCODE_SERVERS.pop(session_id, None)
-        if leftover is not None:
-            with contextlib.suppress(Exception):
-                await leftover.close()
-        elif server is not None:
-            with contextlib.suppress(Exception):
-                await server.close()
+        _pop_opencode_server_if_owned(session_id, server)
+        with contextlib.suppress(Exception):
+            await server.close()
 
 
 # Permission decisions can park a human approval card server-side
@@ -4876,6 +4962,7 @@ async def _auto_create_codex_terminal(
     server_client: httpx.AsyncClient | None = None,
     session_init: RunnerSessionInitEnvelope | None = None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    registration_is_current: Callable[[], bool] | None = None,
 ) -> SessionResourceView:
     """
     Auto-create a Codex terminal for a codex-native session.
@@ -5142,7 +5229,9 @@ async def _auto_create_codex_terminal(
     _session_meta_provider = codex_session_meta_model_provider(_codex_launch)
     # Cancel any surviving forwarder first so its teardown closes the OLD app-server,
     # not the one registered below — and so it can't mirror alongside the new one.
+    _require_current_codex_launch(registration_is_current)
     await _cancel_auto_forwarder_task(session_id)
+    _require_current_codex_launch(registration_is_current)
     clear_bridge_state(bridge_dir)
     # Only a resume can conflict with a stale writer for the same Codex thread.
     # Fresh sessions have no thread writer to recover and must not pay for a
@@ -5171,6 +5260,7 @@ async def _auto_create_codex_terminal(
                 reaped_processes=session_reaped_processes,
             ),
         )
+        _require_current_codex_launch(registration_is_current)
 
     # Forked clone with no native thread of its own yet: clone the SOURCE's
     # local Codex rollout into the clone's OWN CODEX_HOME under a thread id
@@ -5444,6 +5534,7 @@ async def _auto_create_codex_terminal(
     )
     # SDK initialization can block on DNS/auth before model discovery times out.
     # Keep it off the runner loop so heartbeats and other sessions can progress.
+    _require_current_codex_launch(registration_is_current)
     app_server = await asyncio.to_thread(
         build_codex_native_server,
         session_id=session_id,
@@ -5476,6 +5567,7 @@ async def _auto_create_codex_terminal(
         # for the resume path where an old writer can block correctness.
         reconcile_process_registry=False,
     )
+    _require_current_codex_launch(registration_is_current)
     # Generate routing hooks.json (and bypass codex's hook-trust prompt): the
     # app-server reads the endpoint out of its own process env at start, and
     # the server decides per spawn whether to route. Any Smart Routing session,
@@ -5511,8 +5603,13 @@ async def _auto_create_codex_terminal(
         turn_routing=launch_config.turn_routing,
     )
     app_server.listen_url = codex_ws_url
-    await app_server.start()
-    _AUTO_CODEX_APP_SERVERS[session_id] = app_server
+    await _start_codex_app_server_for_launch(
+        session_id,
+        app_server,
+        registration_is_current,
+        _codex_router,
+        _codex_turn_router,
+    )
     _AUTO_CODEX_BRIDGE_DIRS[session_id] = bridge_dir
 
     event_client = CodexAppServerClient(
@@ -5543,9 +5640,9 @@ async def _auto_create_codex_terminal(
                 # The app-server started above must not outlive a refused resume:
                 # without this close, every retry stacked another live codex
                 # process (and only the newest stayed tracked for teardown).
+                _pop_codex_app_server_if_owned(session_id, app_server)
                 with contextlib.suppress(Exception):
                     await app_server.close()
-                _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
                 raise
             # Codex cannot load this thread's rollout, so no retry can resume
             # it. Start a fresh thread on the same app-server instead of
@@ -5579,8 +5676,8 @@ async def _auto_create_codex_terminal(
             # app-server.
             with contextlib.suppress(Exception):
                 await event_client.close()
+            _pop_codex_app_server_if_owned(session_id, app_server)
             await app_server.close()
-            _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
             raise
 
     # Register the Codex TUI as a streamable terminal resource attached to
@@ -5603,6 +5700,7 @@ async def _auto_create_codex_terminal(
     # below: a raise here must still close them and drop the
     # ``_AUTO_CODEX_APP_SERVERS`` entry, or the failure leaks the app-server.
     try:
+        _require_current_codex_launch(registration_is_current)
         if launch_config.external_session_id is not None:
             if launch_config.reasoning_effort:
                 # A resumed thread runs the rollout's effort, not the config pin.
@@ -5625,6 +5723,7 @@ async def _auto_create_codex_terminal(
                         extra={"session_id": session_id},
                     )
             # Publish after resume repair so live settings cannot interleave it.
+            _require_current_codex_launch(registration_is_current)
             write_bridge_state(
                 bridge_dir,
                 CodexNativeBridgeState(
@@ -5652,11 +5751,11 @@ async def _auto_create_codex_terminal(
         terminal_instance = launched.terminal_instance
         thread_start_timeout_seconds = launched.thread_start_timeout_seconds
     except BaseException:
+        _pop_codex_app_server_if_owned(session_id, app_server)
         with contextlib.suppress(Exception):
             await event_client.close()
         with contextlib.suppress(Exception):
             await app_server.close()
-        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
         raise
 
     # Known-thread resumes publish bridge state before the terminal starts;
@@ -9821,6 +9920,8 @@ class NativeLaunchContext:
     auth_token_factory: Callable[[], str | None] | None = None
     resolve_launch_config: Callable[[], Awaitable[ClaudeNativeUcodeConfig | None]] | None = None
     record_launch_config: Callable[[str, ClaudeNativeUcodeConfig | None], None] | None = None
+    # Reset invalidates a launch before it publishes its terminal.
+    registration_is_current: Callable[[], bool] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -9962,6 +10063,7 @@ async def _launch_codex(ctx: NativeLaunchContext) -> SessionResourceView:
         server_client=ctx.server_client,
         session_init=ctx.session_init,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        registration_is_current=ctx.registration_is_current,
     )
 
 
@@ -9999,6 +10101,59 @@ async def _launch_claude(ctx: NativeLaunchContext) -> SessionResourceView:
         auth_token_factory=ctx.auth_token_factory,
         resolve_launch_config=ctx.resolve_launch_config,
         record_launch_config=ctx.record_launch_config,
+    )
+
+
+async def _discard_terminal_reset_mid_launch(
+    ctx: NativeLaunchContext,
+    *,
+    terminal_name: str,
+    view: SessionResourceView | None,
+) -> None:
+    """Retract a stale pane without touching a successor in the same slot."""
+    from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
+
+    if view is None:
+        # Reset closes registered Codex servers; a late start closes itself.
+        return
+    closed = await ctx.resource_registry.close_terminal_if_matching_view(ctx.session_id, view)
+    registry = ctx.resource_registry.terminal_registry
+    if (
+        closed
+        and registry is not None
+        and registry.get(ctx.session_id, terminal_name, "main") is None
+    ):
+        _publish_terminal_deleted_event(
+            conversation_id=ctx.session_id,
+            terminal_name=terminal_name,
+            session_key="main",
+            publish_event=ctx.publish_event,
+        )
+
+
+def _fence_native_created_events(ctx: NativeLaunchContext) -> NativeLaunchContext:
+    is_current = ctx.registration_is_current
+    if is_current is None:
+        return ctx
+    publish_event = ctx.publish_event
+
+    def publish_if_current(session_id: str, event: _JsonObject) -> None:
+        if event.get("type") != "session.resource.created" or is_current():
+            publish_event(session_id, event)
+
+    return dataclasses.replace(ctx, publish_event=publish_if_current)
+
+
+def _session_reset_during_launch_response() -> JSONResponse:
+    """409 telling the caller to re-ask: a reset retired this launch's spec."""
+    return JSONResponse(
+        status_code=409,
+        content={
+            "error": {
+                "code": "session_reset_during_launch",
+                "message": "The session was reset while this terminal was starting.",
+            }
+        },
     )
 
 
@@ -10082,6 +10237,7 @@ async def _launch_native_terminal(
                 ctx = await build_context(ctx)
             elif resolve_agent_spec is not None:
                 ctx = dataclasses.replace(ctx, agent_spec=await resolve_agent_spec())
+            ctx = _fence_native_created_events(ctx)
             _logger.info(
                 "Native input startup",
                 extra=debug_event(
@@ -10091,7 +10247,8 @@ async def _launch_native_terminal(
                     stage="native_input",
                 ),
             )
-            await adapter(ctx)
+            with terminal_launch_fence(ctx.registration_is_current):
+                launched = await adapter(ctx)
             _logger.info(
                 "Native terminal started",
                 extra=debug_event(
@@ -10101,7 +10258,31 @@ async def _launch_native_terminal(
                     stage="terminal_start",
                 ),
             )
+            if ctx.registration_is_current is not None and not ctx.registration_is_current():
+                _logger.info(
+                    "Discarding %s terminal for %s: session was reset mid-launch",
+                    agent.terminal_name,
+                    ctx.session_id,
+                )
+                await _discard_terminal_reset_mid_launch(
+                    ctx,
+                    terminal_name=agent.terminal_name,
+                    view=launched,
+                )
+                return False
             return True
+        except TerminalLaunchSupersededError:
+            _logger.info(
+                "Discarding %s terminal for %s: session was reset mid-launch",
+                agent.terminal_name,
+                ctx.session_id,
+            )
+            await _discard_terminal_reset_mid_launch(
+                ctx,
+                terminal_name=agent.terminal_name,
+                view=None,
+            )
+            return False
         except Exception as exc:
             if not (
                 isinstance(exc, OmnigentError) and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
@@ -10234,6 +10415,7 @@ async def _ensure_native_terminal(
         try:
             if build_context is not None:
                 ctx = await build_context(ctx)
+            ctx = _fence_native_created_events(ctx)
             _logger.info(
                 "Native input startup",
                 extra=debug_event(
@@ -10243,7 +10425,8 @@ async def _ensure_native_terminal(
                     stage="native_input",
                 ),
             )
-            view = await adapter(ctx)
+            with terminal_launch_fence(ctx.registration_is_current):
+                view = await adapter(ctx)
             _logger.info(
                 "Native terminal started",
                 extra=debug_event(
@@ -10253,6 +10436,14 @@ async def _ensure_native_terminal(
                     stage="terminal_start",
                 ),
             )
+        except TerminalLaunchSupersededError:
+            _logger.info(
+                "Discarding %s terminal for %s: session was reset mid-ensure",
+                terminal_name,
+                ctx.session_id,
+            )
+            await _discard_terminal_reset_mid_launch(ctx, terminal_name=terminal_name, view=None)
+            return _session_reset_during_launch_response()
         except Exception as exc:
             if (
                 isinstance(exc, OmnigentError)
@@ -10286,6 +10477,18 @@ async def _ensure_native_terminal(
             return _native_terminal_start_error_response(
                 exc, agent.display_name, session_id=ctx.session_id
             )
+        if ctx.registration_is_current is not None and not ctx.registration_is_current():
+            _logger.info(
+                "Discarding %s terminal for %s: session was reset mid-ensure",
+                terminal_name,
+                ctx.session_id,
+            )
+            await _discard_terminal_reset_mid_launch(
+                ctx,
+                terminal_name=terminal_name,
+                view=view,
+            )
+            return _session_reset_during_launch_response()
         return respond(view)
 
 

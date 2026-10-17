@@ -19,7 +19,8 @@ import re
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -52,9 +53,46 @@ if TYPE_CHECKING:
     from omnigent.inner.os_env import OSEnvironment
     from omnigent.inner.terminal import TerminalInstance
     from omnigent.spec.types import AgentSpec
-    from omnigent.terminals.registry import TerminalRegistry
+    from omnigent.terminals.registry import TerminalListEntry, TerminalRegistry
 
 _logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class SessionResourceCleanup:
+    """Resources detached before cleanup can yield to a fresh session launch."""
+
+    terminals: tuple[TerminalListEntry, ...]
+    close: Callable[[], Awaitable[None]]
+
+
+_terminal_launch_guard: ContextVar[Callable[[], bool] | None] = ContextVar(
+    "terminal_launch_guard", default=None
+)
+
+
+@contextlib.contextmanager
+def terminal_launch_fence(is_current: Callable[[], bool] | None) -> Iterator[None]:
+    """Bind one runner request's reset fence to its terminal launch."""
+    _require_current_terminal_launch(is_current)
+    token = _terminal_launch_guard.set(is_current)
+    try:
+        yield
+    finally:
+        _terminal_launch_guard.reset(token)
+
+
+def _require_current_terminal_launch(is_current: Callable[[], bool] | None) -> None:
+    if is_current is not None and not is_current():
+        from omnigent.terminals.registry import TerminalLaunchSupersededError
+
+        raise TerminalLaunchSupersededError("session reset superseded this terminal launch")
+
+
+def require_current_terminal_launch() -> None:
+    """Reject side effects from a reset-superseded runner launch."""
+    _require_current_terminal_launch(_terminal_launch_guard.get())
+
 
 _DEFAULT_WORKSPACE_ROOT = os.path.join(
     os.environ.get("TMPDIR", "/tmp"),
@@ -1264,6 +1302,8 @@ class SessionResourceRegistry:
 
         from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
+        is_current = _terminal_launch_guard.get()
+        _require_current_terminal_launch(is_current)
         try:
             instance = await self._terminal_registry.launch(
                 conversation_id=session_id,
@@ -1285,6 +1325,7 @@ class SessionResourceRegistry:
                 before_observation=True,
             )
             raise
+        _require_current_terminal_launch(is_current)
         return await self._observe_terminal_with_lifecycle(
             lifecycle,
             session_id=session_id,
@@ -1292,6 +1333,7 @@ class SessionResourceRegistry:
             session_key=session_key,
             instance=instance,
             resource_role=resource_role,
+            registration_is_current=is_current,
         )
 
     async def observe_required_terminal(
@@ -1349,11 +1391,16 @@ class SessionResourceRegistry:
         session_key: str,
         instance: TerminalInstance,
         resource_role: str | None = None,
+        registration_is_current: Callable[[], bool] | None = None,
     ) -> SessionResourceView:
         """Project and observe an already-launched terminal instance."""
         if self._terminal_registry is None:
             raise RuntimeError("Terminal registry not configured")
-        if not getattr(instance, "running", False) or not await instance.is_alive():
+        registration_is_current = registration_is_current or _terminal_launch_guard.get()
+        _require_current_terminal_launch(registration_is_current)
+        alive = bool(getattr(instance, "running", False)) and await instance.is_alive()
+        _require_current_terminal_launch(registration_is_current)
+        if not alive:
             from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
             await self._finalize_terminal_exit(
@@ -1745,8 +1792,19 @@ class SessionResourceRegistry:
         """Clean up and publish lifecycle events for an unexpected terminal exit."""
         terminal_id = terminal_resource_id(terminal_name, session_key)
         with self._lock:
-            observed = self._terminal_lifecycles.pop((session_id, terminal_id), None)
-            observed_role = self._terminal_roles.pop((session_id, terminal_id), None)
+            current = (
+                self._terminal_registry.get(session_id, terminal_name, session_key)
+                if self._terminal_registry is not None
+                else None
+            )
+            superseded = instance is not None and current is not None and current is not instance
+            key = (session_id, terminal_id)
+            if superseded:
+                observed = self._terminal_lifecycles.get(key)
+                observed_role = self._terminal_roles.get(key)
+            else:
+                observed = self._terminal_lifecycles.pop(key, None)
+                observed_role = self._terminal_roles.pop(key, None)
         if observed is None:
             return
         if observed != lifecycle:
@@ -1810,10 +1868,9 @@ class SessionResourceRegistry:
                     terminal_name,
                     session_key,
                 )
-            else:
-                current = self._terminal_registry.get(session_id, terminal_name, session_key)
-                if current is not None and instance is not None and current is not instance:
-                    superseded_by = current
+            current = self._terminal_registry.get(session_id, terminal_name, session_key)
+            if current is not None and instance is not None and current is not instance:
+                superseded_by = current
 
         # A replaced launch must not consume its successor's status memo.
         session_status_before_exit = (
@@ -1948,6 +2005,49 @@ class SessionResourceRegistry:
                 return closed
         return False
 
+    async def close_terminal_if_matching_view(
+        self,
+        session_id: str,
+        view: SessionResourceView,
+    ) -> bool:
+        """Retract a terminal only while its exact pane still owns the slot."""
+        registry = self._terminal_registry
+        metadata = view.metadata
+        terminal_name = metadata.get("terminal_name")
+        session_key = metadata.get("session_key")
+        socket = metadata.get("tmux_socket")
+        target = metadata.get("tmux_target")
+        instance_id = metadata.get("terminal_instance_id")
+        if (
+            registry is None
+            or view.type != "terminal"
+            or view.session_id != session_id
+            or not isinstance(terminal_name, str)
+            or not isinstance(session_key, str)
+            or not isinstance(socket, str)
+            or not isinstance(target, str)
+            or not isinstance(instance_id, str)
+            or not instance_id
+            or view.id != terminal_resource_id(terminal_name, session_key)
+        ):
+            return False
+
+        instance = registry.get(session_id, terminal_name, session_key)
+        if (
+            instance is None
+            or instance.diagnostic_id != instance_id
+            or str(instance.socket_path) != socket
+            or instance.tmux_target != target
+        ):
+            return False
+        closed = await registry.close(session_id, terminal_name, session_key, expected=instance)
+        if closed:
+            with self._lock:
+                if registry.get(session_id, terminal_name, session_key) is None:
+                    self._terminal_roles.pop((session_id, view.id), None)
+                    self._terminal_lifecycles.pop((session_id, view.id), None)
+        return closed
+
     async def transfer_terminal(
         self,
         source_session_id: str,
@@ -2055,6 +2155,10 @@ class SessionResourceRegistry:
 
         :param session_id: Session/conversation identifier.
         """
+        await self.prepare_session_cleanup(session_id).close()
+
+    def prepare_session_cleanup(self, session_id: str) -> SessionResourceCleanup:
+        """Detach current resources synchronously; later cleanup cannot capture a successor."""
         self._take_session_status_memo(session_id)
         with self._lock:
             self._session_activity_epoch.pop(session_id, None)
@@ -2069,37 +2173,31 @@ class SessionResourceRegistry:
             ]
             for key in stale_lifecycle_keys:
                 self._terminal_lifecycles.pop(key, None)
-        if self._terminal_registry is not None:
-            try:
-                await self._terminal_registry.cleanup_conversation(
-                    session_id,
-                )
-            except Exception:
-                _logger.exception(
-                    "Error cleaning up terminals for session=%s",
-                    session_id,
-                )
+        registry = self._terminal_registry
+        terminals = registry.detach_conversation(session_id) if registry is not None else ()
 
-        if primary is not None:
-            try:
-                await run_sync_cleanup(
-                    primary.close,
-                    component="runner_primary_os_env",
-                    session_id=session_id,
-                )
-            except Exception:
-                _logger.exception(
-                    "Error closing primary env for session=%s",
-                    session_id,
-                )
-        if skills_directory is not None:
-            try:
-                await asyncio.to_thread(skills_directory.cleanup)
-            except OSError:
-                _logger.exception(
-                    "Error cleaning up Codex skills for session=%s",
-                    session_id,
-                )
+        async def close() -> None:
+            if registry is not None:
+                try:
+                    await registry.close_detached(session_id, terminals)
+                except Exception:
+                    _logger.exception("Error cleaning up terminals for session=%s", session_id)
+            if primary is not None:
+                try:
+                    await run_sync_cleanup(
+                        primary.close,
+                        component="runner_primary_os_env",
+                        session_id=session_id,
+                    )
+                except Exception:
+                    _logger.exception("Error closing primary env for session=%s", session_id)
+            if skills_directory is not None:
+                try:
+                    await asyncio.to_thread(skills_directory.cleanup)
+                except OSError:
+                    _logger.exception("Error cleaning up Codex skills for session=%s", session_id)
+
+        return SessionResourceCleanup(terminals, close)
 
     def has_primary_env(self, session_id: str) -> bool:
         """Check if a primary env has been materialized.

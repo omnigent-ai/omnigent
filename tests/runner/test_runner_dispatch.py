@@ -43,6 +43,7 @@ import logging
 import os
 import tempfile
 import threading
+import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -3173,6 +3174,7 @@ class _StubTerminalInstance:
 
     def __init__(self, running: bool = True) -> None:
         self.running = running
+        self.diagnostic_id = uuid.uuid4().hex
         # ``None`` => the view uses the default environment id, so we
         # don't need to fabricate an OSEnvironment.
         self.os_env = None

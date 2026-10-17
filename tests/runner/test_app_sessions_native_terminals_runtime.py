@@ -473,6 +473,7 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
         "cancel_launch",
         "use_envelope",
         "provider_profile",
+        "supersede_at",
     ),
     [
         pytest.param(
@@ -481,6 +482,7 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
             retain_subscription,
             cancel_launch,
             use_envelope,
+            None,
             None,
             id=f"{version}-{'cancel' if cancel_launch else 'launch'}-"
             f"{'envelope' if use_envelope else 'legacy'}",
@@ -495,8 +497,19 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
     ]
     + [
         pytest.param(
-            (0, 154, 0), [], True, False, True, "configured-workspace", id="configured-provider"
+            (0, 154, 0),
+            [],
+            True,
+            False,
+            True,
+            "configured-workspace",
+            None,
+            id="configured-provider",
         )
+    ]
+    + [
+        pytest.param((0, 154, 0), [], True, False, True, None, stage, id=f"supersede-{stage}")
+        for stage in ("preload", "effort")
     ],
 )
 @pytest.mark.parametrize("rotated", [False, True], ids=["session-dir", "label-dir"])
@@ -510,6 +523,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     use_envelope: bool,
     rotated: bool,
     provider_profile: str | None,
+    supersede_at: str | None,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
@@ -538,6 +552,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
 
     session_id = "76cbdcbbf84d4149b2a7d7441b6966c1"
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    generation = 0
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
@@ -766,12 +781,27 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     preload_calls: list[tuple[str, str, list[str] | None, str | None]] = []
     effort_calls: list[tuple[str, str, object]] = []
 
+    def supersede() -> None:
+        nonlocal generation
+        generation = 1
+        codex_native_bridge.write_bridge_state(
+            bridge_dir,
+            codex_native_bridge.CodexNativeBridgeState(
+                session_id=session_id,
+                socket_path="ws://127.0.0.1:9999",
+                thread_id="successor-thread",
+                codex_home=str(tmp_path / "successor-home"),
+            ),
+        )
+
     async def _fake_apply_effort(
         transport: str, loaded_thread_id: str, effort: str, **kwargs: Any
     ) -> None:
         effort_calls.append(
             (loaded_thread_id, effort, codex_native_bridge.read_bridge_state(bridge_dir))
         )
+        if supersede_at == "effort":
+            supersede()
 
     async def _fake_preload_thread(
         transport: str,
@@ -796,6 +826,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
         preload_calls.append((transport, loaded_thread_id, terminal_launch_args, model_provider))
         assert isinstance(cwd, Path)
         assert retain_client is retain_subscription
+        if supersede_at == "preload":
+            supersede()
         return retained_client if retain_client else None
 
     async def _fake_forward_known_thread(**kwargs: Any) -> None:
@@ -838,6 +870,26 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     )
 
     try:
+        if supersede_at is not None:
+            from omnigent.terminals.registry import TerminalLaunchSupersededError
+
+            with pytest.raises(TerminalLaunchSupersededError):
+                await _auto_create_codex_terminal(
+                    session_id,
+                    _FakeResourceRegistry(),  # type: ignore[arg-type]
+                    lambda _sid, event: published_events.append(event),
+                    agent_spec=agent_spec,
+                    server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
+                    session_init=session_init,
+                    registration_is_current=lambda: generation == 0,
+                )
+            state = codex_native_bridge.read_bridge_state(bridge_dir)
+            assert state is not None and state.thread_id == "successor-thread"
+            assert state.socket_path == "ws://127.0.0.1:9999"
+            assert app_server.closed and retained_client.closed
+            assert not launched_specs and not published_events and not forward_calls
+            assert session_id not in runner_app_mod._AUTO_CODEX_APP_SERVERS
+            return
         if cancel_launch:
             with pytest.raises(asyncio.CancelledError):
                 await _auto_create_codex_terminal(

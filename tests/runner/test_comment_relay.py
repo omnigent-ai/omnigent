@@ -37,6 +37,7 @@ from omnigent.harnesses.claude_native.bridge import (
 from omnigent.inner.datamodel import TerminalEnvSpec
 from omnigent.runner import create_runner_app
 from omnigent.runner.native import ResolvedSpec
+from omnigent.runner.resource_registry import SessionResourceCleanup
 from omnigent.spec.types import AgentSpec, ExecutorSpec, MCPServerConfig, ToolsConfig
 from omnigent.terminals import TerminalListEntry
 from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient, _sse
@@ -225,6 +226,10 @@ class _StubResourceRegistry:
         :returns: None.
         """
         del session_id
+
+    def prepare_session_cleanup(self, session_id: str) -> SessionResourceCleanup:
+        """Capture the stub's empty resource set for deferred cleanup."""
+        return SessionResourceCleanup((), lambda: self.cleanup_session(session_id))
 
 
 @dataclass

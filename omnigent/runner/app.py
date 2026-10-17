@@ -1251,6 +1251,13 @@ def create_runner_app(
 
     _version_cache: dict[str, int] = {}  # conversation_id → last seen agent_version
     _session_root_spec_cache: dict[str, _SpecEntry] = {}  # session_id → unresolved root spec
+
+    def _terminal_registration_fence(session_id: str) -> Callable[[], bool]:
+        """Fence a launch so a reset-state during its start retires what it built."""
+        if terminal_registry is None:
+            return lambda: True
+        return terminal_registry.launch_fence(session_id)
+
     _resp_to_conv: dict[str, str] = {}  # harness response_id → conversation_id
     _live_response_id: dict[str, str] = {}
     app.state.live_response_id = _live_response_id
@@ -2710,6 +2717,7 @@ def create_runner_app(
                 server_client=server_client,
                 event_dispatcher=getattr(app.state, "runner_event_dispatcher", None),
                 ensure_comment_relay=_ensure_comment_relay_started,
+                registration_is_current=_terminal_registration_fence(session_id),
             )
             _launch_pre: Callable[[bool], Awaitable[PreLaunchResult]] | None = None
             _launch_build: (
@@ -3390,6 +3398,8 @@ def create_runner_app(
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
+        if resource_registry.terminal_registry is not None:
+            resource_registry.terminal_registry.drop_launch_generation(session_id)
         _interrupted_sessions.discard(session_id)
         await _cancel_auto_forwarder_task(session_id)
         # Close any OpenCode server that no forwarder adopted.
@@ -5533,6 +5543,7 @@ def create_runner_app(
                         publish_event=_publish_event,
                         server_client=server_client,
                         ensure_comment_relay=_ensure_comment_relay_started,
+                        registration_is_current=_terminal_registration_fence(conv_id),
                     ),
                     ensure_locks=_opencode_terminal_ensure_locks,
                     resolve_agent_spec=lambda: _resolve_session_agent_spec_or_none(conv_id),
@@ -7273,6 +7284,7 @@ def create_runner_app(
         _resp_to_conv=_resp_to_conv,
         _search_registry_for_root=_search_registry_for_root,
         _session_comment_relays=_session_comment_relays,
+        _terminal_registration_fence=_terminal_registration_fence,
         auth_token_factory=auth_token_factory,
         filesystem_registry=filesystem_registry,
         resource_registry=resource_registry,
@@ -7561,6 +7573,13 @@ def create_runner_app(
 
     @app.post("/v1/sessions/{session_id}/reset-state")
     async def reset_session_state(session_id: str) -> JSONResponse:
+        from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
+
+        # Invalidate in-flight launches before tearing down registered terminals.
+        if resource_registry.terminal_registry is not None:
+            resource_registry.terminal_registry.supersede_inflight_launches(session_id)
+        codex_cleanup = _native_runtime.capture_codex_native_cleanup(session_id)
+        resource_cleanup = resource_registry.prepare_session_cleanup(session_id)
         _required_terminal_exit_errors.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
@@ -7573,11 +7592,24 @@ def create_runner_app(
         _kimi_terminal_ensure_locks.pop(session_id, None)
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
-        await _teardown_session_terminals(session_id)
-        if process_manager is not None:
-            await process_manager.release(session_id)
-        await resource_registry.cleanup_session(session_id)
         _clear_session_agent_caches(session_id)
+        for entry in resource_cleanup.terminals:
+            _publish_terminal_deleted_event(
+                conversation_id=session_id,
+                terminal_name=entry.terminal_name,
+                session_key=entry.session_key,
+                publish_event=_publish_event,
+            )
+        try:
+            if process_manager is not None:
+                await process_manager.release(session_id)
+        finally:
+            try:
+                await resource_cleanup.close()
+            finally:
+                await _native_runtime.teardown_codex_native_app_server(
+                    session_id, captured=codex_cleanup
+                )
         return JSONResponse(
             status_code=200,
             content={

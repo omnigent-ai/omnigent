@@ -159,6 +159,7 @@ def terminal_resource_view(session_id: str, entry: TerminalListEntry) -> Session
             "running": entry.instance.running,
             "tmux_socket": str(entry.instance.socket_path),
             "tmux_target": entry.instance.tmux_target,
+            "terminal_instance_id": entry.instance.diagnostic_id,
         },
     )
 
