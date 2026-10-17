@@ -157,11 +157,14 @@ adding the comma-separated deploy argument, then reload the web app after the
 redeploy:
 
 ```bash
---features usage_page,harness_install
+--features usage_page,harness_install,webfonts
 ```
 
 The Canvas page is off by default; include `canvas` in `--features` for the
 apps that should show it.
+
+The downloadable font catalogs are off by default; include `webfonts` in
+`--features` to offer Google Fonts and Nerd Fonts in Settings.
 
 See [`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md) for the current
 inventory and rollback procedure.

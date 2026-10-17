@@ -66,6 +66,14 @@ import "./index.css";
 import { QueueFlushProvider } from "./hooks/QueueFlushProvider";
 import { ExtensionProvider } from "./extensions/ExtensionProvider";
 import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
+import {
+  applyWebFontCapabilityFromServerInfo,
+  restoreFontPreferences,
+} from "./lib/restoreFontPreferences";
+
+// Keep per-device font choices effective in the embed. Catalog downloads wait
+// for the capability probe; saved CSS preferences apply immediately.
+restoreFontPreferences();
 
 export type { HtmlPreviewFrameProps, OmnigentHostConfig } from "./lib/host";
 export type { RoutingApi } from "./lib/routing";
@@ -140,11 +148,15 @@ function EmbedCapabilitiesProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let alive = true;
     const boot = createBootServerInfo(resolveServerInfo());
+    function applyCapabilities(resolved: ServerInfo): void {
+      applyWebFontCapabilityFromServerInfo(resolved);
+      setInfo(resolved);
+    }
     void boot.initial.then((resolved) => {
-      if (alive) setInfo(resolved);
+      if (alive) applyCapabilities(resolved);
     });
     void boot.settled.then((resolved) => {
-      if (alive) setInfo(resolved);
+      if (alive) applyCapabilities(resolved);
     });
     return () => {
       alive = false;

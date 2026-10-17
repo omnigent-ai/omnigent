@@ -24,6 +24,7 @@ def test_unset_or_empty_disables_every_feature(environ: dict[str, str]) -> None:
         "usage_page": False,
         "harness_install": False,
         "canvas": False,
+        "webfonts": False,
         "arca_shutdown_warnings": False,
         "import_review": False,
         "custom_agents_settings_ui": False,
@@ -60,6 +61,14 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
     assert flags.enabled(Feature.CANVAS)
     assert flags.frontend_dict()["canvas"] is True
     assert flags.enabled_names() == ("canvas",)
+
+
+def test_webfonts_is_a_frontend_visible_feature() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "webfonts"})
+
+    assert flags.enabled(Feature.WEBFONTS)
+    assert flags.frontend_dict()["webfonts"] is True
+    assert flags.enabled_names() == ("webfonts",)
 
 
 def test_arca_shutdown_warnings_are_frontend_visible() -> None:
