@@ -1407,7 +1407,10 @@ function modelSelectionPending(state: ConversationState): boolean {
 /** Keep the draft local while native model startup or a model switch is pending. */
 function waitForModelSelection(conversationId: string, tempId: string): Promise<boolean> {
   return new Promise((resolve, reject) => {
+    let settled = false;
     const finish = (ready: boolean, error?: Error) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       unsubscribe();
       unsubscribeDisposed();
@@ -1438,13 +1441,45 @@ function waitForModelSelection(conversationId: string, tempId: string): Promise<
     const unsubscribeDisposed = conversationRegistry.subscribeDisposed((id) => {
       if (id === conversationId) finish(false);
     });
-    const timer = setTimeout(
-      () =>
-        finish(false, new Error("The model did not finish starting. Please retry the message.")),
-      SEND_CHAIN_MAX_WAIT_MS,
-    );
+    // The stream does not replay `session.model`, so a report this tab missed
+    // (a dropped stream, a sleeping laptop) would fail a message the runner is
+    // ready for. Re-read the snapshot once before giving up.
+    const timer = setTimeout(() => {
+      void adoptSnapshotModelReport(conversationId).then(() => {
+        check();
+        finish(false, new Error("The model did not finish starting. Please retry the message."));
+      });
+    }, SEND_CHAIN_MAX_WAIT_MS);
     check();
   });
+}
+
+/**
+ * Settle a seeded model the session snapshot has since reported, on the same
+ * terms `sessionBindingPatch` applies at bind.
+ */
+function snapshotModelReportPatch(
+  session: Session,
+  s: Pick<ConversationState, "sessionModelSeeded">,
+): Partial<ConversationState> {
+  return s.sessionModelSeeded && session.llmModel != null
+    ? { llmModel: session.llmModel, sessionModelSeeded: false }
+    : {};
+}
+
+/** Apply a model report this tab's stream missed, from a fresh session snapshot. */
+async function adoptSnapshotModelReport(conversationId: string): Promise<void> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS);
+  let session: Session;
+  try {
+    session = await getSessionSlim(conversationId, { signal: controller.signal });
+  } catch {
+    return;
+  } finally {
+    clearTimeout(timeout);
+  }
+  setterFor(conversationId)((s) => snapshotModelReportPatch(session, s));
 }
 
 /**
@@ -4818,6 +4853,9 @@ function reconnectStatusPatch(
   const patch: Partial<ChatState> = {
     sessionStatus: session.status,
     ...mcpStartupSnapshotPatch(session, s, launchBeforeFetch),
+    // A `session.model` missed in the gap would otherwise hold a first
+    // message on `waitForModelSelection` until its deadline.
+    ...snapshotModelReportPatch(session, s),
   };
   // Recover the background-shell tally across the gap too, so the spinner
   // returns to "N background tasks still running" rather than vanishing on reconnect.

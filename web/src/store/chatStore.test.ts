@@ -3692,9 +3692,11 @@ describe("chatStore — first message during native model startup", () => {
   const sessionId = "conv_native_startup";
   const original = "unfinished first prompt";
   let harness = "claude-native";
+  let snapshotModel: string | null = null;
 
   beforeEach(() => {
     harness = "claude-native";
+    snapshotModel = null;
     clearSessionDrafts();
     seedSession(sessionId);
     fetchMock.mockImplementation((input, init) => {
@@ -3709,7 +3711,7 @@ describe("chatStore — first message during native model startup", () => {
             "omnigent.wrapper":
               harness === "claude-native" ? "claude-code-native-ui" : "codex-native-ui",
           },
-          llm_model: null,
+          llm_model: snapshotModel,
         });
       }
       return defaultFetchHandler(input, init);
@@ -3959,6 +3961,120 @@ describe("chatStore — first message during native model startup", () => {
       failedSendDraft: { conversationId: sessionId, text: original, files: [] },
     });
     expect(useChatStore.getState().blocks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "error",
+          message: expect.stringContaining("model did not finish starting"),
+        }),
+      ]),
+    );
+  });
+
+  it("sends the draft once a status snapshot carries the model report the stream missed", async () => {
+    vi.useFakeTimers();
+    begin();
+    await vi.advanceTimersByTimeAsync(0);
+    snapshotModel = "haiku";
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(eventBodies()).toEqual([
+      {
+        type: "message",
+        data: expect.objectContaining({ content: [{ type: "input_text", text: original }] }),
+      },
+    ]);
+    expect(useChatStore.getState()).toMatchObject({ llmModel: "haiku", sessionModelSeeded: false });
+  });
+
+  /** Park matching requests until `release` answers them or their signal aborts. */
+  function parkRequests(matches: (url: string, init?: RequestInit) => boolean): {
+    release: () => void;
+  } {
+    const baseFetch = fetchMock.getMockImplementation()!;
+    const parked: (() => void)[] = [];
+    fetchMock.mockImplementation((input, init) =>
+      matches(String(input), init)
+        ? new Promise<Response>((resolve, reject) => {
+            init?.signal?.addEventListener("abort", () =>
+              reject(new DOMException("aborted", "AbortError")),
+            );
+            parked.push(() => resolve(baseFetch(input, init)));
+          })
+        : baseFetch(input, init),
+    );
+    return { release: () => parked.splice(0).forEach((answer) => answer()) };
+  }
+
+  /**
+   * Start the session, then switch away with its stream unopened, so only the
+   * model-wait deadline can read its snapshot.
+   */
+  async function beginInBackground(): Promise<void> {
+    vi.useFakeTimers();
+    parkRequests((url) => url === `/v1/sessions/${sessionId}/stream`);
+    begin();
+    await vi.advanceTimersByTimeAsync(0);
+    seedSession("conv_other");
+    const switching = useChatStore.getState().switchTo("conv_other");
+    await vi.advanceTimersByTimeAsync(0);
+    await switching;
+  }
+
+  const parkSnapshots = () =>
+    parkRequests(
+      (url, init) =>
+        url.split("?")[0] === `/v1/sessions/${sessionId}` && (init?.method ?? "GET") === "GET",
+    );
+
+  it("re-reads the snapshot at the model-wait deadline before failing the draft", async () => {
+    await beginInBackground();
+    snapshotModel = "haiku";
+    await vi.advanceTimersByTimeAsync(179_000);
+    expect(eventBodies()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(eventBodies()).toHaveLength(1);
+    expect(conversationRegistry.peek(sessionId)?.getState()).toMatchObject({
+      llmModel: "haiku",
+      sessionModelSeeded: false,
+    });
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
+
+  it("sends once when the live report lands during the deadline re-read", async () => {
+    await beginInBackground();
+    const snapshots = parkSnapshots();
+    await vi.advanceTimersByTimeAsync(180_000);
+    expect(eventBodies()).toEqual([]);
+
+    reportModel();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(eventBodies()).toHaveLength(1);
+    snapshotModel = "stale-model";
+    snapshots.release();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(eventBodies()).toHaveLength(1);
+    expect(conversationRegistry.peek(sessionId)?.getState()).toMatchObject({
+      llmModel: "haiku",
+      failedSendDraft: null,
+    });
+  });
+
+  it("restores the draft when the deadline re-read times out", async () => {
+    await beginInBackground();
+    parkSnapshots();
+    await vi.advanceTimersByTimeAsync(180_000);
+    expect(conversationRegistry.peek(sessionId)?.getState().failedSendDraft).toBeNull();
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    expect(eventBodies()).toEqual([]);
+    const state = conversationRegistry.peek(sessionId)?.getState();
+    expect(state).toMatchObject({
+      pendingUserMessages: [],
+      failedSendDraft: { conversationId: sessionId, text: original, files: [] },
+    });
+    expect(state?.blocks).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           type: "error",
