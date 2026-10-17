@@ -175,13 +175,12 @@ interface SceneResources {
 }
 
 /**
- * Push `theme` onto a built scene: canvas clear color, light intensities, and
- * the STL default material (3MF/OBJ keep their own materials). Safe to call on
+ * Push `theme` onto a built scene: light intensities and the STL default
+ * material (3MF/OBJ keep their own materials). Safe to call on
  * a partially-built `res` — each field is guarded — so the theme effect can run
  * before or after the async scene build completes.
  */
 function applyTheme(res: SceneResources, theme: ModelViewerTheme): void {
-  res.renderer?.setClearColor(theme.background, 1);
   if (res.ambient) res.ambient.intensity = theme.ambientIntensity;
   if (res.key) res.key.intensity = theme.keyIntensity;
   res.stlMaterial?.color.setHex(theme.stlMaterial);
@@ -236,7 +235,7 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
   const themeRef = useRef<ModelViewerTheme>(modelViewerTheme(mode));
 
   // A theme toggle while a model is open updates the live scene in place —
-  // clear color, light intensities, and the STL material — with no reload.
+  // light intensities and the STL material — with no reload.
   useEffect(() => {
     const theme = modelViewerTheme(mode);
     themeRef.current = theme;
@@ -327,10 +326,10 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
         res.key = key;
         res.scene.add(key);
 
-        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        // Transparent canvas: the pane's theme background shows through, so it
+        // follows light/dark and custom theme colors with no JS plumbing.
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
         res.renderer = renderer;
-        // Canvas background follows the theme so it sits flush with the panel.
-        renderer.setClearColor(theme.background, 1);
         renderer.setPixelRatio(window.devicePixelRatio);
         const rect = container.getBoundingClientRect();
         renderer.setSize(rect.width || 1, rect.height || 1);
