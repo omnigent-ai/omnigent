@@ -369,3 +369,12 @@ def test_resolve_agent_bundle_ships_the_shared_skills(tmp_path: Path) -> None:
             encoding="utf-8"
         )
     assert not (extracted / "skills" / "resolve-drive-pr" / "review_cycle.py").exists()
+
+
+def test_after_clip_last_frame_rejects_teardown_state() -> None:
+    normalized = _normalized_resolve_instructions()
+
+    assert "Before captioning, inspect the raw clip's last frame" in normalized
+    assert 'greyed out behind "Bridge closed: terminal session ended"' in normalized
+    assert "fix the stop point" in normalized
+    assert "Do not caption around it or declare such a clip as the after-clip" in normalized

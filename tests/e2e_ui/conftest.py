@@ -32,6 +32,7 @@ pytest tmp dir so the test never touches the user's default
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import io
 import json
@@ -2251,10 +2252,21 @@ def _workspace_panel_test_baseline(request: pytest.FixtureRequest) -> None:
     page.add_init_script("window.localStorage.setItem('omnigent:default-workspace-panel', 'open')")
 
 
-def _install_record_video_patches(monkeypatch: pytest.MonkeyPatch, record_dir: str) -> None:
+# Contexts the patched ``Browser`` methods opened during one test, each with the
+# event loop that owns it (async API) or ``None`` (sync API).
+_OPENED_RECORDING_CONTEXTS = pytest.StashKey[list[tuple[Any, asyncio.AbstractEventLoop | None]]]()
+
+
+def _install_record_video_patches(
+    monkeypatch: pytest.MonkeyPatch,
+    record_dir: str,
+    opened: list[tuple[Any, asyncio.AbstractEventLoop | None]],
+) -> None:
     """Inject ``record_video_dir`` into every page/context a ``Browser`` opens,
-    on both the async and sync Playwright APIs. A caller that already passes
-    ``record_video_dir`` is left alone."""
+    on both the async and sync Playwright APIs, and register each recording
+    context in ``opened`` so its video can be stopped with the test body. A
+    caller that already passes ``record_video_dir`` is left alone; ``None``
+    opts the context out of recording and of the early close."""
     from playwright.async_api import Browser as _AsyncBrowser
     from playwright.sync_api import Browser as _SyncBrowser
 
@@ -2265,19 +2277,31 @@ def _install_record_video_patches(monkeypatch: pytest.MonkeyPatch, record_dir: s
 
     async def _new_page(self: Any, *args: Any, **kwargs: Any) -> Any:
         kwargs.setdefault("record_video_dir", record_dir)
-        return await _orig_new_page(self, *args, **kwargs)
+        page = await _orig_new_page(self, *args, **kwargs)
+        if kwargs["record_video_dir"]:
+            opened.append((page.context, asyncio.get_running_loop()))
+        return page
 
     async def _new_context(self: Any, *args: Any, **kwargs: Any) -> Any:
         kwargs.setdefault("record_video_dir", record_dir)
-        return await _orig_new_context(self, *args, **kwargs)
+        context = await _orig_new_context(self, *args, **kwargs)
+        if kwargs["record_video_dir"]:
+            opened.append((context, asyncio.get_running_loop()))
+        return context
 
     def _sync_new_page(self: Any, *args: Any, **kwargs: Any) -> Any:
         kwargs.setdefault("record_video_dir", record_dir)
-        return _orig_sync_new_page(self, *args, **kwargs)
+        page = _orig_sync_new_page(self, *args, **kwargs)
+        if kwargs["record_video_dir"]:
+            opened.append((page.context, None))
+        return page
 
     def _sync_new_context(self: Any, *args: Any, **kwargs: Any) -> Any:
         kwargs.setdefault("record_video_dir", record_dir)
-        return _orig_sync_new_context(self, *args, **kwargs)
+        context = _orig_sync_new_context(self, *args, **kwargs)
+        if kwargs["record_video_dir"]:
+            opened.append((context, None))
+        return context
 
     monkeypatch.setattr(_AsyncBrowser, "new_page", _new_page)
     monkeypatch.setattr(_AsyncBrowser, "new_context", _new_context)
@@ -2287,6 +2311,7 @@ def _install_record_video_patches(monkeypatch: pytest.MonkeyPatch, record_dir: s
 
 @pytest.fixture(autouse=True)
 def _record_video(
+    request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[None]:
     """Record async and sync browser journeys when OMNIGENT_E2E_RECORD_DIR is set.
@@ -2300,7 +2325,8 @@ def _record_video(
         return
 
     Path(record_dir).mkdir(parents=True, exist_ok=True)
-    _install_record_video_patches(monkeypatch, record_dir)
+    opened = request.node.stash.setdefault(_OPENED_RECORDING_CONTEXTS, [])
+    _install_record_video_patches(monkeypatch, record_dir, opened)
     yield
 
 
@@ -2318,23 +2344,48 @@ def _recording_requested(item: pytest.Item) -> bool:
     return marker is not None and bool(marker.kwargs.get("record_video_dir"))
 
 
-def _stop_recorded_context(item: pytest.Item) -> None:
-    """Close the pytest-playwright context so its video ends on the test's final state."""
-    context = getattr(item, "funcargs", {}).get("context")
+def _warn_recording_not_finalized(item: pytest.Item, reason: object) -> None:
+    # A diagnostic from the report hook must not replace the test result,
+    # even when the suite promotes warnings to errors.
+    with warnings.catch_warnings():
+        warnings.simplefilter("always", pytest.PytestWarning)
+        item.warn(
+            pytest.PytestWarning(f"Could not finalize recording for {item.nodeid}: {reason}")
+        )
+
+
+def _close_recorded_context(
+    item: pytest.Item, context: Any, loop: asyncio.AbstractEventLoop | None = None
+) -> None:
+    """Close a recording context so its video ends on the test's final state.
+
+    ``loop`` is the event loop that owns an async-API context; ``None`` for the sync API."""
     # No open page means the test closed it and the video is already finalized.
-    if context is None or not context.pages:
+    if not context.pages:
         return
-    # pytest-playwright's close wrapper still takes its screenshots and traces.
+    if loop is not None and (loop.is_closed() or loop.is_running()):
+        _warn_recording_not_finalized(item, "its event loop is no longer available")
+        return
     try:
-        context.close()
-    except Error as exc:
-        # A diagnostic from the report hook must not replace the test result,
-        # even when the suite promotes warnings to errors.
-        with warnings.catch_warnings():
-            warnings.simplefilter("always", pytest.PytestWarning)
-            item.warn(
-                pytest.PytestWarning(f"Could not finalize recording for {item.nodeid}: {exc}")
-            )
+        if loop is None:
+            context.close()
+        else:
+            loop.run_until_complete(context.close())
+    except (Error, RuntimeError) as exc:
+        _warn_recording_not_finalized(item, exc)
+
+
+def _stop_recorded_contexts(item: pytest.Item) -> None:
+    """Close pytest-playwright's ``context`` and every context the test opened itself."""
+    context = getattr(item, "funcargs", {}).get("context")
+    if context is not None:
+        # pytest-playwright's close wrapper still takes its screenshots and traces.
+        _close_recorded_context(item, context)
+    for opened, loop in item.stash.get(_OPENED_RECORDING_CONTEXTS, []):
+        # The ``context`` fixture is also opened through the patched method.
+        if opened is context:
+            continue
+        _close_recorded_context(item, opened, loop)
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -2343,10 +2394,11 @@ def pytest_runtest_makereport(
 ) -> Generator[None, None, None]:
     """Stop the recording when the test body ends, before later fixtures tear down.
 
-    The ``context`` behind ``page`` otherwise outlives the session fixtures' teardown."""
+    The ``context`` behind ``page``, and any page or context the test opened through
+    the patched ``Browser`` methods, otherwise outlive the session fixtures' teardown."""
     yield
     if call.when == "call" and _recording_requested(item):
-        _stop_recorded_context(item)
+        _stop_recorded_contexts(item)
 
 
 # Screenshot kwargs that describe the clipped result rather than the
