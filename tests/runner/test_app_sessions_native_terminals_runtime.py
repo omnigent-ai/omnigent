@@ -2881,8 +2881,8 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
     """
     Snapshot ``terminal_launch_args`` reach the launched kimi argv.
 
-    This is the seam the server-derived ``--yolo`` rides: a named kimi-native
-    sub-agent with ``yolo: true`` persists ``["--yolo"]`` on the session, and
+    This is the seam the server-derived ``--auto`` rides: a named kimi-native
+    sub-agent with ``yolo: true`` persists ``["--auto"]`` on the session, and
     the runner's auto-create must append it verbatim to the bare ``kimi`` TUI
     command. A failure means the derived flag is dropped, the worker launches
     as plain ``kimi``, and every risky tool call parks on an approval prompt
@@ -2928,7 +2928,7 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
 
     monkeypatch.setattr(kimi_fwd_mod, "supervise_kimi_forwarder", _sleeping_forwarder)
 
-    snapshot = {"workspace": str(workspace), "terminal_launch_args": ["--yolo"]}
+    snapshot = {"workspace": str(workspace), "terminal_launch_args": ["--auto"]}
 
     class _SnapshotServerClient:
         """Server client returning the persisted session snapshot."""
@@ -2995,7 +2995,7 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
     spec = launched_specs[0]
     # Bare ``kimi`` plus the persisted pass-through args, verbatim.
     assert spec.command == "/fake/bin/kimi"
-    assert spec.args == ["--yolo"]
+    assert spec.args == ["--auto"]
 
 
 @pytest.mark.asyncio

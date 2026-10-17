@@ -10996,7 +10996,8 @@ def _derive_terminal_launch_args_from_spec(
       yolo.
     - kimi-native + ``executor.config.yolo: true`` or
       ``permission_mode: bypassPermissions`` -> ``["--auto"]`` (Kimi's
-      Never Ask mode). Opt-IN: absent / false leaves args unset.
+      Never Ask mode). ``permission_mode`` takes precedence over
+      ``yolo: false``. Opt-IN: absent / false leaves args unset.
     - antigravity-native + ``executor.config.permission_mode:
       bypassPermissions`` -> ``["--dangerously-skip-permissions"]``, agy's
       only pre-emptive permission control. Opt-IN like claude-native;
@@ -11091,8 +11092,14 @@ def _derive_terminal_launch_args_from_spec(
         return _validate_terminal_launch_args(["--yolo"])
     if harness == _KIMI_NATIVE_HARNESS:
         permission_mode = spec.executor.config.get("permission_mode")
-        if permission_mode == "bypassPermissions":
+        if isinstance(permission_mode, str) and permission_mode == "bypassPermissions":
             return _validate_terminal_launch_args(["--auto"])
+        if permission_mode is not None:
+            _logger.debug(
+                "kimi-native sub-spec has unrecognized permission_mode=%r; "
+                "launching without --auto.",
+                permission_mode,
+            )
 
         # Kimi's --yolo still asks for approval when needed; --auto is its
         # Never Ask mode and is enabled only by an explicit spec opt-in.
