@@ -1351,6 +1351,10 @@ class SqlHost(OmnigentBase):
     token_expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     sandbox_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # Attached sandboxes are reusable and owned outside Omnigent's lifecycle.
+    sandbox_attached: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
     terminating_sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
