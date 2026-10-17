@@ -110,6 +110,11 @@ def prepare_codex_worker(
     worker_env: MutableMapping[str, str] | None = None,
 ) -> CodexWorkerLaunch:
     """Prepare a contained worker or propagate the containment failure."""
+    if os_env is not None and os_env.sandbox is not None and os_env.sandbox.tcp_egress is not None:
+        raise ValueError(
+            "the Codex worker does not support tcp_egress; "
+            "use sys_os_shell or an inherited sandboxed terminal"
+        )
     if os_env is None or (os_env.sandbox is not None and os_env.sandbox.type == "none"):
         if signer_readiness is not None:
             raise OSError("signer-backed Codex worker requires an active sandbox")

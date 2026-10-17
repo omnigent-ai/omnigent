@@ -364,7 +364,7 @@ def _parse_agent_def(
         if effective_sandbox is not None and effective_sandbox.requires_network_enforcement:
             raise ValueError(
                 f"terminal {term_name!r}: allow_sandbox_override=true is "
-                "incompatible with egress_rules or git_ssh on the effective sandbox. "
+                "incompatible with egress_rules, git_ssh, or tcp_egress on the effective sandbox. "
                 "An override of sandbox.type to 'none' "
                 "drops hard network enforcement while network policy remains "
                 "as inert decoration on the policy, so the LLM could "
@@ -868,10 +868,15 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
         _parse_git_ssh,
     )
 
+    from .tcp_egress_policy import parse_tcp_egress
+
     credential_proxy = _parse_credential_proxy(data.get("credential_proxy"))
     git_ssh = _parse_git_ssh(data.get("git_ssh"))
+    tcp_egress = parse_tcp_egress(data.get("tcp_egress"), egress_rules=egress_rules or ())
     if git_ssh and sandbox_type not in ("linux_bwrap", "darwin_seatbelt"):
         raise ValueError("os_env.sandbox.git_ssh requires linux_bwrap or darwin_seatbelt")
+    if tcp_egress and sandbox_type not in ("linux_bwrap", "darwin_seatbelt"):
+        raise ValueError("os_env.sandbox.tcp_egress requires linux_bwrap or darwin_seatbelt")
     if credential_proxy is not None and sandbox_type not in ("linux_bwrap", "darwin_seatbelt"):
         raise ValueError(
             "os_env.sandbox.credential_proxy requires sandbox.type=linux_bwrap "
@@ -929,6 +934,7 @@ def _parse_os_env_sandbox_spec(data: YamlData | str | bool | None) -> OSEnvSandb
         egress_allow_private_destinations=allow_private,
         credential_proxy=credential_proxy,
         git_ssh=git_ssh,
+        tcp_egress=tcp_egress,
     )
 
 

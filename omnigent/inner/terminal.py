@@ -57,6 +57,7 @@ from .sandbox import (
     with_additional_write_roots,
     with_denied_unix_sockets,
 )
+from .tcp_egress import TcpEgressBroker, apply_tcp_egress_env, start_tcp_egress_broker
 from .terminal_clipboard import TerminalClipboardBridge
 from .terminal_lifecycle import (
     TERMINAL_INSTANCE_ID_ENV,
@@ -664,6 +665,7 @@ def _clone_sandbox_spec(sandbox: OSEnvSandboxSpec | None) -> OSEnvSandboxSpec | 
         ),
         egress_rules=list(sandbox.egress_rules) if sandbox.egress_rules is not None else None,
         git_ssh=list(sandbox.git_ssh) if sandbox.git_ssh is not None else None,
+        tcp_egress=list(sandbox.tcp_egress) if sandbox.tcp_egress is not None else None,
     )
 
 
@@ -1032,7 +1034,7 @@ def build_terminal_os_env_spec(
         if sandbox.requires_network_enforcement:
             raise ValueError(
                 "sandbox_override is not allowed on a terminal whose "
-                "effective sandbox declares egress_rules or git_ssh: overriding "
+                "effective sandbox declares egress_rules, git_ssh, or tcp_egress: overriding "
                 "to 'none' would drop hard network "
                 "enforcement while network policy remains as inert "
                 "decoration on the policy."
@@ -1126,6 +1128,8 @@ class TerminalInstance:
     _egress_tmpdir: Path | None = field(default=None, repr=False)
     _git_ssh_broker: GitSshBroker | None = field(default=None, repr=False)
     _git_ssh_tmpdir: Path | None = field(default=None, repr=False)
+    _tcp_egress_broker: TcpEgressBroker | None = field(default=None, repr=False)
+    _tcp_egress_tmpdir: Path | None = field(default=None, repr=False)
     _clipboard_bridge: TerminalClipboardBridge | None = field(default=None, init=False, repr=False)
     _idle_task: asyncio.Task[None] | None = field(default=None, repr=False)
     # Threaded idle-watcher state. Mirrors :attr:`_idle_task` but for
@@ -1634,6 +1638,8 @@ class TerminalInstance:
                 sandbox_for_launcher = self._bootstrap_egress_proxy(sandbox_for_launcher, env)
             if sandbox_for_launcher.git_ssh:
                 sandbox_for_launcher = self._bootstrap_git_ssh(sandbox_for_launcher, env)
+            if sandbox_for_launcher.tcp_egress:
+                sandbox_for_launcher = self._bootstrap_tcp_egress(sandbox_for_launcher, env)
             cli_path = shutil.which(self.command) or self.command
             try:
                 if sandbox_for_launcher.copy_on_write_namespace:
@@ -1645,6 +1651,7 @@ class TerminalInstance:
                     launcher_path = create_exec_launcher(cli_path, sandbox_for_launcher)
             except Exception:
                 self._stop_git_ssh()
+                self._stop_tcp_egress()
                 raise
             inner_cmd = [launcher_path, *self.args]
         else:
@@ -1729,6 +1736,7 @@ class TerminalInstance:
             if self._clipboard_bridge is not None:
                 await asyncio.to_thread(self._clipboard_bridge.close)
             self._stop_git_ssh()
+            self._stop_tcp_egress()
             raise
 
         self.running = True
@@ -1917,6 +1925,32 @@ class TerminalInstance:
             cleanup_private_tmpdir(self._git_ssh_tmpdir)
             self._git_ssh_tmpdir = None
 
+    def _bootstrap_tcp_egress(self, sandbox: SandboxPolicy, env: dict[str, str]) -> SandboxPolicy:
+        routes = sandbox.tcp_egress
+        assert routes is not None
+        self._tcp_egress_tmpdir = create_private_tmpdir()
+        try:
+            sandbox = with_additional_write_roots(sandbox, [self._tcp_egress_tmpdir])
+            self._tcp_egress_broker = start_tcp_egress_broker(routes, self._tcp_egress_tmpdir)
+            apply_tcp_egress_env(env, self._tcp_egress_broker)
+        except Exception:
+            self._stop_tcp_egress()
+            raise
+        return replace(sandbox, tcp_egress_socket_path=str(self._tcp_egress_broker.socket_path))
+
+    def _stop_tcp_egress(self) -> None:
+        if self._tcp_egress_broker is not None:
+            try:
+                self._tcp_egress_broker.stop()
+            except Exception:
+                logger.exception(
+                    "TCP egress broker stop failed for terminal %s:%s", self.name, self.session_key
+                )
+            self._tcp_egress_broker = None
+        if self._tcp_egress_tmpdir is not None:
+            cleanup_private_tmpdir(self._tcp_egress_tmpdir)
+            self._tcp_egress_tmpdir = None
+
     def _stop_network_brokers(self) -> None:
         if self._egress_handle is not None:
             try:
@@ -1930,6 +1964,7 @@ class TerminalInstance:
             cleanup_private_tmpdir(self._egress_tmpdir)
             self._egress_tmpdir = None
         self._stop_git_ssh()
+        self._stop_tcp_egress()
 
     async def close(self) -> None:
         """Kill the tmux session and clean up."""

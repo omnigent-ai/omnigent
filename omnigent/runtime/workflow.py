@@ -391,9 +391,9 @@ def _configure_brokered_codex_with_ucode(
         else:
             # In place, so the session's OS tools share the worker's sandbox.
             spec.os_env.sandbox = sandbox
-    if sandbox.egress_rules:
+    if sandbox.egress_rules or sandbox.tcp_egress:
         raise OmnigentError(
-            "signer-backed Codex does not support os_env.sandbox.egress_rules; "
+            "signer-backed Codex does not support os_env.sandbox.egress_rules or tcp_egress; "
             "brokered sessions are model-only",
             code=ErrorCode.INVALID_INPUT,
         )
