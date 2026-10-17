@@ -13,6 +13,7 @@ import os
 import pathlib
 
 import pytest
+from omnigent_ui_sdk.terminal import RichBlockFormatter
 from prompt_toolkit.document import Document
 
 from omnigent.repl import _repl
@@ -212,6 +213,7 @@ def test_bang_input_style_is_the_logo_green() -> None:
         ("!echo hi", True),  # a "!" shell command → green
         ("!", True),  # bare "!" (bang mode active) → green
         ("!cd /tmp", True),  # "!cd" is still a bang command → green
+        ("!ls /help", True),  # a slash token inside a bang line stays green
         ("!!literal", False),  # "!!" escape → ordinary prompt, not green
         ("ls -la", False),  # normal prompt → unstyled
         ("", False),  # empty composer → unstyled
@@ -222,3 +224,45 @@ def test_bang_input_lexer_colors_only_bang_lines(text: str, colored: bool) -> No
     style, rendered = get_line(0)[0]
     assert rendered == text
     assert (style == _BANG_INPUT_STYLE) is colored
+
+
+def _style_per_char(text: str) -> list[str]:
+    """The composer style applied to each character of a single-line draft."""
+    fragments = _BangInputLexer().lex_document(Document(text))(0)
+    assert "".join(piece for _, piece in fragments) == text
+    return [style for style, piece in fragments for _ in piece]
+
+
+def _accent_style() -> str:
+    """The terminal's brand accent, which the ``/help`` listing paints commands in."""
+    return f"fg:{RichBlockFormatter().accent}"
+
+
+@pytest.mark.parametrize(
+    ("text", "token"),
+    [
+        # Same shape as the web composer: accent on the command, default colour on the argument.
+        ("/help check this diff", "/help"),
+        ("/figplug:plug-skill hi", "/figplug:plug-skill"),  # a Claude plugin skill
+        ("  /help now", "/help"),  # the dispatcher splits, so indent is tolerated
+        ("/", "/"),  # a bare "/" still dispatches (and reports unknown)
+        # The dispatcher sends these to the model, so the colour must not promise a command.
+        ("/Users/me/shot.png is attached", ""),
+        ("hey /tmp", ""),
+        ("!!/help", ""),  # the "!!" escape is an ordinary prompt
+    ],
+)
+def test_composer_tints_exactly_the_token_the_dispatcher_intercepts(text: str, token: str) -> None:
+    styles = _style_per_char(text)
+    tinted = "".join(
+        ch for ch, style in zip(text, styles, strict=True) if style == _accent_style()
+    )
+    assert tinted == token, styles
+    assert set(styles) <= {"", _accent_style()}
+
+
+def test_composer_tints_the_command_token_of_a_pasted_multiline_draft() -> None:
+    get_line = _BangInputLexer().lex_document(Document("\n  /help check\nthis"))
+    assert get_line(0) == [("", "")]
+    assert get_line(1) == [("", "  "), (_accent_style(), "/help"), ("", " check")]
+    assert get_line(2) == [("", "this")]
