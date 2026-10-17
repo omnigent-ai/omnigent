@@ -126,10 +126,10 @@ def unreachable_start_run(tmp_path_factory: pytest.TempPathFactory) -> _StartRun
     finally:
         reader.join(timeout=10)
         elapsed = time.monotonic() - start
-        # The failed `start` is expected to reap its own daemon; sweep any
-        # leftover so a bug in that cleanup can't leak into other tests.
+        # Stop only this config's daemons; `omnigent stop` also sweeps the
+        # default server port, which can belong to another pytest worker.
         subprocess.run(
-            [sys.executable, "-m", "omnigent", "stop", "--force"],
+            [sys.executable, "-m", "omnigent", "host", "stop", "--all", "--force"],
             env=env,
             cwd=str(home),
             stdout=subprocess.DEVNULL,

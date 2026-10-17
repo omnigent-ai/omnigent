@@ -181,17 +181,24 @@ def register_elicitations_routes(
             if conv is None:
                 raise _session_not_found()
 
-        found = pending_elicitations.lookup(elicitation_id)
-        if found is None or found[0] != session_id:
+        found = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+        if found is None:
             return {"status": "resolved"}
 
         _conv_id, event = found
         params_value = event.get("params")
         params = params_value if isinstance(params_value, dict) else {}
+        if params.get("target_session_id") not in (None, session_id):
+            return {"status": "resolved"}
         return {
             "status": "pending",
             "message": params.get("message", "Approval required"),
             "phase": params.get("phase", ""),
             "policy_name": params.get("policy_name", ""),
             "content_preview": params.get("content_preview", ""),
+            **(
+                {"native_delivery": params["native_delivery"]}
+                if "native_delivery" in params
+                else {}
+            ),
         }

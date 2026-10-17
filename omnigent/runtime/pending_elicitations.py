@@ -345,7 +345,9 @@ def project_for_peek(event: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
-def lookup(elicitation_id: str) -> tuple[str, dict[str, Any]] | None:
+def lookup(
+    elicitation_id: str, *, conversation_id: str | None = None
+) -> tuple[str, dict[str, Any]] | None:
     """
     Look up a single outstanding elicitation by its correlation id.
 
@@ -358,11 +360,17 @@ def lookup(elicitation_id: str) -> tuple[str, dict[str, Any]] | None:
 
     :param elicitation_id: The elicitation correlation id to look up,
         e.g. ``"elicit_abc123"``.
+    :param conversation_id: Restrict lookup to this session. Callers that
+        know the session must pass it: ancestor mirrors share the same id,
+        so the first global match does not establish ownership.
     :returns: ``(conversation_id, event_dict)`` when found, ``None``
         otherwise. The event dict is a deep copy so callers cannot
         mutate the index.
     """
     with _lock:
+        if conversation_id is not None:
+            event = _pending.get(conversation_id, {}).get(elicitation_id)
+            return (conversation_id, copy.deepcopy(event)) if event is not None else None
         for conv_id, ids in _pending.items():
             if elicitation_id in ids:
                 return conv_id, copy.deepcopy(ids[elicitation_id])

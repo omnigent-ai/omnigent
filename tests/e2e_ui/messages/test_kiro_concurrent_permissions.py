@@ -427,12 +427,22 @@ def kiro_shim_session(
     if request.config.getoption("--ui-base-url"):
         pytest.skip("kiro permission-mirror e2e requires an isolated spawned server")
 
+    source = getattr(request, "param", _FAKE_KIRO_SOURCE)
+    server_root = _REPO_ROOT
+    if isinstance(source, dict):
+        checkout = source["server_checkout"]
+        if not checkout:
+            pytest.skip("set OMNIGENT_E2E_KIRO_LEGACY_SERVER_CHECKOUT to an older server checkout")
+        server_root = Path(checkout).resolve()
+        assert (server_root / "omnigent/server/app.py").is_file()
+        source = source["source"]
+
     from omnigent.harnesses.kiro_native.bridge import bridge_dir_for_session_id
     from omnigent.runner.identity import token_bound_runner_id
 
     server_tmp = tmp_path_factory.mktemp("e2e_ui_kiro_shim_server")
     shim_path = server_tmp / "kiro-cli"
-    shim_path.write_text(_FAKE_KIRO_SOURCE, encoding="utf-8")
+    shim_path.write_text(source, encoding="utf-8")
     shim_path.chmod(0o755)
 
     workspace = server_tmp / "workspace"
@@ -450,8 +460,11 @@ def kiro_shim_session(
     binding_token = secrets.token_urlsafe(32)
     runner_id = token_bound_runner_id(binding_token)
 
+    from dev.repro_env.runtime import isolated_env
+
     shared_env = {
-        **os.environ,
+        **isolated_env(dict(os.environ), server_tmp),
+        "OMNIGENT_DATA_DIR": os.environ["OMNIGENT_DATA_DIR"],
         "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
         "OMNIGENT_KIRO_PATH": str(shim_path),
         # The fake TUI renders kiro's ``❯`` / ``─`` markers; make sure tmux and
@@ -459,7 +472,13 @@ def kiro_shim_session(
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
     }
-    server_env = {**shared_env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token}
+    shared_env.pop("OMNIGENT_PROCESS_LOG_FILE", None)
+    server_env = {
+        **shared_env,
+        "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
+        "PYTHONPATH": str(server_root),
+        "OMNIGENT_WEB_UI_DIST": str(_REPO_ROOT / "omnigent/server/static/web-ui"),
+    }
     runner_env = {
         **shared_env,
         "OMNIGENT_RUNNER_ID": runner_id,
@@ -479,6 +498,7 @@ def kiro_shim_session(
                 sys.executable,
                 "-c",
                 "import omnigent.server.presence as _p; _p._LEAVE_GRACE_S = 1.0; "
+                + "import omnigent; print('server source:', omnigent.__file__, flush=True); "
                 + "from omnigent.cli import main; main()",
                 "server",
                 "--host",
@@ -493,6 +513,7 @@ def kiro_shim_session(
                 str(agent_yaml_path),
             ],
             env=server_env,
+            cwd=server_root,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
         )

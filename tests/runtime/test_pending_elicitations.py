@@ -634,7 +634,8 @@ def test_lookup_returns_none_after_resolve() -> None:
     assert pending_elicitations.lookup("elicit_gone") is None
 
 
-def test_lookup_returns_deep_copy() -> None:
+@pytest.mark.parametrize("conversation_id", [None, "conv_a"])
+def test_lookup_returns_deep_copy(conversation_id: str | None) -> None:
     """
     :func:`lookup` returns a deep copy of the stored event so callers
     cannot mutate the index.
@@ -645,14 +646,28 @@ def test_lookup_returns_deep_copy() -> None:
         "params": {"message": "original"},
     }
     pending_elicitations.record_publish("conv_a", event)
-    result = pending_elicitations.lookup("elicit_copy")
+    result = pending_elicitations.lookup("elicit_copy", conversation_id=conversation_id)
     assert result is not None
     _, payload = result
     payload["params"]["message"] = "tampered"
     # Re-lookup must still see the original.
-    result2 = pending_elicitations.lookup("elicit_copy")
+    result2 = pending_elicitations.lookup("elicit_copy", conversation_id=conversation_id)
     assert result2 is not None
     assert result2[1]["params"]["message"] == "original"
+
+
+def test_scoped_lookup_does_not_fall_back_to_another_session() -> None:
+    event = _elicit_event("elicit_child")
+    pending_elicitations.record_publish("conv_parent", event)
+    pending_elicitations.record_publish("conv_child", event)
+    assert pending_elicitations.lookup("elicit_child", conversation_id="conv_child") == (
+        "conv_child",
+        event,
+    )
+    pending_elicitations.resolve("conv_child", "elicit_child")
+    assert pending_elicitations.lookup("elicit_child", conversation_id="conv_child") is None
+    assert pending_elicitations.lookup("elicit_child", conversation_id="conv_unknown") is None
+    assert pending_elicitations.lookup("elicit_unknown", conversation_id="conv_parent") is None
 
 
 def test_snapshot_for_returns_independent_copies() -> None:
