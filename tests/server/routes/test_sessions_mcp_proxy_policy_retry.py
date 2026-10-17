@@ -57,6 +57,12 @@ def approval_state(db_uri: str) -> tuple[SqlAlchemyConversationStore, Conversati
     return store, conv, engine
 
 
+@pytest.fixture(autouse=True)
+def _sessions_have_policies(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests stub the policy engine, so their sessions count as policy-bearing."""
+    monkeypatch.setattr(orchestration, "any_policies_apply", lambda **_: True)
+
+
 def _make_conversation() -> Conversation:
     """
     Build a minimal :class:`Conversation` with an agent binding.
@@ -820,7 +826,7 @@ async def test_retry_dispatches_policy_owned_arguments(
         transport=httpx.MockTransport(execute), base_url="http://runner.test"
     ) as runner:
 
-        async def get_runner(*args):
+        async def get_runner(*args, **kwargs):
             return runner
 
         monkeypatch.setattr(sessions_mod, "_get_runner_client", get_runner)
