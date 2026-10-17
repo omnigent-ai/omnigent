@@ -65,6 +65,9 @@ _PERMISSION_RETRY_MAX_BACKOFF_S = 30.0
 # Fail unreachable-server connects fast into the backoff loop instead
 # of inheriting the day-long read budget.
 _PERMISSION_CONNECT_TIMEOUT_S = 30.0
+# Re-POST a silent held poll just past the gateway's 300s idle cut: after a
+# host network outage the gateway's reply never arrives and the socket is dead.
+_PERMISSION_POLL_READ_TIMEOUT_S = 330.0
 
 
 def _env_int(name: str, default: int) -> int:
@@ -705,7 +708,9 @@ def _post_hook_with_reattach(
       :data:`_PERMISSION_HELD_POLL_FLOOR_S`, or a connection that never
       established (:func:`_never_connected_errors`), or an established
       connection that dropped in under the floor (a flapping/crash-looping
-      server). This is the spin.
+      server). This is the spin. Exception: once a poll has been held, a
+      connect that never reaches the server (a host network outage) backs
+      off without counting, so the card re-parks when the network returns.
     * **Held-poll sever → reset the counter and the backoff.** An established
       connection that dropped mid-poll after being held ≥ the floor, or a
       gateway 5xx (the Databricks front door answers an idle long-poll with
@@ -775,13 +780,20 @@ def _post_hook_with_reattach(
 
     from omnigent.native.native_policy_hook import _is_login_redirect_or_unauthorized
 
-    timeout = httpx.Timeout(_PERMISSION_TIMEOUT_S, connect=_PERMISSION_CONNECT_TIMEOUT_S)
+    timeout = httpx.Timeout(
+        _PERMISSION_TIMEOUT_S,
+        connect=_PERMISSION_CONNECT_TIMEOUT_S,
+        read=_PERMISSION_POLL_READ_TIMEOUT_S,
+    )
     # Absolute backstop: even a run of held-poll severs (which don't count
     # toward the hard-failure cap) can't loop past the day-long human-answer
     # window — matches the read budget and the server's ask_timeout.
     deadline = time.monotonic() + _PERMISSION_TIMEOUT_S
     reauthed = False
     consecutive_hard_failures = 0
+    # Once the server has held a poll, the card is live: ride out a network
+    # outage until the deadline so the re-POST re-publishes it on reconnect.
+    parked = False
     marker_scope = (
         hold_approval_wait_marker(wait_marker)
         if wait_marker is not None
@@ -790,6 +802,7 @@ def _post_hook_with_reattach(
     with marker_scope:
         while True:
             attempt_started = time.monotonic()
+            never_connected = False
             try:
                 with httpx.Client(headers=headers, timeout=timeout) as client:
                     resp = client.post(url, json=body)
@@ -852,8 +865,12 @@ def _post_hook_with_reattach(
                     file=sys.stderr,
                 )
             if is_hard_failure:
-                consecutive_hard_failures += 1
+                # A connect that never reached the server cannot spin it, so a
+                # parked wait keeps backing off without counting toward the cap.
+                if not (parked and never_connected):
+                    consecutive_hard_failures += 1
             else:
+                parked = True
                 # A proxy severed a genuinely-held poll — the re-park mechanism
                 # working as intended. Reset so a slow human is never capped, and
                 # re-POST promptly so the same id re-parks inside the server's

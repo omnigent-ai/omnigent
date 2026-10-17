@@ -2118,7 +2118,7 @@ def record_model_vocabulary(
     # vocabulary refresh (e.g. serving model options) can never replace a
     # concurrent bridge preparation's config — sandbox settings included —
     # with its own stale read.
-    with _bridge_config_write_lock(bridge_dir):
+    with _bridge_metadata_write_lock(bridge_dir):
         config = _read_json_file(bridge_dir / _CONFIG_FILE)
         if not isinstance(config, dict) or not config:
             # No prepared bridge config yet (missing/malformed reads as {}):
@@ -2145,18 +2145,13 @@ def record_model_vocabulary(
 
 
 @contextlib.contextmanager
-def _bridge_config_write_lock(bridge_dir: Path) -> Iterator[None]:
-    """Cross-process mutual exclusion for bridge-config read-modify-writes.
+def _bridge_metadata_write_lock(bridge_dir: Path) -> Iterator[None]:
+    """Cross-process mutual exclusion for bridge metadata read-modify-writes.
 
-    Uses the same on-disk lock file as bridge-dir preparation
-    (``<bridge root>/.locks/<bridge dir>.lock``), so config rewrites and
+    Shares bridge-dir preparation's on-disk lock, so metadata updates and
     :func:`prepare_bridge_dir` exclude each other across processes.
     """
-    from filelock import FileLock
-
-    lock_dir = bridge_dir.parent / ".locks"
-    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with FileLock(str(lock_dir / f"{bridge_dir.name}.lock"), mode=0o600):
+    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
         yield
 
 
@@ -2185,13 +2180,14 @@ def write_active_session_id(bridge_dir: Path, session_id: str) -> None:
     :returns: None.
     :raises RuntimeError: If the bridge config does not exist.
     """
-    config = _read_json_file(bridge_dir / _CONFIG_FILE)
-    if not config:
-        raise RuntimeError(f"bridge config missing: {bridge_dir / _CONFIG_FILE}")
-    config["active_session_id"] = session_id
-    config["conversation_id"] = session_id
-    config["updated_at"] = time.time()
-    _write_json_file(bridge_dir / _CONFIG_FILE, config)
+    with _bridge_metadata_write_lock(bridge_dir):
+        config = _read_json_file(bridge_dir / _CONFIG_FILE)
+        if not config:
+            raise RuntimeError(f"bridge config missing: {bridge_dir / _CONFIG_FILE}")
+        config["active_session_id"] = session_id
+        config["conversation_id"] = session_id
+        config["updated_at"] = time.time()
+        _write_json_file(bridge_dir / _CONFIG_FILE, config)
 
 
 def read_permission_hook_config(bridge_dir: Path) -> _JsonObject:
@@ -2904,50 +2900,49 @@ def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
     :returns: None.
     """
     _ensure_secure_dir(bridge_dir)
-    envelope = {
-        "recorded_at": time.time(),
-        "payload": payload,
-    }
-    with (bridge_dir / _HOOKS_FILE).open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(envelope, separators=(",", ":")) + "\n")
+    with _bridge_metadata_write_lock(bridge_dir):
+        envelope = {
+            "recorded_at": time.time(),
+            "payload": payload,
+        }
+        with (bridge_dir / _HOOKS_FILE).open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(envelope, separators=(",", ":")) + "\n")
 
-    state = _read_json_file(bridge_dir / _STATE_FILE)
-    if not isinstance(state, dict):
-        state = {}
-    event_name = payload.get("hook_event_name")
-    if isinstance(event_name, str) and event_name:
-        state["last_hook_event_name"] = event_name
-    claude_session_id = payload.get("session_id")
-    pinned = state.get("claude_session_id")
-    # Identity pin: the transcript path and session identity may change only
-    # via a SessionStart announcement (startup / clear / resume / compact all
-    # fire one) or an event from the already-pinned session. A side-channel
-    # event carrying another session's identity (e.g. a background Task
-    # agent's edge) must not re-aim the forwarder at a foreign transcript.
-    identity_allowed = event_name == "SessionStart" or (
-        isinstance(claude_session_id, str)
-        and claude_session_id != ""
-        and (not isinstance(pinned, str) or not pinned or claude_session_id == pinned)
-    )
-    if identity_allowed:
-        transcript_path = payload.get("transcript_path")
-        if isinstance(transcript_path, str) and transcript_path:
-            state["transcript_path"] = transcript_path
-        if isinstance(claude_session_id, str) and claude_session_id:
-            state["claude_session_id"] = claude_session_id
-            seen = read_seen_claude_session_ids(bridge_dir)
-            seen.add(claude_session_id)
-            state["seen_claude_session_ids"] = sorted(seen)
-    else:
-        _logger.debug(
-            "Ignoring identity fields from side-channel hook event; "
-            "event=%s session_id=%s pinned=%s",
-            event_name,
-            claude_session_id,
-            pinned,
+        state = _read_json_file(bridge_dir / _STATE_FILE)
+        if not isinstance(state, dict):
+            state = {}
+        event_name = payload.get("hook_event_name")
+        if isinstance(event_name, str) and event_name:
+            state["last_hook_event_name"] = event_name
+        claude_session_id = payload.get("session_id")
+        pinned = state.get("claude_session_id")
+        # Identity pin: only a SessionStart or an event from the already-pinned
+        # session may change transcript/session identity; a side-channel event
+        # (e.g. a background Task agent's edge) must not re-aim the forwarder.
+        identity_allowed = event_name == "SessionStart" or (
+            isinstance(claude_session_id, str)
+            and claude_session_id != ""
+            and (not isinstance(pinned, str) or not pinned or claude_session_id == pinned)
         )
-    state["updated_at"] = time.time()
-    _write_json_file(bridge_dir / _STATE_FILE, state)
+        if identity_allowed:
+            transcript_path = payload.get("transcript_path")
+            if isinstance(transcript_path, str) and transcript_path:
+                state["transcript_path"] = transcript_path
+            if isinstance(claude_session_id, str) and claude_session_id:
+                state["claude_session_id"] = claude_session_id
+                seen = read_seen_claude_session_ids(bridge_dir)
+                seen.add(claude_session_id)
+                state["seen_claude_session_ids"] = sorted(seen)
+        else:
+            _logger.debug(
+                "Ignoring identity fields from side-channel hook event; "
+                "event=%s session_id=%s pinned=%s",
+                event_name,
+                claude_session_id,
+                pinned,
+            )
+        state["updated_at"] = time.time()
+        _write_json_file(bridge_dir / _STATE_FILE, state)
 
 
 def read_transcript_path(bridge_dir: Path) -> Path | None:

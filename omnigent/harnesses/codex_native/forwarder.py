@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import re
 import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator, Callable
@@ -248,8 +249,6 @@ _CODEX_AUTH_HTTP_STATUS = frozenset({401, 403})
 # Surface-only, so recall is favored over precision: a false positive only
 # appends a re-auth hint to an already-failed turn.
 _CODEX_AUTH_ERROR_FRAGMENTS = (
-    "401",
-    "403",
     "unauthorized",
     "authentication",
     "not logged in",
@@ -266,6 +265,11 @@ _CODEX_AUTH_ERROR_FRAGMENTS = (
     "session expired",
     "api key",
 )
+# A standalone 401/403 status token; the lookarounds keep a request-id UUID
+# segment (``...-4013-...``, ``a401...``) from matching.
+_CODEX_AUTH_HTTP_STATUS_TOKEN = re.compile(r"(?<![\w-])40[13](?![\w-])")
+# Explicit rate limits ("last status: 429 Too Many Requests") are never auth.
+_CODEX_RATE_LIMIT_ERROR = re.compile(r"(?<![\w-])429(?![\w-])|too many requests|rate[ _-]limit")
 _CODEX_ERROR_KIND_AUTH = "auth"
 _CODEX_ERROR_KIND_GENERIC = "generic"
 _CODEX_REAUTH_HINT = "If this looks like an auth issue, running `codex login` may help."
@@ -979,9 +983,9 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
     Classify a Codex ``turn.error`` / ``error`` item as auth-related or generic.
 
     Prefers the structured ``codexErrorInfo`` (an ``unauthorized`` variant,
-    case-insensitive, or an httpStatusCode of 401/403); falls back to substring
-    matching against :data:`_CODEX_AUTH_ERROR_FRAGMENTS` for versions/shapes
-    that omit it.
+    case-insensitive, or an httpStatusCode of 401/403); falls back to a
+    standalone 401/403 token or :data:`_CODEX_AUTH_ERROR_FRAGMENTS` in the
+    message for versions/shapes that omit it, unless the message is a 429.
 
     Budget/quota exhaustion is checked first: the AI gateway returns HTTP 403
     for these, which the auth checks below would otherwise misclassify.
@@ -1005,7 +1009,11 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
     variant_is_auth = variant is not None and variant.lower() in _CODEX_AUTH_ERROR_INFO
     if variant_is_auth or http_status in _CODEX_AUTH_HTTP_STATUS:
         return _CODEX_ERROR_KIND_AUTH
-    if any(fragment in lowered for fragment in _CODEX_AUTH_ERROR_FRAGMENTS):
+    if _CODEX_RATE_LIMIT_ERROR.search(lowered):
+        return _CODEX_ERROR_KIND_GENERIC
+    if _CODEX_AUTH_HTTP_STATUS_TOKEN.search(lowered) or any(
+        fragment in lowered for fragment in _CODEX_AUTH_ERROR_FRAGMENTS
+    ):
         return _CODEX_ERROR_KIND_AUTH
     return _CODEX_ERROR_KIND_GENERIC
 
@@ -6936,6 +6944,24 @@ async def _post_turn_status_edge(
         edge.source,
         edge.turn_id,
         edge.status,
+        extra=debug_event(
+            "codex_turn_status",
+            session_id=session_id,
+            turn_id=edge.turn_id,
+            status=edge.status,
+            protocol_source=edge.source[:128],
+            has_turn_id=edge.turn_id is not None,
+            has_error=edge.error is not None,
+            native_error_kind=edge.error.kind if edge.error is not None else None,
+            native_error_reason=(
+                "thread_persistence_shutdown"
+                if edge.error is not None
+                and "failed to shutdown thread persistence" in edge.error.message[:4096].casefold()
+                else "unclassified"
+                if edge.error is not None
+                else None
+            ),
+        ),
     )
     response_id = _response_id(_params_with_turn_id({}, edge.turn_id)) if edge.turn_id else None
     output: str | None = None
