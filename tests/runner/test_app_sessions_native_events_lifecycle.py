@@ -1674,6 +1674,42 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
     monkeypatch.setattr(codex, "client_for_transport", lambda *args, **kwargs: fake_client)
 
     async def fake_launch(session_id: str, *args: Any, **kwargs: Any) -> SessionResourceView:
+        from types import SimpleNamespace
+
+        from omnigent.runner.native.orchestration import (
+            _AUTO_CODEX_APP_SERVERS,
+            _AUTO_CODEX_BRIDGE_DIRS,
+        )
+
+        identity = None
+        if case != "missing-spec":
+            source = codex.capture_codex_catalog_source(
+                codex_path=sys.executable, config_profile=None
+            )
+            try:
+                launch = codex.resolve_native_codex_launch(model=None, spec=spec)
+                identity = codex.bind_codex_catalog_backend(
+                    codex.codex_catalog_identity(
+                        launch, source, actual_route=codex.codex_catalog_launch_route(launch)
+                    ),
+                    codex_home,
+                )
+            except RuntimeError:
+                pass
+        directory = codex_native_bridge.bridge_dir_for_bridge_id(session_id)
+        monkeypatch.setitem(
+            _AUTO_CODEX_APP_SERVERS,
+            session_id,
+            SimpleNamespace(
+                listen_url="ws://codex.test",
+                codex_home=codex_home,
+                catalog_identity=identity,
+                bridge_dir=directory,
+                proc=None,
+                close=AsyncMock(),
+            ),
+        )
+        monkeypatch.setitem(_AUTO_CODEX_BRIDGE_DIRS, session_id, directory)
         return SessionResourceView(
             id="terminal_codex_main",
             type="terminal",

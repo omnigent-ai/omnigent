@@ -1082,6 +1082,29 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
         _write_bridge_state_unlocked(bridge_dir, state)
 
 
+def bridge_binding_matches(bridge_dir: Path, expected: CodexNativeBridgeState) -> bool:
+    """Check the atomically published session and transport binding."""
+    current = read_bridge_state(bridge_dir)
+    return current is not None and (
+        current.session_id,
+        current.socket_path,
+        current.thread_id,
+        current.codex_home,
+    ) == (
+        expected.session_id,
+        expected.socket_path,
+        expected.thread_id,
+        expected.codex_home,
+    )
+
+
+@contextlib.contextmanager
+def matching_bridge_binding(bridge_dir: Path, expected: CodexNativeBridgeState) -> Iterator[bool]:
+    """Hold the state lock while using one captured session and transport binding."""
+    with _bridge_state_lock(bridge_dir):
+        yield bridge_binding_matches(bridge_dir, expected)
+
+
 def _validated_startup_timeout(value: object) -> float | None:
     """Return a bounded configured-command timeout, or ``None`` if invalid."""
     if (

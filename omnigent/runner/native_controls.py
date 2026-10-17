@@ -19,7 +19,10 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
-    from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
+    from omnigent.harnesses.codex_native.app_server import (
+        CodexCatalogIdentity,
+        CodexNativeAppServer,
+    )
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
 
 import httpx
@@ -816,13 +819,25 @@ def build_native_controls(
 
     async def _codex_native_model_options(conv_id: str) -> list[_JsonObject]:
         from omnigent.harnesses.codex_native.app_server import (
+            CodexCatalogIdentity,
             client_for_transport,
             list_codex_model_options,
             mark_launch_default,
         )
-        from omnigent.harnesses.codex_native.bridge import read_codex_home_config_model
+        from omnigent.harnesses.codex_native.bridge import (
+            bridge_binding_matches,
+            read_codex_home_config_model,
+        )
+        from omnigent.models import model_catalog_store
+        from omnigent.runner.native.orchestration import (
+            _AUTO_CODEX_APP_SERVERS,
+            _AUTO_CODEX_BRIDGE_DIRS,
+        )
 
-        state = await _codex_native_bridge_state_for_session(
+        backend = _AUTO_CODEX_APP_SERVERS.get(conv_id)
+        identity = getattr(backend, "catalog_identity", None)
+        owned_directory = _AUTO_CODEX_BRIDGE_DIRS.get(conv_id)
+        state, bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
             conv_id,
             action="model options",
             missing_state_log_level=logging.DEBUG,
@@ -830,6 +845,35 @@ def build_native_controls(
         if state is None:
             raise _CodexNativeModelOptionsNotReady("Codex-native model options are not ready yet.")
 
+        def owns_backend() -> bool:
+            return (
+                _AUTO_CODEX_APP_SERVERS.get(conv_id) is backend
+                and _AUTO_CODEX_BRIDGE_DIRS.get(conv_id) == owned_directory
+                and (
+                    backend is None
+                    or (
+                        getattr(backend, "catalog_identity", None) is identity
+                        and backend.listen_url == state.socket_path
+                        and str(backend.codex_home) == state.codex_home
+                    )
+                )
+                and (owned_directory is None or owned_directory == bridge_dir)
+            )
+
+        def require_binding() -> None:
+            if not bridge_binding_matches(bridge_dir, state) or not owns_backend():
+                raise _CodexNativeModelOptionsNotReady(
+                    "Codex-native model options changed while loading; please try again."
+                )
+
+        require_binding()
+        stored = (
+            model_catalog_store.read_catalog("codex-native", identity.fingerprint)
+            if isinstance(identity, CodexCatalogIdentity)
+            else None
+        )
+        stored_default = model_catalog_store.default_row(stored or [])
+        default_id = stored_default.get("id") if stored_default is not None else None
         codex_client = client_for_transport(
             state.socket_path,
             client_name="omnigent-codex-native-runner",
@@ -840,45 +884,63 @@ def build_native_controls(
         finally:
             with contextlib.suppress(Exception):
                 await codex_client.close()
+        require_binding()
         active_model = await asyncio.to_thread(
             read_codex_home_config_model,
             Path(state.codex_home),
         )
+        require_binding()
         marked = mark_launch_default(rows, active_model)
-        # Write the live account rows back to the shared catalog store so the
-        # pre-launch picker converges to account truth after the first
-        # session — keeping the SHAPE's stored default (a session's own pin
-        # must not become the host-wide default).
-        asyncio.get_running_loop().create_task(
-            _write_back_codex_catalog(conv_id, [dict(row) for row in rows])
-        )
+        if (
+            isinstance(identity, CodexCatalogIdentity)
+            and stored is not None
+            and (rows or not stored)
+        ):
+            asyncio.get_running_loop().create_task(
+                _write_back_codex_catalog(
+                    conv_id,
+                    [dict(row) for row in rows],
+                    identity=identity,
+                    state=state,
+                    bridge_dir=bridge_dir,
+                    owns_backend=owns_backend,
+                    stored_default=default_id if isinstance(default_id, str) else None,
+                )
+            )
         return marked
 
-    async def _write_back_codex_catalog(session_id: str, rows: list[_JsonObject]) -> None:
+    async def _write_back_codex_catalog(
+        session_id: str,
+        rows: list[_JsonObject],
+        *,
+        identity: CodexCatalogIdentity,
+        state: CodexNativeBridgeState,
+        bridge_dir: Path,
+        owns_backend: Callable[[], bool],
+        stored_default: str | None,
+    ) -> None:
         try:
-            from omnigent.harnesses.codex_native.app_server import (
-                codex_catalog_fingerprint,
-                mark_launch_default,
-                resolve_native_codex_launch,
-            )
+            from omnigent.harnesses.codex_native.app_server import mark_launch_default
+            from omnigent.harnesses.codex_native.bridge import matching_bridge_binding
             from omnigent.models import model_catalog_store
 
-            spec = await _resolve_session_agent_spec(session_id)
-            if spec is None:
-                return
-            launch = await asyncio.to_thread(resolve_native_codex_launch, model=None, spec=spec)
-            fingerprint = codex_catalog_fingerprint(launch)
-            stored = model_catalog_store.read_catalog("codex-native", fingerprint)
-            stored_default = next(
-                (row.get("id") for row in stored or [] if row.get("isDefault") is True),
-                None,
+            shaped = (
+                mark_launch_default(rows, stored_default)
+                if stored_default is not None
+                else [
+                    {key: value for key, value in row.items() if key != "isDefault"}
+                    for row in rows
+                ]
             )
-            shaped = mark_launch_default(
-                rows, stored_default if isinstance(stored_default, str) else None
-            )
-            await asyncio.to_thread(
-                model_catalog_store.write_catalog, "codex-native", fingerprint, shaped
-            )
+
+            def write_original_catalog() -> None:
+                with matching_bridge_binding(bridge_dir, state) as matches:
+                    if matches and owns_backend() and identity.unchanged():
+                        model_catalog_store.write_catalog(
+                            "codex-native", identity.fingerprint, shaped
+                        )
+
+            await asyncio.to_thread(write_original_catalog)
         except Exception:  # noqa: BLE001 — write-back is best-effort
             _logger.debug(
                 "codex model-catalog write-back skipped",

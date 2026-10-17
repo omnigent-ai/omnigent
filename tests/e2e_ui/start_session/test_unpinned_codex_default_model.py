@@ -1,9 +1,11 @@
-"""E2E: an unpinned native Codex session launches on Omnigent's Codex default.
+"""Real Codex launches preserve configured models and selected file profiles.
 
 With a provider that pins no model and a Codex catalog whose own default
 marker sits on ``gpt-6-astra`` while ``gpt-5.6-sol`` (Omnigent's
 ``CODEX_DEFAULT_MODEL``) is also servable, a new native Codex session without
 a model pick must launch on Sol, not adopt the catalog's Astra default row.
+Configured root and file-profile choices remain authoritative, including models
+omitted from the visible catalog. No model inference is sent.
 """
 
 from __future__ import annotations
@@ -28,6 +30,8 @@ from playwright.sync_api import Page
 
 from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
 from omnigent.runner.identity import token_bound_runner_id
+from tests._helpers.native_session import create_native_session
+from tests._helpers.session import bind_session_runner
 from tests.e2e_ui.conftest import (
     _REPO_ROOT,
     _codex_cli_supports_mocked_app_server,
@@ -47,8 +51,10 @@ _HEALTH_POLL_INTERVAL_S = 0.5
 _TUI_BANNER_TIMEOUT_MS = 120_000
 
 
-def _write_source_codex_home(codex_path: str, source_home: Path) -> None:
-    """Write a Codex home whose catalog marks Astra as Codex's own default."""
+def _write_source_codex_home(
+    codex_path: str, source_home: Path, configured_model: str | None = None
+) -> None:
+    """Write a source preference and a catalog whose default is Astra."""
     env = {
         key: value
         for key, value in os.environ.items()
@@ -83,9 +89,10 @@ def _write_source_codex_home(codex_path: str, source_home: Path) -> None:
     ]
     catalog = source_home / "models.json"
     catalog.write_text(json.dumps({**bundled, "models": rows}), encoding="utf-8")
-    (source_home / "config.toml").write_text(
-        f"model_catalog_json = {json.dumps(str(catalog))}\n", encoding="utf-8"
-    )
+    config = f"model_catalog_json = {json.dumps(str(catalog))}\n"
+    if configured_model is not None:
+        config += f"model = {json.dumps(configured_model)}\n"
+    (source_home / "config.toml").write_text(config, encoding="utf-8")
 
 
 def _write_unpinned_provider_config(config_home: Path) -> None:
@@ -136,7 +143,7 @@ def unpinned_codex_astra_session(
     tmp_path_factory: pytest.TempPathFactory,
     request: pytest.FixtureRequest,
 ) -> Iterator[tuple[str, str, Path]]:
-    """A runner-bound native Codex session with no model pin anywhere.
+    """A runner-bound native Codex session without a session model pin.
 
     Spawns a dedicated server + runner because the source ``CODEX_HOME`` /
     ``OMNIGENT_CONFIG_HOME`` / ``HOME`` must be present before the runner
@@ -164,7 +171,23 @@ def unpinned_codex_astra_session(
     # Keep managed-terminal private dirs on a SHORT path: tmux.sock must fit
     # the ~108-char unix socket limit, which the pytest basetemp tree exceeds.
     tmp_dir = Path(tempfile.mkdtemp(prefix="codexdef-"))
-    _write_source_codex_home(codex_path, source_codex_home)
+    configured_model = getattr(request, "param", None)
+    profile = configured_model in {"work-profile", "hidden-work-profile"}
+    _write_source_codex_home(codex_path, source_codex_home, None if profile else configured_model)
+    if profile:
+        catalog = json.loads((source_codex_home / "models.json").read_text())
+        catalog["models"] = [
+            row for row in catalog["models"] if row["slug"] == _CODEX_CATALOG_DEFAULT
+        ]
+        profile_catalog = source_codex_home / "work-models.json"
+        profile_catalog.write_text(json.dumps(catalog))
+        profile_model = (
+            "gpt-custom" if configured_model == "hidden-work-profile" else _CODEX_CATALOG_DEFAULT
+        )
+        (source_codex_home / "work.config.toml").write_text(
+            f"model = {json.dumps(profile_model)}\n"
+            f"model_catalog_json = {json.dumps(str(profile_catalog))}\n"
+        )
     _write_unpinned_provider_config(config_home)
 
     port = _find_free_port()
@@ -260,7 +283,20 @@ def unpinned_codex_astra_session(
                     last_error = f"{type(exc).__name__}: {exc}"
             time.sleep(_HEALTH_POLL_INTERVAL_S)
 
-        session_id = _create_native_codex_session(base_url, runner_id)
+        if profile:
+            created = create_native_session(
+                httpx,
+                base_url,
+                harness="codex",
+                metadata={
+                    "workspace": str(_REPO_ROOT),
+                    "terminal_launch_args": ["--profile", "work"],
+                },
+            )
+            session_id = str(created["session_id"])
+            bind_session_runner(httpx.patch, base_url, session_id, runner_id, timeout=30.0)
+        else:
+            session_id = _create_native_codex_session(base_url, runner_id)
         yield base_url, session_id, tmp_dir
     finally:
         if session_id is not None:
@@ -285,7 +321,34 @@ def test_unpinned_native_codex_session_launches_on_omnigent_default(
     unpinned_codex_astra_session: tuple[str, str, Path],
 ) -> None:
     """A Default (unpinned) launch runs Sol, not Codex's Astra catalog default."""
-    base_url, session_id, tmp_dir = unpinned_codex_astra_session
+    _assert_terminal_launch_model(page, unpinned_codex_astra_session, CODEX_DEFAULT_MODEL)
+
+
+@pytest.mark.parametrize(
+    ("unpinned_codex_astra_session", "expected"),
+    [
+        pytest.param(_CODEX_CATALOG_DEFAULT, _CODEX_CATALOG_DEFAULT, id="configured-model"),
+        pytest.param("gpt-custom", "gpt-custom", id="hidden-configured-model"),
+        pytest.param("work-profile", _CODEX_CATALOG_DEFAULT, id="file-profile-model"),
+        pytest.param("hidden-work-profile", "gpt-custom", id="hidden-file-profile-model"),
+    ],
+    indirect=["unpinned_codex_astra_session"],
+)
+@pytest.mark.timeout(420)
+def test_unpinned_native_codex_session_validates_the_configured_model(
+    page: Page,
+    unpinned_codex_astra_session: tuple[str, str, Path],
+    expected: str,
+) -> None:
+    """Root and selected-profile models remain authoritative, including hidden defaults."""
+    _assert_terminal_launch_model(page, unpinned_codex_astra_session, expected)
+
+
+def _assert_terminal_launch_model(
+    page: Page, session: tuple[str, str, Path], expected: str
+) -> None:
+    """Attach to the real terminal and verify the model Codex displays."""
+    base_url, session_id, tmp_dir = session
     page.goto(f"{base_url}/c/{session_id}")
 
     # Attaching the Terminal view is what makes the runner spawn Codex for a
@@ -293,10 +356,9 @@ def test_unpinned_native_codex_session_launches_on_omnigent_default(
     _open_terminal_view(page)
     _wait_terminal_connected(page)
 
-    # The Codex TUI startup banner names the model the session launched on
-    # ("model:     <id>   /model to change"). The SPA renders the pane on a
-    # WebGL canvas, so read the same text from the managed tmux pane.
-    banner = re.compile(r"model:\s*(\S+)")
+    # Codex names the model in its startup banner or, since 0.163, its footer.
+    # Read the managed tmux pane because the SPA terminal uses a WebGL canvas.
+    banner = re.compile(r"model:\s*(\S+)|(?:^|\n)\s*(\S+)\s+default\s+·")
     deadline = time.monotonic() + _TUI_BANNER_TIMEOUT_MS / 1000
     pane_text = ""
     launched: str | None = None
@@ -304,7 +366,7 @@ def test_unpinned_native_codex_session_launches_on_omnigent_default(
         pane_text = _codex_pane_text(tmp_dir)
         match = banner.search(pane_text)
         if match:
-            launched = match.group(1)
+            launched = match.group(1) or match.group(2)
             # Let the SPA terminal mirror the banner so a recording of this
             # run ends on the observable outcome.
             page.wait_for_timeout(3_000)
@@ -313,7 +375,7 @@ def test_unpinned_native_codex_session_launches_on_omnigent_default(
     assert launched is not None, (
         f"Codex TUI never painted its model banner; last pane text:\n{pane_text}"
     )
-    assert launched == CODEX_DEFAULT_MODEL, (
+    assert launched == expected, (
         f"unpinned native Codex session launched on {launched!r} instead of "
-        f"Omnigent's default {CODEX_DEFAULT_MODEL!r}; pane text:\n{pane_text}"
+        f"{expected!r}; pane text:\n{pane_text}"
     )
