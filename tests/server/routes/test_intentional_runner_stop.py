@@ -61,6 +61,51 @@ def family(
             session_stream.close(session_id)
 
 
+@pytest.mark.parametrize("handoff", ["stopped", "rebound", "failed"])
+async def test_host_stop_ack_settles_late_native_activity(
+    family: tuple[SqlAlchemyConversationStore, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+    handoff: str,
+) -> None:
+    store, ids = family
+    child_id = ids["active"]
+    session_live_state.configure(store)
+
+    async def teardown(*_args, **_kwargs):
+        # The relay ends before the native status forwarder finishes shutting down.
+        sessions._intentional_stop_sessions.pop(child_id, None)
+        helpers._publish_status(child_id, "idle")
+        helpers._publish_status(child_id, "running")
+        if handoff == "rebound":
+            store.replace_runner_id(child_id, "runner-replacement")
+        elif handoff == "failed":
+            helpers._publish_status(child_id, "failed")
+        return True
+
+    monkeypatch.setattr(sessions, "_stop_session_host_runner", teardown)
+    try:
+        assert await orchestration._stop_host_runner_intentionally(
+            ids["parent"], "host", _RUNNER, None, store
+        )
+        await asyncio.wrap_future(session_live_state.submit("drain_test_writes", lambda: None))
+        expected = {"stopped": "idle", "rebound": "running", "failed": "failed"}[handoff]
+        assert sessions._session_status_cache[child_id] == expected
+        assert store.get_conversation(child_id).live_status == expected
+        if handoff == "stopped":
+            await sessions._mark_runner_sessions_offline(
+                [store.get_conversation(child_id)],
+                ErrorDetail(code="runner_disconnected", message="Runner disappeared."),
+                store,
+            )
+            assert sessions._session_status_cache[child_id] == "idle"
+            assert not sessions._last_task_error_from_labels(
+                store.get_conversation(child_id).labels
+            )
+    finally:
+        await asyncio.wrap_future(session_live_state.submit("drain_test_writes", lambda: None))
+        session_live_state.configure(None)
+
+
 @pytest.mark.parametrize("outcome", ["delivered", "offline", "error", "cancelled"])
 async def test_stop_marks_only_affected_active_sessions_and_rolls_back(
     family: tuple[SqlAlchemyConversationStore, dict[str, str]],
@@ -135,7 +180,7 @@ async def test_stop_intent_tracks_actual_host_frame_handoff(
             assert encoded is None
         else:
             assert encoded is not None
-            frame = decode_host_frame(encoded)
+            frame = decode_host_frame(encoded.data)
             assert isinstance(frame, HostStopRunnerFrame)
             assert frame.runner_id == _RUNNER
             if outcome == "cancelled":
@@ -379,6 +424,9 @@ async def test_unconsumed_stop_expires_before_a_later_disconnect(
     now += RUNNER_LIVENESS_TTL_S
     assert ids["cold"] not in sessions._intentional_stop_sessions
 
+    # A later turn must still report a real disconnect after Stop's intent expires.
+    store.set_session_live_status(ids["cold"], "running")
+    sessions._session_status_cache[ids["cold"]] = "running"
     error = ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly.")
     await sessions._mark_runner_sessions_offline(
         [store.get_conversation(ids["cold"])], error, store
@@ -416,7 +464,7 @@ async def test_repeated_stop_renews_retained_intent(
     try:
         encoded = await asyncio.wait_for(conn.outbound_queue.get(), timeout=10)
         assert encoded is not None
-        frame = decode_host_frame(encoded)
+        frame = decode_host_frame(encoded.data)
         assert isinstance(frame, HostStopRunnerFrame)
         assert frame.runner_id == _RUNNER
         assert not await asyncio.wait_for(first, timeout=10)
@@ -432,7 +480,7 @@ async def test_repeated_stop_renews_retained_intent(
         )
         encoded = await asyncio.wait_for(conn.outbound_queue.get(), timeout=10)
         assert encoded is not None
-        frame = decode_host_frame(encoded)
+        frame = decode_host_frame(encoded.data)
         assert isinstance(frame, HostStopRunnerFrame)
         assert frame.runner_id == _RUNNER
         now += 2

@@ -447,6 +447,7 @@ class SeatbeltSandboxBackend(SandboxBackend):
                 else None
             ),
             credential_proxy=sandbox_spec.credential_proxy,
+            git_ssh=sandbox_spec.git_ssh,
         )
 
     def wrap_launcher_argv(
@@ -1102,11 +1103,19 @@ def _build_profile(
             "(allow network-outbound (remote unix-socket "
             f"(path-literal {_quote(canonical_socket)})))"
         )
+    elif policy.git_ssh_socket_path is not None:
+        lines.append(";; Git SSH active — only its parent Unix socket is reachable")
     elif policy.allow_network:
         lines.append(";; allow_network=true — host network shared")
         lines.append("(allow network*)")
     else:
         lines.append(";; allow_network=false — covered by (deny default); no allow rules emitted")
+
+    if policy.git_ssh_socket_path is not None:
+        git_socket = str(Path(policy.git_ssh_socket_path).resolve(strict=False))
+        lines.append(
+            f"(allow network-outbound (remote unix-socket (path-literal {_quote(git_socket)})))"
+        )
 
     # ----------------------------------------------------------------
     # AF_UNIX control-socket denials.

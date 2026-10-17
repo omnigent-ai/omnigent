@@ -31,6 +31,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from tests.e2e.conftest import get_mock_requests
 from tests.e2e.omnigent._pexpect_harness import (
     await_turn_complete,
     clean_exit,
@@ -50,6 +51,8 @@ _HARNESS = "openai-agents"
 # startup banners or prompt-toolkit chrome.
 _NEEDLE = "zxqw-unique-history-token"
 _PROMPT = f"please just say ok ({_NEEDLE})"
+_INITIAL_RESPONSE = "initial-ctrl-r-turn-finished"
+_RECALLED_RESPONSE = "recalled-ctrl-r-turn-finished"
 
 # prompt-toolkit's default reverse-search toolbar prompt. This
 # is the literal text the SearchToolbar widget paints when
@@ -95,8 +98,8 @@ def test_repl_ctrl_r_reverse_search(
     configure_mock_llm(
         mock_llm_server_url,
         [
-            {"text": "ok"},
-            {"text": "ok again"},
+            {"text": _INITIAL_RESPONSE},
+            {"text": _RECALLED_RESPONSE},
         ],
         key=_MODEL,
     )
@@ -118,11 +121,13 @@ def test_repl_ctrl_r_reverse_search(
         # REPL is ready.
         child.expect(r"❯ ", timeout=_BOOT_TIMEOUT)
         submit_prompt(child, _PROMPT)
+        # The prompt can redraw during a turn; consume its unique response
+        # before treating the following prompt as ready for history search.
         await_turn_complete(
             child,
             running_timeout=_RUNNING_TIMEOUT,
             completion_timeout=_COMPLETION_TIMEOUT,
-            running_marker=r"working",
+            running_marker=_INITIAL_RESPONSE,
             completion_pattern=r"❯ ",
         )
         # Enter reverse-search mode. prompt-toolkit swaps the
@@ -155,15 +160,18 @@ def test_repl_ctrl_r_reverse_search(
         child.sendcontrol("g")
         drain_for(child, _ACCEPT_DRAIN_TIMEOUT)
         child.send("\r")
-        submit_drain = drain_for(child, _ACCEPT_DRAIN_TIMEOUT)
+        # The turn waiter must own output from submission onward; a fast
+        # mock response can finish before a separate render drain returns.
+        submit_drain = ""
         try:
-            await_turn_complete(
+            submitted_turn = await_turn_complete(
                 child,
                 running_timeout=_RUNNING_TIMEOUT,
                 completion_timeout=_COMPLETION_TIMEOUT,
-                running_marker=r"working",
+                running_marker=_RECALLED_RESPONSE,
                 completion_pattern=r"❯ ",
             )
+            submit_drain = submitted_turn.raw
             accepted_search_submits = True
         except Exception:
             accepted_search_submits = False
@@ -204,3 +212,9 @@ def test_repl_ctrl_r_reverse_search(
         + f"\n\nsearch-drain stripped (last 2000):\n"
         f"{combined_stripped[-2000:]}"
     )
+    requests = get_mock_requests(mock_llm_server_url, key=_MODEL)
+    assert len(requests) == 2
+    user_prompts = [
+        item["content"] for item in requests[-1]["input"] if item.get("role") == "user"
+    ]
+    assert user_prompts == [_PROMPT, _PROMPT]

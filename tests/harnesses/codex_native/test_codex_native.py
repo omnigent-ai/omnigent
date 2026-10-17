@@ -875,6 +875,19 @@ def test_preload_codex_thread_closes_client_on_failure(
         ),
         (
             codex_native_app_server.CodexAppServerResponseError(
+                {
+                    "code": -32600,
+                    "message": (
+                        "invalid paginated history lineage for "
+                        "019e96aa-0be2-7343-8d3b-6f914d60936d: "
+                        "source rollout is not paginated"
+                    ),
+                }
+            ),
+            True,
+        ),
+        (
+            codex_native_app_server.CodexAppServerResponseError(
                 {"code": -32600, "message": "thread 019e already has an active writer"}
             ),
             False,
@@ -886,8 +899,10 @@ def test_is_unreadable_thread_error(exc: BaseException, expected: bool) -> None:
     """
     Only codex's thread-store read failure counts as an unreadable thread.
 
-    A refused resume (another writer holds the thread) and a plain runtime
-    error must keep failing loud rather than silently starting a fresh thread.
+    A refused resume (another writer holds the thread), a paginated-lineage
+    mismatch (``-32600 … source rollout is not paginated``), and a plain
+    runtime error are each tested; only the thread-store and paginated-lineage
+    cases must start a fresh thread.
 
     :param exc: Exception raised by the resume request.
     :param expected: Whether it classifies as an unreadable thread.
@@ -8469,6 +8484,41 @@ def test_wrapper_spec_raw_instructions_resolves_prompt(tmp_path: Path) -> None:
     assert "Codex is running in the session terminal" in result
 
 
+@pytest.mark.asyncio
+async def test_create_codex_session_retries_429(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fresh Codex session creation retries an explicit rate-limit response."""
+    attempts = 0
+    request_bodies: list[bytes] = []
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        request_bodies.append(await request.aread())
+        if attempts == 1:
+            return httpx.Response(429, request=request)
+        return httpx.Response(201, json={"session_id": "conv_new"}, request=request)
+
+    async def _fake_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("omnigent.native.native_terminal._sleep", _fake_sleep)
+    async with httpx.AsyncClient(
+        base_url="https://example.databricks.com",
+        transport=httpx.MockTransport(_handler),
+    ) as client:
+        session_id = await codex_native._create_codex_session(
+            client,
+            b"bundle",
+            bridge_id=None,
+            terminal_launch_args=["--config", "approval_policy=on-request"],
+        )
+
+    assert session_id == "conv_new"
+    assert attempts == 2
+    assert all(b"bundle" in body for body in request_bodies)
+    assert all(b"approval_policy=on-request" in body for body in request_bodies)
+
+
 def test_wrapper_spec_raw_instructions_degrades_on_malformed_spec(tmp_path: Path) -> None:
     """A malformed wrapper spec must not block the terminal launch."""
     bad_spec = tmp_path / "bad.yaml"
@@ -11471,6 +11521,64 @@ def test_clone_codex_rollout_returns_none_for_unsafe_target_id(
     assert result is None
 
 
+@pytest.mark.parametrize(
+    ("recorded_models", "clone_model", "cloned"),
+    [
+        # Codex would compact on the source's last model before the clone's first turn.
+        (["system.ai.gpt-6-1-sol", "system.ai.gpt-6-astra"], "system.ai.gpt-6-1-sol", False),
+        # Only the last turn matters, and gateway and Codex spellings compare equal.
+        (["system.ai.gpt-6-astra", "system.ai.gpt-6-1-sol"], "gpt-6.1-sol", True),
+        ([], "system.ai.gpt-6-1-sol", True),
+        (["system.ai.gpt-6-astra"], None, True),
+    ],
+    ids=["last-turn-other-model", "last-turn-same-model", "no-recorded-model", "no-clone-model"],
+)
+def test_clone_codex_rollout_declines_source_whose_last_turn_used_another_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recorded_models: list[str],
+    clone_model: str | None,
+    cloned: bool,
+) -> None:
+    """A fork launching on a model other than the source's last turn is not cloned."""
+    from omnigent.harnesses.codex_native.bridge import (
+        bridge_dir_for_bridge_id,
+        codex_home_for_bridge_dir,
+    )
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
+    )
+    source_thread = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    source_home = codex_home_for_bridge_dir(bridge_dir_for_bridge_id("conv_source"))
+    rollout = _write_source_rollout(
+        codex_home=source_home, thread_id=source_thread, source_cwd="/repo/src"
+    )
+    with rollout.open("a", encoding="utf-8") as handle:
+        for index, model in enumerate(recorded_models, start=2):
+            turn = {"turn_id": f"turn_{index}", "cwd": "/repo/src", "model": model}
+            handle.write(json.dumps({"type": "turn_context", "payload": turn}) + "\n")
+    clone_home = codex_home_for_bridge_dir(bridge_dir_for_bridge_id("conv_clone"))
+
+    def clone() -> Path | None:
+        return codex_native._clone_codex_rollout(
+            source_session_id="conv_source",
+            source_thread_id=source_thread,
+            target_thread_id="019eaa11-1111-7222-8333-444455556666",
+            clone_codex_home=clone_home,
+            clone_workspace=tmp_path / "clone",
+            clone_model=clone_model,
+        )
+
+    if cloned:
+        assert clone() is not None
+    else:
+        # A declined clone tells the caller that only an item rebuild carries the history.
+        with pytest.raises(codex_native._CodexForkModelMismatchError, match="gpt-6-astra"):
+            clone()
+    assert bool(list(clone_home.glob("sessions/**/*.jsonl"))) is cloned
+
+
 @pytest.mark.asyncio
 async def test_ensure_local_codex_resume_rollout_replays_before_history_fetch(
     tmp_path: Path,
@@ -12805,6 +12913,8 @@ def test_rollout_records_use_terminal_launch_permission_args(
     turn_context = next(r for r in records if r["type"] == "turn_context")["payload"]
     assert turn_context["approval_policy"] == "never"
     assert turn_context["sandbox_policy"] == {"type": "danger-full-access"}
+    # A recorded model would make Codex compact on it before a turn on another model.
+    assert "model" not in turn_context
 
 
 # --- #2745: routing summary surfaced in the startup-timeout error ---

@@ -9,10 +9,17 @@
  *  desktop build that predates the `browser*` bridge is treated as unsupported,
  *  so the relay never claims an action it couldn't fulfill. */
 import { useEffect } from "react";
+import { buildBrowserActionScript } from "../../electron/src/browserActionScript.mjs";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import { supportsBrowser } from "@/lib/nativeBridge";
 import { authenticatedFetch } from "@/lib/identity";
+import { useQueryClient } from "@tanstack/react-query";
+import { sessionRoutingHostId, setSessionHost, setSessionParent } from "@/lib/sessionHost";
+import { getSessionSlim } from "@/lib/sessionsApi";
+import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
+import type { Host } from "@/hooks/useHosts";
+import type { Session } from "@/lib/types";
 
 /** Subset of `window.omnigentDesktop` the relay calls (typed locally, not via
  *  nativeBridge). All optional — an older shell may predate the feature, so the
@@ -22,15 +29,41 @@ interface BrowserDesktopBridge {
     conversationId: string,
     url: string,
     bounds?: unknown,
-    opts?: { force?: boolean; agent?: boolean },
+    opts?: {
+      force?: boolean;
+      agent?: boolean;
+      sourceHostId?: string;
+      rememberedArcaHostId?: string;
+      sourceIsArcaHost?: boolean;
+    },
   ) => Promise<{ ok: boolean; created?: boolean; error?: string }>;
   browserScreenshot?: (
     conversationId: string,
   ) => Promise<{ ok: boolean; dataUrl?: string; error?: string }>;
+  /** @deprecated Compatibility with pre-typed desktops until v0.21. */
   browserExecute?: (
     conversationId: string,
-    js: string,
+    script: string,
   ) => Promise<{ ok: boolean; result?: string; error?: string }>;
+  browserPerformAction?: (
+    conversationId: string,
+    action: "snapshot" | "click" | "type",
+    args?: Record<string, unknown>,
+  ) => Promise<{ ok: boolean; result?: string; error?: string }>;
+}
+
+function isLoopbackPreview(url: string): boolean {
+  try {
+    const { hostname } = new URL(url);
+    return (
+      hostname === "localhost" ||
+      hostname.endsWith(".localhost") ||
+      hostname === "127.0.0.1" ||
+      hostname === "[::1]"
+    );
+  } catch {
+    return false;
+  }
 }
 
 function getBrowserDesktop(): BrowserDesktopBridge | null {
@@ -48,164 +81,20 @@ interface ActionResult {
   data_url?: string;
 }
 
-/** Safely interpolate a string into a `browserExecute` JS payload — always
- *  `JSON.stringify` (handles the full escape table); never hand-roll. */
-function jsString(s: string): string {
-  return JSON.stringify(s);
-}
-
-/** Same for numbers — stringify at the interpolation site so a caller that
- *  skips the shape guard still emits a valid in-page literal. */
-function jsNumber(n: number): string {
-  return JSON.stringify(n);
-}
-
-/** In-page JS producing an a11y-style tree with stable `[ref=N]` ids. Refs live
- *  in `window.__omni_refs__` (resolved by click/type) under a per-snapshot
- *  `__omni_snapshot_id__`, so a stale ref is rejected with a precise error.
- *  Picks interactive/landmark/heading/list elements (skips hidden/zero-area);
- *  accessible name = aria-label > alt > placeholder > title > text, ≤80 chars.
- *  Snapshot REPLACES the ref map — two agents on one page collide (known limit,
- *  but the snapshot_id check turns a mis-click into a clean error).
- *  Returns JSON: `{ snapshot_id, url, title, tree }`. */
-const SNAPSHOT_JS = `(() => {
-  const snapshotId = (crypto && crypto.randomUUID) ? crypto.randomUUID() : ('snap-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10));
-  window.__omni_refs__ = new Map();
-  window.__omni_snapshot_id__ = snapshotId;
-  let nextRef = 0;
-  const lines = [];
-
-  const TAG_ROLE = {
-    a: 'link', button: 'button', textarea: 'textbox', select: 'combobox',
-    nav: 'navigation', main: 'main', header: 'banner', footer: 'contentinfo',
-    form: 'form', section: 'region', article: 'article', aside: 'complementary',
-    ul: 'list', ol: 'list', li: 'listitem', img: 'image', label: 'label',
-    table: 'table', tr: 'row', td: 'cell', th: 'columnheader',
-    dialog: 'dialog', summary: 'button', details: 'group',
-  };
-  const isInteractiveTag = (tag) =>
-    tag === 'a' || tag === 'button' || tag === 'input' ||
-    tag === 'textarea' || tag === 'select' || tag === 'label' ||
-    tag === 'summary';
-  const isHeading = (tag) => tag && tag.length === 2 && tag[0] === 'h' && tag[1] >= '1' && tag[1] <= '6';
-
-  function getRole(el) {
-    const explicit = el.getAttribute && el.getAttribute('role');
-    if (explicit) return explicit;
-    const tag = el.tagName && el.tagName.toLowerCase();
-    if (!tag) return null;
-    if (tag === 'input') {
-      const t = (el.type || 'text').toLowerCase();
-      if (t === 'submit' || t === 'button' || t === 'reset') return 'button';
-      if (t === 'checkbox') return 'checkbox';
-      if (t === 'radio') return 'radio';
-      if (t === 'range') return 'slider';
-      if (t === 'hidden') return null;
-      return 'textbox';
-    }
-    if (isHeading(tag)) return 'heading';
-    if (TAG_ROLE[tag]) return TAG_ROLE[tag];
-    if (el.hasAttribute && (el.hasAttribute('tabindex') || el.hasAttribute('onclick'))) return 'generic';
-    return null;
+async function performAction(
+  desktop: BrowserDesktopBridge,
+  conversationId: string,
+  action: "snapshot" | "click" | "type",
+  args?: Record<string, unknown>,
+) {
+  if (desktop.browserPerformAction) {
+    return desktop.browserPerformAction(conversationId, action, args);
   }
-
-  function getName(el, depth = 0) {
-    if (depth > 4) return '';
-    if (el.getAttribute) {
-      const lbl = el.getAttribute('aria-label');
-      if (lbl) return lbl;
-      const alt = el.getAttribute('alt');
-      if (alt) return alt;
-      const ph = el.getAttribute('placeholder');
-      if (ph) return ph;
-      const ttl = el.getAttribute('title');
-      if (ttl) return ttl;
-    }
-    const tag = el.tagName && el.tagName.toLowerCase();
-    if (tag === 'input' && el.value && el.type !== 'password') return String(el.value).slice(0, 80);
-    let text = '';
-    for (const node of el.childNodes) {
-      if (node.nodeType === 3) text += node.textContent;
-      else if (node.nodeType === 1) {
-        const childTag = node.tagName && node.tagName.toLowerCase();
-        if (depth === 0 && isInteractiveTag(childTag)) continue;
-        text += getName(node, depth + 1);
-      }
-      if (text.length > 80) break;
-    }
-    return text.trim().replace(/\\s+/g, ' ').slice(0, 80);
+  // Pre-typed desktops retain their existing executor until the v0.21 transition.
+  if (desktop.browserExecute) {
+    return desktop.browserExecute(conversationId, buildBrowserActionScript(action, args));
   }
-
-  function isVisible(el) {
-    if (!el.getBoundingClientRect) return false;
-    const style = window.getComputedStyle(el);
-    if (style.display === 'none' || style.visibility === 'hidden') return false;
-    if (style.opacity === '0') return false;
-    const rect = el.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-  }
-
-  function walk(el, depth) {
-    if (!(el instanceof Element)) return;
-    if (!isVisible(el)) return;
-    const role = getRole(el);
-    const picked = role !== null && role !== 'generic';
-    let childDepth = depth;
-    if (picked) {
-      const ref = ++nextRef;
-      window.__omni_refs__.set(ref, new WeakRef(el));
-      const name = getName(el);
-      const indent = '  '.repeat(depth);
-      let line = indent + '- ' + role;
-      if (name) line += ' ' + JSON.stringify(name);
-      line += ' [ref=' + ref + ']';
-      lines.push(line);
-      childDepth = depth + 1;
-    }
-    for (const child of el.children) {
-      walk(child, childDepth);
-    }
-  }
-
-  if (document.body) walk(document.body, 0);
-
-  return JSON.stringify({
-    snapshot_id: snapshotId,
-    url: window.location.href,
-    title: document.title,
-    tree: lines.join('\\n'),
-  });
-})()`;
-
-/** Build the "find element" preamble for an action that accepts EITHER ref OR
- *  selector. Sets `el` in the in-page scope; throws on miss.
- *
- *  When `snapshot_id` is provided (recommended), the resolver validates it
- *  matches `window.__omni_snapshot_id__` BEFORE looking up the ref — gives the
- *  agent a precise "snapshot superseded" error instead of a generic "ref is
- *  stale". */
-function findElJs(args: Record<string, unknown>): string {
-  const ref = typeof args.ref === "number" ? args.ref : undefined;
-  const snapshotId = typeof args.snapshot_id === "string" ? args.snapshot_id : undefined;
-  const selector = typeof args.selector === "string" ? args.selector : "";
-  if (ref !== undefined) {
-    const idCheck = snapshotId
-      ? `if (window.__omni_snapshot_id__ !== ${jsString(snapshotId)}) ` +
-        `throw new Error('snapshot ' + ${jsString(snapshotId)} + ' was superseded by ' + (window.__omni_snapshot_id__ || '(none)') + ' — call browser_snapshot again'); `
-      : "";
-    return (
-      idCheck +
-      `const el = (window.__omni_refs__ && window.__omni_refs__.get(${jsNumber(ref)}))?.deref(); ` +
-      // Distinguish no-snapshot / ref-missing / GC'd so the agent's retry is specific.
-      `if (!window.__omni_refs__) throw new Error('no snapshot in this page — call browser_snapshot first'); ` +
-      `if (!window.__omni_refs__.has(${jsNumber(ref)})) throw new Error('ref ' + ${jsNumber(ref)} + ' not in snapshot — call browser_snapshot again'); ` +
-      `if (!el) throw new Error('ref ' + ${jsNumber(ref)} + ' was garbage-collected — call browser_snapshot again'); `
-    );
-  }
-  return (
-    `const el = document.querySelector(${jsString(selector)}); ` +
-    `if (!el) throw new Error('selector not found: ' + ${jsString(selector)}); `
-  );
+  return { ok: false, error: "this desktop shell does not support the browser pane" };
 }
 
 /** Execute one claimed action against the conversation's WebContentsView.
@@ -217,6 +106,9 @@ async function dispatch(
   action: string,
   args: Record<string, unknown>,
   desktop: BrowserDesktopBridge,
+  sourceHostId: string | null,
+  rememberedArcaHostId: string | null,
+  sourceIsArcaHost: boolean,
 ): Promise<ActionResult> {
   try {
     switch (action) {
@@ -231,8 +123,20 @@ async function dispatch(
         const r = await desktop.browserOpenOrNavigate(conversationId, url, undefined, {
           force: true,
           agent: true,
+          ...(sourceHostId ? { sourceHostId } : {}),
+          ...(rememberedArcaHostId ? { rememberedArcaHostId } : {}),
+          ...(sourceIsArcaHost ? { sourceIsArcaHost: true } : {}),
         });
         if (!r?.ok) return { ok: false, error: r?.error ?? "navigate failed" };
+        if (
+          isLoopbackPreview(url) &&
+          sourceHostId &&
+          rememberedArcaHostId &&
+          sourceHostId !== rememberedArcaHostId
+        ) {
+          // Main only approves this after consent captures the source host.
+          writeArcaHostId(sourceHostId);
+        }
         return { ok: true, data: { final_url: url } };
       }
       case "screenshot": {
@@ -244,10 +148,7 @@ async function dispatch(
         return { ok: true, data_url: r.dataUrl };
       }
       case "snapshot": {
-        if (!desktop.browserExecute) {
-          return { ok: false, error: "this desktop shell does not support the browser pane" };
-        }
-        const r = await desktop.browserExecute(conversationId, SNAPSHOT_JS);
+        const r = await performAction(desktop, conversationId, "snapshot");
         if (!r?.ok) return { ok: false, error: r?.error ?? "snapshot failed" };
         try {
           const parsed = JSON.parse(r.result ?? "{}") as Record<string, unknown>;
@@ -257,31 +158,12 @@ async function dispatch(
         }
       }
       case "click": {
-        if (!desktop.browserExecute) {
-          return { ok: false, error: "this desktop shell does not support the browser pane" };
-        }
-        const js =
-          `(() => { ${findElJs(args)} ` +
-          `el.scrollIntoView({ block: 'center', inline: 'center' }); ` +
-          `el.click(); return 'ok'; })()`;
-        const r = await desktop.browserExecute(conversationId, js);
+        const r = await performAction(desktop, conversationId, "click", args);
         if (!r?.ok) return { ok: false, error: r?.error ?? "click failed" };
         return { ok: true };
       }
       case "type": {
-        if (!desktop.browserExecute) {
-          return { ok: false, error: "this desktop shell does not support the browser pane" };
-        }
-        const text = String(args.text ?? "");
-        const js =
-          `(() => { ${findElJs(args)} ` +
-          `el.focus(); ` +
-          `const setter = Object.getOwnPropertyDescriptor(el.constructor.prototype, 'value')?.set; ` +
-          `if (setter) setter.call(el, ${jsString(text)}); else el.value = ${jsString(text)}; ` +
-          `el.dispatchEvent(new Event('input', { bubbles: true })); ` +
-          `el.dispatchEvent(new Event('change', { bubbles: true })); ` +
-          `return 'ok'; })()`;
-        const r = await desktop.browserExecute(conversationId, js);
+        const r = await performAction(desktop, conversationId, "type", args);
         if (!r?.ok) return { ok: false, error: r?.error ?? "type failed" };
         return { ok: true };
       }
@@ -350,10 +232,13 @@ async function postResult(
  *   open. Routing uses the delivering conversation, not this.
  */
 export function useBrowserAgentRelay(conversationId: string | null | undefined): void {
+  const relayEnabled = !!conversationId;
+  const queryClient = useQueryClient();
   useEffect(() => {
-    if (!conversationId) return;
+    if (!relayEnabled) return;
     if (!supportsBrowser()) return;
 
+    let cancelled = false;
     const handler = async (evt: BrowserActionRequestEvent, sourceConversationId: string | null) => {
       if (!sourceConversationId) return; // no delivering session — nothing to target
       const desktop = getBrowserDesktop();
@@ -361,10 +246,62 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       // Claim FIRST — only the winner proceeds, so two windows can't double-execute.
       const claimToken = await claimAction(sourceConversationId, evt.actionId);
       if (!claimToken) return;
-      const result = await dispatch(sourceConversationId, evt.action, evt.args, desktop);
+      let sourceHostId: string | null = null;
+      if (evt.action === "navigate") {
+        try {
+          // Parent hints cannot establish which ancestor has the nearest own host binding.
+          const visited = new Set<string>();
+          let id: string | null = sourceConversationId;
+          while (id !== null && !visited.has(id)) {
+            visited.add(id);
+            const hopId: string = id;
+            // oxlint-disable-next-line no-await-in-loop -- Each parent comes from the previous snapshot.
+            const source: Session = await queryClient.fetchQuery({
+              queryKey: ["session", hopId],
+              queryFn: () => getSessionSlim(hopId),
+              staleTime: Infinity,
+              retry: false,
+            });
+            setSessionHost(source.id, sessionRoutingHostId(source.hostId, source.labels));
+            setSessionParent(source.id, source.parentSessionId);
+            if (source.hostId) {
+              sourceHostId = source.hostId;
+              break;
+            }
+            id = source.parentSessionId;
+          }
+        } catch {
+          // Unknown provenance stays denied for localhost; public browsing still works.
+        }
+      }
+      const rememberedArcaHostId = evt.action === "navigate" ? readArcaHostId() : null;
+      const sourceIsArcaHost =
+        evt.action === "navigate" && sourceHostId !== null
+          ? queryClient
+              .getQueriesData<Host[]>({ queryKey: ["hosts"] })
+              .flatMap(([, rows]) => rows ?? [])
+              .some(
+                (host) => host.host_id === sourceHostId && isArcaHost(host, rememberedArcaHostId),
+              )
+          : false;
+      const result = cancelled
+        ? { ok: false, error: "browser relay context changed" }
+        : await dispatch(
+            sourceConversationId,
+            evt.action,
+            evt.args,
+            desktop,
+            sourceHostId,
+            rememberedArcaHostId,
+            sourceIsArcaHost,
+          );
       await postResult(sourceConversationId, evt.actionId, claimToken, result);
     };
 
-    return onBrowserActionRequest(handler);
-  }, [conversationId]);
+    const unsubscribe = onBrowserActionRequest(handler);
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [relayEnabled, queryClient]);
 }

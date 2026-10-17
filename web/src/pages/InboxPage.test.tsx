@@ -40,15 +40,22 @@ vi.mock("@/components/blocks/ApprovalCard", () => ({
     status,
     allowAutoMode,
     onSubmit,
+    requester,
   }: {
     elicitationId: string;
     message: string;
     status: string;
     allowAutoMode?: boolean;
     onSubmit: (id: string, action: "accept" | "decline", content?: Record<string, unknown>) => void;
+    requester?: { sessionId: string; ancestorSessionId: string } | null;
   }) => (
     <div data-testid="approval-card" data-status={status}>
       <span>{message}</span>
+      {requester && (
+        <span data-testid="approval-card-requester">
+          {requester.sessionId} under {requester.ancestorSessionId}
+        </span>
+      )}
       <button type="button" onClick={() => onSubmit(elicitationId, "accept")}>
         Stub Accept
       </button>
@@ -267,7 +274,7 @@ describe("InboxPage approval items", () => {
     const row = conversation({ id: "sess_1" });
     vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
     vi.mocked(sessionsApi.getSession).mockResolvedValue({
-      pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
+      pendingElicitations: [rawElicitation("eli_1", "Claude wants to call **Bash**")],
     } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
     renderPage();
 
@@ -277,6 +284,29 @@ describe("InboxPage approval items", () => {
     fireEvent.click(toggle);
     await waitFor(() => expect(item).toHaveAttribute("data-expanded", "false"));
     expect(screen.queryByTestId("approval-card")).not.toBeInTheDocument();
+    // The collapsed row previews the same gating message with its bold tool
+    // name, not the raw `**Bash**` markers.
+    expect(within(toggle).getByText("Bash", { selector: "strong" })).toBeInTheDocument();
+    expect(toggle.textContent).not.toContain("**");
+  });
+
+  it("previews a policy prompt's command verbatim in the collapsed row", async () => {
+    // WHY: only the bridges' `**<tool>**` message is formatted; a balanced `**`
+    // inside a command the user is approving must not be read as emphasis.
+    const message = "Agent wants to call sys_os_shell('ls **/vendor/**'). Approve?";
+    const row = conversation({ id: "sess_1" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", message)],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+
+    const item = await screen.findByTestId("inbox-item");
+    const toggle = within(item).getByRole("button", { name: /My Session/ });
+    fireEvent.click(toggle);
+    await waitFor(() => expect(item).toHaveAttribute("data-expanded", "false"));
+    expect(toggle.textContent).toContain(message);
+    expect(toggle.querySelector("strong")).toBeNull();
   });
 
   it("submits an approve verdict via approve() and flips the card to responded", async () => {
@@ -410,13 +440,29 @@ describe("InboxPage approval items", () => {
     await waitFor(() =>
       expect(sessionsApi.approve).toHaveBeenCalledWith("child", "eli_child", { action: "accept" }),
     );
+    // The card names the child, since the row it surfaced under is the parent.
+    expect(screen.getByTestId("approval-card-requester")).toHaveTextContent("child under parent");
+  });
+
+  it("does not attribute a session's own prompt to a sub-agent", async () => {
+    // WHY: only mirrored prompts carry a requester; a row's own prompt must
+    // not read as coming from a sub-agent.
+    const row = conversation({ id: "parent" });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_own", "Own approval?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+
+    expect(await screen.findByRole("button", { name: "Stub Accept" })).toBeInTheDocument();
+    expect(screen.queryByTestId("approval-card-requester")).toBeNull();
   });
 });
 
 describe("InboxPage comments and errors", () => {
   it("renders unseen file comments with author, path, and body", async () => {
-    // WHY: the comment side of the inbox renders each unseen comment with its
-    // author pill, file path, and body, and counts it in the header summary.
+    // WHY: an unseen comment collapses to one row naming its author; expanding
+    // it shows the file path, body, and the deep link that marks it seen.
     vi.mocked(commentInboxHook.useCommentInbox).mockReturnValue(
       commentInboxStub({
         items: [
@@ -437,11 +483,21 @@ describe("InboxPage comments and errors", () => {
     );
     renderPage();
 
-    expect(await screen.findByTestId("inbox-comment")).toBeInTheDocument();
-    expect(screen.getByText("alice")).toBeInTheDocument();
-    expect(screen.getByText("src/app.ts")).toBeInTheDocument();
-    expect(screen.getByText("Please reconsider this line.")).toBeInTheDocument();
-    expect(screen.getByText(/1 comment/)).toBeInTheDocument();
+    const item = await screen.findByTestId("inbox-comment");
+    expect(item).toHaveAttribute("data-expanded", "false");
+    // Collapsed: the author's avatar tile plus "author: body" in the preview.
+    expect(item).toHaveTextContent("alice: Please reconsider this line.");
+    expect(within(item).getByRole("img", { name: "Unread" })).toBeInTheDocument();
+    expect(screen.getByText("1 comment")).toBeInTheDocument();
+
+    fireEvent.click(within(item).getByRole("button", { name: /Comment: My Session/ }));
+    expect(item).toHaveAttribute("data-expanded", "true");
+    expect(within(item).getByText("src/app.ts")).toBeInTheDocument();
+    expect(within(item).getByText("Please reconsider this line.")).toBeInTheDocument();
+    expect(within(item).getByRole("link", { name: /Open file/ })).toHaveAttribute(
+      "href",
+      "/c/sess_1?file=src%2Fapp.ts&comment=cm_1",
+    );
   });
 
   it("shows the load-error banner and retries failed sources on click", async () => {
@@ -597,6 +653,35 @@ describe("InboxPage unread sessions", () => {
     fireEvent.click(within(item).getByRole("button", { name: /Unread Session/ }));
     fireEvent.click(within(item).getByRole("button", { name: /Mark as read/ }));
     await waitFor(() => expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument());
+  });
+});
+
+describe("InboxPage recency groups", () => {
+  it("interleaves kinds newest first under recency headers", async () => {
+    // WHY: items of every kind share one timeline, so a fresh reply sits
+    // above an older approval — the approval still opens by default.
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const approvalRow = conversation({
+      id: "sess_approval",
+      title: "Approval Session",
+      updated_at: nowSeconds - 3 * 86_400,
+    });
+    const unreadRow = unreadConversation({ updated_at: nowSeconds - 30 });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(
+      conversationsStub([approvalRow, unreadRow]),
+    );
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    renderPage();
+
+    await screen.findByTestId("inbox-item");
+    const regions = screen.getAllByRole("region");
+    expect(regions.map((r) => r.getAttribute("aria-label"))).toEqual(["Just now", "This week"]);
+    expect(within(regions[0]).getByTestId("inbox-unread")).toBeInTheDocument();
+    expect(within(regions[1]).getByTestId("inbox-item")).toHaveAttribute("data-expanded", "true");
+    // The header pill totals every kind; its label spells out the breakdown.
+    expect(screen.getByText("1 approval · 1 unread")).toBeInTheDocument();
   });
 });
 

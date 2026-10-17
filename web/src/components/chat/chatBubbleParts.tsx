@@ -15,6 +15,7 @@ import {
 import {
   ArrowUpIcon,
   CheckIcon,
+  ClockIcon,
   CopyIcon,
   FileTextIcon,
   FolderIcon,
@@ -77,9 +78,11 @@ import { useStickToBottomContext } from "use-stick-to-bottom";
 import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { useForkDialog } from "@/shell/ForkDialogContext";
+import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { InlineImage, SessionImage } from "@/components/SessionImage";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
 import { copyText } from "@/lib/clipboard";
+import { copyMarkdown } from "@/lib/copyMarkdown";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import type { SessionStatus } from "@/lib/types";
@@ -91,7 +94,7 @@ import {
 // Matches both wordings the native executors emit: "[Attached: <path>]"
 // (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
 // is the path. Global so all markers in a message are found / stripped.
-const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
+const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\][ \t]*(?:\r?\n)*/g;
 
 const COLLAPSE_THRESHOLD = 12000;
 
@@ -110,7 +113,7 @@ export function extractUserText(content: MessageContentBlock[]): string {
     .map((c) => c.text)
     .join("")
     .replace(ATTACHED_RE, "")
-    .trim();
+    .trimEnd();
 }
 
 // An absolute filesystem path in any form a native executor might materialize
@@ -216,6 +219,7 @@ export function buildPendingBubbles(
       // No server item id yet; tempId keeps React keys stable until promotion.
       itemId: p.tempId,
       pending: true,
+      ...(p.sentMidTurn ? { awaitingAgent: true } : {}),
       content: p.content,
       ...(author !== null ? { createdBy: author } : {}),
       // Stamped once at send time; absent for snapshot-replayed entries,
@@ -604,9 +608,14 @@ export const BubbleView = memo(
  * Copy-to-clipboard handler for a message bubble's "Copy" action.
  *
  * @param getText - Produces the text to copy at click time.
+ * @param copy - Clipboard writer; assistant bubbles pass {@link copyMarkdown}
+ *   so the paste keeps its formatting.
  * @returns `{ isCopied, handleCopy }` for the action button.
  */
-function useCopyMessage(getText: () => string): {
+function useCopyMessage(
+  getText: () => string,
+  copy: (value: string) => Promise<void> = copyText,
+): {
   isCopied: boolean;
   handleCopy: () => void;
 } {
@@ -620,7 +629,7 @@ function useCopyMessage(getText: () => string): {
     if (isCopied) return;
     const text = getText();
     if (!text) return;
-    copyText(text).then(
+    copy(text).then(
       () => {
         setIsCopied(true);
         window.clearTimeout(timeoutRef.current);
@@ -633,7 +642,7 @@ function useCopyMessage(getText: () => string): {
         console.warn("Failed to copy message", error);
       },
     );
-  }, [getText, isCopied, isMobile]);
+  }, [copy, getText, isCopied, isMobile]);
 
   return { isCopied, handleCopy };
 }
@@ -711,14 +720,15 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   //   for a block carrying neither.
   // - input_file: always render as a chip (non-image files can't be
   //   previewed inline).
-  const text = extractUserText(bubble.content);
+  const isShellCommand = bubble.shellCommand !== undefined;
+  const text = isShellCommand ? `!${bubble.shellCommand}` : extractUserText(bubble.content);
   const images = bubble.content.filter((c): c is ImageContentBlock => c.type === "input_image");
   const fileChips = bubble.content.filter(
     (c): c is Extract<MessageContentBlock, { type: "input_file" }> => c.type === "input_file",
   );
   // "@"-mentioned workspace files/folders ride in as "[Attached: …]" text
   // markers (no input_file block), so surface them as chips.
-  const mentionedChips = extractAttachedPaths(bubble.content);
+  const mentionedChips = isShellCommand ? [] : extractAttachedPaths(bubble.content);
   // Equality selector so Zustand only re-renders the matching bubble.
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
   const { isCopied, handleCopy } = useCopyMessage(() => text);
@@ -730,6 +740,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // a large DOM for text the user hasn't asked to read yet.
   const isLong = text.length > COLLAPSE_THRESHOLD;
   const [isCollapsed, setIsCollapsed] = useState(isLong);
+  const visibleText = isCollapsed ? sliceByCodePoint(text, COLLAPSE_THRESHOLD) : text;
   // Runtime-injected `[System: ...]` notifications ride in on role=user. When
   // the content is a pure system marker, swap in a muted centered indicator.
   if (images.length === 0 && fileChips.length === 0 && mentionedChips.length === 0) {
@@ -865,13 +876,19 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             {text && (
               <>
                 <div className={cn("relative", isCollapsed && "max-h-64 overflow-hidden")}>
-                  <FilePathAwareMessageResponse
-                    breaks
-                    mode="static"
-                    remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
-                  >
-                    {isCollapsed ? sliceByCodePoint(text, COLLAPSE_THRESHOLD) : text}
-                  </FilePathAwareMessageResponse>
+                  {isShellCommand ? (
+                    <pre className="whitespace-pre-wrap break-words font-mono text-sm">
+                      <code>{visibleText}</code>
+                    </pre>
+                  ) : (
+                    <FilePathAwareMessageResponse
+                      breaks
+                      mode="static"
+                      remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
+                    >
+                      {visibleText}
+                    </FilePathAwareMessageResponse>
+                  )}
                   {/* Gradient fade at the bottom of collapsed prompts to signal
                       there is more content below. */}
                   {isCollapsed && isLong && (
@@ -893,6 +910,16 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
           </MessageContent>
         </div>
+        {/* Always visible: a mid-turn message can wait minutes behind a long tool call. */}
+        {bubble.pending && bubble.awaitingAgent && (
+          <div
+            className="flex items-center gap-1 pt-1 text-[11px] leading-4 text-muted-foreground"
+            data-testid="message-awaiting-agent"
+          >
+            <ClockIcon size={12} aria-hidden />
+            The agent will read this after its current step
+          </div>
+        )}
         {/* 40%-visible on touch, hover/focus-reveal on desktop. */}
         <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
           {ts && (
@@ -966,7 +993,10 @@ function AssistantBubble({
     ? scopedState.blocks.some((b) => b.type === "elicitation" && b.status === "pending")
     : rootHasPendingElicitation;
   // Getter computes the markdown lazily at click time.
-  const { isCopied, handleCopy } = useCopyMessage(() => collectBubbleMarkdown(bubble.items));
+  const { isCopied, handleCopy } = useCopyMessage(
+    () => collectBubbleMarkdown(bubble.items),
+    copyMarkdown,
+  );
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(bubble.responseId);
   const flashing = useChatStore((s) => s.flashItemId === bubble.responseId);
   // null outside AppShell's provider (isolated tests) → hide the action.
@@ -1057,12 +1087,9 @@ function AssistantBubble({
         data-role="assistant"
         data-response-stable-id={bubble.stableId}
         data-message-id={bubble.responseId}
-        className={
-          spansFullColumn ? "max-w-full" : "max-w-3xl min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]"
-        }
+        className={spansFullColumn ? "max-w-full" : "max-w-[var(--chat-prose-width)]"}
       >
-        {/* A fold-only bubble takes w-full at the ordinary max-w-3xl cap rather
-            than shrink-wrapping to the summary row's ~110px. */}
+        {/* Fold-only rows fill the prose width so their hairlines remain visible. */}
         <MessageContent
           className={cn(
             (spansFullColumn || foldOnly) && "w-full",
@@ -1117,15 +1144,24 @@ function AssistantBubble({
                     truncated after this turn. Hidden while streaming and when
                     the session can't be forked. */}
               {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
-                <MessageAction
-                  tooltip="Fork from here"
-                  size="icon-xxs"
-                  data-testid="fork-from-response"
-                  onClick={() => forkDialog.openForkDialog({ upToResponseId: bubble.responseId })}
-                  componentId="chat.message.fork"
-                >
-                  <SplitIcon size={14} />
-                </MessageAction>
+                <DisabledActionTooltip reason={forkDialog.disabledReason} label="Fork from here">
+                  <MessageAction
+                    tooltip={forkDialog.disabledReason ? undefined : "Fork from here"}
+                    label="Fork from here"
+                    disabled={!!forkDialog.disabledReason}
+                    size="icon-xxs"
+                    data-testid="fork-from-response"
+                    onClick={() =>
+                      forkDialog.openForkDialog({
+                        sourceSessionId: scopedConversationId ?? undefined,
+                        upToResponseId: bubble.responseId,
+                      })
+                    }
+                    componentId="chat.message.fork"
+                  >
+                    <SplitIcon size={14} />
+                  </MessageAction>
+                </DisabledActionTooltip>
               )}
               <MessageAction
                 tooltip={isLinkCopied ? "Copied!" : "Copy link"}

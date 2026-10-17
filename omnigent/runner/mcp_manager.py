@@ -411,7 +411,7 @@ class RunnerMcpManager:
         This keeps runner startup cheap when a spec lists many MCPs; the
         first schema lookup or tool call still pays the server cold-start.
         """
-        configs = list(spec.mcp_servers or [])
+        configs = [c for c in (spec.mcp_servers or []) if c.transport != "registry"]
         if not configs:
             return
         spec_hash = compute_spec_hash(configs, self._stdio_cwd)
@@ -421,7 +421,7 @@ class RunnerMcpManager:
 
     async def schemas_for(self, spec: AgentSpec) -> McpSchemasResult:
         """Resolve MCP schemas for *spec*; awaits any in-flight connect."""
-        configs = list(spec.mcp_servers or [])
+        configs = [c for c in (spec.mcp_servers or []) if c.transport != "registry"]
         if not configs:
             return McpSchemasResult(
                 schemas=[], tool_names=set(), failures={}, server_instructions={}
@@ -511,7 +511,7 @@ class RunnerMcpManager:
             an ``InputRequiredResult`` requiring user input before
             the tool can execute.
         """
-        configs = list(spec.mcp_servers or [])
+        configs = [c for c in (spec.mcp_servers or []) if c.transport != "registry"]
         if not configs:
             raise RuntimeError(
                 f"runner has no MCPs registered for this spec; cannot dispatch {tool_name!r}"
@@ -581,7 +581,7 @@ class RunnerMcpManager:
         Namespaced names must match their server prefix exactly. Bare names
         are accepted only for internal/test callers.
         """
-        configs = list(spec.mcp_servers or [])
+        configs = [c for c in (spec.mcp_servers or []) if c.transport != "registry"]
         if not configs:
             return None
         spec_hash = compute_spec_hash(configs, self._stdio_cwd)

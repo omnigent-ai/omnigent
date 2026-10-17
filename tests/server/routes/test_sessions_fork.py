@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -23,17 +24,25 @@ from omnigent.entities import (
     PagedList,
     StoredFile,
 )
-from omnigent.errors import OmnigentError
+from omnigent.errors import SESSION_AGENT_BUNDLE_MISSING_MESSAGE, OmnigentError
 from omnigent.server.auth import AuthProvider, UnifiedAuthProvider
 from omnigent.server.managed_hosts import (
     MANAGED_REPO_LABEL_KEY,
+    REQUESTED_HOST_ID_LABEL_KEY,
     ManagedLaunchTracker,
     parse_sandbox_config,
     resolve_managed_agent_label,
 )
 from omnigent.server.routes import _session_create_validation as create_validation
 from omnigent.server.routes.sessions import create_sessions_router, routes_core
-from omnigent.stores.conversation_store import _FORK_ONLY_DROPPED_LABEL_KEYS
+from omnigent.stores.conversation_store import (
+    _FORK_ONLY_DROPPED_LABEL_KEYS,
+    FORK_SOURCE_LABEL_KEY,
+    SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
+)
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from tests.server.helpers import create_test_agent
 
 # ── Minimal store stubs ──────────────────────────────────────────
 
@@ -602,6 +611,74 @@ def _build_app(
 # ── Tests ────────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("source_runner", [None, "runner_shared"])
+def test_side_chat_records_its_source_without_a_persisted_workspace(
+    nested: bool, source_runner: str | None
+) -> None:
+    source = _make_conversation(
+        labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: "original"} if nested else {}
+    )
+    source.runner_id = source_runner
+    store = _ConversationStore({source.id: source})
+    client = TestClient(_build_app(store))
+
+    response = client.post(f"/v1/sessions/{source.id}/fork", json={"side_chat": True})
+
+    assert response.status_code == 201, response.text
+    labels = response.json()["labels"]
+    assert labels[SIDE_CHAT_LABEL_KEY] == "1"
+    assert labels[SIDE_CHAT_SOURCE_LABEL_KEY] == source.id
+    assert FORK_SOURCE_LABEL_KEY not in labels
+    assert response.json()["kind"] == "default"
+    assert response.json()["host_id"] is None
+    assert response.json()["parent_session_id"] is None
+
+
+def test_normal_fork_does_not_copy_side_chat_routing_source() -> None:
+    source = _make_conversation(
+        labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: "original"}
+    )
+    store = _ConversationStore({source.id: source})
+    client = TestClient(_build_app(store))
+
+    response = client.post(f"/v1/sessions/{source.id}/fork", json={})
+
+    assert response.status_code == 201, response.text
+    assert SIDE_CHAT_SOURCE_LABEL_KEY not in response.json()["labels"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_workspace", [None, "/workspace"])
+async def test_runnerless_side_chat_preserves_source_workspace_requirement(
+    client: httpx.AsyncClient, db_uri: str, source_workspace: str | None
+) -> None:
+    agent = await create_test_agent(client)
+    store = SqlAlchemyConversationStore(db_uri)
+    source = store.create_conversation(agent_id=agent["id"], workspace=source_workspace)
+
+    response = await client.post(f"/v1/sessions/{source.id}/fork", json={"side_chat": True})
+
+    assert response.status_code == 201, response.text
+    child_id = response.json()["id"]
+    needs_workspace = source_workspace is not None
+    labels = response.json()["labels"]
+    assert labels[SIDE_CHAT_LABEL_KEY] == "1"
+    assert labels[SIDE_CHAT_SOURCE_LABEL_KEY] == source.id
+    assert labels.get(FORK_SOURCE_LABEL_KEY) == (source.id if needs_workspace else None)
+    connectivity = store.get_session_connectivity([child_id])[child_id]
+    assert connectivity.runner_id is None
+    assert connectivity.host_id is None
+    assert connectivity.needs_workspace is needs_workspace
+
+    snapshot = await client.get(f"/v1/sessions/{child_id}")
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["runner_online"] is not needs_workspace
+    health = await client.get("/health", params={"session_ids": child_id})
+    assert health.status_code == 200, health.text
+    assert health.json()["sessions"][child_id]["runner_online"] is not needs_workspace
+
+
 @pytest.mark.asyncio
 async def test_fork_session_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """POST /sessions/{id}/fork returns 201 and binds the fork to the
@@ -683,6 +760,20 @@ async def test_fork_session_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     # No copy: the store is asked to bind the existing agent.
     assert fork_call["cloned_agent_bundle_location"] is None
     assert fork_call["agent_id"] == "087b7cb7ac30abf4debfaa578d052ec6"
+
+
+@pytest.mark.asyncio
+async def test_normal_fork_of_side_chat_drops_sidebar_hiding_label() -> None:
+    """Promoting a side chat creates a normal session visible in the sidebar."""
+    source_id = "e9f8f58523cec9a57d3bdf93be543e8c"
+    conv = _make_conversation(labels={SIDE_CHAT_LABEL_KEY: "1"})
+    conv_store = _ConversationStore(conversations={source_id: conv})
+    client = TestClient(_build_app(conv_store))
+
+    resp = client.post(f"/v1/sessions/{source_id}/fork", json={})
+
+    assert resp.status_code == 201, resp.text
+    assert SIDE_CHAT_LABEL_KEY not in resp.json()["labels"]
 
 
 @pytest.mark.asyncio
@@ -1834,6 +1925,63 @@ async def test_fork_managed_schedules_sandbox_launch(
     assert conv_store.label_writes == []
 
 
+class _HostIdentityStore:
+    """Host store answering only the requested-host-id collision check."""
+
+    def __init__(self, *, taken: bool) -> None:
+        """
+        :param taken: What ``host_identity_taken`` reports for every lookup.
+        """
+        self.taken = taken
+        self.lookups: list[dict[str, str]] = []
+
+    def host_identity_taken(self, *, host_id: str, user_id: str, name: str) -> bool:
+        """Record the lookup and report the configured answer."""
+        self.lookups.append({"host_id": host_id, "user_id": user_id, "name": name})
+        return self.taken
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("taken", [False, True])
+async def test_fork_managed_launches_its_requested_host_id(
+    monkeypatch: pytest.MonkeyPatch, taken: bool
+) -> None:
+    """A managed fork's ``host_id`` names its sandbox host, as on a managed create.
+
+    The label lets the caller route the fork by that id before the host binds;
+    a taken id 409s before the fork exists.
+    """
+    host_id = "0123456789abcdef0123456789abcdef"
+    conv = _make_conversation()
+    conv_store = _ConversationStore(conversations={"e9f8f58523cec9a57d3bdf93be543e8c": conv})
+    app = _build_app(conv_store)
+    launches = _arm_managed_app(app, monkeypatch)
+    app.state.host_store = host_store = _HostIdentityStore(taken=taken)
+    client = TestClient(app)
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"host_type": "managed", "host_id": host_id},
+    )
+
+    assert host_store.lookups == [
+        {"host_id": host_id, "user_id": "local", "name": "managed-01234567"}
+    ]
+    if taken:
+        assert resp.status_code == 409, f"got {resp.status_code}: {resp.text}"
+        assert conv_store.fork_calls == []
+        assert launches == []
+        return
+    assert resp.status_code == 201, f"got {resp.status_code}: {resp.text}"
+    body = resp.json()
+    assert launches[0]["host_id"] == host_id
+    assert body["labels"][REQUESTED_HOST_ID_LABEL_KEY] == host_id
+    # Born with the row (not patched onto the response): a list read racing the
+    # fork can't return the row without the id the caller routes it by.
+    assert conv_store.fork_calls[0]["extra_labels"] == {REQUESTED_HOST_ID_LABEL_KEY: host_id}
+    assert conv_store.label_writes == [(body["id"], {REQUESTED_HOST_ID_LABEL_KEY: host_id})]
+
+
 @pytest.mark.asyncio
 async def test_fork_managed_launch_classifies_like_a_fresh_builtin_session(
     monkeypatch: pytest.MonkeyPatch,
@@ -2277,8 +2425,10 @@ async def test_fork_copies_only_another_users_agent(
 
 def _cross_user_fork(
     artifact_store: _ArtifactStore | None,
+    *,
+    source_owner: str | None = "owner@example.com",
 ) -> tuple[TestClient, _ConversationStore]:
-    """A forker's client for a session whose agent belongs to another user."""
+    """Build a fork client for a session agent with the given owner."""
     agent_id = "30f9aa4d441e344d3eb273f8cc13e4a5"
     conv_store = _ConversationStore(
         conversations={"e9f8f58523cec9a57d3bdf93be543e8c": _make_conversation(agent_id=agent_id)},
@@ -2296,7 +2446,14 @@ def _cross_user_fork(
                 name="orion",
                 bundle_location=f"{agent_id}/e70dc208",
                 session_id="e9f8f58523cec9a57d3bdf93be543e8c",
-                created_by="owner@example.com",
+                created_by=source_owner,
+            ),
+            "44b4151dd6cdfed6ee19430832398e05": Agent(
+                id="44b4151dd6cdfed6ee19430832398e05",
+                created_at=1,
+                name="codex",
+                bundle_location="44b4151dd6cdfed6ee19430832398e05/hash",
+                version=1,
             ),
         }
     )
@@ -2352,6 +2509,44 @@ async def test_failed_cross_user_fork_removes_its_copied_bundle() -> None:
     assert resp.status_code == 500, resp.text
     assert len(written) == 1 and not written[0].startswith("30f9aa4d"), written
     assert set(artifacts.blobs) == {original}, "the unused copy must be deleted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("caller", "source_owner"),
+    [
+        ("owner@example.com", None),
+        ("forker@example.com", "owner@example.com"),
+    ],
+    ids=["legacy-own-session-null-owner", "cross-user"],
+)
+async def test_fork_needing_a_copy_of_a_missing_bundle_is_refused_cleanly(
+    caller: str, source_owner: str | None
+) -> None:
+    artifacts = _ArtifactStore(blobs={})
+    client, conv_store = _cross_user_fork(artifact_store=artifacts, source_owner=source_owner)
+
+    resp = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={},
+        headers={"X-Forwarded-Email": caller},
+    )
+
+    assert resp.status_code == 410, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "session_agent_missing"
+    assert error["message"] == SESSION_AGENT_BUNDLE_MISSING_MESSAGE
+    assert conv_store.fork_calls == []
+    assert artifacts.blobs == {}, "no copy may be written without a source"
+
+    switched = client.post(
+        "/v1/sessions/e9f8f58523cec9a57d3bdf93be543e8c/fork",
+        json={"agent_id": "44b4151dd6cdfed6ee19430832398e05"},
+        headers={"X-Forwarded-Email": caller},
+    )
+    assert switched.status_code == 201, switched.text
+    assert conv_store.fork_calls[0]["agent_id"] == "44b4151dd6cdfed6ee19430832398e05"
+    assert artifacts.blobs == {}, "a server agent is bound, not copied"
 
 
 def _attachment_fork_client(

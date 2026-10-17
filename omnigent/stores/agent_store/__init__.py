@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import builtins
 from abc import ABC, abstractmethod
+from typing import Any
 
 from omnigent.entities import Agent, PagedList
+
+_UNSET: Any = object()
 
 
 class AgentStore(ABC):
@@ -121,6 +124,8 @@ class AgentStore(ABC):
         agent_id: str,
         bundle_location: str,
         created_by: str | None = None,
+        *,
+        description: str | None = _UNSET,
     ) -> Agent | None:
         """
         Update an agent's bundle location, bump its version, and
@@ -136,6 +141,8 @@ class AgentStore(ABC):
             session-scoped mutation routes to heal pre-migration rows
             whose ``created_by`` is ``None``; template-refresh callers
             leave it ``None`` so template rows stay unowned.
+        :param description: Replacement description; omit to preserve, or pass
+            ``None`` to clear the stored description.
         :returns: The updated :class:`Agent`, or ``None`` if not
             found.
         """
@@ -159,6 +166,36 @@ class AgentStore(ABC):
     # Agents a user installed or uploaded (kind "user", owned via created_by).
     # Non-abstract with safe defaults, so a store that doesn't implement them
     # keeps working and the server reports user agents as unsupported.
+
+    @property
+    def supports_config_edit(self) -> bool:
+        """Whether :meth:`update_configuration` supports atomic configuration edits."""
+        return False
+
+    def update_configuration(
+        self,
+        expected: Agent,
+        bundle_location: str,
+        *,
+        description: str | None,
+        created_by: str | None = None,
+    ) -> Agent | None:
+        """Replace configuration only if the observed agent revision still matches.
+
+        Match ID, creation time, kind, owner, version and bundle location in the
+        current workspace.
+        An unchanged bundle, description and owner checks the revision without
+        bumping version or timestamp. Returns ``None`` on conflict or deletion.
+
+        :param expected: Previously read agent, including its observed revision.
+        :param bundle_location: New immutable artifact key.
+        :param description: Replacement description; ``None`` clears it.
+        :param created_by: Claim an unowned user agent on a successful comparison;
+            never replace an existing owner or claim a server agent.
+        :returns: The current or updated agent, or ``None`` on a failed comparison.
+        :raises NotImplementedError: When atomic configuration edits are unsupported.
+        """
+        raise NotImplementedError("this agent store does not support configuration edits")
 
     @property
     def supports_user_agents(self) -> bool:

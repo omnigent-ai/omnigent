@@ -504,8 +504,10 @@ Fields:
     here — the client re-hydrates the optimistic "queued message"
     bubble so it survives navigation / an SSE rebind. Drained when the
     message round-trips back (the matching `session.input.consumed`
-    carries `cleared_pending_id`). Empty for non-native sessions, which
-    already carry the message in `items`.
+    carries `cleared_pending_id`). Messages still queued when an
+    `interrupt` cancelled the turn are left out, so a reload does not
+    redraw a bubble the person stopped. Empty for non-native sessions,
+    which already carry the message in `items`.
 
   todos (array, default `[]`)
     Current native Plan/TODO list reported by a harness.
@@ -603,8 +605,19 @@ already uploaded or registered an agent. The response is the full
     `"managed"`: the SERVER provisions a sandbox host from its
     `sandbox:` config (see `omnigent/server/managed_hosts.py`),
     starts `omnigent host` inside it, binds the session to it, and
-    launches the runner there. With `"managed"`, `host_id` and
-    `workspace` must NOT be set (422) — the server chooses both.
+    launches the runner there. With `"managed"`, `workspace` must
+    NOT be set (422) — the server chooses it — and `host_id`, when
+    set, names the NEW sandbox host rather than an existing one: 32
+    lowercase hex characters, sent only when `GET /v1/info` reports
+    `request_managed_sandbox_host_id`, so the caller can route the
+    session's requests by it before the host connects. It is recorded
+    in the `omnigent.sandbox.requested_host_id` label until the host
+    binds; null lets the server mint one. A malformed id, or one on a
+    child (`parent_session_id`) create, is a 422; an id that names an
+    existing host, or whose `managed-<first 8 hex>` name one of the
+    caller's hosts already uses, is a 409 `already_exists`, raised
+    before the session is created. JSON creates only: the multipart
+    bundle create does not take it.
     Provisioning runs in the BACKGROUND: the create returns
     immediately with `host_id` / `workspace` null, and they appear
     on `GET /v1/sessions/{id}` once the sandbox host registers. A
@@ -647,6 +660,8 @@ already uploaded or registered an agent. The response is the full
 
 400 Bad Request - invalid terminal_launch_args (count / length bounds)
 404 Not Found - no agent with that id
+409 Conflict - a managed create's host_id names an existing host, or
+  its `managed-<first 8 hex>` name is already taken
 422 Unprocessable Entity - invalid request body
 
 ### List Sessions
@@ -694,7 +709,7 @@ When liveness is wired, each list item includes two orthogonal signals
 ### Get Session (Snapshot)
 
 ```
-GET /v1/sessions/{session_id}[?include_items=true&include_liveness=true&include_usage=true&refresh_state=false]
+GET /v1/sessions/{session_id}[?include_items=true&include_liveness=true&include_usage=true&include_live_status=true&refresh_state=false]
 
 200 OK — body matches the `SessionResponse` shape above.
 404 Not Found — no session with that id
@@ -726,6 +741,12 @@ Contract" below.
     spend. Runner metadata reads use this option. The web chat also opts
     out and loads display usage separately, so a slow usage store does not
     block opening the session. Budget enforcement is unchanged.
+
+  include_live_status (query param, boolean, default `true`)
+    When `false`, skip the live-status probe of the session's bound runner
+    on a status-cache miss and report `status` from the cached or persisted
+    value. Runner metadata reads use this option: the probe would target the
+    very runner waiting on the response.
 
   refresh_state (query param, boolean, default `false`)
     When `true`, runner-derived snapshot overlays (for example skills
@@ -1086,10 +1107,16 @@ user-triggered cancel the server emits BOTH `response.incomplete`
 `session.interrupted` (from the route). Co-emitting the
 Responses-style event lets off-the-shelf parsers close cleanly while
 the session-scoped event carries the cancel intent for session-aware
-clients. The internal terminal-observed envelopes also bypass the
-queue: `external_conversation_item` appends/broadcasts an
-already-observed item and returns its stored `item_id`, while
-`external_output_text_delta` publishes a transient
+clients. On native-terminal sessions an `interrupt` the runner accepted
+also settles the web messages still queued at that moment: they leave
+`pending_inputs`, and a later transcript mirror that jumps over one
+drains it without persisting a `native_prompt_not_recorded` error (an
+exact mirror of it still drains it normally, since the agent did record
+it). A message sent after the Stop, or an interrupt the runner did not
+accept, leaves the queue as it was. The internal terminal-observed
+envelopes also bypass the queue: `external_conversation_item`
+appends/broadcasts an already-observed item and returns its stored
+`item_id`, while `external_output_text_delta` publishes a transient
 `response.output_text.delta` event without persisting. Its `data` is
 `{delta: string, message_id?: string, index?: integer, final?: boolean}`:
 `delta` is required; the optional `message_id` / `index` / `final` are
@@ -1179,6 +1206,14 @@ Request body matches `SessionForkRequest`:
     server's `sandbox_providers`); null takes the server's first.
     Only valid with `host_type: "managed"` (422 otherwise).
 
+  host_id (string | null, optional)
+    Id for the fork's new sandbox host: 32 lowercase hex characters,
+    sent only when `GET /v1/info` reports
+    `request_managed_sandbox_host_id`. Recorded in the
+    `omnigent.sandbox.requested_host_id` label until the host binds;
+    null lets the server mint one. Only valid with
+    `host_type: "managed"` (422 otherwise).
+
   workspace (string | null, optional)
     Git repository URL, optionally `#<branch>`, cloned into the
     fork's sandbox as its working directory. Omitting the field
@@ -1203,9 +1238,11 @@ Request body matches `SessionForkRequest`:
   server has not configured
 404 Not Found — no session with that source_id, or the source's
   agent row is missing
-422 Unprocessable Entity — sandbox_provider / workspace without
-  `host_type: "managed"`, or a managed workspace that is not a
-  repository URL
+409 Conflict — host_id names an existing host, or its
+  `managed-<first 8 hex>` name is already taken
+422 Unprocessable Entity — host_id / sandbox_provider / workspace without
+  `host_type: "managed"`, a malformed host_id, or a managed
+  workspace that is not a repository URL
 ```
 
 Creates a new session by deep-copying every item from the source
@@ -1362,6 +1399,14 @@ across turns, transient races during reconnect are bounded to the
 in-flight HTTP roundtrip rather than the full turn duration. Clients
 should rely on `session.input.consumed` events and item-id dedupe
 against the snapshot to reconcile accepted inputs.
+
+Native shell-mode inputs (`!cmd`) settle when the matching `terminal_command`
+input is persisted. Its output does not acknowledge an input, and no
+`session.input.consumed` event is emitted for the shell command. Clients should
+remove only the sent bubble matching that command. During a mixed-version
+rollout, an older client can retain that bubble until refreshing its snapshot;
+an older server can still report the command as `native_prompt_not_recorded`.
+Updated clients preserve later bubbles when that older server's receipt arrives.
 
 ### Sessions Typical Flow
 

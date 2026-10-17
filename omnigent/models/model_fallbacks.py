@@ -80,7 +80,7 @@ _SMART_ROUTING_FALLBACKS: dict[str, StaticModelFallback] = {
             "databricks-claude-opus-4-8",
         ),
         owner="Smart Routing (omnigent.server.smart_routing)",
-        provenance="AI Gateway Claude serving endpoints, cheapest → most powerful",
+        provenance="Unity Gateway Claude serving endpoints, cheapest → most powerful",
         discovery_gap=(
             "the router picks before a session's live model catalog is reachable, "
             "and a gateway listing ranks models by neither cost nor capability"
@@ -94,7 +94,7 @@ _SMART_ROUTING_FALLBACKS: dict[str, StaticModelFallback] = {
             "databricks-gpt-5-5",
         ),
         owner="Smart Routing (omnigent.server.smart_routing)",
-        provenance="AI Gateway GPT serving endpoints, cheapest → most powerful",
+        provenance="Unity Gateway GPT serving endpoints, cheapest → most powerful",
         discovery_gap=(
             "the router picks before a session's live model catalog is reachable, "
             "and a gateway listing ranks models by neither cost nor capability"
@@ -162,6 +162,12 @@ _SMART_ROUTING_FALLBACKS: dict[str, StaticModelFallback] = {
         provenance="probed: pi's own gateway 400s on each of these",
         discovery_gap="a gateway listing advertises these without pi's request-shape limits",
     ),
+    "codex_native_excluded": StaticModelFallback(
+        model_ids=("databricks-gpt-5-4-nano", "system.ai.databricks-gpt-5-4-nano"),
+        owner="Native Codex Smart Routing",
+        provenance="the model rejects native tool_search input with invalid_request_error",
+        discovery_gap="model availability listings omit native tool-search compatibility",
+    ),
     "codex_catalog_clone_source": StaticModelFallback(
         model_ids=("gpt-5.6-luna",),
         owner="Codex extended catalog (omnigent.inner.codex_executor)",
@@ -194,6 +200,9 @@ SMART_ROUTING_FAMILY_FALLBACKS = _SMART_ROUTING_FALLBACKS["family_fallbacks"].mo
 
 #: Models pi's own gateway rejects, so the router may not pick them under pi.
 SMART_ROUTING_PI_EXCLUDED = _SMART_ROUTING_FALLBACKS["pi_excluded"].model_ids
+
+#: Models incompatible with native Codex's deferred tool-search requests and history.
+SMART_ROUTING_CODEX_NATIVE_EXCLUDED = _SMART_ROUTING_FALLBACKS["codex_native_excluded"].model_ids
 
 #: The codex catalog entry a gateway-only arm is cloned from.
 CODEX_CATALOG_CLONE_SOURCE_SLUG = _SMART_ROUTING_FALLBACKS["codex_catalog_clone_source"].model_ids[

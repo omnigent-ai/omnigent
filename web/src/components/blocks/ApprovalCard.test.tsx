@@ -1,8 +1,11 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { BlockStream } from "@/lib/blockStream";
-import { buildBubbles } from "@/lib/renderItems";
+import { buildBubbles, type RenderItem } from "@/lib/renderItems";
 import { parseEventLines } from "@/lib/sse";
 import { useChatStore } from "@/store/chatStore";
 import { ApprovalCard, ElicitationCard } from "./ApprovalCard";
@@ -561,6 +564,94 @@ describe("ApprovalCard — Codex MCP persistence choices", () => {
     expect(submitSpy).toHaveBeenLastCalledWith("elic_codex_mcp", "accept", undefined, {
       persist: "always",
     });
+  });
+});
+
+describe("ApprovalCard — Antigravity permission prompt details", () => {
+  const baseProps = {
+    elicitationId: "elic_agy_perm",
+    message: "Antigravity wants to run: pwd",
+    phase: "agy_permission",
+    policyName: "agy_native_permission",
+    contentPreview: "",
+    requestedSchema: {},
+  } as const;
+
+  it("shows the action description and both persist choices when advertised", () => {
+    const submitSpy = vi.fn();
+    render(
+      <ApprovalCard
+        {...baseProps}
+        status="pending"
+        response={null}
+        agyPermission={{ actionDescription: "Running pwd command", alwaysAllowPattern: "pwd" }}
+        onSubmit={submitSpy}
+      />,
+    );
+
+    expect(screen.getByText("Running pwd command")).toBeDefined();
+    const sessionAllow = screen.getByRole("button", {
+      name: "Allow commands starting with pwd for this session",
+    });
+    expect(sessionAllow.getAttribute("title")).toBe(
+      "Ask Antigravity to allow commands starting with “pwd” for this conversation",
+    );
+    fireEvent.click(sessionAllow);
+    expect(submitSpy).toHaveBeenCalledWith("elic_agy_perm", "accept", undefined, {
+      persist: "session",
+    });
+    const alwaysAllow = screen.getByRole("button", {
+      name: "Always allow commands starting with pwd",
+    });
+    expect(alwaysAllow.getAttribute("title")).toBe(
+      "Ask Antigravity to save a rule allowing commands starting with “pwd” for this Omnigent session",
+    );
+    fireEvent.click(alwaysAllow);
+    expect(submitSpy).toHaveBeenCalledWith("elic_agy_perm", "accept", undefined, {
+      persist: "always",
+    });
+  });
+
+  it("offers no persist choice when agy's prompt advertises none", () => {
+    render(
+      <ApprovalCard
+        {...baseProps}
+        status="pending"
+        response={null}
+        agyPermission={{ actionDescription: "Running pwd command", alwaysAllowPattern: null }}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByTestId("approval-card-agy-session-allow")).toBeNull();
+    expect(screen.queryByTestId("approval-card-agy-always-allow")).toBeNull();
+    expect(screen.getByRole("button", { name: /^approve$/i })).toBeDefined();
+  });
+
+  it("records an always-allow request without claiming it was saved", () => {
+    render(
+      <ApprovalCard
+        {...baseProps}
+        status="responded"
+        response={{ action: "accept", _meta: { persist: "always" } }}
+        agyPermission={{ actionDescription: "Running pwd command", alwaysAllowPattern: "pwd" }}
+      />,
+    );
+
+    expect(screen.getByText("Always allow requested")).toBeDefined();
+  });
+
+  it("records a session allow request without claiming it was saved", () => {
+    render(
+      <ApprovalCard
+        {...baseProps}
+        status="responded"
+        response={{ action: "accept", _meta: { persist: "session" } }}
+        agyPermission={{ actionDescription: "Running pwd command", alwaysAllowPattern: "pwd" }}
+      />,
+    );
+
+    expect(screen.getByText("Session allow requested")).toBeDefined();
   });
 });
 
@@ -1538,5 +1629,202 @@ describe("ApprovalCard — prompt expired", () => {
 
     expect(screen.getByText(/Resolved elsewhere/)).toBeDefined();
     expect(screen.queryByTestId("prompt-expired-hint")).toBeNull();
+  });
+});
+
+describe("ElicitationCard — prompts mirrored from a sub-agent", () => {
+  type ElicitationItem = Extract<RenderItem, { kind: "elicitation" }>;
+
+  function elicitationItem(overrides: Partial<ElicitationItem> = {}): ElicitationItem {
+    return {
+      kind: "elicitation",
+      itemId: null,
+      elicitationId: "elic_child",
+      targetSessionId: "conv_child",
+      message: "Claude wants to call **Bash**",
+      phase: "pre_tool_use",
+      policyName: "claude_native_permission",
+      contentPreview: "Bash({})",
+      requestedSchema: {},
+      status: "pending",
+      response: null,
+      ...overrides,
+    };
+  }
+
+  function childSession(overrides: Partial<ChildSessionInfo> = {}): ChildSessionInfo {
+    return {
+      id: "conv_child",
+      title: "claude-native:review",
+      task_summary: "Review the auth change",
+      tool: "claude-native",
+      session_name: "review",
+      labels: {},
+      current_task_status: "in_progress",
+      busy: true,
+      last_message_preview: null,
+      pending_elicitations_count: 1,
+      ...overrides,
+    };
+  }
+
+  function renderCard(
+    item: ElicitationItem,
+    cache: Record<string, ChildSessionInfo[]>,
+    queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+  ) {
+    for (const [parentId, children] of Object.entries(cache)) {
+      queryClient.setQueryData(childSessionsQueryKey(parentId), children);
+    }
+    return render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <TooltipProvider>
+            <ElicitationCard item={item} />
+          </TooltipProvider>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+  }
+
+  beforeEach(() => {
+    useChatStore.setState({ conversationId: "conv_parent", blocks: [] });
+  });
+
+  it("names and links the child session on pending and responded cards", () => {
+    // WHY: the parent can run a different harness than the child, so a card
+    // tagged "Claude Code" in a Codex chat must say which sub-agent asked.
+    const cache = { conv_parent: [childSession()] };
+    const { unmount } = renderCard(elicitationItem(), cache);
+    const requester = screen.getByTestId("approval-card-requester");
+    expect(requester).toHaveTextContent("Requested by sub-agent Review the auth change");
+    expect(within(requester).getByRole("link")).toHaveAttribute("href", "/c/conv_child");
+    unmount();
+
+    renderCard(
+      elicitationItem({
+        status: "responded",
+        response: { action: "accept", content: { allow_auto_mode: true } },
+      }),
+      cache,
+    );
+    expect(screen.getByText("Approved · auto mode")).toBeDefined();
+    expect(screen.getByTestId("approval-card-requester")).toHaveTextContent(
+      "Requested by sub-agent Review the auth change",
+    );
+  });
+
+  it("finds a deeper descendant in the cached tree", () => {
+    renderCard(elicitationItem({ targetSessionId: "conv_grandchild" }), {
+      conv_parent: [childSession()],
+      conv_child: [
+        childSession({ id: "conv_grandchild", task_summary: "Run the migration tests" }),
+      ],
+    });
+    expect(screen.getByTestId("approval-card-requester")).toHaveTextContent(
+      "Requested by sub-agent Run the migration tests",
+    );
+  });
+
+  it("names a deeper descendant once its parent's list is cached after mount", () => {
+    // WHY: deeper lists are only read from the cache; a card mounted before
+    // the Agents rail loads them must still pick up the label.
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderCard(
+      elicitationItem({ targetSessionId: "conv_grandchild" }),
+      { conv_parent: [childSession()] },
+      queryClient,
+    );
+    expect(screen.getByTestId("approval-card-requester")).toHaveTextContent(
+      "Requested by a sub-agent",
+    );
+
+    act(() => {
+      queryClient.setQueryData(childSessionsQueryKey("conv_child"), [
+        childSession({ id: "conv_grandchild", task_summary: "Run the migration tests" }),
+      ]);
+    });
+    expect(screen.getByTestId("approval-card-requester")).toHaveTextContent(
+      "Requested by sub-agent Run the migration tests",
+    );
+  });
+
+  it("still links the sub-agent when its summary is not loaded", () => {
+    renderCard(elicitationItem(), { conv_parent: [] });
+    const requester = screen.getByTestId("approval-card-requester");
+    expect(requester).toHaveTextContent("Requested by a sub-agent");
+    expect(within(requester).getByRole("link")).toHaveAttribute("href", "/c/conv_child");
+  });
+
+  it("treats an empty label as missing", () => {
+    // WHY: label fields fall through with ``??``, so an empty summary would
+    // otherwise render an empty, invisible link.
+    renderCard(elicitationItem(), { conv_parent: [childSession({ task_summary: "" })] });
+    const requester = screen.getByTestId("approval-card-requester");
+    expect(requester).toHaveTextContent("Requested by a sub-agent");
+    expect(within(requester).getByRole("link")).toHaveTextContent("sub-agent");
+  });
+
+  it.each([
+    { name: "no target", targetSessionId: null },
+    { name: "the viewed session as target", targetSessionId: "conv_parent" },
+  ])("omits the requester line for a prompt with $name", ({ targetSessionId }) => {
+    renderCard(elicitationItem({ targetSessionId }), { conv_parent: [childSession()] });
+    expect(screen.getByTestId("approval-card")).toBeDefined();
+    expect(screen.queryByTestId("approval-card-requester")).toBeNull();
+  });
+});
+
+describe("ApprovalCard — gating message emphasis", () => {
+  const props = {
+    elicitationId: "elic_emphasis",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: 'Bash({"command":"touch /tmp/probe"})',
+    requestedSchema: {},
+  } as const;
+
+  it("shows the bridge's **tool name** bold without the markers, pending and responded", () => {
+    // The hook publishes "<harness> wants to call **<tool>**"; the card must
+    // not print that string verbatim, asterisks included.
+    const message = "Claude wants to call **Bash**";
+    const { rerender } = render(
+      <ApprovalCard {...props} message={message} status="pending" response={null} />,
+    );
+    let card = screen.getByTestId("approval-card");
+    expect(card.textContent).not.toContain("**");
+    expect(within(card).getByText("Bash", { selector: "strong" })).toBeDefined();
+    expect(within(card).getByText(/Claude wants to call/)).toBeDefined();
+
+    rerender(
+      <ApprovalCard
+        {...props}
+        message={message}
+        status="responded"
+        response={{ action: "decline" }}
+      />,
+    );
+    card = screen.getByTestId("approval-card");
+    expect(card.textContent).not.toContain("**");
+    expect(within(card).getByText("Bash", { selector: "strong" })).toBeDefined();
+  });
+
+  it("leaves a policy prompt's raw command text verbatim", () => {
+    // Policy ASK reasons embed the unescaped command the user is approving; the
+    // full set of non-matching shapes lives in ElicitationMessage.test.tsx.
+    const message = "Agent wants to call sys_os_shell('echo **x** y pkg/__init__.py'). Approve?";
+    render(
+      <ApprovalCard
+        {...props}
+        phase="tool_call"
+        policyName="approve_shell_commands"
+        message={message}
+        status="pending"
+        response={null}
+      />,
+    );
+    const card = screen.getByTestId("approval-card");
+    expect(within(card).getByText(message)).toBeDefined();
+    expect(card.querySelector("strong, em")).toBeNull();
   });
 });

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -1063,14 +1064,14 @@ _LIVE_CATALOG: list[dict[str, object]] = [
 
 
 @pytest.mark.parametrize(
-    ("routed", "applied"),
+    ("routed", "applied", "effort"),
     [
         # The routed arm arrives as a catalog id; codex only has metadata for
         # its own dotted slug, and ``/model`` only highlights that one.
-        ("databricks-gpt-5-6-luna", "gpt-5.6-luna"),
+        ("databricks-gpt-5-6-luna", "gpt-5.6-luna", None),
         # Extended-catalog rows are listed under the catalog spelling, which
         # IS codex's id for them — translating must not mangle it.
-        ("system.ai.glm-5-2", "system.ai.glm-5-2"),
+        ("system.ai.glm-5-2", "system.ai.glm-5-2", "medium"),
     ],
 )
 def test_apply_thread_model_switches_in_codex_spelling(
@@ -1078,21 +1079,133 @@ def test_apply_thread_model_switches_in_codex_spelling(
     monkeypatch: pytest.MonkeyPatch,
     routed: str,
     applied: str,
+    effort: str | None,
 ) -> None:
     """The thread switch and the config.toml mirror both speak codex."""
-    from omnigent.harnesses.codex_native.bridge import read_codex_config_model
+    from omnigent.harnesses.codex_native.bridge import (
+        read_codex_config_effort,
+        read_codex_config_model,
+    )
 
     codex_home_for_bridge_dir(bridge_dir).mkdir(parents=True, exist_ok=True)
     client = _install_fake_client(monkeypatch, _FakeAppServerClient(_LIVE_CATALOG))
 
     assert codex_native_hook._apply_thread_model(bridge_dir, routed) is None
 
+    settings = {"threadId": "thread_abc", "model": applied}
+    if effort is not None:
+        settings["effort"] = effort
     assert client.requests == [
         ("model/list", {"includeHidden": True}),
-        ("thread/settings/update", {"threadId": "thread_abc", "model": applied}),
+        ("thread/settings/update", settings),
     ]
     assert client.closed is True
     assert read_codex_config_model(bridge_dir) == applied
+    assert read_codex_config_effort(bridge_dir) == effort
+
+
+@pytest.mark.parametrize(("inherited", "expected"), [("max", "xhigh"), ("high", "high")])
+def test_routed_model_switch_checks_inherited_effort(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inherited: str,
+    expected: str,
+) -> None:
+    """Routing corrects an incompatible effort and preserves an already supported one."""
+    from omnigent.harnesses.codex_native.bridge import read_codex_config_effort
+
+    home = codex_home_for_bridge_dir(bridge_dir)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_text(
+        f'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "{inherited}"\n'
+    )
+    catalog = [
+        {
+            "id": "gpt-5.4",
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": value} for value in ("low", "medium", "high", "xhigh")
+            ],
+        }
+    ]
+
+    client = _FakeAppServerClient(catalog)
+    _install_fake_client(monkeypatch, client)
+
+    assert codex_native_hook._apply_thread_model(bridge_dir, "databricks-gpt-5-4") is None
+
+    update: dict[str, object] = {
+        "threadId": "thread_abc",
+        "model": "gpt-5.4",
+        "effort": expected,
+    }
+    assert client.requests[-1] == ("thread/settings/update", update)
+    assert read_codex_config_effort(bridge_dir) == expected
+
+
+@pytest.mark.parametrize(("config_rewritten", "expected"), [(False, "high"), (True, "low")])
+def test_routed_model_switch_keeps_an_effort_whose_config_write_failed(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_rewritten: bool,
+    expected: str,
+) -> None:
+    """Routing inherits the applied effort, not a stale config, until the config is replaced."""
+    from omnigent.harnesses.codex_native.bridge import write_unmirrored_codex_settings
+
+    home = codex_home_for_bridge_dir(bridge_dir)
+    home.mkdir(parents=True, exist_ok=True)
+    config = home / "config.toml"
+    config.write_text('model = "gpt-5.6-sol"\nmodel_reasoning_effort = "low"\n')
+    # The runner applied high, but its config write failed.
+    write_unmirrored_codex_settings(bridge_dir, {"effort": "high"})
+    if config_rewritten:
+        # A later terminal pick replaces the config and supersedes the record.
+        replacement = home / "config.toml.terminal"
+        replacement.write_text(config.read_text())
+        os.replace(replacement, config)
+    catalog = [
+        {
+            "id": "gpt-5.4",
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": value} for value in ("low", "medium", "high", "xhigh")
+            ],
+        }
+    ]
+    client = _FakeAppServerClient(catalog)
+    _install_fake_client(monkeypatch, client)
+
+    assert codex_native_hook._apply_thread_model(bridge_dir, "databricks-gpt-5-4") is None
+
+    assert client.requests[-1] == (
+        "thread/settings/update",
+        {"threadId": "thread_abc", "model": "gpt-5.4", "effort": expected},
+    )
+
+
+def test_routed_model_switch_records_an_effort_it_could_not_mirror(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A routed switch whose effort write fails leaves the applied effort for later readers."""
+    from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+
+    home = codex_home_for_bridge_dir(bridge_dir)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.toml").write_text('model = "gpt-5.6-sol"\nmodel_reasoning_effort = "max"\n')
+    catalog = [
+        {
+            "id": "gpt-5.4",
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": value} for value in ("low", "medium", "high", "xhigh")
+            ],
+        }
+    ]
+    _install_fake_client(monkeypatch, _FakeAppServerClient(catalog))
+    monkeypatch.setattr(codex_native_bridge, "write_codex_config_effort", lambda *_: False)
+
+    assert codex_native_hook._apply_thread_model(bridge_dir, "databricks-gpt-5-4") is None
+
+    assert codex_native_bridge.read_unmirrored_codex_settings(bridge_dir) == {"effort": "xhigh"}
 
 
 def test_apply_thread_model_declines_a_model_this_pane_cannot_serve(

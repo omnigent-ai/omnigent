@@ -8,10 +8,13 @@ const {
   buildLoginArgs,
   connectArcaHost,
   describeConnectFailure,
+  readArcaStatus,
   resolveArcaPath,
+  runArcaExtend,
   startArcaConnect,
   startArcaLogin,
 } = require("../src/arca");
+const { IDENTITY_START, IDENTITY_END } = require("../src/arcaIdentity");
 
 /** A fake connect child: an EventEmitter with stdout/stderr stream stubs. */
 function fakeConnectChild() {
@@ -19,11 +22,127 @@ function fakeConnectChild() {
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
   child.killed = false;
-  child.kill = () => {
+  child.signals = [];
+  child.kill = (signal) => {
     child.killed = true;
+    child.signals.push(signal);
   };
   return child;
 }
+
+function commandDeps(outputs) {
+  const calls = [];
+  return {
+    calls,
+    resolveArcaPath: () => "/bin/arca",
+    spawn: (_path, args) => {
+      calls.push(args);
+      const child = fakeConnectChild();
+      const output = outputs.shift();
+      queueMicrotask(() => {
+        child.stdout.emit("data", output?.stdout ?? "");
+        child.stderr.emit("data", output?.stderr ?? "");
+        child.emit("close", output?.code ?? 0);
+      });
+      return child;
+    },
+  };
+}
+
+describe("arca extend command", () => {
+  const running = '{"status":"running","instance":{"shutdown_time":"2026-10-06T01:00:00Z"}}';
+  it("finds status after many brace-containing CLI notices", async () => {
+    const notices = Array.from({ length: 24 }, (_, index) => `notice {${index}}`).join("\n");
+    const deps = commandDeps([{ stdout: `${notices}\n${running}` }]);
+    assert.equal((await readArcaStatus(deps)).state, "running");
+  });
+  it("rejects a JSON error object even when status exits zero", async () => {
+    const result = await readArcaStatus(commandDeps([{ stdout: '{"error":"failed"}' }]));
+    assert.equal(result.ok, false);
+    assert.match(result.error, /Unexpected arca status output/);
+  });
+  it("checks a running instance first and reports the updated shutdown time", async () => {
+    const updated = '{"status":"running","instance":{"shutdown_time":"2026-10-07T01:00:00Z"}}';
+    const deps = commandDeps([{ stdout: running }, { stdout: "Extended" }, { stdout: updated }]);
+    assert.deepEqual(await runArcaExtend("overnight", deps), {
+      ok: true,
+      shutdownAt: Date.UTC(2026, 9, 7, 1),
+    });
+    assert.deepEqual(deps.calls, [
+      ["status", "--json"],
+      ["extend", "overnight"],
+      ["status", "--json"],
+    ]);
+  });
+
+  it("does not invoke extend when status is stopped or lacks an instance", async () => {
+    await Promise.all(
+      ["stopped", "running"].map(async (status) => {
+        const deps = commandDeps([{ stdout: JSON.stringify({ status, instance: null }) }]);
+        assert.equal((await runArcaExtend("workweek", deps)).ok, false);
+        assert.deepEqual(deps.calls, [["status", "--json"]]);
+      }),
+    );
+  });
+
+  it("rejects every mode outside overnight and workweek before spawning", async () => {
+    const deps = commandDeps([]);
+    assert.equal((await runArcaExtend("default", deps)).ok, false);
+    assert.equal((await runArcaExtend(["overnight"], deps)).ok, false);
+    assert.deepEqual(deps.calls, []);
+  });
+
+  it("times out a stuck status check", async () => {
+    const child = fakeConnectChild();
+    const keepAlive = setTimeout(() => {}, 1000);
+    try {
+      const result = await readArcaStatus({
+        resolveArcaPath: () => "/bin/arca",
+        spawn: () => child,
+        timeoutMs: 5,
+        killGraceMs: 5,
+      });
+      assert.equal(result.errorKind, "timeout");
+      assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+    } finally {
+      clearTimeout(keepAlive);
+    }
+  });
+
+  it("times out a stuck extend after the status precheck", async () => {
+    const child = fakeConnectChild();
+    const deps = commandDeps([{ stdout: running }]);
+    const firstSpawn = deps.spawn;
+    deps.spawn = (path, args) => (args[0] === "extend" ? child : firstSpawn(path, args));
+    const keepAlive = setTimeout(() => {}, 1000);
+    try {
+      const result = await runArcaExtend("overnight", { ...deps, timeoutMs: 5, killGraceMs: 5 });
+      assert.equal(result.errorKind, "timeout");
+      assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+    } finally {
+      clearTimeout(keepAlive);
+    }
+  });
+
+  it("classifies failed extend commands", async () => {
+    await Promise.all(
+      [
+        ["No running Arca instance", "no-instance"],
+        ["Runtime limit reached", "runtime-limit"],
+        ["certificate expired; run arca login", "arca-auth"],
+        ["unexpected failure", "unknown"],
+      ].map(async ([stderr, errorKind]) => {
+        const deps = commandDeps([{ stdout: running }, { code: 1, stderr }]);
+        const result = await runArcaExtend("overnight", deps);
+        assert.equal(result.errorKind, errorKind);
+        assert.deepEqual(deps.calls, [
+          ["status", "--json"],
+          ["extend", "overnight"],
+        ]);
+      }),
+    );
+  });
+});
 
 describe("arca binary resolution", () => {
   it("prefers PATH, then falls back to well-known locations", () => {
@@ -70,7 +189,8 @@ describe("arca connect command", () => {
     assert.equal(buildConnectArgs(server)[7], args[6]);
   });
   it("passes the remote isaac omni host command through ssh", () => {
-    assert.deepEqual(buildConnectArgs("https://workspace.example.com/ml/omnigents"), [
+    const args = buildConnectArgs("https://workspace.example.com/ml/omnigents");
+    assert.deepEqual(args.slice(0, 10), [
       "ssh",
       "-o",
       "ClearAllForwardings=yes",
@@ -82,6 +202,7 @@ describe("arca connect command", () => {
       "--background",
       "--non-interactive",
     ]);
+    assert.match(args.join(" "), /&&.*host status --server.*--json/);
   });
 
   it("quotes the URL for the remote shell so a query's `?` isn't globbed", () => {
@@ -179,6 +300,20 @@ describe("arca connect failures", () => {
 });
 
 describe("startArcaConnect / connectArcaHost", () => {
+  it("reports unavailable identity without changing a successful older connect result", async () => {
+    const child = fakeConnectChild();
+    const reasons = [];
+    const run = startArcaConnect("https://srv.example.com", {
+      resolveArcaPath: () => "/bin/arca",
+      spawn: () => child,
+      onIdentityUnavailable: (reason) => reasons.push(reason),
+    });
+    child.stdout.emit("data", "Host daemon already running: private-output");
+    child.emit("exit", 0);
+    assert.deepEqual(await run.promise, { ok: true, alreadyRunning: true });
+    assert.deepEqual(reasons, ["status markers missing"]);
+  });
+
   it("settles canceled login without waiting for a remote process exit", async () => {
     const child = fakeConnectChild();
     const run = startArcaLogin("https://account.databricks.com/omnigent?o=123", {
@@ -254,10 +389,7 @@ describe("startArcaConnect / connectArcaHost", () => {
       },
       onOutput: (text) => chunks.push(text),
     });
-    assert.equal(
-      run.command,
-      "arca ssh -o ClearAllForwardings=yes isaac omni host --server 'https://srv.example.com/' --background --non-interactive",
-    );
+    assert.equal(run.command, `arca ${buildConnectArgs("https://srv.example.com").join(" ")}`);
     child.stdout.emit("data", "Attempting to start your Arca instance\n");
     child.stderr.emit("data", "synced dbcert\n");
     child.emit("exit", 0);
@@ -277,6 +409,37 @@ describe("startArcaConnect / connectArcaHost", () => {
     child.stdout.emit("data", "Host daemon already running (pid 4242).\n");
     child.emit("exit", 0);
     assert.deepEqual(await run.promise, { ok: true, alreadyRunning: true });
+  });
+
+  it("captures machine-readable identity after an already-running connection", async () => {
+    const child = fakeConnectChild();
+    const run = startArcaConnect("https://srv.example.com/", {
+      resolveArcaPath: () => "/bin/arca",
+      spawn: () => child,
+    });
+    child.stdout.emit("data", "Host daemon already running.\n");
+    child.stdout.emit(
+      "data",
+      `${IDENTITY_START}\n${JSON.stringify({
+        daemons: [
+          {
+            target: "https://srv.example.com",
+            server_url: "https://srv.example.com",
+            mode: "server",
+            process: "online",
+            host_status: "online",
+            host_id: "a".repeat(32),
+            error: null,
+          },
+        ],
+      })}\n${IDENTITY_END}\n`,
+    );
+    child.emit("exit", 0);
+    assert.deepEqual(await run.promise, {
+      ok: true,
+      alreadyRunning: true,
+      identity: { serverUrl: "https://srv.example.com/", hostId: "a".repeat(32) },
+    });
   });
 
   it("maps a failing exit through the captured output and never rejects", async () => {

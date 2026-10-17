@@ -102,3 +102,29 @@ describe("scope refresh", () => {
     expect(next.pages[0].last_id).toBe("b");
   });
 });
+
+it("uses creation time for scope boundaries, appended pages, and capped refreshes", () => {
+  const newest = { ...row("new", 10), created_at: 30 };
+  const middle = { ...row("middle", 20), created_at: 20 };
+  const oldest = { ...row("old", 30), created_at: 10 };
+  expect(
+    mergeScopeRows([newest, oldest], [middle], true, true, "old", "middle", "created_at").rows.map(
+      (r) => r.id,
+    ),
+  ).toEqual(["new", "middle"]);
+  const current = {
+    pages: [sessionRowsPage([newest, middle], true)],
+    pageParams: [undefined],
+    windowSize: 2,
+  };
+  const appended = appendScopePage(current, sessionRowsPage([oldest]), 1, "created_at");
+  expect(appended.pages[0].data.map((r) => r.id)).toEqual(["new", "middle", "old"]);
+  const refreshed = refreshScopeWindow(
+    appended,
+    sessionRowsPage([newest, { ...middle, updated_at: 99 }], true),
+    2,
+    "created_at",
+  );
+  expect(refreshed.pages[0].data.map((r) => r.id)).toEqual(["new", "middle", "old"]);
+  expect(refreshed.pages[0].last_id).toBe("old");
+});

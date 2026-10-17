@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { copyText } from "@/lib/clipboard";
 import { getSessionSignInLink } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
+import { ConversationScopeContext } from "@/components/chat/conversationScope";
+import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { ErrorBanner, RoutingDecisionCard } from "./StatusBlocks";
 
 vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn(() => Promise.resolve()) }));
@@ -277,9 +279,36 @@ describe("ErrorBanner", () => {
       "transient_upstream_error",
       "The model service hit a temporary error mid-response; retrying usually continues the turn.",
     ],
+    [
+      "client_update_required",
+      "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
+    ],
   ])("describes a %s failure in plain English", (code, sentence) => {
     render(<ErrorBanner message="raw diagnostics" source="execution" code={code} />);
     expect(screen.getByText(sentence)).toBeInTheDocument();
+  });
+
+  it("names both versions and the update command on a client_update_required card", () => {
+    render(
+      <ErrorBanner
+        message={`API Error: 400 {"message":"Claude Code 2.1.217 does not support this model; version 2.1.280 or newer is required."}`}
+        source="execution"
+        code="client_update_required"
+        title="Claude Code needs an update"
+        cause="Claude Code 2.1.217 on the host doesn't support this model; version 2.1.280 or newer is required."
+        remediation="Run `claude update` on the host, then start a new session."
+        onRetry={vi.fn()}
+      />,
+    );
+    expect(screen.getByText("Claude Code needs an update")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /Claude Code needs an update/i }));
+    const content = screen.getByTestId("error-message-content");
+    expect(content).toHaveTextContent("Claude Code 2.1.217 on the host");
+    expect(content).toHaveTextContent("version 2.1.280 or newer is required");
+    expect(content).toHaveTextContent("Try this: Run `claude update` on the host");
+    // The running CLI keeps its old version, so neither turn retry nor resume applies.
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
   });
 
   const SIGN_IN_REMEDIATION =
@@ -793,6 +822,230 @@ describe("ErrorBanner", () => {
   });
 });
 
+describe("Codex compaction on the previous model", () => {
+  beforeEach(() => useChatStore.setState({ conversationId: "conv_parent" }));
+  afterEach(() => useChatStore.setState({ conversationId: null }));
+
+  const cause =
+    "The AI gateway refused a compaction request on gpt-6-astra: its budget is exhausted.";
+  const gatewayError =
+    'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED","message":"Budget \\"example-budget\\" has reached its limit of $100."}';
+
+  it("leads with the provider's error, then explains and forks without expanding", () => {
+    const openForkDialog = vi.fn();
+    render(
+      <ForkDialogContextProvider value={{ canFork: true, openForkDialog }}>
+        <ErrorBanner
+          message={gatewayError}
+          source="execution"
+          code="codex_compaction_model_failed"
+          title="gpt-6-astra is over its AI gateway budget"
+          cause={cause}
+        />
+      </ForkDialogContextProvider>,
+    );
+
+    const hint = screen.getByTestId("error-compaction-model-hint");
+    expect(hint.textContent?.startsWith(`${gatewayError}${cause}`)).toBe(true);
+    expect(hint).toHaveTextContent(/Fork session…$/);
+    fireEvent.click(screen.getByRole("button", { name: "Fork session…" }));
+    expect(openForkDialog).toHaveBeenCalledExactlyOnceWith({ sourceSessionId: "conv_parent" });
+  });
+
+  it("copies the provider's error from the hint", async () => {
+    render(
+      <ErrorBanner
+        message={gatewayError}
+        source="execution"
+        code="codex_compaction_model_failed"
+        title="gpt-6-astra is over its AI gateway budget"
+        cause={cause}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy error" }));
+
+    expect(copyText).toHaveBeenLastCalledWith(gatewayError);
+    expect(await screen.findByRole("button", { name: "Error copied" })).toBeInTheDocument();
+  });
+
+  it("does not repeat the hint in a Message section", () => {
+    render(
+      <ErrorBanner
+        message={gatewayError}
+        source="execution"
+        code="codex_compaction_model_failed"
+        title="gpt-6-astra is over its AI gateway budget"
+        cause={cause}
+        remediation="Fork this session to continue on gpt-6-1-sol."
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /over its AI gateway budget/i }));
+    expect(screen.queryByTestId("error-disclosure-icon")).toBeNull();
+    expect(screen.queryByTestId("error-message-content")).toBeNull();
+    expect(screen.queryByText(/Try this:/)).toBeNull();
+    expect(screen.getAllByText(gatewayError)).toHaveLength(1);
+  });
+
+  it("offers the fork when the compaction failure is grouped under another error", () => {
+    const openForkDialog = vi.fn();
+    render(
+      <ForkDialogContextProvider value={{ canFork: true, openForkDialog }}>
+        <ErrorBanner
+          message="Runner disconnected."
+          source="execution"
+          code="runner_disconnected"
+          relatedErrors={[
+            {
+              itemId: "related-compaction",
+              message: gatewayError,
+              source: "execution",
+              code: "codex_compaction_model_failed",
+              cause,
+            },
+          ]}
+        />
+      </ForkDialogContextProvider>,
+    );
+
+    const hint = screen.getByTestId("error-compaction-model-hint");
+    expect(hint.textContent?.startsWith(`${gatewayError}${cause}`)).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Fork session…" }));
+    expect(openForkDialog).toHaveBeenCalledExactlyOnceWith({ sourceSessionId: "conv_parent" });
+  });
+
+  it.each([
+    { canFork: false, code: "codex_compaction_model_failed" },
+    { canFork: true, code: "budget_exhausted" },
+  ])("does not offer the fork for $code with canFork=$canFork", ({ canFork, code }) => {
+    render(
+      <ForkDialogContextProvider value={{ canFork, openForkDialog: vi.fn() }}>
+        <ErrorBanner message="Error details" source="execution" code={code} />
+      </ForkDialogContextProvider>,
+    );
+    expect(screen.queryByRole("button", { name: "Fork session…" })).not.toBeInTheDocument();
+  });
+});
+
+describe("missing workspace recovery", () => {
+  beforeEach(() => useChatStore.setState({ conversationId: "conv_parent" }));
+  afterEach(() => useChatStore.setState({ conversationId: null }));
+
+  it.each([null, "conv_side_chat"])("continues the displayed conversation (%s)", (scope) => {
+    const openForkDialog = vi.fn();
+    render(
+      <ForkDialogContextProvider value={{ canFork: true, openForkDialog }}>
+        <ConversationScopeContext.Provider value={scope}>
+          <ErrorBanner
+            message="workspace path does not exist: /missing"
+            source="execution"
+            code="workspace_missing"
+          />
+        </ConversationScopeContext.Provider>
+      </ForkDialogContextProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Continue in another directory…" }));
+    expect(openForkDialog).toHaveBeenCalledExactlyOnceWith({
+      sourceSessionId: scope ?? "conv_parent",
+      workspaceRecovery: true,
+    });
+    expect(screen.queryByText("Message")).not.toBeInTheDocument();
+    expect(screen.getByTestId("error-pill")).toBeInTheDocument();
+  });
+
+  it("offers directory recovery for grouped workspace errors instead of retrying the missing path", () => {
+    const onRetry = vi.fn();
+    const openForkDialog = vi.fn();
+    render(
+      <ForkDialogContextProvider value={{ canFork: true, openForkDialog }}>
+        <ErrorBanner
+          message="The runner disconnected"
+          source="execution"
+          code="runner_disconnected"
+          onRetry={onRetry}
+          relatedErrors={[
+            {
+              itemId: "workspace-error",
+              code: "workspace_missing",
+              source: "execution",
+              message: "Missing directory",
+            },
+          ]}
+        />
+      </ForkDialogContextProvider>,
+    );
+    expect(screen.queryByRole("button", { name: "Resume session" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Continue in another directory…" }));
+    expect(openForkDialog).toHaveBeenCalledOnce();
+    expect(onRetry).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { canFork: false, code: "workspace_missing" },
+    { canFork: true, code: "runner_error" },
+  ])("does not offer directory recovery for $code with canFork=$canFork", ({ canFork, code }) => {
+    render(
+      <ForkDialogContextProvider value={{ canFork, openForkDialog: vi.fn() }}>
+        <ErrorBanner message="Error details" source="execution" code={code} />
+      </ForkDialogContextProvider>,
+    );
+    expect(
+      screen.queryByRole("button", { name: "Continue in another directory…" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the action disabled when forking is unavailable", () => {
+    const openForkDialog = vi.fn();
+    render(
+      <ForkDialogContextProvider
+        value={{
+          currentSessionId: "conv_parent",
+          canFork: true,
+          disabledReason: "Forking is unavailable",
+          openForkDialog,
+        }}
+      >
+        <ErrorBanner message="Missing directory" source="execution" code="workspace_missing" />
+      </ForkDialogContextProvider>,
+    );
+    const button = screen.getByRole("button", { name: "Continue in another directory…" });
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
+    expect(openForkDialog).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])(
+    "lets a scoped child resolve its capabilities independently of root canFork=%s",
+    (canFork) => {
+      const openForkDialog = vi.fn();
+      render(
+        <ForkDialogContextProvider
+          value={{
+            currentSessionId: "conv_parent",
+            canFork,
+            disabledReason: "Forking this sandbox session is not supported yet.",
+            openForkDialog,
+          }}
+        >
+          <ConversationScopeContext.Provider value="conv_side_chat">
+            <ErrorBanner message="Missing directory" source="execution" code="workspace_missing" />
+          </ConversationScopeContext.Provider>
+        </ForkDialogContextProvider>,
+      );
+
+      const button = screen.getByRole("button", { name: "Continue in another directory…" });
+      expect(button).toBeEnabled();
+      fireEvent.click(button);
+      expect(openForkDialog).toHaveBeenCalledExactlyOnceWith({
+        sourceSessionId: "conv_side_chat",
+        workspaceRecovery: true,
+      });
+    },
+  );
+});
+
 describe("RoutingDecisionCard — session-level auto-routing", () => {
   it("applied verdict: shows model pill with tier and rationale", () => {
     render(
@@ -1033,9 +1286,9 @@ describe("routing decision — harness / scope / raw pick", () => {
   // Only an AI-Gateway-routed decision is marked: the built-in judge is the
   // plain case, and a legacy row predates the field entirely.
   const AIGW_MARK = "routing-decision-source-databricks";
-  const AIGW_NAME = "Routed by the Databricks AI Gateway";
+  const AIGW_NAME = "Routed by the Databricks Unity Gateway";
 
-  it("card: marks a decision the Databricks AI Gateway answered", () => {
+  it("card: marks a decision the Databricks Unity Gateway answered", () => {
     render(
       <RoutingDecisionCard
         model="databricks-claude-sonnet-5"
@@ -1076,6 +1329,42 @@ describe("routing decision — harness / scope / raw pick", () => {
     expect(screen.queryByTestId(AIGW_MARK)).toBeNull();
     fireEvent.click(screen.getByTestId("routing-decision-raw-toggle"));
     expect(screen.queryByText(/"router_source"/)).toBeNull();
+  });
+});
+
+describe("ErrorBanner — budget tone", () => {
+  it.each(["budget_exhausted", "codex_compaction_model_failed"])(
+    "renders %s in the neutral tone",
+    (code) => {
+      render(
+        <ErrorBanner message="Budget has reached its limit." source="execution" code={code} />,
+      );
+      const pill = screen.getByTestId("error-pill");
+      // Still a failed turn, only without the failure color.
+      expect(pill).toHaveAttribute("data-level", "error");
+      expect(pill.getAttribute("style")).toContain("--muted-foreground");
+      expect(screen.getByTestId("error-headline")).not.toHaveClass("text-destructive");
+    },
+  );
+
+  it("keeps the failure tone when another failure is grouped with it", () => {
+    render(
+      <ErrorBanner
+        message="Budget has reached its limit."
+        source="execution"
+        code="budget_exhausted"
+        relatedErrors={[
+          {
+            itemId: "related-disconnect",
+            message: "Runner disconnected.",
+            source: "execution",
+            code: "runner_disconnected",
+          },
+        ]}
+      />,
+    );
+    expect(screen.getByTestId("error-pill").getAttribute("style")).toContain("--destructive");
+    expect(screen.getByTestId("error-headline")).toHaveClass("text-destructive");
   });
 });
 

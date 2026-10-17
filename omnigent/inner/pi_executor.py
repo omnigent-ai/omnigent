@@ -20,7 +20,10 @@ OpenAI Completions for others) and ``PI_CODING_AGENT_DIR`` is set so Pi
 picks it up.
 
 Requirements:
-    The ``pi`` CLI must be installed and on PATH.
+    The ``pi`` CLI must be installed and on PATH. Pi >= 0.80.4 reports
+    ``agent_settled``, which this executor uses as the turn boundary; older
+    builds end a turn at ``agent_end`` and can return before an automatic
+    retry or compaction finishes.
 
 Environment (Databricks):
     DATABRICKS_CONFIG_PROFILE — optional Databricks profile selector
@@ -40,12 +43,15 @@ import os
 import pathlib
 import re
 import secrets
+import shlex
 import shutil
-import subprocess
+import signal
 import tempfile
+import time
 from asyncio import Queue, Task
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from importlib.resources import files
 from typing import Any, NotRequired, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
@@ -100,30 +106,64 @@ from .executor import (
 
 logger = logging.getLogger(__name__)
 
+_GATEWAY_AUTH_REFRESH_MS = 900_000
+# Leave time for the bridge round trip within Pi's 10-second command deadline.
+_GATEWAY_AUTH_TIMEOUT_S = 7
+_GATEWAY_BRIDGE_TIMEOUT_S = 8
+
+
+class _GatewayAuthError(OSError):
+    """Credential failure whose message is safe to show without redaction."""
+
+
 # Each line of Pi's JSONL output; the event schema is owned by the Pi CLI
 # not us, and varies across subcommands (response ack, message_update,
 # tool_execution_start/end, agent_end, message_end, etc.).
 CodexEvent: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 
-def _fetch_shell_command_token(command: str) -> str | None:
-    """Run an auth helper command and return its stdout token.
-
-    :param command: Shell command that prints a bearer token.
-    :returns: The stripped token, or ``None`` when the command fails or
-        prints no token.
-    """
-    result = subprocess.run(
-        ["sh", "-c", command],
-        check=False,
-        capture_output=True,
-        text=True,
+async def _fetch_shell_command_token(command: str) -> str:
+    """Resolve a token with a deadline, without exposing helper output on failure."""
+    process = await asyncio.create_subprocess_exec(
+        "sh",
+        "-c",
+        command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        start_new_session=True,
     )
-    token = result.stdout.strip()
-    if result.returncode != 0 or not token:
-        logger.debug("Pi Databricks auth command failed: %s", result.stderr.strip())
-        return None
-    return token
+    try:
+        try:
+            stdout, _ = await asyncio.wait_for(process.communicate(), _GATEWAY_AUTH_TIMEOUT_S)
+        except (TimeoutError, asyncio.CancelledError):
+            # Children may still hold stdout open after the helper shell exits.
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            await process.communicate()
+            raise
+        if process.returncode != 0:
+            raise _GatewayAuthError("Pi gateway auth command failed")
+        token = stdout.decode().strip()
+        if not token:
+            raise _GatewayAuthError("Pi gateway auth command returned an empty token")
+        return token
+    except TimeoutError:
+        raise _GatewayAuthError("Pi gateway auth command timed out") from None
+
+
+def _write_gateway_auth_client(tmp_dir: str, port: int, token: str) -> pathlib.Path:
+    """Copy Pi's credential client and write its private connection settings."""
+    client_path = pathlib.Path(tmp_dir) / "gateway-auth.cjs"
+    config_path = client_path.with_suffix(".json")
+    config_path.write_text(
+        json.dumps({"port": port, "token": token}),
+        encoding="utf-8",
+    )
+    config_path.chmod(0o600)
+    resource = files("omnigent.resources.pi").joinpath("gateway_auth.cjs")
+    client_path.write_bytes(resource.read_bytes())
+    client_path.chmod(0o600)
+    return client_path
 
 
 class ToolExecutor(Protocol):
@@ -236,6 +276,8 @@ class _ToolServer:
         # Per-server bearer token required on every request. Minted at
         # construction (never None) so auth is always enforced.
         self.token: str = secrets.token_urlsafe(32)
+        self._gateway_auth: Callable[[], Awaitable[str]] | None = None
+        self._clients: set[asyncio.Task[None]] = set()
 
     async def start(self) -> int:
         """Start listening on a random port. Returns the port number."""
@@ -252,6 +294,11 @@ class _ToolServer:
     async def stop(self) -> None:
         if self._server is not None:
             self._server.close()
+        clients = list(self._clients)
+        for client in clients:
+            client.cancel()
+        await asyncio.gather(*clients, return_exceptions=True)
+        if self._server is not None:
             await self._server.wait_closed()
             self._server = None
 
@@ -260,6 +307,9 @@ class _ToolServer:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        self._clients.add(task)
         try:
             while True:
                 raw = await reader.readline()
@@ -282,6 +332,20 @@ class _ToolServer:
                         ).encode("utf-8")
                         + b"\n"
                     )
+                    await writer.drain()
+                    break
+                if request.get("kind") == "gateway_auth":
+                    try:
+                        if self._gateway_auth is None:
+                            raise OSError("Pi gateway authentication is not configured")
+                        async with asyncio.timeout(_GATEWAY_BRIDGE_TIMEOUT_S):
+                            credential = await self._gateway_auth()
+                        auth_response = {"token": credential}
+                    except (OSError, TimeoutError) as exc:
+                        error = str(exc) or "Pi gateway authentication timed out"
+                        logger.warning("Pi gateway credential request failed: %s", error)
+                        auth_response = {"error": error}
+                    writer.write(json.dumps(auth_response).encode() + b"\n")
                     await writer.drain()
                     break
                 raw_req_id = request.get("id")
@@ -317,6 +381,7 @@ class _ToolServer:
             pass
         finally:
             writer.close()
+            self._clients.discard(task)
 
     def _token_ok(self, presented: JsonValue) -> bool:
         """
@@ -660,9 +725,9 @@ _RPC_SESSION_CLOSE_REAP_TIMEOUT_S = 2.0
 # EOF does. Module-level so tests can patch it.
 _TURN_STDOUT_IDLE_TIMEOUT_S = 120.0
 
-# Post-error drain budget: after an errored message the only line left to
-# consume is the already-emitted ``agent_end``. Module-level so tests can
-# patch it.
+# Post-error drain budget: pi emits the run's ``agent_end`` right after an
+# errored message, so only that gap is bounded tightly. Module-level so tests
+# can patch it.
 _TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S = 10.0
 
 # CLI flags whose values are sensitive (e.g. the full system prompt) and must
@@ -727,7 +792,7 @@ def _build_models_json(
 
     :param host: Databricks workspace URL used for legacy profile-only
         defaults.
-    :param token: Bearer token to write into Pi's provider entries.
+    :param token: Pi API-key configuration value (literal or ``!command``).
     :param base_urls: Optional provider base URLs keyed by model family,
         e.g. ``{"claude": "...", "openai": "..."}`` — from ucode state or
         a generic (OpenRouter/LiteLLM) provider entry.
@@ -797,7 +862,7 @@ def _build_models_json(
         provider_models[provider_name].append(entry)
     config: _PiModelsConfig = {
         "providers": {
-            # Models advertising Responses support use the AI Gateway's Codex
+            # Models advertising Responses support use the Unity Gateway's Codex
             # surface, including tool-result chaining on subsequent turns.
             "databricks-openai": {
                 "baseUrl": codex_gateway_url,
@@ -922,7 +987,7 @@ def _pi_needs_responses_api(
 
 
 def _is_databricks_gateway_base_url(base_url: str) -> bool:
-    """Return whether a family base URL fronts a Databricks AI Gateway.
+    """Return whether a family base URL fronts a Databricks Unity Gateway.
 
     The one generic-provider vs. Databricks-gateway distinction this module
     makes: a workspace-hosted ``/ai-gateway/`` path or a canonical gateway
@@ -1573,17 +1638,18 @@ def _try_sandbox_pi(
         sandbox = resolve_sandbox(os_env, resolved_cwd)
         if not sandbox.active:
             return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
-        # Pi needs to read its own installation + node_modules.
-        pi_dir = pathlib.Path(pi_path).resolve().parent.parent
+        # Bundled and legacy CLIs both need their sibling npm dependencies.
+        executable = pathlib.Path(pi_path).resolve()
+        pi_dir = next(
+            (parent for parent in executable.parents if parent.name == "node_modules"),
+            executable.parent,
+        )
         sandbox = with_additional_read_roots(sandbox, [pi_dir])
-        # Pi writes to ~/.pi, /tmp, and $TMPDIR (on macOS $TMPDIR is a
-        # per-user dir under /var/folders/, not /tmp — grant both so
-        # PI_CODING_AGENT_DIR (created via tempfile.mkdtemp) is reachable.
         home_pi = pathlib.Path(os.path.expanduser("~/.pi"))
-        sys_tmpdir = pathlib.Path(tempfile.gettempdir())
-        sandbox = with_additional_write_roots(sandbox, [home_pi, pathlib.Path("/tmp"), sys_tmpdir])
+        sandbox = with_additional_write_roots(sandbox, [home_pi])
         sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
-        launcher = create_exec_launcher(pi_path, sandbox)
+        # npm's .bin symlink can be hidden by the sandbox's dotfile mask.
+        launcher = create_exec_launcher(str(executable), sandbox)
         return SandboxedPiCli(launch_path=launcher, sandboxed=True)
     except (OSError, ImportError, NotImplementedError) as exc:
         logger.warning("Could not apply sandbox for Pi: %s", exc)
@@ -1806,6 +1872,7 @@ class PiExecutor(Executor):
         base_urls_override: dict[str, str] | None = None,
         openai_wire_api: str | None = None,
         gateway_auth_command: str | None = None,
+        gateway_auth_refresh_interval_ms: str | None = None,
         retry_policy: RetryPolicy | None = None,
         bundle_dir: pathlib.Path | None = None,
         agent_name: str | None = None,
@@ -1829,7 +1896,7 @@ class PiExecutor(Executor):
         :param pi_path: Absolute path to a ``pi`` CLI binary.  When ``None``
             the executor searches ``PATH``.
         :param gateway: When ``True``, write a ``models.json`` pointing Pi
-            at a vendor-neutral gateway. The Databricks AI gateway is one
+            at a vendor-neutral gateway. The Databricks Unity Gateway is one
             producer of this transport; generic providers are another.
         :param databricks_profile: Databricks-specific config profile from
             ``~/.databrickscfg``, e.g. ``"<your-profile>"``.  Only used on the
@@ -1856,6 +1923,8 @@ class PiExecutor(Executor):
             ``"databricks auth token --host https://example.databricks.com ..."``
             or ``"printf %s sk-..."``. Set from
             ``HARNESS_PI_GATEWAY_AUTH_COMMAND``.
+        :param gateway_auth_refresh_interval_ms: Token cache lifetime in milliseconds;
+            defaults to 15 minutes. Zero resolves credentials on every request.
         :param retry_policy: The spec's ``llm.retry`` budget. Threads
             ``policy.pi.settings()`` into Pi's ``.pi/settings.json``
             before subprocess spawn — Pi natively does exponential
@@ -1901,6 +1970,16 @@ class PiExecutor(Executor):
         self._gateway_model_entries: tuple[model_catalog.ModelEntry, ...] | None = None
         self._gateway_model_wire_apis: dict[str, frozenset[ModelWireAPI]] | None = None
         self._gateway_auth_command = gateway_auth_command
+        interval = (
+            int(gateway_auth_refresh_interval_ms)
+            if gateway_auth_refresh_interval_ms
+            else _GATEWAY_AUTH_REFRESH_MS
+        )
+        if interval < 0:
+            raise ValueError("gateway_auth_refresh_interval_ms must be nonnegative")
+        self._gateway_auth_refresh_interval_s = interval / 1000
+        self._gateway_refresh_after = 0.0
+        self._gateway_auth_lock = asyncio.Lock()
         # Retry policy → Pi's .pi/settings.json before subprocess spawn.
         # See ``RetryPolicy.pi.settings()`` for the schema. Pi natively
         # does exponential backoff + Retry-After honoring; we just set
@@ -1920,12 +1999,31 @@ class PiExecutor(Executor):
         # off (they don't route through Omnigent policies / history and
         # can 400 against the Databricks Responses API), and the bridge
         # extension's tools are explicitly allowlisted.
-        from omnigent.harnesses.pi_native.main import pi_supports_approve
+        from omnigent.harnesses.pi_native.main import (
+            PI_AGENT_SETTLED_MIN_VERSION,
+            PI_APPROVE_MIN_VERSION,
+            pi_version,
+        )
 
+        self._pi_version = pi_version(self._pi_path)
+        # Pi >= 0.80.4 reports ``agent_settled`` once a prompt's run is fully
+        # finished; older builds only emit ``agent_end`` per run.
+        self._settled_turn_boundary = (
+            self._pi_version is not None and self._pi_version >= PI_AGENT_SETTLED_MIN_VERSION
+        )
+        if not self._settled_turn_boundary:
+            logger.warning(
+                "PiExecutor: pi %s does not report agent_settled, so turns end at agent_end "
+                "and may return before an automatic retry or compaction finishes; upgrade "
+                "@earendil-works/pi-coding-agent to >= 0.80.4.",
+                ".".join(str(part) for part in self._pi_version)
+                if self._pi_version is not None
+                else "(unknown version)",
+            )
         self._extra_args: list[str] = ["--no-tools"]
         if not context_files:
             self._extra_args.append("--no-context-files")
-        if pi_supports_approve(self._pi_path):
+        if self._pi_version is not None and self._pi_version >= PI_APPROVE_MIN_VERSION:
             # Pre-accept the project-folder trust dialog. Pi 0.79+ shows a
             # blocking TUI prompt on first launch in a directory with .pi/
             # resources. In a runner-driven session there is nobody at the
@@ -1942,41 +2040,17 @@ class PiExecutor(Executor):
         # Set by Session._wire_sdk_executor().
         self._tool_executor: ToolExecutor | None = None
 
+        self._databricks_host = self._gateway_host_override or ""
+        self._databricks_token = ""
         if gateway:
-            creds = None
-            if self._gateway_host_override is None:
-                creds = _read_databrickscfg(databricks_profile)
-                if creds is None:
-                    raise OSError(
-                        "PiExecutor(gateway=True) requires gateway credentials via "
-                        "the gateway base URL / auth command or a valid "
-                        "~/.databrickscfg profile."
-                    )
-            if self._gateway_host_override is not None:
-                self._databricks_host = self._gateway_host_override
-                if gateway_auth_command is None:
-                    raise OSError(
-                        "PiExecutor(gateway=True) with a gateway workspace host "
-                        "requires a gateway auth command."
-                    )
-                token = _fetch_shell_command_token(gateway_auth_command)
-                if token is None:
-                    raise OSError(
-                        "PiExecutor(gateway=True) could not fetch a gateway token "
-                        "for the workspace host."
-                    )
-                self._databricks_token = token
-            elif base_url_override:
-                # Derive the workspace host from the Anthropic gateway URL
-                # ucode wrote to state.json.
-                _parsed = _urlparse(base_url_override)
-                self._databricks_host = f"{_parsed.scheme}://{_parsed.netloc}"
-                assert creds is not None
-                self._databricks_token = creds.token
-            else:
-                assert creds is not None
-                self._databricks_host = creds.host
-                self._databricks_token = creds.token
+            if self._gateway_host_override is not None and gateway_auth_command is None:
+                raise OSError(
+                    "PiExecutor(gateway=True) with a gateway workspace host "
+                    "requires a gateway auth command."
+                )
+            if self._gateway_host_override is None and base_url_override:
+                parsed = _urlparse(base_url_override)
+                self._databricks_host = f"{parsed.scheme}://{parsed.netloc}"
 
         # True when the gateway transport was derived from a ~/.databrickscfg
         # profile (no gateway host or base URL supplied directly). Gates the
@@ -2050,6 +2124,16 @@ class PiExecutor(Executor):
         if state is not None and state.rpc is not None:
             await state.rpc.close()
 
+    async def _evict_rpc(self, session_key: str, rpc: _PiRpcSession) -> None:
+        """Drop *rpc* mid-turn so frames it still emits can't reach the next turn."""
+        state = self._session_states.get(session_key)
+        if state is not None and state.rpc is rpc:
+            self._session_states.pop(session_key, None)
+        try:
+            await rpc.close()
+        except Exception as exc:  # noqa: BLE001 — best-effort teardown on an already-failed turn
+            logger.debug("PiExecutor: evicting the RPC session failed: %s", exc)
+
     async def interrupt_session(self, session_key: str) -> bool:
         state = self._session_states.get(session_key)
         if state is None or state.rpc is None:
@@ -2119,7 +2203,7 @@ class PiExecutor(Executor):
                 raise TypeError("Databricks model resolution returned a non-string model id")
             return model_id
         # Strip bracket suffixes (e.g. "[1m]") — context-window hints accepted
-        # by the direct Anthropic API but not by the Databricks AI Gateway.
+        # by the direct Anthropic API but not by the Databricks Unity Gateway.
         if model and self._gateway and not self._preserve_model_ids:
             model = re.sub(r"\[.*?\]$", "", model)
         return model
@@ -2155,6 +2239,8 @@ class PiExecutor(Executor):
         """Fetch and cache the live Databricks model catalog."""
         if self._gateway_model_wire_apis is not None:
             return self._gateway_model_wire_apis
+        if self._gateway:
+            await self._get_gateway_token()
         workspace_url = self._gateway_workspace_url if self._gateway else None
         if workspace_url is None:
             self._gateway_model_entries = ()
@@ -2192,15 +2278,47 @@ class PiExecutor(Executor):
         return self._gateway_model_wire_apis
 
     async def _ensure_tool_server(self, tools: list[ToolSpec]) -> int | None:
-        """Start the TCP tool server if there are Omnigent tools to bridge."""
-        if not tools:
+        """Start the authenticated bridge for tools or gateway credentials."""
+        if not tools and not self._gateway:
             return None
         if self._tool_server is None:
             self._tool_server = _ToolServer()
             await self._tool_server.start()
         self._tool_server._tool_executor = self._tool_executor
         self._tool_server._policy_gate = self._gate_native_tool
+        self._tool_server._gateway_auth = self._get_gateway_token if self._gateway else None
         return self._tool_server.port
+
+    async def _get_gateway_token(self) -> str:
+        """Refresh expired credentials under a lock; never fall back after failure."""
+        async with self._gateway_auth_lock:
+            if time.monotonic() < self._gateway_refresh_after:
+                return self._databricks_token
+            self._gateway_refresh_after = 0.0
+            try:
+                async with asyncio.timeout(_GATEWAY_BRIDGE_TIMEOUT_S):
+                    if self._gateway_host_override is not None:
+                        assert self._gateway_auth_command is not None
+                        token = await _fetch_shell_command_token(self._gateway_auth_command)
+                    else:
+                        creds = await run_sync_on_thread(
+                            _read_databrickscfg, self._databricks_profile
+                        )
+                        token = creds.token if creds is not None else None
+                        if creds is not None and not self._databricks_host:
+                            self._databricks_host = creds.host
+                    if not isinstance(token, str) or not token.strip():
+                        raise _GatewayAuthError("Pi gateway authentication returned no token")
+            except _GatewayAuthError:
+                raise
+            except TimeoutError:
+                raise _GatewayAuthError("Pi gateway credential refresh timed out") from None
+            except Exception:  # noqa: BLE001 — SDK/helper exceptions may contain credentials
+                raise _GatewayAuthError("Pi gateway credential refresh failed") from None
+            self._databricks_token = token
+            self._gateway_workspace_url = self._gateway_model_service_workspace_url()
+            self._gateway_refresh_after = time.monotonic() + self._gateway_auth_refresh_interval_s
+            return token
 
     async def _gate_native_tool(  # type: ignore[explicit-any]
         self,
@@ -2258,14 +2376,20 @@ class PiExecutor(Executor):
             is pinned (Pi picks its own default).
         """
         env = dict(self._env)
-        tmp_dir = tempfile.mkdtemp(prefix="omnigent_pi_")
+        tmp_parent = None
+        if self._sandboxed:
+            tmp_parent = pathlib.Path.home() / ".pi"
+            tmp_parent.mkdir(parents=True, exist_ok=True)
+        tmp_dir = tempfile.mkdtemp(prefix="omnigent_pi_", dir=tmp_parent)
         extra_args: list[str] = list(self._extra_args)
 
         if self._gateway:
             effective_model = model
+            assert tool_server_port is not None and tool_server_token is not None
+            auth_client = _write_gateway_auth_client(tmp_dir, tool_server_port, tool_server_token)
             models_json = _build_models_json(
                 self._gateway_workspace_url or self._databricks_host,
-                self._databricks_token,
+                f"!node {shlex.quote(str(auth_client))}",
                 self._base_urls_override,
                 model=effective_model,
                 catalog_models=self._gateway_model_entries or (),
@@ -2496,15 +2620,11 @@ class PiExecutor(Executor):
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         if self._gateway:
-            if self._gateway_host_override is None:
-                creds = _read_databrickscfg(self._databricks_profile)
-                if creds is not None:
-                    self._databricks_token = creds.token
-            else:
-                assert self._gateway_auth_command is not None
-                token = _fetch_shell_command_token(self._gateway_auth_command)
-                if token:
-                    self._databricks_token = token
+            try:
+                await self._get_gateway_token()
+            except OSError as exc:
+                yield ExecutorError(message=str(exc), retryable=False)
+                return
         session_key = self._session_key(messages)
         model = await self._resolve_model(config)
         try:
@@ -2580,41 +2700,66 @@ class PiExecutor(Executor):
             yield ExecutorError(message=f"Failed to send prompt to Pi: {exc}")
             return
 
-        # Read events until agent_end.
+        # Read events until the turn boundary: ``agent_settled`` on pi >= 0.80.4,
+        # where one prompt may span several ``agent_end`` runs (retry, compaction,
+        # queued continuation); ``agent_end`` on older builds without settlement.
+        settled_boundary = self._settled_turn_boundary
         response_text = ""
         streamed_any = False
+        # Text deltas already yielded for the assistant message in flight. If
+        # that message then fails, pi regenerates it on retry; appending the new
+        # text after the partial one would corrupt an append-only consumer.
+        message_streamed_text = False
         # Per-LLM-call token usage captured from each assistant message pi
         # forwards (``message_end`` is the capture site; ``agent_end`` is a
         # fallback). Summed into a turn-level usage dict at completion so a
         # multi-step (tool-loop) turn bills for every call, not just the
         # last. Empty when pi reports no usage — cost tracking is skipped.
         message_usages: list[_PiMessageUsage] = []
-        # Error reported by a ``message_end`` (stopReason=error); surfaced at
-        # ``agent_end`` so the terminal event is consumed off the RPC stream.
+        # Error reported by a ``message_end`` (stopReason=error); cleared when a
+        # later message completes (pi recovered) and surfaced at the turn
+        # boundary so every terminal frame is consumed off the RPC stream.
         pending_error: str | None = None
+        # True between an errored ``message_end`` and the ``agent_end`` pi
+        # emits right after it; only that gap uses the short drain budget.
+        awaiting_error_agent_end = False
 
         while True:
-            # After an errored message the only thing left to drain is the
-            # already-emitted agent_end, so don't wait the full idle budget.
             line = await rpc.read_line(
-                timeout=_TURN_STDOUT_IDLE_TIMEOUT_S
-                if pending_error is None
-                else _TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S
+                timeout=_TURN_STDOUT_ERROR_DRAIN_TIMEOUT_S
+                if awaiting_error_agent_end
+                else _TURN_STDOUT_IDLE_TIMEOUT_S
             )
             if line is None:
-                if pending_error is None and not rpc.stdout_at_eof():
-                    # Idle timeout, not process death: pi's stdout reader is
-                    # still running — e.g. a long tool call silent past the
-                    # idle budget. Keep waiting; a dead pi process delivers
-                    # a real EOF (reader finishes) instead. True hangs are
-                    # bounded by the harness-level idle watchdog.
-                    logger.debug("PiExecutor: stdout idle past budget; pi still running, waiting")
-                    continue
-                if pending_error is not None:
+                if not rpc.stdout_at_eof():
+                    if not awaiting_error_agent_end:
+                        # Idle timeout, not process death: pi's stdout reader is
+                        # still running (e.g. a long silent tool call). Keep waiting;
+                        # a dead pi delivers EOF, and the harness watchdog bounds hangs.
+                        logger.debug(
+                            "PiExecutor: stdout idle past budget; pi still running, waiting"
+                        )
+                        continue
+                    # The agent_end that always follows an errored message never
+                    # came; the session's state is unknown, so don't reuse it.
+                    if settled_boundary:
+                        await self._evict_rpc(session_key, rpc)
+                    yield ExecutorError(
+                        message=pending_error or "Pi stopped responding after an error"
+                    )
+                    return
+                # EOF: pi exited mid-turn.
+                stderr = "\n".join(rpc._stderr_lines) if rpc._stderr_lines else ""
+                stderr_suffix = f" Stderr: {stderr}" if stderr else ""
+                if settled_boundary:
+                    await self._evict_rpc(session_key, rpc)
+                    yield ExecutorError(
+                        message=pending_error
+                        or f"Pi process ended before the turn settled.{stderr_suffix}"
+                    )
+                elif pending_error is not None:
                     yield ExecutorError(message=pending_error)
                 elif not streamed_any and not response_text:
-                    stderr = "\n".join(rpc._stderr_lines) if rpc._stderr_lines else ""
-                    stderr_suffix = f" Stderr: {stderr}" if stderr else ""
                     yield ExecutorError(
                         message=f"Pi process ended without response.{stderr_suffix}"
                     )
@@ -2639,8 +2784,14 @@ class PiExecutor(Executor):
             # Skip the command-ack response.
             if event_type == "response":
                 if not event.get("success", True):
+                    if settled_boundary:
+                        await self._evict_rpc(session_key, rpc)
                     yield ExecutorError(message=event.get("error", "Pi command failed"))
                     return
+                continue
+
+            if event_type == "message_start":
+                message_streamed_text = False
                 continue
 
             # Streaming text and thinking deltas.
@@ -2653,6 +2804,7 @@ class PiExecutor(Executor):
                         yield TextChunk(text=raw_delta)
                         response_text += raw_delta
                         streamed_any = True
+                        message_streamed_text = True
                 elif ame_type == "thinking_start":
                     # Anchors the "Thinking…" indicator before the first delta.
                     yield ReasoningChunk(delta="", event_type="reasoning_started")
@@ -2756,13 +2908,13 @@ class PiExecutor(Executor):
                 )
                 continue
 
-            # Agent ended — the turn is complete.
+            # ``agent_end`` closes one agent run. On pi >= 0.80.4 the turn goes on
+            # until ``agent_settled`` (pi may retry, compact and re-run, or continue
+            # with a queued message); older pi ends the turn here.
             if event_type == "agent_end":
-                if pending_error is not None:
-                    yield ExecutorError(message=pending_error)
-                    return
+                awaiting_error_agent_end = False
                 end_messages = event.get("messages", [])
-                if not response_text:
+                if not response_text and pending_error is None:
                     for m in reversed(end_messages):
                         if m.get("role") == "assistant":
                             content = m.get("content", [])
@@ -2788,6 +2940,25 @@ class PiExecutor(Executor):
                         if captured is not None:
                             message_usages.append(captured)
                             break
+                if settled_boundary:
+                    continue
+                if pending_error is not None:
+                    yield ExecutorError(message=pending_error)
+                    return
+                turn_usage = _aggregate_pi_turn_usage(message_usages, model)
+                _notify_usage_from_dict(model=model, usage=turn_usage)
+                yield TurnComplete(
+                    response=response_text,
+                    usage=dict(turn_usage) if turn_usage is not None else None,
+                )
+                return
+
+            # ``agent_settled``: no retry, compaction or queued continuation is
+            # left, so the stream is clean for the next turn on this session.
+            if event_type == "agent_settled" and settled_boundary:
+                if pending_error is not None:
+                    yield ExecutorError(message=pending_error)
+                    return
                 turn_usage = _aggregate_pi_turn_usage(message_usages, model)
                 _notify_usage_from_dict(model=model, usage=turn_usage)
                 yield TurnComplete(
@@ -2808,16 +2979,42 @@ class PiExecutor(Executor):
                     raw_stop = msg.get("stopReason")
                     stop: str | None = raw_stop if isinstance(raw_stop, str) else None
                     if stop == "aborted":
-                        err = msg.get("errorMessage", stop)
-                        yield ExecutorError(message=str(err))
+                        # pi still emits agent_end/agent_settled after an abort;
+                        # drop the session so the next turn cannot read them.
+                        if settled_boundary:
+                            await self._evict_rpc(session_key, rpc)
+                        yield ExecutorError(message=str(msg.get("errorMessage", stop)))
                         return
                     if stop == "error":
-                        # Pi emits the turn-terminal ``agent_end`` after an
-                        # errored LLM call; returning here would leave it
-                        # queued, so the next turn on this RPC session reads
-                        # the stale event as its own end. Record the error
-                        # and keep draining until ``agent_end``.
-                        pending_error = str(msg.get("errorMessage", stop))
+                        error = str(msg.get("errorMessage", stop))
+                        if settled_boundary and message_streamed_text:
+                            # pi regenerates this message on retry; its partial
+                            # text is already on screen, so stop here.
+                            await self._evict_rpc(session_key, rpc)
+                            yield ExecutorError(message=error)
+                            return
+                        # pi emits the run's ``agent_end`` right after an errored
+                        # call; consume it (and on pi >= 0.80.4 the retry or
+                        # settlement that follows) rather than leave it queued.
+                        pending_error = error
+                        awaiting_error_agent_end = True
+                    elif stop is not None:
+                        # A later completed assistant message means pi recovered.
+                        pending_error = None
+                continue
+
+            if event_type == "compaction_end" and settled_boundary:
+                if event.get("willRetry") and message_streamed_text:
+                    # Overflow recovery re-runs the prompt, replacing a
+                    # truncated message whose text already streamed.
+                    await self._evict_rpc(session_key, rpc)
+                    yield ExecutorError(
+                        message=(
+                            "Pi's response was truncated and it compacted the context to "
+                            "retry, but the partial response was already streamed."
+                        )
+                    )
+                    return
                 continue
 
             logger.debug("PiExecutor: ignoring event type=%s", event_type)

@@ -15,15 +15,19 @@ from omnigent.server.feature_flags import (
 )
 
 
-def test_features_default_off() -> None:
-    flags = resolve_feature_flags({})
+@pytest.mark.parametrize("environ", [{}, {FEATURES_ENV_VAR: ""}])
+def test_unset_or_empty_disables_every_feature(environ: dict[str, str]) -> None:
+    flags = resolve_feature_flags(environ)
 
     assert flags.enabled_features == frozenset()
     assert flags.frontend_dict() == {
         "usage_page": False,
         "harness_install": False,
         "canvas": False,
-        "harness_settings_ui": False,
+        "arca_shutdown_warnings": False,
+        "import_review": False,
+        "custom_agents_settings_ui": False,
+        "sidebar_grouping_ui": False,
     }
 
 
@@ -58,6 +62,13 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
     assert flags.enabled_names() == ("canvas",)
 
 
+def test_arca_shutdown_warnings_are_frontend_visible() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "arca_shutdown_warnings"})
+
+    assert flags.enabled(Feature.ARCA_SHUTDOWN_WARNINGS)
+    assert flags.frontend_dict()["arca_shutdown_warnings"] is True
+
+
 def test_unknown_feature_fails_with_known_names() -> None:
     with pytest.raises(ValueError) as exc_info:
         resolve_feature_flags({FEATURES_ENV_VAR: "usage-pgae"})
@@ -79,7 +90,7 @@ def test_snapshot_is_immutable_and_does_not_follow_environment_mutation() -> Non
         flags.enabled_features = frozenset()  # type: ignore[misc]
 
 
-def test_release_flags_have_lifecycle_metadata_and_default_off() -> None:
+def test_release_flags_have_lifecycle_metadata_and_expected_defaults() -> None:
     assert {definition.feature for definition in FEATURE_DEFINITIONS} == set(Feature)
     for definition in FEATURE_DEFINITIONS:
         assert definition.owner

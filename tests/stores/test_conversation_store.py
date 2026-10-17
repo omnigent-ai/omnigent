@@ -33,6 +33,7 @@ from omnigent.session_import import (
     IMPORT_SOURCE_LABEL_KEY,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store import ConversationUpdateResult
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -95,23 +96,28 @@ def test_fork_drops_import_provenance_labels(
 def test_fork_drops_sandbox_repo_label(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """A fork must not inherit the repository the source's sandbox was built
-    from: the label is what a sandbox RELAUNCH re-clones, so a clone that
-    asked for an empty sandbox would get the source's repo re-cloned into it
-    on the first relaunch. The fork's own launch re-stamps whatever it
-    resolves."""
-    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
+    """A fork must not inherit the source sandbox's labels: the repository is
+    what a sandbox RELAUNCH re-clones, so a clone that asked for an empty
+    sandbox would get the source's repo re-cloned into it on the first
+    relaunch; the host id routes requests to the source's host, while the fork
+    launches its own. The fork's own launch re-stamps whatever it resolves."""
+    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY, REQUESTED_HOST_ID_LABEL_KEY
 
     source = conversation_store.create_conversation()
     conversation_store.set_labels(
         source.id,
-        {MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo#main", "kept": "yes"},
+        {
+            MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo#main",
+            REQUESTED_HOST_ID_LABEL_KEY: "0123456789abcdef0123456789abcdef",
+            "kept": "yes",
+        },
     )
 
     fork = conversation_store.fork_conversation(source.id)
 
     assert fork.labels["kept"] == "yes"
     assert MANAGED_REPO_LABEL_KEY not in fork.labels
+    assert REQUESTED_HOST_ID_LABEL_KEY not in fork.labels
 
 
 def test_fork_drops_per_repo_sandbox_labels(
@@ -486,6 +492,121 @@ def test_update_title(conversation_store: SqlAlchemyConversationStore) -> None:
         conversation_store.update_conversation("c55a64c3f6f954fe0fc8738ba3f45f26", title="x")
         is None
     )
+
+
+def test_update_conversation_with_changes_reports_effort_changes(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+
+    first = conversation_store.update_conversation_with_changes(conv.id, reasoning_effort="high")
+    assert isinstance(first, ConversationUpdateResult)
+    assert first.conversation.reasoning_effort == "high"
+    assert first.reasoning_effort_changed is True
+    assert first.model_override_changed is False
+
+    no_op = conversation_store.update_conversation_with_changes(conv.id, reasoning_effort="high")
+    assert no_op is not None
+    assert no_op.reasoning_effort_changed is False
+    assert no_op.model_override_changed is False
+
+    changed = conversation_store.update_conversation_with_changes(conv.id, reasoning_effort="low")
+    assert changed is not None
+    assert changed.conversation.reasoning_effort == "low"
+    assert changed.reasoning_effort_changed is True
+
+    cleared = conversation_store.update_conversation_with_changes(
+        conv.id, _unset_reasoning_effort=True
+    )
+    assert cleared is not None
+    assert cleared.conversation.reasoning_effort is None
+    assert cleared.reasoning_effort_changed is True
+
+    clear_no_op = conversation_store.update_conversation_with_changes(
+        conv.id, _unset_reasoning_effort=True
+    )
+    assert clear_no_op is not None
+    assert clear_no_op.reasoning_effort_changed is False
+
+    unrelated = conversation_store.update_conversation_with_changes(conv.id, title="Renamed")
+    assert unrelated is not None
+    assert unrelated.reasoning_effort_changed is False
+    assert unrelated.model_override_changed is False
+
+
+def test_update_conversation_with_changes_reports_model_changes(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+
+    first = conversation_store.update_conversation_with_changes(conv.id, model_override="model-a")
+    assert first is not None
+    assert first.conversation.model_override == "model-a"
+    assert first.reasoning_effort_changed is False
+    assert first.model_override_changed is True
+
+    no_op = conversation_store.update_conversation_with_changes(conv.id, model_override="model-a")
+    assert no_op is not None
+    assert no_op.model_override_changed is False
+
+    changed = conversation_store.update_conversation_with_changes(
+        conv.id, model_override="model-b"
+    )
+    assert changed is not None
+    assert changed.conversation.model_override == "model-b"
+    assert changed.model_override_changed is True
+
+    cleared = conversation_store.update_conversation_with_changes(
+        conv.id, _unset_model_override=True
+    )
+    assert cleared is not None
+    assert cleared.conversation.model_override is None
+    assert cleared.model_override_changed is True
+
+    clear_no_op = conversation_store.update_conversation_with_changes(
+        conv.id, _unset_model_override=True
+    )
+    assert clear_no_op is not None
+    assert clear_no_op.model_override_changed is False
+
+
+def test_update_conversation_with_changes_missing_conversation(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    assert (
+        conversation_store.update_conversation_with_changes(
+            "c55a64c3f6f954fe0fc8738ba3f45f26",
+            reasoning_effort="high",
+            model_override="model-a",
+        )
+        is None
+    )
+
+
+def test_update_conversation_with_changes_retries_commit(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+    retrying_maker = _RetryOnceMaker(conversation_store._conv_session_immediate)
+    conversation_store._conv_session_immediate = retrying_maker
+
+    result = conversation_store.update_conversation_with_changes(
+        conv.id,
+        reasoning_effort="high",
+        model_override="model-a",
+    )
+
+    assert retrying_maker.attempts == 2
+    assert result is not None
+    assert result.reasoning_effort_changed is True
+    assert result.model_override_changed is True
+    assert result.conversation.reasoning_effort == "high"
+    assert result.conversation.model_override == "model-a"
+
+    committed = conversation_store.get_conversation(conv.id)
+    assert committed is not None
+    assert committed.reasoning_effort == "high"
+    assert committed.model_override == "model-a"
 
 
 def test_reported_model_round_trips_beside_the_request(
@@ -2573,6 +2694,90 @@ def test_append_bumps_updated_at(
     )
 
 
+def _deleted_terminal_event(conversation_id: str) -> NewConversationItem:
+    return NewConversationItem(
+        type="resource_event",
+        response_id=conversation_id,
+        data=ResourceEventData(
+            event_type="session.resource.deleted",
+            resource_id="terminal_codex_main",
+            resource_type="terminal",
+        ),
+    )
+
+
+def test_resource_event_only_append_preserves_updated_at(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operational resource cleanup must not look like new conversation activity."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+
+    appended = conversation_store.append(conv.id, [_deleted_terminal_event(conv.id)])
+
+    assert [item.type for item in appended] == ["resource_event"]
+    assert [item.type for item in conversation_store.list_items(conv.id).data] == [
+        "resource_event"
+    ]
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.updated_at == 1000
+
+
+def test_mixed_resource_and_message_append_bumps_updated_at(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mixed batch remains real activity when it contains a new message."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+    message = NewConversationItem(
+        type="message",
+        response_id="resp_mixed",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+    )
+
+    conversation_store.append(conv.id, [_deleted_terminal_event(conv.id), message])
+
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.updated_at == 2000
+
+
+def test_resource_event_with_duplicate_message_preserves_updated_at(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resource event plus a deduplicated message contains no new activity."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+    message = NewConversationItem(
+        type="message",
+        response_id="resp_duplicate",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id="ab" * 16,
+    )
+    conversation_store.append(conv.id, [message])
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+
+    appended = conversation_store.append(conv.id, [message, _deleted_terminal_event(conv.id)])
+
+    assert appended[0].deduplicated is True
+    assert [item.type for item in appended] == ["message", "resource_event"]
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.updated_at == 1000
+
+
 def test_update_title_bumps_updated_at(
     conversation_store: SqlAlchemyConversationStore,
     monkeypatch: pytest.MonkeyPatch,
@@ -2945,6 +3150,65 @@ def test_list_child_conversation_ids_by_parent_groups_direct_subagents(
     assert nested.id not in result[parent_a.id]
     nested_result = conversation_store.list_child_conversation_ids_by_parent([child_a1.id])
     assert nested_result[child_a1.id] == [nested.id]
+
+    pages: list[tuple[str, int]] = []
+    while True:
+        cursor = (pages[-1][1], pages[-1][0]) if pages else None
+        page = conversation_store.list_child_conversation_ids_page(
+            parent_a.id, after=cursor, limit=1
+        )
+        if not page:
+            break
+        pages.extend(page)
+    assert pages == sorted(
+        [(child_a1.id, child_a1.created_at), (child_a2.id, child_a2.created_at)],
+        key=lambda row: (row[1], row[0]),
+        reverse=True,
+    )
+    assert conversation_store.list_child_conversation_ids_page(parent_b.id) == [
+        (child_b.id, child_b.created_at)
+    ]
+    assert conversation_store.list_child_conversation_ids_page(child_a1.id) == [
+        (nested.id, nested.created_at)
+    ]
+
+
+def test_child_conversation_page_uses_parent_index_for_first_and_next_page(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    if conversation_store._engine.dialect.name != "sqlite":
+        pytest.skip("SQLite query-plan assertion")
+    parent = conversation_store.create_conversation()
+    children = [
+        conversation_store.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
+        for _ in range(3)
+    ]
+    queries = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(conversation_store._engine, "before_cursor_execute", capture)
+    try:
+        first = conversation_store.list_child_conversation_ids_page(parent.id, limit=1)
+        following = conversation_store.list_child_conversation_ids_page(
+            parent.id, after=(first[0][1], first[0][0]), limit=1
+        )
+    finally:
+        event.remove(conversation_store._engine, "before_cursor_execute", capture)
+    assert len(first) == len(following) == 1
+    assert {first[0][0], following[0][0]} <= {child.id for child in children}
+    assert len(queries) == 2
+    with conversation_store._engine.connect() as conn:
+        plans = [
+            str(conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all())
+            for statement, parameters in queries
+        ]
+    for plan in plans:
+        assert "idx_conversations_parent" in plan, plan
+        assert "TEMP B-TREE" not in plan, plan
+    assert "(created_at,id)<(?,?)" in "".join(plans[1].split()), plans[1]
 
 
 # ── agent_id filter on list_conversations ──────────────
@@ -4325,6 +4589,146 @@ def test_fork_conversation_copies_items(
         assert fork_item.data == src_item.data
 
 
+@pytest.mark.parametrize("last_error_code", ["workspace_missing", "runner_disconnected"])
+def test_fork_marks_source_workspace_failures_as_notices(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    last_error_code: str,
+) -> None:
+    """A new unbound fork leaves the source's missing-workspace diagnosis behind."""
+    host_id = "1" * 32
+    _register_host(db_uri, host_id)
+    source = conversation_store.create_conversation(
+        workspace="/missing-workspace", host_id=host_id, runner_id="source-runner"
+    )
+    source_labels = {
+        "omnigent.last_task_error_code": last_error_code,
+        "omnigent.last_task_error_message": "Source launch failed",
+        "omnigent.last_task_error_item_id": "source-error",
+        "omnigent.last_task_error_title": "Source failure",
+        "kept": "yes",
+    }
+    conversation_store.set_labels(source.id, source_labels)
+    missing = NewConversationItem(
+        type="error",
+        response_id="failed_launch",
+        data=ErrorData(
+            source="execution",
+            code="workspace_missing",
+            message="workspace path does not exist: /missing-workspace",
+            title="Workspace missing",
+            cause="The source working directory was deleted.",
+            remediation="Restore the original directory.",
+        ),
+    )
+    source_items = conversation_store.append(
+        source.id,
+        [
+            _user_message("Earlier context", "earlier"),
+            NewConversationItem(
+                type="error",
+                response_id="earlier",
+                data=ErrorData(source="llm", code="rate_limit_exceeded", message="Retry later"),
+            ),
+            missing,
+            _user_message("Please continue", "failed_launch"),
+            missing,
+        ],
+    )
+    calls = _count_encode_hooks(conversation_store, monkeypatch)
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert calls == {"item": 0, "batch": 1, "decode_batch": 1}
+    assert fork.workspace is None and fork.host_id is None and fork.runner_id is None
+    assert fork.labels["kept"] == "yes"
+    if last_error_code == "workspace_missing":
+        assert not any(key.startswith("omnigent.last_task_error_") for key in fork.labels)
+    else:
+        assert all(fork.labels[key] == value for key, value in source_labels.items())
+    fork_items = conversation_store.list_items(fork.id).data
+    for original_item, fork_item in zip(source_items, fork_items, strict=True):
+        assert original_item.id != fork_item.id
+        assert original_item.response_id == fork_item.response_id
+        if original_item.data == missing.data:
+            assert isinstance(fork_item.data, ErrorData)
+            assert fork_item.data.code == "source_workspace_missing"
+            assert fork_item.data.level == "info"
+            assert fork_item.data.title == "The original session’s workspace was unavailable."
+            assert fork_item.data.message == missing.data.message
+            assert fork_item.data.cause is None and fork_item.data.remediation is None
+        else:
+            assert fork_item.data == original_item.data
+    assert _stored_positions(conversation_store, fork.id) == list(range(5))
+    assert conversation_store.list_items(source.id).data == source_items
+    original = conversation_store.get_conversation(source.id)
+    assert original is not None
+    assert original.workspace == "/missing-workspace" and original.host_id == host_id
+    assert original.labels == source_labels
+    assert len(conversation_store.search("source_workspace_missing", conversation_id=fork.id)) == 2
+    assert conversation_store.search("source_workspace_missing", conversation_id=source.id) == []
+
+    [new_failure] = conversation_store.append(fork.id, [missing])
+    assert conversation_store.list_items(fork.id).data[-1] == new_failure
+    assert isinstance(new_failure.data, ErrorData)
+    assert new_failure.data.code == "workspace_missing" and new_failure.data.level is None
+    assert _stored_positions(conversation_store, fork.id) == list(range(6))
+
+
+@pytest.mark.parametrize("has_prior_item", [False, True])
+def test_fork_preserves_compaction_boundary_at_workspace_error(
+    conversation_store: SqlAlchemyConversationStore,
+    has_prior_item: bool,
+) -> None:
+    """A historical workspace notice keeps later, unsummarized messages after its cursor."""
+    source = conversation_store.create_conversation()
+    if has_prior_item:
+        conversation_store.append(source.id, [_user_message("Earlier context", "earlier")])
+    [boundary] = conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="error",
+                response_id="failed_launch",
+                data=ErrorData(
+                    source="execution", code="workspace_missing", message="Directory missing"
+                ),
+            ),
+        ],
+    )
+    conversation_store.append(
+        source.id,
+        [
+            _user_message("Intervening message", "between"),
+            NewConversationItem(
+                type="compaction",
+                response_id="compacted",
+                data=CompactionData(
+                    summary="Prior context", last_item_id=boundary.id, token_count=3
+                ),
+            ),
+            _user_message("Continue", "latest"),
+        ],
+    )
+    original_items = conversation_store.list_items(source.id).data
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    items = conversation_store.list_items(fork.id).data
+    compaction = next(item for item in items if item.type == "compaction")
+    assert isinstance(compaction.data, CompactionData)
+    fork_boundary = next(item for item in items if item.type == "error")
+    assert compaction.data.last_item_id == fork_boundary.id
+    assert isinstance(fork_boundary.data, ErrorData)
+    assert fork_boundary.data.code == "source_workspace_missing"
+    recent_items = conversation_store.list_items(fork.id, after=compaction.data.last_item_id).data
+    assert [
+        item.data.content[0]["text"] for item in recent_items if isinstance(item.data, MessageData)
+    ] == ["Intervening message", "Continue"]
+    assert conversation_store.list_items(source.id).data == original_items
+
+
 def test_fork_conversation_remaps_file_references(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,
@@ -5536,10 +5940,11 @@ def test_fork_only_dropped_label_keys_match_sandbox_repo_constant() -> None:
     the first relaunch. Importing the real constant here makes that rename
     fail loudly at test time.
     """
-    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
+    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY, REQUESTED_HOST_ID_LABEL_KEY
     from omnigent.stores.conversation_store import _FORK_ONLY_DROPPED_LABEL_KEYS
 
     assert MANAGED_REPO_LABEL_KEY in _FORK_ONLY_DROPPED_LABEL_KEYS
+    assert REQUESTED_HOST_ID_LABEL_KEY in _FORK_ONLY_DROPPED_LABEL_KEYS
 
 
 def test_fork_conversation_copies_reasoning_effort(

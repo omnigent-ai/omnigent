@@ -162,3 +162,45 @@ export function sumPendingApprovals(rows: Conversation[]): number {
   }
   return total;
 }
+
+/** Recency bucket the Inbox lists an item under. */
+export type InboxTimeGroup = "Just now" | "Earlier today" | "Yesterday" | "This week" | "Older";
+
+const JUST_NOW_MS = 5 * 60_000;
+
+/**
+ * Bucket an item's timestamp by recency. Day boundaries are local calendar
+ * days, so "Yesterday" means the previous date, not "24–48 hours ago".
+ *
+ * :param atSeconds: Item timestamp in epoch seconds.
+ * :param now: Reference time (defaults to the current time).
+ */
+export function inboxTimeGroup(atSeconds: number, now: Date = new Date()): InboxTimeGroup {
+  const atMs = atSeconds * 1000;
+  if (now.getTime() - atMs < JUST_NOW_MS) return "Just now";
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  const d = now.getDate();
+  if (atMs >= new Date(y, m, d).getTime()) return "Earlier today";
+  if (atMs >= new Date(y, m, d - 1).getTime()) return "Yesterday";
+  if (atMs >= new Date(y, m, d - 6).getTime()) return "This week";
+  return "Older";
+}
+
+/**
+ * Sort entries newest first and split them into recency groups, in order.
+ * The sort is stable, so equal timestamps keep their input order.
+ */
+export function groupInboxEntries<T extends { at: number }>(
+  entries: T[],
+  now: Date = new Date(),
+): { label: InboxTimeGroup; entries: T[] }[] {
+  const groups: { label: InboxTimeGroup; entries: T[] }[] = [];
+  for (const entry of [...entries].sort((a, b) => b.at - a.at)) {
+    const label = inboxTimeGroup(entry.at, now);
+    const last = groups.at(-1);
+    if (last?.label === label) last.entries.push(entry);
+    else groups.push({ label, entries: [entry] });
+  }
+  return groups;
+}

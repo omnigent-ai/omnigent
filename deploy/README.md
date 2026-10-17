@@ -133,7 +133,7 @@ deploy/
 > **On Databricks?** The fully managed
 > [Omnigent on Databricks](https://docs.databricks.com/aws/en/omnigent/)
 > (Beta) is the recommended path: Databricks operates the server for
-> you, wired to workspace identity, Foundation Models, AI Gateway, and
+> you, wired to workspace identity, Foundation Models, Unity Gateway, and
 > MLflow Tracing. Enable the **Omnigent** preview in your workspace
 > settings. The self-managed Databricks Apps bundle above is for when
 > you need control the managed service does not expose yet.
@@ -253,6 +253,55 @@ OIDC, header-auth proxies, and Databricks-hosted servers (a Databricks App
 or a workspace API path) all work with the same command; for Databricks it
 runs `databricks auth login` against the right workspace for you (requires
 the `databricks` extra).
+
+### OIDC login client upgrades
+
+OIDC ticket login requires PKCE and explicit browser approval. This is a
+breaking change for older CLIs, mobile apps, Slack integrations, and custom
+clients: their next login cannot complete until they are updated. Existing
+sessions and refresh grants keep their normal expiry and revocation behavior.
+Browser-only login and the other authentication modes are unchanged.
+
+An old client's empty login request opens an **Update Omnigent to sign in**
+page. CLI users should run `omni upgrade` and retry their login; mobile users
+should update the app through their normal distribution channel; Slack users
+need their administrator to update the integration. The terminal or Slack
+message may still say the login was rejected because installed old clients
+do not display the server's detailed error text.
+Update the centrally managed Slack bot before the server: its old error modal
+can replace the upgrade link before the user opens it.
+
+The server returns HTTP 200 only to let these clients open the instructions.
+Its `ticket` field is a fixed, non-redeemable notice marker: no login ticket
+or credentials are created, and polling returns terminal HTTP 410. Requests
+containing invalid PKCE data still return HTTP 400. There is no legacy login
+fallback.
+
+Before deploying the server, make client builds containing the PKCE update
+available through your CLI, mobile, and Slack distribution channels, and
+announce that older clients must upgrade to sign in again. Test both an old
+and an updated client against a staging server with your actual identity
+provider. The old client must show the upgrade page without signing in; the
+updated client must complete fresh sign-in and browser approval. Preserve
+PKCE and consent enforcement if rolling back an unrelated deployment issue.
+
+Updated clients send proof in `X-Omnigent-Code-Verifier`; proxies must forward
+this header without logging it. Query-based proof remains supported for API
+compatibility, so do not retain `/auth/cli-poll` query strings either: a ticket
+and verifier together can redeem an approved login. Approval requires a browser
+session authenticated for that specific ticket; ordinary browser sessions,
+runner tokens, and refresh-issued tokens cannot approve it. Existing sessions
+remain valid elsewhere. Generic OIDC ticket flows require fresh IdP authentication
+and a signed ID token with `auth_time` at or after the reauthentication request.
+Verify that your IdP honors `prompt=login` and `max_age=0` and supplies `auth_time`;
+missing or stale claims fail closed. GitHub OAuth may reuse its provider session,
+but still requires ticket-specific browser sign-in and approval.
+Polling responses forbid caching, including successful credential responses.
+CLI and Slack display a comparison code; native mobile apps currently rely
+on explicit browser approval without displaying that code in the app. Include
+the actual native apps in staging checks before publishing a mobile build.
+
+### Register the host
 
 Then register the machine as a host, so sessions created in the web UI can
 run on it:
@@ -419,6 +468,40 @@ overrides this auto-selection.
 > (the deploy default above) can't supply over the runner WebSocket — it returns
 > `403` even though the host connects. Framework-level; applies to every sandbox
 > provider (Modal / Daytona / Islo / Kubernetes / …).
+
+### Ending accounts sessions
+
+An `accounts` session lasts `OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS` (default 8).
+To end one user's sessions sooner, change the password (Account menu → Change
+password) or have an admin reset it (Members → Reset). Either one invalidates
+the browser sessions, CLI logins, refresh tokens, and unused sign-in links
+issued to that user so far. A password change keeps the browser that made it
+signed in.
+
+The user's scheduled tasks and host registrations are kept, but that does not
+mean they keep running. A host that is already connected keeps its connection,
+and still looks online, but launches on it fail, including scheduled runs,
+until it reconnects:
+
+- A host signed in with the user's credentials (`omnigent host` after
+  `omnigent login`) cannot reconnect with them. Run `omnigent login`, then
+  restart the host.
+- A managed host, which the server starts in a sandbox, connects with its own
+  launch token rather than the user's credentials. It needs no login: once it
+  reconnects with that token, before the token expires, launches work again.
+
+CLIs need `omnigent login` too.
+
+Servers running a release without this behaviour keep the user's sessions when
+they change or reset a password. During a rolling upgrade, repeat a change made
+while such instances were still serving.
+
+Rotating `OMNIGENT_ACCOUNTS_COOKIE_SECRET` signs out every user at once: it
+invalidates all session tokens, CLI logins, and refresh tokens. Unused sign-in
+and invite links are looked up by value, not signed with the secret, so they
+keep working until they expire (sign-in links after
+`OMNIGENT_ACCOUNTS_MAGIC_TTL_MINUTES`, default 10; invites after
+`OMNIGENT_ACCOUNTS_INVITE_TTL_HOURS`, default 72).
 
 ### Browser origin allowlist
 

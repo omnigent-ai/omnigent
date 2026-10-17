@@ -55,6 +55,7 @@ from omnigent.harness_aliases import (
     is_native_harness,
     native_terminal_name,
 )
+from omnigent.inner.async_utils import run_sync_cleanup
 from omnigent.inner.executor import ToolCallStatus, classify_tool_result
 from omnigent.models.model_override import (
     harness_supports_model_override,
@@ -63,7 +64,6 @@ from omnigent.models.model_override import (
     validate_model_override,
 )
 from omnigent.native.native_coding_agents import public_agent_name
-from omnigent.runtime import pending_elicitations
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
@@ -314,7 +314,7 @@ _SESSION_RENAME_TITLE_MAX_CHARS: int = SysSessionRenameTool().get_schema()["func
     "parameters"
 ]["properties"]["title"]["maxLength"]
 
-# Grantee sentinel for an anonymous, public read-only share. Mirrors the
+# Grantee sentinel for public link access. Mirrors the
 # server's RESERVED_USER_PUBLIC; only specs with
 # ``agent_session_sharing: public`` may grant it (enforced in
 # _session_share_via_rest — the server can't see the agent's sharing
@@ -5135,7 +5135,7 @@ async def _session_share_via_rest(
     Same channel and security posture as the other session REST tools:
     the server enforces that ``server_client``'s identity holds
     manage-level access on the target (the session owner does), and caps
-    public (``__public__``) grants at read.
+    public (``__public__``) grants at the configured ceiling (read by default).
 
     The spec's ``agent_session_sharing:`` policy is enforced HERE, in the
     runner, because the server cannot see it: an ``agent_session_sharing:
@@ -6275,6 +6275,9 @@ async def _session_get_history_via_rest(
         for it in reversed(data)
     ]
     meta = await _fetch_peek_meta(target_id, server_client)
+    # Load the server's pending-index helpers only when a history tool needs them.
+    from omnigent.runtime import pending_elicitations
+
     # A parked elicitation never lands in the conversation store (it
     # lives only in the Omnigent server's pending-elicitations index, replayed
     # on the snapshot), so append the snapshot's outstanding prompts
@@ -7053,6 +7056,7 @@ def _clone_os_env_spec(spec: OSEnvSpec) -> OSEnvSpec:
                 list(sandbox.env_passthrough) if sandbox.env_passthrough is not None else None
             ),
             egress_rules=list(sandbox.egress_rules) if sandbox.egress_rules is not None else None,
+            git_ssh=list(sandbox.git_ssh) if sandbox.git_ssh is not None else None,
         )
     return dataclasses.replace(spec, sandbox=sandbox_copy)
 
@@ -7278,7 +7282,11 @@ async def _execute_os_env_tool(
         return json_dumps_transport_safe({"error": str(exc)})
     finally:
         if os_env is not None and owns_environment:
-            os_env.close()
+            await run_sync_cleanup(
+                os_env.close,
+                component="runner_os_env_tool",
+                session_id=conversation_id,
+            )
 
     return json_dumps_transport_safe(result)
 

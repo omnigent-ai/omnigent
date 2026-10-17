@@ -41,6 +41,17 @@ from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.errors import HarnessTransportClosedError
+from omnigent.harnesses.codex_egress import (
+    CERTIFICATE_FAILURE_CODE,
+    CERTIFICATE_FAILURE_TITLE,
+    CERTIFICATE_REMEDIATION,
+    CertificateFailure,
+    certificate_failure_message,
+    connection_retry_detail,
+    detect_certificate_failure,
+    is_connection_failure_text,
+    is_connection_retry,
+)
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.models import model_catalog
@@ -109,7 +120,7 @@ logger = logging.getLogger(__name__)
 # Default auth-token refresh cadence (ms) for the vendor-neutral gateway
 # transport when ``HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTERVAL_MS`` is unset.
 # Not Databricks-specific: the same fallback applies to any gateway producer
-# (Databricks AI gateway or a generic key/gateway provider).
+# (Databricks Unity Gateway or a generic key/gateway provider).
 _GATEWAY_AUTH_REFRESH_MS = 900_000
 _GATEWAY_AUTH_TIMEOUT_MS = 15_000
 
@@ -269,6 +280,16 @@ def _parse_codex_gateway_error(line: str) -> _CodexGatewayError | None:
     url_match = _CODEX_STDERR_URL_RE.search(line)
     url = url_match.group("url").rstrip(",") if url_match else None
     return _CodexGatewayError(code, reason, url)
+
+
+def _codex_turn_status(turn: object) -> str | None:
+    """Return a Codex turn object's status, e.g. ``"completed"`` or ``"interrupted"``."""
+    if not isinstance(turn, dict):
+        return None
+    status = turn.get("status")
+    if isinstance(status, dict):
+        status = status.get("type") or status.get("status")
+    return status if isinstance(status, str) else None
 
 
 def _extract_codex_last_turn_usage(params: object, model: str | None) -> dict[str, object] | None:
@@ -611,21 +632,30 @@ async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
 
 
-_BROKERED_CODEX_VERSION = Version("0.146.0")
+_BROKERED_CODEX_MIN_VERSION = Version("0.146.0")
 
 
 async def _require_brokered_codex_version(codex_path: str) -> None:
-    """Fail closed unless Codex uses the wire version tested for brokered auth."""
+    """Fail closed unless Codex is a stable release at or above the brokered-auth floor.
+
+    The signer rebuilds every request strictly, so a newer Codex that sends an
+    unexpected request fails its turn rather than reaching the model.
+    """
     raw = await _codex_cli_version_text(codex_path)
     try:
         version = Version(raw) if raw is not None else None
     except InvalidVersion:
         version = None
-    if version != _BROKERED_CODEX_VERSION:
+    if (
+        version is None
+        or version.is_prerelease
+        or version.is_postrelease
+        or version < _BROKERED_CODEX_MIN_VERSION
+    ):
         shown = raw or "unparseable"
         raise RuntimeError(
             "unsupported Codex wire version "
-            f"{shown}; brokered authentication requires exactly 0.146.0"
+            f"{shown}; brokered authentication requires a stable Codex 0.146.0 or newer"
         )
 
 
@@ -2122,7 +2152,7 @@ def _normalize_copied_codex_effort(
 
 
 def _databricks_codex_base_url(host: str) -> str:
-    """Return the Unity AI Gateway Codex Responses base URL for *host*."""
+    """Return the Unity Gateway Codex Responses base URL for *host*."""
     return f"{host.rstrip('/')}/ai-gateway/codex/v1"
 
 
@@ -2774,12 +2804,10 @@ class _CodexAppServerSession:
         self._loop: asyncio.AbstractEventLoop | None = None
         self.thread_id: str | None = None
         self.active_turn_id: str | None = None
-        # Last reasoning effort applied via ``thread/settings/update`` on the
-        # current thread. Effort is not part of the executor's session
-        # signature, so a change must be re-applied per turn; this is reset on
-        # a fresh thread so it is re-sent. ``turn/start`` carries no ``effort``
-        # field (it is silently dropped), hence the separate settings update.
+        # Last requested override on this thread; None means its original default.
         self._applied_effort: str | None = None
+        self._default_effort: str | None = None
+        self._thread_model: str | None = None
         self._recent_stderr: list[str] = []
         # Auth-class gateway rejection tracking, read off the CLI's stderr so a
         # turn that emits no events fails fast with the real cause instead of
@@ -2791,6 +2819,12 @@ class _CodexAppServerSession:
         self._pending_fatal_gateway_error: _CodexGatewayError | None = None
         self._saw_retries_exhausted = False
         self._fatal_gateway_error: _CodexGatewayError | None = None
+        # A TLS certificate failure the codex launcher printed to stderr. The
+        # launcher prints it once at start, so it stays until a turn reaches
+        # the model and proves the egress works.
+        self._certificate_failure: CertificateFailure | None = None
+        # Whether this turn saw Codex retry a request that got no HTTP response.
+        self._saw_connection_retry = False
         self._recent_events: list[CodexMessage] = []
         self._process_cwd: Path | None = None
         self._worker_launch: CodexWorkerLaunch | None = None
@@ -3529,6 +3563,35 @@ class _CodexAppServerSession:
             if phase == "final_answer":
                 return final_response
 
+    async def _resolve_default_effort(self) -> str:
+        """Resolve the thread's original configured or model-default effort."""
+        if self._default_effort is not None:
+            return self._default_effort
+        # Null is a no-op for both settings/update and legacy turn/start.
+        # Resolve an explicit value without replacing the thread or its history.
+        if self._thread_model is not None:
+            params: CodexParams = {"includeHidden": True}
+            seen_cursors: set[str] = set()
+            while True:
+                response = await self._request("model/list", params.copy())
+                result = response.get("result", {})
+                for entry in result.get("data", []):
+                    if entry.get("model") == self._thread_model:
+                        effort = entry.get("defaultReasoningEffort")
+                        if isinstance(effort, str) and effort:
+                            self._default_effort = effort
+                            return effort
+                cursor = result.get("nextCursor")
+                if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+                    break
+                seen_cursors.add(cursor)
+                params["cursor"] = cursor
+        raise RuntimeError(
+            f"Cannot restore Codex default reasoning effort for {self._thread_model!r}: "
+            "the app-server did not provide a default. Select an explicit effort or "
+            "start a new session."
+        )
+
     async def run_turn(
         self,
         *,
@@ -3553,6 +3616,7 @@ class _CodexAppServerSession:
         self._pending_fatal_gateway_error = None
         self._saw_retries_exhausted = False
         self._fatal_gateway_error = None
+        self._saw_connection_retry = False
         native_forwarder_health.note_post_success()
 
         is_new_thread = self.thread_id is None
@@ -3589,6 +3653,14 @@ class _CodexAppServerSession:
             # Fresh thread: forget the prior thread's applied effort so the
             # settings update below re-sends it for this thread.
             self._applied_effort = None
+            raw_default_effort = response.get("result", {}).get("reasoningEffort")
+            self._default_effort = (
+                raw_default_effort
+                if isinstance(raw_default_effort, str) and raw_default_effort
+                else None
+            )
+            raw_model = response.get("result", {}).get("model")
+            self._thread_model = raw_model if isinstance(raw_model, str) and raw_model else model
             # Fresh thread: cumulative usage counters restart at zero.
             self._thread_usage_total_raw = None
             self._thread_usage_baseline_raw = None
@@ -3631,13 +3703,16 @@ class _CodexAppServerSession:
         # Prefer the persistent thread setting and fall back only for that
         # explicit protocol-version mismatch.
         effort_via_turn_start = False
-        if reasoning_effort and reasoning_effort != self._applied_effort:
+        effort = reasoning_effort
+        if reasoning_effort != self._applied_effort:
+            if effort is None:
+                effort = await self._resolve_default_effort()
             try:
                 await self._request(
                     "thread/settings/update",
                     {
                         "threadId": self.thread_id,
-                        "effort": reasoning_effort,
+                        "effort": effort,
                         "summary": "detailed",
                     },
                 )
@@ -3660,7 +3735,7 @@ class _CodexAppServerSession:
             "input": turn_input,
         }
         if effort_via_turn_start:
-            turn_params["effort"] = reasoning_effort
+            turn_params["effort"] = effort
             turn_params["summary"] = "detailed"
         start_response = await self._request(
             "turn/start",
@@ -3804,10 +3879,7 @@ class _CodexAppServerSession:
                     event_task.cancel()
                     with suppress(BaseException):
                         await event_task
-                    try:
-                        await asyncio.wait_for(self.interrupt_turn(), timeout=0.5)
-                    except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
-                        logger.debug("Codex auth-failure turn interrupt failed: %s", exc)
+                    await self._interrupt_failed_turn("auth-failure")
                     if (
                         fatal_gateway_error.code == 401
                         and self._provider_auth_authority is not None
@@ -4035,6 +4107,10 @@ class _CodexAppServerSession:
                             active_turn_id,
                         )
                         continue
+                    if _codex_turn_status(turn) in (None, "completed"):
+                        # The model answered, so a certificate failure printed at
+                        # launch no longer describes this process's egress.
+                        self._certificate_failure = None
                     if not final_response:
                         final_response = _latest_buffered_agent_message(message_buffers)
                     if not final_response:
@@ -4065,6 +4141,13 @@ class _CodexAppServerSession:
                         or turn.get("error")
                         or "Codex App Server turn failed"
                     )
+                    # Only a connection-level failure is the certificate's doing;
+                    # a tool or provider error keeps its own retryable text.
+                    if self._certificate_failure is not None and (
+                        self._saw_connection_retry or is_connection_failure_text(error_text)
+                    ):
+                        yield self._certificate_error(model, codex_error=error_text)
+                        return
                     # turn/failed is a provider/runtime-level turn error
                     # (e.g. tool exit code, transient provider issue) —
                     # mark retryable so the workflow's retry policy
@@ -4074,6 +4157,18 @@ class _CodexAppServerSession:
 
                 if method == "error":
                     if isinstance(params, dict) and params.get("willRetry") is True:
+                        if is_connection_retry(params):
+                            # Codex retries a connection failure indefinitely:
+                            # name it for the idle watchdog, and fail fast once
+                            # the launcher has already reported the certificate.
+                            self._saw_connection_retry = True
+                            native_forwarder_health.record_transport_failure(
+                                connection_retry_detail(params)
+                            )
+                            if self._certificate_failure is not None:
+                                await self._interrupt_failed_turn("certificate-failure")
+                                yield self._certificate_error(model)
+                                return
                         continue
                     # JSON-RPC-shaped error frames from the app server
                     # carry ``code`` / ``message`` / ``data``. Some error
@@ -4138,6 +4233,28 @@ class _CodexAppServerSession:
             },
         )
         return True
+
+    async def _interrupt_failed_turn(self, cause: str) -> None:
+        """Best-effort interrupt of a turn the head is about to fail on *cause*."""
+        try:
+            await asyncio.wait_for(self.interrupt_turn(), timeout=0.5)
+        except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
+            logger.debug("Codex %s turn interrupt failed: %s", cause, exc)
+
+    def _certificate_error(
+        self, model: str | None, *, codex_error: str | None = None
+    ) -> ExecutorError:
+        """The terminal error for a turn blocked by the launcher-reported certificate failure."""
+        assert self._certificate_failure is not None
+        return ExecutorError(
+            message=certificate_failure_message(
+                self._certificate_failure, model=model, codex_error=codex_error
+            ),
+            retryable=False,
+            code=CERTIFICATE_FAILURE_CODE,
+            title=CERTIFICATE_FAILURE_TITLE,
+            remediation=CERTIFICATE_REMEDIATION,
+        )
 
     async def _execute_dynamic_tool(
         self,
@@ -4329,7 +4446,17 @@ class _CodexAppServerSession:
         its own retry budget (a final ``Reconnecting N/N``); the two signals can
         arrive in either order, so both are tracked and fast-fail arms when both
         hold — a single blip the CLI recovers from never kills a healthy turn.
+
+        A TLS certificate failure printed by the codex launcher is kept
+        separately; it arms fast-fail once Codex reports a connection retry.
         """
+        if self._certificate_failure is None:
+            failure = detect_certificate_failure(text)
+            if failure is not None:
+                self._certificate_failure = failure
+                logger.warning(
+                    "codex launcher reported a TLS certificate failure: %s", failure.evidence
+                )
         retry = _CODEX_STDERR_RETRY_EXHAUSTED_RE.search(text)
         if retry is not None and retry.group("n") == retry.group("total"):
             self._saw_retries_exhausted = True

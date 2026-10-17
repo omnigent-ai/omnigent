@@ -42,6 +42,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -305,6 +306,34 @@ async def _drain_failed_status_event(
         if not drained:
             await asyncio.sleep(0.02)
     return None
+
+
+async def _drain_turn_events(
+    queues: dict[str, Any],
+    conv: str,
+    *,
+    until_status: str,
+    timeout: float,
+) -> list[dict[str, Any]]:
+    """Collect all runner events through one terminal session status."""
+    events: list[dict[str, Any]] = []
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        queue = queues.get(conv)
+        drained = False
+        while queue is not None and not queue.empty():
+            event = queue.get_nowait()
+            drained = True
+            if isinstance(event, dict):
+                events.append(event)
+        if any(
+            event.get("type") == "session.status" and event.get("status") == until_status
+            for event in events
+        ):
+            return events
+        if not drained:
+            await asyncio.sleep(0.02)
+    return events
 
 
 class _FakeHarnessClient:
@@ -2291,6 +2320,7 @@ async def test_runner_failed_status_carries_setup_error_message(
     from omnigent.errors import ErrorCode, OmnigentError
 
     conv = "conv_failed_status_carries_error"
+    stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
     raised_message = "No model resolved for the 'claude-sdk' harness on a generic provider."
 
     async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
@@ -2345,16 +2375,29 @@ async def test_runner_failed_status_carries_setup_error_message(
                 "agent_id": "ag_claude_sdk",
                 "model": "x",
                 "content": [{"role": "user", "content": "hi"}],
+                "stable_id": stable_id,
+                "input_stable_id": stable_id,
             },
         )
         assert response.status_code == 202
         # Await the background turn task (main's helper) before draining, then
         # read the runner's per-session queue via the ``app.state`` test seam.
         await _await_bg_turn_task(conv)
-        failed_event = await _drain_failed_status_event(
-            app.state.session_event_queues, conv, timeout=2.0
+        events = await _drain_turn_events(
+            app.state.session_event_queues,
+            conv,
+            until_status="failed",
+            timeout=2.0,
         )
 
+    failed_event = next(
+        event
+        for event in events
+        if event.get("type") == "session.status" and event.get("status") == "failed"
+    )
+    [undelivered] = [event for event in events if event.get("type") == "response.failed"]
+    assert undelivered["input_stable_id"] == stable_id
+    assert undelivered["response"]["error"]["undelivered"] is True
     # The failed event must carry the real setup error message — not a
     # bare status. Without the fix ``error`` is absent and the REPL
     # renders nothing.
@@ -2621,6 +2664,71 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
         shell_result = json.loads(shell)
         assert shell_result["exit_code"] == 0
         assert Path(shell_result["stdout"].strip()).resolve() == root.resolve()
+
+
+@pytest.mark.asyncio
+async def test_runner_os_env_cleanup_is_off_loop_and_cancellation_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Owned OS-tool cleanup keeps the runner loop live before cancellation."""
+    import omnigent.inner.os_env as os_env_module
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    close_started = threading.Event()
+    release_close = threading.Event()
+    close_finished = threading.Event()
+    heartbeat_ran_while_blocked = asyncio.Event()
+
+    class _BlockingEnvironment:
+        async def read(self, **kwargs: object) -> dict[str, str]:
+            del kwargs
+            return {"content": "ok"}
+
+        def close(self) -> None:
+            close_started.set()
+            assert release_close.wait(timeout=2.0)
+            close_finished.set()
+
+    monkeypatch.setattr(
+        os_env_module, "create_os_environment", lambda *args, **kwargs: _BlockingEnvironment()
+    )
+
+    async def heartbeat() -> None:
+        while not close_finished.is_set():
+            if close_started.is_set():
+                heartbeat_ran_while_blocked.set()
+                return
+            await asyncio.sleep(0.01)
+
+    heartbeat_task: asyncio.Task[None] | None = None
+    tool_task: asyncio.Task[str] | None = None
+    watchdog = threading.Thread(
+        target=lambda: (release_close.wait(timeout=2.0), release_close.set()),
+        name="test-os-env-watchdog",
+        daemon=True,
+    )
+    watchdog.start()
+    try:
+        heartbeat_task = asyncio.create_task(heartbeat())
+        tool_task = asyncio.create_task(_execute_os_env_tool("sys_os_read", {"path": "x"}))
+        await asyncio.wait_for(heartbeat_ran_while_blocked.wait(), timeout=1.0)
+        tool_task.cancel()
+        await asyncio.sleep(0)
+        tool_task.cancel()
+        release_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await tool_task
+    finally:
+        release_close.set()
+        if tool_task is not None and not tool_task.done():
+            tool_task.cancel()
+        if heartbeat_task is not None and not heartbeat_task.done():
+            heartbeat_task.cancel()
+        await asyncio.gather(tool_task, heartbeat_task, return_exceptions=True)
+        watchdog.join(timeout=1.0)
+
+    assert close_finished.is_set()
+    assert heartbeat_ran_while_blocked.is_set()
 
 
 @pytest.mark.asyncio
@@ -3324,6 +3432,35 @@ async def test_runner_read_inbox_continues_after_malformed_terminal_idle_item() 
     assert "terminal-idle inbox payload requires non-empty string session" in inbox_output
     assert "task handle_after completed" in inbox_output
     assert "sys_os_shell returned: after" in inbox_output
+    assert session_inbox.empty()
+
+
+@pytest.mark.asyncio
+async def test_runner_read_inbox_formats_valid_terminal_idle_item() -> None:
+    """A valid terminal-idle payload becomes a user-visible inbox notice."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    session_inbox.put_nowait(
+        {
+            "type": "terminal_idle",
+            "source": "bash",
+            "session": "main",
+            "content": {
+                "status": "idle",
+                "terminal": "bash",
+                "session": "main",
+            },
+        }
+    )
+
+    inbox_output = await execute_tool(
+        tool_name="sys_read_inbox",
+        arguments="{}",
+        session_inbox=session_inbox,
+    )
+
+    assert inbox_output == "[System: inbox item terminal_idle — terminal bash:main is idle]"
     assert session_inbox.empty()
 
 
@@ -6827,6 +6964,209 @@ async def test_session_peek_returns_chronological_projected_items() -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_session_peek_rest_projects_tool_calls_and_unknown_items() -> None:
+    """REST history preserves tool-call/result items and unknown item types."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target/items":
+            # The API returns newest-first; the tool must reverse this order.
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {"id": "i3", "type": "response.error", "message": "ignored"},
+                        {
+                            "id": "i2",
+                            "type": "function_call_output",
+                            "output": {"matches": 2},
+                        },
+                        {
+                            "id": "i1",
+                            "type": "function_call",
+                            "name": "search",
+                            "arguments": '{"query":"auth"}',
+                        },
+                    ],
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "title": "researcher:auth"})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_history",
+                json.dumps({"conversation_id": "conv_target", "tail_items": 3}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+
+    assert out["items"] == [
+        {
+            "type": "function_call",
+            "tool": "search",
+            "args": '{"query":"auth"}',
+        },
+        {"type": "function_call_output", "output": '{"matches": 2}'},
+        {"type": "response.error"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_session_peek_rest_handles_empty_and_mixed_message_content() -> None:
+    """REST history ignores non-text blocks and renders empty content safely."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target/items":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "i2",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {"type": "output_text", "text": "first"},
+                                {"type": "input_image", "detail": "low"},
+                                {"type": "output_text", "text": "second"},
+                            ],
+                        },
+                        {
+                            "id": "i1",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": None,
+                        },
+                    ],
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "title": "researcher:auth"})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_history",
+                json.dumps({"conversation_id": "conv_target", "tail_items": 2}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+
+    assert out["items"] == [
+        {"type": "message", "role": "assistant", "text": ""},
+        {"type": "message", "role": "assistant", "text": "first second"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_session_peek_rest_truncates_tool_call_and_result_windows() -> None:
+    """REST history applies offset/truncation to tool arguments and results."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/conv_target/items":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "i2",
+                            "type": "function_call_output",
+                            "output": "0123456789abcdef",
+                        },
+                        {
+                            "id": "i1",
+                            "type": "function_call",
+                            "name": "search",
+                            "arguments": "abcdefghijklmno",
+                        },
+                    ],
+                },
+            )
+        if request.url.path == "/v1/sessions/conv_target":
+            return httpx.Response(200, json={"id": "conv_target", "title": "researcher:auth"})
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_history",
+                json.dumps(
+                    {
+                        "conversation_id": "conv_target",
+                        "tail_items": 2,
+                        "content_max_chars": 5,
+                        "content_offset_chars": 3,
+                    }
+                ),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+
+    assert out["items"] == [
+        {
+            "type": "function_call",
+            "tool": "search",
+            "args": "defgh [truncated]",
+        },
+        {
+            "type": "function_call_output",
+            "output": "34567 [truncated]",
+        },
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response_or_error", "expected_fragment"),
+    [
+        pytest.param(httpx.Response(500), "sys_session_get_history returned 500", id="500"),
+        pytest.param(
+            httpx.ReadError("connection reset"),
+            "sys_session_get_history failed: connection reset",
+            id="transport-error",
+        ),
+    ],
+)
+async def test_session_peek_rest_maps_server_and_transport_failures(
+    response_or_error: httpx.Response | Exception,
+    expected_fragment: str,
+) -> None:
+    """History failures become structured tool errors instead of escaping."""
+    from omnigent.runner.tool_dispatch import _execute_session_query_tool
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/v1/sessions/conv_target/items"
+        if isinstance(response_or_error, Exception):
+            raise response_or_error
+        return response_or_error
+
+    async with _session_query_client(handler) as client:
+        out = json.loads(
+            await _execute_session_query_tool(
+                "sys_session_get_history",
+                json.dumps({"conversation_id": "conv_target"}),
+                conversation_id="conv_caller",
+                server_client=client,
+            )
+        )
+
+    assert expected_fragment in out["error"]
+
+
 _REST_HISTORY_CONTENT_SCENARIOS = [
     pytest.param(3000, 4000, "R" * 3000, id="raised-limit"),
     pytest.param(3000, None, "R" * 2000 + " [truncated]", id="default-limit"),
@@ -8539,7 +8879,8 @@ async def test_sys_session_share_non_public_rejects_public_grant() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sys_session_share_public_allows_public_grant() -> None:
+@pytest.mark.parametrize("level,number", [("read", 1), ("edit", 2)])
+async def test_sys_session_share_public_allows_public_grant(level: str, number: int) -> None:
     """
     Under ``agent_session_sharing: public`` a ``__public__`` read grant
     passes the runner gate and PUTs to the permissions endpoint — the
@@ -8555,7 +8896,7 @@ async def test_sys_session_share_public_allows_public_grant() -> None:
         requests.append((request.method, request.url.path, json.loads(request.content)))
         return httpx.Response(
             200,
-            json={"user_id": "__public__", "conversation_id": "conv_caller", "level": 1},
+            json={"user_id": "__public__", "conversation_id": "conv_caller", "level": number},
         )
 
     async with httpx.AsyncClient(
@@ -8564,7 +8905,7 @@ async def test_sys_session_share_public_allows_public_grant() -> None:
     ) as server_client:
         output = await execute_tool(
             tool_name="sys_session_share",
-            arguments=json.dumps({"user_id": "__public__"}),
+            arguments=json.dumps({"user_id": "__public__", "level": level}),
             server_client=server_client,
             conversation_id="conv_caller",
             agent_spec=AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.PUBLIC),
@@ -8572,14 +8913,14 @@ async def test_sys_session_share_public_allows_public_grant() -> None:
 
     # __public__ reached the server as a level-1 (read) grant on the caller.
     assert requests == [
-        ("PUT", "/v1/sessions/conv_caller/permissions", {"user_id": "__public__", "level": 1})
+        ("PUT", "/v1/sessions/conv_caller/permissions", {"user_id": "__public__", "level": number})
     ]
     result = json.loads(output)
     assert result == {
         "shared": True,
         "session_id": "conv_caller",
         "user_id": "__public__",
-        "level": "read",
+        "level": level,
     }
 
 
@@ -9067,6 +9408,50 @@ def test_format_async_task_item_truncated_generic_task_keeps_plain_marker() -> N
     )
     assert "...[truncated 500 chars]" in line
     assert "sys_session_get_history" not in line
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "subagent_args",
+    [
+        pytest.param(None, id="missing-args"),
+        pytest.param({}, id="empty-object"),
+        pytest.param({"input": 42}, id="non-string-input"),
+    ],
+)
+async def test_sys_session_send_rejects_malformed_message_before_server_call(
+    subagent_args: object,
+) -> None:
+    """Malformed message payloads fail before routing or child creation."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests_seen = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests_seen
+        requests_seen += 1
+        return httpx.Response(500, json={"error": str(request.url)})
+
+    session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    async with _session_query_client(handler) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_send",
+            arguments=json.dumps(
+                {
+                    "agent": "worker",
+                    "title": "malformed",
+                    "args": subagent_args,
+                }
+            ),
+            server_client=server_client,
+            conversation_id="conv_parent_malformed",
+            agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="worker")]),
+            session_inbox=session_inbox,
+        )
+
+    assert output == "Error: sys_session_send requires non-empty args string or args.input string"
+    assert requests_seen == 0
+    assert session_inbox.empty()
 
 
 @pytest.mark.asyncio
@@ -10491,6 +10876,59 @@ async def test_on_proxy_stream_end_spares_superseded_response() -> None:
         app.state.active_turns.pop(conv, None)
 
 
+@pytest.mark.parametrize("replacement", ["none", "task", "stream", "finished"])
+@pytest.mark.asyncio
+async def test_interrupt_cleanup_is_scoped_to_turn_generation(replacement: str) -> None:
+    """An old cancellation cannot consume the replacement's interrupt marker."""
+    conv = "conv_cancel_generation"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    started = asyncio.Event()
+    successor = asyncio.create_task(asyncio.Event().wait())
+
+    async def old_turn() -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            app.state.active_turns.pop(conv, None)
+            if replacement != "none":
+                app.state.begin_turn_slot(conv)
+                if replacement == "task":
+                    app.state.active_turns[conv] = successor
+                elif replacement == "finished":
+                    app.state.active_turns.pop(conv, None)
+                # A second interrupt belongs to this newly bound generation.
+                app.state.interrupted_sessions.add(conv)
+
+    target = asyncio.create_task(old_turn())
+    await started.wait()
+    app.state.begin_turn_slot(conv)
+    app.state.active_turns[conv] = target
+    try:
+        async with _recovery_runner_client(app) as http:
+            response = await http.post(f"/v1/sessions/{conv}/events", json={"type": "interrupt"})
+            assert response.status_code == 204, response.text
+
+        assert target.cancelled()
+        assert (conv in app.state.interrupted_sessions) is (replacement != "none")
+        if replacement == "task":
+            assert app.state.active_turns[conv] is successor
+        elif replacement == "stream":
+            assert conv in app.state.active_turns and app.state.active_turns[conv] is None
+        else:
+            assert conv not in app.state.active_turns
+    finally:
+        for task in (target, successor):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        app.state.active_turns.pop(conv, None)
+
+
 @pytest.mark.asyncio
 async def test_resync_ownership_gate_ignores_superseded_delivery_failure() -> None:
     """BLOCKING-2: a delayed verdict-delivery failure must not cancel a newer turn."""
@@ -10522,6 +10960,65 @@ async def test_resync_ownership_gate_ignores_superseded_delivery_failure() -> No
             and ev["error"].get("code") == "runner_turn_context_desync"
         ), ev
     app.state.active_turns.pop(conv, None)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("replaced", [False, True])
+@pytest.mark.asyncio
+async def test_interrupt_client_lookup_preserves_turn_ownership(
+    stream: bool, replaced: bool
+) -> None:
+    """A delayed harness lookup must not send the old interrupt to new work."""
+    conv = "conv_interrupt_lookup_owner"
+    original = asyncio.create_task(asyncio.Event().wait())
+    successor = asyncio.create_task(asyncio.Event().wait())
+
+    class InterruptClient(_RecoveryScriptedHarnessClient):
+        async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+            if json.get("type") == "interrupt":
+                task = app.state.active_turns.get(conv)
+                if isinstance(task, asyncio.Task):
+                    task.cancel()
+                else:
+                    app.state.on_proxy_stream_end(conv)
+            return await super().post(url, json=json, timeout=timeout)
+
+    class DelayedProcessManager(_RecoveryFakeProcessManager):
+        async def get_client(
+            self, conversation_id: str, harness: str, env: Any = None
+        ) -> _RecoveryScriptedHarnessClient:
+            if replaced:
+                app.state.on_proxy_stream_end(conv)
+                app.state.begin_turn_slot(conv)
+                app.state.active_turns[conv] = successor
+            return await super().get_client(conversation_id, harness, env)
+
+    harness = InterruptClient([])
+    app = create_runner_app(
+        process_manager=DelayedProcessManager(harness),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.begin_turn_slot(conv)
+    if not stream:
+        app.state.active_turns[conv] = original
+    try:
+        async with _recovery_runner_client(app) as http:
+            response = await http.post(f"/v1/sessions/{conv}/events", json={"type": "interrupt"})
+            assert response.status_code == 204, response.text
+
+        assert successor.cancelling() == 0
+        if replaced:
+            assert app.state.active_turns.get(conv) is successor
+            assert harness.patched_events == []
+        else:
+            assert harness.patched_events == [{"type": "interrupt"}]
+            assert conv not in app.state.active_turns
+    finally:
+        for task in (original, successor):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        app.state.active_turns.pop(conv, None)
 
 
 @pytest.mark.asyncio
@@ -12665,11 +13162,16 @@ _SIGNED_IN_SCREENS = {
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("harness", ["codex-native", "claude-native"])
+@pytest.mark.parametrize(
+    ("harness", "rotated"),
+    [("codex-native", False), ("codex-native", True), ("claude-native", False)],
+    ids=["codex-native", "codex-native-rotated", "claude-native"],
+)
 async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     harness: str,
+    rotated: bool,
 ) -> None:
     """
     A turn that failed on a pending Databricks sign-in is followed by one "signed in" notice.
@@ -12678,15 +13180,21 @@ async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
     prompt is on screen nothing is posted. Once the prompt is gone and the
     agent can take a message (Codex has published its bridge state, Claude Code
     shows its composer), one neutral notice lands in the transcript so the
-    person knows the sign-in worked and can resend.
+    person knows the sign-in worked and can resend. A rotated Codex session's
+    launch publishes its state in its bridge-id label's directory.
     """
     from omnigent.harnesses.codex_native import bridge as codex_bridge
+    from omnigent.runner.native import orchestration as native_orchestration
     from omnigent.terminals import TerminalRegistry
     from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
     conv = f"conv_signin_{harness.replace('-', '_')}"
     monkeypatch.setattr(sign_in_watch, "_SIGN_IN_WATCH_INTERVAL_S", 0.01)
     monkeypatch.setattr(codex_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    bridge_dir = codex_bridge.bridge_dir_for_bridge_id(conv)
+    if rotated:
+        bridge_dir = codex_bridge.bridge_dir_for_bridge_id("conv_signin_rotated_from")
+        monkeypatch.setitem(native_orchestration._AUTO_CODEX_BRIDGE_DIRS, conv, bridge_dir)
 
     class _RecordingServerClient(NullServerClient):
         def __init__(self) -> None:
@@ -12707,7 +13215,7 @@ async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
         if harness == "codex-native":
             # Thread discovery publishes the bridge state as the TUI starts a thread.
             codex_bridge.write_bridge_state(
-                codex_bridge.bridge_dir_for_bridge_id(conv),
+                bridge_dir,
                 codex_bridge.CodexNativeBridgeState(
                     session_id=conv,
                     socket_path="ws://127.0.0.1:1",
@@ -12837,3 +13345,182 @@ async def test_failed_turn_event_names_the_web_message_it_carried() -> None:
     failed = [e for e in published if e.get("type") == "response.failed"]
     assert failed, "response.failed was not published"
     assert failed[0]["input_stable_id"] == "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+
+
+@pytest.mark.asyncio
+async def test_turn_lifecycle_events_name_the_web_message_they_settle() -> None:
+    conv = "conv_stable_id_on_lifecycle"
+    stable_id = "8a4b0d2f6c3e5a7b9d1f2e3c4b5a6d7e"
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="stable-id-agent",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+        )
+
+    frames = [
+        "event: response.in_progress\n"
+        'data: {"type":"response.in_progress","response":{"id":"resp_lifecycle"}}\n\n',
+        "event: response.completed\n"
+        'data: {"type":"response.completed","response":{"id":"resp_lifecycle"}}\n\n',
+    ]
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _FakeProcessManager(_FakeHarnessClient(frames)),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            f"/v1/sessions/{conv}/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_stable",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+                "stable_id": stable_id,
+            },
+        )
+        assert response.status_code == 200
+        direct_frames = response.text.strip().split("\n\n")
+        assert [frame.splitlines()[0] for frame in direct_frames] == [
+            "event: response.in_progress",
+            "event: response.completed",
+        ]
+        assert [
+            json.loads(next(line[5:] for line in frame.splitlines() if line.startswith("data:")))[
+                "input_stable_id"
+            ]
+            for frame in direct_frames
+        ] == [stable_id, stable_id]
+        events = await _drain_turn_events(
+            app.state.session_event_queues,
+            conv,
+            until_status="idle",
+            timeout=2.0,
+        )
+
+    lifecycle = [
+        event
+        for event in events
+        if event.get("type") in {"response.in_progress", "response.completed"}
+    ]
+    assert [event["input_stable_id"] for event in lifecycle] == [stable_id, stable_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True])
+async def test_shared_agent_selections_are_isolated_and_revision_recovers_missed_reset(
+    monkeypatch, stream
+):
+    from omnigent.mcp_selection import mcp_selection_revision
+    from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
+    from omnigent.spec.types import MCPServerConfig
+
+    services = {"first": "tracker", "second": "other"}
+    resolved = []
+    resolve_counts = []
+    schemas_seen = []
+
+    async def resolver(agent_id, session_id):
+        resolved.append(session_id)
+        return AgentSpec(
+            spec_version=1,
+            name="shared",
+            instructions=f"Selected {services[session_id]}.",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "hermes"}),
+            mcp_servers=[MCPServerConfig(name=services[session_id], transport="registry")],
+        )
+
+    async def schemas(self, spec):
+        schemas_seen.append([s.name for s in spec.mcp_servers])
+        return SimpleNamespace(schemas=[], tool_names=set(), failures={})
+
+    class SnapshotClient(NullServerClient):
+        async def get(self, url, **kwargs):
+            if url.endswith(("/v1/sessions/first", "/v1/sessions/second")):
+                return httpx.Response(200, json={"agent_id": "ag_shared"})
+            return await super().get(url, **kwargs)
+
+    monkeypatch.setattr(ProxyMcpManager, "schemas_for", schemas)
+    recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording)),
+        spec_resolver=resolver,
+        server_client=SnapshotClient(),
+    )
+    async with _runner_test_client(app) as http:
+        for sid, service in [
+            ("first", "tracker"),
+            ("second", "other"),
+            ("first", "tracker"),
+            ("first", "updated"),
+            ("second", "other"),
+        ]:
+            services[sid] = service
+            schemas_seen.clear()
+            revision = mcp_selection_revision(
+                "ag_shared/source", {f"omnigent.mcp_service.{service}": "1"}
+            )
+            response = await http.post(
+                f"/v1/sessions/{sid}/events?stream={str(stream).lower()}",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_shared",
+                    "harness": "hermes",
+                    "agent_revision": revision,
+                    "has_mcp_servers": True,
+                    "content": [],
+                },
+            )
+            assert response.status_code == (200 if stream else 202), response.text
+            if not stream:
+                await _await_bg_turn_task(sid)
+            assert f"Selected {service}." in recording.posted_bodies[-1]["instructions"]
+            assert schemas_seen and all(names == [service] for names in schemas_seen)
+            resolve_counts.append(len(resolved))
+    first, second, first_again, updated, second_again = resolve_counts
+    assert first > 0 and second > first
+    assert first_again == second and updated > first_again and second_again == updated
+
+
+@pytest.mark.asyncio
+async def test_eager_mcp_cache_keeps_named_child_scope_after_revision_change(monkeypatch):
+    from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
+    from omnigent.spec.types import MCPServerConfig
+
+    async def resolver(agent_id, session_id):
+        spec = _contract_root_spec(with_child=True)
+        spec.mcp_servers = [MCPServerConfig(name="tracker", transport="registry")]
+        return spec
+
+    async def schemas(self, spec):
+        return SimpleNamespace(schemas=[], tool_names=set(), failures={})
+
+    monkeypatch.setattr(ProxyMcpManager, "schemas_for", schemas)
+    recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    conv = "named_child_mcp"
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording)),
+        spec_resolver=resolver,
+        server_client=_ContractSnapshotClient(conv),
+    )
+    async with _runner_test_client(app) as http:
+        for revision in ["source:first", "source:updated"]:
+            response = await _post_stream_message(
+                http,
+                conv,
+                agent_id="ag_contract_root",
+                harness="hermes",
+                has_mcp_servers=True,
+                agent_revision=revision,
+            )
+            assert response.status_code == 200, response.text
+            assert "Worker instructions." in recording.posted_bodies[-1]["instructions"]
+            assert "Root instructions." not in recording.posted_bodies[-1]["instructions"]

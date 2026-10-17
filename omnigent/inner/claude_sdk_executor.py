@@ -98,12 +98,12 @@ logger = logging.getLogger(__name__)
 # Default auth-token refresh cadence (ms) for the vendor-neutral gateway
 # transport when ``HARNESS_CLAUDE_SDK_GATEWAY_AUTH_REFRESH_INTERVAL_MS`` is
 # unset. Not Databricks-specific: the same fallback applies to any gateway
-# producer (Databricks AI gateway or a generic key/gateway provider).
+# producer (Databricks Unity Gateway or a generic key/gateway provider).
 _GATEWAY_AUTH_REFRESH_MS = 900_000
 _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 
 # Claude Code forwards the ANTHROPIC_CUSTOM_HEADERS value verbatim as
-# request headers. The Databricks AI gateway only serves Claude requests
+# request headers. The Databricks Unity Gateway only serves Claude requests
 # in coding-agent mode when this header is present, so the Databricks
 # gateway env (not the generic-provider gateway env) must carry it.
 _ANTHROPIC_CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
@@ -835,6 +835,7 @@ class _ClaudeClientState:
     model: str | None
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
+    effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1255,7 +1256,7 @@ def _resolve_gateway_env(
     # already fixed this by negotiating betas with the gateway instead
     # (`claude_native.py` CLAUDE_CODE_USE_GATEWAY=1); claude-sdk — the harness
     # behind Polly and Debby — never got that change. Scope it to a real
-    # Databricks AI Gateway base URL so a generic gateway (or a mock server)
+    # Databricks Unity Gateway base URL so a generic gateway (or a mock server)
     # that cannot negotiate betas keeps the original workaround.
     if is_databricks_ai_gateway_url(base_url):
         gateway_env["CLAUDE_CODE_USE_GATEWAY"] = "1"
@@ -1614,7 +1615,7 @@ class ClaudeSDKExecutor(Executor):
             gateway: If True, route through a vendor-neutral gateway
                 (base URL + bearer-token command + model). Enables the
                 gateway path regardless of which producer fed it (the
-                Databricks AI gateway or a generic provider).
+                Databricks Unity Gateway or a generic provider).
             databricks_profile: Databricks-specific config profile from
                 ~/.databrickscfg, e.g. ``"<your-profile>"``.  Only used by the
                 Databricks producer path (deriving base URL / auth command
@@ -1700,7 +1701,7 @@ class ClaudeSDKExecutor(Executor):
         # ``--plugin-dir <bundle>`` produces clean
         # ``<agent-name>:<skill-name>`` labels in Claude's skill
         # listing instead of the auto-derived tmpdir basename.
-        if self._bundle_dir is not None:
+        if self._bundle_dir is not None and (self._bundle_dir / "skills").is_dir():
             try:
                 ensure_bundle_plugin_manifest(self._bundle_dir, self._agent_name)
             except OSError as exc:
@@ -1795,6 +1796,8 @@ class ClaudeSDKExecutor(Executor):
                 )
             self._extra_env.update(gateway_env)
         self._extra_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
+        if entrypoint := os.environ.get("OMNIGENT_CLAUDE_CODE_ENTRYPOINT"):
+            self._extra_env["CLAUDE_CODE_ENTRYPOINT"] = entrypoint
 
         # Retry policy → Anthropic SDK env vars passed to the Claude
         # CLI subprocess. ``ANTHROPIC_MAX_RETRIES`` and
@@ -1951,6 +1954,7 @@ class ClaudeSDKExecutor(Executor):
                 model=model,
                 loop=asyncio.get_running_loop(),
                 task=current_task,
+                effort=getattr(options, "effort", None),
             )
             self._clients[session_key] = state
             return client
@@ -2505,6 +2509,13 @@ class ClaudeSDKExecutor(Executor):
         from claude_agent_sdk.types import StreamEvent as _StreamEvent
 
         cfg = config or ExecutorConfig()
+        try:
+            reasoning_effort = validate_effort(
+                cfg.extra.get("reasoning_effort"), "Claude Agent SDK", CLAUDE_EFFORTS
+            )
+        except ValueError as exc:
+            yield ExecutorError(message=describe_exception(exc), retryable=False)
+            return
 
         session_key = self._session_key(messages)
         crashed_reason = self._crashed_sessions.get(session_key)
@@ -2527,6 +2538,14 @@ class ClaudeSDKExecutor(Executor):
             # completion with no assistant text instead of an empty string.
             yield TurnComplete(response=None)
             return
+
+        state = self._clients.get(session_key)
+        if state is not None and state.effort != reasoning_effort and prompt != "/compact":
+            # Effort is a launch option. Rebuild with history for conversational
+            # turns, but let /compact operate on the existing client's context.
+            await self._close_live_client(session_key)
+            resume_session = False
+            prompt = self._build_prompt(messages, resume_session=False)
 
         # Build MCP tools from Omnigent tool schemas
         mcp_tools = _build_mcp_tools(tools, self._tool_executor) if tools else []
@@ -2657,7 +2676,7 @@ class ClaudeSDKExecutor(Executor):
         # ``name`` (and thus the skill-listing prefix) comes from
         # the manifest written at construction time.
         bundle_plugins: list[Any] = []  # type: ignore[explicit-any]  # SdkPluginConfig is a TypedDict — typed Any here to keep the import lazy
-        if self._bundle_dir is not None:
+        if self._bundle_dir is not None and (self._bundle_dir / "skills").is_dir():
             bundle_plugins.append({"type": "local", "path": str(self._bundle_dir)})
         options_kwargs: dict[str, Any] = {  # type: ignore[explicit-any]  # ClaudeAgentOptions accepts mixed-typed kwargs (str / list / dict / callable / etc.)
             "tools": base_tools,
@@ -2687,13 +2706,6 @@ class ClaudeSDKExecutor(Executor):
         # branch).
         if resolved.setting_sources is not None:
             options_kwargs["setting_sources"] = resolved.setting_sources
-        try:
-            reasoning_effort = validate_effort(
-                cfg.extra.get("reasoning_effort"), "Claude Agent SDK", CLAUDE_EFFORTS
-            )
-        except ValueError as exc:
-            yield ExecutorError(message=describe_exception(exc), retryable=False)
-            return
         if reasoning_effort is not None:
             options_kwargs["effort"] = reasoning_effort
         # Databricks opus/fable endpoints reject thinking.type="enabled"
@@ -3167,6 +3179,10 @@ class ClaudeSDKExecutor(Executor):
                     elif isinstance(message, sdk.ResultMessage):
                         result_msg = cast(_ResultMessageObj, message)
                         claude_session_id = getattr(result_msg, "session_id", None)
+                        logger.info(
+                            "Claude CLI result received (is_error=%s)",
+                            getattr(result_msg, "is_error", None),
+                        )
                         if getattr(result_msg, "is_error", None):
                             # Harness-level failure (e.g. expired login). Surface
                             # as an executor error rather than assistant content.
@@ -3404,6 +3420,7 @@ class ClaudeSDKExecutor(Executor):
             if compaction_event is not None:
                 yield compaction_event
 
+        logger.info("ClaudeSDKExecutor: turn complete")
         yield TurnComplete(response=response_text, usage=turn_usage)
 
     @staticmethod

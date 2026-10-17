@@ -57,12 +57,18 @@ import pytest
 from playwright.sync_api import APIResponse, Error, Locator, Page, Route, expect
 
 from tests._helpers.compat import (
+    apply_runner_env,
     apply_server_env,
+    compat_runner_cwd,
     compat_server_cwd,
+    runner_executable,
     server_executable,
 )
 from tests._helpers.native_session import create_native_session
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
+from tests._helpers.workspace_geometry import (
+    workspace_bar_needs_collapse as workspace_bar_needs_collapse,
+)
 from tests.codex_parity.helpers import ev_assistant_message, ev_completed, ev_response_created
 from tests.codex_parity.sidecar_harness import (
     CodexResponsesSidecar,
@@ -127,30 +133,6 @@ def fetch_with_retry(route: Route, *, attempts: int = 3) -> APIResponse:
     return route.fetch()
 
 
-def workspace_bar_needs_collapse(bar: Locator) -> bool:
-    """Whether the composer workspace bar's full labels would overflow or truncate.
-
-    Mirrors the bar's own rule (any ``[data-workspace-collapse-label]`` wider
-    than its box, or the row wider than the bar) by probing the expanded layout
-    in place and restoring the current verdict within the same evaluation, so a
-    test can assert the icon collapse is justified — and absent when everything fits.
-
-    :param bar: Locator for ``composer-workspace-controls``.
-    :returns: ``True`` when the bar must show icons only.
-    """
-    return bar.evaluate(
-        """bar => {
-          const verdict = bar.dataset.labels;
-          delete bar.dataset.labels;
-          const labels = [...bar.querySelectorAll('[data-workspace-collapse-label]')];
-          const cramped = bar.scrollWidth > bar.clientWidth + 1
-            || labels.some(el => el.scrollWidth > el.clientWidth + 1);
-          if (verdict !== undefined) bar.dataset.labels = verdict;
-          return cramped;
-        }"""
-    )
-
-
 def open_right_rail(page: Page) -> None:
     """Expand the right "Workspace" rail if it is collapsed.
 
@@ -189,6 +171,31 @@ def switch_markdown_view_mode(page: Page, file_viewer: Locator, mode: str) -> No
     """
     file_viewer.get_by_role("button", name=re.compile(r"^View mode")).first.click()
     page.get_by_role("menuitem", name=mode, exact=True).click()
+
+
+def open_previewable_files_in_preview(page: Page) -> None:
+    """Make Markdown, HTML, and notebook files open on the rendered Preview.
+
+    Seeds the stored FileViewer preferences before the app loads (Markdown
+    otherwise opens in the rich-text editor), so call it before ``page.goto``.
+
+    :param page: Playwright page that has not yet loaded the app.
+    :returns: None.
+    """
+    page.add_init_script(
+        """
+        window.localStorage.setItem(
+          "omnigent:file-view-preferences",
+          JSON.stringify({
+            diffActive: false,
+            diffLayout: "unified",
+            previewableViewMode: "preview",
+            hideWhitespace: false,
+            wrapLines: false,
+          }),
+        );
+        """
+    )
 
 
 # Populated by live_server for fixtures that need the server PID or runner ID.
@@ -875,8 +882,9 @@ def _spawn_runner_against_external_server(
     }
     log_handle = open(log_path, "w")  # noqa: SIM115 — closed in finally
     proc = subprocess.Popen(
-        [sys.executable, "-m", "omnigent.runner._entry"],
-        env=env,
+        [runner_executable(), "-m", "omnigent.runner._entry"],
+        env=apply_runner_env(env),
+        cwd=compat_runner_cwd(),
         stdout=log_handle,
         stderr=subprocess.STDOUT,
     )
@@ -1115,8 +1123,9 @@ def live_server(
         "OPENAI_API_KEY": "mock-key",
     }
     runner_proc = subprocess.Popen(
-        [sys.executable, "-m", "omnigent.runner._entry"],
-        env=runner_env,
+        [runner_executable(), "-m", "omnigent.runner._entry"],
+        env=apply_runner_env(runner_env),
+        cwd=compat_runner_cwd(),
         stdout=runner_log_handle,
         stderr=subprocess.STDOUT,
     )
@@ -1407,8 +1416,9 @@ def _ensure_runner_online(
         ),
     }
     proc = subprocess.Popen(
-        [sys.executable, "-m", "omnigent.runner._entry"],
-        env=env,
+        [runner_executable(), "-m", "omnigent.runner._entry"],
+        env=apply_runner_env(env),
+        cwd=compat_runner_cwd(),
         stdout=log_handle,
         stderr=subprocess.STDOUT,
     )
@@ -2806,23 +2816,30 @@ def native_codex_session(
                 respawned.wait(timeout=5)
 
 
-@pytest.fixture
-def native_claude_mock_session(
+@contextlib.contextmanager
+def native_claude_mock_session_context(
     live_server: str,
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
+    *,
+    terminal_launch_args: list[str] | None = None,
 ) -> Iterator[tuple[str, str]]:
     """A real Claude CLI using an explicitly configured mock provider.
 
     Workflow-owned runners are already configured. Standalone tests temporarily
     install a mock provider regardless of ambient credential placeholders.
+    ``terminal_launch_args`` are persisted on the session and passed to ``claude``.
     """
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
     with _temp_omnigent_mock_config(
         mock_llm_server_url, "claude", workflow_owned=bool(_server_state.get("workflow_owned"))
     ):
-        session_id = _create_native_claude_session(live_server, runner_id)
+        # Keep the default create call unchanged; tests/test_ui_fixture_wiring.py pins it.
+        launch_args = (
+            {} if terminal_launch_args is None else {"terminal_launch_args": terminal_launch_args}
+        )
+        session_id = _create_native_claude_session(live_server, runner_id, **launch_args)
         try:
             yield (live_server, session_id)
         finally:
@@ -2834,6 +2851,19 @@ def native_claude_mock_session(
                 except subprocess.TimeoutExpired:
                     respawned.kill()
                     respawned.wait(timeout=5)
+
+
+@pytest.fixture
+def native_claude_mock_session(
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A real Claude CLI using an explicitly configured mock provider."""
+    with native_claude_mock_session_context(
+        live_server, mock_llm_server_url, tmp_path_factory
+    ) as session:
+        yield session
 
 
 @pytest.fixture
@@ -3088,8 +3118,9 @@ def mocked_native_codex_session(
     try:
         proc = _spawn_server()
         runner_proc = subprocess.Popen(
-            [sys.executable, "-m", "omnigent.runner._entry"],
-            env=runner_env,
+            [runner_executable(), "-m", "omnigent.runner._entry"],
+            env=apply_runner_env(runner_env),
+            cwd=compat_runner_cwd(),
             stdout=runner_log_handle,
             stderr=subprocess.STDOUT,
         )

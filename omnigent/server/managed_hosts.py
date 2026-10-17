@@ -173,7 +173,7 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import partial
@@ -340,6 +340,73 @@ MANAGED_SANDBOX_LABEL_NAMESPACE = "omnigent.sandbox."
 # ``<base>.`` family, and the fork's own launch re-stamps whatever it resolves),
 # while an in-place agent switch keeps them — the sandbox is unchanged.
 MANAGED_REPO_LABEL_KEY = "omnigent.sandbox.repo"
+
+# Server-owned routing id from a managed create's or fork's ``host_id``:
+# available before the host binds, and never copied from a fork's source.
+REQUESTED_HOST_ID_LABEL_KEY = "omnigent.sandbox.requested_host_id"
+
+
+def managed_host_name(host_id: str) -> str:
+    """
+    The host-picker name of the managed host *host_id*, e.g. ``"managed-a1b2c3d4"``.
+
+    ``(owner, name)`` is unique in the hosts table, so the name embeds the id's
+    leading hex; a create that chooses its id must avoid an owner's taken name.
+
+    :param host_id: The managed host's id.
+    :returns: Its display name.
+    """
+    return f"managed-{host_id[:8]}"
+
+
+def host_slice_key_enabled(labels: Mapping[str, str], host_id: str) -> bool:
+    """
+    Whether a session's managed host routes by its own id.
+
+    Only when the create or fork chose this host id, so the caller routes by it from
+    the start; otherwise the host stays on the caller's default replica.
+
+    :param labels: The session's labels.
+    :param host_id: The session's managed host.
+    :returns: ``True`` when the create requested *host_id*.
+    """
+    return labels.get(REQUESTED_HOST_ID_LABEL_KEY) == host_id
+
+
+def _with_host_slice_key(
+    host_config: dict[str, object] | None, enabled: bool, server_url: str
+) -> dict[str, object] | None:
+    """
+    Apply the launch's ``host.slice_key_enabled`` decision to *host_config*.
+
+    The setting rides ``host_config`` because every launcher already installs
+    it before the host starts; a host env var would need each launcher's own
+    plumbing. The env var ``OMNIGENT_HOST_SLICE_KEY_ENABLED`` still overrides it.
+    *host_config* is returned as is when the host would already key as
+    *enabled* says, whether by the deployment's explicit
+    ``host.slice_key_enabled`` or, absent one, by its default for
+    *server_url*; so when no override or deployment config is needed,
+    ``host_config`` stays unset for legacy launchers. An explicit deployment
+    value that contradicts the launch is overwritten: the launch decides the
+    host's routing, since the caller already routes by its decision.
+
+    :param host_config: The deployment's ``sandbox.host_config``, or ``None``.
+    :param enabled: Whether the host keys its traffic by its own id.
+    :param server_url: URL the host dials, which sets its default.
+    :returns: *host_config*, or a copy with the setting in its ``host`` section.
+    """
+    from omnigent.util.server_url import is_workspace_hosted_url
+
+    existing = host_config.get("host") if host_config else None
+    configured = existing.get("slice_key_enabled") if isinstance(existing, dict) else None
+    current = configured if isinstance(configured, bool) else is_workspace_hosted_url(server_url)
+    if enabled == current:
+        return host_config
+    merged = dict(host_config or {})
+    host = dict(existing) if isinstance(existing, dict) else {}
+    host["slice_key_enabled"] = enabled
+    merged["host"] = host
+    return merged
 
 
 def managed_repo_labels(workspaces: Sequence[str]) -> dict[str, str]:
@@ -622,6 +689,9 @@ class ManagedSandboxConfig:
         keyed by inference provider name. Never installed in the sandbox.
     :param git_clone: Admin clone policy for fresh or missing repo checkouts.
         Existing retained checkouts are not reconfigured.
+    :param default_model_options: Optional, request-scoped provider catalog used
+        when no host catalog is available for the selected harness and user.
+        Supplies choices without selecting a default or provisioning a host.
     """
 
     server_url: str
@@ -632,6 +702,9 @@ class ManagedSandboxConfig:
     host_config: dict[str, object] | None = None
     model_discovery: dict[str, object] = dataclass_field(default_factory=dict)
     git_clone: GitCloneOptions = dataclass_field(default_factory=GitCloneOptions)
+    default_model_options: Callable[[str, str | None], Awaitable[list[dict[str, Any]]]] | None = (
+        None
+    )
 
 
 @dataclass(frozen=True)
@@ -801,9 +874,19 @@ class ManagedSandboxDeployment:
                 launcher = config.launcher_factory()
                 caps[config.provider] = {"multi_repo": launcher.capabilities.multi_repo}
                 from omnigent.inference_config import parse_inference_config
+                from omnigent.server.inference_catalog import ambient_gateway_providers
 
-                if parse_inference_config(config.host_config or {}):
+                try:
+                    bound = bool(parse_inference_config(config.host_config or {}))
+                except ValueError:
+                    # Startup rejects malformed YAML; a programmatic target advertises no catalog.
+                    bound = False
+                if bound:
                     caps[config.provider]["inference_models"] = True
+                elif config.default_model_options is not None or ambient_gateway_providers(
+                    config.host_config, config.model_discovery
+                ):
+                    caps[config.provider]["default_models"] = True
         return caps
 
 
@@ -3445,6 +3528,7 @@ async def launch_managed_host(
     provider: str | None = None,
     agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
+    host_id: str | None = None,
 ) -> ManagedHostLaunch:
     """
     Provision a sandbox, start a host in it, and wait until it registers.
@@ -3486,6 +3570,9 @@ async def launch_managed_host(
         worker thread (the sandbox exec steps run via
         ``asyncio.to_thread``), so it must be thread-safe. ``None``
         disables progress reporting.
+    :param host_id: Id to register the host under — a create's
+        ``host_id`` — or ``None`` to mint one. A requested id also makes the
+        host route by it (see :func:`host_slice_key_enabled`).
     :returns: The registered host id + in-sandbox workspace path
         (the cloned repository directory when *repo* is set).
     :raises HTTPException: 400 when *provider* is not configured or the
@@ -3495,11 +3582,9 @@ async def launch_managed_host(
     entry = _select_provider_config(config, provider)
     launcher = entry.launcher_factory()
     repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
-    host_id = uuid.uuid4().hex
-    # Visible label in the host picker; (owner, name) is the hosts
-    # table PK, so embed the host_id's leading hex for uniqueness
-    # across a user's managed sandboxes.
-    host_name = f"managed-{host_id[:8]}"
+    slice_key_enabled = host_id is not None
+    host_id = host_id or uuid.uuid4().hex
+    host_name = managed_host_name(host_id)
     try:
         await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
         await asyncio.to_thread(launcher.prepare)
@@ -3520,6 +3605,7 @@ async def launch_managed_host(
         repos=repos,
         agent_name=agent_name,
         on_stage=on_stage,
+        slice_key_enabled=slice_key_enabled,
     )
     return ManagedHostLaunch(host_id=host_id, workspace=workspace)
 
@@ -3532,6 +3618,7 @@ async def relaunch_managed_host(
     repos: Sequence[RepoWorkspace] = (),
     agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
+    slice_key_enabled: bool = False,
 ) -> ManagedHostLaunch:
     """
     Provision a NEW sandbox generation for an existing managed host.
@@ -3564,6 +3651,8 @@ async def relaunch_managed_host(
     :param on_stage: Progress observer forwarded to
         :func:`_register_and_start_host`; see :func:`launch_managed_host`.
         ``None`` disables progress reporting.
+    :param slice_key_enabled: Whether the host routes by its own id, as at its
+        first launch (see :func:`host_slice_key_enabled`).
     :returns: The (unchanged) host id + fresh in-sandbox workspace.
     :raises HTTPException: 400 when the host's recorded provider no
         longer matches the configured launcher; 502 when
@@ -3614,6 +3703,7 @@ async def relaunch_managed_host(
             agent_name=agent_name,
             on_stage=on_stage,
             keep_host_on_failure=True,
+            slice_key_enabled=slice_key_enabled,
         )
     except ValueError as exc:
         raise HTTPException(
@@ -3736,6 +3826,7 @@ async def _register_and_start_host(
     agent_name: str | None = None,
     on_stage: Callable[[str], None] | None = None,
     keep_host_on_failure: bool = False,
+    slice_key_enabled: bool = False,
 ) -> str:
     """
     Arm the credential, start the in-sandbox host, and await its
@@ -3772,6 +3863,7 @@ async def _register_and_start_host(
     :param keep_host_on_failure: ``True`` on a relaunch — failure
         cleanup terminates the new sandbox and revokes the token but
         keeps the host row. ``False`` (first launch) deletes the row.
+    :param slice_key_enabled: Whether the host routes by its own id.
     :returns: The absolute in-sandbox workspace path.
     :raises HTTPException: 502 when cloning, host startup, or
         registration fails.
@@ -3814,7 +3906,9 @@ async def _register_and_start_host(
             host_name=host_name,
             server_url=config.server_url,
             repos=repos,
-            host_config=config.host_config,
+            host_config=_with_host_slice_key(
+                config.host_config, slice_key_enabled, config.server_url
+            ),
             agent_name=agent_name,
             on_stage=on_stage,
         )
@@ -3994,6 +4088,7 @@ async def resume_managed_host(
     force: bool = False,
     on_stage: Callable[[str], None] | None = None,
     agent_name: str | None = None,
+    slice_key_enabled: bool = False,
 ) -> None:
     """
     Wake a dormant managed host so a session bound to it can run again.
@@ -4035,6 +4130,8 @@ async def resume_managed_host(
         runner, or ``None`` to leave it unstamped. A wake rebuilds the runner
         from scratch, so the classifier is not carried over by the resume: the
         caller re-derives it through the same built-in gate a launch uses.
+    :param slice_key_enabled: Whether the host routes by its own id, as at its
+        first launch (see :func:`host_slice_key_enabled`).
     :raises SandboxGoneError: When the sandbox generation definitively no
         longer exists, allowing the caller to create a fresh one.
     :raises HTTPException: 502 when the resume or host restart otherwise fails.
@@ -4116,7 +4213,9 @@ async def resume_managed_host(
                 host_name=host.name,
                 server_url=entry.server_url,
                 repos=workspace_repos,
-                host_config=entry.host_config,
+                host_config=_with_host_slice_key(
+                    entry.host_config, slice_key_enabled, entry.server_url
+                ),
                 on_stage=on_stage,
                 agent_name=agent_name,
             )

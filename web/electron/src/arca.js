@@ -27,12 +27,19 @@ const { execFile, execFileSync, spawn } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const { StringDecoder } = require("node:string_decoder");
+const { readArcaIdentity, IDENTITY_START, IDENTITY_END } = require("./arcaIdentity");
 
 /**
  * Connecting may cold-start the EC2 instance, which takes minutes — give the
  * whole ssh + remote daemon startup a generous ceiling.
  */
 const CONNECT_TIMEOUT_MS = 5 * 60 * 1000;
+const STATUS_TIMEOUT_MS = 60_000;
+const EXTEND_TIMEOUT_MS = 120_000;
+const ARCA_EXTEND_MODES = Object.freeze(["overnight", "workweek"]);
+const ARCA_AUTH_RE = /arca (auth )?login|certificate.*expired|permission denied \(publickey/i;
+const MAX_CLI_OUTPUT_BYTES = 256 * 1024;
 
 /**
  * The only characters allowed in the server URL that rides inside the ssh
@@ -45,7 +52,7 @@ const CONNECT_TIMEOUT_MS = 5 * 60 * 1000;
 const SAFE_URL_RE = /^[A-Za-z0-9\-._~:/?=&%]+$/;
 
 /**
- * @typedef {"timeout" | "omni-auth" | "arca-auth" | "missing-remote-cli" | "unreachable" | "unknown"} ArcaErrorKind
+ * @typedef {"timeout" | "omni-auth" | "arca-auth" | "missing-remote-cli" | "unreachable" | "not-installed" | "no-instance" | "runtime-limit" | "unknown"} ArcaErrorKind
  */
 
 /**
@@ -165,7 +172,30 @@ function buildArcaArgs(serverUrl, login = false) {
     // match); SAFE_URL_RE already bars `'`, so the quotes can't be broken out of.
     ...(login
       ? ["login", `'${url.toString()}'`]
-      : ["host", "--server", `'${url.toString()}'`, "--background", "--non-interactive"]),
+      : [
+          "host",
+          "--server",
+          `'${url.toString()}'`,
+          "--background",
+          "--non-interactive",
+          "&&",
+          "{",
+          "printf",
+          `'\\n${IDENTITY_START}\\n'`,
+          ";",
+          "isaac",
+          "omni",
+          "host",
+          "status",
+          "--server",
+          `'${url.toString()}'`,
+          "--json",
+          ";",
+          "printf",
+          `'\\n${IDENTITY_END}\\n'`,
+          ";",
+          "}",
+        ]),
   ];
 }
 
@@ -224,7 +254,7 @@ function describeConnectFailure(run) {
   }
   // This machine's arca credentials are missing or expired, so ssh never
   // reached the instance.
-  if (/arca (auth )?login|certificate.*expired|permission denied \(publickey/i.test(output)) {
+  if (ARCA_AUTH_RE.test(output)) {
     return {
       ok: false,
       errorKind: "arca-auth",
@@ -267,6 +297,343 @@ function lastLine(text) {
 }
 
 /**
+ * Parse the status object even when the CLI surrounds it with notices.
+ * @param {string} stdout
+ * @returns {{ state: string | null, hasInstance: boolean, shutdownAt: number | null, rawShutdownTime: string | null } | null}
+ */
+function parseArcaStatus(stdout) {
+  const isStatus = (value) => {
+    const hasInstance =
+      Object.hasOwn(value, "instance") &&
+      (value.instance === null ||
+        (typeof value.instance === "object" && !Array.isArray(value.instance)));
+    return (
+      typeof value.status === "string" && (hasInstance || Object.hasOwn(value, "shutdown_time"))
+    );
+  };
+  const parseObject = (text) => {
+    try {
+      const value = JSON.parse(text);
+      return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+    } catch {
+      return null;
+    }
+  };
+  let status = parseObject(stdout.trim());
+  if (status && !isStatus(status)) status = null;
+  if (!status) {
+    let start = -1;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = 0; i < stdout.length; i++) {
+      const char = stdout[i];
+      if (depth === 0) {
+        if (char === "{") {
+          start = i;
+          depth = 1;
+        }
+        continue;
+      }
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (char === "\\") escaped = true;
+        else if (char === '"') inString = false;
+      } else if (char === '"') {
+        inString = true;
+      } else if (char === "{") {
+        depth++;
+      } else if (char === "}" && --depth === 0) {
+        const candidate = parseObject(stdout.slice(start, i + 1));
+        if (candidate && isStatus(candidate)) {
+          if (Object.hasOwn(candidate, "instance")) {
+            status = candidate;
+            break;
+          }
+          status ??= candidate;
+        }
+      }
+    }
+  }
+  if (!status) return null;
+  const raw =
+    status.instance === null || status.instance === undefined
+      ? status.shutdown_time
+      : status.instance.shutdown_time;
+  const rawShutdownTime = typeof raw === "string" ? raw : null;
+  const shutdownAt =
+    rawShutdownTime && /(?:Z|[+-]\d{2}:?\d{2})$/i.test(rawShutdownTime)
+      ? Date.parse(rawShutdownTime.replace(/([+-]\d{2})(\d{2})$/, "$1:$2"))
+      : NaN;
+  return {
+    state: typeof status.status === "string" ? status.status : null,
+    hasInstance:
+      status.instance !== null &&
+      typeof status.instance === "object" &&
+      !Array.isArray(status.instance),
+    shutdownAt: Number.isFinite(shutdownAt) ? shutdownAt : null,
+    rawShutdownTime,
+  };
+}
+
+/**
+ * Run a headless Arca command and capture both output streams.
+ * @param {string} arcaPath
+ * @param {string[]} args
+ * @param {{ spawn?: typeof spawn, timeoutMs: number, killGraceMs?: number, maxOutputBytes?: number }} options
+ * @returns {Promise<{ code: number | null, stdout: string, stderr: string, timedOut?: boolean, spawnError?: Error }>}
+ */
+function runArca(arcaPath, args, options) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = (options.spawn || spawn)(arcaPath, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        detached: true,
+      });
+    } catch (error) {
+      resolve({ code: null, stdout: "", stderr: "", spawnError: error });
+      return;
+    }
+    let stdout = "";
+    let stdoutBytes = 0;
+    let stderr = "";
+    let stderrBytes = 0;
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+    let settled = false;
+    let exited = false;
+    let exitCode = null;
+    let exitGraceTimer;
+    let killTimer;
+    let timedOut = false;
+    const killTree = (signal) => {
+      try {
+        if (typeof child.pid === "number") process.kill(-child.pid, signal);
+        else child.kill(signal);
+      } catch {
+        try {
+          child.kill(signal);
+        } catch {
+          // Already gone.
+        }
+      }
+    };
+    const onStdout = (chunk) => {
+      if (stdoutBytes >= (options.maxOutputBytes ?? Infinity)) return;
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      const retained = bytes.subarray(0, (options.maxOutputBytes ?? Infinity) - stdoutBytes);
+      stdout += stdoutDecoder.write(retained);
+      stdoutBytes += retained.length;
+    };
+    const onStderr = (chunk) => {
+      if (stderrBytes >= (options.maxOutputBytes ?? Infinity)) return;
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      const retained = bytes.subarray(0, (options.maxOutputBytes ?? Infinity) - stderrBytes);
+      stderr += stderrDecoder.write(retained);
+      stderrBytes += retained.length;
+    };
+    const settle = (result, fromClose = false) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(exitGraceTimer);
+      clearTimeout(killTimer);
+      stdout += stdoutDecoder.end();
+      stderr += stderrDecoder.end();
+      if (!fromClose) {
+        for (const [stream, listener] of [
+          [child.stdout, onStdout],
+          [child.stderr, onStderr],
+        ]) {
+          try {
+            stream?.off("data", listener);
+            stream?.destroy?.();
+          } catch {
+            // A child may already have closed the pipe.
+          }
+        }
+      }
+      resolve({ code: result.code, stdout, stderr, timedOut, ...result });
+    };
+    const timer = setTimeout(() => {
+      if (exited) {
+        settle({ code: exitCode });
+        return;
+      }
+      timedOut = true;
+      killTree("SIGTERM");
+      killTimer = setTimeout(() => {
+        killTree("SIGKILL");
+        settle({ code: null, timedOut: true });
+      }, options.killGraceMs ?? 5000);
+    }, options.timeoutMs);
+    child.stdout?.on("data", onStdout);
+    child.stderr?.on("data", onStderr);
+    child.on("error", (error) => settle({ code: null, spawnError: error }));
+    child.on("exit", (code) => {
+      if (settled) return;
+      exited = true;
+      exitCode = code;
+      exitGraceTimer = setTimeout(() => settle({ code }), 500);
+    });
+    child.on("close", (code) => settle({ code: exited ? exitCode : code }, true));
+  });
+}
+
+/**
+ * Turn a failed status or extend run into an actionable result.
+ * @param {{ code: number | null, stdout: string, stderr: string, timedOut?: boolean }} run
+ * @param {"status" | "extend"} action
+ * @returns {{ ok: false, errorKind: ArcaErrorKind, error: string }}
+ */
+function describeArcaCliFailure(run, action) {
+  const output = `${run.stdout}\n${run.stderr}`;
+  if (run.timedOut) {
+    return {
+      ok: false,
+      errorKind: "timeout",
+      error:
+        action === "status"
+          ? "Checking Arca's status timed out. Try again."
+          : "Extending Arca timed out. Try again.",
+    };
+  }
+  if (/no running arca instance/i.test(output)) {
+    return {
+      ok: false,
+      errorKind: "no-instance",
+      error:
+        action === "status"
+          ? "Your Arca instance isn't running. Start it with `arca start` and try again."
+          : "Your Arca instance isn't running anymore, so there's nothing to extend.",
+    };
+  }
+  if (/runtime limit/i.test(output)) {
+    return {
+      ok: false,
+      errorKind: "runtime-limit",
+      error:
+        action === "status"
+          ? "Your Arca instance reached its one-week runtime limit. Restart it with `arca stop && arca start`, then check its status again."
+          : "Your Arca instance reached its one-week runtime limit, so it can't be extended. Restart it with `arca stop && arca start`.",
+    };
+  }
+  if (ARCA_AUTH_RE.test(output) || /dbcert/i.test(output)) {
+    return {
+      ok: false,
+      errorKind: "arca-auth",
+      error:
+        "Your arca sign-in on this machine has expired. Run `arca login` in a terminal, then try again.",
+    };
+  }
+  if (/error connecting to arca/i.test(output)) {
+    return {
+      ok: false,
+      errorKind: "unreachable",
+      error:
+        "Couldn't reach the Arca instance. Try `arca stop && arca start` in a terminal, then try again.",
+    };
+  }
+  const detail = lastLine(output.trim());
+  return {
+    ok: false,
+    errorKind: "unknown",
+    error: detail
+      ? `Arca ${action} failed: ${detail}`
+      : `Arca ${action} failed (exit code ${run.code ?? "unknown"}).`,
+  };
+}
+
+/**
+ * Read this machine's Arca instance state and shutdown time.
+ * @param {{ resolveArcaPath?: () => string | null | Promise<string | null>, spawn?: typeof spawn, timeoutMs?: number, killGraceMs?: number }} [deps]
+ * @returns {Promise<{ ok: true, state: string | null, hasInstance: boolean, shutdownAt: number | null, rawShutdownTime: string | null } | { ok: false, errorKind: ArcaErrorKind, error: string }>}
+ */
+async function readArcaStatus(deps = {}) {
+  try {
+    const arcaPath = await (deps.resolveArcaPath || resolveArcaPathAsync)();
+    if (!arcaPath)
+      return {
+        ok: false,
+        errorKind: "not-installed",
+        error: "The arca CLI was not found on this machine.",
+      };
+    const run = await runArca(arcaPath, ["status", "--json"], {
+      spawn: deps.spawn,
+      timeoutMs: deps.timeoutMs ?? STATUS_TIMEOUT_MS,
+      killGraceMs: deps.killGraceMs,
+      maxOutputBytes: MAX_CLI_OUTPUT_BYTES,
+    });
+    if (run.spawnError)
+      return {
+        ok: false,
+        errorKind: "unknown",
+        error: `Couldn't run arca: ${run.spawnError.message}`,
+      };
+    if (run.code !== 0 || run.timedOut) return describeArcaCliFailure(run, "status");
+    const parsed = parseArcaStatus(run.stdout);
+    if (!parsed)
+      return {
+        ok: false,
+        errorKind: "unknown",
+        error:
+          "Unexpected arca status output. Run `arca status --json` in a terminal and try again.",
+      };
+    return { ok: true, ...parsed };
+  } catch (error) {
+    return { ok: false, errorKind: "unknown", error: `Couldn't run arca: ${error.message}` };
+  }
+}
+
+/**
+ * Extend this machine's Arca instance using an approved mode.
+ * @param {string} mode
+ * @param {{ resolveArcaPath?: () => string | null | Promise<string | null>, spawn?: typeof spawn, timeoutMs?: number, killGraceMs?: number }} [deps]
+ * @returns {Promise<{ ok: true, shutdownAt: number | null } | { ok: false, errorKind: ArcaErrorKind, error: string }>}
+ */
+async function runArcaExtend(mode, deps = {}) {
+  if (!ARCA_EXTEND_MODES.includes(mode))
+    return { ok: false, errorKind: "unknown", error: "Unsupported arca extend mode." };
+  try {
+    const arcaPath = await (deps.resolveArcaPath || resolveArcaPathAsync)();
+    if (!arcaPath)
+      return {
+        ok: false,
+        errorKind: "not-installed",
+        error: "The arca CLI was not found on this machine.",
+      };
+    const status = await readArcaStatus({ ...deps, resolveArcaPath: () => arcaPath });
+    if (!status.ok) return status;
+    if (status.state?.toLowerCase() !== "running" || !status.hasInstance) {
+      return {
+        ok: false,
+        errorKind: "no-instance",
+        error: "Your Arca instance is not running. Start it and try again.",
+      };
+    }
+    const run = await runArca(arcaPath, ["extend", mode], {
+      spawn: deps.spawn,
+      timeoutMs: deps.timeoutMs ?? EXTEND_TIMEOUT_MS,
+      killGraceMs: deps.killGraceMs,
+      maxOutputBytes: MAX_CLI_OUTPUT_BYTES,
+    });
+    if (run.spawnError)
+      return {
+        ok: false,
+        errorKind: "unknown",
+        error: `Couldn't run arca: ${run.spawnError.message}`,
+      };
+    if (run.code !== 0 || run.timedOut) return describeArcaCliFailure(run, "extend");
+    const updated = await readArcaStatus({ ...deps, resolveArcaPath: () => arcaPath });
+    if (!updated.ok) console.warn("[arca] status verification after extend failed:", updated.error);
+    return { ok: true, shutdownAt: updated.ok ? updated.shutdownAt : null };
+  } catch (error) {
+    return { ok: false, errorKind: "unknown", error: `Couldn't run arca: ${error.message}` };
+  }
+}
+
+/**
  * Start connecting the user's Arca instance to `serverUrl` as an Omnigent
  * host, streaming the command's live output. Built for the connect console:
  * the caller shows `command` to the user, pipes `onOutput` chunks into a
@@ -279,12 +646,14 @@ function lastLine(text) {
  *   resolveArcaPath?: () => string | null,
  *   spawn?: typeof spawn,
  *   onOutput?: (text: string) => void,
+ *   onIdentityUnavailable?: (reason: string) => void,
  * }} [deps]
  * @returns {{
  *   command: string | null,
  *   promise: Promise<{
  *     ok: boolean,
  *     alreadyRunning?: boolean,
+ *     identity?: { serverUrl: string, hostId: string },
  *     error?: string,
  *     authError?: boolean,
  *     canceled?: boolean,
@@ -378,7 +747,14 @@ function startArcaCommand(serverUrl, deps = {}, login = false) {
       if (code === 0) {
         // `omni host --background` reuses a healthy daemon and says so — the
         // caller can then skip waiting for a host that was online all along.
-        settle({ ok: true, alreadyRunning: /already running/i.test(stdout + stderr) });
+        const identity = login
+          ? null
+          : readArcaIdentity(stdout, serverUrl, deps.onIdentityUnavailable);
+        settle({
+          ok: true,
+          alreadyRunning: /already running/i.test(stdout + stderr),
+          ...(identity ? { identity } : {}),
+        });
         return;
       }
       if (login) {
@@ -446,6 +822,12 @@ function connectArcaHost(serverUrl, deps = {}) {
 }
 
 module.exports = {
+  ARCA_EXTEND_MODES,
+  STATUS_TIMEOUT_MS,
+  EXTEND_TIMEOUT_MS,
+  parseArcaStatus,
+  readArcaStatus,
+  runArcaExtend,
   CONNECT_TIMEOUT_MS,
   buildConnectArgs,
   buildLoginArgs,

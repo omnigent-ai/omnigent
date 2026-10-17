@@ -382,7 +382,7 @@ describe("browserViewRegistry — agent-navigation allowlist", () => {
 // A stub view that captures the webContents event handlers (will-navigate /
 // will-redirect / will-frame-navigate) and the window-open handler, so tests
 // can fire a redirect and assert whether it was cancelled (preventDefault).
-function makeEventCapturingRegistry() {
+function makeEventCapturingRegistry(extra = {}) {
   const sent = []; // { channel, payload }
   const loaded = []; // loadURL targets on the created view
   const clipboardWrites = []; // copyTextToClipboard payloads
@@ -422,6 +422,7 @@ function makeEventCapturingRegistry() {
     openUrlExternal: (url) => externalOpens.push(url),
     copyTextToClipboard: (text) => clipboardWrites.push(text),
     showContextMenu: (items) => menus.push(items),
+    ...extra,
   });
   return {
     registry,
@@ -448,6 +449,68 @@ function makeEventCapturingRegistry() {
 }
 
 describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every hop)", () => {
+  it("uses the same live Arca context for initial URL, redirect, frame and popup", () => {
+    let eligible = true;
+    const context = { serverTarget: "selected-server", sourceHostId: "actual-host" };
+    const { registry, fire, windowOpen, loaded } = makeEventCapturingRegistry({
+      isArcaAgentContext: (ctx) => eligible && ctx === context,
+    });
+    assert.equal(
+      registry.openOrNavigate("arca", "http://localhost:5173", undefined, {
+        agent: true,
+        agentContext: context,
+      }).ok,
+      true,
+    );
+    for (const event of ["will-navigate", "will-redirect", "will-frame-navigate"]) {
+      assert.equal(fire(event, "http://127.0.0.1:5173").prevented, false);
+      assert.equal(fire(event, "http://169.254.169.254").prevented, true);
+      assert.equal(fire(event, "http://192.168.1.1").prevented, true);
+    }
+    const before = loaded.length;
+    windowOpen("http://[::1]:5173");
+    assert.equal(loaded.length, before + 1);
+    windowOpen("file:///tmp/test");
+    windowOpen("http://10.0.0.1");
+    assert.equal(loaded.length, before + 1);
+    eligible = false;
+    assert.equal(fire("will-redirect", "http://localhost:5173").prevented, true);
+    windowOpen("http://localhost:5173");
+    assert.equal(loaded.length, before + 1);
+    assert.equal(
+      registry.openOrNavigate("unknown", "http://localhost:5173", undefined, {
+        agent: true,
+        agentContext: context,
+      }).ok,
+      false,
+    );
+    assert.equal(registry.has("unknown"), false);
+  });
+
+  it("does not carry a previous Arca context into another navigation or registry", () => {
+    const context = {};
+    const options = { isArcaAgentContext: (ctx) => ctx === context };
+    const first = makeEventCapturingRegistry(options);
+    const second = makeEventCapturingRegistry();
+    assert.equal(
+      first.registry.openOrNavigate("same-id", "http://localhost", undefined, {
+        agent: true,
+        agentContext: context,
+      }).ok,
+      true,
+    );
+    assert.equal(
+      second.registry.openOrNavigate("same-id", "http://localhost", undefined, {
+        agent: true,
+        agentContext: context,
+      }).ok,
+      false,
+    );
+    first.registry.openOrNavigate("same-id", "https://example.com", undefined, { agent: true });
+    assert.equal(first.fire("will-redirect", "http://localhost").prevented, true);
+    first.registry.openOrNavigate("same-id", "http://localhost", undefined, { force: true });
+    assert.equal(first.fire("will-redirect", "http://10.0.0.1").prevented, false);
+  });
   it("blocks an agent-locked will-redirect to the cloud-metadata IP", () => {
     const { registry, sent, fire } = makeEventCapturingRegistry();
     // Agent navigates to an allowed host (locks the view to agent policy).

@@ -18,6 +18,7 @@ _logger = logging.getLogger(__name__)
 _InjectionFunction = TypeVar("_InjectionFunction", bound=Callable[..., Any])
 
 _Parameters = ParamSpec("_Parameters")
+_TMUX_OPERATIONS = frozenset({"send-keys", "load-buffer", "paste-buffer", "kill-session"})
 
 
 def _best_effort(function: Callable[_Parameters, None]) -> Callable[_Parameters, None]:
@@ -38,6 +39,8 @@ class _PromptDeliveryTrace:
     stage: str = "lock_wait"
     stage_seconds: dict[str, float] = field(default_factory=dict)
     attempts: list[dict[str, object]] = field(default_factory=list)
+    input_attributes: dict[str, object] = field(default_factory=dict)
+    tmux_failure: dict[str, object] = field(default_factory=dict)
 
 
 @_best_effort
@@ -65,6 +68,30 @@ def record_details(**attributes: object) -> None:
         trace.attempts[-1].update(attributes)
 
 
+@_best_effort
+def record_tmux_failure(
+    operation: str,
+    *,
+    returncode: int | None = None,
+    timeout_s: float | None = None,
+    os_errno: int | None = None,
+) -> None:
+    """Retain the first failing operation without command arguments or terminal output."""
+    trace = _prompt_delivery_trace.get()
+    if trace is None or trace.tmux_failure:
+        return
+    trace.tmux_failure = {
+        "tmux_operation": operation if operation in _TMUX_OPERATIONS else "other",
+    }
+    for name, value in (
+        ("tmux_returncode", returncode),
+        ("tmux_timeout_s", timeout_s),
+        ("tmux_os_errno", os_errno),
+    ):
+        if value is not None:
+            trace.tmux_failure[name] = value
+
+
 def trace_delivery(
     *,
     session_id_reader: Callable[[Path], str | None],
@@ -80,6 +107,7 @@ def trace_delivery(
             try:
                 # Hooks import this module on every invocation; keep the sink lazy.
                 from omnigent.debug_logging import current_session_id, debug_event
+                from omnigent.native.input_diagnostics import current_input_attributes
 
                 started = time.monotonic()
                 trace = _PromptDeliveryTrace(
@@ -87,6 +115,7 @@ def trace_delivery(
                     session_id=current_session_id() or session_id_reader(bridge_dir),
                     started=started,
                     stage_started=started,
+                    input_attributes=current_input_attributes(),
                 )
                 token = _prompt_delivery_trace.set(trace)
             except Exception:  # noqa: BLE001 — trace setup must not prevent delivery
@@ -111,6 +140,7 @@ def trace_delivery(
                     if _logger.isEnabledFor(level):
                         normalized = content.replace("\r\n", "\n").replace("\r", "\n")
                         fields = {
+                            **trace.input_attributes,
                             "delivery_id": trace.delivery_id,
                             "stage": trace.stage,
                             "attempt": len(trace.attempts),
@@ -121,11 +151,17 @@ def trace_delivery(
                             and not normalized.split("\n", 1)[0].strip(),
                             "outcome": outcome,
                             "verification": verification,
+                            "delivery_outcome": (
+                                "draft_cleared"
+                                if outcome == "returned" and verification == "draft_absent"
+                                else "unknown"
+                            ),
                             **last_attempt,
                             **{
                                 f"stage_{stage}_ms": round(seconds * 1000)
                                 for stage, seconds in trace.stage_seconds.items()
                             },
+                            **trace.tmux_failure,
                         }
                         if error_type is not None:
                             fields["error_type"] = error_type

@@ -35,6 +35,7 @@ from omnigent._terminal_picker_theme import PICKER_ACCENT, PICKER_MUTED
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.inner.native_attachments import attachment_cache_dir
 from omnigent.models.databricks_model_discovery import DatabricksClaudeCatalog
+from omnigent.native import native_terminal
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runtime import tool_result_replay as trc
 from omnigent.spec import load_omnigent_yaml
@@ -155,6 +156,26 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
         "TaskCreated",
         "UserPromptSubmit",
     ]
+
+
+def test_claude_terminal_request_loads_workspace_agents_skills(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    skill = tmp_path / ".agents" / "skills" / "portable" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: portable\ndescription: Portable skill\n---\nUse this skill.\n")
+
+    body = claude_native._claude_terminal_request(
+        (),
+        command="claude",
+        bridge_dir=_test_bridge_dir(tmp_path, monkeypatch),
+    )
+
+    args = body["spec"]["args"]
+    overlay = Path(args[args.index("--add-dir") + 1])
+    exposed = list((overlay / ".claude" / "skills").glob("*/SKILL.md"))
+    assert [path.parent.name for path in exposed] == ["portable"]
+    assert [path.read_text() for path in exposed] == [skill.read_text()]
 
 
 def test_claude_terminal_request_default_launch_is_unwrapped(tmp_path, monkeypatch) -> None:
@@ -3172,6 +3193,57 @@ async def test_fetch_resume_items_retries_smaller_pages_on_dropped_connection() 
 
 
 @pytest.mark.asyncio
+async def test_fetch_resume_items_retries_throttled_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A 429 on an item page waits and retries that page at the same size.
+
+    After a mass runner reconnect the server throttles the history reads of
+    every re-initializing session. Treating that as a contract error dropped
+    the resume and relaunched Claude without its conversation.
+    """
+    requested: list[tuple[str | None, int]] = []
+    sleeps: list[float] = []
+    total = 30
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        limit = int(request.url.params["limit"])
+        after = request.url.params.get("after")
+        requested.append((after, limit))
+        if after == "9" and requested.count((after, limit)) == 1:
+            return httpx.Response(
+                429,
+                headers={"Retry-After": "2"},
+                json={"error_code": "RESOURCE_EXHAUSTED"},
+            )
+        start = int(after) + 1 if after is not None else 0
+        page = [
+            {"type": "message", "id": str(i), "role": "user", "content": []}
+            for i in range(start, min(start + 10, total))
+        ]
+        return httpx.Response(
+            200,
+            json={"data": page, "has_more": start + 10 < total, "last_id": page[-1]["id"]},
+        )
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(native_terminal, "_sleep", fake_sleep)
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+        items = await claude_native._fetch_all_session_items_for_claude_resume(client, "conv_abc")
+
+    assert [item["id"] for item in items] == [str(i) for i in range(total)]
+    # Only the throttled page is repeated, honoring Retry-After, and the page
+    # size is kept: throttling is not a sign the page was too large.
+    limit = claude_native._CLAUDE_RESUME_ITEMS_PAGE_LIMIT
+    assert requested == [(None, limit), ("9", limit), ("9", limit), ("19", limit)]
+    assert sleeps == [2.0]
+
+
+@pytest.mark.asyncio
 async def test_fetch_resume_items_raises_on_4xx_without_retry() -> None:
     """A 4xx is a contract error: raise immediately, no page-size retry."""
     calls = 0
@@ -3210,16 +3282,19 @@ async def test_fetch_resume_items_raises_when_5xx_persists_at_floor() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [500, 429])
 async def test_resume_transcript_falls_back_to_local_file_when_history_unfetchable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
 ) -> None:
     """
     Server history unreachable + intact local transcript → resume from it.
 
-    When every page size fails, a previous run's local
-    ``~/.claude/projects/<ws>/<sid>.jsonl`` still holds the conversation;
-    resuming from it beats silently launching a blank session.
+    When every page size fails, or throttling outlasts the 429 retries, a
+    previous run's local ``~/.claude/projects/<ws>/<sid>.jsonl`` still holds
+    the conversation; resuming from it beats silently launching a blank
+    session.
     """
     projects = tmp_path / "projects"
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
@@ -3229,9 +3304,14 @@ async def test_resume_transcript_falls_back_to_local_file_when_history_unfetchab
     local = target_dir / "sid123.jsonl"
     local.write_text('{"type":"user"}\n', encoding="utf-8")
 
+    async def no_sleep(delay: float) -> None:
+        del delay
+
+    monkeypatch.setattr(native_terminal, "_sleep", no_sleep)
+
     def handler(request: httpx.Request) -> httpx.Response:
         del request
-        return httpx.Response(500, json={"error": {"code": "internal_error"}})
+        return httpx.Response(status_code, json={"error": {"code": "unavailable"}})
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
@@ -11305,6 +11385,69 @@ def test_catalog_fingerprint_survives_a_missing_binary(
 
 
 # ── ambient gateway detection ─────────────────────────────
+
+
+def test_managed_gateway_rejects_uncataloged_canonical_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(
+        json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}})
+    )
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,))
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    rows = [{"id": "opus", "model": "system.ai.claude-opus-5-5[1m]"}]
+
+    assert claude_native._ambient_env_is_non_anthropic_gateway() is True
+    assert not claude_native.claude_catalog_serves_model(rows, "claude-opus-4-8", None)
+    assert claude_native.claude_catalog_serves_model(rows, "opus", None)
+    assert claude_native.claude_catalog_serves_model(rows, "system.ai.claude-opus-5-5[1m]", None)
+    rows.append({"id": "canonical", "model": "claude-opus-4-8"})
+    assert claude_native.claude_catalog_serves_model(rows, "claude-opus-4-8", None)
+
+
+@pytest.mark.parametrize(
+    ("managed_url", "env_url", "is_gateway"),
+    [
+        ("https://gateway.example/anthropic", "https://api.anthropic.com", True),
+        ("https://api.anthropic.com", "https://gateway.example/anthropic", False),
+    ],
+)
+def test_managed_gateway_endpoint_takes_precedence(
+    managed_url: str,
+    env_url: str,
+    is_gateway: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _point_claude_at(monkeypatch, tmp_path / "claude")
+    (tmp_path / "claude").write_text("binary")
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": managed_url}}))
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,))
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", env_url)
+    fingerprint = claude_native.claude_catalog_fingerprint(None)
+
+    assert claude_native._ambient_env_is_non_anthropic_gateway() is is_gateway
+    monkeypatch.delenv("ANTHROPIC_BASE_URL")
+    assert claude_native.claude_catalog_fingerprint(None) == fingerprint
+
+
+def test_catalog_fingerprint_changes_with_managed_gateway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _point_claude_at(monkeypatch, tmp_path / "claude")
+    (tmp_path / "claude").write_text("binary")
+    managed_settings = tmp_path / "managed-settings.json"
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,))
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    managed_settings.write_text("{}")
+    direct = claude_native.claude_catalog_fingerprint(None)
+    managed_settings.write_text(
+        json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"}})
+    )
+
+    assert claude_native.claude_catalog_fingerprint(None) != direct
 
 
 def test_ambient_env_is_non_anthropic_gateway_detects_databricks(

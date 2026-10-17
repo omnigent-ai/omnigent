@@ -46,6 +46,10 @@ HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 # daemon (producer) and server (consumer) so both can handle it structurally.
 WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 
+# Separates the summary of ``HostRunnerExitedFrame.error`` from the runner's log
+# tail, whose last line the server keeps when it shortens the report for storage.
+RUNNER_LOG_TAIL_HEADING = "--- runner log tail ---"
+
 # Capability tokens a host advertises in ``HostHelloFrame.capabilities``. A token
 # is present only in builds that have the feature, so the server gates on
 # presence — no host-version table to maintain, and a build that lacks the
@@ -58,6 +62,7 @@ CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
+CAP_MCP_REGISTRY = "mcp_registry"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
@@ -66,6 +71,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_PLUGINS,
     CAP_SKILL_CONTENT,
     CAP_MCP_TOOLS,
+    CAP_MCP_REGISTRY,
     CAP_MCP_INVENTORY,
     CAP_HARNESS_STARTUP,
 ]
@@ -206,6 +212,8 @@ class HostHelloFrame:
         (see ``HOST_CAPABILITIES`` / ``CAP_*``). Empty from an older host that
         predates a given capability, so the server treats absence as "not
         supported" without a version check.
+    :param connection_id: Host-minted identifier for this socket, shared with
+        server diagnostics. Absent from older hosts.
     """
 
     version: str
@@ -218,6 +226,7 @@ class HostHelloFrame:
     telemetry_opt_out: bool = False
     installation_id: str | None = None
     capabilities: list[str] = field(default_factory=list)
+    connection_id: str | None = None
 
 
 @dataclass
@@ -358,11 +367,15 @@ class HostRunnerExitedFrame:
         ``"runner_abc123..."``.
     :param error: Human-readable cause, e.g.
         ``"runner process exited with code 1 (log: ~/...) ..."``,
-        including the trailing lines of the runner's log.
+        followed by :data:`RUNNER_LOG_TAIL_HEADING` and the trailing
+        lines of the runner's log.
+    :param had_connected: Whether the runner touched its first-connect marker.
+        ``None`` when unavailable or reported by an older host.
     """
 
     runner_id: str
     error: str
+    had_connected: bool | None = None
 
 
 @dataclass
@@ -396,6 +409,8 @@ class HostRunnerStatusResultFrame:
 
         * ``"alive"`` — the host has this runner and its process is
           running (booting or serving). The runner is coming; wait.
+        * ``"sign_in_pending"`` — this live, unconnected runner is waiting
+          within its bounded host sign-in window. Keep the original input.
         * ``"dead"`` — the host has this runner but its process has
           exited. It will never connect; relaunch now.
         * ``"unknown"`` — the host has no record of this runner (it was
@@ -933,13 +948,16 @@ class HostFsWriteFrame:
 
     The read counterpart (:class:`HostFsRequestFrame`) is read-only by design;
     this carries the small set of writes the host can serve when the session's
-    runner is offline — currently the GitHub account/base preference
-    (``op="github_set_preference"``). The host runs the mutation against
+    runner is offline — currently the pull request panel's account/base
+    preference (``op="github_set_preference"``) and PR attach/remove
+    (``op="github_prs_update"``), for every git provider; the op names are
+    stable wire ids. The host runs the mutation against
     ``workspace`` and replies with the same :class:`HostFsResultFrame` a read
     would, so the result transport and correlation are shared.
 
     :param request_id: Correlates the result, e.g. ``"req_fsw_1"``.
-    :param op: Write op name — currently ``"github_set_preference"``.
+    :param op: Write op name — ``"github_set_preference"`` or
+        ``"github_prs_update"``.
     :param workspace: Absolute path to the session's workspace on the host.
     :param session_id: Session id, for parity with the read frame.
     :param params: Operation-specific arguments, e.g.
@@ -1353,6 +1371,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "telemetry_opt_out": frame.telemetry_opt_out,
                 "installation_id": frame.installation_id,
                 "capabilities": list(frame.capabilities),
+                "connection_id": frame.connection_id,
             }
         )
     if isinstance(frame, HostConnectionErrorFrame):
@@ -1418,6 +1437,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.RUNNER_EXITED.value,
                 "runner_id": frame.runner_id,
                 "error": frame.error,
+                "had_connected": frame.had_connected,
             }
         )
     if isinstance(frame, HostRunnerStatusFrame):
@@ -2237,6 +2257,7 @@ def _decode_host_hello(msg: _JsonObject) -> HostHelloFrame:
         telemetry_opt_out=bool(msg.get("telemetry_opt_out", False)),
         installation_id=_optional_nullable_str(msg, "installation_id"),
         capabilities=_optional_str_list(msg, "capabilities"),
+        connection_id=_optional_nullable_str(msg, "connection_id"),
     )
 
 
@@ -2330,6 +2351,9 @@ def _decode_runner_exited(msg: _JsonObject) -> HostRunnerExitedFrame:
     return HostRunnerExitedFrame(
         runner_id=_required_str(msg, "runner_id"),
         error=_required_str(msg, "error"),
+        had_connected=(
+            _required_bool(msg, "had_connected") if msg.get("had_connected") is not None else None
+        ),
     )
 
 
@@ -2774,12 +2798,15 @@ def _decode_skills_result(msg: _JsonObject) -> HostSkillsResultFrame:
     for skill in raw_skills:
         if not isinstance(skill, dict):
             raise ValueError("frame field must be a list of skill summaries: 'skills'")
-        skills.append(
-            {
-                "name": _required_str(skill, "name"),
-                "description": _required_str(skill, "description"),
-            }
-        )
+        summary = {
+            "name": _required_str(skill, "name"),
+            "description": _required_str(skill, "description"),
+        }
+        # Absent from older hosts; the menu falls back to ``name``.
+        display_name = _optional_nullable_str(skill, "display_name")
+        if display_name is not None:
+            summary["display_name"] = display_name
+        skills.append(summary)
     return HostSkillsResultFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),

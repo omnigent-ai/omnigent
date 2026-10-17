@@ -34,7 +34,6 @@ from omnigent.cli import (
     _dispatch_run,
     _display_db_uri,
     _ensure_sqlite_parent_dir,
-    _ensure_stdio_survives_unencodable_output,
     _expand_config_env_vars,
     _extract_global_logging_flags,
     _HostHttpResult,
@@ -1051,6 +1050,46 @@ def test_codex_args_no_config_is_cli_args_only(
 
     assert result.exit_code == 0, result.output
     assert captured["extra_args"] == ("--flag",)
+
+
+@pytest.mark.parametrize(
+    ("codex_args", "reserved"),
+    [
+        # A tool spawning its own app-server sidecar through the Omnigent launcher.
+        (
+            [
+                "app-server",
+                "--listen",
+                "ws://127.0.0.1:7101",
+                "-c",
+                "mcp_servers.demo.command=node",
+            ],
+            "app-server",
+        ),
+        (["--remote", "ws://127.0.0.1:7101"], "--remote"),
+        (["--remote=ws://127.0.0.1:7101"], "--remote"),
+    ],
+)
+def test_codex_cli_rejects_runner_owned_transport_args(
+    monkeypatch: pytest.MonkeyPatch,
+    codex_args: list[str],
+    reserved: str,
+) -> None:
+    """Runner-owned Codex transport args fail before a session or backend exists."""
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_backend",
+        lambda *_: pytest.fail("invalid args must not start the backend"),
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.main.run_codex_native",
+        lambda **_: pytest.fail("invalid args must not create a session"),
+    )
+
+    result = CliRunner().invoke(cli, ["codex", *codex_args])
+
+    assert result.exit_code == 2, result.output
+    assert f"'{reserved}' is reserved for Omnigent" in result.output
 
 
 def test_pi_config_args_form_base_cli_args_append(
@@ -3162,6 +3201,115 @@ def test_bundle_resolves_config_env_vars(
     # Non-secret fields survive bundling.
     assert parsed["name"] == "env-test-agent"
     assert parsed["llm"]["model"] == "openai/gpt-4o"
+
+
+def _agent_with_shared_skill(checkout: Path, *, git: bool = True) -> Path:
+    """Create a checkout with one agent and a skill stored outside its ``skills/``."""
+    checkout.mkdir(parents=True, exist_ok=True)
+    if git:
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    else:
+        # A stray directory named .git is not a checkout and must not widen the boundary.
+        (checkout / ".git").mkdir()
+    shared = checkout / "shared-skills" / "review-loop"
+    shared.mkdir(parents=True)
+    (shared / "SKILL.md").write_text(
+        "---\nname: review-loop\ndescription: Shared loop.\n---\nBody.\n"
+    )
+    (shared / "helper.py").write_text("print('helper')\n")
+    agent = checkout / "agents" / "fixer"
+    (agent / "skills").mkdir(parents=True)
+    _write_config(
+        agent,
+        {
+            "spec_version": 1,
+            "name": "fixer",
+            "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+        },
+    )
+    return agent
+
+
+@pytest.mark.parametrize("link", ["directory", "files", "hardlinks"])
+def test_bundle_includes_symlinked_skill_as_regular_files(tmp_path: Path, link: str) -> None:
+    """A skill linked from elsewhere in the checkout survives server-side extraction."""
+    from omnigent.spec import load
+    from omnigent.spec.tar_utils import extract_safe
+
+    agent = _agent_with_shared_skill(tmp_path)
+    linked = agent / "skills" / "review-loop"
+    if link == "directory":
+        linked.symlink_to(Path("../../../shared-skills/review-loop"))
+    elif link == "files":
+        linked.mkdir()
+        for name in ("SKILL.md", "helper.py"):
+            (linked / name).symlink_to(Path("../../../../shared-skills/review-loop") / name)
+    else:
+        # Two bundled paths sharing an inode must not become a hardlink member.
+        linked.mkdir()
+        shared = agent.parents[1] / "shared-skills" / "review-loop"
+        (linked / "SKILL.md").symlink_to(shared / "SKILL.md")
+        os.link(shared / "helper.py", linked / "helper.py")
+        (linked / "helper-alias.py").symlink_to(shared / "helper.py")
+
+    bundle_bytes = _bundle(agent)
+
+    with tarfile.open(fileobj=io.BytesIO(bundle_bytes), mode="r:gz") as tf:
+        assert tf.getmember("skills/review-loop/helper.py").isfile()
+    extracted = tmp_path / "extracted"
+    extract_safe(bundle_bytes, extracted)
+    assert [skill.name for skill in load(extracted).skills] == ["review-loop"]
+    assert (extracted / "skills/review-loop/helper.py").read_text() == "print('helper')\n"
+
+
+@pytest.mark.parametrize(
+    ("target", "message", "git"),
+    [
+        ("../../../shared-skills/missing", "dangling symlink", True),
+        ("../../../../outside", "outside", True),
+        ("../../../shared-skills/review-loop", "outside", False),
+        ("..", "symlink loop", True),
+        ("review-loop", "symlink loop", True),
+        ("../../../.git/config", "repository's .git directory", True),
+    ],
+)
+def test_bundle_rejects_unbundleable_symlinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str, message: str, git: bool
+) -> None:
+    """Links that cannot be bundled fail instead of silently dropping the skill."""
+    from omnigent.runtime import filesystem_registry
+
+    # Ignore any repository enclosing pytest's temp dir; only the fixture's own .git counts.
+    detect = filesystem_registry.detect_git_root
+    monkeypatch.setattr(
+        filesystem_registry,
+        "detect_git_root",
+        lambda path: root if (root := detect(path)) and root.is_relative_to(tmp_path) else None,
+    )
+    agent = _agent_with_shared_skill(tmp_path / "checkout", git=git)
+    (tmp_path / "outside").mkdir()
+    (agent / "skills" / "review-loop").symlink_to(Path(target))
+
+    with pytest.raises(OmnigentError, match=message):
+        _bundle(agent)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    [(0o600, r"cannot be resolved \(Permission denied\)"), (0o300, r"cannot be read")],
+)
+def test_bundle_reports_inaccessible_skill_paths(tmp_path: Path, mode: int, message: str) -> None:
+    """Permission failures are reported as such, not as dangling links or skipped content."""
+    agent = _agent_with_shared_skill(tmp_path)
+    shared = tmp_path / "shared-skills" / "review-loop"
+    (agent / "skills" / "review-loop").symlink_to(Path("../../../shared-skills/review-loop"))
+    shared.chmod(mode)
+    try:
+        with pytest.raises(OmnigentError, match=message):
+            _bundle(agent)
+    finally:
+        shared.chmod(0o755)
 
 
 def test_bundle_resolves_mcp_header_env_vars(
@@ -6219,82 +6367,6 @@ def test_run_bare_omnigent_with_harness_only_config(
     # harness default must be forwarded; no target was set
     assert dispatched["harness"] == "claude-sdk"
     assert dispatched["target"] is None
-
-
-class _FakeStream:
-    """A stdio stub recording ``reconfigure`` calls for the stdio-hardening test."""
-
-    def __init__(self, encoding: str, *, raises: bool = False) -> None:
-        self.encoding = encoding
-        self.raises = raises
-        self.reconfigured: dict[str, object] | None = None
-
-    def reconfigure(self, **kwargs: object) -> None:
-        if self.raises:
-            raise ValueError("stream detached")
-        self.reconfigured = kwargs
-        self.encoding = str(kwargs.get("encoding", self.encoding))
-
-
-def test_stdio_hardening_reconfigures_legacy_windows_streams(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """On Windows, non-UTF-8 stdio is reconfigured to utf-8/replace."""
-    monkeypatch.setattr(sys, "platform", "win32")
-    out, err = _FakeStream("cp1252"), _FakeStream("cp1252")
-    monkeypatch.setattr(sys, "stdout", out)
-    monkeypatch.setattr(sys, "stderr", err)
-
-    _ensure_stdio_survives_unencodable_output()
-
-    assert out.reconfigured == {"encoding": "utf-8", "errors": "replace"}
-    assert err.reconfigured == {"encoding": "utf-8", "errors": "replace"}
-
-
-def test_stdio_hardening_relaxes_errors_on_posix_legacy_stream(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A legacy-encoding stream off Windows keeps its encoding, relaxed errors.
-
-    ``PYTHONIOENCODING=cp1252`` (or a C/latin-1 locale) reproduces the same
-    mid-command ``UnicodeEncodeError`` on any OS; the stream must degrade
-    unencodable glyphs instead of aborting, without changing the encoding
-    the consumer asked for.
-    """
-    monkeypatch.setattr(sys, "platform", "linux")
-    out, err = _FakeStream("cp1252"), _FakeStream("cp1252")
-    monkeypatch.setattr(sys, "stdout", out)
-    monkeypatch.setattr(sys, "stderr", err)
-
-    _ensure_stdio_survives_unencodable_output()
-
-    assert out.reconfigured == {"errors": "replace"}
-    assert err.reconfigured == {"errors": "replace"}
-    assert out.encoding == "cp1252"
-
-
-def test_stdio_hardening_skips_already_utf8(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A UTF-8 stream is not reconfigured again (any platform)."""
-    for platform in ("win32", "linux"):
-        monkeypatch.setattr(sys, "platform", platform)
-        out = _FakeStream("utf-8")
-        monkeypatch.setattr(sys, "stdout", out)
-        monkeypatch.setattr(sys, "stderr", _FakeStream("utf-8"))
-
-        _ensure_stdio_survives_unencodable_output()
-
-        assert out.reconfigured is None
-
-
-def test_stdio_hardening_tolerates_reconfigure_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A stream whose ``reconfigure`` raises does not abort startup."""
-    monkeypatch.setattr(sys, "platform", "win32")
-    monkeypatch.setattr(sys, "stdout", _FakeStream("cp1252", raises=True))
-    monkeypatch.setattr(sys, "stderr", _FakeStream("cp1252", raises=True))
-
-    _ensure_stdio_survives_unencodable_output()  # must not raise
 
 
 def test_bare_omnigent_harness_flag_dispatches_to_run(

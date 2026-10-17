@@ -275,7 +275,20 @@ async def test_list_filesystem_survives_idle_mock_host(
         (
             {"skills": [{"name": "toolkit:review", "description": "Review changes"}]},
             200,
-            {"skills": [{"name": "toolkit:review", "description": "Review changes"}]},
+            {
+                "skills": [
+                    {
+                        "name": "toolkit:review",
+                        "description": "Review changes",
+                        "display_name": None,
+                    }
+                ]
+            },
+        ),
+        (
+            {"skills": [{"name": "ste", "description": "STE", "display_name": "Simplified STE"}]},
+            200,
+            {"skills": [{"name": "ste", "description": "STE", "display_name": "Simplified STE"}]},
         ),
         ({"skills": []}, 200, {"skills": []}),
         (
