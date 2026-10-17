@@ -237,8 +237,8 @@ import {
   nativeWrapperLabelsForAgent,
 } from "@/lib/nativeCodingAgents";
 import {
-  CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
-  CLAUDE_NATIVE_PERMISSION_MODES,
+  CLAUDE_NATIVE_INHERIT_PERMISSION_MODE,
+  CLAUDE_NATIVE_NEW_CHAT_PERMISSION_MODES,
 } from "@/lib/claudePermissionMode";
 import {
   AGY_NATIVE_DEFAULT_SKIP_MODE,
@@ -2552,7 +2552,7 @@ export function NewChatLandingScreen() {
   }, [projectParam]);
   // Claude Code permission mode, selected from the composer permissions menu.
   const [permissionMode, setPermissionMode] = useState<string>(
-    () => restoredDraft?.permissionMode ?? CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
+    () => restoredDraft?.permissionMode ?? CLAUDE_NATIVE_INHERIT_PERMISSION_MODE,
   );
   // Codex approval preset, selected from the composer permissions menu.
   const [approvalMode, setApprovalMode] = useState<string>(
@@ -3410,7 +3410,7 @@ export function NewChatLandingScreen() {
         ? EFFORT_UNAVAILABLE_PLACEHOLDER
         : normalizeEffortLabel(pickedEffort);
       const permissionValue =
-        CLAUDE_NATIVE_PERMISSION_MODES.find((m) => m.value === permissionMode)?.label ??
+        CLAUDE_NATIVE_NEW_CHAT_PERMISSION_MODES.find((m) => m.value === permissionMode)?.label ??
         permissionMode;
       return [
         { label: "Model", value: modelValue },
@@ -4046,7 +4046,7 @@ export function NewChatLandingScreen() {
   const directModeOptions = smartRoutingHarnessSelected
     ? []
     : supportsPermissionMode
-      ? CLAUDE_NATIVE_PERMISSION_MODES
+      ? CLAUDE_NATIVE_NEW_CHAT_PERMISSION_MODES
       : supportsApprovalMode
         ? selectedNativeHarness === "codex-native"
           ? codexCreateApprovalOptions()
@@ -4181,7 +4181,7 @@ export function NewChatLandingScreen() {
     }
     if (supportsPermissionMode) {
       setPermissionMode(
-        resolve(CLAUDE_NATIVE_PERMISSION_MODES, CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE),
+        resolve(CLAUDE_NATIVE_NEW_CHAT_PERMISSION_MODES, CLAUDE_NATIVE_INHERIT_PERMISSION_MODE),
       );
       // The model + effort picker remembers its own last pick (same per-harness
       // snapshot the mode knob uses), validated against the current vocab. With
@@ -4339,7 +4339,7 @@ export function NewChatLandingScreen() {
   // resetting would clobber the mode of whatever native harness comes next.
   useEffect(() => {
     if (pickedHarness !== AUTO_NATIVE_HARNESS_ID) return;
-    setPermissionMode(CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE);
+    setPermissionMode(CLAUDE_NATIVE_INHERIT_PERMISSION_MODE);
   }, [pickedHarness]);
   // Native harnesses receive skill invocations as plain text for their CLI to interpret.
   const isNativeTerminalAgent = isNativeCodingAgent(selectedAgent);
@@ -5714,11 +5714,12 @@ export function NewChatLandingScreen() {
               [CLIENT_CREATE_TOKEN_LABEL]: createToken,
             },
             // Permission / approval / cursor mode → CLI flag pair, persisted as
-            // terminal_launch_args. Omitted for the default and non-native agents.
+            // terminal_launch_args. Omitted for the no-flag Default and
+            // non-native agents; "Manual" sends --permission-mode default.
             terminal_launch_args: smartRoutingHarnessSelected
               ? undefined
               : agentSupportsPermissionMode &&
-                  permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
+                  permissionMode !== CLAUDE_NATIVE_INHERIT_PERMISSION_MODE
                 ? ["--permission-mode", permissionMode]
                 : agentSupportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
                   ? (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.args ?? [])
