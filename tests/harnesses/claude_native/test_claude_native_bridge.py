@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 import unicodedata
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from http.client import BadStatusLine, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10185,6 +10185,117 @@ def test_readiness_detects_dead_pane_on_next_liveness_probe(
 
     assert clock.monotonic() == 1.5
     assert probe.call_count == 2
+
+
+def _patch_busy_boot(
+    monkeypatch: pytest.MonkeyPatch,
+    clock: _VirtualClock,
+    cpu_seconds: Callable[[float], float | None],
+    *,
+    ready_at: float | None = None,
+) -> None:
+    """
+    Run the readiness gate on *clock* with a 0.75 s hard cap and a 5 s ceiling.
+
+    :param monkeypatch: Fixture used to patch the gate's probes and timings.
+    :param clock: Virtual clock the gate polls and sleeps on.
+    :param cpu_seconds: The pane tree's CPU reading at a given clock time.
+    :param ready_at: Clock time the composer renders, or ``None`` for never.
+    """
+    monkeypatch.setattr(claude_native_bridge, "time", clock)
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.25)
+    monkeypatch.setattr(claude_native_bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 0.75)
+    monkeypatch.setattr(claude_native_bridge, "_TMUX_READY_BUSY_BOOT_WINDOW_S", 0.5)
+    monkeypatch.setattr(claude_native_bridge, "_TMUX_READY_BUSY_BOOT_MIN_CPU_S", 2.0)
+    monkeypatch.setattr(claude_native_bridge, "_TMUX_READY_BUSY_BOOT_CEILING_S", 5.0)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda *_: (
+            _READY_PANE
+            if ready_at is not None and clock.monotonic() >= ready_at
+            else _BOOTING_PANE
+        ),
+    )
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_claude_pane_state",
+        lambda *_: claude_native_bridge._ClaudePaneState(True),
+    )
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_claude_pane_cpu_seconds",
+        lambda *_: cpu_seconds(clock.monotonic()),
+    )
+
+
+def test_readiness_keeps_waiting_past_the_cap_while_the_boot_burns_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A boot still busy at the hard cap is waited out until the composer renders.
+
+    On a slow host a launcher and a cold plugin load can take minutes, so
+    the cap alone reaped a pane that was seconds from ready, on every
+    relaunch. Its processes kept using CPU, which a parked pane does not.
+    """
+    clock = _VirtualClock()
+    _patch_busy_boot(monkeypatch, clock, lambda now: now * 10.0, ready_at=2.0)
+
+    claude_native_bridge._wait_for_claude_prompt_ready("/tmp/sock", "main", timeout_s=0.0)
+
+    assert clock.monotonic() == 2.0
+
+
+@pytest.mark.parametrize("reading", ["idle", "unreadable"])
+def test_readiness_stops_at_the_cap_without_cpu_progress(
+    monkeypatch: pytest.MonkeyPatch, reading: str
+) -> None:
+    """A live pane that uses no CPU, or whose CPU can't be read, still stops at the cap."""
+    clock = _VirtualClock()
+
+    def cpu(now: float) -> float | None:
+        return 3.0 if reading == "idle" else None
+
+    _patch_busy_boot(monkeypatch, clock, cpu, ready_at=2.0)
+
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout):
+        claude_native_bridge._wait_for_claude_prompt_ready("/tmp/sock", "main", timeout_s=0.0)
+
+    assert clock.monotonic() == 0.75
+
+
+def test_readiness_busy_boot_wait_stops_at_the_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pane that keeps burning CPU but never renders the composer stops at the ceiling."""
+    clock = _VirtualClock()
+    _patch_busy_boot(monkeypatch, clock, lambda now: now * 10.0)
+
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready("/tmp/sock", "main", timeout_s=0.0)
+
+    assert clock.monotonic() == 5.0
+    assert "did not become ready within 5.0s" in str(excinfo.value)
+
+
+def test_claude_pane_cpu_seconds_reads_the_pane_process_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pane's pid comes from tmux; its process tree's CPU time comes from psutil."""
+    answers = iter(
+        [
+            subprocess.CompletedProcess([], 0, stdout=f"{os.getpid()}\n", stderr=""),
+            subprocess.CompletedProcess([], 1, stdout="", stderr="no server running"),
+            subprocess.CompletedProcess([], 0, stdout="\n", stderr=""),
+        ]
+    )
+    monkeypatch.setattr(subprocess, "run", lambda *_a, **_k: next(answers))
+
+    used = claude_native_bridge._claude_pane_cpu_seconds("/tmp/sock", "main")
+    assert used is not None and used > 0.0
+    assert claude_native_bridge._claude_pane_cpu_seconds("/tmp/sock", "main") is None
+    assert claude_native_bridge._claude_pane_cpu_seconds("/tmp/sock", "main") is None
 
 
 def test_claude_pane_state_distinguishes_dead_pane_from_unanswered_probe(
