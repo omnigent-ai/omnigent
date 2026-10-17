@@ -245,9 +245,7 @@ def build_native_controls(
     _ensure_comment_relay_started: _EnsureCommentRelayStartedFn,
     _ensure_native_terminal_for_turn: Callable[[str, str | None], Coroutine[Any, Any, None]],
     _fetch_session_model_override: Callable[[str], Coroutine[Any, Any, str | None]],
-    _ingest_cond: dict[str, asyncio.Condition],
-    _ingest_next_seq: dict[str, int],
-    _ingest_now_serving: dict[str, int],
+    _finish_ingest_turn: Callable[[str, int], Coroutine[Any, Any, None]],
     _load_history_as_input: _LoadHistoryAsInputFn,
     _model_dialog_watchers: set[asyncio.Task[None]],
     _native_cost_popup_config_file: Callable[[str, str], Coroutine[Any, Any, Path]],
@@ -266,6 +264,7 @@ def build_native_controls(
     _session_message_buffers: dict[str, list[dict[str, Any]]],
     _session_reasoning_effort: dict[str, str],
     _session_spec_cache: dict[str, _SpecEntry | None],
+    _wait_for_ingest_turn: Callable[[str], Coroutine[Any, Any, int]],
     resource_registry: SessionResourceRegistry,
     server_client: httpx.AsyncClient,
 ) -> NativeControls:
@@ -2036,15 +2035,7 @@ def build_native_controls(
         # the slot — the two turns then clobber each other's `_active_turns`
         # entry and race the single live SDK client. Under the gate one reaches
         # its bind before the other's check, so the loser buffers instead.
-        _seq = _ingest_next_seq.get(conv_id, 0)
-        _ingest_next_seq[conv_id] = _seq + 1
-        _cond = _ingest_cond.get(conv_id)
-        if _cond is None:
-            _cond = asyncio.Condition()
-            _ingest_cond[conv_id] = _cond
-        async with _cond:
-            while _ingest_now_serving.get(conv_id, 0) != _seq:
-                await _cond.wait()
+        _seq = await _wait_for_ingest_turn(conv_id)
         try:
             # A turn is already running: buffer so /compact runs as the next turn
             # rather than racing the live one; the buffer drains via
@@ -2095,9 +2086,7 @@ def build_native_controls(
                 raise
             return Response(status_code=200)
         finally:
-            async with _cond:
-                _ingest_now_serving[conv_id] = _seq + 1
-                _cond.notify_all()
+            await _finish_ingest_turn(conv_id, _seq)
 
     async def _handle_claude_native_cost_popup(
         conv_id: str,

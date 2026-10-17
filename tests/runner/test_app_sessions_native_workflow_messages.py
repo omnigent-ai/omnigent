@@ -867,6 +867,74 @@ async def test_messages_reach_harness_in_submission_order() -> None:
 
 
 @pytest.mark.asyncio
+async def test_messages_cancelled_in_the_ingest_queue_do_not_block_later_ones() -> None:
+    """A message cancelled while queued behind another gives up its place.
+
+    The tunnel cancels in-flight requests when it disconnects. A message
+    cancelled while waiting at the ingest gate must not leave its slot
+    unserved, or every later message for the session waits forever.
+    """
+    hc = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    server = _GatedFileServerClient()
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(hc),  # type: ignore[arg-type]
+        server_client=server,  # type: ignore[arg-type]
+    )
+    url = "/v1/sessions/0d6c1d4f1b0e4f0e9a6c2b7d8e5f4a31/events"
+
+    def _message(text: str, *, gated_image: bool = False) -> dict[str, Any]:
+        """Build a user message, optionally carrying the gated image."""
+        content: list[dict[str, Any]] = [{"type": "input_text", "text": text}]
+        if gated_image:
+            content.insert(
+                0,
+                {
+                    "type": "input_image",
+                    "file_id": "c531a3c97ad5fca15709d73d1f734a0c",
+                    "filename": "a.png",
+                },
+            )
+        return {
+            "type": "message",
+            "role": "user",
+            "model": "test-agent",
+            "content": content,
+            "harness": "openai-agents",
+        }
+
+    async with _runner_client(app) as client:
+        # Alpha passes the gate and parks inside content resolution.
+        alpha_task = asyncio.create_task(
+            client.post(url, json=_message("alpha", gated_image=True))
+        )
+        await asyncio.wait_for(server.meta_fetch_started.wait(), timeout=5.0)
+        # Bravo and charlie queue behind alpha, then are cancelled while waiting.
+        queued = [
+            asyncio.create_task(client.post(url, json=_message(text)))
+            for text in ("bravo", "charlie")
+        ]
+        await asyncio.sleep(0.05)
+        for task in queued:
+            task.cancel()
+        await asyncio.gather(*queued, return_exceptions=True)
+
+        server.release.set()
+        alpha_resp = await asyncio.wait_for(alpha_task, timeout=5.0)
+        delta_resp = await asyncio.wait_for(client.post(url, json=_message("delta")), timeout=5.0)
+
+    assert alpha_resp.status_code == 202
+    assert delta_resp.status_code == 202
+    delivered = [text for body in hc.posted_bodies for text in _ordered_user_texts(body)]
+    assert "bravo" not in delivered
+    assert "charlie" not in delivered
+
+
+@pytest.mark.asyncio
 async def test_forwarded_model_override_reaches_the_harness() -> None:
     """A routed model rides the forwarded message all the way to the harness.
 

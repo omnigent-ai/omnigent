@@ -1407,6 +1407,8 @@ def create_runner_app(
     _ingest_next_seq: dict[str, int] = {}
     _ingest_now_serving: dict[str, int] = {}
     _ingest_cond: dict[str, asyncio.Condition] = {}
+    # Tickets whose holders were cancelled before being served; serving skips them.
+    _ingest_abandoned: dict[str, set[int]] = {}
     _interrupted_sessions: set[str] = set()
     app.state.interrupted_sessions = _interrupted_sessions
     # Desynced conversations; cleared when a fresh turn binds.
@@ -3379,6 +3381,7 @@ def create_runner_app(
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
         _ingest_cond.pop(session_id, None)
+        _ingest_abandoned.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -4291,18 +4294,55 @@ def create_runner_app(
         _background_tasks.add(waiter)
         waiter.add_done_callback(_background_tasks.discard)
 
+    async def _wait_for_ingest_turn(session_id: str) -> int:
+        """Take the session's next ingest ticket and wait until it is served.
+
+        Message ingest for a session runs one caller at a time, in arrival
+        order. Pass the returned ticket to ``_finish_ingest_turn`` in a
+        ``finally``. A caller cancelled while waiting gives its ticket up here,
+        so the callers queued behind it are still served.
+
+        :param session_id: Session whose ingest is serialized.
+        :returns: The caller's ticket.
+        """
+        seq = _ingest_next_seq.get(session_id, 0)
+        _ingest_next_seq[session_id] = seq + 1
+        cond = _ingest_cond.setdefault(session_id, asyncio.Condition())
+        try:
+            async with cond:
+                while _ingest_now_serving.get(session_id, 0) != seq:
+                    await cond.wait()
+        except asyncio.CancelledError:
+            await _finish_ingest_turn(session_id, seq)
+            raise
+        return seq
+
+    async def _finish_ingest_turn(session_id: str, seq: int) -> None:
+        """Release an ingest ticket taken by ``_wait_for_ingest_turn``.
+
+        A ticket that is not being served yet is recorded as abandoned and
+        skipped when its turn comes.
+
+        :param session_id: Session whose ingest is serialized.
+        :param seq: The ticket to release.
+        """
+        cond = _ingest_cond.setdefault(session_id, asyncio.Condition())
+        async with cond:
+            abandoned = _ingest_abandoned.setdefault(session_id, set())
+            if _ingest_now_serving.get(session_id, 0) != seq:
+                abandoned.add(seq)
+                return
+            seq += 1
+            while seq in abandoned:
+                abandoned.remove(seq)
+                seq += 1
+            _ingest_now_serving[session_id] = seq
+            cond.notify_all()
+
     async def _check_and_start_next_turn(
         session_id: str,
     ) -> None:
-        _seq = _ingest_next_seq.get(session_id, 0)
-        _ingest_next_seq[session_id] = _seq + 1
-        _cond = _ingest_cond.get(session_id)
-        if _cond is None:
-            _cond = asyncio.Condition()
-            _ingest_cond[session_id] = _cond
-        async with _cond:
-            while _ingest_now_serving.get(session_id, 0) != _seq:
-                await _cond.wait()
+        _seq = await _wait_for_ingest_turn(session_id)
         try:
             if session_id in _active_turns:
                 return
@@ -4380,9 +4420,7 @@ def create_runner_app(
             )
             _background_tasks.add(_turn_task)
         finally:
-            async with _cond:
-                _ingest_now_serving[session_id] = _seq + 1
-                _cond.notify_all()
+            await _finish_ingest_turn(session_id, _seq)
 
     app.state.check_and_start_next_turn = _check_and_start_next_turn
 
@@ -6478,15 +6516,7 @@ def create_runner_app(
             if _is_native_harness(conversation_id):
                 resource_registry.note_session_turn_started(conversation_id)
 
-            _seq = _ingest_next_seq.get(conversation_id, 0)
-            _ingest_next_seq[conversation_id] = _seq + 1
-            _cond = _ingest_cond.get(conversation_id)
-            if _cond is None:
-                _cond = asyncio.Condition()
-                _ingest_cond[conversation_id] = _cond
-            async with _cond:
-                while _ingest_now_serving.get(conversation_id, 0) != _seq:
-                    await _cond.wait()
+            _seq = await _wait_for_ingest_turn(conversation_id)
             try:
                 _raw_content = message_body.get("content")
                 if isinstance(_raw_content, list):
@@ -6642,9 +6672,7 @@ def create_runner_app(
                     },
                 )
             finally:
-                async with _cond:
-                    _ingest_now_serving[conversation_id] = _seq + 1
-                    _cond.notify_all()
+                await _finish_ingest_turn(conversation_id, _seq)
 
         if body_type == "interrupt":
             _cancel_claude_prompt_waiter(conversation_id)
@@ -7296,9 +7324,7 @@ def create_runner_app(
         _ensure_comment_relay_started=_ensure_comment_relay_started,
         _ensure_native_terminal_for_turn=_ensure_native_terminal_for_turn,
         _fetch_session_model_override=_fetch_session_model_override,
-        _ingest_cond=_ingest_cond,
-        _ingest_next_seq=_ingest_next_seq,
-        _ingest_now_serving=_ingest_now_serving,
+        _finish_ingest_turn=_finish_ingest_turn,
         _load_history_as_input=_load_history_as_input,
         _model_dialog_watchers=_model_dialog_watchers,
         _native_cost_popup_config_file=_native_cost_popup_config_file,
@@ -7315,6 +7341,7 @@ def create_runner_app(
         _session_message_buffers=_session_message_buffers,
         _session_reasoning_effort=_session_reasoning_effort,
         _session_spec_cache=_session_spec_cache,
+        _wait_for_ingest_turn=_wait_for_ingest_turn,
         resource_registry=resource_registry,
         server_client=server_client,
     )
