@@ -32,6 +32,7 @@ from omnigent.host.connect import (
     HostRetryableConnectionError,
     ModelOptionsResult,
     _build_runner_env,
+    _connection_refused,
     _runner_exit_error,
     _RunnerHandle,
     run_host_process,
@@ -807,6 +808,45 @@ def _make_host_process() -> HostProcess:
         identity=identity,
         server_url="http://localhost:8000",
     )
+
+
+async def test_local_host_does_not_dial_port_after_its_server_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local host whose server is gone never registers on the port's next owner.
+
+    Registering there would rotate away the same-name row of the host that
+    owns that server, leaving it connected but invisible to ``GET /v1/hosts``.
+    """
+    owned = [True]
+    host = HostProcess(
+        identity=HostIdentity(host_id="host_test_connect", name="test-laptop"),
+        server_url="http://127.0.0.1:6767",
+        server_still_ours=lambda: owned[0],
+    )
+    dialed: list[str] = []
+
+    class _RejectedConnection:
+        async def __aenter__(self) -> None:
+            raise ConnectionError("dialed")
+
+    def _connect(url: str, **_kwargs: object) -> _RejectedConnection:
+        dialed.append(url)
+        return _RejectedConnection()
+
+    monkeypatch.setattr(host, "_build_connect_headers", dict)
+    monkeypatch.setattr("omnigent.host.connect.websockets.asyncio.client.connect", _connect)
+
+    with pytest.raises(ConnectionError, match="dialed"):
+        await host._connect_and_serve()
+    assert len(dialed) == 1
+
+    owned[0] = False
+    with pytest.raises(ConnectionRefusedError) as refused:
+        await host._connect_and_serve()
+    assert len(dialed) == 1
+    # Counted as refused, so the loopback give-up bound still applies.
+    assert _connection_refused(refused.value)
 
 
 def _cleanup_host(host: HostProcess) -> None:

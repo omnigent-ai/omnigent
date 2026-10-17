@@ -236,9 +236,17 @@ def test_background_daemon_claims_record_before_connecting(
 
     connected: list[str] = []
 
-    def _run(*, server_url: str, daemon_target: str, lifecycle_lock: object) -> None:
+    def _run(
+        *,
+        server_url: str,
+        daemon_target: str,
+        lifecycle_lock: object,
+        server_still_ours: object,
+    ) -> None:
         assert record_flock_is_held(daemon_record_path(target, base_dir=tmp_path)) is True
         assert lifecycle_lock is not None
+        # An explicit server URL is the user's choice; there is no local server to own.
+        assert server_still_ours is None
         connected.append(f"{server_url}|{daemon_target}")
 
     monkeypatch.setattr("omnigent.host.connect.run_host_process", _run)
@@ -251,6 +259,48 @@ def test_background_daemon_claims_record_before_connecting(
     assert payload["config_sig"] == "config-signature"
     assert connected == [f"{target}|{target}"]
     assert record_flock_is_held(daemon_record_path(target, base_dir=tmp_path)) is False
+
+
+def test_local_daemon_binds_reconnects_to_its_own_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``--local`` daemon only reconnects while its own server holds the URL."""
+    from omnigent.host import _daemon_entry, local_server
+    from omnigent.host import identity as identity_module
+    from omnigent.process_logging import DATA_DIR_ENV_VAR
+
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["omnigent.host._daemon_entry", "--local"])
+    monkeypatch.setattr(
+        "omnigent.process_logging.configure_process_logging",
+        lambda *_a, **_kw: tmp_path / "host.log",
+    )
+    monkeypatch.setattr(
+        identity_module,
+        "load_or_create_host_identity",
+        lambda: HostIdentity(host_id="host_local", name="local"),
+    )
+    monkeypatch.setattr(
+        local_server,
+        "ensure_local_omnigent_server",
+        lambda: local_server.LocalServerStartup(url="http://127.0.0.1:6767", spawned=True),
+    )
+    checked: list[str] = []
+    monkeypatch.setattr(
+        local_server, "local_server_still_serves", lambda url: checked.append(url) or False
+    )
+    checks: list[object] = []
+    monkeypatch.setattr(
+        "omnigent.host.connect.run_host_process",
+        lambda **kwargs: checks.append(kwargs["server_still_ours"]),
+    )
+
+    _daemon_entry.main()
+
+    [check] = checks
+    assert callable(check)
+    assert check() is False
+    assert checked == ["http://127.0.0.1:6767"]
 
 
 def test_background_daemon_loser_exits_before_connecting(
