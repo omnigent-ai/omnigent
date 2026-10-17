@@ -418,6 +418,12 @@ class _HelperProcessClient:
         # helper itself. Cleared in :meth:`_stop_egress_proxy_locked`.
         self._egress_relay_port: int | None = None
         self._proc: subprocess.Popen[str] | None = None
+        # PDEATHSIG (bwrap's ``--die-with-parent``) tracks *thread* lifetime, so
+        # the helper is spawned by an owned thread that parks until teardown:
+        # keep the helper's spawning thread alive until ``close()``. See
+        # :meth:`_start_helper_from_owned_thread_locked` (issue #8956).
+        self._spawn_thread: threading.Thread | None = None
+        self._spawn_thread_exit: threading.Event | None = None
         # Parent-held containment handle from the sandbox backend's
         # post_spawn hook (e.g. a Windows Job Object). Closed in
         # ``_stop_locked`` to tear down the helper's process tree.
@@ -480,7 +486,75 @@ class _HelperProcessClient:
     def _ensure_started_locked(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
             return
-        self._start_locked()
+        # A helper that died on its own leaves its spawn thread parked even though
+        # the process is gone; retire it before starting a replacement so these
+        # threads do not accumulate across restarts.
+        self._retire_spawn_thread_locked()
+        self._start_helper_from_owned_thread_locked()
+
+    def _start_helper_from_owned_thread_locked(self) -> None:
+        """Start the helper from a thread that outlives the triggering request.
+
+        Keep the helper's spawning thread alive until teardown; PDEATHSIG tracks
+        thread lifetime, and ``run_sync_on_thread`` runs every request on a fresh
+        short-lived thread (issue #8956). The thread starts the helper, then parks
+        until ``_stop_locked`` retires it.
+
+        Caller must hold :attr:`_lock`.
+        """
+        exit_event = threading.Event()
+        started = threading.Event()
+        failure: list[BaseException] = []
+
+        def _spawn() -> None:
+            try:
+                self._start_locked()
+            except BaseException as exc:  # noqa: BLE001 — forwarded to the requesting thread below
+                failure.append(exc)
+            finally:
+                started.set()
+            exit_event.wait()
+
+        thread = threading.Thread(
+            target=_spawn,
+            name="omnigent-os-env-helper-spawn",
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except BaseException:
+            # Publish ownership only once the thread is actually running. An
+            # unstarted thread left behind here makes the next
+            # ``_retire_spawn_thread_locked`` raise "cannot join thread before it
+            # is started", which poisons every later request and aborts
+            # ``close()`` before it finishes tearing the environment down.
+            self._spawn_thread = None
+            self._spawn_thread_exit = None
+            raise
+        self._spawn_thread = thread
+        self._spawn_thread_exit = exit_event
+        started.wait()
+        if failure:
+            self._retire_spawn_thread_locked()
+            raise failure[0]
+
+    def _retire_spawn_thread_locked(self) -> None:
+        """Retire the helper's spawn thread, letting it stop being the PDEATHSIG parent.
+
+        Called on every restart and from ``_stop_locked``. Retiring the thread while
+        the helper is still running kills it — which is the intended containment
+        behaviour, and why ``_stop_locked`` tears the process down first.
+
+        Caller must hold :attr:`_lock`.
+        """
+        thread = self._spawn_thread
+        exit_event = self._spawn_thread_exit
+        self._spawn_thread = None
+        self._spawn_thread_exit = None
+        if exit_event is not None:
+            exit_event.set()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1)
 
     def _start_locked(self) -> None:
         try:
@@ -736,6 +810,10 @@ class _HelperProcessClient:
                 with contextlib.suppress(Exception):
                     self._sandbox_handle.close()
                 self._sandbox_handle = None
+            # Parent-side teardown last: the process above is already gone, so
+            # letting the spawn thread leave (and with it the PDEATHSIG parent)
+            # costs nothing and leaves no parked thread behind.
+            self._retire_spawn_thread_locked()
             self._stop_egress_proxy_locked()
             if self._git_ssh_broker is not None:
                 try:
