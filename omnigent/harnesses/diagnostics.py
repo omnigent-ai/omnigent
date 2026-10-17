@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from omnigent.process_logging import redact_log_text
@@ -116,6 +117,12 @@ _ECHOED_CONTROL = re.compile(r"\^\[(?:\[[0-9;?]*[A-Za-z~]?)?")
 _SIGN_IN_CODE = re.compile(
     r"\b(?:[A-Z0-9]{4,8}-[A-Z0-9]{4,8}|(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-Z])[A-Z0-9]{6,9})\b"
 )
+# The same shape in any case, for checks that withhold rather than lift a code.
+_SIGN_IN_CODE_ANY_CASE = re.compile(_SIGN_IN_CODE.pattern, re.IGNORECASE)
+# A value labelled as a code, e.g. "code: HQ7M-2KPD", needs no sign-in wording.
+_LABELLED_SIGN_IN_CODE = re.compile(
+    r"\bcode\s*[:=]\s*(?:" + _SIGN_IN_CODE.pattern + r")", re.IGNORECASE
+)
 
 
 def _nearby(lines: list[str], index: int) -> str:
@@ -132,6 +139,53 @@ def _is_reprint(line: str, url: str) -> bool:
     """Whether ``line`` is just ``url`` again or another endpoint (an earlier attempt's link)."""
     text = line.strip().rstrip(".,;:")
     return text == url or (_SIGN_IN_URL.fullmatch(text) is not None and _is_endpoint(text))
+
+
+def _sign_in_addresses(lines: list[str]) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
+    """Return the auth-shaped and the cue-adjacent addresses on screen with their line indexes."""
+    addresses = [
+        (index, match.group(0).rstrip(".,;:"))
+        for index, line in enumerate(lines)
+        for match in _SIGN_IN_URL.finditer(line)
+    ]
+    endpoints = [(index, url) for index, url in addresses if _is_endpoint(url)]
+    cued = [(index, url) for index, url in addresses if _SIGN_IN_CUE.search(_nearby(lines, index))]
+    return endpoints, cued
+
+
+def contains_sign_in_material(screen: str | None) -> bool:
+    """Whether a sign-in address or device code is on screen, actionable or not.
+
+    :func:`detect_sign_in_prompt` rejects a prompt the launcher has moved past,
+    but the address and one-time code it printed are still on screen and still
+    secret. Diagnostics that export pane text use this broader check to decide
+    whether the text may be logged at all, so it errs toward withholding: sign-in
+    wording anywhere with a code-shaped token anywhere counts, as do a value
+    labelled ``code:`` and a line holding only a device code. A line that merely
+    mentions a code counts only beside sign-in wording, whatever the code looks
+    like: "Claude Code" is on most launcher lines.
+
+    :param screen: ANSI-stripped terminal screen text, or ``None``.
+    :returns: ``True`` when any sign-in material is on screen.
+    """
+    if not screen:
+        return False
+    lines = screen.splitlines()
+    endpoints, cued = _sign_in_addresses(lines)
+    if endpoints or cued:
+        return True
+    # A code may sit anywhere below its prompt, or outlive a prompt that scrolled away.
+    if _SIGN_IN_CUE.search(screen) and _SIGN_IN_CODE_ANY_CASE.search(screen):
+        return True
+    if _LABELLED_SIGN_IN_CODE.search(screen):
+        return True
+    # A line that is nothing but a device code, e.g. left behind by a scrolled-off prompt.
+    if any(_SIGN_IN_CODE.fullmatch(line.strip()) for line in lines):
+        return True
+    return any(
+        _SIGN_IN_CODE_LINE.search(line) and _SIGN_IN_CUE.search(_nearby(lines, index))
+        for index, line in enumerate(lines)
+    )
 
 
 def detect_sign_in_prompt(screen: str | None) -> SignInPrompt | None:
@@ -164,13 +218,7 @@ def detect_sign_in_prompt(screen: str | None) -> SignInPrompt | None:
     if not screen:
         return None
     lines = screen.splitlines()
-    addresses = [
-        (index, match.group(0).rstrip(".,;:"))
-        for index, line in enumerate(lines)
-        for match in _SIGN_IN_URL.finditer(line)
-    ]
-    endpoints = [(index, url) for index, url in addresses if _is_endpoint(url)]
-    cued = [(index, url) for index, url in addresses if _SIGN_IN_CUE.search(_nearby(lines, index))]
+    endpoints, cued = _sign_in_addresses(lines)
     if not endpoints and not cued:
         return None
     url = endpoints[-1][1] if endpoints else cued[0][1]
@@ -229,3 +277,85 @@ def sign_in_next_step(agent: str) -> str:
         f"Open the sign-in link and sign in. {agent} continues on its own once the "
         "sign-in completes; then send your message again."
     )
+
+
+# Key hints a dialog or picker prints under its options, e.g. "Enter to confirm · Esc to cancel".
+_KEY_HINT = re.compile(
+    r"\b(?:enter|return) to (?:confirm|continue|select|submit|proceed)\b"
+    r"|\besc(?:ape)? to (?:cancel|exit|reject|go back|skip|close)\b"
+    r"|\bpress (?:enter|return|any key)\b",
+    re.IGNORECASE,
+)
+# A launcher question waiting on a typed answer, e.g. "Upgrade if available? (Y/n)".
+_YES_NO_PROMPT = re.compile(
+    r"[(\[](?:y/n|yes/no)[)\]][ \t]*[:?]?[ \t]*$", re.IGNORECASE | re.MULTILINE
+)
+_TRACEBACK_HEADER = "Traceback (most recent call last):"
+# An unindented "pkg.FooError: …" line names a traceback's exception. Only names
+# shaped like an exception class count, so other output never becomes the label.
+_EXCEPTION_LINE = re.compile(r"(?:[A-Za-z_]\w*\.)*([A-Za-z_]\w*)(?::.*)?")
+_EXCEPTION_CLASS = re.compile(
+    r"(?:[A-Z]\w*)?(?:Error|Exception|Exit|Interrupt|Expired|Timeout|Failure|Abort|Warning)"
+    r"|StopIteration|StopAsyncIteration"
+)
+_BOX_DRAWING = frozenset("─━│┃╭╮╯╰┌┐└┘├┤┬┴┼═║╔╗╚╝")
+
+
+def describe_pane_shape(screen: str | None) -> dict[str, str | int]:
+    """
+    Describe what a terminal screen shows without keeping any of its text.
+
+    Startup records carry this for every person, so a stalled pane can be told
+    apart even where its text may not be logged. Only fixed labels, a line count
+    and a Python exception's class name leave the screen.
+
+    :param screen: ANSI-stripped screen text, or ``None`` when the pane could not be read.
+    :returns: ``pane_state``, one of ``unreadable``, ``blank``, ``traceback``,
+        ``yes_no_prompt``, ``dialog``, ``tui`` or ``text``, plus ``pane_lines`` (the
+        non-blank line count) for a readable pane. A traceback whose exception
+        line is shaped like a class name adds ``pane_traceback_type``, e.g.
+        ``"JSONDecodeError"``; otherwise the field is left out.
+    """
+    if screen is None:
+        return {"pane_state": "unreadable"}
+    lines = sum(1 for line in screen.splitlines() if line.strip())
+    shape: dict[str, str | int] = {"pane_lines": lines}
+    if not lines:
+        shape["pane_state"] = "blank"
+    elif _TRACEBACK_HEADER in screen:
+        shape["pane_state"] = "traceback"
+        block = screen.rsplit(_TRACEBACK_HEADER, 1)[1].splitlines()
+        for line in block:
+            if not line.strip() or line[0].isspace():
+                continue
+            raised = _EXCEPTION_LINE.fullmatch(line.rstrip())
+            # The class name alone: a module path can name the person's own code.
+            if raised and _EXCEPTION_CLASS.fullmatch(raised[1]):
+                shape["pane_traceback_type"] = raised[1][:80]
+                break
+    elif _YES_NO_PROMPT.search(screen):
+        shape["pane_state"] = "yes_no_prompt"
+    elif _KEY_HINT.search(screen):
+        shape["pane_state"] = "dialog"
+    elif _BOX_DRAWING.intersection(screen):
+        shape["pane_state"] = "tui"
+    else:
+        shape["pane_state"] = "text"
+    return shape
+
+
+def pane_shape_summary(shape: Mapping[str, object]) -> str:
+    """
+    Render a :func:`describe_pane_shape` result for a log message, or ``""`` for none.
+
+    :param shape: The shape attributes, e.g. ``{"pane_state": "traceback", "pane_lines": 3,
+        "pane_traceback_type": "JSONDecodeError"}``.
+    :returns: e.g. ``" pane=traceback(JSONDecodeError) lines=3"``.
+    """
+    state = shape.get("pane_state")
+    if not state:
+        return ""
+    traceback_type = shape.get("pane_traceback_type")
+    summary = f" pane={state}({traceback_type})" if traceback_type else f" pane={state}"
+    lines = shape.get("pane_lines")
+    return f"{summary} lines={lines}" if lines is not None else summary

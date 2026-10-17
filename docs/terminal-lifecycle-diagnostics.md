@@ -33,11 +33,17 @@ event for the actual user-visible outcome.
 
 Lifecycle metadata excludes command arguments and filesystem paths. Codex
 terminal-text excerpts can include either, along with other user content.
-Pane text is limited to Codex `terminal_exit_observed` records: registered
-terminals export `terminal_last_output`, a bounded excerpt of the final screen
-with terminal control sequences stripped and known credential patterns redacted.
-This existing excerpt is exported independently of
-`OMNIGENT_HARNESS_STDERR_ENABLED`.
+Among lifecycle records, pane text is limited to Codex `terminal_exit_observed`:
+registered terminals export `terminal_last_output`, a bounded excerpt of the final
+screen with terminal control sequences stripped and known credential patterns
+redacted. This existing excerpt is exported independently of
+`OMNIGENT_HARNESS_STDERR_ENABLED`. With that flag enabled, the native startup
+records `terminal_interactive_slow`, `terminal_interactive_unobserved` and
+`agent_startup_pending` also carry a `terminal_last_output` excerpt of a live
+pane that has not become interactive. With or without it they carry
+`pane_state`, `pane_lines` and, for a Python traceback, `pane_traceback_type`,
+which describe the screen without its text; see
+[Native startup stall records](harness-diagnostics.md#native-startup-stall-records).
 
 A terminal that exits before registration also emits `terminal_exit_observed`,
 with `before_observation=True`. Available exit metadata is always included;

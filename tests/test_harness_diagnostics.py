@@ -8,7 +8,10 @@ import pytest
 
 from omnigent.harnesses.diagnostics import (
     bounded_diagnostic_tail,
+    contains_sign_in_material,
+    describe_pane_shape,
     detect_sign_in_prompt,
+    pane_shape_summary,
     sanitize_diagnostic_text,
     sign_in_next_step,
 )
@@ -377,6 +380,68 @@ def test_detect_sign_in_prompt_does_not_treat_an_auth_shaped_hostname_as_the_end
     assert prompt.url == authorize_url
 
 
+@pytest.mark.parametrize(
+    "screen",
+    [
+        "Enter code ABCD-1234 at https://x.example/verify\nwaiting for sign-in...\n"
+        "See https://docs.example.com/oauth/troubleshooting\n",
+        "Open the following URL to sign in:\nhttps://dbcert.example.com/x\n"
+        "Signed in as someone@example.com.\nAgent ready.\n",
+        "Sign in to continue:\n  code: HQ7M-2KPD\n",
+        "Sign in to continue\nEnter code 12345678\n",
+        "Sign in to continue:\n  code: abcd-1234\n",
+        "https://signin.example.com/device",
+        "Sign in to continue:\n\n\n\n  code: HQ7M-2KPD\n",
+        "Sign in to continue:\n  HQ7M-2KPD\n",
+        "code: HQ7M-2KPD",
+        "HQ7M-2KPD\nwaiting...\n",
+    ],
+    ids=[
+        "moved-past-prompt",
+        "completed-prompt",
+        "cued-code",
+        "cued-numeric-code",
+        "cued-lowercase-code",
+        "bare-endpoint",
+        "code-below-a-gap",
+        "unlabelled-code",
+        "labelled-code-without-cue",
+        "standalone-code",
+    ],
+)
+def test_contains_sign_in_material_outlives_an_actionable_prompt(screen: str) -> None:
+    """Material a stale or partial prompt leaves on screen still counts as sign-in material."""
+    assert contains_sign_in_material(screen)
+
+
+@pytest.mark.parametrize(
+    "screen",
+    [
+        None,
+        "",
+        "Starting MCP servers: omnigent",
+        "Loading configuration...\nLauncher: update check before starting Codex...\n",
+        "Opened https://github.com/omnigent-ai/omnigent/pull/123 for review\n",
+        "exit code 1\n",
+        "Launcher: update check before starting Claude Code... OMNI-STALL-e532148b\n",
+        "launcher: refreshing workspace login\nusing a cached token\n",
+    ],
+    ids=[
+        "none",
+        "empty",
+        "startup",
+        "launcher-status",
+        "ordinary-link",
+        "exit-code",
+        "claude-code-with-marker",
+        "login-refresh-without-code",
+    ],
+)
+def test_contains_sign_in_material_ignores_ordinary_output(screen: str | None) -> None:
+    """Ordinary startup text, plain links and exit codes may still be exported."""
+    assert not contains_sign_in_material(screen)
+
+
 def test_sign_in_next_step_names_the_agent_and_carries_no_address() -> None:
     """The next step never embeds the one-time link; the card fetches it live."""
     step = sign_in_next_step("Codex")
@@ -385,3 +450,125 @@ def test_sign_in_next_step_names_the_agent_and_carries_no_address() -> None:
         "sign-in completes; then send your message again."
     )
     assert "http" not in step
+
+
+_PANE_TEXT = "example-repo"
+
+
+@pytest.mark.parametrize(
+    ("screen", "expected"),
+    [
+        (None, {"pane_state": "unreadable"}),
+        ("", {"pane_state": "blank", "pane_lines": 0}),
+        (" \n\t\n", {"pane_state": "blank", "pane_lines": 0}),
+        (
+            "Traceback (most recent call last):\n"
+            f'  File "/home/u/{_PANE_TEXT}/settings.py", line 9, in load\n'
+            f"json.decoder.JSONDecodeError: Expecting value in {_PANE_TEXT}: line 1 column 1\n",
+            {
+                "pane_state": "traceback",
+                "pane_lines": 3,
+                "pane_traceback_type": "JSONDecodeError",
+            },
+        ),
+        (
+            "Traceback (most recent call last):\n"
+            '  File "/srv/app/main.py", line 4, in run\n'
+            f"{_PANE_TEXT.replace('-', '_')}.errors.LicenseError: expired\n"
+            "wrapper recovered and continued\n"
+            f"AuthError: refresh status for {_PANE_TEXT}\n",
+            {"pane_state": "traceback", "pane_lines": 5, "pane_traceback_type": "LicenseError"},
+        ),
+        (
+            "Traceback (most recent call last):\n"
+            '  File "/srv/app/cli.py", line 7, in main\n'
+            "click.exceptions.Abort\n",
+            {"pane_state": "traceback", "pane_lines": 3, "pane_traceback_type": "Abort"},
+        ),
+        (
+            "Traceback (most recent call last):\n"
+            '  File "launcher.py", line 2\n'
+            "KeyboardInterrupt\n",
+            {
+                "pane_state": "traceback",
+                "pane_lines": 3,
+                "pane_traceback_type": "KeyboardInterrupt",
+            },
+        ),
+        (
+            "Traceback (most recent call last):\n"
+            '  File "/opt/launcher/settings.py", line 9, in load\n'
+            f"{_PANE_TEXT.replace('-', '_')}_internal: retrying workspace lookup\n"
+            "json.decoder.JSONDecodeError: Expecting value\n",
+            {"pane_state": "traceback", "pane_lines": 4, "pane_traceback_type": "JSONDecodeError"},
+        ),
+        (
+            "Traceback (most recent call last):\n"
+            '  File "/opt/launcher/auth.py", line 3, in wait\n'
+            "HQ7M2KPD\n",
+            {"pane_state": "traceback", "pane_lines": 3},
+        ),
+        (
+            f"Checking {_PANE_TEXT} for updates...\nUpgrade the agent if available? (Y/n) ",
+            {"pane_state": "yes_no_prompt", "pane_lines": 2},
+        ),
+        (
+            f"Overwrite {_PANE_TEXT}/settings.json (y/n)?",
+            {"pane_state": "yes_no_prompt", "pane_lines": 1},
+        ),
+        (
+            f"────\n Settings Error\n /home/u/{_PANE_TEXT}/settings.json\n"
+            " ❯ 1. Exit and fix manually\n Enter to confirm · Esc to cancel\n",
+            {"pane_state": "dialog", "pane_lines": 5},
+        ),
+        (
+            f"╭──────╮\n│ ✻ Welcome to {_PANE_TEXT} │\n╰──────╯\n",
+            {"pane_state": "tui", "pane_lines": 3},
+        ),
+        (f"launcher: refreshing {_PANE_TEXT} login\n", {"pane_state": "text", "pane_lines": 1}),
+    ],
+    ids=[
+        "unreadable",
+        "empty",
+        "whitespace",
+        "traceback",
+        "traceback-own-exception-not-later-output",
+        "traceback-unsuffixed-exception",
+        "traceback-bare-exception",
+        "traceback-interleaved-output",
+        "traceback-without-exception-name",
+        "yes-no-prompt",
+        "yes-no-question",
+        "dialog",
+        "tui",
+        "text",
+    ],
+)
+def test_describe_pane_shape_names_the_screen_without_its_text(
+    screen: str | None, expected: dict[str, object]
+) -> None:
+    """Each screen gets a fixed label; only an exception's class name leaves the pane."""
+    shape = describe_pane_shape(screen)
+    assert shape == expected
+    for leaked in (_PANE_TEXT, _PANE_TEXT.replace("-", "_"), "HQ7M2KPD"):
+        assert leaked not in repr(shape)
+        assert leaked not in pane_shape_summary(shape)
+
+
+@pytest.mark.parametrize(
+    ("shape", "summary"),
+    [
+        ({}, ""),
+        ({"pane_state": "unreadable"}, " pane=unreadable"),
+        ({"pane_state": "blank", "pane_lines": 0}, " pane=blank lines=0"),
+        (
+            {"pane_state": "traceback", "pane_lines": 3, "pane_traceback_type": "JSONDecodeError"},
+            " pane=traceback(JSONDecodeError) lines=3",
+        ),
+    ],
+    ids=["none", "unreadable", "blank", "traceback"],
+)
+def test_pane_shape_summary_renders_the_labels_for_a_log_message(
+    shape: dict[str, object], summary: str
+) -> None:
+    assert pane_shape_summary(shape) == summary
