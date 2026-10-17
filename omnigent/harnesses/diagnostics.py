@@ -116,6 +116,12 @@ _ECHOED_CONTROL = re.compile(r"\^\[(?:\[[0-9;?]*[A-Za-z~]?)?")
 _SIGN_IN_CODE = re.compile(
     r"\b(?:[A-Z0-9]{4,8}-[A-Z0-9]{4,8}|(?=[A-Z0-9]*\d)(?=[A-Z0-9]*[A-Z])[A-Z0-9]{6,9})\b"
 )
+# The same shape in any case, for checks that withhold rather than lift a code.
+_SIGN_IN_CODE_ANY_CASE = re.compile(_SIGN_IN_CODE.pattern, re.IGNORECASE)
+# A value labelled as a code, e.g. "code: HQ7M-2KPD", needs no sign-in wording.
+_LABELLED_SIGN_IN_CODE = re.compile(
+    r"\bcode\s*[:=]\s*(?:" + _SIGN_IN_CODE.pattern + r")", re.IGNORECASE
+)
 
 
 def _nearby(lines: list[str], index: int) -> str:
@@ -132,6 +138,53 @@ def _is_reprint(line: str, url: str) -> bool:
     """Whether ``line`` is just ``url`` again or another endpoint (an earlier attempt's link)."""
     text = line.strip().rstrip(".,;:")
     return text == url or (_SIGN_IN_URL.fullmatch(text) is not None and _is_endpoint(text))
+
+
+def _sign_in_addresses(lines: list[str]) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
+    """Return the auth-shaped and the cue-adjacent addresses on screen with their line indexes."""
+    addresses = [
+        (index, match.group(0).rstrip(".,;:"))
+        for index, line in enumerate(lines)
+        for match in _SIGN_IN_URL.finditer(line)
+    ]
+    endpoints = [(index, url) for index, url in addresses if _is_endpoint(url)]
+    cued = [(index, url) for index, url in addresses if _SIGN_IN_CUE.search(_nearby(lines, index))]
+    return endpoints, cued
+
+
+def contains_sign_in_material(screen: str | None) -> bool:
+    """Whether a sign-in address or device code is on screen, actionable or not.
+
+    :func:`detect_sign_in_prompt` rejects a prompt the launcher has moved past,
+    but the address and one-time code it printed are still on screen and still
+    secret. Diagnostics that export pane text use this broader check to decide
+    whether the text may be logged at all, so it errs toward withholding: sign-in
+    wording anywhere with a code-shaped token anywhere counts, as do a value
+    labelled ``code:`` and a line holding only a device code. A line that merely
+    mentions a code counts only beside sign-in wording, whatever the code looks
+    like: "Claude Code" is on most launcher lines.
+
+    :param screen: ANSI-stripped terminal screen text, or ``None``.
+    :returns: ``True`` when any sign-in material is on screen.
+    """
+    if not screen:
+        return False
+    lines = screen.splitlines()
+    endpoints, cued = _sign_in_addresses(lines)
+    if endpoints or cued:
+        return True
+    # A code may sit anywhere below its prompt, or outlive a prompt that scrolled away.
+    if _SIGN_IN_CUE.search(screen) and _SIGN_IN_CODE_ANY_CASE.search(screen):
+        return True
+    if _LABELLED_SIGN_IN_CODE.search(screen):
+        return True
+    # A line that is nothing but a device code, e.g. left behind by a scrolled-off prompt.
+    if any(_SIGN_IN_CODE.fullmatch(line.strip()) for line in lines):
+        return True
+    return any(
+        _SIGN_IN_CODE_LINE.search(line) and _SIGN_IN_CUE.search(_nearby(lines, index))
+        for index, line in enumerate(lines)
+    )
 
 
 def detect_sign_in_prompt(screen: str | None) -> SignInPrompt | None:
@@ -164,13 +217,7 @@ def detect_sign_in_prompt(screen: str | None) -> SignInPrompt | None:
     if not screen:
         return None
     lines = screen.splitlines()
-    addresses = [
-        (index, match.group(0).rstrip(".,;:"))
-        for index, line in enumerate(lines)
-        for match in _SIGN_IN_URL.finditer(line)
-    ]
-    endpoints = [(index, url) for index, url in addresses if _is_endpoint(url)]
-    cued = [(index, url) for index, url in addresses if _SIGN_IN_CUE.search(_nearby(lines, index))]
+    endpoints, cued = _sign_in_addresses(lines)
     if not endpoints and not cued:
         return None
     url = endpoints[-1][1] if endpoints else cued[0][1]

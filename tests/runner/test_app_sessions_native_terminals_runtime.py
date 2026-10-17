@@ -4120,24 +4120,38 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
 
 
 @pytest.mark.parametrize(
-    ("screen", "expected_code", "expected_title"),
+    ("screen", "expected_code", "expected_title", "tail_expected"),
     [
         (
             "dbexec: launcher 1.2.3\nSign in to continue:\n"
             "  https://signin.example.com/device\n  code: HQ7M-2KPD\nwaiting for sign-in...\n",
             "databricks_sign_in_pending",
             "Codex can't start until you sign in to Databricks",
+            False,
         ),
-        ("Loading configuration...\n", "agent_startup_pending", "Codex is still starting"),
+        ("Loading configuration...\n", "agent_startup_pending", "Codex is still starting", True),
+        # The launcher moved past its prompt, so it is no longer actionable, but the
+        # code and address it printed are still on screen.
+        (
+            "Sign in to continue:\n  https://signin.example.com/device\n  code: HQ7M-2KPD\n"
+            "See https://docs.example.com/oauth/troubleshooting\n"
+            "Still waiting on the network...\n",
+            "agent_startup_pending",
+            "Codex is still starting",
+            False,
+        ),
     ],
+    ids=["sign-in-prompt", "loading", "sign-in-material-after-prompt"],
 )
 @pytest.mark.asyncio
 async def test_codex_discover_thread_and_forward_waits_while_terminal_alive(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     tmp_path: Path,
     screen: str,
     expected_code: str,
     expected_title: str,
+    tail_expected: bool,
 ) -> None:
     """
     A thread-start deadline with a live pane records a pending cause and keeps waiting.
@@ -4207,8 +4221,10 @@ async def test_codex_discover_thread_and_forward_waits_while_terminal_alive(
     monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _fake_wait)
     monkeypatch.setattr(codex_native_forwarder, "supervise_forwarder", _fake_supervise)
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setenv("OMNIGENT_HARNESS_STDERR_ENABLED", "1")
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
     monkeypatch.setattr(httpx, "AsyncClient", _mock_client)
+    caplog.set_level(logging.WARNING, logger="omnigent.runner.app")
 
     session_id = "3c0a9d4e6b8f4a2c9e1d7b5a3f6c8e0d"
     app_server = _AppServer()
@@ -4244,6 +4260,21 @@ async def test_codex_discover_thread_and_forward_waits_while_terminal_alive(
     assert "http" not in pending.remediation
     if expected_code == "databricks_sign_in_pending":
         assert pending.remediation.startswith("Open the sign-in link and sign in. Codex continues")
+    # The pending row carries the pane only while no sign-in material is on it.
+    (pending_record,) = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "agent_startup_pending"
+    ]
+    if tail_expected:
+        assert pending_record.attributes["terminal_last_output"] == screen.strip()
+        # The local runner log renders only the message, so the tail rides on it too.
+        assert screen.strip() in pending_record.getMessage()
+    else:
+        assert "terminal_last_output" not in pending_record.attributes
+        logged = pending_record.getMessage() + "\n".join(
+            map(str, pending_record.attributes.values())
+        )
+        assert "HQ7M-2KPD" not in logged
+        assert "signin.example.com" not in logged
     # The backend outlived the deadline and closed only after forwarding ended.
     assert timeline == ["thread_started", "app_server_closed"]
     # The thread start cleared the pending record and published bridge state.
