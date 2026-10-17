@@ -371,6 +371,25 @@ def test_claude_terminal_env_databricks_gateway_helper_path() -> None:
     assert config.api_key_helper
 
 
+def test_build_native_claude_terminal_env_disables_dangerous_rm_self_deny_timer() -> None:
+    """In auto/bypass mode Claude Code's dangerous-rm prompt denies itself after
+    ~120s unless this variable is set, so a web-routed approval card dies before
+    anyone can answer. Pin it on both launch paths; the pin beats a provider env."""
+    disable_timeout = "CLAUDE_CODE_DISABLE_DANGEROUS_RM_TIMEOUT"
+
+    assert build_native_claude_terminal_env(None).get(disable_timeout) == "1"
+
+    # A provider env that re-arms the timer must lose to Omnigent's pin.
+    config = ClaudeNativeUcodeConfig(
+        env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic", disable_timeout: "0"},
+        api_key_helper="printf %s sk-gateway",
+        model="gateway-served-claude",
+    )
+    terminal_env = build_native_claude_terminal_env(config)
+    assert terminal_env[disable_timeout] == "1"
+    assert terminal_env["ANTHROPIC_BASE_URL"] == "https://gateway.example/anthropic"
+
+
 @pytest.fixture
 def bridge_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """
