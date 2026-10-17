@@ -134,6 +134,43 @@ def _is_reprint(line: str, url: str) -> bool:
     return text == url or (_SIGN_IN_URL.fullmatch(text) is not None and _is_endpoint(text))
 
 
+def _sign_in_addresses(lines: list[str]) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
+    """Return the auth-shaped and the cue-adjacent addresses on screen with their line indexes."""
+    addresses = [
+        (index, match.group(0).rstrip(".,;:"))
+        for index, line in enumerate(lines)
+        for match in _SIGN_IN_URL.finditer(line)
+    ]
+    endpoints = [(index, url) for index, url in addresses if _is_endpoint(url)]
+    cued = [(index, url) for index, url in addresses if _SIGN_IN_CUE.search(_nearby(lines, index))]
+    return endpoints, cued
+
+
+def contains_sign_in_material(screen: str | None) -> bool:
+    """Whether a sign-in address or device code is on screen, actionable or not.
+
+    :func:`detect_sign_in_prompt` rejects a prompt the launcher has moved past,
+    but the address and one-time code it printed are still on screen and still
+    secret. Diagnostics that export pane text use this broader check to decide
+    whether the text may be logged at all. A line that mentions a code counts
+    only beside sign-in wording, whatever the code looks like: "Claude Code" is
+    on most launcher lines.
+
+    :param screen: ANSI-stripped terminal screen text, or ``None``.
+    :returns: ``True`` when any sign-in material is on screen.
+    """
+    if not screen:
+        return False
+    lines = screen.splitlines()
+    endpoints, cued = _sign_in_addresses(lines)
+    if endpoints or cued:
+        return True
+    return any(
+        _SIGN_IN_CODE_LINE.search(line) and _SIGN_IN_CUE.search(_nearby(lines, index))
+        for index, line in enumerate(lines)
+    )
+
+
 def detect_sign_in_prompt(screen: str | None) -> SignInPrompt | None:
     """Find a device-style sign-in prompt in terminal screen text.
 
@@ -164,13 +201,7 @@ def detect_sign_in_prompt(screen: str | None) -> SignInPrompt | None:
     if not screen:
         return None
     lines = screen.splitlines()
-    addresses = [
-        (index, match.group(0).rstrip(".,;:"))
-        for index, line in enumerate(lines)
-        for match in _SIGN_IN_URL.finditer(line)
-    ]
-    endpoints = [(index, url) for index, url in addresses if _is_endpoint(url)]
-    cued = [(index, url) for index, url in addresses if _SIGN_IN_CUE.search(_nearby(lines, index))]
+    endpoints, cued = _sign_in_addresses(lines)
     if not endpoints and not cued:
         return None
     url = endpoints[-1][1] if endpoints else cued[0][1]
