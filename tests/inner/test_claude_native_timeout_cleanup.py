@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.harnesses.claude_native import bridge
+from omnigent.harnesses.claude_native.tmux_terminal import stop_tmux_terminal
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import ExecutorError
 
@@ -32,6 +33,10 @@ tty.setraw(sys.stdin.fileno())
 Path(ready).write_text("ready")
 while True:
     data=os.read(sys.stdin.fileno(),65536)
+    if b"TRANSFER" in data:
+        role="replacement"
+        print("\033[2J\033[H"+"─"*80+"\r\n❯ \r\n"+"─"*80,flush=True)
+        Path(ready).with_name("replacement-ready").write_text("ready")
     if b"EXIT" in data:
         raise SystemExit(7)
     if role == "replacement" and b"START" in data:
@@ -69,8 +74,15 @@ async def _until(predicate: Callable[[], bool]) -> None:
         ("restarted_server", "timeout"),
         ("cross_process", "timeout"),
         ("unavailable", "timeout"),
+        ("missing_owner", "timeout"),
+        ("logical_transfer", "timeout"),
+        ("logical_return", "timeout"),
+        ("cross_process_transfer", "timeout"),
         ("owned", "cancel"),
         ("replacement", "cancel"),
+        ("logical_transfer", "cancel"),
+        ("logical_return", "cancel"),
+        ("cross_process_transfer", "cancel"),
         ("owned", "exit"),
         ("replacement", "exit"),
     ],
@@ -90,7 +102,11 @@ async def test_stale_cleanup_preserves_a_same_owner_native_terminal(
         monkeypatch.setattr(bridge, "capture_tmux_terminal", lambda *_args: None)
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir(mode=0o700)
-    (bridge_dir / "bridge.json").write_text(json.dumps({"active_session_id": "same-conversation"}))
+    (bridge_dir / "bridge.json").write_text(
+        json.dumps(
+            {} if scenario == "missing_owner" else {"active_session_id": "same-conversation"}
+        )
+    )
     terminal = tmp_path / "terminal.py"
     terminal.write_text(_TERMINAL)
     failure_observed = threading.Event()
@@ -177,13 +193,50 @@ async def test_stale_cleanup_preserves_a_same_owner_native_terminal(
             if failure == "cancel":
                 task.cancel()
                 await _until(task.cancelling)
-            has_replacement = scenario not in {"owned", "unavailable"}
+            has_replacement = scenario not in {"owned", "unavailable", "missing_owner"}
             replacement_target = "main"
             old_pane = _tmux(
                 old_socket, "display-message", "-p", "-t", "main", "#{pane_id}"
             ).stdout.strip()
             if has_replacement:
-                if scenario == "renamed_session":
+                if scenario in {"logical_transfer", "logical_return", "cross_process_transfer"}:
+                    replacement_socket = old_socket
+                    original_terminal = bridge.capture_tmux_terminal(str(old_socket), "main")
+                    assert original_terminal is not None
+                    assert (
+                        _tmux(
+                            old_socket, "send-keys", "-t", "main", "TRANSFER", "Enter"
+                        ).returncode
+                        == 0
+                    )
+                    await _until((tmp_path / "replacement-ready").exists)
+                    if scenario == "cross_process_transfer":
+                        result = subprocess.run(
+                            [
+                                sys.executable,
+                                "-c",
+                                "from pathlib import Path; import sys; "
+                                "from omnigent.harnesses.claude_native import bridge; "
+                                "bridge._TRUSTED_PARENT = bridge._BRIDGE_ROOT = "
+                                "Path(sys.argv[2]); "
+                                "bridge.write_active_session_id(Path(sys.argv[1]), "
+                                "'replacement-conversation')",
+                                str(bridge_dir),
+                                str(tmp_path),
+                            ],
+                            capture_output=True,
+                            text=True,
+                            timeout=5,
+                        )
+                        assert result.returncode == 0, result.stderr
+                    else:
+                        bridge.write_active_session_id(bridge_dir, "replacement-conversation")
+                        if scenario == "logical_return":
+                            bridge.write_active_session_id(bridge_dir, "same-conversation")
+                    assert (
+                        bridge.capture_tmux_terminal(str(old_socket), "main") == original_terminal
+                    )
+                elif scenario == "renamed_session":
                     assert _tmux(old_socket, "rename-session", "-t", "main", "old").returncode == 0
                     replacement_socket = old_socket
                     spawn(replacement_socket, "replacement")
@@ -247,7 +300,11 @@ async def test_stale_cleanup_preserves_a_same_owner_native_terminal(
                     bridge.write_tmux_target(
                         bridge_dir, socket_path=replacement_socket, tmux_target=replacement_target
                     )
-                assert bridge.read_active_session_id(bridge_dir) == "same-conversation"
+                assert bridge.read_active_session_id(bridge_dir) == (
+                    "replacement-conversation"
+                    if scenario in {"logical_transfer", "cross_process_transfer"}
+                    else "same-conversation"
+                )
                 assert (
                     _tmux(
                         replacement_socket, "send-keys", "-t", replacement_target, "START", "Enter"
@@ -297,3 +354,68 @@ async def test_stale_cleanup_preserves_a_same_owner_native_terminal(
                     task.result()
             for socket in sockets_to_close:
                 _tmux(socket, "kill-server")
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+@pytest.mark.parametrize("writer", ["active_session", "prepare"])
+async def test_logical_owner_writers_wait_for_native_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, writer: str
+) -> None:
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir(mode=0o700)
+    (bridge_dir / "bridge.json").write_text(json.dumps({"active_session_id": "old-owner"}))
+    owner = bridge._read_bridge_owner(bridge_dir)
+    assert owner is not None
+    attempted = tmp_path / "writer-attempted"
+    completed = tmp_path / "writer-completed"
+    writer_code = """
+import sys
+from pathlib import Path
+from omnigent.harnesses.claude_native import bridge
+root,writer=sys.argv[1:]
+root=Path(root)
+bridge._TRUSTED_PARENT=bridge._BRIDGE_ROOT=root
+(root/'writer-attempted').touch()
+if writer == 'active_session':
+    bridge.write_active_session_id(root/'bridge','new-owner')
+else:
+    bridge.bridge_dir_for_bridge_id=lambda _: root/'bridge'
+    bridge.prepare_bridge_dir(conversation_id='new-owner',bridge_id='bridge',workspace=root)
+(root/'writer-completed').touch()
+"""
+    process = None
+    with tempfile.TemporaryDirectory(prefix="claude-owner-lock-", dir="/tmp") as sockets:
+        socket = Path(sockets) / "tmux.sock"
+        try:
+            assert _tmux(socket, "new-session", "-d", "-s", "main", "sleep 30").returncode == 0
+            terminal = bridge.capture_tmux_terminal(str(socket), "main")
+            assert terminal is not None
+            with bridge.native_terminal_cleanup_lock(bridge_dir, owner) as owned:
+                assert owned
+                process = subprocess.Popen(
+                    [sys.executable, "-c", writer_code, str(tmp_path), writer],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                await _until(attempted.exists)
+                with pytest.raises(subprocess.TimeoutExpired):
+                    process.wait(timeout=0.1)
+                assert bridge._read_bridge_owner(bridge_dir) == owner
+                assert not completed.exists()
+                stop_tmux_terminal(terminal)
+                assert _tmux(socket, "has-session", "-t", "main").returncode != 0
+                assert bridge._read_bridge_owner(bridge_dir) == owner
+            _stdout, stderr = process.communicate(timeout=5)
+            assert process.returncode == 0, stderr
+            assert completed.exists()
+            assert bridge.read_active_session_id(bridge_dir) == "new-owner"
+            assert bridge._read_bridge_owner(bridge_dir) != owner
+        finally:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.communicate(timeout=5)
+            _tmux(socket, "kill-server")

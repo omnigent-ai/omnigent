@@ -107,12 +107,21 @@ CLAUDE_FRAMEWORK_CONTEXT_FILE = "pending_framework_context.txt"
 _logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class BridgeOwner:
+    """One logical conversation's ownership of a native bridge."""
+
+    session_id: str
+    generation: str | None
+
+
 @dataclass
 class InjectionAttempt:
     """Shared with the worker so cleanup retains its observed native generation."""
 
     cancelled: threading.Event
     terminal: NativeTmuxTerminal | None = None
+    owner: BridgeOwner | None = None
 
 
 _INJECTION_ATTEMPT: ContextVar[InjectionAttempt | None] = ContextVar(
@@ -589,6 +598,7 @@ class ClaudePromptTimeout(RuntimeError):
     """Claude Code's input box did not render before delivery timed out."""
 
     terminal: NativeTmuxTerminal | None = None
+    owner: BridgeOwner | None = None
 
 
 class ClaudeTerminalExited(ClaudePromptTimeout):
@@ -653,9 +663,22 @@ class ClaudeMessageNotAccepted(RuntimeError):
 
 
 @contextlib.contextmanager
-def cancellable_injection(cancel_event: threading.Event) -> Iterator[InjectionAttempt]:
+def cancellable_injection(
+    cancel_event: threading.Event,
+    *,
+    bridge_dir: Path | None = None,
+    request_session_id: str | None = None,
+) -> Iterator[InjectionAttempt]:
     """Bind a cancellation flag inherited by this delivery's ``asyncio.to_thread`` worker."""
     attempt = InjectionAttempt(cancel_event)
+    if bridge_dir is not None:
+        attempt.owner = _read_bridge_owner(bridge_dir)
+        if (
+            attempt.owner is not None
+            and request_session_id is not None
+            and attempt.owner.session_id != request_session_id
+        ):
+            attempt.owner = None
     token = _INJECTION_ATTEMPT.set(attempt)
     try:
         yield attempt
@@ -1778,6 +1801,7 @@ def prepare_bridge_dir(
         payload: dict[str, object] = {
             "bridge_id": resolved_bridge_id,
             "active_session_id": conversation_id,
+            "active_session_generation": secrets.token_hex(16),
             "conversation_id": conversation_id,
             "workspace": str(workspace),
             "token": token,
@@ -2148,7 +2172,7 @@ def record_model_vocabulary(
     # vocabulary refresh (e.g. serving model options) can never replace a
     # concurrent bridge preparation's config — sandbox settings included —
     # with its own stale read.
-    with _bridge_config_write_lock(bridge_dir):
+    with _bridge_metadata_write_lock(bridge_dir):
         config = _read_json_file(bridge_dir / _CONFIG_FILE)
         if not isinstance(config, dict) or not config:
             # No prepared bridge config yet (missing/malformed reads as {}):
@@ -2175,19 +2199,38 @@ def record_model_vocabulary(
 
 
 @contextlib.contextmanager
-def _bridge_config_write_lock(bridge_dir: Path) -> Iterator[None]:
-    """Cross-process mutual exclusion for bridge-config read-modify-writes.
+def _bridge_metadata_write_lock(bridge_dir: Path, *, timeout_s: float = -1) -> Iterator[None]:
+    """Cross-process mutual exclusion for bridge metadata read-modify-writes.
 
-    Uses the same on-disk lock file as bridge-dir preparation
-    (``<bridge root>/.locks/<bridge dir>.lock``), so config rewrites and
+    Shares bridge-dir preparation's on-disk lock, so metadata updates and
     :func:`prepare_bridge_dir` exclude each other across processes.
     """
-    from filelock import FileLock
-
-    lock_dir = bridge_dir.parent / ".locks"
-    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with FileLock(str(lock_dir / f"{bridge_dir.name}.lock"), mode=0o600):
+    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir, timeout_s=timeout_s):
         yield
+
+
+def _read_bridge_owner(bridge_dir: Path) -> BridgeOwner | None:
+    config = _read_json_file(bridge_dir / _CONFIG_FILE)
+    session_id = config.get("active_session_id") or config.get("conversation_id")
+    generation = config.get("active_session_generation")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    if generation is not None and (not isinstance(generation, str) or not generation):
+        return None
+    return BridgeOwner(session_id, generation)
+
+
+@contextlib.contextmanager
+def native_terminal_cleanup_lock(bridge_dir: Path, owner: BridgeOwner | None) -> Iterator[bool]:
+    """Exclude ownership writers until an owned terminal's cleanup finishes."""
+    if owner is None:
+        yield False
+        return
+    try:
+        with _bridge_metadata_write_lock(bridge_dir, timeout_s=1.0):
+            yield _read_bridge_owner(bridge_dir) == owner
+    except FileLockTimeout as exc:
+        raise RuntimeError("Native terminal ownership lock is busy; cleanup refused") from exc
 
 
 def read_bridge_id(bridge_dir: Path) -> str | None:
@@ -2215,13 +2258,15 @@ def write_active_session_id(bridge_dir: Path, session_id: str) -> None:
     :returns: None.
     :raises RuntimeError: If the bridge config does not exist.
     """
-    config = _read_json_file(bridge_dir / _CONFIG_FILE)
-    if not config:
-        raise RuntimeError(f"bridge config missing: {bridge_dir / _CONFIG_FILE}")
-    config["active_session_id"] = session_id
-    config["conversation_id"] = session_id
-    config["updated_at"] = time.time()
-    _write_json_file(bridge_dir / _CONFIG_FILE, config)
+    with _bridge_metadata_write_lock(bridge_dir):
+        config = _read_json_file(bridge_dir / _CONFIG_FILE)
+        if not config:
+            raise RuntimeError(f"bridge config missing: {bridge_dir / _CONFIG_FILE}")
+        config["active_session_id"] = session_id
+        config["active_session_generation"] = secrets.token_hex(16)
+        config["conversation_id"] = session_id
+        config["updated_at"] = time.time()
+        _write_json_file(bridge_dir / _CONFIG_FILE, config)
 
 
 def read_permission_hook_config(bridge_dir: Path) -> _JsonObject:

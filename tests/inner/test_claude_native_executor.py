@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import json
 import logging
 import threading
 from pathlib import Path
@@ -36,7 +37,10 @@ _TINY_PNG_BYTES = base64.b64decode(_TINY_PNG_B64)
 
 
 @pytest.fixture
-def observed_terminal(monkeypatch: pytest.MonkeyPatch) -> NativeTmuxTerminal:
+def observed_terminal(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> NativeTmuxTerminal:
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "bridge.json").write_text(json.dumps({"active_session_id": "conversation"}))
     terminal = NativeTmuxTerminal("/tmp/synthetic.sock", 123, 456, "$0", "%0", 789)
     monkeypatch.setattr(claude_bridge, "capture_tmux_terminal", lambda *_args: terminal)
     return terminal
