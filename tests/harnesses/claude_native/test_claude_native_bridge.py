@@ -10842,8 +10842,9 @@ def test_framework_context_does_not_replace_a_new_owner_before_atomic_commit(
     assert path.read_text() == "replacement context"
 
 
+@pytest.mark.parametrize("generation", [None, "owner-before-clear"])
 def test_a_pending_clear_rotation_refuses_input_until_the_replacement_owner_is_named(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, generation: str | None
 ) -> None:
     """
     The hook marks the pane as rotating before the replacement conversation exists.
@@ -10853,7 +10854,10 @@ def test_a_pending_clear_rotation_refuses_input_until_the_replacement_owner_is_n
     owner is accepted as soon as ``write_active_session_id`` names it.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    (bridge_dir / "bridge.json").write_text('{"active_session_id": "conv_old"}')
+    config: dict[str, Any] = {"active_session_id": "conv_old"}
+    if generation is not None:
+        config["active_session_generation"] = generation
+    (bridge_dir / "bridge.json").write_text(json.dumps(config))
     sends = _fake_tmux(monkeypatch, [_composer_pane()])
     monkeypatch.setattr(claude_native_bridge, "_restore_occupied_input", lambda *a, **k: None)
     monkeypatch.setattr(
@@ -10863,6 +10867,10 @@ def test_a_pending_clear_rotation_refuses_input_until_the_replacement_owner_is_n
 
     claude_native_bridge.begin_active_session_rotation(bridge_dir)
 
+    rotating = json.loads((bridge_dir / "bridge.json").read_text())
+    assert rotating["active_session_id"] == "conv_old"
+    assert isinstance(rotating["active_session_generation"], str)
+    assert rotating["active_session_generation"] != generation
     assert not claude_native_bridge.active_session_accepts_input(bridge_dir, "conv_old")
     assert claude_native_bridge.active_session_accepts_input(bridge_dir, None)
     with pytest.raises(claude_native_bridge.ClaudeSessionInactive):

@@ -2292,6 +2292,7 @@ def begin_active_session_rotation(bridge_dir: Path) -> None:
         if not config:
             raise RuntimeError(f"bridge config missing: {bridge_dir / _CONFIG_FILE}")
         config[_ACTIVE_SESSION_ROTATION_KEY] = time.time()
+        config["active_session_generation"] = secrets.token_hex(16)
         _write_json_file(bridge_dir / _CONFIG_FILE, config)
 
 
