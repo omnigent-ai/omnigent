@@ -109,9 +109,11 @@ import {
   isSideChatCommand,
   newPendingSideChatId,
   SIDE_CHAT_COMMAND_PREFIX,
+  sideChatDisabledReason,
   supportsSideChat,
   usesNativeSideChatFork,
 } from "@/lib/sideChat";
+import { toastSideChatStartFailed } from "@/components/chat/sideChatStartFailedToast";
 import { shouldQueueSend } from "@/lib/messageQueue";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
@@ -182,6 +184,7 @@ import {
   computeIsWorking,
 } from "@/components/chat/chatBubbleParts";
 import { useSession } from "@/hooks/useSession";
+import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import { useOpenGithubTab } from "@/shell/FileViewerContext";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
@@ -1513,8 +1516,16 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
 
   const composerRef = useRef<ComposerHandle>(null);
   // Cold selector (harness rarely changes) — gates the selection popup's "Ask
-  // in side chat" action to harnesses that support side chat.
+  // in side chat" action to harnesses that support side chat, on a session
+  // whose fork restriction doesn't withhold it.
   const selectionSessionHarness = useChatStore((s) => s.sessionHarness);
+  const selectionRestrictions = useSessionActionRestrictions(
+    isTempConvId(conversationId) ? null : conversationId,
+  );
+  const selectionSideChatUnavailable = sideChatDisabledReason(
+    selectionSessionHarness,
+    selectionRestrictions,
+  );
 
   // Ref forwarded to SelectionPopup to scope selection detection to the
   // conversation area, preventing selections in the composer from triggering
@@ -1751,7 +1762,8 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             containerRef={conversationRef}
             onReply={(text) => composerRef.current?.appendReplyQuote(text)}
             onAskInSideChat={
-              supportsSideChat(selectionSessionHarness)
+              supportsSideChat(selectionSessionHarness) &&
+              selectionSideChatUnavailable === undefined
                 ? (text) => composerRef.current?.startSideChat(text)
                 : undefined
             }
@@ -2445,6 +2457,10 @@ function ComposerImpl(
   // the create window issues no `/v1/sessions/temp:*` requests.
   const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
   const { session: composerSession } = useSession(composerSessionId);
+  // Generic side chats fork server-side, so every composer entry point follows
+  // the session's fork restriction; Codex's native /side is exempt.
+  const sideChatRestrictions = useSessionActionRestrictions(composerSessionId);
+  const sideChatUnavailable = sideChatDisabledReason(sessionHarness, sideChatRestrictions);
   const composerBranch = useChatStore((s) => s.gitBranch);
   const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
   const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
@@ -2676,10 +2692,10 @@ function ComposerImpl(
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
   const showBtw = sessionHarness === "claude-native";
   const skillPrefix = skillInvocationPrefix(sessionHarness);
-  // /side is a Codex Code CLI built-in (ephemeral fork side chat), so offer it
-  // only on codex-native sessions. Selected/typed, it sends as plaintext to the
-  // vendor turn path (see submit); the runner opens the fork as a sub-agent chat.
-  const showSide = supportsSideChat(sessionHarness);
+  // /side opens a side chat on every harness that supports one, unless this
+  // session's fork restriction withholds the generic server-side fork (a typed
+  // /side then explains itself inline — see submit).
+  const showSide = supportsSideChat(sessionHarness) && sideChatUnavailable === undefined;
   const slashCommands = useMemo(
     () =>
       buildSlashCommandMap(
@@ -3276,9 +3292,9 @@ function ComposerImpl(
           setValue("");
           useChatStore.getState().openSideChatWithDraft(childSessionId, question, sourceId);
         },
-        // Surface the failure as a toast, not an inline composer error; the
-        // composer text is left intact for a retry.
-        () => toast.error("Couldn't start a side chat for this session."),
+        // Surface the failure (with the server's reason) as a toast, not an
+        // inline composer error; the composer text is left intact for a retry.
+        toastSideChatStartFailed,
       );
     };
 
@@ -3346,6 +3362,10 @@ function ComposerImpl(
       // plaintext path so its runner forks); every other harness forks
       // server-side here into an empty side chat, carrying the typed question.
       if (cmd === "/side" && !usesNativeSideChatFork(sessionHarness)) {
+        if (sideChatUnavailable !== undefined) {
+          setCommandError(sideChatUnavailable);
+          return;
+        }
         openGenericSideChat(trimmed.slice(cmd.length).trim());
         return;
       }
@@ -3867,11 +3887,12 @@ function ComposerImpl(
                             useChatStore.setState({
                               sideChatToOpen: { childId: childSessionId, parentId: sourceId },
                             }),
-                          () => toast.error("Couldn't start a side chat for this session."),
+                          toastSideChatStartFailed,
                         );
                       }
                     : undefined
                 }
+                sideChatDisabledReason={sideChatUnavailable}
               />
               {!subAgentLabel && composerSessionId && (
                 <HostBadge

@@ -4,13 +4,14 @@ import {
   SESSION_ACTIONS_LOADING,
   SESSION_ACTIONS_UNAVAILABLE,
   sessionActionRestrictions,
+  type SessionActionRestrictions,
   type SessionActionSource,
 } from "@/lib/sessionCapabilities";
 
 export function useSessionActionRestrictions(
   sessionId: string | null | undefined,
   fallback?: SessionActionSource | null,
-) {
+): SessionActionRestrictions {
   const { session, isLoading, error } = useSession(sessionId);
   const hostId = session ? session.hostId : (fallback?.hostId ?? fallback?.host_id);
   const {
@@ -33,6 +34,7 @@ export function useSessionActionRestrictions(
   const hostMissing = Boolean(hostId && hosts && !host);
   return {
     forkDisabledReason: restrictions.forkDisabledReason ?? lookupReason,
+    sideChatDisabledReason: restrictions.sideChatDisabledReason ?? lookupReason,
     switchHostDisabledReason:
       restrictions.switchHostDisabledReason ??
       lookupReason ??

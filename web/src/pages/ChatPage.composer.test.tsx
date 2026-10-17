@@ -29,6 +29,8 @@ import {
 import { setOmnigentHostConfig } from "@/lib/host";
 import * as host from "@/lib/host";
 import * as identity from "@/lib/identity";
+import * as sessionsApi from "@/lib/sessionsApi";
+import { SANDBOX_SIDE_CHAT_UNSUPPORTED } from "@/lib/sessionCapabilities";
 import {
   getSessionModelLabelCacheKey,
   readSessionModelLabelCache,
@@ -4438,6 +4440,53 @@ describe("Composer startSideChat (text-select → Ask in side chat)", () => {
     render(<Composer {...composerProps(overrides)} ref={ref} />);
     act(() => ref.current?.startSideChat("selected text"));
     expect(useChatStore.getState().sideChatToOpen).toBeNull();
+  });
+});
+
+describe("Composer /side on a fork-restricted session", () => {
+  beforeEach(() => {
+    clearSessionDrafts();
+    localStorage.clear();
+    // A managed-sandbox snapshot: the deployment refuses server-side forks, so
+    // sessionActionRestrictions withholds the generic side chat.
+    composerSessionSnapshot.labels = { "omnigent.host_type": "managed" };
+    setComposerState({ conversationId: "conv_test", skills: [], sessionHarness: "claude-sdk" });
+  });
+
+  afterEach(() => {
+    cleanup();
+    clearSessionDrafts();
+    vi.restoreAllMocks();
+    composerSessionSnapshot.labels = {};
+    useChatStore.setState({ sessionHarness: null });
+  });
+
+  it("blocks a submitted /side inline and keeps the typed question for a retry", () => {
+    const createSideChat = vi
+      .spyOn(sessionsApi, "createSideChat")
+      .mockResolvedValue({ childSessionId: "child" });
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend, onSendSlashCommand: vi.fn() })} />);
+    const ta = textarea();
+
+    fireEvent.change(ta, { target: { value: "/side resize the panel" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    expect(screen.getByText(SANDBOX_SIDE_CHAT_UNSUPPORTED)).toBeVisible();
+    // The server-side fork is never attempted, and the question stays in the
+    // composer rather than being dropped behind the inline refusal.
+    expect(createSideChat).not.toHaveBeenCalled();
+    expect(onSend).not.toHaveBeenCalled();
+    expect(ta).toHaveValue("/side resize the panel");
+  });
+
+  it("withholds the /side slash suggestion while listing other commands", () => {
+    render(<Composer {...composerProps({ onSendSlashCommand: vi.fn() })} />);
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    // Positive control: the menu opened and still lists ungated built-ins, so a
+    // missing /side is a withheld entry rather than an unopened or empty menu.
+    expect(screen.getByTestId("slash-menu-item-help")).toBeVisible();
+    expect(screen.queryByTestId("slash-menu-item-side")).toBeNull();
   });
 });
 

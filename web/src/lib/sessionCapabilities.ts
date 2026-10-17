@@ -1,6 +1,8 @@
 /** UI-only session capability gates, derived from the live session snapshot. */
 
 export const SANDBOX_FORK_UNSUPPORTED = "Forking this sandbox session is not supported yet.";
+export const SANDBOX_SIDE_CHAT_UNSUPPORTED =
+  "Side chat forks this sandbox session, which is not supported yet.";
 export const SANDBOX_SWITCH_HOST_UNSUPPORTED =
   "Switching hosts is not supported for this sandbox session yet.";
 export const SESSION_ACTIONS_LOADING = "Checking session capabilities…";
@@ -21,10 +23,17 @@ export interface SessionActionSource {
   host_id?: string | null;
 }
 
+export interface SessionActionRestrictions {
+  forkDisabledReason?: string;
+  /** A generic side chat is a server-side fork, so it shares the fork ban. */
+  sideChatDisabledReason?: string;
+  switchHostDisabledReason?: string;
+}
+
 export function sessionActionRestrictions(
   session: SessionActionSource | null | undefined,
   host?: { sandbox_provider?: string | null },
-): { forkDisabledReason?: string; switchHostDisabledReason?: string } {
+): SessionActionRestrictions {
   // The embedded deployment derives this marker alongside its managed-fork ban,
   // regardless of provider. It is distinct from core `host_type: managed` launches.
   const unsupportedSource =
@@ -32,6 +41,7 @@ export function sessionActionRestrictions(
     (host?.sandbox_provider != null && UNSUPPORTED_FORK_PROVIDERS.has(host.sandbox_provider));
   return {
     forkDisabledReason: unsupportedSource ? SANDBOX_FORK_UNSUPPORTED : undefined,
+    sideChatDisabledReason: unsupportedSource ? SANDBOX_SIDE_CHAT_UNSUPPORTED : undefined,
     switchHostDisabledReason:
       unsupportedSource || host?.sandbox_provider ? SANDBOX_SWITCH_HOST_UNSUPPORTED : undefined,
   };

@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import * as sessionsApi from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
+import { SANDBOX_SIDE_CHAT_UNSUPPORTED } from "@/lib/sessionCapabilities";
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useSessionAgent } from "@/hooks/useAgents";
@@ -59,11 +60,27 @@ vi.mock("@/hooks/useAgents", () => ({
   useSessionAgent: vi.fn(() => ({ data: undefined })),
 }));
 vi.mock("sonner", () => ({ toast: { error: vi.fn() } }));
-// A side chat's pane is covered by its own suite; the stub just names its child.
+// A side chat's pane is covered by its own suite; the stub names its child and
+// exposes its first-send callback so pending-tab submission can be driven here.
 vi.mock("@/components/chat/SideChatPane", () => ({
-  SideChatPane: ({ childId }: { childId: string }) => (
-    <div data-testid="side-chat-pane-stub">{childId}</div>
+  SideChatPane: ({ childId, onStart }: { childId: string; onStart?: (text: string) => void }) => (
+    <div data-testid="side-chat-pane-stub">
+      {childId}
+      {onStart && (
+        <button
+          type="button"
+          aria-label="send pending side chat"
+          onClick={() => void Promise.resolve(onStart("restored draft")).catch(() => {})}
+        />
+      )}
+    </div>
   ),
+}));
+// Side-chat entry points consult the session's fork restriction; default to an
+// unrestricted session so the generic cases below keep side chat available.
+const restrictionsMock = vi.hoisted(() => vi.fn(() => ({}) as Record<string, string | undefined>));
+vi.mock("@/hooks/useSessionActionRestrictions", () => ({
+  useSessionActionRestrictions: () => restrictionsMock(),
 }));
 const isMobileMock = vi.hoisted(() => vi.fn(() => false));
 vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => isMobileMock() }));
@@ -77,6 +94,8 @@ afterEach(() => {
   localStorage.clear();
   vi.clearAllMocks();
   isMobileMock.mockReturnValue(false);
+  restrictionsMock.mockReturnValue({});
+  useChatStore.setState({ sessionHarness: null });
   Reflect.deleteProperty(window, "omnigentDesktop");
   useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
   useCreateTerminalMock.mockReturnValue({
@@ -1122,6 +1141,38 @@ describe("WorkspacePanel mobile side chats", () => {
 
     expect(screen.queryByTestId("side-chats-panel-drawer")).toBeNull();
     expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_b");
+  });
+
+  it("disables the drawer's New side chat and explains the fork restriction", () => {
+    isMobileMock.mockReturnValue(true);
+    useChatStore.setState({ sessionHarness: "claude-sdk" });
+    restrictionsMock.mockReturnValue({ sideChatDisabledReason: SANDBOX_SIDE_CHAT_UNSUPPORTED });
+    renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: true });
+
+    const drawer = screen.getByTestId("side-chats-panel-drawer");
+    expect(within(drawer).getByRole("button", { name: "New side chat" })).toBeDisabled();
+    // The empty state swaps its "Tap +" hint for the server's refusal reason.
+    expect(within(drawer).getByText(SANDBOX_SIDE_CHAT_UNSUPPORTED)).toBeVisible();
+    expect(within(drawer).queryByText(/Tap \+ to ask a question/)).toBeNull();
+  });
+
+  it("rejects a restored pending side chat on a fork-restricted session without forking", async () => {
+    useChatStore.setState({ sessionHarness: "claude-sdk" });
+    restrictionsMock.mockReturnValue({ sideChatDisabledReason: SANDBOX_SIDE_CHAT_UNSUPPORTED });
+    writeSessionWorkspaceState("conv_ws", {
+      openSideChats: ["pending:restored"],
+      selectedSideChatId: "pending:restored",
+    });
+    const create = vi.spyOn(sessionsApi, "createSideChat");
+    renderWorkspace({ rightRailTab: "sidechat" });
+
+    fireEvent.click(screen.getByRole("button", { name: "send pending side chat" }));
+
+    // A pending tab created before the restriction never reaches the server-side
+    // fork; its first send surfaces the known reason and keeps the draft.
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(SANDBOX_SIDE_CHAT_UNSUPPORTED));
+    expect(create).not.toHaveBeenCalled();
+    create.mockRestore();
   });
 });
 

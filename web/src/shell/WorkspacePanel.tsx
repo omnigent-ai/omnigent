@@ -55,8 +55,17 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { useChatStore } from "@/store/chatStore";
-import { SIDE_CHAT_COMMAND_PREFIX, supportsSideChat, usesNativeSideChatFork } from "@/lib/sideChat";
+import {
+  SIDE_CHAT_COMMAND_PREFIX,
+  sideChatDisabledReason as resolveSideChatDisabledReason,
+  supportsSideChat,
+  usesNativeSideChatFork,
+} from "@/lib/sideChat";
 import { createSideChat, stopSession } from "@/lib/sessionsApi";
+import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
+import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
+import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
+import { toastSideChatStartFailed } from "@/components/chat/sideChatStartFailedToast";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { terminalTabKey, useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
@@ -168,6 +177,7 @@ function NewTabMenu({
   onOpenTerminal,
   onOpenBrowser,
   onOpenSideChat,
+  sideChatDisabledReason,
   onCreateStart,
   onCreateError,
   triggerClassName,
@@ -180,6 +190,8 @@ function NewTabMenu({
   /** Open a new side chat (a fork of this conversation) as a rail tab. Absent
    *  when the session can't host one (e.g. Codex uses its typed `/side`). */
   onOpenSideChat?: () => void;
+  /** Keeps "Side chat" listed but disabled, explaining why it can't start now. */
+  sideChatDisabledReason?: string;
   /** Called when a shell create is initiated (before the POST resolves), so
    *  the shell can be focused as soon as its tab appears in the list. */
   onCreateStart?: () => void;
@@ -303,10 +315,14 @@ function NewTabMenu({
           </DropdownMenuItem>
         )}
         {onOpenSideChat && (
-          <DropdownMenuItem onSelect={onOpenSideChat} className="cursor-pointer">
+          <SessionActionMenuItem
+            onSelect={onOpenSideChat}
+            disabledReason={sideChatDisabledReason}
+            className="cursor-pointer"
+          >
             <MessagesSquareIcon className="size-4" />
             Side chat
-          </DropdownMenuItem>
+          </SessionActionMenuItem>
         )}
         {canOpenShell &&
           (multipleShells ? (
@@ -820,6 +836,10 @@ function WorkspacePanelImpl({
   // ── Side chats: rail tabs backed by forked child conversations. ──────────
   const sideChats = useSideChats(conversationId);
   const sideChatHarness = useChatStore((s) => s.sessionHarness);
+  // A generic side chat forks server-side, so it follows the session's fork
+  // restriction; the entry stays listed with the reason, like Fork does.
+  const sideChatRestrictions = useSessionActionRestrictions(conversationId);
+  const sideChatUnavailable = resolveSideChatDisabledReason(sideChatHarness, sideChatRestrictions);
   const sideChatToOpen = useChatStore((s) => s.sideChatToOpen);
   const clearSideChatToOpen = useChatStore((s) => s.clearSideChatToOpen);
   const activeSideChatRef = useRef<HTMLDivElement | null>(null);
@@ -912,6 +932,13 @@ function WorkspacePanelImpl({
           if (sendFailed) throw new Error("side chat send failed");
         });
     }
+    // A pending tab persists across reloads and may outlive the restriction that
+    // now disables the entry points; reject locally with the known reason and keep
+    // the draft rather than letting its first send reach the server-side fork.
+    if (sideChatUnavailable !== undefined) {
+      toast.error(sideChatUnavailable);
+      return Promise.reject(new Error(sideChatUnavailable));
+    }
     return createSideChat(conversationId).then(
       ({ childSessionId }) => {
         // We have the child id here, so rekey THIS pending tab directly — no
@@ -925,9 +952,9 @@ function WorkspacePanelImpl({
         useChatStore.getState().openSideChatWithDraft(childSessionId, text, conversationId);
       },
       (err) => {
-        // The rail path had no failure feedback (unlike the composer entry
-        // points); surface it. The pending tab + typed text stay for a retry.
-        toast.error("Couldn't start a side chat for this session.");
+        // Toast the server's reason; rethrow so the pending tab + typed text
+        // stay for a retry.
+        toastSideChatStartFailed(err);
         throw err;
       },
     );
@@ -1406,6 +1433,7 @@ function WorkspacePanelImpl({
                 conversationId={conversationId}
                 onOpenBrowser={showBrowserTab ? addBrowser : undefined}
                 onOpenSideChat={onNewSideChat}
+                sideChatDisabledReason={sideChatUnavailable}
                 onCreateError={onShellCreateFailed}
                 onOpenTerminal={openTerminalTab}
                 onCreateStart={onShellCreateStart}
@@ -1423,6 +1451,7 @@ function WorkspacePanelImpl({
               conversationId={conversationId}
               onOpenBrowser={showBrowserTab ? addBrowser : undefined}
               onOpenSideChat={onNewSideChat}
+              sideChatDisabledReason={sideChatUnavailable}
               onOpenTerminal={openTerminalTab}
               onCreateStart={onShellCreateStart}
               onCreateError={onShellCreateFailed}
@@ -1606,22 +1635,26 @@ function WorkspacePanelImpl({
               );
             })}
             {onNewSideChat && (
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-sm"
-                aria-label="New side chat"
-                onClick={onNewSideChat}
-              >
-                <PlusIcon className="size-4" />
-              </Button>
+              <DisabledActionTooltip reason={sideChatUnavailable} label="New side chat">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="New side chat"
+                  disabled={sideChatUnavailable !== undefined}
+                  onClick={onNewSideChat}
+                >
+                  <PlusIcon className="size-4" />
+                </Button>
+              </DisabledActionTooltip>
             )}
           </div>
           {selectedSideChatPane ?? (
             <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
               <MessagesSquareIcon className="size-6 text-muted-foreground" />
               <p className="max-w-[36ch] text-sm text-muted-foreground">
-                Tap + to ask a question without affecting the main conversation.
+                {sideChatUnavailable ??
+                  "Tap + to ask a question without affecting the main conversation."}
               </p>
             </div>
           )}

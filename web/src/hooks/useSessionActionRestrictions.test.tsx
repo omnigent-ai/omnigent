@@ -9,6 +9,7 @@ import { getSessionSlim } from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
 import {
   SANDBOX_FORK_UNSUPPORTED,
+  SANDBOX_SIDE_CHAT_UNSUPPORTED,
   SANDBOX_SWITCH_HOST_UNSUPPORTED,
   SESSION_ACTIONS_LOADING,
   SESSION_ACTIONS_UNAVAILABLE,
@@ -28,13 +29,19 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
 const getSessionMock = vi.mocked(getSessionSlim);
 const fetchMock = vi.mocked(authenticatedFetch);
 const clients = new Set<QueryClient>();
-const unrestricted = { forkDisabledReason: undefined, switchHostDisabledReason: undefined };
+const unrestricted = {
+  forkDisabledReason: undefined,
+  sideChatDisabledReason: undefined,
+  switchHostDisabledReason: undefined,
+};
 const unlistedHost = {
   forkDisabledReason: undefined,
+  sideChatDisabledReason: undefined,
   switchHostDisabledReason: SESSION_ACTIONS_UNAVAILABLE,
 };
 const unsupported = {
   forkDisabledReason: SANDBOX_FORK_UNSUPPORTED,
+  sideChatDisabledReason: SANDBOX_SIDE_CHAT_UNSUPPORTED,
   switchHostDisabledReason: SANDBOX_SWITCH_HOST_UNSUPPORTED,
 };
 
@@ -82,6 +89,7 @@ describe("useSessionActionRestrictions", () => {
     const { result } = renderRestrictions();
     expect(result.current).toEqual({
       forkDisabledReason: SESSION_ACTIONS_LOADING,
+      sideChatDisabledReason: SESSION_ACTIONS_LOADING,
       switchHostDisabledReason: SESSION_ACTIONS_LOADING,
     });
     expect(fetchMock).not.toHaveBeenCalled();
@@ -119,6 +127,7 @@ describe("useSessionActionRestrictions", () => {
     await waitFor(() =>
       expect(result.current).toEqual({
         forkDisabledReason: SESSION_ACTIONS_UNAVAILABLE,
+        sideChatDisabledReason: SESSION_ACTIONS_UNAVAILABLE,
         switchHostDisabledReason: SESSION_ACTIONS_UNAVAILABLE,
       }),
     );
@@ -130,6 +139,7 @@ describe("useSessionActionRestrictions", () => {
     await waitFor(() =>
       expect(result.current).toEqual({
         forkDisabledReason: SESSION_ACTIONS_UNAVAILABLE,
+        sideChatDisabledReason: SESSION_ACTIONS_UNAVAILABLE,
         switchHostDisabledReason: SESSION_ACTIONS_UNAVAILABLE,
       }),
     );
