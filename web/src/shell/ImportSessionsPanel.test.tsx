@@ -12,7 +12,7 @@ import { useSessionImportStore } from "@/store/sessionImport";
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
 vi.mock("@/lib/sessionsApi", () => ({ importLocalSessions: vi.fn() }));
 vi.mock("./HostLabel", () => ({
-  HostLabel: ({ host }: { host: { name: string } }) => <span>{host.name}</span>,
+  HostLabel: ({ host }: { host: { name: string } }) => <>{host.name}</>,
 }));
 // Radix Select uses a portal + pointer events jsdom can't drive; a native
 // <select> keeps the option list assertable.
@@ -138,6 +138,29 @@ describe("ImportSessionsPanel", () => {
     importLocalSessionsMock.mockClear();
     fireEvent.click(screen.getByTestId("import-retry"));
     await waitFor(() => expect(importLocalSessionsMock).toHaveBeenCalledTimes(1));
+  });
+
+  it("keeps imported progress visible when the import stops early", async () => {
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    importLocalSessionsMock.mockImplementation(async (_host, _source, _limit, onSession) => {
+      onSession?.({ id: "c1", title: "First session" });
+      onSession?.({ id: "c2", title: "Second session" });
+      throw new Error(
+        "The import stopped before it could finish. 2 sessions were imported. " +
+          "Import again to pick up the rest.",
+      );
+    });
+
+    renderPanel();
+    fireEvent.click(screen.getByTestId("import-submit"));
+
+    await waitFor(() => expect(screen.getByTestId("import-error")).toBeInTheDocument());
+    expect(screen.getByTestId("import-error")).toHaveTextContent("2 sessions were imported");
+    expect(screen.getByText("Imported 2 before the import stopped.")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "View sessions" })).toHaveAttribute("href", "/");
+    expect(screen.queryByTestId("import-result")).toBeNull();
   });
 
   it("keeps an in-flight import running and shows its progress after a remount", async () => {
