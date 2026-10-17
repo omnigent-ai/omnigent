@@ -3784,6 +3784,7 @@ def create_app(
         from omnigent.server.routes._sessions.common import (
             _session_sandbox_status_cache,
             _session_status_cache,
+            session_stream,
         )
         from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
         from omnigent.server.routes.sessions import (
@@ -3792,6 +3793,7 @@ def create_app(
             _publish_sandbox_status,
             prefetch_session_routing_catalogs,
         )
+        from omnigent.server.schemas import SessionStatusEvent
 
         if tunnel_registry.get(runner_id) is not connection:
             return
@@ -4023,6 +4025,18 @@ def create_app(
                     async with store_slots:
                         await _publish_runner_recovered_status(
                             conv.id, conversation_store, require_disconnect_code=True
+                        )
+                    if not initialize_runtime and conv.agent_id is not None and not conv.archived:
+                        # A runner that died mid-delivery never sent the turn's
+                        # terminal edge; re-announce the idle status so open tabs settle.
+                        session_stream.publish(
+                            conv.id,
+                            SessionStatusEvent(
+                                type="session.status",
+                                conversation_id=conv.id,
+                                status="idle",
+                                error=None,
+                            ).model_dump(),
                         )
                     if initialize_runtime:
                         await restore_active_children(
