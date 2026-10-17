@@ -14,6 +14,7 @@ from omnigent.runner.launch_failure import (
     diagnose_codex_compaction_model_failure,
     diagnose_codex_model_rejection,
     diagnose_model_unavailable,
+    is_rate_limit_error,
 )
 
 # The tail Claude Code prints when refusing --dangerously-skip-permissions as
@@ -202,6 +203,37 @@ def test_preserves_other_native_turn_errors(message: str) -> None:
 @pytest.mark.parametrize("code", ["workspace_missing", "invalid_input"])
 def test_rate_limit_text_does_not_override_specific_failure_codes(code: str) -> None:
     assert classify_native_turn_error(code, "HTTP 429: rate limit exceeded") == code
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        (
+            "exceeded retry limit, last status: 429 Too Many Requests; stderr: WARNING: "
+            "proceeding, even though we could not create PATH aliases"
+        ),
+        "Rate limit exceeded",
+        "HTTP/1.1 429",
+    ],
+)
+def test_is_rate_limit_error_recognizes_rate_limit_text(message: str) -> None:
+    assert is_rate_limit_error(message)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "An unexpected error occurred",
+        (
+            "API Error: Request rejected (403) · PERMISSION_DENIED: "
+            "See rate_limit_error troubleshooting"
+        ),
+        "You've hit your usage limit.",
+        "Request rejected (4290)",
+    ],
+)
+def test_is_rate_limit_error_ignores_other_failures(message: str) -> None:
+    assert not is_rate_limit_error(message)
 
 
 _CONTENT_LENGTH_REJECTION = (
