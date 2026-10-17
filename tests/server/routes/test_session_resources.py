@@ -4828,9 +4828,11 @@ async def test_filesystem_download_runner_unavailable_is_typed(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [httpx.ConnectError, ConnectionError])
 async def test_filesystem_download_connect_error_is_typed_unavailable(
     app: FastAPI,
     client: httpx.AsyncClient,
+    error_type: type[Exception],
 ) -> None:
     class OfflineRunnerClient:
         def build_request(self, method: str, url: str, **kwargs: Any) -> httpx.Request:
@@ -4839,7 +4841,7 @@ async def test_filesystem_download_connect_error_is_typed_unavailable(
 
         async def send(self, request: httpx.Request, *, stream: bool) -> httpx.Response:
             del stream
-            raise httpx.ConnectError("runner is offline", request=request)
+            raise error_type("runner is offline")
 
     set_runner_router(_FakeRunnerRouter(OfflineRunnerClient()))  # type: ignore[arg-type]
     resp = await client.get(_DOWNLOAD_URL)
