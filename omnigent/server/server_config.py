@@ -88,6 +88,14 @@ def load_server_config() -> dict[str, Any]:
     return data
 
 
+def mobile_push_preview(config: Mapping[str, Any]) -> bool:
+    """Resolve the non-secret preview setting, defaulting to private content off."""
+    value = os.environ.get("OMNIGENT_MOBILE_PUSH_PREVIEW")
+    if value is not None:
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return config.get("mobile_push_preview") is True
+
+
 def config_str_list(value: Any) -> list[str]:
     """Coerce a config value into a list of non-empty strings.
 

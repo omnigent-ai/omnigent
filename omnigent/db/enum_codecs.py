@@ -338,3 +338,27 @@ def encode_scheduled_task_run_status(name: str) -> int:
 def decode_scheduled_task_run_status(code: int) -> str:
     """Decode a ``scheduled_task_runs.status`` int code to its name."""
     return _decode(SCHEDULED_TASK_RUN_STATUS, code, field="scheduled_task_runs.status")
+
+
+MOBILE_PUSH_PLATFORM: dict[str, int] = {"android": 1, "ios": 2}
+MOBILE_PUSH_KIND: dict[str, int] = {"completed": 1, "failed": 2, "needs_input": 3}
+
+
+def encode_mobile_push_platform(name: str) -> int:
+    """Encode a ``mobile_push_devices.platform`` name to its int code."""
+    return _encode(MOBILE_PUSH_PLATFORM, name, field="mobile_push_devices.platform")
+
+
+def decode_mobile_push_platform(code: int) -> str:
+    """Decode a ``mobile_push_devices.platform`` int code to its name."""
+    return _decode(MOBILE_PUSH_PLATFORM, code, field="mobile_push_devices.platform")
+
+
+def encode_mobile_push_kind(name: str) -> int:
+    """Encode a ``mobile_push_outbox.kind`` name to its int code."""
+    return _encode(MOBILE_PUSH_KIND, name, field="mobile_push_outbox.kind")
+
+
+def decode_mobile_push_kind(code: int) -> str:
+    """Decode a ``mobile_push_outbox.kind`` int code to its name."""
+    return _decode(MOBILE_PUSH_KIND, code, field="mobile_push_outbox.kind")
