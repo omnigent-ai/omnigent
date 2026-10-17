@@ -4473,6 +4473,85 @@ async def test_filesystem_download_streams_runner_attachment(
 
 
 @pytest.mark.asyncio
+async def test_filesystem_download_with_http_middleware_preserves_bytes(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    tmp_path: Path,
+) -> None:
+    payload = bytes(range(256)) * 64
+    (tmp_path / "big.bin").write_bytes(payload)
+
+    @app.middleware("http")
+    async def pass_through(request: Request, call_next: Callable[..., Any]) -> Any:
+        return await call_next(request)
+
+    runner = FastAPI()
+
+    @runner.get(_FS_ROUTE)
+    async def _serve(
+        session_id: str,
+        environment_id: str,
+        relative_path: str,
+        download: bool = False,
+        scope: str | None = None,
+    ) -> FileResponse:
+        del session_id, environment_id, relative_path, download, scope
+        return FileResponse(tmp_path / "big.bin", filename="big.bin")
+
+    async with _runner_app_client(runner):
+        resp = await client.get(
+            _DOWNLOAD_URL,
+            headers={"Accept-Encoding": "gzip, deflate, br"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.content == payload
+    assert resp.headers["content-disposition"] == 'attachment; filename="big.bin"'
+    assert resp.headers["content-length"] == str(len(payload))
+
+
+@pytest.mark.asyncio
+async def test_filesystem_download_runner_abort_before_first_chunk_is_typed(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+) -> None:
+    @app.middleware("http")
+    async def pass_through(request: Request, call_next: Callable[..., Any]) -> Any:
+        return await call_next(request)
+
+    class AbortingStream(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            raise ConnectionError("runner disconnected before first chunk")
+            yield b""
+
+        async def aclose(self) -> None:
+            return None
+
+    class AbortingRunnerClient:
+        def build_request(self, method: str, url: str, **kwargs: Any) -> httpx.Request:
+            del kwargs
+            return httpx.Request(method, f"http://runner{url}")
+
+        async def send(self, request: httpx.Request, *, stream: bool) -> httpx.Response:
+            del stream
+            return httpx.Response(
+                200,
+                headers={"content-disposition": 'attachment; filename="big.bin"'},
+                stream=AbortingStream(),
+                request=request,
+            )
+
+    set_runner_router(_FakeRunnerRouter(AbortingRunnerClient()))  # type: ignore[arg-type]
+    resp = await client.get(
+        _DOWNLOAD_URL,
+        headers={"Accept-Encoding": "gzip, deflate, br"},
+    )
+
+    assert resp.status_code == 502
+    assert resp.json() == {"detail": "runner download failed"}
+
+
+@pytest.mark.asyncio
 async def test_filesystem_download_rejects_runner_without_download_support(
     client: httpx.AsyncClient,
 ) -> None:

@@ -173,8 +173,14 @@ class _RunnerStreamResponse(StreamingResponse):
     :param headers: Response headers to forward.
     """
 
-    def __init__(self, upstream: httpx.Response, *, headers: Mapping[str, str]) -> None:
-        super().__init__(upstream.aiter_raw(), headers=headers)
+    def __init__(
+        self,
+        upstream: httpx.Response,
+        *,
+        headers: Mapping[str, str],
+        content: AsyncIterator[bytes],
+    ) -> None:
+        super().__init__(content, headers=headers)
         self._upstream = upstream
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -525,9 +531,32 @@ def register_resources_routes(
                 )
                 if name in resp.headers
             }
-            return _RunnerStreamResponse(resp, headers=forwarded)
+            chunks = resp.aiter_raw()
+            try:
+                first_chunk = await anext(chunks)
+            except StopAsyncIteration:
+                first_chunk = None
+            except (httpx.HTTPError, ConnectionError) as exc:
+                _logger.warning("Runner download failed before streaming began: %s", exc)
+                await resp.aclose()
+                raise HTTPException(status_code=502, detail="runner download failed") from exc
+
+            async def stream_chunks() -> AsyncIterator[bytes]:
+                if first_chunk is not None:
+                    yield first_chunk
+                async for chunk in chunks:
+                    yield chunk
+
+            return _RunnerStreamResponse(
+                resp,
+                headers=forwarded,
+                content=stream_chunks(),
+            )
         try:
             await resp.aread()
+        except (httpx.HTTPError, ConnectionError) as exc:
+            _logger.warning("Runner download error response could not be read: %s", exc)
+            raise HTTPException(status_code=502, detail="runner download failed") from exc
         finally:
             await resp.aclose()
         if resp.status_code == 200:

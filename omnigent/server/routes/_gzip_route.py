@@ -120,6 +120,7 @@ class _StateAwareGZipResponder(GZipResponder):
     ) -> None:
         super().__init__(app, minimum_size, compresslevel=compresslevel)
         self._state = state
+        self._skip = False
 
     async def send_with_compression(self, message: Message) -> None:
         """
@@ -128,14 +129,12 @@ class _StateAwareGZipResponder(GZipResponder):
         :param message: The outgoing ASGI message.
         :returns: None.
         """
-        if (
-            message["type"] == "http.response.body"
-            and not self.started
-            and self._state.get(SKIP_GZIP_STATE_KEY)
-        ):
-            # Starlette reads this flag on the first body message, then emits
-            # the start message it buffered — untouched.
+        if message["type"] == "http.response.start" and self._state.get(SKIP_GZIP_STATE_KEY):
             self.content_type_is_excluded = True
+            self._skip = True
+        if self._skip:
+            await self.send(message)
+            return
         await super().send_with_compression(message)
 
 
