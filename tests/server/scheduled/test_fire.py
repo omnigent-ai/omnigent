@@ -31,7 +31,7 @@ from omnigent.entities import ScheduledTask
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import bundle_location
 from omnigent.server.scheduled import fire as fire_mod
-from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
+from omnigent.server.scheduled.fire import FireDeps, RunRequest, build_on_fire, build_run_now
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from tests.server.helpers import build_agent_bundle
@@ -1795,6 +1795,100 @@ async def test_run_now_skips_when_already_in_flight() -> None:
     release.set()
     await _drain()
     assert len(store.runs) == 1
+
+
+# ── run-now with a request body (input, labels, idempotency key) ──────────
+
+
+@pytest.mark.asyncio
+async def test_run_now_input_follows_the_prompt_and_labels_reach_the_session() -> None:
+    """A run's input is dispatched after the stored prompt; its labels land on the session."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(task)
+
+    run_now = build_run_now(_deps(store, conversation_store=conv_store), launch_dispatch=_launch)
+    run = RunRequest(
+        run_id="run_a", input="Subject: Pricing question", labels={"app.thread": "t1"}
+    )
+    assert await run_now(0, "task_1", run) is True
+    await _drain()
+
+    assert (
+        launched[0].prompt
+        == "do the thing\n\n<run_input>\nSubject: Pricing question\n</run_input>"
+    )
+    assert conv_store.label_writes["conv_1"] == {"app.thread": "t1"}
+    assert store.runs[0]["run_id"] == "run_a"
+    assert store.runs[0]["status"] == "running"
+    # The stored task keeps its prompt; only this run's copy carries the input.
+    assert store.get("task_1").prompt == "do the thing"
+
+
+@pytest.mark.asyncio
+async def test_run_now_without_input_sends_the_prompt_unchanged() -> None:
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(task)
+
+    run_now = build_run_now(_deps(store), launch_dispatch=_launch)
+    assert await run_now(0, "task_1", RunRequest(run_id="run_b")) is True
+    await _drain()
+
+    assert launched[0].prompt == "do the thing"
+    assert store.runs[0]["run_id"] == "run_b"
+
+
+@pytest.mark.asyncio
+async def test_run_now_failed_run_keeps_the_callers_run_id() -> None:
+    """The caller's run ID is the one recorded, also when the fire fails."""
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        pytest.fail("a failed session create must not launch")
+
+    run_now = build_run_now(
+        _deps(store, conversation_store=FakeConversationStore(fail_create=True)),
+        launch_dispatch=_launch,
+    )
+    assert await run_now(0, "task_1", RunRequest(run_id="run_c", input="x")) is True
+    await _drain()
+
+    assert [(r["run_id"], r["status"]) for r in store.runs] == [("run_c", "failed")]
+
+
+@pytest.mark.asyncio
+async def test_run_now_idempotency_keys_set_the_in_flight_guard() -> None:
+    """Different keys fire together; the same key, or no key twice, is refused while in flight."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    release = asyncio.Event()
+
+    async def _slow_launch(conv: Any, task: Any) -> None:
+        await release.wait()
+
+    run_now = build_run_now(
+        _deps(store, conversation_store=conv_store), launch_dispatch=_slow_launch
+    )
+    assert await run_now(0, "task_1", RunRequest(run_id="r1", idempotency_key="mail:1")) is True
+    assert await run_now(0, "task_1", RunRequest(run_id="r2", idempotency_key="mail:2")) is True
+    assert await run_now(0, "task_1", RunRequest(run_id="r3", idempotency_key="mail:1")) is False
+    # Keyed runs do not hold the task-wide key, so one unkeyed run still starts.
+    assert await run_now(0, "task_1", RunRequest(run_id="r4")) is True
+    assert await run_now(0, "task_1", RunRequest(run_id="r5")) is False
+
+    for _ in range(100):
+        if len(conv_store.created) == 3:
+            break
+        await asyncio.sleep(0.01)
+    release.set()
+    await _drain()
+    assert sorted(r["run_id"] for r in store.runs) == ["r1", "r2", "r4"]
 
 
 # ── Cost budget policy attachment ─────────────────────────────────────────
