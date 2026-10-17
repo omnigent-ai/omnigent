@@ -6944,6 +6944,24 @@ async def _post_turn_status_edge(
         edge.source,
         edge.turn_id,
         edge.status,
+        extra=debug_event(
+            "codex_turn_status",
+            session_id=session_id,
+            turn_id=edge.turn_id,
+            status=edge.status,
+            protocol_source=edge.source[:128],
+            has_turn_id=edge.turn_id is not None,
+            has_error=edge.error is not None,
+            native_error_kind=edge.error.kind if edge.error is not None else None,
+            native_error_reason=(
+                "thread_persistence_shutdown"
+                if edge.error is not None
+                and "failed to shutdown thread persistence" in edge.error.message[:4096].casefold()
+                else "unclassified"
+                if edge.error is not None
+                else None
+            ),
+        ),
     )
     response_id = _response_id(_params_with_turn_id({}, edge.turn_id)) if edge.turn_id else None
     output: str | None = None

@@ -1400,7 +1400,7 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
     tracker = ManagedLaunchTracker()
     calls: list[str] = []
     host_deregistered: list[str] = []
-    runner_deregistered: list[str] = []
+    runner_deregistered: list[tuple[str, bool]] = []
     fresh_host_conn = SimpleNamespace(last_frame_at=time.time())
     fresh_runner_session = object()
     host_registry_state: dict[str, object | None] = {"conn": fresh_host_conn}
@@ -1427,7 +1427,9 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
         tunnel_registry=SimpleNamespace(
             get=lambda _runner_id: fresh_runner_session,
             seconds_since_last_frame=lambda _session: 0.0,
-            deregister=lambda runner_id: runner_deregistered.append(runner_id),
+            deregister=lambda runner_id, *, retire: runner_deregistered.append(
+                (runner_id, retire)
+            ),
         ),
     )
 
@@ -1441,7 +1443,8 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
     assert exc.value.code == ErrorCode.WRONG_REPLICA
     assert calls == ["wake"]
     assert host_deregistered == ["055e31f38d07908f171ebad4ff5cbe9c"]
-    assert runner_deregistered == ["runner_stale_tunnel"]
+    # A stale tunnel is torn down, not handed off: its turns stay reconcilable here.
+    assert runner_deregistered == [("runner_stale_tunnel", False)]
 
 
 async def test_managed_wake_fails_when_runner_never_reconnects(

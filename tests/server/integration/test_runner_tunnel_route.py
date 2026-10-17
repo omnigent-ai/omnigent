@@ -2200,6 +2200,14 @@ async def test_ping_timeout_closes_tunnel_and_names_the_connection(
     assert timeouts[0]["app_silence_timeout_s"] == 0.02
     assert timeouts[0]["last_received_frame_age_s"] >= 0
     assert timeouts[0]["last_app_pong_received_age_s"] is None
+    # A silent peer is an expected, self-recovering outage, not a warning.
+    assert timeouts[0]["silence_source"] == "peer"
+    assert timeouts[0]["error_category"] == "runner"
+    assert timeouts[0]["error_impact"] == "transient"
+    [timeout_record] = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "runner_ping_timeout"
+    ]
+    assert timeout_record.levelno == logging.INFO
     ends = _tunnel_end_events(caplog)
     assert len(ends) == 1
     assert ends[0]["phase"] == "disconnected"

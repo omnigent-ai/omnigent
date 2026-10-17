@@ -468,6 +468,13 @@ async def test_host_tunnel_failed_heartbeat_still_times_out_silent_host(
             if getattr(r, "event_name", None) == "host_ping_timeout"
         ]
         assert timeout["connection_id"] == "host-silent"
+        # A sleeping or offline host is expected; only a local stall warns.
+        assert timeout["silence_source"] == "peer"
+        assert all(
+            r.levelno == logging.INFO
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "host_ping_timeout"
+        )
         assert timeout["app_silence_timeout_s"] == 0.06
         assert timeout["last_app_ping_sent_age_s"] is not None
         assert timeout["last_app_pong_received_age_s"] is None

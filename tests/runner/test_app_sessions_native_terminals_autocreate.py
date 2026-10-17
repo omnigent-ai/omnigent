@@ -3004,6 +3004,11 @@ def test_publish_native_terminal_start_error_emits_failed_status_only(
             "type": "session.status",
             "status": "failed",
             "error": error,
+            "failure_context": {
+                "failure_source": "native_terminal_start",
+                "failure_id": error_id,
+                "exception_type": "ImportError",
+            },
         },
     ]
     assert all(p.session_id == "415c9954e2fe4b9276083a4d2c66f689" for p in published)
