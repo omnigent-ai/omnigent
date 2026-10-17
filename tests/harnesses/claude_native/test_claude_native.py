@@ -6083,21 +6083,18 @@ async def test_resolve_cold_resume_args_warning_lands_in_logger(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("resume_args", [("--resume", "claude-sid-abc"), ()])
 async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    resume_args: tuple[str, ...],
 ) -> None:
     """
-    Cold-resume threads ``--resume <claude_sid>`` into the args
-    passed to ``_launch_claude_terminal``.
+    Cold resume keeps the same Omnigent id and delivers a new CLI prompt.
 
-    Load-bearing assertion: the conv id stays the SAME Omnigent
-    id end-to-end (no new id minted), AND the spawned terminal
-    receives Claude's prior session id as the first two args. A
-    regression that dropped the cold-resume args at the launch
-    seam would silently lose Claude-side context — the user keeps
-    the Omnigent conv id but Claude starts fresh. Tests
-    ``_resolve_cold_resume_args`` in isolation cannot catch this.
+    When the local transcript is available, ``--resume <claude_sid>``
+    precedes the current invocation's args. When it is unavailable, Claude
+    starts a fresh transcript and still delivers the newly supplied prompt.
     """
     captured_terminal_args: dict[str, Any] = {}
 
@@ -6117,13 +6114,13 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
     ) -> tuple[str, ...]:
         """
         Stand in for the real wrapper-label / external_session_id
-        lookup. Returns the args that production injects.
+        lookup, including the no-transcript fallback.
 
         :param _client: Unused HTTP client.
         :param _session_id: Unused conversation id.
-        :returns: Fixed ``("--resume", "claude-sid-abc")``.
+        :returns: The selected cold-resume args.
         """
-        return ("--resume", "claude-sid-abc")
+        return resume_args
 
     async def _fake_fetch_labels(
         _client: object,
@@ -6219,7 +6216,7 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
             session_id="conv_abc",
             runner_id="runner_xyz",
             session_bundle=None,
-            claude_args=("--print", "hello"),
+            claude_args=("CONTINUE_STEP_2", "--model", "sonnet", "--mcp-config", "mcp.json"),
             command="claude",
             append_system_prompt="Wrapper bridge instructions.",
         )
@@ -6230,14 +6227,14 @@ async def test_prepare_claude_terminal_cold_resume_injects_external_session_id(
     # exactly what the user told us NOT to do.
     assert prepared.session_id == "conv_abc"
     assert captured_terminal_args["session_id"] == "conv_abc"
-    # Cold-resume args land at the FRONT of claude's argv, with the
-    # user's passthrough args after. A regression that appended
-    # them OR dropped them would fail this assertion.
+    # The current invocation's prompt must reach Claude after the resume args.
     assert captured_terminal_args["claude_args"] == (
-        "--resume",
-        "claude-sid-abc",
-        "--print",
-        "hello",
+        *resume_args,
+        "CONTINUE_STEP_2",
+        "--model",
+        "sonnet",
+        "--mcp-config",
+        "mcp.json",
     )
     # Cold resume launches a new terminal (no early reattach return), so raw
     # author instructions must reach --append-system-prompt exactly as given.
@@ -6309,7 +6306,8 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
         """Return a fixed terminal id without spawning anything."""
         assert append_system_prompt == "Fresh session bridge instructions."
         assert allowed_tools == ()
-        del _client, _session_id, _claude_args, command, bridge_dir, claude_config
+        assert _claude_args == ("INITIAL_ONCE", "--model", "sonnet")
+        del _client, _session_id, command, bridge_dir, claude_config
         return "terminal_claude_main"
 
     monkeypatch.setattr(claude_native, "_create_claude_session", _fake_create_session)
@@ -6335,7 +6333,7 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
             session_id=None,
             runner_id="runner_xyz",
             session_bundle=b"fake-bundle",
-            claude_args=(),
+            claude_args=("INITIAL_ONCE", "--model", "sonnet"),
             command="claude",
             append_system_prompt="Fresh session bridge instructions.",
         )

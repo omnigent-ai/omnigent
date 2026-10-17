@@ -7565,6 +7565,7 @@ def _build_claude_native_base_args(
     model_override: str | None,
     terminal_launch_args: list[str] | None,
     resume_external_session_id: str | None = None,
+    cold_resume: bool = False,
 ) -> tuple[str, ...]:
     """
     Assemble the base ``claude`` CLI args for a native-terminal launch.
@@ -7572,8 +7573,9 @@ def _build_claude_native_base_args(
     These are the args before :func:`augment_claude_args` layers on the
     bridge / MCP / hook / Omnigent wiring. The order is: ``--resume`` for a
     cold resume, then persisted reasoning effort, then the user's
-    pass-through ``terminal_launch_args``, then a ``--model`` derived
-    from ``model_override`` — appended only when the user did not
+    pass-through ``terminal_launch_args`` (without the one-time leading
+    prompt on resume), then a ``--model`` derived from
+    ``model_override`` — appended only when the user did not
     already pass an explicit ``--model``. That precedence (explicit
     ``--model`` in pass-through args wins over ``model_override``)
     mirrors the CLI's ``_merge_default_model_arg``, moved runner-side.
@@ -7602,9 +7604,12 @@ def _build_claude_native_base_args(
         the same plain ``--resume`` path serves both cold resume and
         fork resume. ``None`` (a fresh launch, or no local transcript
         could be synthesized) adds nothing.
+    :param cold_resume: An existing native session is relaunching, even if
+        its transcript could not be restored and no ``--resume`` is passed.
     :returns: The assembled base args, e.g.
         ``("--resume", "<sid>", "--effort", "high")``.
     """
+    from omnigent.harnesses.claude_native.main import without_claude_launch_prompt
     from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
     args: list[str] = []
@@ -7613,7 +7618,11 @@ def _build_claude_native_base_args(
     if reasoning_effort is not None and reasoning_effort in CLAUDE_EFFORTS:
         args.extend(("--effort", reasoning_effort))
     if terminal_launch_args:
-        args.extend(terminal_launch_args)
+        args.extend(
+            without_claude_launch_prompt(terminal_launch_args)
+            if cold_resume or resume_external_session_id
+            else terminal_launch_args
+        )
     # model_override is a default: it applies only when the user did
     # not pass their own ``--model`` (in either the long ``--model X``
     # or the joined ``--model=X`` form).
@@ -9095,6 +9104,7 @@ async def _auto_create_claude_terminal(
         model_override=launch_model,
         terminal_launch_args=session_launch_args,
         resume_external_session_id=resume_external_session_id,
+        cold_resume=session_external_id is not None,
     )
 
     # Pass ``ap_server_url`` so ``build_hook_settings`` registers the
