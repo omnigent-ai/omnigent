@@ -187,8 +187,8 @@ boxlite = ["boxlite>=0.9.5,<1"]
 microsandbox = ["microsandbox>=0.6.9,<0.7"]
 # CoreWeave Sandbox launcher (`omnigent sandbox --provider cwsandbox` and
 # server-managed `sandbox.provider: cwsandbox`).
-# Same lazy-import posture as above. Pre-1.0 SDK: pin minor.
-cwsandbox = ["cwsandbox>=0.24,<1"]
+# Includes W&B authentication and typed HTTPS egress allowlists.
+cwsandbox = ["cwsandbox[wandb]>=1.14.3,<2"]
 # E2B sandbox launcher (`omnigent sandbox --provider e2b` and
 # server-managed `sandbox.provider: e2b`).
 # Same lazy-import posture as above.
