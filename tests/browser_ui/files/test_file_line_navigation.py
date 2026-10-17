@@ -327,6 +327,216 @@ def _seed_citation_file(
     )
 
 
+@pytest.mark.parametrize(
+    ("layout", "scenario"),
+    [
+        (layout, scenario)
+        for layout in ("unified", "split", "mobile")
+        for scenario in ("dense", "sparse")
+    ]
+    + [("unified", "navigate"), ("unified", "limited")],
+)
+def test_large_diff_has_bounded_computation(
+    page: Page, seeded_session: BrowserSession, layout: str, scenario: str
+) -> None:
+    dense = scenario != "sparse"
+    before = [
+        f'entry_{i}: str = "original value {i}"'
+        for i in range(1000 if scenario == "dense" else 5000)
+    ]
+    after = [
+        line.replace("original", "changed") if dense or i % 500 == 0 else line
+        for i, line in enumerate(before)
+    ]
+    _seed_citation_file(page, seeded_session)
+    base_url, session_id = seeded_session
+    environment_url = f"{base_url}/v1/sessions/{session_id}/resources/environments/default"
+    seeded_session.contract.json(
+        f"/v1/sessions/{session_id}/resources/environments/default/diff/{_FILE_PATH}",
+        {"path": _FILE_PATH, "before": "\n".join(before), "after": "\n".join(after)},
+    )
+    seeded_session.contract.route(
+        f"{environment_url}/filesystem/{_FILE_PATH}",
+        lambda route: route.fulfill(
+            json={
+                "path": _FILE_PATH,
+                "content": "\n".join(after),
+                "encoding": "utf-8",
+                "content_type": "text/plain",
+                "bytes": len("\n".join(after)),
+            }
+        ),
+    )
+    # Force the timeout boundary on fast CI machines; the refinement still uses real Monaco.
+    page.add_init_script(f"window.forceInitialBudget = {str(dense).lower()};")
+    page.add_init_script(f"window.holdRefinement = {str(scenario == 'dense').lower()};")
+    page.add_init_script(f"window.refinementScenario = {json.dumps(scenario)};")
+    # Observe the configured budget and real worker results.
+    page.add_init_script("""(() => {
+      window.diffComputations = [];
+      window.releaseRefinement = null;
+      window.refinementWorkers = [];
+      const NativeWorker = window.Worker;
+      window.Worker = class extends NativeWorker {
+        constructor(...args) {
+          super(...args);
+          this.terminated = false;
+          if (String(args[0]).includes('monacoRefinement.worker')) {
+            window.refinementWorkers.push(this);
+          }
+          this.pendingDiffs = new Map();
+          this.addEventListener('message', (event) => {
+            const {data} = event;
+            const record = this.pendingDiffs.get(data?.seq);
+            if (!record) return;
+            record.durationMs = performance.now() - record.started;
+            if (window.holdRefinement && record.options.maxComputationTimeMs > 1000
+                && !record.released) {
+              event.stopImmediatePropagation();
+              window.releaseRefinement = () => {
+                record.released = true;
+                this.dispatchEvent(new MessageEvent('message', {data}));
+              };
+              return;
+            }
+            record.result = data.res;
+            this.pendingDiffs.delete(data.seq);
+          });
+        }
+        terminate() {
+          this.terminated = true;
+          for (const record of this.pendingDiffs.values()) record.terminated = true;
+          super.terminate();
+        }
+        postMessage(message, ...args) {
+          if (message?.before && message?.options) {
+            if (window.refinementScenario === 'navigate') return; // Stall until cancelled.
+            if (window.refinementScenario === 'limited') {
+              message = {...message, options: {...message.options, maxComputationTimeMs: 1}};
+            }
+          }
+          if (message?.method === '$computeDiff') {
+            const record = {
+              started: performance.now(),
+              options: message.args[2],
+              algorithm: message.args[3],
+            };
+            window.diffComputations.push(record);
+            this.pendingDiffs.set(message.req, record);
+            if (window.forceInitialBudget && message.args[2].maxComputationTimeMs === 1000) {
+              message = {...message, args: [...message.args]};
+              message.args[2] = {...message.args[2], maxComputationTimeMs: 1};
+            }
+          }
+          return super.postMessage(message, ...args);
+        }
+      };
+    })()""")
+    if layout == "mobile":
+        page.set_viewport_size({"width": 390, "height": 844})
+        page.goto(f"{base_url}/c/{session_id}?file={_FILE_PATH}&diff=1")
+        viewer = page.locator('[data-testid="file-viewer"]:visible')
+    else:
+        viewer = _open_monaco(page, seeded_session, layout)
+    page.wait_for_function(
+        "!!window.diffComputations[0]?.result",
+        timeout=30_000,
+    )
+    expect(viewer.locator(".monaco-diff-editor")).to_have_count(1)
+    expect(viewer.locator(".line-insert, .char-insert").first).to_be_visible()
+    computations = page.evaluate("window.diffComputations")
+    # These are contract expectations, independent of the application's constants.
+    assert computations[0]["options"]["maxComputationTimeMs"] == 1000, (
+        "Initial budget changed: update the Worker interception and budget expectations together"
+    )
+    if scenario == "navigate":
+        page.wait_for_function("window.refinementWorkers.length === 1")
+        assert page.evaluate("!window.refinementWorkers[0].terminated")
+        viewer.get_by_role("button", name="Exit diff view").click()
+        expect(viewer.locator(".monaco-diff-editor")).to_have_count(0)
+        # Disposing the models terminates refinement instead of queuing behind its 10s budget.
+        page.wait_for_function(
+            "window.refinementWorkers[0].terminated",
+            timeout=3000,
+        )
+        expect(viewer.get_by_role("status")).to_have_count(0)
+        return
+    if scenario == "limited":
+        expect(viewer.get_by_role("status")).to_have_text(
+            "Diff computation stopped early. Highlighting may include unchanged text.",
+            timeout=20_000,
+        )
+        assert len(page.evaluate("window.diffComputations")) == 2
+        expect(viewer.locator(".line-insert, .char-insert").first).to_be_visible()
+        return
+    if dense:
+        expect(viewer.get_by_role("status")).to_have_text("Refining diff…", timeout=5000)
+        # The first result remains highlighted and scrollable during refinement.
+        editor = viewer.locator(".monaco-diff-editor")
+        editor.evaluate("e => e.dataset.refinementIdentity = 'same-editor'")
+        page.wait_for_function("!!window.releaseRefinement", timeout=20_000)
+        visible_text = """els => els.filter(e => {
+            const r=e.getBoundingClientRect(); return r.top > 200 && r.top < 700;
+        }).map(e => [e.textContent,e.getBoundingClientRect().top])"""
+        initial_scroll = editor.locator(".modified .view-line").evaluate_all(visible_text)
+        pane = editor.locator(".modified").bounding_box()
+        assert pane is not None
+        page.mouse.move(pane["x"] + pane["width"] / 2, pane["y"] + pane["height"] / 2)
+        page.mouse.wheel(0, 1400)
+        # Wait for movement and then stable rendered positions, including smooth scrolling.
+        page.wait_for_function(
+            """initial => {
+                const lines = [...document.querySelectorAll(
+                    '.monaco-diff-editor .modified .view-line'
+                )].filter(e => {
+                    const r = e.getBoundingClientRect(); return r.top > 200 && r.top < 700;
+                }).map(e => [e.textContent, e.getBoundingClientRect().top]);
+                const value = JSON.stringify(lines);
+                if (value !== window.scrollSample?.value) {
+                    window.scrollSample = {value, since: performance.now()};
+                }
+                return lines.length && value !== JSON.stringify(initial)
+                    && performance.now() - window.scrollSample.since >= 100;
+            }""",
+            arg=initial_scroll,
+        )
+        before_scroll = editor.locator(".modified .view-line").evaluate_all(visible_text)
+        assert before_scroll
+        assert before_scroll != initial_scroll
+        page.evaluate("window.releaseRefinement()")
+        expect(viewer.get_by_role("status")).to_have_text("", timeout=5000)
+        expect(editor).to_have_attribute("data-refinement-identity", "same-editor")
+        # Let Monaco finish painting the newly applied result before comparing positions.
+        page.evaluate(
+            "() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))"
+        )
+        after_scroll = editor.locator(".modified .view-line").evaluate_all(visible_text)
+        assert before_scroll == after_scroll
+        computations = page.evaluate("window.diffComputations")
+        assert len(computations) == 2
+        refined = computations[1]
+        assert refined["options"]["maxComputationTimeMs"] == 10000
+        assert not refined["result"]["quitEarly"]
+        assert sum(len(change[4] or []) for change in refined["result"]["changes"]) >= 1000
+    else:
+        assert len(computations) == 1
+    computation = computations[0]
+    print(f"{layout} dense={dense}: {json.dumps(computation)}")
+    assert computation["algorithm"] == "advanced"
+    assert 0 < computation["options"]["maxComputationTimeMs"] <= 1000
+    changes = computation["result"]["changes"]
+    reconstructed = before.copy()
+    for original_start, original_end, modified_start, modified_end, *_ in reversed(changes):
+        reconstructed[original_start - 1 : original_end - 1] = after[
+            modified_start - 1 : modified_end - 1
+        ]
+    assert reconstructed == after
+    if not dense:
+        assert not computation["result"]["quitEarly"]
+        assert len(changes) == 10
+        assert all(change[4] for change in changes), "Sparse edits keep character highlighting"
+
+
 def test_diff_loads_in_parallel_with_workspace_metadata(
     page: Page, seeded_session: BrowserSession
 ) -> None:

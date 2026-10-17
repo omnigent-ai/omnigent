@@ -15,6 +15,7 @@
 // @monaco-editor/react at the bundled instance. It lives behind the lazy
 // MonacoCodeEditor import so Monaco stays out of the initial bundle.
 
+import { createMonacoWorker } from "./createMonacoWorker";
 import { loader } from "@monaco-editor/react";
 import { shikiToMonaco } from "@shikijs/monaco";
 import { createHighlighter } from "shiki";
@@ -48,12 +49,9 @@ const DARK_THEME = "github-dark";
 // worker as a content-hashed asset served from their own CDN/output — no
 // hardcoded path, no manual copy. This matches the monolith's convention for
 // worker/wasm assets (see ruff/pdf workers in webapp/web). The worker is an ESM
-// module (it lives under monaco's `esm/` tree), hence `type: "module"`.
+// module, hence `type: "module"`.
 self.MonacoEnvironment = {
-  getWorker: () =>
-    new Worker(new URL("monaco-editor/esm/vs/editor/editor.worker.js", import.meta.url), {
-      type: "module",
-    }),
+  getWorker: createMonacoWorker,
 };
 
 // Point @monaco-editor/react at the bundled instance instead of its CDN loader.
