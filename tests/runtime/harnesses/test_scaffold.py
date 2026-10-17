@@ -33,6 +33,7 @@ import uuid
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -1915,14 +1916,19 @@ async def test_idle_watchdog_attaches_recent_forwarder_post_failure(
             await asyncio.Event().wait()
 
     # Short idle window so the watchdog trips quickly; absolute kept high so the
-    # idle ceiling (not the absolute one) is what fails the turn. The reader's
-    # recency window is 2x the idle timeout, comfortably covering the record
-    # made just before run_turn started plus scheduling overhead.
-    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.2)
+    # idle ceiling (not the absolute one) is what fails the turn.
+    idle_timeout = 0.2
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", idle_timeout)
     monkeypatch.setattr(_scaffold, "_TURN_ABSOLUTE_TIMEOUT_S", 3600.0)
+    # Age the failure by exactly the wedged attempts' idle windows (plus a
+    # margin) on a fake clock, so a stalled runner can't push it out of range.
+    health_clock = {"now": 1000.0}
+    monkeypatch.setattr(health, "time", SimpleNamespace(monotonic=lambda: health_clock["now"]))
 
     health.clear()
     health.record_post_failure("external_session_status", httpx.ConnectError("No route to host"))
+    attempts = 1 + _scaffold._WEDGED_TURN_RECOVERY_RETRIES
+    health_clock["now"] += idle_timeout * attempts + 0.05
 
     app = _WedgedApp()
     ctx = TurnContext(

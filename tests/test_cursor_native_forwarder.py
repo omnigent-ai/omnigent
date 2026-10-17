@@ -657,6 +657,16 @@ async def _drive_forwarder(
     monkeypatch.setattr(fwd, "_discover_store", lambda workspace, launch_ms: store)
     monkeypatch.setattr(fwd, "_chat_claimed_by_other", claim or (lambda *a, **k: False))
     monkeypatch.setattr(fwd, "_post_conversation_item", poster)
+    # Answer the loop's other requests (e.g. the external_session_id PATCH)
+    # in-process: resolving the fake host can stall past the tick budget.
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        fwd.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(
+            transport=httpx.MockTransport(lambda request: httpx.Response(204)), **kwargs
+        ),
+    )
     task = asyncio.create_task(
         fwd.forward_cursor_store_to_session(
             base_url="http://test",
