@@ -43,9 +43,11 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import importlib
 import json
 import logging
 import os
+import secrets
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -574,6 +576,44 @@ async def _bridge_spawn_in_cwd(cwd: str) -> AsyncIterator[None]:
             os.chdir(prev_cwd)
 
 
+# cursor-sdk's callback-token factory, module-private in both callback servers.
+_SDK_TOKEN_FACTORY = "_new_auth_token"
+
+
+def _argv_safe_auth_token(*_args: object, **_kwargs: object) -> str:
+    """Mint a callback auth token that never starts with ``-``.
+
+    Ignores any arguments so it can replace the SDK factory whatever its signature.
+    """
+    for _ in range(100):
+        token = secrets.token_urlsafe(32)
+        if not token.startswith("-"):
+            return token
+    raise RuntimeError("could not mint an argv-safe cursor-sdk callback token")
+
+
+def _harden_cursor_sdk_callback_tokens() -> None:
+    """Swap cursor-sdk's callback-token factories for argv-safe ones.
+
+    The SDK passes these tokens to the bridge as flag values, and the bridge
+    rejects a value with a leading ``-`` as a missing value. No-op when the
+    factories are absent: newer SDKs mint safe tokens themselves.
+    """
+    for module_name in ("cursor_sdk._tool_callback", "cursor_sdk._store_callback"):
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        if callable(getattr(module, _SDK_TOKEN_FACTORY, None)):
+            setattr(module, _SDK_TOKEN_FACTORY, _argv_safe_auth_token)
+        else:
+            logger.debug(
+                "CursorExecutor: %s has no %s; assuming the SDK mints argv-safe tokens.",
+                module_name,
+                _SDK_TOKEN_FACTORY,
+            )
+
+
 @dataclass
 class _CursorSessionState:
     """Per-Omnigent-conversation SDK session state."""
@@ -842,6 +882,7 @@ class CursorExecutor(Executor):
             hook_script = str(Path(__file__).with_name("cursor_policy_hook.py"))
             state.hooks_file = _write_cursor_hooks(cwd, hook_script, server_url, conv_id)
 
+        _harden_cursor_sdk_callback_tokens()
         # Spawn the bridge with the process cwd pointing at the workspace so
         # Cursor's shell tools execute there, not in the runner daemon's
         # directory (the SDK spawns the bridge without a cwd=). See
