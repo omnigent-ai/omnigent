@@ -402,9 +402,13 @@ def _rotate_session_on_clear(bridge_dir: Path) -> str | None:
     from omnigent.cli_auth import databricks_request_headers
 
     headers.update(databricks_request_headers(ap_server_url))
+    from omnigent.native.native_policy_hook import is_loopback_url
+
     try:
         with httpx.Client(
-            headers=headers, timeout=httpx.Timeout(_SESSION_ROTATION_TIMEOUT_S)
+            headers=headers,
+            timeout=httpx.Timeout(_SESSION_ROTATION_TIMEOUT_S),
+            trust_env=not is_loopback_url(ap_server_url),
         ) as client:
             new_session_id = _create_clear_replacement_session(
                 client,
@@ -460,9 +464,13 @@ def _rotate_session_on_fork(bridge_dir: Path) -> str | None:
     from omnigent.cli_auth import databricks_request_headers
 
     headers.update(databricks_request_headers(ap_server_url))
+    from omnigent.native.native_policy_hook import is_loopback_url
+
     try:
         with httpx.Client(
-            headers=headers, timeout=httpx.Timeout(_SESSION_ROTATION_TIMEOUT_S)
+            headers=headers,
+            timeout=httpx.Timeout(_SESSION_ROTATION_TIMEOUT_S),
+            trust_env=not is_loopback_url(ap_server_url),
         ) as client:
             new_session_id = _create_fork_replacement_session(
                 client,
@@ -773,7 +781,10 @@ def _post_hook_with_reattach(
     backoff_s = _PERMISSION_RETRY_INITIAL_BACKOFF_S
     import httpx
 
-    from omnigent.native.native_policy_hook import _is_login_redirect_or_unauthorized
+    from omnigent.native.native_policy_hook import (
+        _is_login_redirect_or_unauthorized,
+        is_loopback_url,
+    )
 
     timeout = httpx.Timeout(_PERMISSION_TIMEOUT_S, connect=_PERMISSION_CONNECT_TIMEOUT_S)
     # Absolute backstop: even a run of held-poll severs (which don't count
@@ -788,10 +799,15 @@ def _post_hook_with_reattach(
         else contextlib.nullcontext()
     )
     with marker_scope:
+        trust_env = not is_loopback_url(url)
         while True:
             attempt_started = time.monotonic()
             try:
-                with httpx.Client(headers=headers, timeout=timeout) as client:
+                with httpx.Client(
+                    headers=headers,
+                    timeout=timeout,
+                    trust_env=trust_env,
+                ) as client:
                     resp = client.post(url, json=body)
                     if (
                         reauth is not None

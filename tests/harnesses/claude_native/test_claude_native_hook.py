@@ -272,8 +272,9 @@ def test_clear_session_start_hook_rotates_before_printing_conversation_url(
         """
 
         captured_timeouts: list[object] = []
+        captured_trust_env: list[object] = []
 
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             """
             Capture constructor inputs.
 
@@ -283,6 +284,7 @@ def test_clear_session_start_hook_rotates_before_printing_conversation_url(
             """
             del headers
             self.captured_timeouts.append(timeout)
+            self.captured_trust_env.append(_kwargs.get("trust_env"))
 
         def __enter__(self) -> _FakeHttpxClient:
             """
@@ -420,6 +422,8 @@ def test_clear_session_start_hook_rotates_before_printing_conversation_url(
     ]
     recorded = (bridge_dir / "hooks.jsonl").read_text(encoding="utf-8")
     assert '"omnigent_clear_rotated_to":"conv_new"' in recorded
+    # Loopback rotations must bypass ambient proxies, or they fail closed.
+    assert _FakeHttpxClient.captured_trust_env == [False]
     # The /clear rotation gates Claude's welcome banner and must fail
     # fast — it uses _SESSION_ROTATION_TIMEOUT_S, NOT the day-long
     # permission long-poll budget. If this regresses to
@@ -455,8 +459,9 @@ def test_fork_session_start_hook_forks_before_printing_conversation_url(
         """
 
         captured_timeouts: list[object] = []
+        captured_trust_env: list[object] = []
 
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             """
             Capture constructor inputs.
 
@@ -466,6 +471,7 @@ def test_fork_session_start_hook_forks_before_printing_conversation_url(
             """
             del headers
             self.captured_timeouts.append(timeout)
+            self.captured_trust_env.append(_kwargs.get("trust_env"))
 
         def __enter__(self) -> _FakeHttpxClient:
             """
@@ -615,6 +621,8 @@ def test_fork_session_start_hook_forks_before_printing_conversation_url(
     assert '"omnigent_claude_session_was_seen":false' in recorded
     assert '"omnigent_fork_detected":true' in recorded
     assert '"omnigent_fork_rotated_to":"conv_fork"' in recorded
+    # Loopback rotations must bypass ambient proxies, or they fail closed.
+    assert _FakeHttpxClient.captured_trust_env == [False]
     # The /fork rotation gates Claude's welcome banner and must fail
     # fast — it uses _SESSION_ROTATION_TIMEOUT_S, NOT the day-long
     # permission long-poll budget. If this regresses to
@@ -624,6 +632,67 @@ def test_fork_session_start_hook_forks_before_printing_conversation_url(
     rotation_timeout = _FakeHttpxClient.captured_timeouts[0]
     assert isinstance(rotation_timeout, httpx.Timeout)
     assert rotation_timeout.read == claude_native_hook._SESSION_ROTATION_TIMEOUT_S
+
+
+@pytest.mark.parametrize("mode", ["clear", "fork"])
+def test_session_rotation_honours_ambient_proxy_for_a_remote_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    """A remote-server rotation callback keeps honouring the ambient proxy.
+
+    The loopback branch is covered by the clear/fork rotation tests above; this
+    guards the other branch so an unconditional ``trust_env=False`` at either
+    rotation call site would fail.
+    """
+    captured_trust_env: list[object] = []
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object, trust_env: object) -> None:
+            del headers, timeout
+            captured_trust_env.append(trust_env)
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def get(self, url: str) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_old",
+                    "agent_id": "ag_claude",
+                    "runner_id": "runner_one",
+                    "labels": {},
+                },
+                request=httpx.Request("GET", url),
+            )
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            return httpx.Response(200, json={"id": "conv_new"}, request=httpx.Request("POST", url))
+
+        def patch(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            return httpx.Response(200, json={"id": "patched"}, request=httpx.Request("PATCH", url))
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+    bridge_dir = prepare_bridge_dir("conv_old", bridge_id="bridge_shared", workspace=tmp_path)
+    build_hook_settings(
+        bridge_dir,
+        ap_server_url="https://omnigent.example.com",
+        ap_auth_headers={"Authorization": "Bearer xyz"},
+    )
+    write_active_session_id(bridge_dir, "conv_old")
+
+    rotate = {
+        "clear": claude_native_hook._rotate_session_on_clear,
+        "fork": claude_native_hook._rotate_session_on_fork,
+    }[mode]
+    assert rotate(bridge_dir) == "conv_new"
+    assert captured_trust_env == [True]
 
 
 def test_resume_session_start_without_branch_marker_does_not_fork(
@@ -646,7 +715,7 @@ def test_resume_session_start_without_branch_marker_does_not_fork(
         :param timeout: Timeout passed to :class:`httpx.Client`.
         """
 
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             """
             Capture constructor inputs.
 
@@ -763,7 +832,7 @@ def test_permission_request_hook_posts_to_active_session_from_bridge_config(
         :param timeout: Timeout passed to :class:`httpx.Client`.
         """
 
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             """
             Capture constructor inputs.
 
@@ -850,6 +919,49 @@ def test_permission_request_hook_posts_to_active_session_from_bridge_config(
     assert captured.err == ""
 
 
+@pytest.mark.parametrize(
+    ("url", "expected_trust_env"),
+    [
+        ("http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request", False),
+        ("http://localhost:8787/v1/sessions/conv_x/hooks/permission-request", False),
+        (
+            "https://omnigents.example.databricksapps.com/v1/sessions/conv_x/hooks/permission-request",
+            True,
+        ),
+    ],
+)
+def test_post_hook_with_reattach_bypasses_proxy_only_for_loopback(
+    monkeypatch: pytest.MonkeyPatch, url: str, expected_trust_env: bool
+) -> None:
+    """A loopback permission callback bypasses the ambient proxy; a remote one keeps it."""
+    captured_trust_env: list[object] = []
+
+    class _Client:
+        def __init__(self, **kwargs: object) -> None:
+            captured_trust_env.append(kwargs.get("trust_env"))
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def post(self, request_url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            return httpx.Response(
+                200,
+                text='{"hookSpecificOutput":{"permissionDecision":"allow"}}',
+                request=httpx.Request("POST", request_url),
+            )
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+
+    resp = claude_native_hook._post_hook_with_reattach(url, {}, {}, "claude permission")
+    assert resp is not None
+    assert resp.status_code == 200
+    assert captured_trust_env == [expected_trust_env]
+
+
 def _prepare_permission_bridge(tmp_path: Path, session_id: str) -> Path:
     """
     Stand up a bridge dir wired for the permission-request hook.
@@ -897,7 +1009,7 @@ def test_permission_request_hook_retries_transport_cut_with_same_id(
         :param timeout: Timeout passed to :class:`httpx.Client`.
         """
 
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             """
             Accept and discard constructor inputs.
 
@@ -998,7 +1110,7 @@ def test_permission_request_hook_does_not_retry_rejections(
         :param timeout: Timeout passed to :class:`httpx.Client`.
         """
 
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             """
             Accept and discard constructor inputs.
 
@@ -1238,7 +1350,7 @@ def test_evaluate_policy_pre_tool_use_converts_and_returns_deny(
         :param timeout: Timeout passed to :class:`httpx.Client`.
         """
 
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             """
             Capture constructor inputs.
 
@@ -1350,7 +1462,7 @@ def test_evaluate_policy_stamps_live_model_from_context_json(
     class _FakeHttpxClient:
         """Sync HTTP client stub capturing the posted EvaluationRequest."""
 
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             """Record constructor inputs. :returns: None."""
             del headers, timeout
 
@@ -1418,7 +1530,7 @@ def test_evaluate_policy_post_tool_use_converts_and_returns_context(
         :param timeout: Timeout passed to :class:`httpx.Client`.
         """
 
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             """
             Capture constructor inputs.
 
@@ -1711,7 +1823,7 @@ def test_evaluate_policy_retries_5xx_and_succeeds(
     call_count = 0
 
     class _FlakyThenOkClient:
-        def __init__(self, *, headers: object, timeout: object) -> None:
+        def __init__(self, *, headers: object, timeout: object, **_kwargs: object) -> None:
             del headers, timeout
 
         def __enter__(self) -> _FlakyThenOkClient:
@@ -1775,7 +1887,7 @@ def test_evaluate_policy_reauths_on_expired_token_instead_of_failing_closed(
     attempts: list[dict[str, str]] = []
 
     class _RedirectThenOkClient:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del timeout
             self._headers = headers
 
@@ -1850,7 +1962,7 @@ def test_evaluate_policy_reauths_on_403_invalid_token(
     attempts: list[dict[str, str]] = []
 
     class _ForbiddenThenOkClient:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del timeout
             self._headers = headers
 
@@ -1922,7 +2034,7 @@ def test_evaluate_policy_fails_closed_when_reauth_unavailable(
     """
 
     class _RedirectClient:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del headers, timeout
 
         def __enter__(self) -> _RedirectClient:
@@ -2105,7 +2217,7 @@ def _scripted_client(
     class _ScriptedClient:
         calls: list[str] = []
 
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del headers, timeout
 
         def __enter__(self) -> _ScriptedClient:
@@ -2246,7 +2358,7 @@ def test_reattach_proxy_severed_held_poll_never_caps(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(claude_native_hook.time, "sleep", lambda _s: None)
 
     class _SeverThenAnswerClient:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del headers, timeout
 
         def __enter__(self) -> _SeverThenAnswerClient:
@@ -2367,7 +2479,7 @@ def test_reattach_holds_the_approval_wait_marker_until_the_wait_ends(
     monkeypatch.setattr(claude_native_hook.time, "sleep", lambda _s: None)
 
     class _ObservingClient:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del headers, timeout
 
         def __enter__(self) -> _ObservingClient:
@@ -2426,7 +2538,7 @@ def test_reattach_marker_stays_fresh_through_an_unsevered_held_poll(
     freshness: list[bool] = []
 
     class _HoldingClient:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del headers, timeout
 
         def __enter__(self) -> _HoldingClient:
@@ -2476,7 +2588,7 @@ def test_reattach_reauths_again_after_a_held_poll_sever(monkeypatch: pytest.Monk
     seen_auth: list[str] = []
 
     class _Client:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del timeout
             self._headers = headers
 
@@ -2641,7 +2753,7 @@ def test_reattach_returns_response_on_success(monkeypatch: pytest.MonkeyPatch) -
     class _OkClient:
         calls = 0
 
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del headers, timeout
 
         def __enter__(self) -> _OkClient:
