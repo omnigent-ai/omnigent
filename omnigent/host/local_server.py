@@ -959,8 +959,8 @@ def stop_untracked_local_server(port: int = _DEFAULT_LOCAL_PORT) -> int | None:
     ``/health`` on the canonical loopback *port*, find its PID and terminate
     it. Call it AFTER :func:`stop_local_omnigent_server` so a normally-tracked
     server is already gone and ``/health`` no longer answers (this is a
-    no-op). Best-effort: returns ``None`` when nothing untracked is found or
-    ``lsof`` is unavailable.
+    no-op). A server belonging to another data dir is left alone. Best-effort:
+    returns ``None`` when nothing untracked is found or ``lsof`` is unavailable.
 
     :param port: Canonical loopback port to sweep, e.g. ``6767``.
     :returns: The PID stopped, or ``None`` if there was nothing to stop.
@@ -971,8 +971,39 @@ def stop_untracked_local_server(port: int = _DEFAULT_LOCAL_PORT) -> int | None:
     pid = _pid_listening_on_port(port)
     if pid is None or not _pid_alive(pid):
         return None
+    if not _pid_serves_local_data_dir(pid):
+        # Another data dir's server (a second worktree or HOME) owns the port.
+        return None
     _terminate_pid(pid)
     return pid
+
+
+def _pid_serves_local_data_dir(pid: int) -> bool:
+    """Return whether server *pid* runs on this invocation's data dir.
+
+    A spawned server names its artifact dir on the command line; a foreground
+    ``omnigent server`` derives it from ``OMNIGENT_DATA_DIR`` or ``HOME``.
+    Unknowable ownership (exited, access denied) counts as foreign.
+
+    :param pid: The pid listening on the canonical port, e.g. ``93359``.
+    :returns: ``True`` only when the server's data dir is :func:`_local_data_dir`.
+    """
+    try:
+        proc = psutil.Process(pid)
+        argv = proc.cmdline()
+        if "--artifact-location" in argv[:-1]:
+            server_data_dir = Path(argv[argv.index("--artifact-location") + 1]).parent
+        else:
+            environ = proc.environ()
+            if explicit := environ.get("OMNIGENT_DATA_DIR"):
+                server_data_dir = Path(explicit).expanduser()
+            elif home := environ.get("HOME"):
+                server_data_dir = Path(home) / ".omnigent"
+            else:
+                return False
+        return server_data_dir.resolve() == _local_data_dir().resolve()
+    except (psutil.Error, OSError, ValueError):
+        return False
 
 
 def register_local_server(port: int) -> None:
