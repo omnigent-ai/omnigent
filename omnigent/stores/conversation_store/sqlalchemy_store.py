@@ -15,6 +15,7 @@ from sqlalchemy import (
     Select,
     and_,
     asc,
+    column,
     delete,
     desc,
     func,
@@ -24,8 +25,10 @@ from sqlalchemy import (
     or_,
     select,
     text,
+    true,
     tuple_,
     update,
+    values,
 )
 from sqlalchemy.orm import QueryableAttribute, Session, load_only
 from sqlalchemy.sql.selectable import Subquery
@@ -47,6 +50,7 @@ from omnigent.db.db_models import (
     SqlSessionPermission,
     SqlUser,
     SqlUserDailyCost,
+    Uuid16,
     current_workspace_id,
     uuid_to_bytes,
 )
@@ -149,14 +153,13 @@ def _encode_session_state(
 
 
 # Server-side deadline (ms) for the content-search query in
-# ``list_conversations``. Session search matches ``LOWER(search_text) LIKE
-# '%q%'`` across ``conversation_items``; that is index-backed by the pg_trgm
-# GIN index (migration ``d5e9f1a2b3c4``), but if the index is ever missing the
-# scan can run unbounded and — since the query runs in a worker thread — a
-# client disconnect does not stop it. ``SET LOCAL statement_timeout`` caps it so
-# a degraded deployment fails the search fast instead of pinning a DB
-# connection. Postgres-only; ``SET LOCAL`` reverts on commit so it never leaks
-# to the connection's next pooled use. Longer than the client's own
+# ``list_conversations``. Session search matches ``search_text ILIKE '%q%'``
+# per conversation; no index serves a leading-wildcard match, so a large
+# workspace can scan many items and — since the query runs in a worker thread —
+# a client disconnect does not stop it. ``SET LOCAL statement_timeout`` caps it
+# so a slow search fails fast instead of pinning a DB connection.
+# Postgres-only; ``SET LOCAL`` reverts on commit so it never leaks to the
+# connection's next pooled use. Longer than the client's own
 # ``SEARCH_FETCH_TIMEOUT_MS`` so the browser gives up first on the happy path.
 _SEARCH_STATEMENT_TIMEOUT_MS = 15_000
 
@@ -628,6 +631,80 @@ def _fetch_labels_bulk(
     return out
 
 
+def _earliest_match_by_min(conversation_ids: list[str], pattern: str) -> Select[tuple[str, str]]:
+    """
+    Select each conversation's earliest matching item body via ``MIN(position)``.
+
+    Portable form: a grouped subquery finds the min matching ``position`` per
+    conversation, then the outer query joins back for only those bodies. It
+    still visits every matching item of each conversation to aggregate.
+
+    :param conversation_ids: Conversation IDs to search, e.g. ``["conv_a"]``.
+    :param pattern: Unescaped ``ILIKE`` pattern, e.g. ``"%deploy%"``.
+    :returns: A ``(conversation_id, search_text)`` select.
+    """
+    workspace_id = current_workspace_id()
+    # workspace_id leads the (workspace_id, conversation_id, position) index.
+    # Both the aggregate and the join-back must include it or the planner
+    # can't use that index and falls back to a full table scan of every item.
+    earliest = (
+        select(
+            SqlConversationItem.conversation_id.label("cid"),
+            func.min(SqlConversationItem.position).label("pos"),
+        )
+        .where(
+            SqlConversationItem.workspace_id == workspace_id,
+            SqlConversationItem.conversation_id.in_(conversation_ids),
+            SqlConversationItem.search_text.ilike(pattern),
+        )
+        .group_by(SqlConversationItem.conversation_id)
+        .subquery()
+    )
+    return select(
+        SqlConversationItem.conversation_id,
+        SqlConversationItem.search_text,
+    ).join(
+        earliest,
+        and_(
+            SqlConversationItem.workspace_id == workspace_id,
+            SqlConversationItem.conversation_id == earliest.c.cid,
+            SqlConversationItem.position == earliest.c.pos,
+        ),
+    )
+
+
+def _earliest_match_by_probe(conversation_ids: list[str], pattern: str) -> Select[tuple[str, str]]:
+    """
+    Select each conversation's earliest matching item body via a LATERAL probe.
+
+    PostgreSQL only. Each conversation walks the
+    ``(workspace_id, conversation_id, position)`` index in order and stops at
+    its first match, so a common term costs one row per conversation rather
+    than every match. ``id`` breaks ties between duplicate positions.
+
+    :param conversation_ids: Conversation IDs to search, e.g. ``["conv_a"]``.
+    :param pattern: Unescaped ``ILIKE`` pattern, e.g. ``"%deploy%"``.
+    :returns: A ``(conversation_id, search_text)`` select.
+    """
+    page = values(column("cid", Uuid16()), name="snippet_page").data(
+        [(conversation_id,) for conversation_id in conversation_ids]
+    )
+    first_match = (
+        select(SqlConversationItem.search_text)
+        .where(
+            SqlConversationItem.workspace_id == current_workspace_id(),
+            SqlConversationItem.conversation_id == page.c.cid,
+            SqlConversationItem.search_text.ilike(pattern),
+        )
+        .order_by(SqlConversationItem.position, SqlConversationItem.id)
+        .limit(1)
+        .lateral("first_match")
+    )
+    return select(page.c.cid, first_match.c.search_text).select_from(
+        page.join(first_match, true())
+    )
+
+
 def _fetch_search_snippets(
     session: Session,
     conversation_ids: list[str],
@@ -641,12 +718,10 @@ def _fetch_search_snippets(
     match so the search UI can show *where* the session matched. The
     earliest matching item per conversation wins.
 
-    Bulk (no N+1) *and* bounded to one row per conversation: a grouped
-    subquery finds the min matching ``position`` per conversation, then the
-    outer query materializes only those rows. Without the ``MIN(position)``
-    join, the plain ``LIKE`` would stream every matching item's full
-    ``search_text`` body — potentially thousands per long conversation —
-    just to keep the first.
+    Bulk (no N+1) *and* bounded to one body per conversation, so a long
+    conversation never streams every matching item's full ``search_text``
+    just to keep the first. ``ILIKE`` on the raw column, matching the content
+    filter in ``list_conversations``.
 
     :param session: The active SQLAlchemy session.
     :param conversation_ids: Conversation IDs to build snippets for,
@@ -659,45 +734,13 @@ def _fetch_search_snippets(
     if not conversation_ids or not query:
         return {}
     pattern = f"%{query.lower()}%"
-    workspace_id = current_workspace_id()
-    # workspace_id leads the (workspace_id, conversation_id, position) index.
-    # Both the aggregate and the join-back below must include it or Postgres
-    # can't use that index and falls back to a full table scan of every item.
-    # ILIKE on the raw column rather than ``lower(search_text) LIKE`` for the
-    # same reason as the content match in ``list_conversations``: the lower()
-    # form matches the pg_trgm index expression, and the planner then scans the
-    # whole workspace even though this is already scoped to one page of ids.
-    match_pred = and_(
-        SqlConversationItem.workspace_id == workspace_id,
-        SqlConversationItem.conversation_id.in_(conversation_ids),
-        SqlConversationItem.search_text.ilike(pattern),
+    dialect = session.bind.dialect.name if session.bind is not None else ""
+    # Literal "postgresql": CockroachDB is PostgreSQL-family but keeps the
+    # portable aggregate.
+    earliest_match = (
+        _earliest_match_by_probe if dialect == "postgresql" else _earliest_match_by_min
     )
-    # Earliest matching position per conversation — a small (conv_id, position)
-    # aggregate, no bodies materialized.
-    earliest = (
-        select(
-            SqlConversationItem.conversation_id.label("cid"),
-            func.min(SqlConversationItem.position).label("pos"),
-        )
-        .where(match_pred)
-        .group_by(SqlConversationItem.conversation_id)
-        .subquery()
-    )
-    # Join back to pull exactly one search_text body per conversation. The
-    # workspace_id predicate keeps this on the composite index.
-    rows = session.execute(
-        select(
-            SqlConversationItem.conversation_id,
-            SqlConversationItem.search_text,
-        ).join(
-            earliest,
-            and_(
-                SqlConversationItem.workspace_id == workspace_id,
-                SqlConversationItem.conversation_id == earliest.c.cid,
-                SqlConversationItem.position == earliest.c.pos,
-            ),
-        )
-    ).all()
+    rows = session.execute(earliest_match(conversation_ids, pattern)).all()
     out: dict[str, str] = {}
     for conv_id, search_text in rows:
         if not search_text:
