@@ -17,6 +17,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, cast
 
+import anyio
 import httpx
 from fastapi import (
     APIRouter,
@@ -542,14 +543,11 @@ def register_resources_routes(
             except StopAsyncIteration:
                 first_chunk = None
             except BaseException as exc:
-                await resp.aclose()
+                with anyio.CancelScope(shield=True):
+                    with contextlib.suppress(BaseException):
+                        await resp.aclose()
                 if isinstance(exc, (httpx.HTTPError, ConnectionError)):
                     _logger.warning("Runner download failed before streaming began: %s", exc)
-                    if isinstance(exc, httpx.ConnectError):
-                        raise OmnigentError(
-                            "The session runner is offline. Reconnect the host and retry.",
-                            code=ErrorCode.RUNNER_UNAVAILABLE,
-                        ) from exc
                     raise HTTPException(
                         status_code=502,
                         detail="runner download failed",
@@ -562,28 +560,19 @@ def register_resources_routes(
                 async for chunk in chunks:
                     yield chunk
 
-            try:
-                response = _RunnerStreamResponse(
-                    resp,
-                    headers=forwarded,
-                    content=stream_chunks(),
-                )
-            except BaseException:
-                await resp.aclose()
-                raise
-            return response
+            return _RunnerStreamResponse(
+                resp,
+                headers=forwarded,
+                content=stream_chunks(),
+            )
         try:
             await resp.aread()
         except (httpx.HTTPError, ConnectionError) as exc:
             _logger.warning("Runner download error response could not be read: %s", exc)
-            if isinstance(exc, httpx.ConnectError):
-                raise OmnigentError(
-                    "The session runner is offline. Reconnect the host and retry.",
-                    code=ErrorCode.RUNNER_UNAVAILABLE,
-                ) from exc
             raise HTTPException(status_code=502, detail="runner download failed") from exc
         finally:
-            await resp.aclose()
+            with anyio.CancelScope(shield=True):
+                await resp.aclose()
         if resp.status_code == 200:
             # A runner that predates ``download=true`` ignores it and answers
             # the capped JSON envelope; serving that would truncate silently.

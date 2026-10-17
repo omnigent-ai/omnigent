@@ -15,6 +15,7 @@ from typing import Any, cast
 from unittest.mock import Mock
 from urllib.parse import quote
 
+import anyio
 import httpx
 import pytest
 from fastapi import FastAPI, HTTPException, Request
@@ -4572,15 +4573,41 @@ async def test_filesystem_download_connect_error_is_typed_unavailable(
     app: FastAPI,
     client: httpx.AsyncClient,
 ) -> None:
-    class OfflineStream(httpx.AsyncByteStream):
+    class OfflineRunnerClient:
+        def build_request(self, method: str, url: str, **kwargs: Any) -> httpx.Request:
+            del kwargs
+            return httpx.Request(method, f"http://runner{url}")
+
+        async def send(self, request: httpx.Request, *, stream: bool) -> httpx.Response:
+            del stream
+            raise httpx.ConnectError("runner is offline", request=request)
+
+    set_runner_router(_FakeRunnerRouter(OfflineRunnerClient()))  # type: ignore[arg-type]
+    resp = await client.get(_DOWNLOAD_URL)
+
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == ErrorCode.RUNNER_UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_filesystem_download_cancelled_prefetch_shields_stream_cleanup(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+) -> None:
+    started = asyncio.Event()
+    cleaned = asyncio.Event()
+
+    class BlockingStream(httpx.AsyncByteStream):
         async def __aiter__(self) -> AsyncIterator[bytes]:
-            raise httpx.ConnectError("runner is offline")
+            started.set()
+            await asyncio.Event().wait()
             yield b""
 
         async def aclose(self) -> None:
-            return None
+            await asyncio.sleep(0)
+            cleaned.set()
 
-    class OfflineRunnerClient:
+    class BlockingRunnerClient:
         def build_request(self, method: str, url: str, **kwargs: Any) -> httpx.Request:
             del kwargs
             return httpx.Request(method, f"http://runner{url}")
@@ -4590,15 +4617,27 @@ async def test_filesystem_download_connect_error_is_typed_unavailable(
             return httpx.Response(
                 200,
                 headers={"content-disposition": 'attachment; filename="big.bin"'},
-                stream=OfflineStream(),
+                stream=BlockingStream(),
                 request=request,
             )
 
-    set_runner_router(_FakeRunnerRouter(OfflineRunnerClient()))  # type: ignore[arg-type]
-    resp = await client.get(_DOWNLOAD_URL)
+    set_runner_router(_FakeRunnerRouter(BlockingRunnerClient()))  # type: ignore[arg-type]
+    cancelled: list[BaseException] = []
 
-    assert resp.status_code == 503
-    assert resp.json()["error"]["code"] == ErrorCode.RUNNER_UNAVAILABLE
+    async def request_download() -> None:
+        try:
+            await client.get(_DOWNLOAD_URL)
+        except BaseException as exc:
+            cancelled.append(exc)
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(request_download)
+        await started.wait()
+        task_group.cancel_scope.cancel()
+
+    assert cleaned.is_set()
+    assert len(cancelled) == 1
+    assert isinstance(cancelled[0], asyncio.CancelledError)
 
 
 @pytest.mark.asyncio
