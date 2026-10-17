@@ -3788,12 +3788,11 @@ async def test_relay_records_a_disconnect_failed_turn_that_finishes_as_resumed(
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(runner_id="runner-resumed-child")
     session_id = conv.id
+    code_key = sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY
+    message_key = sessions_module._LAST_TASK_ERROR_MESSAGE_LABEL_KEY
     store.set_labels(
         session_id,
-        {
-            sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY: "runner_disconnected",
-            sessions_module._LAST_TASK_ERROR_MESSAGE_LABEL_KEY: "Runner disconnected unexpectedly.",
-        },
+        {code_key: "runner_disconnected", message_key: "Runner disconnected unexpectedly."},
     )
     store.set_session_live_status(session_id, "failed")
     sessions_module._session_status_cache[session_id] = "failed"
