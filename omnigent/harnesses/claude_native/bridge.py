@@ -53,6 +53,7 @@ import threading
 import time
 import unicodedata
 import urllib.parse
+import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -4761,6 +4762,541 @@ def inject_slash_command(
             )
     if dialog_hint is not None:
         _confirm_tui_dialog(socket_path, tmux_target, hint=dialog_hint, bridge_dir=bridge_dir)
+
+
+# Claude awaits its own default-model save for at most 3s after ``/model``.
+_DEFAULT_MODEL_SAVE_WAIT_S = 3.0
+_DEFAULT_MODEL_SAVE_POLL_S = 0.05
+# Longer than one switch holds it: tmux wait, submit check, confirm, save wait.
+_DEFAULT_MODEL_LOCK_TIMEOUT_S = 60.0
+_DEFAULT_MODEL_RESTORE_ATTEMPTS = 3
+# Expires a switch whose runner stopped refreshing it, e.g. after a crash.
+_DEFAULT_MODEL_PENDING_TTL_S = 1800.0
+_MISSING = object()
+
+
+@dataclass(frozen=True)
+class DefaultModelSnapshot:
+    """The user's default model before a typed ``/model``, for :func:`restore_default_model`."""
+
+    value: object
+    settings_path: Path
+    pending_id: str | None = None
+
+
+class DefaultModelLockTimeout(RuntimeError):
+    """Another Claude model switch held the default-model lock past the wait."""
+
+
+def inject_model_command(
+    bridge_dir: Path,
+    *,
+    model_arg: str,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+    defer_restore: bool = False,
+) -> DefaultModelSnapshot:
+    """
+    Switch the pane to *model_arg* for this session only.
+
+    Claude Code 2.1.x has no session-only form of ``/model <name>``: in an
+    interactive session it also saves the pick as the user's default model in
+    ``settings.json``, so every switch Omnigent typed rewrote the default of
+    every future Claude Code session. This types the command, waits for
+    Claude's save, and puts the previous value of the ``model`` key back,
+    also when typing fails or is cancelled after the command went in.
+    The running session keeps the switched model: Claude holds it in memory
+    and does not re-read the key for the live session. The snapshot, the
+    command and the restore share one lock across sessions, and a deferred
+    switch is recorded from before it is typed until it restores, so no
+    switch snapshots another's unrestored save as the user's default. A save
+    the restore could not undo stays recorded too, so a later restore retries it.
+
+    :param bridge_dir: Bridge directory path.
+    :param model_arg: ``/model`` argument, e.g. ``"claude-sonnet-5-5"``.
+    :param timeout_s: Seconds to wait for ``tmux.json``, e.g. ``30.0``.
+    :param defer_restore: ``True`` for a switch Claude applies later, such as
+        one queued behind a busy turn: the caller calls
+        :func:`keep_default_model_switch_pending` while it waits and
+        :func:`restore_default_model` once it lands. The restore still runs
+        here if typing raises.
+    :returns: The default before the switch, for :func:`restore_default_model`.
+    :raises ValueError: See :func:`inject_slash_command`.
+    :raises RuntimeError: See :func:`inject_slash_command`; also
+        :class:`DefaultModelLockTimeout`, or a deferred switch that could not
+        be recorded, both before anything is typed.
+    """
+    with _default_model_lock(bridge_dir):
+        path = _session_user_settings_path(bridge_dir)
+        pending = _PendingDefaultModelSwitches(bridge_dir, path)
+        before = pending.user_default(_read_settings_model(path))
+        pending_id = pending.add(model_arg) if defer_restore else None
+        try:
+            inject_slash_command(
+                bridge_dir,
+                command=f"/model {model_arg}",
+                timeout_s=timeout_s,
+                auto_confirm=True,
+                confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+            )
+        except BaseException:
+            _restore_or_record(pending, pending_id, path, before, model_arg)
+            raise
+        if not defer_restore:
+            pending_id = _restore_or_record(pending, pending_id, path, before, model_arg)
+    return DefaultModelSnapshot(before, path, pending_id)
+
+
+def restore_default_model(
+    bridge_dir: Path,
+    before: DefaultModelSnapshot,
+    model_arg: str,
+    *,
+    wait_for_save: bool = True,
+    keep_pending: bool = False,
+) -> None:
+    """
+    Undo Claude's save of ``/model <model_arg>`` as the user's default model.
+
+    :param bridge_dir: Bridge directory of the switched session.
+    :param before: The snapshot :func:`inject_model_command` returned.
+    :param model_arg: The typed ``/model`` argument, e.g. ``"sonnet"``.
+    :param wait_for_save: ``False`` to only undo a save already on disk, e.g.
+        a second check after :func:`inject_model_command` restored.
+    :param keep_pending: ``True`` to keep a deferred switch's record, for a
+        queued switch that may still land after its caller stops watching.
+        A save that could not be undone keeps its switch recorded either way.
+    :returns: None.
+    """
+    path = before.settings_path
+    try:
+        with _default_model_lock(bridge_dir):
+            pending = _PendingDefaultModelSwitches(bridge_dir, path)
+            pending_id = before.pending_id if pending.has(before.pending_id) else None
+            value = before.value if pending_id is None else pending.default
+            if keep_pending and pending_id is not None:
+                _restore_default_model(
+                    path, value, model_arg, pending.models(), wait_for_save=wait_for_save
+                )
+            else:
+                _restore_or_record(
+                    pending, pending_id, path, value, model_arg, wait_for_save=wait_for_save
+                )
+    except (DefaultModelLockTimeout, OSError):
+        # A deferred switch's record stays, so other switches still undo its save.
+        _logger.warning("claude-native: default model not restored", exc_info=True)
+
+
+def keep_default_model_switch_pending(bridge_dir: Path, before: DefaultModelSnapshot) -> None:
+    """
+    Keep a deferred switch's record from expiring while its switch is still queued.
+
+    :param bridge_dir: Bridge directory of the switched session.
+    :param before: The snapshot :func:`inject_model_command` returned.
+    :returns: None.
+    """
+    if before.pending_id is None:
+        return
+    try:
+        with _default_model_lock(bridge_dir):
+            pending = _PendingDefaultModelSwitches(bridge_dir, before.settings_path)
+            pending.refresh(before.pending_id)
+    except (DefaultModelLockTimeout, OSError):
+        _logger.warning("claude-native: queued model switch not refreshed", exc_info=True)
+
+
+def defer_default_model_restore(
+    bridge_dir: Path, before: DefaultModelSnapshot, model_arg: str
+) -> DefaultModelSnapshot:
+    """
+    Record a switch that :func:`inject_model_command` restored but Claude queued.
+
+    :param bridge_dir: Bridge directory of the switched session.
+    :param before: The snapshot :func:`inject_model_command` returned.
+    :param model_arg: The typed ``/model`` argument, e.g. ``"sonnet"``.
+    :returns: The snapshot for the recorded switch, or *before* if it could not be recorded.
+    """
+    if before.pending_id is not None:
+        return before
+    try:
+        with _default_model_lock(bridge_dir):
+            pending = _PendingDefaultModelSwitches(bridge_dir, before.settings_path)
+            pending_id = _record_switch(pending, model_arg, before.value)
+    except (DefaultModelLockTimeout, OSError):
+        _logger.warning("claude-native: queued model switch not recorded", exc_info=True)
+        return before
+    if pending_id is None:
+        return before
+    return DefaultModelSnapshot(before.value, before.settings_path, pending_id)
+
+
+class _PendingDefaultModelSwitches:
+    """
+    Deferred switches whose save is not restored yet, shared by sessions under the lock.
+
+    While one is pending, its save on disk is not the user's default, so a
+    snapshot taken then uses the recorded default and every restore also
+    undoes the pending saves.
+    """
+
+    def __init__(self, bridge_dir: Path, settings_path: Path) -> None:
+        self._file = bridge_dir.parent / ".locks" / "claude-default-model.pending.json"
+        self._key = str(settings_path)
+        self._record = self._read()
+        entry = self._record.get(self._key, {})
+        self.default: object = entry.get("default", _MISSING)
+        self._switches: dict[str, dict[str, Any]] = entry.get("switches", {})
+
+    def _read(self) -> dict[str, Any]:
+        try:
+            record = json.loads(self._file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        cutoff = time.time() - _DEFAULT_MODEL_PENDING_TTL_S
+        live: dict[str, Any] = {}
+        for key, entry in record.items() if isinstance(record, dict) else ():
+            switches = entry.get("switches") if isinstance(entry, dict) else None
+            fresh = {
+                switch_id: switch
+                for switch_id, switch in (switches.items() if isinstance(switches, dict) else ())
+                if isinstance(switch, dict)
+                and isinstance(switch.get("model"), str)
+                and isinstance(switch.get("at"), int | float)
+                and switch["at"] >= cutoff
+            }
+            if fresh:
+                live[key] = {**entry, "switches": fresh}
+        return live
+
+    def models(self) -> list[str]:
+        """Return the ``/model`` arguments of the pending switches."""
+        return [switch["model"] for switch in self._switches.values()]
+
+    def user_default(self, current: object) -> object:
+        """Return the user's default, given the settings file's *current* value."""
+        if any(_same_model(current, model) for model in self.models()):
+            return self.default
+        if current != self.default:
+            self.default = current
+            if self._switches:
+                self._save()
+        return current
+
+    def add(self, model_arg: str, *, unowned: bool = False) -> str:
+        """
+        Record a deferred switch to *model_arg*; return its id.
+
+        :param unowned: ``True`` for a landed save no caller will restore; the
+            next successful restore clears it.
+        :raises RuntimeError: If the record cannot be written.
+        """
+        switch_id = uuid.uuid4().hex
+        self._switches[switch_id] = {"model": model_arg, "at": time.time()}
+        if unowned:
+            self._switches[switch_id]["unowned"] = True
+        if not self._save():
+            raise RuntimeError("could not record the queued Claude model switch")
+        return switch_id
+
+    def refresh(self, switch_id: str) -> None:
+        """Restart the expiry of the switch *switch_id* if it is still pending."""
+        switch = self._switches.get(switch_id)
+        if switch is not None:
+            switch["at"] = time.time()
+            self._save()
+
+    def has(self, switch_id: str | None) -> bool:
+        """Return whether the switch *switch_id* is still pending."""
+        return switch_id in self._switches
+
+    def remove(self, switch_id: str | None) -> bool:
+        """Drop the switch *switch_id*; return whether it was still pending."""
+        if switch_id is None or self._switches.pop(switch_id, None) is None:
+            return False
+        self._save()
+        return True
+
+    def disown(self, switch_id: str) -> None:
+        """Leave the switch *switch_id* for the next successful restore to clear."""
+        switch = self._switches.get(switch_id)
+        if switch is not None and not switch.get("unowned"):
+            switch["unowned"] = True
+            self._save()
+
+    def clear_restored(self, switch_id: str | None) -> None:
+        """Drop *switch_id* and the unowned switches once the file holds no typed save."""
+        kept = {
+            other_id: switch
+            for other_id, switch in self._switches.items()
+            if other_id != switch_id and not switch.get("unowned")
+        }
+        if len(kept) != len(self._switches):
+            self._switches = kept
+            self._save()
+
+    def _save(self) -> bool:
+        if self._switches:
+            entry: dict[str, Any] = {"switches": self._switches}
+            if self.default is not _MISSING:
+                entry["default"] = self.default
+            self._record[self._key] = entry
+        else:
+            self._record.pop(self._key, None)
+        try:
+            if self._record:
+                _write_json_file(self._file, self._record)
+            else:
+                self._file.unlink(missing_ok=True)
+        except (OSError, RuntimeError):
+            _logger.warning(
+                "claude-native: could not update the pending default-model switches", exc_info=True
+            )
+            return False
+        return True
+
+
+@contextlib.contextmanager
+def _default_model_lock(bridge_dir: Path) -> Iterator[None]:
+    """
+    Serialize default-model snapshots and restores across sessions and processes.
+
+    :raises DefaultModelLockTimeout: If another switch holds the lock past the wait.
+    """
+    lock_dir = bridge_dir.parent / ".locks"
+    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock = FileLock(str(lock_dir / "claude-default-model.lock"), mode=0o600)
+    deadline = time.monotonic() + _DEFAULT_MODEL_LOCK_TIMEOUT_S
+    while True:
+        _check_injection_cancelled()
+        try:
+            lock.acquire(timeout=_INJECTION_LOCK_POLL_INTERVAL_S)
+            break
+        except FileLockTimeout:
+            if time.monotonic() >= deadline:
+                raise DefaultModelLockTimeout(
+                    "another Claude model switch is still running after "
+                    f"{_DEFAULT_MODEL_LOCK_TIMEOUT_S:.0f}s; try again"
+                ) from None
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def _restore_default_model(
+    path: Path,
+    before: object,
+    model_arg: str,
+    pending_models: Sequence[str] = (),
+    *,
+    wait_for_save: bool = True,
+) -> bool:
+    """Run :func:`_restore_settings_model`; return ``False`` if a typed save may remain."""
+    if all(_same_model(before, model) for model in (model_arg, *pending_models)):
+        return True  # No typed save would change the file.
+    try:
+        return _restore_settings_model(
+            path, before, model_arg, pending_models, wait_for_save=wait_for_save
+        )
+    except (OSError, ValueError):
+        _logger.warning(
+            "claude-native: could not restore the default model in %s", path, exc_info=True
+        )
+        return False
+
+
+def _restore_or_record(
+    pending: _PendingDefaultModelSwitches,
+    pending_id: str | None,
+    path: Path,
+    before: object,
+    model_arg: str,
+    *,
+    wait_for_save: bool = True,
+) -> str | None:
+    """
+    Restore *before*, keeping the switch recorded while its save is not undone.
+
+    :param pending: The pending switches, read under the default-model lock.
+    :param pending_id: The switch's record id, or ``None`` if it has none.
+    :param path: Settings file.
+    :param before: The user's default before ``/model``, or ``_MISSING``.
+    :param model_arg: The typed ``/model`` argument.
+    :param wait_for_save: ``False`` to check the file once instead of waiting.
+    :returns: The switch's record id, or ``None`` once nothing is left to undo.
+    """
+    if _restore_default_model(
+        path, before, model_arg, pending.models(), wait_for_save=wait_for_save
+    ):
+        pending.clear_restored(pending_id)
+        return None
+    if pending_id is not None:
+        pending.disown(pending_id)
+        return pending_id
+    return _record_switch(pending, model_arg, before, unowned=True)
+
+
+def _record_switch(
+    pending: _PendingDefaultModelSwitches,
+    model_arg: str,
+    default: object,
+    *,
+    unowned: bool = False,
+) -> str | None:
+    """Record a switch whose save is not undone yet; ``None`` if the record cannot be written."""
+    if not pending.models():
+        pending.default = default
+    try:
+        return pending.add(model_arg, unowned=unowned)
+    except RuntimeError:
+        _logger.warning("claude-native: model switch not recorded", exc_info=True)
+        return None
+
+
+def _same_model(value: object, model_arg: str) -> bool:
+    return isinstance(value, str) and value.strip().lower() == model_arg.strip().lower()
+
+
+def claude_user_settings_path(
+    cwd: Path | None = None, env: Mapping[str, str] | None = None
+) -> Path:
+    """
+    Return the user ``settings.json`` Claude Code saves its default model to.
+
+    Claude reads it from ``$CLAUDE_CONFIG_DIR``, else ``$HOME/.claude``, with
+    the same path rules as :func:`claude_global_config_path`.
+
+    :param cwd: Claude's working directory, e.g. ``Path("/home/user/repo")``.
+        ``None`` uses this process's working directory.
+    :param env: Claude's launch environment, e.g. ``{"HOME": "/home/user"}``.
+        ``None`` uses this process's environment.
+    :returns: The settings path, e.g. ``Path("/home/user/.claude/settings.json")``.
+    """
+    env = os.environ if env is None else env
+    config_dir = env.get("CLAUDE_CONFIG_DIR")
+    if config_dir is None:
+        config_dir = os.path.join(env.get("HOME") or str(_account_home_dir()), ".claude")
+    return _claude_joined_path(
+        cwd if cwd is not None else Path.cwd(),
+        unicodedata.normalize("NFC", config_dir),
+        "settings.json",
+    )
+
+
+def record_claude_user_settings_path(bridge_dir: Path, settings_path: Path) -> None:
+    """
+    Persist the user ``settings.json`` this session's Claude reads, for model switches.
+
+    :param bridge_dir: Bridge directory path.
+    :param settings_path: Path from :func:`claude_user_settings_path` for the
+        pane's launch cwd and environment.
+    :returns: None.
+    """
+    with _bridge_metadata_write_lock(bridge_dir):
+        config = _read_json_file(bridge_dir / _CONFIG_FILE)
+        if not isinstance(config, dict) or not config:
+            return  # No prepared bridge config to extend.
+        if config.get("claude_user_settings_path") != str(settings_path):
+            config["claude_user_settings_path"] = str(settings_path)
+            _write_json_file(bridge_dir / _CONFIG_FILE, config)
+
+
+def _session_user_settings_path(bridge_dir: Path) -> Path:
+    config = _read_json_file(bridge_dir / _CONFIG_FILE)
+    recorded = config.get("claude_user_settings_path") if isinstance(config, dict) else None
+    if isinstance(recorded, str) and recorded:
+        return Path(recorded)
+    return claude_user_settings_path()  # A session launched before the path was recorded.
+
+
+def _read_settings_model(path: Path) -> object:
+    """
+    Read the ``model`` key of a Claude settings file.
+
+    :param path: Settings file.
+    :returns: The value, or ``_MISSING`` when the file or key is absent or
+        the file is not a readable JSON object.
+    """
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return _MISSING
+    return payload.get("model", _MISSING) if isinstance(payload, dict) else _MISSING
+
+
+def _restore_settings_model(
+    path: Path,
+    before: object,
+    model_arg: str,
+    pending_models: Sequence[str] = (),
+    *,
+    wait_for_save: bool = True,
+) -> bool:
+    """
+    Undo Claude's default-model saves, touching only the ``model`` key.
+
+    Waits for Claude's save of *model_arg*, then restores *before* only while
+    the key holds a typed value (*model_arg*, or a still-pending deferred
+    switch's), so a value someone else wrote in the meantime is left alone.
+    A write landing between its read and the replace is redone on the new
+    contents; only one in the final instant before the replace can be lost.
+
+    :param path: Settings file.
+    :param before: The user's default before ``/model``, or ``_MISSING``.
+    :param model_arg: The typed ``/model`` argument.
+    :param pending_models: ``/model`` arguments of other unrestored switches.
+    :param wait_for_save: ``False`` to check the file once instead of waiting.
+    :returns: ``False`` if the file kept changing and still holds a typed save.
+    :raises OSError: If the file cannot be rewritten.
+    :raises ValueError: If the file stops being valid JSON mid-restore.
+    """
+    deadline = time.monotonic() + (_DEFAULT_MODEL_SAVE_WAIT_S if wait_for_save else 0.0)
+    current = _read_settings_model(path)
+    while not _same_model(current, model_arg) and time.monotonic() < deadline:
+        time.sleep(_DEFAULT_MODEL_SAVE_POLL_S)
+        current = _read_settings_model(path)
+    if current == before:
+        return True  # No save landed (non-interactive session, or the switch did not take).
+    target = path.resolve()
+    for _attempt in range(_DEFAULT_MODEL_RESTORE_ATTEMPTS):
+        text = target.read_text(encoding="utf-8")
+        payload = json.loads(text)
+        if not isinstance(payload, dict):
+            raise ValueError(f"{target} is not a JSON object")
+        current = payload.get("model", _MISSING)
+        if not any(_same_model(current, typed) for typed in (model_arg, *pending_models)):
+            _logger.info(
+                "claude-native: default model in %s changed to %r, not a typed %r; left as is",
+                path,
+                current,
+                model_arg,
+            )
+            return True
+        if before is _MISSING:
+            payload.pop("model", None)
+        else:
+            payload["model"] = before
+        tmp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=target.parent, prefix=f".{target.name}.", delete=False
+            ) as handle:
+                tmp_path = Path(handle.name)
+                # Claude's own layout: two-space indent, raw UTF-8, trailing newline.
+                handle.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+            os.chmod(tmp_path, stat.S_IMODE(target.stat().st_mode))
+            # Nothing coordinates other writers: redo the edit if one wrote since the read.
+            if target.read_text(encoding="utf-8") != text:
+                continue
+            os.replace(tmp_path, target)
+            tmp_path = None
+        finally:
+            if tmp_path is not None:
+                with contextlib.suppress(FileNotFoundError):
+                    tmp_path.unlink()
+        _logger.info("claude-native: kept %s default model as %r", path, before)
+        return True
+    _logger.warning("claude-native: %s kept changing; default model left as is", path)
+    return False
 
 
 def _confirm_tui_dialog(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import os
 import textwrap
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 
 import pytest
 
@@ -82,7 +82,11 @@ def _validate_ui_base_url(base_url: str) -> None:
 
 @contextlib.contextmanager
 def temp_omnigent_mock_config(
-    mock_llm_server_url: str, harness: str, *, workflow_owned: bool = False
+    mock_llm_server_url: str,
+    harness: str,
+    *,
+    workflow_owned: bool = False,
+    claude_models: Mapping[str, str] | None = None,
 ) -> Generator[None, None, None]:
     """Temporarily write a mock provider config in the selected config home.
 
@@ -94,6 +98,8 @@ def temp_omnigent_mock_config(
         ``"http://127.0.0.1:51235"``.
     :param harness: ``"claude"`` or ``"codex"``.
     :param workflow_owned: Reuse the provider configuration prepared by the workflow.
+    :param claude_models: Claude provider model pins (alias to model id); defaults
+        to ``{"default": _CLAUDE_MOCK_MODEL}``.
     """
     if workflow_owned:
         yield
@@ -114,6 +120,7 @@ def temp_omnigent_mock_config(
     original = config_path.read_bytes() if config_path.exists() else None
 
     if harness == "claude":
+        models = claude_models or {"default": _CLAUDE_MOCK_MODEL}
         mock_config = textwrap.dedent(f"""\
             providers:
               mock-claude:
@@ -123,8 +130,7 @@ def temp_omnigent_mock_config(
                   base_url: "{mock_llm_server_url}"
                   api_key: "mock-key"
                   models:
-                    default: {_CLAUDE_MOCK_MODEL}
-            """)
+            """) + "".join(f"        {alias}: {model}\n" for alias, model in models.items())
     else:  # codex
         # The mock model is not in the pricing catalog; configured rates let
         # the server price codex-native sessions (Session cost, per-model cost).

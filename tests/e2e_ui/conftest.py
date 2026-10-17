@@ -46,7 +46,7 @@ import subprocess
 import sys
 import time
 import warnings
-from collections.abc import Callable, Generator, Iterator
+from collections.abc import Callable, Generator, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -2823,17 +2823,22 @@ def native_claude_mock_session_context(
     tmp_path_factory: pytest.TempPathFactory,
     *,
     terminal_launch_args: list[str] | None = None,
+    claude_models: Mapping[str, str] | None = None,
 ) -> Iterator[tuple[str, str]]:
     """A real Claude CLI using an explicitly configured mock provider.
 
     Workflow-owned runners are already configured. Standalone tests temporarily
     install a mock provider regardless of ambient credential placeholders.
-    ``terminal_launch_args`` are persisted on the session and passed to ``claude``.
+    ``terminal_launch_args`` are persisted on the session and passed to ``claude``;
+    ``claude_models`` replaces the standalone provider's model pins.
     """
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
     with _temp_omnigent_mock_config(
-        mock_llm_server_url, "claude", workflow_owned=bool(_server_state.get("workflow_owned"))
+        mock_llm_server_url,
+        "claude",
+        workflow_owned=bool(_server_state.get("workflow_owned")),
+        claude_models=claude_models,
     ):
         # Keep the default create call unchanged; tests/test_ui_fixture_wiring.py pins it.
         launch_args = (

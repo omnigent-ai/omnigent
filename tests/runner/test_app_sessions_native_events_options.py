@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import time
 import uuid
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -1875,16 +1878,27 @@ async def _post_model_change_with_status_sequence(
     picker_source: str = "bridge",
     empty_session_catalog: bool = False,
     stored_catalog_rows: list[dict[str, object]] | None = None,
-    pane_idle_after_polls: int | None = None,
+    pane_status_change: tuple[int, str] | None = None,
+    after_response: Callable[[list[str | None], dict[str, str]], Awaitable[None]] | None = None,
+    on_status_read: Callable[[int], None] | None = None,
+    typing_s: float = 0.0,
+    request_timeout_s: float | None = None,
 ) -> Any:
     """Run one claude-native ``model_change`` with a scripted status file.
 
     ``status_values`` are successive ``read_claude_status_model`` answers
     (the first is the pre-injection baseline); the last value repeats once
     the script is exhausted. Injection is stubbed; the confirm pacing is
-    tightened so the unconfirmed path stays fast.
+    tightened so the unconfirmed path stays fast. ``pane_status_change`` is a
+    ``(poll, status)`` pair: at that dialog check, the pane's status
+    becomes *status*. ``after_response`` gets the
+    live status script and pane statuses once the reply is in, even a failed
+    one, to drive a detached watcher. ``on_status_read`` gets the 1-based count of each
+    status read, the first being the baseline. ``typing_s`` is how long the
+    stubbed typing takes; a request outliving ``request_timeout_s`` is
+    cancelled.
 
-    :returns: The ``/events`` HTTP response.
+    :returns: The ``/events`` HTTP response, or ``None`` for a cancelled request.
     """
 
     commands: list[str] = []
@@ -1899,6 +1913,7 @@ async def _post_model_change_with_status_sequence(
     ) -> None:
         del bridge_dir, timeout_s, auto_confirm, confirm_hint
         commands.append(command)
+        time.sleep(typing_s)
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
     monkeypatch.setattr(
@@ -1931,8 +1946,13 @@ async def _post_model_change_with_status_sequence(
 
     monkeypatch.setattr("omnigent.harnesses.claude_native.main.claude_launch_catalog", _catalog)
     script = list(status_values)
+    status_reads = 0
 
     def _scripted_status(_bridge_dir: Any) -> str | None:
+        nonlocal status_reads
+        status_reads += 1
+        if on_status_read is not None:
+            on_status_read(status_reads)
         return script.pop(0) if len(script) > 1 else script[0]
 
     monkeypatch.setattr(claude_native_bridge, "read_claude_status_model", _scripted_status)
@@ -1954,17 +1974,18 @@ async def _post_model_change_with_status_sequence(
         spec_resolver=_resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
-    if pane_idle_after_polls is not None:
+    if pane_status_change is not None:
         polls = 0
+        changed_at_poll, changed_status = pane_status_change
 
-        def _turn_settles(_bridge_dir: Any, *, hint: str) -> bool:
+        def _pane_status_changes(_bridge_dir: Any, *, hint: str) -> bool:
             nonlocal polls
             polls += 1
-            if polls >= pane_idle_after_polls:
-                app.state.native_pane_status["68c7c1acc5eeec3978c5e62043da51a5"] = "idle"
+            if polls == changed_at_poll:
+                app.state.native_pane_status["68c7c1acc5eeec3978c5e62043da51a5"] = changed_status
             return False
 
-        monkeypatch.setattr(claude_native_bridge, "confirm_dialog_if_open", _turn_settles)
+        monkeypatch.setattr(claude_native_bridge, "confirm_dialog_if_open", _pane_status_changes)
     async with _runner_client(app) as client:
         create_resp = await client.post(
             "/v1/sessions",
@@ -1981,10 +2002,19 @@ async def _post_model_change_with_status_sequence(
                 "/v1/sessions/68c7c1acc5eeec3978c5e62043da51a5/claude-model-options"
             )
             assert catalog.status_code == 200, catalog.text
-        response = await client.post(
-            "/v1/sessions/68c7c1acc5eeec3978c5e62043da51a5/events",
-            json={"type": "model_change", "model": model},
-        )
+        try:
+            response = await asyncio.wait_for(
+                client.post(
+                    "/v1/sessions/68c7c1acc5eeec3978c5e62043da51a5/events",
+                    json={"type": "model_change", "model": model},
+                ),
+                request_timeout_s,
+            )
+        except TimeoutError:
+            response = None
+        finally:
+            if after_response is not None:
+                await after_response(script, app.state.native_pane_status)
     switch_rejected = empty_session_catalog or stored_catalog_rows == []
     assert commands == ([] if switch_rejected else [f"/model {model}"])
     return response
@@ -2165,6 +2195,326 @@ async def test_events_model_change_mid_turn_defers_instead_of_failing(
 
 
 @pytest.mark.asyncio
+async def test_a_mid_turn_switch_keeps_the_users_default_model_when_it_lands_late(
+    monkeypatch: pytest.MonkeyPatch,
+    _isolate_claude_user_settings: Path,
+) -> None:
+    """Claude saves a queued mid-turn ``/model`` as the default once the turn settles; undo it."""
+    settings = _isolate_claude_user_settings
+    settings.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
+    monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_LATE_DIALOG_POLL_S", 0.01)
+
+    async def _turn_settles_and_the_switch_lands(
+        status: list[str | None], _pane_status: dict[str, str]
+    ) -> None:
+        settings.write_text(json.dumps({"model": "claude-opus-4-7"}), encoding="utf-8")
+        status[:] = ["claude-opus-4-7"]
+        deadline = time.monotonic() + 10.0
+        while "opus-4-7" in settings.read_text(encoding="utf-8") and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6"],
+        pane_status="running",
+        after_response=_turn_settles_and_the_switch_lands,
+    )
+
+    assert resp.status_code == 204, resp.text
+    assert json.loads(settings.read_text(encoding="utf-8")) == {"model": "opus"}
+
+
+@pytest.mark.asyncio
+async def test_a_late_switch_watcher_that_errors_still_restores_the_default_model(
+    monkeypatch: pytest.MonkeyPatch,
+    _isolate_claude_user_settings: Path,
+) -> None:
+    """The watcher keeps watching through failed status reads and undoes a later save."""
+    settings = _isolate_claude_user_settings
+    settings.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
+    monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_LATE_DIALOG_POLL_S", 0.01)
+    monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_LATE_DIALOG_BUDGET_S", 0.0)
+    monkeypatch.setattr(claude_native_bridge, "_DEFAULT_MODEL_SAVE_WAIT_S", 0.0)
+    status_file_gone = False
+    failed_reads = 0
+
+    def _status_read(_read_count: int) -> None:
+        nonlocal failed_reads
+        if status_file_gone:
+            failed_reads += 1
+            raise OSError("status file removed")
+
+    async def _the_status_read_fails_then_the_switch_saves(
+        _status: list[str | None], pane_status: dict[str, str]
+    ) -> None:
+        nonlocal status_file_gone
+        status_file_gone = True
+        deadline = time.monotonic() + 5.0
+        while failed_reads < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        settings.write_text(json.dumps({"model": "claude-opus-4-7"}), encoding="utf-8")
+        pane_status["68c7c1acc5eeec3978c5e62043da51a5"] = "idle"
+        await _wait_for_the_default_model(settings, "opus")
+
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6"],
+        pane_status="running",
+        after_response=_the_status_read_fails_then_the_switch_saves,
+        on_status_read=_status_read,
+    )
+
+    assert resp.status_code == 204, resp.text
+    assert json.loads(settings.read_text(encoding="utf-8")) == {"model": "opus"}
+
+
+async def _wait_for_the_default_model(settings: Path, model: str) -> None:
+    deadline = time.monotonic() + 5.0
+    while json.loads(settings.read_text(encoding="utf-8")).get("model") != model:
+        if time.monotonic() >= deadline:
+            return
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_mid_turn_switch_request_still_restores_the_default_model(
+    monkeypatch: pytest.MonkeyPatch,
+    _isolate_claude_user_settings: Path,
+) -> None:
+    """A request dropped while ``/model`` is typed must not strand the restore."""
+    settings = _isolate_claude_user_settings
+    settings.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
+    monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_LATE_DIALOG_POLL_S", 0.01)
+
+    async def _the_switch_lands_after_the_request_is_gone(
+        status: list[str | None], _pane_status: dict[str, str]
+    ) -> None:
+        settings.write_text(json.dumps({"model": "claude-opus-4-7"}), encoding="utf-8")
+        status[:] = ["claude-opus-4-7"]
+        await _wait_for_the_default_model(settings, "opus")
+
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6"],
+        pane_status="running",
+        typing_s=0.3,
+        request_timeout_s=0.1,
+        after_response=_the_switch_lands_after_the_request_is_gone,
+    )
+
+    assert resp is None
+    assert json.loads(settings.read_text(encoding="utf-8")) == {"model": "opus"}
+
+
+@pytest.mark.asyncio
+async def test_a_switch_queued_behind_a_turn_longer_than_the_watch_still_restores(
+    monkeypatch: pytest.MonkeyPatch,
+    _isolate_claude_user_settings: Path,
+) -> None:
+    """The late watch outlasts its budget while the turn the switch waits on still runs."""
+    settings = _isolate_claude_user_settings
+    settings.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
+    monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_LATE_DIALOG_POLL_S", 0.01)
+    monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_LATE_DIALOG_BUDGET_S", 0.0)
+
+    async def _the_turn_outlasts_the_budget_then_the_switch_lands(
+        status: list[str | None], pane_status: dict[str, str]
+    ) -> None:
+        await asyncio.sleep(0.2)
+        pane_status["68c7c1acc5eeec3978c5e62043da51a5"] = "idle"
+        settings.write_text(json.dumps({"model": "claude-opus-4-7"}), encoding="utf-8")
+        status[:] = ["claude-opus-4-7"]
+        await _wait_for_the_default_model(settings, "opus")
+
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6"],
+        pane_status="running",
+        after_response=_the_turn_outlasts_the_budget_then_the_switch_lands,
+    )
+
+    assert resp.status_code == 204, resp.text
+    assert json.loads(settings.read_text(encoding="utf-8")) == {"model": "opus"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claude_saved_first", [True, False])
+async def test_a_mid_turn_switch_whose_confirm_check_fails_still_restores_the_default_model(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    _isolate_claude_user_settings: Path,
+    claude_saved_first: bool,
+) -> None:
+    """A failed status read is logged, and the queued switch stays watched until it lands."""
+    caplog.set_level(logging.WARNING)
+    settings = _isolate_claude_user_settings
+    settings.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
+    monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_LATE_DIALOG_POLL_S", 0.01)
+    monkeypatch.setattr(claude_native_bridge, "_DEFAULT_MODEL_SAVE_WAIT_S", 0.2)
+    switch_tasks: list[asyncio.Task[Any]] = []
+    create_task = asyncio.create_task
+
+    def _record_the_switch_task(coroutine: Any, **kwargs: Any) -> asyncio.Task[Any]:
+        task = create_task(coroutine, **kwargs)
+        if task.get_name().startswith("claude-model-switch-"):
+            switch_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", _record_the_switch_task)
+
+    def _the_status_read_fails(read_count: int) -> None:
+        if read_count == 2:
+            if claude_saved_first:
+                settings.write_text(json.dumps({"model": "claude-opus-4-7"}), encoding="utf-8")
+            raise OSError("status file removed")
+
+    def _pending_models() -> list[str]:
+        return claude_native_bridge._PendingDefaultModelSwitches(
+            claude_native_bridge._BRIDGE_ROOT / "probe", settings
+        ).models()
+
+    pending_after_the_error: list[str] = []
+
+    async def _the_turn_settles_and_the_switch_lands(
+        status: list[str | None], pane_status: dict[str, str]
+    ) -> None:
+        pending_after_the_error.extend(_pending_models())
+        pane_status["68c7c1acc5eeec3978c5e62043da51a5"] = "idle"
+        if not claude_saved_first:
+            settings.write_text(json.dumps({"model": "claude-opus-4-7"}), encoding="utf-8")
+        status[:] = ["claude-opus-4-7"]
+        await asyncio.wait(switch_tasks, timeout=5.0)
+
+    with pytest.raises(OSError, match="status file removed"):
+        await _post_model_change_with_status_sequence(
+            monkeypatch,
+            ["claude-opus-4-6"],
+            pane_status="running",
+            on_status_read=_the_status_read_fails,
+            after_response=_the_turn_settles_and_the_switch_lands,
+        )
+
+    assert pending_after_the_error == ["claude-opus-4-7"]
+    assert json.loads(settings.read_text(encoding="utf-8")) == {"model": "opus"}
+    assert _pending_models() == []
+    # Nothing awaits the switch task, so an exception it ended with would go unretrieved.
+    (switch,) = switch_tasks
+    assert switch.done() and switch.exception() is None
+    assert "claude-native model change for session=68c7c1acc5eeec3978c5e62043da51a5 failed" in [
+        record.getMessage() for record in caplog.records
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_idle_switch_queued_by_a_starting_turn_stays_pending_until_it_lands(
+    monkeypatch: pytest.MonkeyPatch,
+    _isolate_claude_user_settings: Path,
+) -> None:
+    """A turn starting right after an idle ``/model`` queues it, so its save is recorded."""
+    settings = _isolate_claude_user_settings
+    settings.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
+    monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_LATE_DIALOG_POLL_S", 0.01)
+    pending_while_queued: list[str] = []
+
+    async def _the_turn_settles_and_the_switch_lands(
+        status: list[str | None], pane_status: dict[str, str]
+    ) -> None:
+        pending = claude_native_bridge._PendingDefaultModelSwitches(
+            claude_native_bridge._BRIDGE_ROOT / "probe", settings
+        )
+        pending_while_queued.extend(pending.models())
+        pane_status["68c7c1acc5eeec3978c5e62043da51a5"] = "idle"
+        settings.write_text(json.dumps({"model": "claude-opus-4-7"}), encoding="utf-8")
+        status[:] = ["claude-opus-4-7"]
+        await _wait_for_the_default_model(settings, "opus")
+
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6"],
+        pane_status_change=(1, "running"),
+        after_response=_the_turn_settles_and_the_switch_lands,
+    )
+
+    assert resp.status_code == 204, resp.text
+    assert pending_while_queued == ["claude-opus-4-7"]
+    assert json.loads(settings.read_text(encoding="utf-8")) == {"model": "opus"}
+
+
+@pytest.mark.asyncio
+async def test_a_switch_queued_behind_a_long_turn_stays_pending_past_the_record_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+    _isolate_claude_user_settings: Path,
+) -> None:
+    """The late watch keeps its pending record live, so other sessions skip the queued save."""
+    settings = _isolate_claude_user_settings
+    settings.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
+    monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_LATE_DIALOG_POLL_S", 0.01)
+    monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_PENDING_REFRESH_S", 0.05)
+    monkeypatch.setattr(claude_native_bridge, "_DEFAULT_MODEL_PENDING_TTL_S", 1.0)
+    pending_after_the_expiry: list[str] = []
+
+    async def _the_turn_outlasts_the_record_expiry_then_the_switch_lands(
+        status: list[str | None], pane_status: dict[str, str]
+    ) -> None:
+        await asyncio.sleep(1.5)
+        pending = claude_native_bridge._PendingDefaultModelSwitches(
+            claude_native_bridge._BRIDGE_ROOT / "probe", settings
+        )
+        pending_after_the_expiry.extend(pending.models())
+        pane_status["68c7c1acc5eeec3978c5e62043da51a5"] = "idle"
+        settings.write_text(json.dumps({"model": "claude-opus-4-7"}), encoding="utf-8")
+        status[:] = ["claude-opus-4-7"]
+        await _wait_for_the_default_model(settings, "opus")
+
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6"],
+        pane_status="running",
+        after_response=_the_turn_outlasts_the_record_expiry_then_the_switch_lands,
+    )
+
+    assert resp.status_code == 204, resp.text
+    assert pending_after_the_expiry == ["claude-opus-4-7"]
+    assert json.loads(settings.read_text(encoding="utf-8")) == {"model": "opus"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_values", "status_code"),
+    [
+        # The pane reports the switch a few polls after the command went in.
+        (["claude-opus-4-6", "claude-opus-4-6", "claude-opus-4-7"], 204),
+        # No statusLine on either side: unverifiable, answered as success.
+        ([None], 204),
+        # The pane never reports the switch.
+        (["claude-opus-4-6"], 503),
+    ],
+)
+async def test_an_idle_switch_keeps_the_users_default_model_when_claude_saves_late(
+    monkeypatch: pytest.MonkeyPatch,
+    _isolate_claude_user_settings: Path,
+    status_values: list[str | None],
+    status_code: int,
+) -> None:
+    """Claude's save landing only after the command returned is still undone."""
+    settings = _isolate_claude_user_settings
+    settings.write_text(json.dumps({"model": "opus"}), encoding="utf-8")
+
+    def _claude_saves_after_the_command_returned(read_count: int) -> None:
+        if read_count == 2:
+            settings.write_text(json.dumps({"model": "claude-opus-4-7"}), encoding="utf-8")
+
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        status_values,
+        on_status_read=_claude_saves_after_the_command_returned,
+    )
+
+    assert resp.status_code == status_code, resp.text
+    assert json.loads(settings.read_text(encoding="utf-8")) == {"model": "opus"}
+
+
+@pytest.mark.asyncio
 async def test_events_model_change_stays_queued_when_the_turn_settles_mid_wait(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2177,7 +2527,7 @@ async def test_events_model_change_stays_queued_when_the_turn_settles_mid_wait(
         monkeypatch,
         ["claude-opus-4-6"],
         pane_status="running",
-        pane_idle_after_polls=2,
+        pane_status_change=(2, "idle"),
     )
     assert resp.status_code == 204, resp.text
 
