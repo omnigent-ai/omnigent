@@ -58,7 +58,9 @@ and steers messages while the agent is busy.
   (numbers increment) and ends it after an empty item.
 - `focus-hotkey`: Ctrl+Shift+L focuses the in-session message box from anywhere
   in the session view (not on mobile).
-- `new-session-hotkey`: ⌘/Ctrl+Alt+N opens and focuses the new-session composer.
+- `new-session-hotkey`: ⌘+Shift+O on macOS or Ctrl+Shift+O on Windows/Linux
+  opens and focuses the new-session composer in browsers. Native shells retain
+  ⌘/Ctrl+Alt+N. Embedded apps require focus inside the app.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
   can be steered into the running turn.
 - `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
@@ -116,7 +118,8 @@ and steers messages while the agent is busy.
 - Open the host chip, expand **Offline hosts (N)**, then **Show more**. Check the
   same menu on mobile and with a managed sandbox available. Offline rows remain
   disabled; a remembered offline selection still requires an explicit switch.
-- From any page, press ⌘/Ctrl+Alt+N to open and focus a clean new-session
+- With the browser app focused, press ⌘+Shift+O (macOS) or
+  Ctrl+Shift+O (Windows/Linux) to open and focus a clean new-session
   composer.
 - Hover the model/effort pill to see the tooltip.
 - Hover the host chip to see the selected host or sandbox and its connection.

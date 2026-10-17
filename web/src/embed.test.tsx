@@ -73,6 +73,13 @@ describe("macOS Electron embed", () => {
     expect(scope.getAttribute("data-electron-mac")).toBe(expected ? "true" : null);
     expect(document.documentElement).not.toHaveAttribute("data-electron-mac");
 
+    const keyboardScope = getEmbedRoot()!;
+    expect(keyboardScope.getAttribute("tabindex")).toBe(electron ? null : "-1");
+    if (!electron) {
+      keyboardScope.focus();
+      expect(document.activeElement).toBe(keyboardScope);
+    }
+
     for (const className of [
       "electron-drag-strip",
       "sidebar-header-row",

@@ -20,6 +20,7 @@ import {
   ENTER_KEY,
   Kbd,
   MOD_KEY,
+  newSessionShortcutKeys,
   SHIFT_KEY,
   VIEW_MODE_TOGGLE_KEYS,
 } from "@/components/KeyboardShortcut";
@@ -75,7 +76,6 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
     title: "General",
     items: [
-      { label: "Start a new session", keys: [MOD_KEY, ALT_KEY, "N"] },
       { label: "Open command palette", keys: [MOD_KEY, "K"] },
       { label: "Find a session by name", keys: [MOD_KEY, ALT_KEY, "S"] },
       { label: "Open Settings", keys: [MOD_KEY, ALT_KEY, ","] },
@@ -147,6 +147,15 @@ function shortcutGroupsFor(
   preventsKeyboardSubmit: boolean,
 ): ShortcutGroup[] {
   return SHORTCUT_GROUPS.map((group) => {
+    if (group.title === "General") {
+      return {
+        ...group,
+        items: [
+          { label: "Start a new session", keys: newSessionShortcutKeys(native) },
+          ...group.items,
+        ],
+      };
+    }
     if (group.title === "In chats" && !preventsKeyboardSubmit) {
       return {
         ...group,
