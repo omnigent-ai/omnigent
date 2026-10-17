@@ -55,6 +55,7 @@ class ScheduledTaskStore(ABC):
         workspace: str | None = None,
         host_id: str | None = None,
         execution_target: str = "connected_host",
+        project_id: str | None = None,
         state: str = "active",
     ) -> ScheduledTask:
         """
@@ -96,11 +97,19 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
-    def list(self, *, owner_user_id: str | None = None) -> list[ScheduledTask]:
+    def list(
+        self,
+        *,
+        owner_user_id: str | None = None,
+        project_id: str | None = _UNSET,
+    ) -> list[ScheduledTask]:
         """
         List all scheduled tasks ordered by ``created_at ASC, id ASC``.
 
-        :param owner_user_id: When given, return only tasks owned by this user.
+        :param owner_user_id: A non-null id filters by owner. ``None`` preserves
+            the legacy unfiltered local-mode listing.
+        :param project_id: Omit for all tasks, pass ``None`` for tolerant
+            unfiled membership, or pass an id for one Project.
         :returns: List of :class:`ScheduledTask` instances.
         """
         ...
@@ -145,6 +154,7 @@ class ScheduledTaskStore(ABC):
         workspace: str | None = _UNSET,
         host_id: str | None = _UNSET,
         execution_target: str | None = None,
+        project_id: str | None = _UNSET,
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
@@ -173,6 +183,20 @@ class ScheduledTaskStore(ABC):
 
         :param scheduled_task_id: Opaque task identifier.
         :returns: The updated :class:`ScheduledTask`, or ``None`` if not found.
+        """
+        ...
+
+    @abstractmethod
+    def compare_and_set_project(
+        self,
+        scheduled_task_id: str,
+        *,
+        expected_project_id: str,
+        project_id: str | None,
+    ) -> bool:
+        """Conditionally replace a task's Project assignment.
+
+        :returns: ``True`` only when the task still held the expected id.
         """
         ...
 

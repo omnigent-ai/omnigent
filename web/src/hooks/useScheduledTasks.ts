@@ -17,11 +17,17 @@ import {
   type CreateScheduledTaskInput,
   type ScheduledTask,
   type ScheduledTaskRun,
+  type ScheduledTaskProjectFilter,
   type UpdateScheduledTaskInput,
 } from "@/lib/scheduledTasksApi";
 
 /** Query key for the caller's scheduled-tasks list. */
 export const SCHEDULED_TASKS_KEY = ["scheduled-tasks"] as const;
+
+export function scheduledTasksKey(filter: ScheduledTaskProjectFilter): readonly unknown[] {
+  if (filter.kind === "project") return [...SCHEDULED_TASKS_KEY, "project", filter.projectId];
+  return [...SCHEDULED_TASKS_KEY, filter.kind];
+}
 
 /** Query key for one task's run history. */
 export function scheduledTaskRunsKey(id: string): readonly unknown[] {
@@ -34,10 +40,10 @@ export function scheduledTaskRunsKey(id: string): readonly unknown[] {
  * catches out-of-band changes (a task created from the agent tool, or a run
  * that just fired) without hammering the server.
  */
-export function useScheduledTasks() {
+export function useScheduledTasks(filter: ScheduledTaskProjectFilter = { kind: "all" }) {
   return useQuery<ScheduledTask[]>({
-    queryKey: SCHEDULED_TASKS_KEY,
-    queryFn: listScheduledTasks,
+    queryKey: scheduledTasksKey(filter),
+    queryFn: () => listScheduledTasks(filter),
     staleTime: 30_000,
     // POLLING CONTRACT — read before reusing this hook.
     // The 60s interval only runs while a component that mounts this hook is
