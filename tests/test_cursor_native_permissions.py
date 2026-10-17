@@ -26,7 +26,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json as _json
+import logging
 import sqlite3 as _sqlite3
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -173,6 +175,120 @@ def test_send_cursor_pane_keys_raises_without_target(
     monkeypatch.setattr(cnb, "read_tmux_info", lambda _d: None)
     with pytest.raises(RuntimeError):
         cnb.send_cursor_pane_keys(tmp_path, "y")
+
+
+def test_send_cursor_pane_keys_confirmed_gone_pane_raises_pane_gone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A send-keys failure that the re-probe confirms as teardown is reported as gone."""
+
+    def _connect_error(_sp: str, *_a: str) -> None:
+        raise RuntimeError("tmux command failed (rc=1): no server running on sock")
+
+    monkeypatch.setattr(
+        cnb, "read_tmux_info", lambda _d: {"socket_path": "sock", "tmux_target": "main"}
+    )
+    monkeypatch.setattr(cnb, "_run_tmux", _connect_error)
+    monkeypatch.setattr(cnb, "_probe_session", lambda _s, _t: False)
+    with pytest.raises(cnb.CursorPaneGoneError):
+        cnb.send_cursor_pane_keys(tmp_path, "Escape")
+
+
+@pytest.mark.parametrize("recheck", [True, None])
+def test_send_cursor_pane_keys_send_failure_without_confirmed_teardown_stays_an_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, recheck: bool | None
+) -> None:
+    """A send failure stays a genuine error unless the re-probe confirms teardown.
+
+    ``True`` is a live pane; ``None`` is an inconclusive probe (a hung tmux or an
+    operational failure such as a permission error). Neither confirms the pane is
+    gone, so the original delivery error (and its ERROR log) must survive.
+    """
+
+    def _tmux_error(_sp: str, *_a: str) -> None:
+        raise RuntimeError("tmux command failed (rc=1): unknown key")
+
+    monkeypatch.setattr(
+        cnb, "read_tmux_info", lambda _d: {"socket_path": "sock", "tmux_target": "main"}
+    )
+    monkeypatch.setattr(cnb, "_run_tmux", _tmux_error)
+    monkeypatch.setattr(cnb, "_probe_session", lambda _s, _t: recheck)
+    with pytest.raises(RuntimeError) as excinfo:
+        cnb.send_cursor_pane_keys(tmp_path, "Escape")
+    assert not isinstance(excinfo.value, cnb.CursorPaneGoneError)
+
+
+def test_send_cursor_pane_keys_operational_probe_failure_stays_an_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A nonzero probe that does not confirm absence keeps the delivery error.
+
+    A live pane whose socket is momentarily inaccessible makes ``has-session``
+    exit nonzero with ``Permission denied``; that must not be read as the pane
+    being gone. Drives the real ``_probe_session`` so the classification itself
+    is under test, not a stub.
+    """
+
+    def _tmux_error(_sp: str, *_a: str) -> None:
+        raise RuntimeError("tmux command failed (rc=1): error connecting (Permission denied)")
+
+    def _permission_denied(*_a: object, **_k: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            returncode=1, stdout="", stderr="error connecting to sock (Permission denied)"
+        )
+
+    monkeypatch.setattr(
+        cnb, "read_tmux_info", lambda _d: {"socket_path": "sock", "tmux_target": "main"}
+    )
+    monkeypatch.setattr(cnb, "_run_tmux", _tmux_error)
+    monkeypatch.setattr(cnb.subprocess, "run", _permission_denied)
+    with pytest.raises(RuntimeError) as excinfo:
+        cnb.send_cursor_pane_keys(tmp_path, "Escape")
+    assert not isinstance(excinfo.value, cnb.CursorPaneGoneError)
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stderr", "expected"),
+    [
+        (0, "", True),
+        (1, "no server running on sock", False),
+        (1, "error connecting to sock (No such file or directory)", False),
+        (1, "can't find session: main", False),
+        (1, "error connecting to sock (Permission denied)", None),
+        # A dynamic-loader failure keeps the tmux client from starting; its
+        # trailing "No such file or directory" must not be read as teardown.
+        (
+            1,
+            "error while loading shared libraries: libtinfo.so.6: "
+            "cannot open shared object file: No such file or directory",
+            None,
+        ),
+        (1, "", None),
+    ],
+)
+def test_probe_session_classifies_has_session_outcomes(
+    monkeypatch: pytest.MonkeyPatch, returncode: int, stderr: str, expected: bool | None
+) -> None:
+    """``_probe_session`` reports True/False only for a definitive answer, else ``None``."""
+
+    def _run(*_a: object, **_k: object) -> SimpleNamespace:
+        return SimpleNamespace(returncode=returncode, stdout="", stderr=stderr)
+
+    monkeypatch.setattr(cnb.subprocess, "run", _run)
+    assert cnb._probe_session("sock", "main") is expected
+
+
+def test_probe_session_reports_unanswered_probe_as_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hung ``has-session`` is indeterminate for the probe and not-alive for callers."""
+
+    def _hang(*_a: object, **_k: object) -> None:
+        raise subprocess.TimeoutExpired(cmd="tmux", timeout=1.0)
+
+    monkeypatch.setattr(cnb.subprocess, "run", _hang)
+    assert cnb._probe_session("sock", "main") is None
+    assert cnb._session_alive("sock", "main") is False
 
 
 # ── Transcript-based detector ────────────────────────────────────────────────
@@ -907,7 +1023,9 @@ def test_pane_shows_accept_prompt(pane: str, expected: bool) -> None:
 
 
 async def test_send_cursor_keys_reports_undelivered_keystroke(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A tmux send that raises reports failure rather than a silent success."""
 
@@ -915,10 +1033,44 @@ async def test_send_cursor_keys_reports_undelivered_keystroke(
         raise RuntimeError("cursor-native tmux target not advertised")
 
     monkeypatch.setattr(cnp, "send_cursor_pane_keys", _boom)
-    assert await cnp._send_cursor_keys(tmp_path, "conv_dead", "y") is False
+    with caplog.at_level(logging.ERROR, logger=cnp.__name__):
+        assert await cnp._send_cursor_keys(tmp_path, "conv_dead", "y") is False
+    # A genuine delivery failure keeps the ERROR-level signature.
+    assert any(
+        "failed to send cursor keystroke" in record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.ERROR
+    )
 
     monkeypatch.setattr(cnp, "send_cursor_pane_keys", lambda *_a, **_k: None)
     assert await cnp._send_cursor_keys(tmp_path, "conv_live", "y") is True
+
+
+async def test_send_cursor_keys_dead_pane_drops_verdict_without_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A verdict to a torn-down pane reports failure with no ERROR record."""
+
+    tmux_detail = "tmux command failed (rc=1): socket gone"
+
+    def _gone(_bridge: Path, _key: str) -> None:
+        cause = RuntimeError(tmux_detail)
+        raise cnb.CursorPaneGoneError("cursor pane no longer exists (TUI exited)") from cause
+
+    monkeypatch.setattr(cnp, "send_cursor_pane_keys", _gone)
+    with caplog.at_level(logging.INFO, logger=cnp.__name__):
+        assert await cnp._send_cursor_keys(tmp_path, "conv_gone", "Escape", "Enter") is False
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+    # The drop is still observable, as an expected teardown consequence logged at INFO,
+    # and that record keeps the originating tmux failure so the teardown stays diagnosable.
+    info_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.INFO and "cursor pane gone" in record.getMessage()
+    ]
+    assert any(tmux_detail in message for message in info_messages)
 
 
 # ── AskQuestion (structured multiple-choice) ─────────────────────────────────

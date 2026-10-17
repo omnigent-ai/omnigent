@@ -47,7 +47,11 @@ from pathlib import Path
 
 import httpx
 
-from omnigent.harnesses.cursor_native.bridge import capture_cursor_pane, send_cursor_pane_keys
+from omnigent.harnesses.cursor_native.bridge import (
+    CursorPaneGoneError,
+    capture_cursor_pane,
+    send_cursor_pane_keys,
+)
 
 # Reuse the forwarder's store discovery and WAL-aware blob reader so the
 # transcript-based detector binds to the SAME cursor chat the forwarder mirrors
@@ -132,7 +136,8 @@ async def _send_cursor_keys(bridge_dir: Path, session_id: str, *keys: str) -> bo
     ``Enter`` (it re-renders the picker between keys). So send each key in its
     own call, pause between them, and pause a little longer before ``Enter``.
     A single-key approval (``y`` / ``Escape``) just sends once. Delivery failure
-    is logged and aborts the rest of the sequence.
+    is logged and aborts the rest of the sequence; a pane that is already gone
+    (session teardown / disconnect) aborts quietly at INFO.
 
     :returns: Whether every key was handed to tmux. Callers that retry (the
         yolo auto-accept) must not record an undelivered keystroke as an
@@ -145,6 +150,17 @@ async def _send_cursor_keys(bridge_dir: Path, session_id: str, *keys: str) -> bo
             await asyncio.sleep(_KEY_ENTER_SETTLE_S)
         try:
             await asyncio.to_thread(send_cursor_pane_keys, bridge_dir, key)
+        except CursorPaneGoneError as exc:
+            # The pane was torn down (session end / runner disconnect): the
+            # verdict has nowhere to land. Expected teardown, not an error.
+            _logger.info(
+                "cursor pane gone; dropped keystroke %r (of %r); session=%s; cause=%s",
+                key,
+                keys,
+                session_id,
+                exc.__cause__,
+            )
+            return False
         except RuntimeError:
             _logger.exception(
                 "failed to send cursor keystroke %r (of %r); session=%s", key, keys, session_id
