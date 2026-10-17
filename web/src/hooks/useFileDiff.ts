@@ -6,8 +6,9 @@
 //   before=null → new file (no pre-session snapshot available)
 //   after=null  → deleted file
 //
-// Requested diffs can start while the changed-files list is loading. Known
-// unchanged files and unavailable workspaces keep the query disabled.
+// Requested diffs can start while the changed-files list or liveness check is
+// still loading, but known unchanged files and known-unavailable workspaces
+// keep the query disabled.
 
 import { useQuery } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
@@ -67,7 +68,8 @@ async function fetchFileDiff(conversationId: string, path: string): Promise<File
  *
  * Disabled (no request made) when:
  * - `conversationId` or `path` is missing, or the session id is temporary
- * - neither the runner nor host can serve the workspace
+ * - the workspace is known unavailable; non-requested diffs also wait for
+ *   liveness to resolve serveable
  * - the file is known unchanged (or discovery is pending without a request)
  */
 export function useFileDiff(
@@ -90,7 +92,7 @@ export function useFileDiff(
       !!conversationId &&
       !isTempConvId(conversationId) &&
       !!path &&
-      serveable !== false &&
+      (requestedBeforeDiscovery ? serveable !== false : serveable === true) &&
       environment.data?.available !== false &&
       (isInChangedFiles || !!requestedBeforeDiscovery),
     // An old diff link may point to a now-unchanged file; don't retry its expected 404.

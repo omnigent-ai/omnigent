@@ -154,7 +154,10 @@ export async function downloadWorkspaceFile(conversationId: string, path: string
  * Fetch the content of a workspace file for the given conversation.
  *
  * Disabled (no request made) when `conversationId` or `path` is
- * null / undefined, or when `conversationId` is a client-only temp id.
+ * null / undefined, when `conversationId` is a client-only temp id, or until
+ * the workspace is known serveable (`useWorkspaceServeable` → `true`): it
+ * stays idle while liveness is unresolved and when neither the runner nor a
+ * host tunnel can serve.
  *
  * Fires one trailing invalidation when the session transitions from active
  * (running/waiting) to idle so the viewer picks up any file writes the agent
@@ -172,9 +175,9 @@ export function useFileContent(conversationId: string | undefined, path: string 
     !!serverId &&
     serverId === focusedId &&
     (sessionStatus === "running" || sessionStatus === "waiting");
-  // Serveable when the runner is online OR (runner offline but) the host can
-  // read the workspace from disk — keeps the viewer live while the agent is
-  // asleep. `false` only when neither source can answer.
+  // Serveable is tri-state: `true` when the runner is online or the host can
+  // read the workspace from disk, `false` when neither can, `undefined` until
+  // liveness resolves. The query below stays idle unless it is `true`.
   const serveable = useWorkspaceServeable(serverId);
   const queryClient = useQueryClient();
 
@@ -196,7 +199,7 @@ export function useFileContent(conversationId: string | undefined, path: string 
   return useQuery({
     queryKey: ["file-content", serverId, path],
     queryFn: () => fetchFileContent(serverId!, path!),
-    enabled: !!serverId && !!path && serveable !== false,
+    enabled: !!serverId && !!path && serveable === true,
     staleTime: 5_000,
   });
 }
