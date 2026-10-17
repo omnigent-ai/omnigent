@@ -28,6 +28,7 @@ spawn: true
 executor:
   type: omnigent
   context_window: 1000000
+  reasoning_effort: high
   config:
     harness: claude-sdk
     # A pinned brain also pins the family its workers are routed within, which
