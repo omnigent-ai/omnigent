@@ -1036,6 +1036,55 @@ def _is_spec_local_python_tool(tool_name: str, agent_spec: AgentSpec | None) -> 
     )
 
 
+def is_known_mcp_local_tool(tool_name: str, agent_spec: AgentSpec | None) -> bool:
+    """Whether runner MCP dispatch has a handler for this local tool name."""
+    return (
+        tool_name in _ALL_LOCAL_TOOLS
+        or tool_name in _BROWSER_TOOLS
+        or _is_spec_local_python_tool(tool_name, agent_spec)
+    )
+
+
+def build_mcp_local_tool_schemas(
+    agent_spec: AgentSpec, effective_harness: str | None = None
+) -> list[_JsonObject]:
+    """Advertise the local tools that MCP dispatch can actually execute.
+
+    Use the same granted surface as :func:`execute_tool`. Native harnesses
+    additionally grant the four OS tools through their relay, even without
+    an ``os_env`` section in the agent spec.
+    """
+    harness = _effective_harness_name(agent_spec, effective_harness)
+    granted = _granted_tool_names(agent_spec, harness)
+    manager = ToolManager(agent_spec, os_env_schema_only=True)
+    try:
+        source_schemas = manager.get_tool_schemas()
+    finally:
+        manager.shutdown()
+    if is_native_harness(harness):
+        source_schemas.extend(tool_cls.get_schema() for tool_cls in OS_ENV_TOOL_TYPES)
+
+    schemas: dict[str, _JsonObject] = {}
+    for schema in source_schemas:
+        function = _string_object_dict(schema.get("function"))
+        if function is None:
+            continue
+        name = function.get("name")
+        if not isinstance(name, str) or name not in granted:
+            continue
+        if not is_known_mcp_local_tool(name, agent_spec):
+            continue
+        description = function.get("description")
+        parameters = _string_object_dict(function.get("parameters"))
+        schemas[name] = {
+            "type": "function",
+            "name": name,
+            "description": description if isinstance(description, str) else "",
+            "parameters": parameters or {"type": "object", "properties": {}},
+        }
+    return list(schemas.values())
+
+
 async def _execute_local_python_tool(
     tool_name: str,
     args: str,
