@@ -162,6 +162,21 @@ def _runner_resource_write_payload(
     )
 
 
+class _ShieldedCloseByteStream(httpx.AsyncByteStream):
+    """Keep an upstream stream's cleanup running through request cancellation."""
+
+    def __init__(self, stream: httpx.AsyncByteStream) -> None:
+        self._stream = stream
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in self._stream:
+            yield chunk
+
+    async def aclose(self) -> None:
+        with anyio.CancelScope(shield=True):
+            await self._stream.aclose()
+
+
 class _RunnerStreamResponse(StreamingResponse):
     """Stream a runner response body and close it however the send ends.
 
@@ -188,8 +203,7 @@ class _RunnerStreamResponse(StreamingResponse):
         try:
             await super().__call__(scope, receive, send)
         finally:
-            with anyio.CancelScope(shield=True):
-                await self._upstream.aclose()
+            await self._upstream.aclose()
 
 
 # Runner wait for a PR label, reviewer, or merge request, above the runner's 15-second
@@ -525,6 +539,7 @@ def register_resources_routes(
                 status_code=502,
                 detail="runner download endpoint unavailable",
             ) from exc
+        resp.stream = _ShieldedCloseByteStream(cast(httpx.AsyncByteStream, resp.stream))
         if resp.status_code == 200 and "content-disposition" in resp.headers:
             skip_gzip(request)
             forwarded = {
@@ -545,9 +560,8 @@ def register_resources_routes(
             except StopAsyncIteration:
                 first_chunk = None
             except BaseException as exc:
-                with anyio.CancelScope(shield=True):
-                    with contextlib.suppress(BaseException):
-                        await resp.aclose()
+                with contextlib.suppress(BaseException):
+                    await resp.aclose()
                 if isinstance(exc, (httpx.HTTPError, ConnectionError)):
                     _logger.warning("Runner download failed before streaming began: %s", exc)
                     raise HTTPException(
@@ -573,8 +587,7 @@ def register_resources_routes(
             _logger.warning("Runner download error response could not be read: %s", exc)
             raise HTTPException(status_code=502, detail="runner download failed") from exc
         finally:
-            with anyio.CancelScope(shield=True):
-                await resp.aclose()
+            await resp.aclose()
         if resp.status_code == 200:
             # A runner that predates ``download=true`` ignores it and answers
             # the capped JSON envelope; serving that would truncate silently.
