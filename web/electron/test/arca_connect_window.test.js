@@ -85,18 +85,9 @@ for (const copy of [
     confirm.click();
     events.Started({ login: false, command: "host command" });
     assert.equal(confirm.disabled, true);
-    events.Done({
-      ok: false,
-      authRequired: true,
-      command: "login command",
-      error: "Sign-in required",
-    });
-    assert.equal(confirm.hidden, false);
-    assert.equal(confirm.textContent, "Sign in and retry");
-    assert.equal(document.activeElement, confirm);
-    confirm.click();
-    assert.equal(confirms, 2);
+    // Sign-in follows a rejected connect without another click.
     events.Started({ login: true, command: "login command" });
+    assert.equal(confirms, 1);
     assert.equal(command.textContent, "login command");
     assert.equal(confirm.textContent, "Signing in…");
     assert.equal(confirm.disabled, true);
@@ -223,22 +214,29 @@ describe("arca connect console flow", () => {
     assert.deepEqual((await first).identity, identity);
   });
 
-  it("requires shell consent to sign in, then retries the identical target only once", async () => {
+  it("signs in under the Connect consent, then retries the identical target only once", async () => {
     const { world, flow } = flowHarness();
     const url = "https://account.databricks.com/omnigent?o=123";
     const result = flow.run(null, url);
     const win = world.windows[0];
+    world.ipc.emit("arca-connect:confirm", { sender: { id: 9999 } });
+    assert.equal(world.connects.length, 0);
     world.sendFrom(win, "arca-connect:confirm");
     world.connects[0].finish({ ok: false, authError: true });
     await Promise.resolve();
-    assert.equal(world.logins.length, 0);
-    assert.equal(win.webContents.sent.at(-1)[1].authRequired, true);
-    world.ipc.emit("arca-connect:confirm", { sender: { id: 9999 } });
-    assert.equal(world.logins.length, 0);
-    world.sendFrom(win, "arca-connect:confirm");
-    world.sendFrom(win, "arca-connect:confirm");
     assert.equal(world.logins.length, 1);
     assert.equal(world.logins[0].serverUrl, url);
+    const started = win.webContents.sent.filter(([channel]) => channel === "arca-connect:started");
+    assert.deepEqual(started.at(-1)[1], {
+      login: true,
+      command: `arca ssh isaac omni login ${url}`,
+    });
+    assert.equal(
+      win.webContents.sent.some(([channel]) => channel === "arca-connect:done"),
+      false,
+    );
+    world.sendFrom(win, "arca-connect:confirm");
+    assert.equal(world.logins.length, 1);
     world.logins[0].finish({ ok: true });
     await Promise.resolve();
     assert.equal(world.connects[1].serverUrl, url);
@@ -255,7 +253,6 @@ describe("arca connect console flow", () => {
     world.sendFrom(win, "arca-connect:confirm");
     world.connects[0].finish({ ok: false, authError: true });
     await Promise.resolve();
-    world.sendFrom(win, "arca-connect:confirm");
     win.close();
     assert.equal(world.logins[0].canceled, true);
     world.logins[0].finish({ ok: true });
