@@ -23,6 +23,7 @@ from omnigent.llms.errors import (
     LLMErrorDetail,
     PermanentLLMError,
     RetryableLLMError,
+    detect_prompt_token_overflow,
     detect_request_size_overflow,
 )
 from omnigent.spec.types import RetryPolicy
@@ -98,14 +99,11 @@ def _detect_context_overflow(body: str) -> _OverflowTokens | None:
         )
 
     # Anthropic: "prompt is too long: {actual} tokens > {limit} maximum"
-    anthropic_long = re.search(
-        r"prompt is too long:\s*(\d+)\s*tokens\s*>\s*(\d+)\s*maximum",
-        body,
-    )
-    if anthropic_long:
+    prompt_overflow = detect_prompt_token_overflow(body)
+    if prompt_overflow is not None:
         return _OverflowTokens(
-            max_context_tokens=int(anthropic_long.group(2)),
-            actual_tokens=int(anthropic_long.group(1)),
+            max_context_tokens=prompt_overflow.limit_tokens,
+            actual_tokens=prompt_overflow.actual_tokens,
         )
 
     # Gemini: "input token count ({actual}) exceeds ... ({limit})"
