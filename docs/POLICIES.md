@@ -193,6 +193,22 @@ Session-level policies let you customize agent behavior for your current task. T
 
 1. **UI** -- Open the information window to browse available policies and toggle them on or off.
 2. **Chat** -- Tell the agent directly, e.g. *"add a policy that asks me before running shell commands"*. The agent has a built-in `sys_add_policy` tool and will configure the policy for you.
+3. **CLI** -- Pass a policies file when you start or resume a session with `omnigent pi`:
+
+   ```sh
+   omnigent pi --policies policies.yaml
+   ```
+
+   ```yaml
+   # policies.yaml
+   policies:
+     - name: cap-tool-calls
+       type: python
+       handler: omnigent.policies.builtins.safety.max_tool_calls_per_session
+       factory_params: {limit: 20}
+   ```
+
+   Each entry uses the same fields as `POST /v1/sessions/{session_id}/policies`. The policies are attached before the runner starts, so they cover the first turn. Resuming with the same file keeps policies that are already attached.
 
 Session policies evaluate before agent spec and admin policies, so they can enforce stricter rules or add additional gates for your specific workflow.
 
