@@ -2862,6 +2862,89 @@ def _merge_allowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
     return args
 
 
+# Claude Code's print mode answers once and exits instead of opening the TUI.
+_CLAUDE_PRINT_MODE_FLAGS = frozenset({"-p", "--print"})
+
+
+def drop_startup_fatal_claude_args(args: Sequence[str], *, workspace: Path) -> list[str]:
+    """
+    Drop stored launch args that make Claude Code exit before its TUI starts.
+
+    A session replays its stored launch args on every relaunch, so one bad arg
+    leaves it unable to start. ``--print`` runs Claude headless, which a
+    terminal session can't use, and Claude refuses to start when an
+    ``--mcp-config`` file has since been deleted. Tokens after an option
+    terminator ``--`` are positional text and are kept as they are. Options
+    that exist only in print mode (``--no-session-persistence`` and the like)
+    are left alone: a session stored with them never started.
+
+    :param args: The session's Claude Code launch args, e.g. ``["--print"]``.
+    :param workspace: Directory Claude runs in, which relative config paths
+        resolve against.
+    :returns: The args without print mode or missing MCP config files.
+    """
+    kept: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        if arg == "--":
+            kept.extend(args[index - 1 :])
+            break
+        if arg in _CLAUDE_PRINT_MODE_FLAGS:
+            _logger.warning(
+                "Dropped %s from the Claude launch args; the session needs its TUI", arg
+            )
+            continue
+        if arg.startswith("--mcp-config="):
+            if _mcp_config_value_exists(arg.partition("=")[2], workspace):
+                kept.append(arg)
+            continue
+        if arg != "--mcp-config":
+            kept.append(arg)
+            continue
+        # The flag is variadic: its values run until the next option.
+        values: list[str] = []
+        while index < len(args) and not args[index].startswith("-"):
+            if _mcp_config_value_exists(args[index], workspace):
+                values.append(args[index])
+            index += 1
+        if values:
+            kept.extend(("--mcp-config", *values))
+        else:
+            _logger.warning(
+                "Dropped --mcp-config with no usable values from the Claude launch args"
+            )
+    return kept
+
+
+def _mcp_config_value_exists(value: str, workspace: Path) -> bool:
+    """
+    Whether an ``--mcp-config`` value is inline JSON or names an existing file.
+
+    :param value: One flag value, e.g. ``"/home/u/.mcp/servers.json"``.
+    :param workspace: Directory relative paths resolve against.
+    :returns: ``False`` for an empty value or a path that is not an existing
+        file; ``True`` for inline JSON, an existing file, or a path that
+        cannot be checked.
+    """
+    if value.lstrip().startswith("{"):
+        return True
+    if not value:
+        _logger.warning("Dropped an empty --mcp-config value from the Claude launch args")
+        return False
+    path = workspace / value
+    try:
+        if path.is_file():
+            return True
+    except OSError:
+        return True
+    _logger.warning(
+        "Dropped --mcp-config %s from the Claude launch args; it is not an existing file", path
+    )
+    return False
+
+
 def _merge_disallowed_tools(args: list[str], extra: tuple[str, ...]) -> list[str]:
     """
     Add ``extra`` tool names to a ``--disallowedTools`` flag in ``args``.

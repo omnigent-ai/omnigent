@@ -48,6 +48,7 @@ from omnigent.harnesses.claude_native.bridge import (
     claude_global_config_path,
     count_hook_events,
     display_cost_approval_popup,
+    drop_startup_fatal_claude_args,
     ensure_claude_workspace_trusted,
     inject_interrupt,
     inject_user_message,
@@ -3619,6 +3620,67 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
     # elicitation card (question answers ride back via ``updatedInput``),
     # so the wrapper must not inject a ``--disallowedTools`` flag of its own.
     assert "--disallowedTools" not in args
+
+
+def test_drop_startup_fatal_claude_args_drops_print_mode(tmp_path: Path) -> None:
+    """Print mode would make the session's Claude answer once and exit."""
+    args = drop_startup_fatal_claude_args(
+        ["--print", "-p", "fix the bug", "--model", "opus"], workspace=tmp_path
+    )
+
+    assert args == ["fix the bug", "--model", "opus"]
+
+
+def test_drop_startup_fatal_claude_args_keeps_text_after_option_terminator(
+    tmp_path: Path,
+) -> None:
+    """Tokens after ``--`` are positional text, not flags to filter."""
+    args = drop_startup_fatal_claude_args(["--print", "--", "--print", "-p"], workspace=tmp_path)
+
+    assert args == ["--", "--print", "-p"]
+
+
+def test_drop_startup_fatal_claude_args_drops_missing_mcp_config_files(tmp_path: Path) -> None:
+    """A deleted MCP config file stops Claude from starting, so it is left out.
+
+    An empty value and a directory are just as fatal and are dropped too.
+    """
+    (tmp_path / "servers.json").write_text('{"mcpServers": {}}', encoding="utf-8")
+    (tmp_path / "configs").mkdir()
+    inline = '{"mcpServers":{}}'
+
+    args = drop_startup_fatal_claude_args(
+        [
+            "--mcp-config",
+            str(tmp_path / "gone.json"),
+            "servers.json",
+            "missing.json",
+            f"--mcp-config={tmp_path / 'gone-too.json'}",
+            "--mcp-config",
+            inline,
+            "--mcp-config",
+            "also-missing.json",
+            "--mcp-config",
+            str(tmp_path / "configs"),
+            "--mcp-config=",
+            "--mcp-config=servers.json",
+            f"--mcp-config={inline}",
+            "--model",
+            "opus",
+        ],
+        workspace=tmp_path,
+    )
+
+    assert args == [
+        "--mcp-config",
+        "servers.json",
+        "--mcp-config",
+        inline,
+        "--mcp-config=servers.json",
+        f"--mcp-config={inline}",
+        "--model",
+        "opus",
+    ]
 
 
 def test_generated_claude_subprocesses_pin_runner_tmpdir(
