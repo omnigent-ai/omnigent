@@ -1,6 +1,6 @@
 """Mint a Databricks bearer via the databricks-sdk unified auth resolver.
 
-Run as ``python3 -m omnigent.inner.databricks_token --host <h> [--profile <p>]``.
+Run as ``<python> -P -m omnigent.inner.databricks_token --host <h> [--profile <p>]``.
 This is the auth-command fallback the native-harness gateway path installs (see
 :func:`omnigent.inner.databricks_executor.databricks_bearer_token_command`).
 
