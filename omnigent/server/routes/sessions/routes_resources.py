@@ -163,7 +163,10 @@ def _runner_resource_write_payload(
 
 
 class _ShieldedCloseByteStream(httpx.AsyncByteStream):
-    """Keep an upstream stream's cleanup running through request cancellation."""
+    """Keep an upstream stream's cleanup running through request cancellation.
+
+    :param stream: The upstream httpx byte stream to delegate to.
+    """
 
     def __init__(self, stream: httpx.AsyncByteStream) -> None:
         self._stream = stream
@@ -184,11 +187,12 @@ class _RunnerStreamResponse(StreamingResponse):
     send that fails before that, or a client that disconnects (where
     Starlette skips background tasks), would leak the tunnel request.
     Closing in ``__call__`` covers every exit.
-    After send, its stream is wrapped in ``_ShieldedCloseByteStream`` so
-    ``__call__`` cleanup completes even when the request is cancelled.
+    The route wraps ``upstream.stream`` in ``_ShieldedCloseByteStream`` before
+    constructing this response, so the ``finally`` close completes on cancellation.
 
     :param upstream: The runner's streamed response.
     :param headers: Response headers to forward.
+    :param content: Async iterator of body chunks, including the prefetched first chunk.
     """
 
     def __init__(
