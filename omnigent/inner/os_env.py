@@ -433,6 +433,8 @@ class _HelperProcessClient:
         # the handle when present.
         self._egress_handle: EgressProxyHandle | None = None
         self._git_ssh_broker: GitSshBroker | None = None
+        self._owner_thread: threading.Thread | None = None
+        self._owner_stop: threading.Event | None = None
         self._lock = threading.Lock()
         self._closed = False
         atexit.register(self.close)
@@ -484,10 +486,42 @@ class _HelperProcessClient:
 
     def _start_locked(self) -> None:
         try:
-            self._start_unchecked_locked()
+            if self.sandbox.active and self.sandbox.backend_type == "linux_bwrap":
+                self._start_on_owner_thread_locked()
+            else:
+                self._start_unchecked_locked()
         except BaseException:
             self._stop_locked()
             raise
+
+    def _start_on_owner_thread_locked(self) -> None:
+        """Keep Linux's parent-death signal bound to an environment-owned thread."""
+        # Stop and join any stale owner thread before creating a replacement.
+        if self._owner_stop is not None or self._owner_thread is not None:
+            self._stop_locked()
+
+        ready = threading.Event()
+        stop = threading.Event()
+        failures: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                self._start_unchecked_locked()
+            except BaseException as exc:  # noqa: BLE001 - return startup failures to the waiting caller.
+                failures.append(exc)
+            finally:
+                ready.set()
+            if not failures:
+                stop.wait()
+
+        # RPC callers use short-lived threads; their exit must not kill bwrap.
+        owner = threading.Thread(target=run, name="os-env-helper-owner", daemon=True)
+        self._owner_stop = stop
+        self._owner_thread = owner
+        owner.start()
+        ready.wait()
+        if failures:
+            raise failures[0]
 
     def _start_unchecked_locked(self) -> None:
         sandbox = self.sandbox
@@ -701,6 +735,19 @@ class _HelperProcessClient:
         return f"OS environment helper exited with code {returncode}"
 
     def _stop_locked(self) -> None:
+        owner = self._owner_thread
+        stop = self._owner_stop
+        if stop is not None:
+            stop.set()
+        if (
+            owner is not None
+            and owner is not threading.current_thread()
+            and owner.ident is not None
+        ):
+            # Startup may still be assigning the process when its caller is interrupted.
+            owner.join()
+        self._owner_thread = None
+        self._owner_stop = None
         proc = self._proc
         self._proc = None
         try:
