@@ -11096,8 +11096,7 @@ def _derive_terminal_launch_args_from_spec(
             return _validate_terminal_launch_args(["--auto"])
         if permission_mode is not None:
             _logger.debug(
-                "kimi-native sub-spec has unrecognized permission_mode=%r; "
-                "launching without --auto.",
+                "kimi-native sub-spec has unrecognized permission_mode=%r; ignoring it.",
                 permission_mode,
             )
 

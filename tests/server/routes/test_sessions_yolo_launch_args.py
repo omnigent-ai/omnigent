@@ -281,6 +281,12 @@ def test_kimi_native_non_bypass_permission_mode_without_yolo_returns_none() -> N
     assert _derive_terminal_launch_args_from_spec(spec) is None
 
 
+def test_kimi_native_yolo_true_applies_after_non_bypass_permission_mode() -> None:
+    """A non-bypass permission mode does not suppress an explicit yolo opt-in."""
+    spec = _spec_with_config({"harness": "kimi-native", "permission_mode": "plan", "yolo": True})
+    assert _derive_terminal_launch_args_from_spec(spec) == ["--auto"]
+
+
 def test_kimi_native_non_string_permission_mode_is_fail_closed() -> None:
     """Non-string permission modes must never enable Kimi Never Ask."""
 
