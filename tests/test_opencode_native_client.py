@@ -14,6 +14,7 @@ from omnigent.harnesses.opencode_native.client import (
     OpenCodeEvent,
     OpenCodeSession,
 )
+from tests._helpers.proxy_env import dead_proxy_url, loopback_json_stub, set_proxy_env
 
 Handler = Callable[[httpx.Request], httpx.Response]
 
@@ -352,3 +353,35 @@ async def test_reject_question_posts_global_endpoint() -> None:
     assert seen["method"] == "POST"
     assert seen["path"] == "/question/que_1/reject"
     await client.aclose()
+
+
+_STUB_MODELS = b'{"models": [{"id": "opencode-go/stub"}]}'
+
+
+async def test_owned_client_bypasses_proxy_env_for_loopback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A proxy that cannot route 127.0.0.1 must not black-hole calls to the
+    # loopback opencode serve; the server is reachable without any proxy.
+    with loopback_json_stub(_STUB_MODELS) as stub, dead_proxy_url() as proxy:
+        set_proxy_env(monkeypatch, proxy)
+        client = OpenCodeClient(stub.url)
+        try:
+            assert await client.list_models() == [{"id": "opencode-go/stub"}]
+        finally:
+            await client.aclose()
+
+
+async def test_owned_client_keeps_proxy_env_for_remote_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A remote server still goes through the configured proxy: the stub plays
+    # the proxy and must receive the absolute-form request for the remote host.
+    with loopback_json_stub(_STUB_MODELS) as proxy:
+        set_proxy_env(monkeypatch, proxy.url)
+        client = OpenCodeClient("http://opencode.internal.test:4096")
+        try:
+            assert await client.list_models() == [{"id": "opencode-go/stub"}]
+        finally:
+            await client.aclose()
+    assert proxy.paths == ["http://opencode.internal.test:4096/api/model"]
