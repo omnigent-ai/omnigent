@@ -72,6 +72,10 @@ from omnigent.harnesses.claude_native import delivery_diagnostics
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
+from omnigent.harnesses.claude_native.tmux_terminal import (
+    NativeTmuxTerminal,
+    capture_tmux_terminal,
+)
 from omnigent.harnesses.diagnostics import (
     detect_sign_in_prompt,
     sign_in_next_step,
@@ -101,8 +105,18 @@ from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 CLAUDE_FRAMEWORK_CONTEXT_FILE = "pending_framework_context.txt"
 
 _logger = logging.getLogger(__name__)
-_INJECTION_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
-    "claude_native_injection_cancel_event", default=None
+
+
+@dataclass
+class InjectionAttempt:
+    """Shared with the worker so cleanup retains its observed native generation."""
+
+    cancelled: threading.Event
+    terminal: NativeTmuxTerminal | None = None
+
+
+_INJECTION_ATTEMPT: ContextVar[InjectionAttempt | None] = ContextVar(
+    "claude_native_injection_attempt", default=None
 )
 _INJECTION_LOCKS_GUARD = threading.Lock()
 _INJECTION_LOCKS: dict[str, threading.Lock] = {}
@@ -574,6 +588,8 @@ def validate_claude_hook_interpreter_compatibility(
 class ClaudePromptTimeout(RuntimeError):
     """Claude Code's input box did not render before delivery timed out."""
 
+    terminal: NativeTmuxTerminal | None = None
+
 
 class ClaudeTerminalExited(ClaudePromptTimeout):
     """
@@ -637,19 +653,35 @@ class ClaudeMessageNotAccepted(RuntimeError):
 
 
 @contextlib.contextmanager
-def cancellable_injection(cancel_event: threading.Event) -> Iterator[None]:
+def cancellable_injection(cancel_event: threading.Event) -> Iterator[InjectionAttempt]:
     """Bind a cancellation flag inherited by this delivery's ``asyncio.to_thread`` worker."""
-    token = _INJECTION_CANCEL_EVENT.set(cancel_event)
+    attempt = InjectionAttempt(cancel_event)
+    token = _INJECTION_ATTEMPT.set(attempt)
     try:
-        yield
+        yield attempt
     finally:
-        _INJECTION_CANCEL_EVENT.reset(token)
+        _INJECTION_ATTEMPT.reset(token)
 
 
 def _check_injection_cancelled() -> None:
-    cancel_event = _INJECTION_CANCEL_EVENT.get()
-    if cancel_event is not None and cancel_event.is_set():
+    attempt = _INJECTION_ATTEMPT.get()
+    if attempt is not None and attempt.cancelled.is_set():
         raise ClaudeInjectionCancelled("Claude Code message delivery was cancelled")
+
+
+def _capture_injection_terminal(socket_path: str, tmux_target: str) -> None:
+    attempt = _INJECTION_ATTEMPT.get()
+    if attempt is None:
+        return
+    attempt.terminal = capture_tmux_terminal(
+        socket_path, tmux_target, timeout_s=_TMUX_SEND_TIMEOUT_S
+    )
+    if attempt.terminal is None:
+        _logger.warning(
+            "claude-native: could not pin the identity of tmux target %s; a failed "
+            "delivery will leave this terminal running",
+            tmux_target,
+        )
 
 
 class TmuxSessionNotAdvertised(RuntimeError):
@@ -4202,6 +4234,7 @@ def inject_user_message(
     """
     delivery_diagnostics.set_stage("waiting_for_tmux")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    _capture_injection_terminal(info["socket_path"], info["tmux_target"])
     delivery_diagnostics.set_stage("restoring_input")
     # A surface left occupying the composer swallows everything typed
     # below — and hides the input box, wedging the readiness gate — so
@@ -4707,6 +4740,7 @@ def inject_slash_command(
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
+    _capture_injection_terminal(socket_path, tmux_target)
     # Same reclaim as inject_user_message: a surface left occupying the
     # composer would swallow the C-u and the typed command.
     surface = _restore_occupied_input(socket_path, tmux_target, bridge_dir=bridge_dir)
