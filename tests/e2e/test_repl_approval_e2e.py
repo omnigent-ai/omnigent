@@ -47,6 +47,7 @@ from typing import Any, TextIO
 import pytest
 
 from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
+from tests.e2e._repl_toolbar import expect_idle_toolbar, track_toolbar
 from tests.e2e.conftest import (
     configure_mock_llm,
     get_mock_requests,
@@ -360,12 +361,13 @@ def _wait_for_prompt_ready(
         ``ask-demo`` fixture); pass a different pattern for
         other fixtures.
     """
+    track_toolbar(child)
     child.expect(welcome_pattern, timeout=timeout)
     # The banner is not input-readiness. Wait for the status
     # toolbar's ``· ready`` (idle ``state: sleeping``) marker
     # so the next send() lands in prompt_toolkit's live loop
     # instead of racing ahead of it.
-    child.expect(r"·\s*ready", timeout=timeout)
+    expect_idle_toolbar(child, timeout=timeout)
 
 
 def _wait_for_turn_complete(child: Any, timeout: float = 45.0) -> None:
@@ -391,7 +393,7 @@ def _wait_for_turn_complete(child: Any, timeout: float = 45.0) -> None:
     :param child: Active pexpect child.
     :param timeout: Max seconds to wait for the turn to settle.
     """
-    child.expect(r"·\s*ready", timeout=timeout)
+    expect_idle_toolbar(child, timeout=timeout)
 
 
 def _read_pending(child: Any, seconds: float = 0.2) -> str:

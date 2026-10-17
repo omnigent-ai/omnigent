@@ -27,6 +27,7 @@ from typing import Any
 import pytest
 
 from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
+from tests.e2e._repl_toolbar import expect_idle_toolbar
 from tests.e2e.conftest import configure_mock_llm, reset_mock_llm
 
 pexpect = pytest.importorskip("pexpect")
@@ -151,7 +152,7 @@ def _wait_for_prompt_ready(child: Any, timeout: float = 60.0) -> None:
     loop starts reading.  The ready toolbar is emitted by the live loop, so
     waiting for it prevents the first keystroke from being dropped.
     """
-    child.expect(r"·\s*ready", timeout=timeout)
+    expect_idle_toolbar(child, timeout=timeout)
 
 
 def _read_pending(child: Any, seconds: float = 0.3) -> str:
