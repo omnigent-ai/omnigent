@@ -124,10 +124,22 @@ class CompressedText(TypeDecorator[str]):
     impl = LargeBinary
     cache_ok = True
 
+    def __init__(self, max_stored_bytes: int | None = None) -> None:
+        """Optionally bound the final stored frame, including its codec header."""
+        super().__init__()
+        self.max_stored_bytes = max_stored_bytes
+
     def process_bind_param(self, value: str | None, dialect: object) -> bytes | None:
         """Compress on the way into the database."""
         del dialect
-        return encode(value)
+        framed = encode(value)
+        if (
+            framed is not None
+            and self.max_stored_bytes is not None
+            and len(framed) > self.max_stored_bytes
+        ):
+            raise ValueError(f"Compressed text exceeds {self.max_stored_bytes} stored bytes")
+        return framed
 
     def process_result_value(
         self, value: bytes | str | memoryview | None, dialect: object

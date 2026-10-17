@@ -10,8 +10,55 @@ from __future__ import annotations
 import json
 
 import pytest
+import sqlalchemy as sa
+from sqlalchemy.exc import StatementError
 
-from omnigent.db.compression import _MIN_COMPRESS_BYTES, decode, encode
+from omnigent.db.compression import _MIN_COMPRESS_BYTES, CompressedText, decode, encode
+
+
+def test_statement_cache_keeps_independent_storage_limits() -> None:
+    engine = sa.create_engine("sqlite://")
+    try:
+        with engine.connect() as connection:
+            for limit in (65, 64, 65):
+                statement = sa.select(
+                    sa.literal("x" * 63, type_=CompressedText(max_stored_bytes=limit))
+                )
+                if limit == 64:
+                    with pytest.raises(StatementError, match="64 stored bytes"):
+                        connection.scalar(statement)
+                else:
+                    assert connection.scalar(statement) == "x" * 63
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("value", ["x" * 62, "é" * 31, "é" * 3000])
+def test_bounded_type_checks_encoded_bytes_on_insert_and_update(value: str) -> None:
+    engine = sa.create_engine("sqlite://")
+    table = sa.Table(
+        "bounded_text",
+        sa.MetaData(),
+        sa.Column("id", sa.Integer, primary_key=True),
+        sa.Column("value", CompressedText(max_stored_bytes=64)),
+    )
+    try:
+        table.create(engine)
+        with engine.begin() as connection:
+            connection.execute(table.insert().values(id=1, value=value))
+            assert connection.scalar(sa.select(table.c.value)) == value
+            assert connection.scalar(sa.select(sa.func.length(table.c.value))) <= 64
+        for statement in (
+            table.insert().values(id=2, value="é" * 31 + "x"),
+            table.update().where(table.c.id == 1).values(value="é" * 31 + "x"),
+        ):
+            with pytest.raises(StatementError, match="64 stored bytes"):
+                with engine.begin() as connection:
+                    connection.execute(statement)
+        with engine.connect() as connection:
+            assert connection.execute(sa.select(table)).all() == [(1, value)]
+    finally:
+        engine.dispose()
 
 
 @pytest.mark.parametrize("write_content_size", [False, True])

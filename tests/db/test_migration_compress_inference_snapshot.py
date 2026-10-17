@@ -150,17 +150,6 @@ def test_compression_migration_retains_fitting_snapshots_and_all_sessions(
         assert columns["inference_snapshot"]["nullable"]
         assert isinstance(columns["inference_snapshot"]["type"], sa.LargeBinary)
         assert not any(name.startswith("_inference_snapshot") for name in columns)
-        store = SqlAlchemyConversationStore(db_uri)
-        for (workspace_id, row_id), value in original.items():
-            if workspace_id != 0:
-                continue
-            conversation = store.get_conversation(row_id.hex())
-            assert conversation is not None
-            assert conversation.title == "Preserve conversation"
-            expected = None if value is None or value == oversized else json.loads(value)
-            assert conversation.inference_snapshot == expected
-            assert conversation.session_state == {"untouched": True}
-
         _migrate(engine, _PREVIOUS, downgrade=True)
         for key, row in _rows(engine).items():
             assert row.inference_snapshot == (
@@ -172,6 +161,19 @@ def test_compression_migration_retains_fitting_snapshots_and_all_sessions(
             with Operations.context(MigrationContext.configure(connection)):
                 migration.upgrade()
         assert _rows(engine) == after
+
+        # Current ORM readers require the complete schema beyond this migration's revision.
+        _migrate(engine, "head")
+        store = SqlAlchemyConversationStore(db_uri)
+        for (workspace_id, row_id), value in original.items():
+            if workspace_id != 0:
+                continue
+            conversation = store.get_conversation(row_id.hex())
+            assert conversation is not None
+            assert conversation.title == "Preserve conversation"
+            expected = None if value is None or value == oversized else json.loads(value)
+            assert conversation.inference_snapshot == expected
+            assert conversation.session_state == {"untouched": True}
     finally:
         _migrate(engine, "head")
 

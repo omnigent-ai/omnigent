@@ -636,6 +636,19 @@ class SqlSessionPermission(OmnigentBase):
     )
 
 
+class _SessionObservationIdentifier(TypeDecorator[str]):
+    """Enforce the observation identifiers' character bound on every backend."""
+
+    impl = String(64)
+    cache_ok = True
+
+    def process_bind_param(self, value: str | None, dialect: object) -> str | None:
+        del dialect
+        if value is not None and len(value) > 64:
+            raise ValueError("Session observation identifier exceeds 64 characters")
+        return value
+
+
 class SqlConversationMetadata(OmnigentBase):
     """
     SQLAlchemy model for the ``omnigent_conversation_metadata`` table.
@@ -659,6 +672,9 @@ class SqlConversationMetadata(OmnigentBase):
     # Enum stored as a stable int code (CONVERSATION_KIND: default=1, sub_agent=2).
     kind: Mapped[int] = mapped_column(SmallInteger, default=1)
     runner_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    runner_binding_epoch: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
     # No FK: host records are managed outside this table.
     host_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     sub_agent_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -683,6 +699,30 @@ class SqlConversationMetadata(OmnigentBase):
     # Last relay-observed turn status (enum_codecs.SESSION_LIVE_STATUS);
     # NULL means no relay has ever reported on this session.
     live_status: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    live_status_revision: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    live_status_observation_id: Mapped[str | None] = mapped_column(
+        _SessionObservationIdentifier, nullable=True
+    )
+    live_status_response_id: Mapped[str | None] = mapped_column(
+        CompressedText(max_stored_bytes=16_383), nullable=True
+    )
+    live_status_error_key: Mapped[str | None] = mapped_column(
+        _SessionObservationIdentifier, nullable=True
+    )
+    live_status_error_labels: Mapped[str | None] = mapped_column(
+        CompressedText(max_stored_bytes=16_383), nullable=True
+    )
+    terminal_pending: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    terminal_startup_claim: Mapped[str | None] = mapped_column(
+        CompressedText(max_stored_bytes=16_383), nullable=True
+    )
+    runner_offline_decision: Mapped[str | None] = mapped_column(
+        CompressedText(max_stored_bytes=16_383), nullable=True
+    )
     # Outstanding elicitation (approval-prompt) count; NULL = never written.
     pending_elicitation_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # First-class project membership. Relates to projects.id; no DB FK
