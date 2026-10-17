@@ -39,6 +39,17 @@ class HostService:
     log_path: Path | None = None
 
 
+def launchd_plist_path() -> Path:
+    """Per-user launchd plist that ``omnigent host service enable`` installs."""
+    return Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+
+
+def systemd_unit_path() -> Path:
+    """Per-user systemd unit that ``omnigent host service enable`` installs."""
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return config_home / "systemd" / "user" / SYSTEMD_UNIT
+
+
 def _service_for_current_platform() -> HostService:
     """Return the current platform's per-user service description."""
     system = platform.system()
@@ -46,15 +57,14 @@ def _service_for_current_platform() -> HostService:
         log_path = data_dir() / "logs" / "host" / "service.log"
         return HostService(
             kind="launchd",
-            path=Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist",
+            path=launchd_plist_path(),
             label=LAUNCHD_LABEL,
             log_path=log_path,
         )
     if system == "Linux":
-        config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
         return HostService(
             kind="systemd_user",
-            path=config_home / "systemd" / "user" / SYSTEMD_UNIT,
+            path=systemd_unit_path(),
             label=SYSTEMD_UNIT,
         )
     raise HostServiceError(
