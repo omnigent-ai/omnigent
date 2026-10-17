@@ -529,9 +529,12 @@ def login_app_oauth_in_sandbox(
             sandbox_id,
             f"rm -f ~/.databrickscfg && printf '%s' {shlex.quote(cfg_body)} > ~/.databrickscfg",
         )
+    from omnigent.cli import _BROWSER_LOGIN_CALLBACK_FORWARDED_ENV
+
+    # The callback port is forwarded below, so the inner login must not ask the user to.
     login = launcher.stream_exec(
         sandbox_id,
-        f"omnigent login {shlex.quote(server_url)}",
+        f"{_BROWSER_LOGIN_CALLBACK_FORWARDED_ENV}=1 omnigent login {shlex.quote(server_url)}",
         pty=True,
     )
     try:
