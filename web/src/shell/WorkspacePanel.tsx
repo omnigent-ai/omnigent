@@ -1509,7 +1509,7 @@ function WorkspacePanelImpl({
             <FileViewer
               viewport="desktop"
               frameless
-              open
+              open={open}
               conversationId={conversationId}
               path={selectedFilePath}
               position={filePosition}

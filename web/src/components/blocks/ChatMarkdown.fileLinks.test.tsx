@@ -102,6 +102,33 @@ function renderMarkdown(
 }
 
 describe("markdown links to workspace files", () => {
+  it("plays an existing root-level recording outside the changed-file list", async () => {
+    fetchMock.mockResolvedValue(dirListing(["demo.webm"]));
+    renderMarkdown("[Screen recording](demo.webm)", [], FILE_VIEWER_WITH_SESSION);
+
+    expect(
+      await screen.findByRole("button", { name: "Play video: Screen recording" }),
+    ).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Screen recording" }));
+    expect(openFile).toHaveBeenCalledWith("demo.webm");
+  });
+
+  it("renders a workspace recording inline and keeps its file-viewer link", () => {
+    renderMarkdown("[Screen recording](demo.webm)", ["demo.webm"], FILE_VIEWER_WITH_SESSION);
+    expect(screen.getByRole("button", { name: "Play video: Screen recording" })).toBeVisible();
+    expect(screen.getAllByText("Screen recording")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Screen recording" }));
+    expect(openFile).toHaveBeenCalledWith("demo.webm");
+  });
+
+  it("renders direct remote video links but leaves ordinary links alone", () => {
+    renderMarkdown("[Demo](https://example.com/demo.mp4?signature=abc)");
+    expect(document.querySelector("video")).toHaveAttribute(
+      "src",
+      "https://example.com/demo.mp4?signature=abc",
+    );
+  });
+
   it("opens the FileViewer for an absolute path instead of navigating", () => {
     renderMarkdown(`[proposal.md](${WORKSPACE}/docs/proposal.md)`, ["docs/proposal.md"]);
 
