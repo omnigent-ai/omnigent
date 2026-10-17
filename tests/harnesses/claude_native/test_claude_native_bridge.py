@@ -830,8 +830,9 @@ def test_bridge_writers_preserve_concurrent_identity_and_model_updates(
             writer_context.delay = False
             first_read.set()
             assert update_attempted.wait(timeout=budget(3.0))
-            # An excluded writer waits for this read-modify-write to finish.
-            update_finished.wait(timeout=budget(0.5))
+            # Expected to time out under correct locking: this bounded window only
+            # lets a buggy unlocked write complete and clobber state (final asserts).
+            update_finished.wait(timeout=0.5)
         return result
 
     monkeypatch.setattr(claude_native_bridge, "_read_json_file", read_with_delayed_writer)
