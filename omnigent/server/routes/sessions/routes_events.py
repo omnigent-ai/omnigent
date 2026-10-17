@@ -89,6 +89,7 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
+    local_single_user_enabled,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -229,6 +230,7 @@ from omnigent.server.routes._sessions.helpers import (
     require_filesystem_attachment_runtime,
 )
 from omnigent.server.routes._sessions.orchestration import (
+    HostLaunchRefusedError,
     _best_effort_stop,
     _child_session_summaries_from_conversations,
     _codex_side_chat_fork_lost,
@@ -240,6 +242,8 @@ from omnigent.server.routes._sessions.orchestration import (
     _evaluate_input_policy,
     _evaluate_tool_call_policy,
     _heal_subagent_runner_binding_via_parent,
+    _host_launch_refusal_detail,
+    _host_launch_refusal_message,
     _is_native_terminal_session,
     _mark_dispatch_in_flight,
     _maybe_relaunch_managed_sandbox,
@@ -533,21 +537,92 @@ async def _session_host_offline(conv: Conversation, app_state: Any) -> bool:
     """
     if conv.host_id is None:
         return False
+    return await _host_offline(conv.host_id, app_state)
+
+
+async def _host_offline(host_id: str, app_state: Any) -> bool:
+    """Return whether user-run host ``host_id`` is absent here and not live elsewhere."""
     host_registry = getattr(app_state, "host_registry", None)
-    if host_registry is None or host_registry.get(conv.host_id) is not None:
+    if host_registry is None or host_registry.get(host_id) is not None:
         return False
     host_store = getattr(app_state, "host_store", None)
     if host_store is None:
         return True
-    host = await asyncio.to_thread(host_store.get_host, conv.host_id)
+    host = await asyncio.to_thread(host_store.get_host, host_id)
     return host is not None and host.sandbox_provider is None and not host_is_live(host)
 
 
-def _host_offline_message() -> str:
-    """Return the failure text for a send that found its session's host offline."""
+def _host_offline_message(next_step: str = "send the message again") -> str:
+    """Return the failure text for a send or retry that found its session's host offline."""
     return (
         "The host for this session is offline. "
-        f"Start it with `{cli_invocation()} host` (or reconnect it) and send the message again."
+        f"Start it with `{cli_invocation()} host` (or reconnect it) and {next_step}."
+    )
+
+
+async def _retry_unavailable_message(
+    conv: Conversation, app_state: Any, conversation_store: ConversationStore
+) -> str:
+    """
+    Explain why Retry found no runner to recover, with the next step to take.
+
+    :raises OmnigentError: ``WRONG_REPLICA`` when the host or runner reconnected
+        to a sibling replica during the recovery wait.
+    """
+    # A side chat recovers through its source, whose relaunch may have rotated the
+    # source's runner while the side chat still names the old one; classify the
+    # source row so the host and replica checks see the runner actually launched.
+    subject = conv
+    source_id = _side_chat_source_id(conv)
+    if source_id is not None:
+        source = await asyncio.to_thread(conversation_store.get_conversation, source_id)
+        if source is not None:
+            subject = source
+    await _raise_if_runner_on_another_replica(subject, app_state, conversation_store)
+    await _raise_if_runner_re_tunnelled_to_another_replica(
+        subject.id, subject.runner_id, conversation_store
+    )
+    # Recovery never asks a host to launch a sub-agent; it rides its parent's runner.
+    sub_agent_message = (
+        "This sub-agent runs on its parent session's runner and has no runner of "
+        "its own to restart. Resume the parent session if it is not running, then "
+        "send your message here again."
+    )
+    # A side chat or sub-agent runs on an ancestor's host; describe that host.
+    host_id = await asyncio.to_thread(routing_host_id, subject, conversation_store)
+    if host_id is None:
+        if conv.kind == "sub_agent":
+            return sub_agent_message
+        return (
+            "This session has no host to relaunch its runner on. "
+            "Reconnect the client that started it, then retry."
+        )
+    if await _host_offline(host_id, app_state):
+        return _host_offline_message(next_step="retry")
+    host_registry = getattr(app_state, "host_registry", None)
+    if host_registry is not None and host_registry.get(host_id) is None:
+        host_store = getattr(app_state, "host_store", None)
+        host = (
+            await asyncio.to_thread(host_store.get_host, host_id)
+            if host_store is not None
+            else None
+        )
+        if host is not None and host.sandbox_provider is not None:
+            # Users cannot reconnect a server-managed sandbox themselves.
+            return (
+                "The managed sandbox for this session is not connected to this server. "
+                "Retry in a moment; if it keeps failing, start a new session or ask an "
+                "administrator to check the sandbox."
+            )
+        return (
+            "The host for this session is not connected to this server. "
+            "Retry in a moment; if it keeps failing, reconnect the host."
+        )
+    if conv.host_id is None and conv.kind == "sub_agent":
+        return sub_agent_message
+    return (
+        "The host was asked to start a runner for this session, but none "
+        "connected to the server. Check the runner log on the host, then retry."
     )
 
 
@@ -592,7 +667,7 @@ async def _recover_retry_session(
             )
         if runner_client is None:
             raise OmnigentError(
-                "No runner is available to recover this session.",
+                await _retry_unavailable_message(conv, request.app.state, conversation_store),
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
         runner_relaunched = conv.runner_id != original_runner_id
@@ -1163,7 +1238,7 @@ def register_events_routes(
                 code=ErrorCode.CONFLICT,
             )
         if body.type == _RETRY_SESSION_TYPE:
-            return await _retry_session_single_flight(
+            recovery = _retry_session_single_flight(
                 request=cast("Request", request),
                 session_id=session_id,
                 conversation=conv,
@@ -1172,6 +1247,11 @@ def register_events_routes(
                 user_id=user_id,
                 permission_store=permission_store,
             )
+            try:
+                return await recovery
+            except HostLaunchRefusedError as exc:
+                # Shared recovery: re-scope the refusal text per requester.
+                raise exc.for_viewer(user_id) from exc
         # ── Policy evaluation (path-agnostic) ────────────────
         # Evaluate policies BEFORE persistence/runner forwarding so
         # enforcement fires on both paths. On DENY, persist the
@@ -2465,6 +2545,8 @@ def register_events_routes(
                     permission_store=permission_store,
                     raise_host_refusal=True,
                 )
+            except HostLaunchRefusedError as exc:
+                raise exc.for_viewer(user_id) from exc
             except OmnigentError as exc:
                 if exc.code not in (
                     ErrorCode.HARNESS_NOT_CONFIGURED,
@@ -2501,6 +2583,7 @@ def register_events_routes(
         # the raw host text the 503 below deliberately owner-scopes.
         relaunch_refusal_reason: str | None = None
         relaunch_refusal_visible = False
+        relaunch_refusal_persistable = False
         host_wait_started = time.monotonic()
         _host_conn: HostConnection | None = None
         if runner_client is None and conv.host_id is not None:
@@ -2613,6 +2696,12 @@ def register_events_routes(
                         _host_reg,
                         _host_conn,
                     )
+                    if (launch_attempt.error or launch_attempt.error_code) and (
+                        await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                        is None
+                    ):
+                        # Deleted mid-relaunch: the server, not the host, ended it.
+                        raise _session_not_found()
                     host_error_code = _classify_launch_refusal(
                         launch_attempt.error_code,
                         launch_attempt.error,
@@ -2657,6 +2746,14 @@ def register_events_routes(
                             user_id is None
                             or _host_conn.owner is None
                             or _host_conn.owner == user_id
+                        )
+                        # A persisted failed turn is read by every session
+                        # collaborator, so it carries the host's text only when
+                        # this server cannot have other users.
+                        relaunch_refusal_persistable = (
+                            user_id is None
+                            or _host_conn.owner is None
+                            or local_single_user_enabled()
                         )
             if (
                 runner_client is None
@@ -2714,20 +2811,9 @@ def register_events_routes(
                 conv.kind != "sub_agent" or _is_native_terminal_session(conv)
             )
         if runner_client is None:
-            # A native terminal-session message must NOT be silently
-            # dropped when no runner is reachable — the runner crashed
-            # before connecting (the daemon couldn't bring it up). Persist
-            # the user's message together with the runner-failure error so
-            # it survives reload and the banner explains why, becoming the
-            # AP-server-as-writer failed turn (same shape as a definitive
-            # ensure-probe failure). The cause, when known, is the daemon's
-            # exit report keyed by this session's runner_id; failing that, a
-            # host that is offline (so no runner could start); otherwise a
-            # generic unavailable message. This is safe precisely because
-            # the harness will never see it (no desync — there is no live
-            # harness). Other event types and non-native sessions still
-            # raise: their message would replay to a relaunched runner, so
-            # persisting now WOULD desync the store from harness state.
+            # A native terminal message must not be dropped when no runner is
+            # reachable: persist it with the failure so it survives reload.
+            # Safe because no live harness exists to desync.
             if body.type == "message" and _is_native_terminal_session(conv):
                 exit_cause = (
                     runner_exit_reports.get(conv.runner_id)
@@ -2760,6 +2846,10 @@ def register_events_routes(
                     )
                 if exit_cause:
                     failure_message = exit_cause
+                elif relaunched_launch_refused:
+                    failure_message = _host_launch_refusal_message(
+                        relaunch_refusal_reason, visible=relaunch_refusal_persistable
+                    )
                 elif host_offline:
                     failure_message = _host_offline_message()
                     _logger.warning(
@@ -2821,19 +2911,12 @@ def register_events_routes(
                     log_detail = "the host reported the launch failed" + (
                         f": {relaunch_refusal_reason}" if relaunch_refusal_reason else ""
                     )
-                    if relaunch_refusal_reason and relaunch_refusal_visible:
-                        launch_detail = (
-                            f"the host reported the launch failed: {relaunch_refusal_reason}"
-                        )
-                    else:
-                        launch_detail = (
-                            "the host reported the launch failed. The reason "
-                            "is in the daemon log on the host, visible to the "
-                            "host owner."
-                        )
+                    launch_detail = _host_launch_refusal_detail(
+                        relaunch_refusal_reason, visible=relaunch_refusal_visible
+                    )
                     launch_message = (
                         f"The host could not start runner {relaunched_runner_id} "
-                        f"for this session — {launch_detail}"
+                        f"for this session — {launch_detail}."
                     )
                 elif exit_report:
                     event_name = "runner_never_connected"

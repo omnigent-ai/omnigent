@@ -168,6 +168,7 @@ from omnigent.server.routes._sessions.helpers import (
     reconcile_orphaned_running_status,
 )
 from omnigent.server.routes._sessions.orchestration import (
+    HostLaunchRefusedError,
     _best_effort_stop,
     _build_session_list_item,
     _build_session_response,
@@ -278,18 +279,22 @@ async def _wake_runner_for_model_change(
     conv: Conversation,
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
+    user_id: str | None,
 ) -> Conversation:
     """Restore a sleeping native session before applying an explicit model pick."""
     if await _get_runner_client(conv.id, runner_router) is not None:
         return conv
-    runner_client, conv = await ensure_runner_connected(
-        session_id=conv.id,
-        conv=conv,
-        app_state=request.app.state,
-        conversation_store=conversation_store,
-        runner_router=runner_router,
-        raise_host_refusal=True,
-    )
+    try:
+        runner_client, conv = await ensure_runner_connected(
+            session_id=conv.id,
+            conv=conv,
+            app_state=request.app.state,
+            conversation_store=conversation_store,
+            runner_router=runner_router,
+            raise_host_refusal=True,
+        )
+    except HostLaunchRefusedError as exc:
+        raise exc.for_viewer(user_id) from exc
     if runner_client is None:
         raise OmnigentError(
             "Cannot switch models while the session host is offline. Reconnect the host and retry.",
@@ -2878,7 +2883,7 @@ def register_core_routes(
         if wake_for_model_change:
             assert conv is not None
             conv = await _wake_runner_for_model_change(
-                request, conv, conversation_store, runner_router
+                request, conv, conversation_store, runner_router, user_id
             )
 
         update_result = await asyncio.to_thread(

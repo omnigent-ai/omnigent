@@ -55,6 +55,7 @@ from omnigent.harness_availability import (
     HARNESS_NEEDS_AUTH,
     HARNESS_VERSION_TOO_LOW,
 )
+from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
 )
@@ -4622,6 +4623,80 @@ async def _maybe_wake_stale_resumable_managed_sandbox(
     )
 
 
+_HOST_REFUSAL_REASON_MAX_CHARS = 300
+
+
+def _host_launch_refusal_detail(reason: str | None, *, visible: bool) -> str:
+    """
+    Describe a host's uncategorized launch refusal as a sentence fragment.
+
+    The host's text is untrusted, so terminal controls and known credential
+    patterns are removed, it is flattened to one printable line and capped;
+    viewers who may not see it get a pointer to the daemon log instead.
+
+    :param reason: The host's refusal text, e.g. ``"failed to spawn runner:
+        [Errno 2] No such file or directory: '/venv/bin/python'"``.
+    :param visible: Whether the requester may see the host's text.
+    :returns: A fragment without a trailing period.
+    """
+    if reason and visible:
+        plain = sanitize_diagnostic_text(reason)
+        flat = " ".join("".join(ch if ch.isprintable() else " " for ch in plain).split())
+        if len(flat) > _HOST_REFUSAL_REASON_MAX_CHARS:
+            flat = flat[: _HOST_REFUSAL_REASON_MAX_CHARS - 1].rstrip() + "…"
+        if flat:
+            return f"the host reported the launch failed: {flat}"
+    return (
+        "the host reported the launch failed. The reason is in the daemon log "
+        "on the host, visible to the host owner"
+    )
+
+
+def _host_launch_refusal_message(reason: str | None, *, visible: bool) -> str:
+    """Return the user-facing text for a host that refused to start the session's runner."""
+    detail = _host_launch_refusal_detail(reason, visible=visible)
+    return (
+        f"The host could not start a runner for this session — {detail}. "
+        "Fix it on the host, then retry."
+    )
+
+
+class HostLaunchRefusedError(OmnigentError):
+    """
+    The session's host refused a runner launch for an uncategorized reason.
+
+    The default message hides the host's text whenever the host has an owner;
+    :meth:`for_viewer` adds it for requesters allowed to see it, since one
+    recovery attempt can serve many.
+    """
+
+    def __init__(self, reason: str | None, host_owner: str | None) -> None:
+        """
+        :param reason: The host's refusal text, if any.
+        :param host_owner: Owner of the refusing host, or ``None`` when unowned.
+        """
+        super().__init__(
+            _host_launch_refusal_message(reason, visible=host_owner is None),
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+        self.reason = reason
+        self.host_owner = host_owner
+
+    def for_viewer(self, user_id: str | None) -> OmnigentError:
+        """
+        Re-render the refusal for one requester.
+
+        :param user_id: The requester, or ``None`` when auth is disabled.
+        :returns: An error naming the host's reason when the requester owns
+            the host (or ownership is not enforced).
+        """
+        visible = user_id is None or self.host_owner is None or self.host_owner == user_id
+        return OmnigentError(
+            _host_launch_refusal_message(self.reason, visible=visible),
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+
+
 async def ensure_runner_connected(
     *,
     session_id: str,
@@ -4666,8 +4741,10 @@ async def ensure_runner_connected(
     :param runner_router: The ``RunnerRouter``, or ``None`` for in-process.
     :param raise_host_refusal: Raise typed, non-persisting errors when the
         host rejects launch because the harness is unavailable or the
-        workspace is gone. Resource callers keep the legacy ``False``
-        behavior; retry recovery opts in because it has no message to persist.
+        workspace is gone, :class:`HostLaunchRefusedError` for any other
+        refusal, and the usual not-found error when the session was deleted
+        mid-relaunch. Resource callers keep the legacy ``False`` behavior;
+        retry recovery opts in because it has no message to persist.
     :returns: ``(runner_client, conv)`` — the client is ``None`` when no
         runner is reachable and none is wakeable; ``conv`` is re-read after
         any wake/relaunch so the caller sees the rebound row.
@@ -4767,6 +4844,14 @@ async def ensure_runner_connected(
                 _refusal_message = _workspace_missing_message(conv.workspace)
             else:
                 _refusal_message = launch_attempt.error or ""
+            if (
+                raise_host_refusal
+                and (launch_attempt.error or launch_attempt.error_code)
+                and await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                is None
+            ):
+                # Deleted mid-relaunch: the server, not the host, ended this launch.
+                raise _session_not_found()
             if _refusal_code is not None and raise_host_refusal:
                 raise OmnigentError(
                     _refusal_message
@@ -4781,6 +4866,13 @@ async def ensure_runner_connected(
                         else ErrorCode.WORKSPACE_MISSING
                     ),
                 )
+            if (
+                _refusal_code is None
+                and raise_host_refusal
+                and (launch_attempt.error or launch_attempt.error_code)
+            ):
+                # Any other "failed" answer means no runner is coming; skip the wait.
+                raise HostLaunchRefusedError(launch_attempt.error, host_conn.owner)
             if _refusal_code is not None and _refusal_message:
                 _rer = getattr(app_state, "runner_exit_reports", None)
                 if _rer is not None:

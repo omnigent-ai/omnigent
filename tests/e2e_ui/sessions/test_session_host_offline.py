@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import time
 import uuid
-from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -14,15 +13,7 @@ from playwright.sync_api import Page, expect
 from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 from tests._helpers.native_session import NativeHarness, create_native_session
 from tests._helpers.server_runner import server_runner
-
-
-def _wait_until(predicate: Callable[[], bool], *, timeout: float = 30.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(0.2)
-    raise AssertionError(f"condition was not met within {timeout}s")
+from tests.e2e_ui.sessions._host_stack import list_hosts, wait_for_online_host, wait_until
 
 
 @pytest.mark.parametrize("harness", ["claude", "codex"])
@@ -52,14 +43,7 @@ def test_offline_native_host_preserves_failed_turn_and_retry(
             }
         )
 
-        def hosts() -> list[dict]:
-            response = client.get("/v1/hosts")
-            response.raise_for_status()
-            return response.json()["hosts"]
-
-        _wait_until(lambda: any(host["status"] == "online" for host in hosts()))
-        [host] = [host for host in hosts() if host["status"] == "online"]
-        host_id = host["host_id"]
+        host_id = wait_for_online_host(client)
         created = create_native_session(
             client,
             stack.base_url,
@@ -78,14 +62,13 @@ def test_offline_native_host_preserves_failed_turn_and_retry(
         stack.host.wait(timeout=10.0)
         _, survivors = reap_leaked_omnigent_processes(stack.runner_home / ".omnigent", timeout=2.0)
         assert not survivors
-        _wait_until(
+        wait_until(
             lambda: any(
-                host["host_id"] == host_id and host["status"] == "offline" for host in hosts()
+                host["host_id"] == host_id and host["status"] == "offline"
+                for host in list_hosts(client)
             )
         )
-        _wait_until(
-            lambda: client.get(f"/v1/runners/{runner_id}/status").json()["online"] is False
-        )
+        wait_until(lambda: client.get(f"/v1/runners/{runner_id}/status").json()["online"] is False)
         if not runner_bound:
             cleared = client.patch(f"/v1/sessions/{session_id}", json={"runner_id": ""})
             cleared.raise_for_status()
