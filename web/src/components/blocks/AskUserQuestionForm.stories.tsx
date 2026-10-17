@@ -1,5 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { userEvent } from "storybook/test";
+import { clearAskUserQuestionDrafts } from "@/lib/askUserQuestionDrafts";
 import { AskUserQuestionForm } from "./AskUserQuestionForm";
 
 const meta = {
@@ -7,8 +8,13 @@ const meta = {
   component: AskUserQuestionForm,
   tags: ["visual-snapshot"],
   args: {
+    elicitationId: "story",
     onSubmit: () => undefined,
     onReject: () => undefined,
+  },
+  // Each story starts from an untouched form, not a draft an earlier run left.
+  beforeEach: () => {
+    clearAskUserQuestionDrafts();
   },
 } satisfies Meta<typeof AskUserQuestionForm>;
 
