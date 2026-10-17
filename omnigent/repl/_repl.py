@@ -1750,7 +1750,13 @@ class _SessionsChatReplAdapter:
         # the id, and a bound runner means we don't need the harness either.
         agent: RegisteredAgent | None = None
         if self._agent_id is None or self._runner_id is None:
-            agent = await self._client.sessions.resolve_agent(self._agent_name)
+            try:
+                agent = await self._client.sessions.resolve_agent(self._agent_name)
+            except LookupError as exc:
+                from omnigent.cli_diagnostics import printable
+
+                # The REPL renders this message; keep server-supplied names inert.
+                raise LookupError(printable(str(exc))) from exc
         agent_id = self._agent_id or (agent.id if agent is not None else None)
         if agent_id is None:
             raise RuntimeError(f"Could not resolve an agent id for {self._agent_name!r}")
