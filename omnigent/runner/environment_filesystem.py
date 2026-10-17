@@ -146,6 +146,65 @@ def _glob_to_regex(pattern: str) -> str:
     return "^" + "".join(out) + "$"
 
 
+def _path_query(q: str) -> str | None:
+    """Normalized form of a path-shaped search query, or ``None`` for a plain one.
+
+    A query with a path separator names a path. Once normalized, one that still
+    contains a separator is also matched against each entry's absolute path, so
+    a pasted absolute path or the search root's own folder name finds the entry.
+    One that collapses to a bare word (``./name``, ``name/``) is matched like a
+    plain word, against the relative path only: against absolute paths, any
+    word from the root's own path would match every entry.
+
+    :param q: Stripped, lowercased query.
+    :returns: The ``/``-separated normalized path, or ``None`` for a plain word
+        or a query that is only separators (``/``) or ``.``.
+    """
+    if "/" not in q and os.sep not in q:
+        return None
+    normalized = os.path.normpath(q)
+    if os.sep != "/":
+        normalized = normalized.replace(os.sep, "/")
+    elif normalized.startswith("//"):
+        # POSIX normpath keeps exactly two leading slashes; Linux reads them as one.
+        normalized = normalized[1:]
+    return None if normalized.strip("/") in ("", ".") else normalized
+
+
+def _path_matcher(q: str, root: str) -> Callable[[str], bool]:
+    """Build the search predicate for ``/``-separated paths relative to *root*.
+
+    Same rule as the sandboxed walk in :meth:`CallerProcessFilesystem.search_files`:
+    a substring of the relative path, or of the absolute path when the normalized
+    *q* still contains a separator (see :func:`_path_query`) and the match reaches
+    into the relative part, so a fragment of the root's own path matches nothing.
+
+    :param q: Stripped, lowercased query.
+    :param root: Absolute directory the matched paths are relative to.
+    :returns: Predicate taking a relative path.
+    """
+    qp = _path_query(q)
+    if qp is None:
+        return lambda rel: q in rel.lower()
+    if "/" not in qp:
+        return lambda rel: q in rel.lower() or qp in rel.lower()
+    prefix = root.rstrip(os.sep)
+    if os.sep != "/":
+        prefix = prefix.replace(os.sep, "/")
+    prefix = (prefix + "/").lower()
+
+    def hit(rel: str) -> bool:
+        low = rel.lower()
+        if q in low:
+            return True
+        # The match must reach into the relative part; an occurrence lying
+        # wholly inside the root's own path says nothing about the entry.
+        pos = (prefix + low).rfind(qp)
+        return pos != -1 and pos + len(qp) > len(prefix)
+
+    return hit
+
+
 def split_glob_list(raw: str | None) -> list[str]:
     """Split a comma-separated glob list on top-level commas only.
 
@@ -255,7 +314,9 @@ def search_indexed_paths(
 
     :param root: Absolute directory the paths are relative to.
     :param paths: File paths relative to *root*, e.g. from ``git ls-files``.
-    :param query: Case-insensitive substring; whitespace-only matches nothing.
+    :param query: Case-insensitive substring of the path; a path-shaped query
+        also matches the absolute path (see :func:`_path_query`).
+        Whitespace-only matches nothing.
     :param include: Pre-split include globs (see :func:`_glob_to_regex`).
     :param exclude: Pre-split exclude globs; an excluded directory takes its
         whole subtree with it, as the walk's pruning does.
@@ -265,6 +326,7 @@ def search_indexed_paths(
     q = query.strip().lower()
     if not q:
         return []
+    hit = _path_matcher(q, str(root))
     inc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in include]
     exc = [re.compile(_glob_to_regex(p), re.IGNORECASE) for p in exclude]
 
@@ -275,12 +337,12 @@ def search_indexed_paths(
             return False
         return not inc or any(r.match(rel) for r in inc)
 
-    # A directory whose path contains q is a prefix of every file under it,
-    # so only files that match can contribute matching directories.
+    # A matching directory is a prefix of every file under it, so only files
+    # that match can contribute matching directories.
     candidates: dict[str, bool] = {}  # path -> is a directory
     seen_dirs: set[str] = set()
     for p in paths:
-        if q not in p.lower():
+        if not hit(p):
             continue
         candidates.setdefault(p, False)
         cut = p.rfind("/")
@@ -289,7 +351,7 @@ def search_indexed_paths(
             if ancestor in seen_dirs:
                 break
             seen_dirs.add(ancestor)
-            if q in ancestor.lower():
+            if hit(ancestor):
                 candidates[ancestor] = True
             cut = p.rfind("/", 0, cut)
 
@@ -905,8 +967,12 @@ class CallerProcessFilesystem:
           descending into those directories.
         - ``include``: when non-empty, the entry is kept only if its path
           matches at least one include glob.
-        - ``query``: when non-empty, the entry's name or relative path must
-          contain ``query`` (case-insensitive substring match).
+        - ``query``: when non-empty, the entry's relative path must contain
+          ``query`` (case-insensitive substring match). A path-shaped query,
+          one containing a path separator, also matches the entry's absolute
+          path, so a pasted absolute path, a ``./``-prefixed path, or a path
+          crossing the search root's own folder name finds it (see
+          :func:`_path_query`).
 
         Directory matches let the UI reveal a folder from a search, so a query
         like ``"src"`` surfaces the ``src`` directory alongside files under it.
@@ -919,9 +985,10 @@ class CallerProcessFilesystem:
         every file, so the method returns an empty list instead of walking the
         whole tree. ``include`` / ``exclude`` only narrow the query's results.
 
-        :param query: Case-insensitive substring to match against filename
-            and relative path, e.g. ``"test.md"``. Whitespace-only strings
-            return an empty list immediately without walking the tree.
+        :param query: Case-insensitive substring to match against the relative
+            path, e.g. ``"test.md"``, or a path such as ``"/home/u/ws/src/a.py"``.
+            Whitespace-only strings return an empty list immediately without
+            walking the tree.
         :param include: Pre-split, non-blank glob patterns scoping which files
             are returned, e.g. ``["*.ts", "src/**"]``. ``None`` or empty means
             no include filter. Parse query strings with :func:`split_glob_list`
@@ -940,6 +1007,7 @@ class CallerProcessFilesystem:
             # A query is required; a whitespace-only query would match every
             # file, so return nothing instead of walking the whole tree.
             return [], False
+        qp = _path_query(q)
 
         start, _prefix = self._target(path)
 
@@ -954,6 +1022,8 @@ class CallerProcessFilesystem:
                 "import os, json, re",
                 "from collections import deque",
                 f"q = {_json.dumps(q)}",
+                # json.dumps(None) is JSON null, not a Python literal.
+                f"qp = {'None' if qp is None else _json.dumps(qp)}",
                 f"limit = {limit}",
                 f"start = {_json.dumps(start)}",
                 f"budget = {_SEARCH_SCAN_BUDGET}",
@@ -981,6 +1051,23 @@ stop = False
 root = os.path.abspath(start)
 # A bare root ('/', 'C:\') already ends in the separator the slice skips.
 cut = len(root.rstrip(os.sep)) + 1
+# Absolute-path prefix for path-shaped queries; bare-word queries ('./name')
+# match the relative path only (see _path_query).
+prefix = (root.rstrip(os.sep).replace(os.sep, '/') + '/').lower()
+qp_abs = qp is not None and '/' in qp
+
+
+def hit(p):
+    low = p.lower()
+    if q in low:
+        return True
+    if qp is None:
+        return False
+    if not qp_abs:
+        return qp in low
+    # The match must reach into the relative part (see _path_matcher).
+    pos = (prefix + low).rfind(qp)
+    return pos != -1 and pos + len(qp) > len(prefix)
 
 
 def rel(dirpath, name):
@@ -1001,7 +1088,7 @@ def match(dirpath, name, is_dir):
         return
     if inc and not any(r.match(p) for r in inc):
         return
-    if q not in p.lower():
+    if not hit(p):
         return
     try:
         st = os.stat(os.path.join(dirpath, name))

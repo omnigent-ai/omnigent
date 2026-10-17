@@ -46,6 +46,16 @@ def _put_file(base_url: str, session_id: str, path: str) -> None:
     resp.raise_for_status()
 
 
+def _environment_root(base_url: str, session_id: str) -> str:
+    """Absolute workspace root, as the Files header's "Copy folder path" copies it."""
+    resp = httpx.get(
+        f"{base_url}/v1/sessions/{session_id}/resources/environments/default",
+        timeout=10.0,
+    )
+    resp.raise_for_status()
+    return resp.json()["metadata"]["root"]
+
+
 @pytest.fixture
 def all_search_session(seeded_session: tuple[str, str]) -> Iterator[tuple[str, str]]:
     """Three files PUT to the workspace so they populate the All tree listing."""
@@ -157,14 +167,19 @@ def test_search_matches_and_reveals_a_directory(
     page: Page,
     dir_search_session: tuple[str, str],
 ) -> None:
-    """Searching a folder name lists it and clicking it reveals it in the tree.
+    """Searching a folder name lists it and clicking it reveals it in the tree;
+    the file under it is then found by its absolute path.
 
     Directory search is the feature under test: the server ``/search`` now
     emits directory entries, the results render them as folder rows, and
     clicking one exits search and expands the folder in the tree (rather than
     opening a file). Covers the reveal + exit-search interaction end to end.
+    The final step pins the browser boundary of path-shaped search: the root
+    the Files header's "Copy folder path" copies is the root the search
+    compares an absolute query with.
     """
     base_url, session_id = dir_search_session
+    root = _environment_root(base_url, session_id)
     page.goto(f"{base_url}/c/{session_id}?view=explore")
 
     rail = page.get_by_role("complementary", name="Workspace")
@@ -199,6 +214,11 @@ def test_search_matches_and_reveals_a_directory(
     expect(search).to_have_value("")
     # Back in tree mode the folder row is still present as a tree node.
     expect(folder_row).to_be_visible(timeout=15_000)
+
+    # Only a search result carries the full path as its name; the tree row is
+    # named by the bare file name, so this cannot pass on the revealed tree.
+    _search_for(search, f"{root}/{_DIR_FILE}")
+    expect(rail.get_by_role("button", name=_DIR_FILE, exact=True)).to_be_visible(timeout=15_000)
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)

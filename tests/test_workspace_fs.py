@@ -307,6 +307,18 @@ def test_search_returns_matching_directories(tmp_path: Path) -> None:
     assert by_path["src"]["bytes"] is None
 
 
+def test_search_matches_an_absolute_path(tmp_path: Path) -> None:
+    """A query spelled as the file's absolute path finds that file."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("x")
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.search(f"{tmp_path.resolve()}/src/main.py")
+
+    paths = {e["path"] for e in result["data"]}
+    assert "src/main.py" in paths, paths
+
+
 def test_search_defers_deep_noise_subtree_to_reach_later_real_dir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

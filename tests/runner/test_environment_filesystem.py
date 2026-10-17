@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import ntpath
 import os
 import shutil
 import subprocess
 import sys
+import urllib.parse
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,7 +28,11 @@ from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import create_os_environment
 from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.runner import create_runner_app
-from omnigent.runner.environment_filesystem import CallerProcessFilesystem, search_indexed_paths
+from omnigent.runner.environment_filesystem import (
+    CallerProcessFilesystem,
+    _path_matcher,
+    search_indexed_paths,
+)
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runtime.filesystem_registry import GitFilesystemRegistry
 from tests.runner.helpers import NullServerClient
@@ -2864,3 +2870,72 @@ async def test_default_read_still_follows_a_symlink_into_a_read_grant(tmp_path: 
             await fs.read("escape/note.txt")
     finally:
         os_env.close()
+
+
+# Query shapes the sandboxed walk and the git-index matcher must agree on. The
+# walk's predicate lives in a script string, so one table drives both layers.
+_PATH_SHAPED_QUERY_CASES = [
+    pytest.param("{root}/src/main.py", ["src/main.py"], id="absolute_file"),
+    pytest.param("{root}/src", ["src", "src/main.py"], id="absolute_dir"),
+    pytest.param("{root}/src/", ["src", "src/main.py"], id="absolute_dir_trailing_slash"),
+    pytest.param(
+        "/{root}/src/main.py",
+        ["src/main.py"],
+        id="doubled_leading_separator",
+        marks=pytest.mark.skipif(os.sep != "/", reason="a leading // is a UNC prefix on Windows"),
+    ),
+    pytest.param("./src/main.py", ["src/main.py"], id="dot_prefixed"),
+    pytest.param("./hello.txt", ["hello.txt"], id="dot_prefixed_name"),
+    pytest.param("src//main.py", ["src/main.py"], id="doubled_separator"),
+    pytest.param("{folder}/src/main.py", ["src/main.py"], id="workspace_folder_prefixed"),
+    pytest.param("src/", ["src", "src/main.py"], id="trailing_slash"),
+    pytest.param("{folder}", [], id="plain_root_name"),
+    pytest.param("./{folder}", [], id="dot_prefixed_root_name"),
+    pytest.param("{folder}/", [], id="root_name_slash"),
+    pytest.param("/", ["src/main.py"], id="bare_separator"),
+    pytest.param("{root}", [], id="root_itself"),
+    pytest.param("{parent_name}/{folder}", [], id="root_path_fragment"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("query_template", "expected_paths"), _PATH_SHAPED_QUERY_CASES)
+async def test_search_route_matches_path_shaped_queries(
+    client: httpx.AsyncClient, workspace: Path, query_template: str, expected_paths: list[str]
+) -> None:
+    """A query spelled as a path finds its entry; one that is or normalizes to a
+    bare word, only separators, or a fragment of the root's own path matches
+    nothing inside it."""
+    query = query_template.format(
+        root=workspace, folder=workspace.name, parent_name=workspace.parent.name
+    )
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/search"
+        f"?q={urllib.parse.quote(query, safe='')}"
+    )
+    assert resp.status_code == 200, resp.text
+    assert [e["path"] for e in resp.json()["data"]] == expected_paths, f"q={query!r}"
+
+
+@pytest.mark.parametrize(("query_template", "expected_paths"), _PATH_SHAPED_QUERY_CASES)
+def test_search_indexed_paths_matches_path_shaped_queries(
+    workspace: Path, query_template: str, expected_paths: list[str]
+) -> None:
+    """The git-index matcher returns what the walk returns for every case above."""
+    query = query_template.format(
+        root=workspace, folder=workspace.name, parent_name=workspace.parent.name
+    )
+    tracked = ["hello.txt", "logo.png", "src/main.py"]
+    entries = search_indexed_paths(workspace, tracked, query)
+    assert [e.path for e in entries] == expected_paths, f"q={query!r}"
+
+
+def test_path_matcher_handles_windows_separators(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Windows query and root use backslashes; entries still use '/'."""
+    monkeypatch.setattr(os, "sep", "\\")
+    monkeypatch.setattr(os.path, "normpath", ntpath.normpath)
+
+    hit = _path_matcher("c:\\ws\\src\\main.py", "C:\\ws")
+
+    assert hit("src/main.py")
+    assert not hit("docs/main.py")

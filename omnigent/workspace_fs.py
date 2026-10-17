@@ -47,6 +47,7 @@ from omnigent.runner import pr_resource
 from omnigent.runner.environment_filesystem import (
     _SEARCH_SCAN_BUDGET,
     _glob_to_regex,
+    _path_matcher,
     _validate_path,
     entry_payload,
     index_search,
@@ -303,8 +304,9 @@ class WorkspaceReader:
     ) -> _WorkspacePayload:
         """Search files by substring + glob filters, like the runner.
 
-        :param query: Case-insensitive substring matched against name and
-            relative path.  Whitespace-only yields an empty result.
+        :param query: Case-insensitive substring matched against the relative
+            path; a path-shaped query also matches the absolute path, like the
+            runner's matcher.  Whitespace-only yields an empty result.
         :param include: Comma-separated include globs (VSCode/Cursor
             subset), e.g. ``"*.ts,src/**"``.
         :param exclude: Comma-separated exclude globs.
@@ -318,6 +320,7 @@ class WorkspaceReader:
         q = query.strip().lower()
         if not q:
             return {"object": "list", "data": [], "has_more": False}
+        hit = _path_matcher(q, str(self._root))
 
         include_patterns = split_glob_list(include)
         exclude_patterns = split_glob_list(exclude)
@@ -368,7 +371,7 @@ class WorkspaceReader:
                 return
             if inc and not any(r.match(p) for r in inc):
                 return
-            if q not in name.lower() and q not in p.lower():
+            if not hit(p):
                 return
             try:
                 st = (Path(dirpath) / name).stat()
