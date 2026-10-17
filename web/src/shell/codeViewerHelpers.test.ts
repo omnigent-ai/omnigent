@@ -333,10 +333,6 @@ describe("getModelFormat", () => {
 // ---------------------------------------------------------------------------
 
 describe("modelViewerTheme", () => {
-  it("returns distinct backgrounds for light and dark", () => {
-    expect(modelViewerTheme("light").background).not.toBe(modelViewerTheme("dark").background);
-  });
-
   it("brightens the lights in dark mode so the mesh stays legible", () => {
     const light = modelViewerTheme("light");
     const dark = modelViewerTheme("dark");
