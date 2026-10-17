@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+import sys
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 pytest.importorskip("celpy", reason="cel-python not installed")
 
-from omnigent.policies.builtins.cel import cel_policy
-from omnigent.policies.function import FunctionPolicy
+import celpy
+
+from omnigent.policies.builtins import cel as cel_module
+from omnigent.policies.builtins.cel import _PROGRAM_CACHE_SIZE, _compile, cel_policy
+from omnigent.policies.function import FunctionPolicy, resolve_function_policy
 from omnigent.policies.types import EvaluationContext
 from omnigent.spec.types import (
     FunctionPolicySpec,
+    FunctionRef,
     Phase,
     PhaseSelector,
     PolicyAction,
@@ -297,3 +305,208 @@ def test_llm_client_stripped_from_cel_event() -> None:
     # is stripped before marshalling. The expression must evaluate normally.
     result = evaluate({"type": "request", "llm_client": _FakeLLMClient()})  # type: ignore[typeddict-unknown-key]
     assert result == {"result": "DENY", "reason": "Denied by policy."}
+
+
+# ── Compiled-program cache ──────────────────────────────────────
+
+
+@pytest.fixture
+def parse_calls(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
+    """Start from an empty program cache and record every CEL parse."""
+    calls: list[str] = []
+    real_compile = celpy.Environment.compile
+
+    def counting_compile(self: object, text: str) -> object:
+        calls.append(text)
+        return real_compile(self, text)
+
+    monkeypatch.setattr(celpy.Environment, "compile", counting_compile)
+    _compile.cache_clear()
+    yield calls
+    _compile.cache_clear()
+
+
+def _resolve(expression: str) -> FunctionPolicy:
+    """Instantiate a CEL policy the way each engine build does."""
+    return resolve_function_policy(
+        FunctionPolicySpec(
+            name="cel",
+            on=[PhaseSelector(phase=Phase.TOOL_CALL, tool_name=None)],
+            function=FunctionRef(
+                path="omnigent.policies.builtins.cel.cel_policy",
+                arguments={"expression": expression},
+            ),
+        )
+    )
+
+
+def test_expression_parsed_once_across_engine_builds(parse_calls: list[str]) -> None:
+    """Rebuilding policies reuses the parsed program; a new expression parses once."""
+    shell = 'event.data.name == "sys_os_shell" ? {"result": "DENY"} : {"result": "ALLOW"}'
+    other = '{"result": "ASK", "reason": "Approve?"}'
+    event = {"type": "tool_call", "data": {"name": "sys_os_shell"}}
+
+    for _ in range(5):
+        assert _resolve(shell)._callable(event) == {
+            "result": "DENY",
+            "reason": "Denied by policy.",
+        }
+    assert parse_calls == [shell]
+
+    for _ in range(3):
+        assert _resolve(other)._callable(event) == {"result": "ASK", "reason": "Approve?"}
+    assert parse_calls == [shell, other]
+
+
+def test_invalid_expression_raises_on_every_build(parse_calls: list[str]) -> None:
+    """Parse errors are not cached: each build re-parses and raises the same error."""
+    messages = []
+    for _ in range(2):
+        with pytest.raises(ValueError, match="CEL policy: compile error") as exc_info:
+            cel_policy(expression="event.type ==== bad")
+        messages.append(str(exc_info.value))
+    assert messages[0] == messages[1]
+    assert len(parse_calls) == 2
+
+
+def test_program_cache_is_bounded(parse_calls: list[str]) -> None:
+    """Distinct expressions beyond the bound evict the least recently used."""
+    for i in range(_PROGRAM_CACHE_SIZE + 5):
+        cel_policy(expression=f'{{"result": "ALLOW", "reason": "{i}"}}')
+    assert _compile.cache_info().currsize == _PROGRAM_CACHE_SIZE
+
+    cel_policy(expression='{"result": "ALLOW", "reason": "0"}')
+    assert len(parse_calls) == _PROGRAM_CACHE_SIZE + 6
+
+
+def test_cached_build_keeps_celpy_recursion_limit(parse_calls: list[str]) -> None:
+    """A cache hit still applies the recursion limit deep expressions need."""
+    nested = "(" * 30 + '{"result": "DENY"}' + ")" * 30
+    original = sys.getrecursionlimit()
+    try:
+        cel_policy(expression=nested)
+        sys.setrecursionlimit(1000)
+        evaluate = cel_policy(expression=nested)
+        assert evaluate({"type": "tool_call"}) == {"result": "DENY", "reason": "Denied by policy."}
+    finally:
+        sys.setrecursionlimit(original)
+    assert parse_calls == [nested]
+
+
+def test_shared_program_evaluates_concurrently() -> None:
+    """Threads sharing one cached program get results for their own events."""
+    evaluate = cel_policy(
+        expression=(
+            'event.data.name.startsWith("deny_")'
+            ' ? {"result": "DENY", "reason": event.data.name}'
+            ' : {"result": "ALLOW", "state_updates":'
+            ' [{"key": "last", "action": "set", "value": event.data.name}]}'
+        )
+    )
+
+    def run(i: int) -> tuple[int, object]:
+        name = f"deny_{i}" if i % 2 else f"tool_{i}"
+        return i, evaluate({"type": "tool_call", "data": {"name": name}})
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(run, range(400)))
+
+    for i, result in results:
+        if i % 2:
+            assert result == {"result": "DENY", "reason": f"deny_{i}"}
+        else:
+            assert result == {
+                "result": "ALLOW",
+                "state_updates": [{"key": "last", "action": "set", "value": f"tool_{i}"}],
+            }
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        r'"plain"',
+        r'""',
+        r'"tab\there\nnewline"',
+        r'"\x41\u00e9\101\U0001F600"',
+        r'"quote \" and backslash \\"',
+        r'"\"\"leading quotes"',
+        r'"(?i)\\bgh\\s+pr\\s+merge\\b"',
+        r'r"raw \n stays"',
+        '"""multi\nline \\t"""',
+        r'b"\x41"',
+        r'"\U00110000"',
+    ],
+)
+def test_string_literal_values_match_uncached_celpy(literal: str) -> None:
+    """Compiled literals evaluate to exactly what plain celpy produces, errors included."""
+
+    def outcome(program: object) -> object:
+        try:
+            return program.evaluate({})  # type: ignore[attr-defined]
+        except celpy.CELEvalError as exc:
+            return ("error", exc.args)
+
+    env = celpy.Environment()
+    expected = outcome(env.program(env.compile(literal)))
+    actual = outcome(_compile(literal))
+    assert actual == expected
+    assert type(actual) is type(expected)
+
+
+_ESCAPED_DENY = (
+    'event.data.name.matches("^sys\\\\.os_\\\\w+$")'
+    ' ? {"result": "DENY", "reason": "Tab\\there."} : {"result": "ALLOW"}'
+)
+
+
+def _string_tokens(expression: str) -> list[str]:
+    """Return the string-literal token texts in the cached program's AST."""
+    return [
+        str(tree.children[0])
+        for tree in _compile(expression).ast.iter_subtrees()
+        if tree.data == "literal" and tree.children[0].type == "STRING_LIT"
+    ]
+
+
+def _assert_escaped_deny_decisions() -> None:
+    evaluate = cel_policy(expression=_ESCAPED_DENY)
+    assert evaluate({"type": "tool_call", "data": {"name": "sys.os_shell"}}) == {
+        "result": "DENY",
+        "reason": "Tab\there.",
+    }
+    assert evaluate({"type": "tool_call", "data": {"name": "sysXos_shell"}}) == {"result": "ALLOW"}
+
+
+def test_escaped_literals_are_predecoded(parse_calls: list[str]) -> None:
+    """Escaped literals are stored raw in the cached AST."""
+    _assert_escaped_deny_decisions()
+    assert all(text.startswith('r"') for text in _string_tokens(_ESCAPED_DENY))
+
+
+def test_predecode_skipped_without_celstr(
+    parse_calls: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without the celpy internal, literals stay as parsed and decisions hold."""
+    monkeypatch.setattr(cel_module, "celstr", None)
+    _assert_escaped_deny_decisions()
+    assert not any(text.startswith('r"') for text in _string_tokens(_ESCAPED_DENY))
+
+
+def test_predecode_failure_leaves_ast_untouched(
+    parse_calls: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unexpected error mid-rewrite keeps the parsed AST and decisions."""
+    real_celstr = cel_module.celstr
+    calls = 0
+
+    def flaky_celstr(token: object) -> object:
+        nonlocal calls
+        calls += 1
+        if calls > 3:
+            raise RuntimeError("unexpected celpy internals")
+        return real_celstr(token)
+
+    monkeypatch.setattr(cel_module, "celstr", flaky_celstr)
+    _assert_escaped_deny_decisions()
+    assert calls > 3
+    assert not any(text.startswith('r"') for text in _string_tokens(_ESCAPED_DENY))
