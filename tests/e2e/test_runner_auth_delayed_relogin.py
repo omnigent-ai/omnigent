@@ -31,6 +31,10 @@ controlled setup the report used:
    (invalidate + re-mint). ``_InitialAuthTokenFactory.invalidate()`` returns
    ``False`` without forwarding, so every retry re-sends the same rejected
    token and callbacks 401 forever.
+5. ``serve_tunnel``: a runner launched while its credential source waits on
+   an interactive sign-in (``sign_in_pending``) must wait for it instead of
+   exiting after three unauthenticated upgrades, then connect with the token
+   the sign-in produced.
 
 Every assertion states the EXPECTED (fixed) behaviour, so each test fails on
 the live bug and passes once the fix lands. No real credentials are touched:
@@ -348,6 +352,122 @@ async def test_established_tunnel_survives_login_redirect_and_reconnects() -> No
                 "completing; established tunnels must survive a failed or "
                 "delayed login and reconnect when credentials return"
             )
+        finally:
+            tunnel_task.cancel()
+            await asyncio.gather(tunnel_task, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# Facet 5 — a runner launched during a pending host sign-in must wait for it.
+# ---------------------------------------------------------------------------
+
+
+class _PendingSignInCredentials:
+    """Credential source that is waiting on an interactive sign-in.
+
+    Mirrors a host credential service that reopened its browser sign-in for
+    this session start: no token and ``sign_in_pending`` until the sign-in
+    finishes, then the fresh token.
+    """
+
+    def __init__(self) -> None:
+        """Start with the sign-in still in progress."""
+        self.login_complete = False
+
+    @property
+    def sign_in_pending(self) -> bool:
+        """Whether the sign-in is still in progress.
+
+        :returns: ``True`` until :attr:`login_complete` is set.
+        """
+        return not self.login_complete
+
+    def __call__(self) -> str | None:
+        """Return the post-sign-in token, or ``None`` while it is pending.
+
+        :returns: The fresh token once the sign-in finished, else ``None``.
+        """
+        return _FRESH_OIDC_TOKEN if self.login_complete else None
+
+
+async def test_launched_runner_waits_for_a_pending_sign_in_then_connects() -> None:
+    """A never-connected runner must outlast a pending sign-in, then connect.
+
+    Journey: the host launches a runner while its credential grant is
+    expired and the host has reopened the browser sign-in. The runner's token
+    factory reports ``sign_in_pending`` and returns no token. Pre-fix the
+    runner upgrades without a credential, collects three HTTP 401s within
+    about two seconds and exits ("runner tunnel has no credential
+    available"), long before the person can finish signing in. The runner
+    must instead send no upgrade while the sign-in is pending and connect
+    with the new token once it lands.
+
+    :returns: None.
+    """
+    creds = _PendingSignInCredentials()
+    upgrade_auth: list[str] = []
+    connected = asyncio.Event()
+
+    def process_request(connection: object, request: object) -> object | None:
+        """Accept only the post-sign-in bearer, as the server's auth does.
+
+        :param connection: The server-side WebSocket connection.
+        :param request: The HTTP upgrade request.
+        :returns: ``None`` to accept, or a 401 response.
+        """
+        auth = request.headers.get("Authorization", "")  # type: ignore[attr-defined]
+        upgrade_auth.append(auth)
+        if auth == f"Bearer {_FRESH_OIDC_TOKEN}":
+            return None
+        return connection.respond(http.HTTPStatus.UNAUTHORIZED, "")  # type: ignore[attr-defined]
+
+    async def handler(connection: object) -> None:
+        """Mark the tunnel connected and hold it open.
+
+        :param connection: The server-side WebSocket connection.
+        :returns: None.
+        """
+        connected.set()
+        with contextlib.suppress(Exception):
+            await connection.wait_closed()  # type: ignore[attr-defined]
+
+    async def _noop_app(scope: object, receive: object, send: object) -> None:
+        """Minimal ASGI app; the fake server never dispatches requests.
+
+        :param scope: ASGI scope.
+        :param receive: ASGI receive callable.
+        :param send: ASGI send callable.
+        :returns: None.
+        """
+        del scope, receive, send
+
+    port = find_free_port()
+    async with serve(handler, "127.0.0.1", port, process_request=process_request):
+        tunnel_task = asyncio.create_task(
+            serve_tunnel(
+                _noop_app,
+                server_url=f"http://127.0.0.1:{port}",
+                runner_id="runner_pending_sign_in_e2e",
+                runner_version="0.0.0-e2e",
+                auth_token_factory=creds,
+            )
+        )
+        try:
+            # Longer than the three-strike unauthenticated failure takes.
+            await asyncio.sleep(5)
+            if tunnel_task.done():
+                pytest.fail(
+                    "runner exited while the sign-in was still pending: "
+                    f"{tunnel_task.exception()!r}. Expected it to wait for the sign-in."
+                )
+            assert upgrade_auth == [], (
+                f"runner sent {len(upgrade_auth)} upgrade(s) without a credential "
+                "while the sign-in was pending"
+            )
+
+            creds.login_complete = True
+            await asyncio.wait_for(connected.wait(), timeout=15)
+            assert upgrade_auth == [f"Bearer {_FRESH_OIDC_TOKEN}"]
         finally:
             tunnel_task.cancel()
             await asyncio.gather(tunnel_task, return_exceptions=True)

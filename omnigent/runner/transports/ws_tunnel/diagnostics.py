@@ -22,6 +22,9 @@ _SLOW_OPERATION_S = 1.0
 _REPORT_INTERVAL_S = 60.0
 _MAX_TRACKED_SENDS = 64
 _MAX_TRACKED_PINGS = 8
+# A healthy peer's last frame can predate a local stall by up to one ping
+# interval (30 s), so a stall this close to the silence explains all of it.
+_LOCAL_STALL_SLACK_S = 35.0
 
 
 class TunnelKeepaliveSettings(TypedDict, total=False):
@@ -102,6 +105,23 @@ class _Timing:
             f"{name}_max_s": _rounded(self.max_s),
             f"{name}_max_age_s": _age(now, self.max_at),
         }
+
+
+def silence_source(silent_s: float, attrs: TunnelDiagnosticAttrs) -> str:
+    """Name which end caused a tunnel's silence: this process or its peer.
+
+    A process whose own event loop stalled past the liveness window wakes to
+    find every peer silent, although the peers were fine. That timeout is a
+    local fault; any other silence means the peer or the path went away.
+
+    :param silent_s: Seconds since the peer's last frame.
+    :param attrs: This connection's :meth:`TunnelDiagnostics.snapshot`.
+    :returns: ``"local_event_loop"`` or ``"peer"``.
+    """
+    lag = attrs.get("loop_lag_s")
+    if lag is not None and lag >= silent_s - _LOCAL_STALL_SLACK_S:
+        return "local_event_loop"
+    return "peer"
 
 
 def _rounded(value: float | None) -> float | None:

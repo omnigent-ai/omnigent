@@ -9,7 +9,7 @@ import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import TracebackType
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -1173,7 +1173,18 @@ async def test_relay_preserves_failure_reported_during_intentional_teardown(
     session_id = "aa251103f45c42da8b471d1f6b12b54a"
     runner_id = "runner-failing-during-stop"
     error = {"code": "native_turn_error", "message": "Harness failed before teardown."}
-    event = {"type": "session.status", "status": "failed", "error": error}
+    event = {
+        "type": "session.status",
+        "status": "failed",
+        "error": error,
+        "failure_context": {
+            "failure_id": "err_synthetic_relay",
+            "failure_source": "native_terminal_start",
+            "exception_type": "RuntimeError",
+            "exception_cause_type": "ReadTimeout",
+            "origin": "forged",
+        },
+    }
     gate = asyncio.Event()
     runner = _ScriptedThenDropRunnerClient([f"data: {json.dumps(event)}\n\n"], gate)
     store = _RecordingLabelStore(live_status="running")
@@ -1190,8 +1201,16 @@ async def test_relay_preserves_failure_reported_during_intentional_teardown(
         collector = await start_session_stream_collector(session_id)
         if intentional:
             sessions_module._intentional_stop_sessions[session_id] = runner_id
-        gate.set()
-        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        with capture_debug_rows("server") as rows:
+            gate.set()
+            await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        [failure] = [r for r in rows if r["event_name"] == "session_turn_failed"]
+        attrs = failure["attributes"]
+        assert isinstance(attrs, dict)
+        assert attrs["failure_id"] == "err_synthetic_relay"
+        assert attrs["exception_cause_type"] == "ReadTimeout"
+        assert attrs["origin"] == "relayed_runner_status"
 
         status = await asyncio.wait_for(collector.queue.get(), timeout=_TASK_TIMEOUT_S)
         assert status["type"] == "session.status"
@@ -3430,6 +3449,70 @@ async def test_relay_does_not_fail_turn_during_server_shutdown(
         shutdown_state.reset_for_tests()
         gate.set()
         handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_relay_relinquishes_a_turn_this_replica_handed_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A drop after this replica handed the runner's tunnel off leaves the turn to its new replica.
+
+    The handoff mark alone decides, even with every store read failing and a
+    stale cached ``running`` status; the relay drops its local state instead
+    of publishing a failure.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server import shutdown_state
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 0.0)
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    runner_id = "runner_handed_off_here"
+    session_id = "fedcba9876543210fedcba9876543210"
+    store = _RecordingLabelStore(live_status="running")
+
+    def unavailable(conversation_id: str) -> Any:
+        raise ConnectionError("live-state backend unavailable")
+
+    monkeypatch.setattr(store, "get_runner_liveness", unavailable)
+    monkeypatch.setattr(store, "get_conversation", unavailable)
+    handle = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            runner_id,
+            _TunnelCloseRunnerClient(gate),  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        sessions_module._session_status_cache[session_id] = "running"
+        shutdown_state.mark_runner_handed_off(runner_id, reason="rebalance")
+
+        with capture_debug_rows("server") as rows:
+            gate.set()
+            await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        assert handle.task.exception() is None
+        assert session_id not in store.labels
+        assert session_id not in sessions_module._session_status_cache
+        assert not any(row["event_name"] == "session_turn_failed" for row in rows)
+        outcome = next(row for row in rows if row["event_name"] == "runner_stream_disconnected")
+        attributes = cast("dict[str, object]", outcome["attributes"])
+        assert attributes["decision"] == "handed_off"
+        assert attributes["runner_handoff_reason"] == "rebalance"
+    finally:
+        shutdown_state.reset_for_tests()
+        gate.set()
         if handle is not None and not handle.task.done():
             handle.task.cancel()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
