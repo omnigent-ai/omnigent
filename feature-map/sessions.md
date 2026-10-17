@@ -9,6 +9,7 @@ the header menu), and each place is a separate entry point.
 
 ## Sub-features
 
+- `child-discovery`: the selected parent row exposes child chats with status and navigation links.
 - `pin`: pinned sessions move to their own section and back.
 - `pin-undo`: unpinning shows an Undo toast that re-pins the session into its
   old Pinned slot. Dragging a pinned row into a folder unpins it without one.
@@ -290,6 +291,10 @@ create or select a closable Browser soft tab automatically.
 recent sessions. Continue pressing Tab (or Shift+Tab) to cycle, release Control
 to switch, or press Escape to cancel.
 
+**Child chats:** select a parent session in the sidebar. Expand its child-chat
+list and select a child to open that chat. The parent can be in Pinned, a project,
+or Sessions. Closed children are hidden. The Agents panel keeps the full tree.
+
 ## Driving it with the repro environment
 
 Preconditions: a running instance (`verify-env start`, then `verify-env
@@ -304,6 +309,13 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 Tests that stop a runner, restart the server, or read the database cannot run
 through `verify-env run`. They are marked "own environment" below; run them with
 plain `uv run pytest`, which starts a private server for the test.
+
+- **`child-discovery` (browser-only, no instance):**
+  `tests/browser_ui/chat/test_child_session_sidebar.py::test_selected_parent_exposes_child_links`
+  shows the selected parent's child titles and statuses, hides a closed child,
+  and opens the child's chat. Run with `uv run pytest` and `--browser-ui-skip-build`
+  after building the web UI. Repeat from a pinned parent and a project parent.
+  Component coverage also checks session navigation context and an empty list.
 
 - **`pin`:**
   `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_unpin_moves_session_back_to_recent`

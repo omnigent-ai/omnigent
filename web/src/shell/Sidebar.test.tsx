@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+vi.mock("@/hooks/useChildSessions", () => ({ useChildSessions: vi.fn() }));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 // Integration tests for the Sidebar's session list. The search box no
@@ -17,6 +18,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
+import { useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import type * as PullRequestsModule from "@/hooks/usePullRequests";
 import {
   markConversationRead,
@@ -292,6 +294,7 @@ function closeProjectsMenu() {
 }
 
 beforeEach(() => {
+  vi.mocked(useChildSessions).mockReturnValue({ children: [], isLoading: false, error: null });
   useConvMock.mockReset();
   useHostsMock.mockReset();
   useHostsMock.mockReturnValue({ data: [] });
@@ -2954,6 +2957,34 @@ describe("Sidebar active-row auto-scroll", () => {
       </QueryClientProvider>,
     );
   }
+
+  it.each(["sessions", "pinned", "project"])(
+    "places child chats under the selected %s parent only",
+    (section) => {
+      if (section === "pinned") seedPins(["parent"]);
+      if (section === "project") projectsMock.push("Example project");
+      mockConversations([
+        conv("parent", "Main work", {
+          labels: section === "project" ? { omni_project: "Example project" } : {},
+        }),
+        conv("other", "Other work"),
+      ]);
+      vi.mocked(useChildSessions).mockReturnValue({
+        children: [
+          { id: "worker", title: "Research worker", busy: true, pending_elicitations_count: 0 },
+        ] as ChildSessionInfo[],
+        isLoading: false,
+        error: null,
+      });
+      renderAtRoute("/c/parent?panel=agents&o=workspace");
+      expect(screen.getByRole("link", { name: "Research worker: Working" })).toHaveAttribute(
+        "href",
+        "/c/worker?o=workspace",
+      );
+      expect(useChildSessions).toHaveBeenCalledWith("parent");
+      expect(useChildSessions).not.toHaveBeenCalledWith("other");
+    },
+  );
 
   it("scrolls the active session's row to center with a smooth animation", () => {
     const scrollIntoView = vi.fn();
