@@ -6,6 +6,7 @@ import os
 import platform
 import plistlib
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -299,6 +300,75 @@ def enable_user_host_service(
         _enable_systemd(service, content)
     _record_service(service)
     return service
+
+
+def installed_user_host_service() -> tuple[HostService, str | None] | None:
+    """Return the installed service and its recorded server target, if any.
+
+    ``None`` on unsupported platforms and when no definition is installed.
+    The server target is ``None`` for a ``--local`` service.
+    """
+    try:
+        service = _service_for_current_platform()
+    except HostServiceError:
+        return None
+    if not service.path.exists():
+        return None
+    return service, _recorded_server_url(service)
+
+
+def _recorded_server_url(service: HostService) -> str | None:
+    """Read the ``--server`` value back out of an installed definition."""
+    content = service.path.read_bytes()
+    command: list[str] = []
+    if service.kind == "launchd":
+        try:
+            command = list(plistlib.loads(content).get("ProgramArguments", []))
+        except (plistlib.InvalidFileException, ValueError) as exc:
+            raise HostServiceError(
+                f"Cannot read the installed host service definition {service.path}."
+            ) from exc
+    else:
+        try:
+            for line in content.decode(errors="replace").splitlines():
+                if line.startswith("ExecStart="):
+                    # Undo _systemd_quote: shell-style quotes, then %% and $$.
+                    command = [
+                        part.replace("%%", "%").replace("$$", "$")
+                        for part in shlex.split(line[len("ExecStart=") :])
+                    ]
+                    break
+        except ValueError as exc:
+            raise HostServiceError(
+                f"Cannot read the installed host service definition {service.path}."
+            ) from exc
+    if "--local" in command:
+        return None
+    try:
+        return command[command.index("--server") + 1]
+    except (ValueError, IndexError) as exc:
+        raise HostServiceError(
+            f"Cannot determine the target of the installed host service {service.path}."
+        ) from exc
+
+
+def stop_user_host_service(service: HostService) -> None:
+    """Stop the service process but keep its definition so it returns at login."""
+    if service.kind == "launchd":
+        service_target = f"gui/{os.getuid()}/{service.label}"
+        _run_best_effort(["launchctl", "bootout", service_target])
+        if not _wait_for_launchd_unload(service_target):
+            raise HostServiceError(f"launchd service {service.label!r} did not stop.")
+    else:
+        _run_checked(["systemctl", "--user", "stop", service.label])
+
+
+def start_user_host_service(service: HostService) -> None:
+    """Start the installed service definition as-is."""
+    if service.kind == "launchd":
+        _run_checked(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(service.path)])
+    else:
+        _run_checked(["systemctl", "--user", "start", service.label])
 
 
 def disable_user_host_service() -> HostService:
