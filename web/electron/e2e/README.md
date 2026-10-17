@@ -40,6 +40,23 @@ backend — no real provider creds.
 - `desktop_connect.e2e.js` — the reference test to **copy** for a desktop bug:
   launch → setup page → type URL → Connect → land in the shell. Its `.webm` is
   the desktop journey footage.
+- `desktop_workspace_download.e2e.js` — downloading a workspace file from the
+  Files panel when the deployment routes host-scoped requests by the app's
+  slice-key header. Builds an SPA with `VITE_OMNIGENT_HOST_ROUTING=true` (or
+  uses `OMNIGENT_ROUTING_WEB_UI_DIST`), spawns a real `omnigent host` with a
+  session on it (`fixtures/hostStack.js`), and puts a loopback stand-in for the
+  multi-replica ingress in front of the server (`fixtures/routingIngress.js`:
+  keyless tunnel requests get the wrong-replica 502, every request is logged
+  with its routing headers). Run it with `OMNIGENT_PYTHON` pointing at the venv:
+
+  ```bash
+  cd web/electron
+  OMNIGENT_PYTHON=../../.venv/bin/python OMNIGENT_PW_NO_SANDBOX=1 \
+    xvfb-run -a node --test e2e/desktop_workspace_download.e2e.js
+  ```
+
+  Setting `OMNIGENT_DESKTOP_RECORD_DIR` keeps the recordings and ingress log
+  there and paces the journey so the clip stays legible.
 
 ## Prerequisites
 
