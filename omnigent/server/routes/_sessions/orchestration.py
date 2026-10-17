@@ -3986,6 +3986,9 @@ async def _publish_runner_recovered_status_impl(
         if last_error is None or last_error.get("code") != "runner_disconnected":
             return
     versioned_store = callable(getattr(conversation_store, "record_session_observation", None))
+    cleared_decision = conv.runner_offline_decision if isinstance(conv, Conversation) else None
+    if cleared_decision is not None:
+        cleared_decision = cleared_decision.model_copy(deep=True)
     recovered_observation: SessionObservation | None = None
     if isinstance(conv, Conversation) and versioned_store:
         captured = captured or conv.session_observation
@@ -4021,6 +4024,8 @@ async def _publish_runner_recovered_status_impl(
             session_id,
             failure_code="runner_disconnected",
             runner_id=captured.runner_id if captured is not None else None,
+            decision=cleared_decision,
+            recovered_observation=recovered_observation,
         )
     # Owned disconnect causes live in metadata and clear with the observation.
     if not isinstance(conv, Conversation) or not versioned_store:
