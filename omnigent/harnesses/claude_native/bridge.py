@@ -256,6 +256,14 @@ _TMUX_READY_TIMEOUT_S = 30.0
 # Hard cap on waiting for a slow-booting terminal whose process is still
 # alive.
 _TMUX_READY_SLOW_BOOT_TIMEOUT_S = 180.0
+# Past that cap, a boot whose processes are still busy (a slow launcher plus a
+# cold plugin load can take minutes) keeps waiting one window at a time, up to
+# the ceiling. A pane parked on a prompt the gate can't see is idle and stops at
+# the cap as before.
+_TMUX_READY_BUSY_BOOT_CEILING_S = 480.0
+_TMUX_READY_BUSY_BOOT_WINDOW_S = 30.0
+# CPU seconds the pane's processes must use in a window to count as booting.
+_TMUX_READY_BUSY_BOOT_MIN_CPU_S = 2.0
 # Per-command tmux budget. 10s matches every other native bridge: a tmux
 # server starved by parallel worker boots on a large worktree can stall
 # past 5s while still healthy, and a shorter budget kills the delivery.
@@ -5546,6 +5554,52 @@ def _claude_pane_state(socket_path: str, tmux_target: str) -> _ClaudePaneState:
     return _ClaudePaneState(None)
 
 
+def _claude_pane_cpu_seconds(socket_path: str, tmux_target: str) -> float | None:
+    """
+    Return the CPU time the pane's process tree has used so far.
+
+    Sums user and system time over the pane's process and its descendants,
+    including children they already reaped, so a launcher's short-lived
+    helpers still count. A process that exits mid-read is skipped.
+
+    :param socket_path: Absolute path to the tmux socket, e.g.
+        ``"/tmp/.../tmux.sock"``.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: CPU seconds, e.g. ``12.5``, or ``None`` when tmux or the
+        process table can't be read.
+    """
+    import subprocess
+
+    import psutil
+
+    try:
+        proc = subprocess.run(
+            ["tmux", "-S", socket_path, "list-panes", "-t", tmux_target, "-F", "#{pane_pid}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_SEND_TIMEOUT_S,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    fields = proc.stdout.split() if proc.returncode == 0 else []
+    if not fields or not fields[0].isdigit():
+        return None
+    try:
+        root = psutil.Process(int(fields[0]))
+        tree = [root, *root.children(recursive=True)]
+    except psutil.Error:
+        return None
+    total = 0.0
+    for member in tree:
+        try:
+            times = member.cpu_times()
+        except psutil.Error:
+            continue
+        total += times.user + times.system + times.children_user + times.children_system
+    return total
+
+
 def claude_pane_ready(bridge_dir: Path) -> bool:
     """
     Report whether the Claude pane is showing a usable input box right now.
@@ -6178,7 +6232,9 @@ def _wait_for_claude_prompt_ready(
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param timeout_s: Base readiness budget, e.g. ``30.0``. A live pane or
         unanswered liveness probe extends the wait to
-        :data:`_TMUX_READY_SLOW_BOOT_TIMEOUT_S`. Liveness checks start within
+        :data:`_TMUX_READY_SLOW_BOOT_TIMEOUT_S`, and a pane whose processes
+        stay busy past that cap extends it again up to
+        :data:`_TMUX_READY_BUSY_BOOT_CEILING_S`. Liveness checks start within
         one second; a dead pane or rejected query ends the wait.
     :param bridge_dir: Protect live permission-hook waits when delivering a message.
     :returns: None.
@@ -6208,6 +6264,11 @@ def _wait_for_claude_prompt_ready(
     started = time.monotonic()
     next_liveness_probe = started + min(timeout_s, _CLAUDE_LIVENESS_POLL_INTERVAL_S)
     hard_deadline = started + max(timeout_s, _TMUX_READY_SLOW_BOOT_TIMEOUT_S)
+    busy_boot_ceiling = started + max(timeout_s, _TMUX_READY_BUSY_BOOT_CEILING_S)
+    # CPU reading one window before the current deadline; ``sampled`` keeps a
+    # failed read from being retried every poll.
+    cpu_mark: float | None = None
+    cpu_mark_sampled = False
     polls = 0
     empty_polls = 0
     # Keep the last non-empty capture the loop actually saw, not a fresh
@@ -6293,8 +6354,32 @@ def _wait_for_claude_prompt_ready(
                 exited_status = state.exit_status
                 break
             next_liveness_probe = time.monotonic() + _CLAUDE_LIVENESS_POLL_INTERVAL_S
+        if not cpu_mark_sampled and time.monotonic() >= (
+            hard_deadline - _TMUX_READY_BUSY_BOOT_WINDOW_S
+        ):
+            cpu_mark = _claude_pane_cpu_seconds(socket_path, tmux_target)
+            cpu_mark_sampled = True
         if time.monotonic() >= hard_deadline:
-            break
+            # Still booting means real CPU use since the mark; a parked pane is idle.
+            cpu_now = (
+                _claude_pane_cpu_seconds(socket_path, tmux_target)
+                if cpu_mark is not None and hard_deadline < busy_boot_ceiling
+                else None
+            )
+            if (
+                cpu_mark is None
+                or cpu_now is None
+                or cpu_now - cpu_mark < _TMUX_READY_BUSY_BOOT_MIN_CPU_S
+            ):
+                break
+            _logger.info(
+                "Claude Code is still starting after %.0fs (its processes used %.1fs of "
+                "CPU in the last window); extending the readiness wait",
+                time.monotonic() - started,
+                cpu_now - cpu_mark,
+            )
+            hard_deadline = min(hard_deadline + _TMUX_READY_BUSY_BOOT_WINDOW_S, busy_boot_ceiling)
+            cpu_mark = cpu_now
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     # Timed out. The poll/empty-capture counts separate the failure modes:
     # mostly-empty captures point at a torn read under a busy repaint (the
