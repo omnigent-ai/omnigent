@@ -61,6 +61,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    InjectionDeliveryAmbiguous,
     Message,
     ToolSpec,
     TurnComplete,
@@ -458,13 +459,19 @@ async def _inject_codex_turn(
         if state.active_turn_id is None or not is_compaction_steer_refusal(error):
             raise
     recovered_state = await _wait_for_compaction_turn(bridge_dir, state)
-    await _inject_codex_turn_once(
-        client,
-        bridge_dir=bridge_dir,
-        state=recovered_state,
-        input_items=input_items,
-        settings_overrides=settings_overrides,
-    )
+    try:
+        await _inject_codex_turn_once(
+            client,
+            bridge_dir=bridge_dir,
+            state=recovered_state,
+            input_items=input_items,
+            settings_overrides=settings_overrides,
+        )
+    except (CodexAppServerResponseError, _CodexNativeInputUndelivered):
+        raise
+    except Exception as exc:
+        # Codex may have accepted the resubmitted input before its reply was lost.
+        raise InjectionDeliveryAmbiguous(str(exc)) from exc
 
 
 async def _wait_for_compaction_turn(
@@ -648,7 +655,8 @@ class CodexNativeExecutor(Executor):
                     input_items=input_items,
                     settings_overrides={},
                 )
-            except Exception as exc:  # noqa: BLE001 - steering is best-effort from the runner facade.
+            except Exception as exc:
+                ambiguous = isinstance(exc, InjectionDeliveryAmbiguous)
                 _logger.warning(
                     "Codex native turn/steer failed",
                     exc_info=True,
@@ -663,10 +671,12 @@ class CodexNativeExecutor(Executor):
                             if isinstance(exc, CodexAppServerResponseError)
                             else None,
                             stage="native_rpc",
-                            outcome="error",
+                            outcome="ambiguous" if ambiguous else "error",
                         )
                     ),
                 )
+                if ambiguous:
+                    raise
                 return False
             finally:
                 await client.close()

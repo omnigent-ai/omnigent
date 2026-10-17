@@ -28,7 +28,12 @@ from omnigent.harnesses.codex_native.bridge import (
     write_bridge_state,
 )
 from omnigent.inner.codex_native_executor import CodexNativeExecutor
-from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
+from omnigent.inner.executor import (
+    ExecutorConfig,
+    ExecutorError,
+    InjectionDeliveryAmbiguous,
+    TurnComplete,
+)
 from omnigent.inner.native_attachments import attachment_cache_dir
 from omnigent.native.input_diagnostics import input_delivery_scope
 
@@ -194,8 +199,12 @@ def draining_client(monkeypatch: pytest.MonkeyPatch):
 
         async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
             if method in {"turn/start", "turn/steer"} and type(self).delivery_errors:
-                type(self).requests.append((method, params))
                 error = type(self).delivery_errors.pop(0)
+                if isinstance(error, _ReplyLost):
+                    await super().request(method, params)
+                    type(self).accepted_inputs.append(params["input"])
+                else:
+                    type(self).requests.append((method, params))
                 if type(self).on_refusal is not None:
                     type(self).on_refusal()
                 raise error
@@ -208,6 +217,10 @@ def draining_client(monkeypatch: pytest.MonkeyPatch):
         "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _DrainingClient
     )
     return _DrainingClient
+
+
+class _ReplyLost(ConnectionResetError):
+    """Codex accepted the request, then the connection dropped before its reply."""
 
 
 def _compact_steer_refusal() -> CodexAppServerResponseError:
@@ -361,24 +374,97 @@ async def test_compact_steer_wait_cancellation_propagates_without_resubmission(
     assert draining_client.closes == 1
 
 
-@pytest.mark.parametrize("error", [ConnectionResetError("reply lost"), _compact_steer_refusal()])
-def test_compact_steer_second_submission_failure_is_bounded(
-    draining_client, error: BaseException, tmp_path: Path
+@pytest.mark.parametrize("reply_lost", [True, False], ids=["reply-lost", "refused-again"])
+@pytest.mark.parametrize("live_injection", [False, True], ids=["run-turn", "live-steer"])
+async def test_compact_steer_second_submission_failure_is_bounded(
+    draining_client, reply_lost: bool, live_injection: bool, tmp_path: Path
 ) -> None:
     _seed_bridge(tmp_path, active_turn_id="turn_compact")
     state = read_bridge_state(tmp_path)
     assert state is not None
-    draining_client.delivery_errors = [_compact_steer_refusal(), error]
+    second = _ReplyLost("reply lost") if reply_lost else _compact_steer_refusal()
+    draining_client.delivery_errors = [_compact_steer_refusal(), second]
     draining_client.on_refusal = lambda: write_bridge_state(
         tmp_path, replace(state, active_turn_id="turn_new")
     )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
 
-    [failure] = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "queued input")
+    if live_injection and reply_lost:
+        # The runner must not resend input Codex may already hold.
+        with pytest.raises(InjectionDeliveryAmbiguous):
+            await executor.enqueue_session_message("main", "queued input")
+    elif live_injection:
+        assert await executor.enqueue_session_message("main", "queued input") is False
+    else:
+        [failure] = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "queued input"}], [], ""
+            )
+        ]
+        assert isinstance(failure, ExecutorError)
+        assert failure.undelivered is not reply_lost
 
-    assert isinstance(failure, ExecutorError)
-    assert failure.undelivered is isinstance(error, CodexAppServerResponseError)
     assert len(draining_client.requests) == 2
-    assert draining_client.accepted_inputs == []
+    assert draining_client.accepted_inputs == (
+        [[{"type": "text", "text": "queued input"}]] if reply_lost else []
+    )
+
+
+class _OneInjectionCtx:
+    """Turn context that hands the adapter one live injection and records what it emits."""
+
+    def __init__(self, injection: Any) -> None:
+        self._injection: Any = injection
+        self.emitted: list[Any] = []
+        self.response_id = "resp_injection"
+        self.session_id = "session_injection"
+        self.cancelled = asyncio.Event()
+
+    async def next_injection(self, timeout: float | None = None) -> Any:
+        del timeout
+        if self._injection is None:
+            await asyncio.sleep(3600)
+        injection, self._injection = self._injection, None
+        return injection
+
+    def emit(self, event: Any) -> None:
+        self.emitted.append(event)
+
+
+async def test_live_resubmission_with_lost_reply_is_consumed_not_resent(
+    draining_client, tmp_path: Path
+) -> None:
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import CreateResponseRequest, InjectionConsumedEvent
+
+    _seed_bridge(tmp_path, active_turn_id="turn_compact")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    draining_client.delivery_errors = [_compact_steer_refusal(), _ReplyLost("reply lost")]
+    draining_client.on_refusal = lambda: write_bridge_state(
+        tmp_path, replace(state, active_turn_id="turn_new")
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="main")
+    ctx = _OneInjectionCtx(
+        CreateResponseRequest(model="m", input="queued input", injection_id="inj_compact")
+    )
+
+    watcher = asyncio.create_task(adapter._watch_injections(ctx, executor))  # type: ignore[arg-type]
+    try:
+        for _ in range(200):
+            if ctx.emitted:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+
+    # The consumed marker makes the runner drop its buffered copy instead of resending it.
+    assert [type(event) for event in ctx.emitted] == [InjectionConsumedEvent]
+    assert ctx.emitted[0].injection_id == "inj_compact"
+    assert draining_client.accepted_inputs == [[{"type": "text", "text": "queued input"}]]
 
 
 @pytest.mark.parametrize(

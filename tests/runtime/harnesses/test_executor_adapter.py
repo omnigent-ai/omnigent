@@ -2226,6 +2226,90 @@ async def test_watch_injections_emits_consumed_marker_on_accept() -> None:
     assert marker.injection_id == "inj_x"
 
 
+class _ScriptedInjectionExecutor:
+    """Inner executor stub whose enqueue_session_message returns or raises a scripted outcome."""
+
+    def __init__(self, outcome: bool | BaseException) -> None:
+        """Hold the outcome to return or raise.
+
+        :param outcome: ``True``/``False`` to return, or an exception to raise.
+        """
+        self.outcome = outcome
+
+    async def enqueue_session_message(self, session_key: str, content: Any) -> bool:
+        """Return or raise the scripted outcome.
+
+        :param session_key: Adapter session key.
+        :param content: The injected user text.
+        :returns: The scripted boolean.
+        """
+        del session_key, content
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "consumed", "logged"),
+    [
+        (True, True, "executor_accepted"),
+        (False, False, "executor_refused"),
+        (None, True, "executor_ambiguous"),
+        (RuntimeError("socket closed before sending"), False, "error"),
+    ],
+    ids=["accepted", "refused", "ambiguous", "error"],
+)
+async def test_watch_injections_marks_ambiguous_delivery_consumed(
+    outcome: bool | BaseException | None,
+    consumed: bool,
+    logged: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An injection the harness may already hold is marked consumed, so it is never resent."""
+    import asyncio as _aio
+    import logging
+
+    from omnigent.inner.executor import InjectionDeliveryAmbiguous
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import CreateResponseRequest, InjectionConsumedEvent
+
+    executor = _ScriptedInjectionExecutor(
+        InjectionDeliveryAmbiguous("reply lost") if outcome is None else outcome
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="sk")
+    ctx = _OneInjectionCtx(
+        CreateResponseRequest(
+            model="m", input="steer me", injection_id="inj_x", input_stable_id="a" * 32
+        )
+    )
+
+    caplog.set_level(logging.INFO)
+    task = _aio.create_task(adapter._watch_injections(ctx, executor))  # type: ignore[arg-type]
+    try:
+        for _ in range(200):
+            if any(
+                getattr(record, "event_name", None) == "native_input_steering_finished"
+                for record in caplog.records
+            ):
+                break
+            await _aio.sleep(0.01)
+        await _aio.sleep(0.01)
+    finally:
+        task.cancel()
+        with contextlib.suppress(_aio.CancelledError):
+            await task
+
+    finished = [
+        record.attributes["outcome"]
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "native_input_steering_finished"
+    ]
+    assert finished == [logged]
+    markers = [event for event in ctx.emitted if isinstance(event, InjectionConsumedEvent)]
+    assert [marker.injection_id for marker in markers] == (["inj_x"] if consumed else [])
+
+
 @pytest.mark.asyncio
 async def test_watch_injections_drops_injection_when_turn_cancelled() -> None:
     """A queued injection is dropped if the turn was interrupted.
