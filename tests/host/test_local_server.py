@@ -1047,6 +1047,7 @@ def test_stop_untracked_local_server_kills_orphan_on_default_port(
     monkeypatch.setattr("httpx.get", _healthy)
     monkeypatch.setattr(local_server, "subprocess", _fake_subprocess(stdout="93359\n93360\n"))
     monkeypatch.setattr(local_server, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(local_server, "_pid_serves_local_data_dir", lambda pid: True)
     terminated: list[int] = []
     monkeypatch.setattr(local_server, "_terminate_pid", terminated.append)
 
@@ -1117,6 +1118,87 @@ def test_stop_untracked_local_server_noop_when_lsof_unavailable(
     monkeypatch.setattr(local_server, "_terminate_pid", _raise_if_called)
 
     assert local_server.stop_untracked_local_server(port=8000) is None
+
+
+def test_stop_untracked_local_server_spares_another_data_dirs_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``omnigent stop`` in one data dir must not kill a sibling data dir's server.
+
+    Two worktrees (or HOMEs) on one machine both prefer the canonical port; the
+    one holding it is tracked by its own pidfile and is not an orphan here.
+    """
+
+    def _healthy(url: str, *, timeout: float, trust_env: bool) -> _FakeHealthResp:
+        return _FakeHealthResp(200, {"status": "ok"})
+
+    monkeypatch.setattr("httpx.get", _healthy)
+    monkeypatch.setattr(local_server, "subprocess", _fake_subprocess(stdout="93359\n"))
+    monkeypatch.setattr(local_server, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(local_server, "_pid_serves_local_data_dir", lambda pid: False)
+    monkeypatch.setattr(local_server, "_terminate_pid", _raise_if_called)
+
+    assert local_server.stop_untracked_local_server(port=8000) is None
+
+
+class _FakeServerProcess:
+    """psutil.Process stand-in exposing a server's argv and environment."""
+
+    def __init__(self, argv: list[str], environ: dict[str, str]) -> None:
+        self._argv = argv
+        self._environ = environ
+
+    def cmdline(self) -> list[str]:
+        """Return the canned argv."""
+        return self._argv
+
+    def environ(self) -> dict[str, str]:
+        """Return the canned environment."""
+        return self._environ
+
+
+@pytest.mark.parametrize(
+    ("argv_dir", "environ_key", "expected"),
+    [
+        ("mine", None, True),
+        ("theirs", None, False),
+        (None, "OMNIGENT_DATA_DIR", True),
+        (None, "HOME", False),
+    ],
+)
+def test_pid_serves_local_data_dir_matches_server_data_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    argv_dir: str | None,
+    environ_key: str | None,
+    expected: bool,
+) -> None:
+    """Ownership comes from a spawned server's argv, else a foreground one's env."""
+    mine = tmp_path / "mine"
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(mine))
+    argv = ["python", "-m", "omnigent.cli", "server", "--port", "6767"]
+    if argv_dir is not None:
+        argv += ["--artifact-location", str(tmp_path / argv_dir / "artifacts")]
+    environ = {"HOME": str(tmp_path / "other-home")}
+    if environ_key == "OMNIGENT_DATA_DIR":
+        environ["OMNIGENT_DATA_DIR"] = str(mine)
+    fake = _FakeServerProcess(argv, environ)
+    monkeypatch.setattr(local_server.psutil, "Process", lambda pid: fake)
+
+    assert local_server._pid_serves_local_data_dir(93359) is expected
+
+
+def test_pid_serves_local_data_dir_treats_unreadable_process_as_foreign(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A process whose argv cannot be read is never claimed as ours."""
+
+    def _denied(pid: int) -> Any:
+        raise local_server.psutil.AccessDenied(pid)
+
+    monkeypatch.setattr(local_server.psutil, "Process", _denied)
+
+    assert local_server._pid_serves_local_data_dir(93359) is False
 
 
 def _raise_if_called(pid: int) -> None:
