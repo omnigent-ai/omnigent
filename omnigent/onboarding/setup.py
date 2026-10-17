@@ -316,6 +316,14 @@ def _login_profile(cli: str, spec: ProfileSpec, console: Console) -> bool:
     """
     console.print(f"\n  [bold]→ {spec.name}[/bold]  [dim]{spec.purpose}[/dim]")
     console.print(f"    [dim]host: {spec.host}[/dim]")
+    from rich.markup import escape
+
+    from omnigent.onboarding.databricks_config import databricks_login_port_conflict
+
+    conflict = databricks_login_port_conflict(cli)
+    if conflict is not None:
+        console.print(f"  [red]{escape(conflict)}[/red]")
+        return False
     try:
         result = subprocess.run(
             [cli, "auth", "login", "--host", spec.host, "--profile", spec.name],
