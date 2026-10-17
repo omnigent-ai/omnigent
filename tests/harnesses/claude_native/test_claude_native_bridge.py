@@ -5515,15 +5515,24 @@ def test_kill_session_raises_when_tmux_target_never_published(
     tmp_path: Path,
 ) -> None:
     """
-    kill_session fails loud if tmux.json was never written.
+    kill_session fails loud if tmux.json was never written, but still drops the markers.
 
     The runner handler catches RuntimeError and returns 503 (best
     effort — a missing target means there is no live session to
     kill). Swallowing it silently would make the stop button appear
-    to work while doing nothing.
+    to work while doing nothing. With no advertised pane there is no
+    live hook either, so a marker a dead one left must not survive.
     """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "bridge.json").write_text(json.dumps({"active_session_id": "conv_vanished"}))
+    marker = claude_native_bridge.approval_wait_marker_path("conv_vanished", bridge_dir=bridge_dir)
+    marker.parent.mkdir(parents=True)
+    claude_native_bridge.touch_approval_wait_marker(marker)
+
     with pytest.raises(RuntimeError, match="tmux target is not advertised"):
-        kill_session(tmp_path / "bridge", timeout_s=0.0)
+        kill_session(bridge_dir, timeout_s=0.0)
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize(
@@ -5538,13 +5547,17 @@ def test_kill_session_is_idempotent_when_tmux_is_absent(
     monkeypatch: pytest.MonkeyPatch,
     stderr: str,
 ) -> None:
-    """A stale tmux advertisement still counts as a successful stop."""
+    """A stale tmux advertisement still counts as a successful stop and drops the markers."""
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
         bridge_dir,
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="main",
     )
+    (bridge_dir / "bridge.json").write_text(json.dumps({"active_session_id": "conv_gone"}))
+    marker = claude_native_bridge.approval_wait_marker_path("conv_gone", bridge_dir=bridge_dir)
+    marker.parent.mkdir(parents=True)
+    claude_native_bridge.touch_approval_wait_marker(marker)
 
     class _FakeCompleted:
         """Fake CompletedProcess returning a non-zero exit code."""
@@ -5561,19 +5574,119 @@ def test_kill_session_is_idempotent_when_tmux_is_absent(
 
     monkeypatch.setattr("subprocess.run", _fake_run)
     kill_session(bridge_dir)
+    # A pane that is already gone has no hook left to own the marker.
+    assert not marker.exists()
 
 
-def test_kill_session_raises_on_unexpected_tmux_failure(
+def test_kill_session_drops_the_markers_of_the_hooks_it_kills(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Unexpected tmux failures remain visible to the stop caller."""
+    """
+    Stopping a pane parked on a permission prompt leaves no approval-wait marker.
+
+    ``tmux kill-session`` ends the parked hook before its own cleanup runs; its
+    marker would otherwise read as a live prompt for the whole TTL and the
+    runner would hold the session's next message behind it.
+    """
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
         bridge_dir,
         socket_path=Path("/tmp/example/tmux.sock"),
         tmux_target="main",
     )
+    (bridge_dir / "bridge.json").write_text(json.dumps({"active_session_id": "conv_stopped"}))
+    # Two hooks parked on this session (parallel tool calls) and one on another.
+    own = claude_native_bridge.approval_wait_marker_path("conv_stopped", bridge_dir=bridge_dir)
+    own.parent.mkdir(parents=True)
+    sibling = own.with_name(own.name.replace(f".{os.getpid()}.", f".{os.getpid() + 1}."))
+    other = claude_native_bridge.approval_wait_marker_path("conv_other", bridge_dir=bridge_dir)
+    for marker in (own, sibling, other):
+        claude_native_bridge.touch_approval_wait_marker(marker)
+    assert claude_native_bridge.has_pending_user_prompt(bridge_dir)
+
+    monkeypatch.setattr(
+        "subprocess.run", lambda cmd, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr="")
+    )
+    kill_session(bridge_dir)
+
+    assert not own.exists() and not sibling.exists()
+    assert not claude_native_bridge.approval_wait_is_fresh("conv_stopped", bridge_dir=bridge_dir)
+    assert not claude_native_bridge.has_pending_user_prompt(bridge_dir)
+    assert other.exists(), "another session's parked hook keeps its evidence"
+
+
+def test_kill_session_still_kills_when_the_bridge_config_is_unreadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreadable bridge config skips the marker cleanup but never the kill."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="main",
+    )
+
+    def _unreadable(path: Path) -> str | None:
+        raise PermissionError(f"cannot read {path}")
+
+    monkeypatch.setattr(claude_native_bridge, "read_active_session_id", _unreadable)
+    captured: list[list[str]] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        captured.append(cmd)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    kill_session(bridge_dir)
+
+    assert [cmd[3] for cmd in captured] == ["kill-session"]
+
+
+def test_kill_session_drops_markers_when_teardown_removes_the_bridge_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The session id is captured before the kill, which can trigger bridge teardown."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="main",
+    )
+    (bridge_dir / "bridge.json").write_text(json.dumps({"active_session_id": "conv_stopped"}))
+    marker = claude_native_bridge.approval_wait_marker_path("conv_stopped", bridge_dir=bridge_dir)
+    marker.parent.mkdir(parents=True)
+    claude_native_bridge.touch_approval_wait_marker(marker)
+
+    def _kill_and_tear_down(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del cmd, kwargs
+        (bridge_dir / "bridge.json").unlink()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _kill_and_tear_down)
+    kill_session(bridge_dir)
+
+    assert not marker.exists()
+
+
+def test_kill_session_raises_on_unexpected_tmux_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unexpected tmux failures stay visible to the stop caller and keep the hook's marker."""
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="main",
+    )
+    (bridge_dir / "bridge.json").write_text(json.dumps({"active_session_id": "conv_live"}))
+    marker = claude_native_bridge.approval_wait_marker_path("conv_live", bridge_dir=bridge_dir)
+    marker.parent.mkdir(parents=True)
+    claude_native_bridge.touch_approval_wait_marker(marker)
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         del cmd, kwargs
@@ -5582,6 +5695,8 @@ def test_kill_session_raises_on_unexpected_tmux_failure(
     monkeypatch.setattr("subprocess.run", _fake_run)
     with pytest.raises(RuntimeError, match="permission denied"):
         kill_session(bridge_dir)
+    # The pane may still be alive, so its parked hook keeps its evidence.
+    assert marker.exists()
 
 
 def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
