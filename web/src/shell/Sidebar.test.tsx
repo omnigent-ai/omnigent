@@ -52,7 +52,9 @@ const {
   useSessionWorktreesMock,
 } = vi.hoisted(() => ({
   projectsMock: [] as string[],
-  projectRowsRef: { current: undefined as { id: string; name: string }[] | undefined },
+  projectRowsRef: {
+    current: undefined as { id: string; name: string; icon?: string | null }[] | undefined,
+  },
   moveToProjectSpy: vi.fn(),
   deleteProjectSpy: vi.fn(),
   renameProjectSpy: vi.fn(),
@@ -3058,6 +3060,141 @@ function renderGroupingSidebar() {
     features: { ...FALLBACK_SERVER_INFO.features, sidebar_grouping_ui: true },
   });
 }
+
+describe("session tooltip project detail", () => {
+  const filedSession = (id = "conv_filed", partial: Partial<Conversation> = {}) =>
+    conv(id, "Codex", {
+      labels: { omni_project: "Alpha" },
+      ...partial,
+    });
+
+  const openTooltip = async (id: string) => {
+    fireEvent.pointerMove(screen.getByRole("link", { name: id }), { pointerType: "mouse" });
+    return screen.findByTestId("session-tooltip-content");
+  };
+
+  it("shows a pinned project's first-class name and emoji in the shared tooltip", async () => {
+    projectRowsRef.current = [{ id: "p_alpha", name: "Alpha", icon: "🚀" }];
+    usePullRequestInfoMock.mockReturnValue({
+      data: {
+        object: "session.github.info",
+        available: true,
+        branch: "main",
+        repo: { name_with_owner: "example/omnigent" },
+        pr: { number: 42, state: "OPEN", is_draft: false },
+      },
+    });
+    mockConversations([
+      filedSession("conv_pinned", {
+        project_id: "p_alpha",
+        labels: {},
+        workspace: "/Users/me/Alpha",
+        owner: "owner@example.com",
+        git_branch: "feature/tooltip",
+      }),
+    ]);
+    seedPins(["conv_pinned"]);
+    renderGroupingSidebar();
+
+    const tooltip = await openTooltip("conv_pinned");
+    expect(within(tooltip).getByTestId("session-tooltip-project")).toHaveTextContent("Alpha");
+    expect(within(tooltip).getByTestId("project-icon")).toHaveTextContent("🚀");
+    const detailRows = within(tooltip).getByTestId("session-tooltip-project").parentElement!;
+    expect(Array.from(detailRows.children).map((row) => row.getAttribute("data-testid"))).toEqual([
+      "session-tooltip-owner",
+      "session-tooltip-project",
+      "session-tooltip-repo",
+      "session-tooltip-pr",
+      "session-tooltip-branch",
+    ]);
+    expect(screen.queryByTestId("pinned-project-flyout")).toBeNull();
+  });
+
+  it("keeps the pinned project flyout when grouping is disabled", async () => {
+    projectsMock.push("Alpha");
+    mockConversations([filedSession("conv_pinned"), filedSession("conv_filed")]);
+    seedPins(["conv_pinned"]);
+    renderSidebar();
+    fireEvent.focus(screen.getByRole("link", { name: "conv_pinned" }));
+    expect(await screen.findByTestId("pinned-project-flyout")).toBeInTheDocument();
+    expect(screen.queryByTestId("session-tooltip-content")).toBeNull();
+  });
+
+  it("keeps the legacy tooltip free of a Project row for a shared row outside project folders", async () => {
+    mockConversations([
+      filedSession("conv_shared", {
+        owner: "other@example.com",
+      }),
+    ]);
+    renderSidebar();
+    showSharedTab();
+    expect(screen.queryByRole("button", { name: /^Alpha/ })).toBeNull();
+    const legacyTooltip = await openTooltip("conv_shared");
+    expect(within(legacyTooltip).queryByTestId("session-tooltip-project")).toBeNull();
+  });
+
+  it.each(["status", "updated"] as const)(
+    "shows the project for a filed session in the %s grouping",
+    async (grouping) => {
+      localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping }));
+      mockConversations([filedSession()]);
+      renderGroupingSidebar();
+
+      const tooltip = await openTooltip("conv_filed");
+      expect(within(tooltip).getByTestId("session-tooltip-project")).toHaveTextContent(
+        "ProjectAlpha",
+      );
+
+      cleanup();
+      mockConversations([conv("conv_unfiled", "Codex")]);
+      renderGroupingSidebar();
+      const unfiledTooltip = await openTooltip("conv_unfiled");
+      expect(within(unfiledTooltip).queryByTestId("session-tooltip-project")).toBeNull();
+    },
+  );
+
+  it("shows the project in Shared and hides it inside its own folder", async () => {
+    projectRowsRef.current = [{ id: "p_alpha", name: "Alpha" }];
+    mockConversations([
+      filedSession("conv_shared", {
+        project_id: "p_alpha",
+        owner: "other@example.com",
+      }),
+    ]);
+    renderGroupingSidebar();
+    selectSessionFilter("all");
+
+    const sharedTooltip = await openTooltip("conv_shared");
+    expect(within(sharedTooltip).getByTestId("session-tooltip-project")).toHaveTextContent(
+      "ProjectAlpha",
+    );
+    cleanup();
+
+    projectsMock.push("Alpha");
+    mockConversations([filedSession()]);
+    renderGroupingSidebar();
+    fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
+
+    const projectTooltip = await openTooltip("conv_filed");
+    expect(within(projectTooltip).queryByTestId("session-tooltip-project")).toBeNull();
+
+    cleanup();
+    mockConversations([
+      filedSession("conv_first_class", {
+        project_id: "p_alpha",
+        labels: {},
+      }),
+    ]);
+    renderGroupingSidebar();
+    const firstClassFolder = screen.getByRole("button", { name: /^Alpha/ });
+    if (firstClassFolder.getAttribute("aria-expanded") !== "true") {
+      fireEvent.click(firstClassFolder);
+    }
+
+    const firstClassTooltip = await openTooltip("conv_first_class");
+    expect(within(firstClassTooltip).queryByTestId("session-tooltip-project")).toBeNull();
+  });
+});
 
 describe("Sidebar view options", () => {
   function openViewSubmenu(testId: string) {
