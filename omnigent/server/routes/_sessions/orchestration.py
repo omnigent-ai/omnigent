@@ -686,7 +686,7 @@ async def _best_effort_stop(
     session_id: str,
     conversation_store: ConversationStore,
     runner_router: Any,
-) -> None:
+) -> list[str]:
     """Stop a running session before a destructive lifecycle action.
 
     Mirrors the client-side stop-then-archive/delete pattern. A session
@@ -705,19 +705,21 @@ async def _best_effort_stop(
     :param conversation_store: Store for descendant-id lookup.
     :param runner_router: The ``RunnerRouter`` for runner-client
         resolution, or ``None`` in tests / in-process setups.
+    :returns: The sub-agent descendant ids it looked up, so the caller can
+        clean them up too; empty when the lookup failed.
     """
     try:
         descendant_ids = await _collect_descendant_conversation_ids(conversation_store, session_id)
         status = _session_status_with_child_rollup(session_id, descendant_ids)
         own_status = _session_status_from_cache(session_id)
     except Exception:  # noqa: BLE001
-        _logger.debug(
-            "Best-effort stop failed for %s; proceeding anyway",
+        _logger.warning(
+            "Descendant lookup failed for %s; skipping best-effort stop",
             session_id,
             exc_info=True,
             extra={"session_id": session_id},
         )
-        return
+        return []
 
     # Background shells outlive their turn without making the session read as
     # running (the sidebar must not spin for an ended turn), but they are live
@@ -726,7 +728,7 @@ async def _best_effort_stop(
         own_status != "failed" and _session_background_task_count_cache.get(session_id, 0) > 0
     )
     if status != "running" and not has_background_tasks:
-        return
+        return descendant_ids
 
     async def _stop(target_id: str) -> None:
         try:
@@ -744,6 +746,19 @@ async def _best_effort_stop(
     for descendant_id in descendant_ids:
         if _session_status_cache.get(descendant_id) in ("running", "waiting"):
             await _stop(descendant_id)
+    return descendant_ids
+
+
+def _cancel_runner_relays(session_ids: list[str]) -> None:
+    """Cancel the runner relays of deleted sessions.
+
+    A relay riding out an offline runner's reconnect grace would otherwise fail
+    the deleted session's turn when the grace expires.
+    """
+    for session_id in session_ids:
+        handle = _runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
 
 
 # Strong references to detached archive stops so the tasks can't be
@@ -13243,6 +13258,7 @@ __all__ = [
     "_build_session_list_item",
     "_build_session_response",
     "_cancel_pending_archive_stop",
+    "_cancel_runner_relays",
     "_child_session_summaries_from_conversations",
     "_create_session_from_bundle",
     "_create_session_from_existing_agent",
