@@ -1579,6 +1579,13 @@ export function AgentHarnessPicker({
   useEffect(() => {
     if (!loading) writeNewChatPickerCache(cacheKey, resolvedPreview);
   }, [cacheKey, loading, resolvedPreview]);
+  // Keep a showing menu mounted while a newly picked harness loads its models,
+  // so open flyouts such as "Other..." don't collapse behind the placeholder.
+  const [menuShown, setMenuShown] = useState(false);
+  const showLoadingPlaceholder = previewOnly && cachedPreview === null && !menuShown;
+  useEffect(() => {
+    setMenuShown(open && !showLoadingPlaceholder);
+  }, [open, showLoadingPlaceholder]);
 
   const isMobile = useIsMobileViewport();
   const hasSelectedConfig = selectedConfigContent != null;
@@ -1812,7 +1819,7 @@ export function AgentHarnessPicker({
     triggerTooltip || null
   );
 
-  if (previewOnly && cachedPreview === null) {
+  if (showLoadingPlaceholder) {
     return (
       <NewChatPickerLoading
         label="Loading session configuration"
