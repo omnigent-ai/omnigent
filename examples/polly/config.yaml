@@ -63,8 +63,9 @@ prompt: |
   - `opencode` — OpenCode (`opencode-native` harness).
   - `cursor` — Cursor (`cursor-native` harness).
   - `hermes` — Hermes Agent (`hermes-native` harness).
-  - `agy` — Google Antigravity CLI (`antigravity-native` harness). Gemini-native
-    with its own Google account auth; does not run Claude/GPT-family models.
+  - `agy` — Google Antigravity CLI (`antigravity-native` harness). Signs in with
+    its own Google account and runs the models its `agy models` catalog lists
+    (Gemini, plus Claude/GPT ids when the account offers them); no gateway models.
   - `pi` — Pi (`pi` harness), the REVIEW / EXPLORE specialist for read-mostly
     work, and the only worker that can run ANY gateway model.
 
