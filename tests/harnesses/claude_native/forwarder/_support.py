@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import queue
 import threading
 from collections.abc import Callable
@@ -12,7 +13,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
+
+import omnigent.harnesses.claude_native.forwarder as forwarder
 
 
 class _RecordingHTTPServer(ThreadingHTTPServer):
@@ -391,3 +395,80 @@ def _subagent_drop_row(caplog: pytest.LogCaptureFixture) -> dict[str, Any]:
     ]
     assert len(records) == 1
     return record_to_row(records[0], source="runner")
+
+
+def _registering_handler(request: httpx.Request) -> httpx.Response:
+    """
+    Acknowledge every forwarder POST: register sub-agents as ``conv_<id>``,
+    acknowledge item batches, and accept anything else.
+
+    :param request: Request issued by the forwarder.
+    :returns: Canned Omnigent response.
+    """
+    body = json.loads(request.content) if request.content else {}
+    if isinstance(body, list):
+        return httpx.Response(
+            202,
+            json=[{"queued": False, "item_id": f"item-{index}"} for index, _ in enumerate(body)],
+        )
+    if body.get("type") != "external_subagent_start":
+        return httpx.Response(202, json={})
+    subagent_id = body["data"]["subagent_id"]
+    return httpx.Response(202, json={"queued": False, "child_session_id": f"conv_{subagent_id}"})
+
+
+async def _poll_subagents(
+    client: httpx.AsyncClient,
+    *,
+    bridge_dir: Path,
+    transcript_path: Path,
+    state: forwarder.SubagentForwardState,
+    start_retry_tracker: forwarder._PostRetryTracker | None = None,
+) -> forwarder.SubagentForwardState:
+    """
+    Run one real sub-agent poll with zero-delay retry trackers.
+
+    :param start_retry_tracker: Pass one tracker across polls to carry
+        registration backoff between them; each poll gets a fresh one otherwise.
+    :returns: The forwarder state after the poll.
+    """
+    return await forwarder._forward_available_subagents(
+        client=client,
+        parent_session_id="conv_root",
+        bridge_dir=bridge_dir,
+        transcript_path=transcript_path,
+        state=state,
+        agent_name="claude-native-ui",
+        start_retry_tracker=start_retry_tracker or forwarder._PostRetryTracker(base_delay_s=0.0),
+        item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+        status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+    )
+
+
+def _count_transcript_scans(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """
+    Count full transcript scans while still running the real scan.
+
+    :returns: A list that grows by one ordinal per
+        ``_subagent_parents_by_tool_use`` call.
+    """
+    scans: list[int] = []
+    original = forwarder._subagent_parents_by_tool_use
+
+    def counting_scan(*args: Any, **kwargs: Any) -> dict[str, str | None]:
+        scans.append(len(scans) + 1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(forwarder, "_subagent_parents_by_tool_use", counting_scan)
+    return scans
+
+
+def _set_aside_warnings(caplog: pytest.LogCaptureFixture, *needles: str) -> list[str]:
+    """Return the set-aside WARNING messages that name every one of ``needles``."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+        and "Setting aside" in record.getMessage()
+        and all(needle in record.getMessage() for needle in needles)
+    ]
