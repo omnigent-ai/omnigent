@@ -538,6 +538,35 @@ def claude_managed_gateway(
     return None, False
 
 
+def claude_managed_env(paths: tuple[Path, ...] | None = None) -> dict[str, str]:
+    """The ``env`` block Claude Code applies from its managed settings chain.
+
+    Same precedence as :func:`claude_managed_gateway`: the first readable,
+    object-shaped file decides, even when it carries no ``env``. Only
+    non-empty string values are returned, stripped.
+
+    :param paths: Settings files to read, highest precedence first; defaults to
+        :data:`CLAUDE_CODE_MANAGED_SETTINGS_PATHS`.
+    :returns: The managed environment, e.g. ``{"ANTHROPIC_BASE_URL": "https://…"}``,
+        or ``{}`` when no file is readable.
+    """
+    for path in CLAUDE_CODE_MANAGED_SETTINGS_PATHS if paths is None else paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        raw_env = payload.get("env")
+        env = raw_env if isinstance(raw_env, dict) else {}
+        return {
+            key: value.strip()
+            for key, value in env.items()
+            if isinstance(key, str) and isinstance(value, str) and value.strip()
+        }
+    return {}
+
+
 def claude_managed_model_picker(
     paths: tuple[Path, ...] | None = None,
 ) -> tuple[tuple[str, str], ...]:

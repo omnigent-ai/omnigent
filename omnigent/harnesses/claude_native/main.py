@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import hashlib
 import json
 import logging
 import os
@@ -199,6 +200,7 @@ _UCODE_CLAUDE_AGENT_NAME = "claude"
 _UCODE_CLAUDE_BASE_URL_ENV = "ANTHROPIC_BASE_URL"
 _ANTHROPIC_MODEL_ENV = "ANTHROPIC_MODEL"
 _ANTHROPIC_API_KEY_ENV = "ANTHROPIC_API_KEY"
+_ANTHROPIC_AUTH_TOKEN_ENV = "ANTHROPIC_AUTH_TOKEN"
 _ANTHROPIC_BEDROCK_BASE_URL_ENV = "ANTHROPIC_BEDROCK_BASE_URL"
 _AWS_BEARER_TOKEN_BEDROCK_ENV = "AWS_BEARER_TOKEN_BEDROCK"
 _CLAUDE_CODE_USE_BEDROCK_ENV = "CLAUDE_CODE_USE_BEDROCK"
@@ -219,6 +221,9 @@ _CLAUDE_NONESSENTIAL_TRAFFIC_ENV = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
 _CLAUDE_RESUME_ITEMS_PAGE_LIMIT = 1000
 _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR = 100
 _CLAUDE_MODEL_PROBE_TIMEOUT_S = 20.0
+#: Per-phase (connect/read/write) cap on the ambient gateway's model-listing
+#: request; a phase that does not finish in time leaves the CLI's rows in place.
+_AMBIENT_GATEWAY_LISTING_TIMEOUT_S = 10.0
 #: Wall-clock cap for the per-alias resolution fan-out as a whole; aliases
 #: still unresolved when it expires keep their bare rows (the cache's
 #: revalidation retries them later). Startup dominates each run and
@@ -431,6 +436,13 @@ class ClaudeNativeUcodeConfig:
         Claude Code's ``modelOverrides`` setting. Consumers treat both sides
         as opaque ids; an empty map means the provider supplied no reliable
         equivalence information.
+    :param listing_provider: The endpoint the pre-launch picker may enumerate
+        live (a model-catalog :class:`ResolvedModelProvider`), set for
+        key/gateway/local anthropic providers. Metadata only — recording it
+        does no I/O, so launch/resume stay offline; the catalog build is what
+        fetches ``<base>/v1/models``. Excluded from equality/hash: two configs
+        that render the same launch env are the same config regardless of how
+        the picker discovers ids (mirrors pi's ``PiProviderConfig``).
     """
 
     env: dict[str, str]
@@ -438,6 +450,9 @@ class ClaudeNativeUcodeConfig:
     model: str | None = None
     routable_models: tuple[str, ...] = ()
     model_overrides: dict[str, str] = field(default_factory=dict)
+    listing_provider: model_catalog.ResolvedModelProvider | None = field(
+        default=None, compare=False, hash=False
+    )
 
 
 def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> bool:
@@ -456,20 +471,225 @@ def _serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig) -> b
     return host == "anthropic.com" or host.endswith(".anthropic.com")
 
 
-def _ambient_env_is_non_anthropic_gateway() -> bool:
-    """Whether managed settings or the process env route through a gateway.
+_AMBIENT_CREDENTIAL_ENV = (
+    _ANTHROPIC_AUTH_TOKEN_ENV,
+    _ANTHROPIC_API_KEY_ENV,
+    _CLAUDE_CODE_CUSTOM_HEADERS_ENV,
+)
 
-    Used as the ``claude_config is None`` counterpart to
-    :func:`_serves_canonical_anthropic_ids`: when managed settings (e.g. Isaac)
-    set ``ANTHROPIC_BASE_URL`` to a Databricks gateway, the catalog and its
-    fingerprint must treat the env as a non-canonical endpoint.
+
+def _ambient_claude_env() -> dict[str, str]:
+    """The endpoint and credential values Claude Code applies with no resolved config.
+
+    Managed settings win at Claude Code's actual launch, so a managed ``env``
+    value takes precedence over the process env for each variable.
     """
-    managed_base_url, _ = managed_claude_gateway_signal()
-    base_url = managed_base_url or os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV, "")
+    from omnigent.onboarding.ambient import claude_managed_env
+
+    managed = claude_managed_env(_managed_settings_paths())
+    return {
+        name: managed.get(name) or os.environ.get(name, "")
+        for name in (_UCODE_CLAUDE_BASE_URL_ENV, *_AMBIENT_CREDENTIAL_ENV)
+    }
+
+
+def _ambient_claude_base_url() -> str:
+    """The ``ANTHROPIC_BASE_URL`` Claude Code applies when no config is resolved."""
+    return _ambient_claude_env()[_UCODE_CLAUDE_BASE_URL_ENV]
+
+
+def _is_non_anthropic_host(base_url: str) -> bool:
+    """Whether *base_url* names an endpoint other than Anthropic's own API."""
     if not base_url:
         return False
     host = (urlparse(base_url).hostname or "").lower()
     return host != "anthropic.com" and not host.endswith(".anthropic.com")
+
+
+def _ambient_env_is_non_anthropic_gateway() -> bool:
+    """Whether managed settings or the process env route through a gateway.
+
+    The ``claude_config is None`` counterpart to
+    :func:`_serves_canonical_anthropic_ids`, except that a gateway host alone
+    does not say which ids it routes: a LiteLLM passthrough takes bare
+    ``claude-*`` ids, a Databricks Unity Gateway only its own. The catalog asks
+    the gateway itself (:func:`_ambient_gateway_rejects_canonical_ids`).
+    """
+    return _is_non_anthropic_host(_ambient_claude_base_url())
+
+
+def _gateway_claude_listing(
+    listing_provider: model_catalog.ResolvedModelProvider,
+    *,
+    transport: httpx.BaseTransport | None = None,
+) -> tuple[bool | None, tuple[str, ...]]:
+    """Enumerate a gateway's live ``/v1/models`` for Claude servability.
+
+    Mirrors pi's ``_live_family_model_entries`` (#7007): a real anthropic key
+    speaks the Anthropic models API; any gateway is read through the
+    OpenAI-compatible ``/v1/models``. Case-sensitive on purpose — Claude Code and
+    Anthropic ids are lowercase, so a differently-cased id proves nothing about
+    the bare ``claude-*`` rows the probe offers.
+
+    :returns: ``(serves_canonical, concrete_ids)``:
+
+        - ``serves_canonical=True`` — the listing reports a bare ``claude-*`` id
+          (concrete or a ``claude-*`` / ``*`` wildcard); the endpoint accepts
+          canonical Claude ids (a LiteLLM passthrough lists ``claude-*``).
+        - ``serves_canonical=False`` — a non-empty listing with no bare
+          ``claude-*`` (OpenRouter's ``anthropic/claude-*``); authoritatively
+          namespaced.
+        - ``serves_canonical=None`` — unreachable, unparseable, or an empty
+          listing: undetermined, so the caller fails OPEN (keeps the probe rows)
+          rather than blanking the picker on a transient blip.
+
+        ``concrete_ids`` are the literal, non-wildcard ``claude-*`` ids listed.
+    """
+    from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, KEY_KIND
+
+    try:
+        if listing_provider.kind == KEY_KIND and listing_provider.family == ANTHROPIC_FAMILY:
+            listing = model_catalog._fetch_anthropic_listing(listing_provider, transport=transport)
+        else:
+            # LiteLLM hides wildcard routes (``claude-*``) unless asked; other
+            # OpenAI-compatible servers ignore the unknown param.
+            listing = model_catalog._fetch_openai_compatible_listing(
+                listing_provider,
+                transport=transport,
+                params={"return_wildcard_routes": "true"},
+            )
+    except (httpx.HTTPError, OSError, ValueError, subprocess.SubprocessError) as exc:
+        # The error text carries the request URL (userinfo, query tokens): log none of it.
+        status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+        _logger.debug(
+            "claude gateway model listing failed for %s: %s (HTTP status %s)",
+            listing_provider.detail or listing_provider.kind,
+            type(exc).__name__,
+            status,
+        )
+        return (None, ())
+    ids = [entry.id for entry in listing.models]
+    if not ids:
+        # A 200 with no models (empty ``data`` / unexpected shape) proves nothing
+        # about namespacing — treat it as undetermined, not authoritative.
+        return (None, ())
+    serves = any(mid == "*" or mid.startswith("claude-") for mid in ids)
+    concrete = tuple(mid for mid in ids if mid.startswith("claude-") and "*" not in mid)
+    return (serves, concrete)
+
+
+def _ambient_custom_headers(raw: str) -> dict[str, str]:
+    """An ``ANTHROPIC_CUSTOM_HEADERS`` value (``Name: value`` per line) as a dict."""
+    headers: dict[str, str] = {}
+    for line in raw.splitlines():
+        name, separator, value = line.partition(":")
+        if separator and name.strip():
+            headers[name.strip()] = value.strip()
+    return headers
+
+
+def _ambient_credential_digest(env: Mapping[str, str]) -> str | None:
+    """A non-reversible digest of the ambient listing credential; ``None`` without one."""
+    values = [env.get(name, "") for name in _AMBIENT_CREDENTIAL_ENV]
+    if not any(values):
+        return None
+    return hashlib.sha256("\x00".join(values).encode("utf-8")).hexdigest()
+
+
+def _ambient_gateway_serves_canonical_ids(
+    env: Mapping[str, str] | None = None, *, transport: httpx.BaseTransport | None = None
+) -> bool | None:
+    """Ask the ambient gateway's model listing whether it routes bare ``claude-*`` ids.
+
+    The request is the one Claude Code itself would make there: the
+    ``ANTHROPIC_AUTH_TOKEN`` bearer and/or ``ANTHROPIC_API_KEY``, plus the
+    ``ANTHROPIC_CUSTOM_HEADERS`` lines. ``return_wildcard_routes`` makes LiteLLM
+    list a ``claude-*`` passthrough route; other servers ignore the unknown
+    parameter.
+
+    :param env: The ambient values from :func:`_ambient_claude_env`; read when
+        ``None``.
+    :param transport: Optional httpx transport override for tests.
+    :returns: ``True`` when the listing names a bare ``claude-*`` id or a
+        wildcard, ``False`` when a non-empty listing names none (a namespaced
+        gateway such as OpenRouter's ``anthropic/claude-*``), ``None`` when
+        undetermined: nothing to authenticate with, unreachable, rejected,
+        unparseable, or empty.
+    """
+    if env is None:
+        env = _ambient_claude_env()
+    base_url = env[_UCODE_CLAUDE_BASE_URL_ENV]
+    if not base_url:
+        return None
+    try:
+        # Case-insensitive, and an explicit custom header wins over the derived
+        # one, as in Claude Code's own client. Built inside the handler: a
+        # non-ASCII header value fails here, before any request.
+        headers = httpx.Headers(_ambient_custom_headers(env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV]))
+        auth_token = env[_ANTHROPIC_AUTH_TOKEN_ENV]
+        api_key = env[_ANTHROPIC_API_KEY_ENV]
+        if auth_token and "authorization" not in headers:
+            headers["Authorization"] = f"Bearer {auth_token}"
+        if api_key and "x-api-key" not in headers:
+            headers["x-api-key"] = api_key
+        if not headers:
+            return None
+        headers.setdefault("anthropic-version", model_catalog._ANTHROPIC_API_VERSION)
+        with httpx.Client(
+            transport=transport, timeout=_AMBIENT_GATEWAY_LISTING_TIMEOUT_S
+        ) as client:
+            response = client.get(
+                model_catalog._models_url(base_url),
+                params={"return_wildcard_routes": "true"},
+                headers=headers,
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError, OSError) as exc:
+        # The error text can carry the URL (userinfo, query tokens): log the
+        # class and status only.
+        status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+        _logger.info(
+            "ambient Claude gateway did not list its models (%s, HTTP status %s); "
+            "keeping the CLI's rows",
+            type(exc).__name__,
+            status,
+        )
+        return None
+    data = payload.get("data") if isinstance(payload, dict) else None
+    ids = [
+        item["id"]
+        for item in (data if isinstance(data, list) else [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]
+    ]
+    if not ids:
+        return None
+    return any(model_id == "*" or model_id.startswith("claude-") for model_id in ids)
+
+
+async def _ambient_gateway_rejects_canonical_ids() -> bool:
+    """Whether a no-config launch must drop the CLI's bare ``claude-*`` rows.
+
+    Only the gateway's own listing can say. When it cannot be read the probe
+    rows stay (Claude Code's own picker beats an empty one), except on a
+    Databricks Unity Gateway, which routes only its own ids.
+    """
+    # One read of the ambient env serves the gate, the listing and the fallback.
+    env = _ambient_claude_env()
+    base_url = env[_UCODE_CLAUDE_BASE_URL_ENV]
+    if not _is_non_anthropic_host(base_url):
+        return False
+    serves = await asyncio.to_thread(_ambient_gateway_serves_canonical_ids, env)
+    if serves is not None:
+        return not serves
+    from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
+
+    return is_databricks_ai_gateway_url(base_url)
+
+
+def _rows_spell_canonical_ids(rows: list[dict[str, object]]) -> bool:
+    """Whether any catalog row runs a bare Anthropic id."""
+    return any(str(row.get("model") or row.get("id") or "").startswith("claude-") for row in rows)
 
 
 def _claude_family(token: str) -> str | None:
@@ -513,7 +733,13 @@ def claude_catalog_serves_model(
 
     if catalog_contains(rows, model):
         return True
-    if claude_config is None and _ambient_env_is_non_anthropic_gateway():
+    if (
+        claude_config is None
+        and _ambient_env_is_non_anthropic_gateway()
+        and not _rows_spell_canonical_ids(rows)
+    ):
+        # Bare rows permit canonical spellings, including when gateway discovery
+        # failed open; a catalog without any says the gateway does not route them.
         return False
     if claude_config is not None and not _serves_canonical_anthropic_ids(claude_config):
         return False
@@ -1308,19 +1534,32 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     from omnigent.onboarding.ambient import claude_managed_model_picker
 
     command, _ = resolve_claude_launch("claude", [])
-    ambient_gateway = None
-    if claude_config is None:
-        managed_base_url, _ = managed_claude_gateway_signal()
-        ambient_gateway = managed_base_url or os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV)
+    ambient_env = _ambient_claude_env() if claude_config is None else None
+    ambient_gateway = (ambient_env[_UCODE_CLAUDE_BASE_URL_ENV] or None) if ambient_env else None
+    # The ambient credential decides what the gateway's listing reveals, so a
+    # changed key or header re-probes; only its digest enters the key.
+    ambient_credentials = (
+        _ambient_credential_digest(ambient_env) if ambient_env and ambient_gateway else None
+    )
+    # A live-enumerated gateway shapes the catalog rows, so key configured
+    # gateways on the listing endpoint (never the credential).
+    listing_provider = claude_config.listing_provider if claude_config is not None else None
+    listing_endpoint = (
+        (listing_provider.kind, listing_provider.family, listing_provider.base_url)
+        if listing_provider is not None
+        else None
+    )
     return fingerprint_of(
         "claude-native",
-        "control-picker-v3",
+        "control-picker-v4",
         sorted(claude_config.env.items()) if claude_config is not None else None,
         claude_config.api_key_helper if claude_config is not None else None,
         claude_config.model if claude_config is not None else None,
         sorted(claude_config.routable_models) if claude_config is not None else None,
         binary_identity(command),
         ambient_gateway,
+        ambient_credentials,
+        listing_endpoint,
         claude_managed_model_picker() if claude_config is None else None,
     )
 
@@ -1334,7 +1573,9 @@ async def claude_model_catalog(
     Rows come from the harness's own enumeration alone (no configured/static
     merge). Servability filtering matches the listing composition: on a
     non-canonical endpoint, aliases resolving to bare Anthropic ids are
-    dropped unless the provider explicitly declares them routable. The
+    dropped unless the provider explicitly declares them routable; with no
+    config, the ambient gateway's own listing decides whether it is one
+    (:func:`_ambient_gateway_rejects_canonical_ids`). The
     default marker is what a Default launch of this config
     actually runs: the config's own launch pin when the provider resolves
     one (those launches pass ``--model`` explicitly), else the enumeration
@@ -1352,9 +1593,45 @@ async def claude_model_catalog(
         return []
     rows = list(probe.alias_rows)
     declared_models = set(claude_config.routable_models) if claude_config is not None else set()
-    _non_canonical = (
-        claude_config is not None and not _serves_canonical_anthropic_ids(claude_config)
-    ) or (claude_config is None and _ambient_env_is_non_anthropic_gateway())
+    # A configured gateway provider's live /v1/models is the source of truth for
+    # what it serves (mirrors pi #7007), overriding the hostname heuristic. It is
+    # three-valued: True (a bare ``claude-*`` is listed → keep the canonical
+    # rows), False (a reachable listing with none → authoritatively namespaced,
+    # e.g. OpenRouter → drop), or None (unreachable/empty → fail OPEN, keep the
+    # probe rows rather than blank the picker on a blip). Fetched off-thread.
+    # For ambient gateways (no config), the probe is made with the CLI's own
+    # credentials and headers; see _ambient_gateway_rejects_canonical_ids().
+    gateway_concrete_ids: tuple[str, ...] = ()
+    if claude_config is not None:
+        listing_provider = claude_config.listing_provider
+        gateway_serves_canonical: bool | None = None
+        if listing_provider is not None:
+            gateway_serves_canonical, gateway_concrete_ids = await asyncio.to_thread(
+                _gateway_claude_listing, listing_provider
+            )
+        if gateway_serves_canonical is True:
+            _non_canonical = False
+        elif gateway_serves_canonical is False:
+            _non_canonical = True
+        else:
+            # No listing provider, or the listing was undetermined: fall back to the
+            # hostname heuristic (which, for a configured gateway provider whose
+            # listing failed, keeps the probe rows — the fail-open path). Exception:
+            # Databricks AI Gateway whose /v1/models 404s should not offer bare
+            # claude-* ids that fail at the first turn.
+            from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
+
+            is_undetermined_databricks_gateway = (
+                gateway_serves_canonical is None
+                and listing_provider is not None
+                and listing_provider.base_url
+                and is_databricks_ai_gateway_url(listing_provider.base_url)
+            )
+            _non_canonical = is_undetermined_databricks_gateway or (
+                listing_provider is None and not _serves_canonical_anthropic_ids(claude_config)
+            )
+    else:
+        _non_canonical = await _ambient_gateway_rejects_canonical_ids()
     if _non_canonical:
         rows = [
             row
@@ -1362,6 +1639,16 @@ async def claude_model_catalog(
             if not str(row.get("model", "")).startswith("claude-")
             or str(row.get("model", "")) in declared_models
         ]
+    # Surface concrete claude ids the gateway lists that the probe did not offer,
+    # deduped against both the probe rows and each other.
+    if gateway_concrete_ids:
+        known = {str(row.get("model", "")) for row in rows} | {
+            str(row.get("id", "")) for row in rows
+        }
+        for mid in gateway_concrete_ids:
+            if mid not in known:
+                known.add(mid)
+                rows.append({"id": mid, "model": mid, "displayName": mid})
 
     configured_pin = claude_config.model if claude_config is not None else None
     default_model = configured_pin or probe.default_model
@@ -1379,14 +1666,12 @@ async def claude_model_catalog(
         else:
             out.append({key: value for key, value in row.items() if key != "isDefault"})
     if default_model and not marked and default_model not in probe.disabled_models:
-        # Append the observed default as its own honest row — but never
-        # claim a bare Anthropic id is launchable on an endpoint that
-        # rejects that spelling.
-        _canonical_ids_ok = (
-            claude_config is None and not _ambient_env_is_non_anthropic_gateway()
-        ) or (claude_config is not None and _serves_canonical_anthropic_ids(claude_config))
+        # Append the observed default as its own honest row — but never claim a
+        # bare Anthropic id is launchable on an endpoint that rejects that
+        # spelling. Canonical ids are servable exactly when the rows above were
+        # NOT dropped as non-canonical.
         servable = (
-            _canonical_ids_ok
+            not _non_canonical
             or not default_model.startswith("claude-")
             or default_model in declared_models
         )
@@ -3107,6 +3392,16 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
                     *([family.default_model] if family.default_model else []),
                 ]
             )
+        ),
+        # Record the endpoint the pre-launch picker can enumerate live; no I/O
+        # happens here so session launch/resume stay off the network.
+        listing_provider=model_catalog.ResolvedModelProvider(
+            kind=entry.kind,
+            family=ANTHROPIC_FAMILY,
+            base_url=family.base_url,
+            api_key=family.api_key,
+            auth_command=family.auth_command,
+            detail=f"provider {entry.name!r}",
         ),
     )
 

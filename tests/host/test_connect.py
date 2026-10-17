@@ -4191,6 +4191,7 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
         "HOME": "/root",
         "ANTHROPIC_API_KEY": "sk-a",
         "ANTHROPIC_BASE_URL": "https://gateway.example.com/anthropic",
+        "ANTHROPIC_CUSTOM_HEADERS": "x-litellm-api-key: fake-virtual-key",
         "ANTHROPIC_MODEL": "gateway-served-claude",
         "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-sub",
         "CODEX_ACCESS_TOKEN": "codex-workspace-token",
@@ -4215,6 +4216,9 @@ def test_build_runner_env_forwards_harness_credentials_and_endpoints() -> None:
     for name in (
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_BASE_URL",
+        # Extra gateway headers (a LiteLLM virtual key) travel with the endpoint so
+        # the runner's Claude Code and catalog see the host's gateway identity.
+        "ANTHROPIC_CUSTOM_HEADERS",
         # The gateway model pin travels with the key/endpoint — without it a
         # LiteLLM-style gateway session launches Claude Code model-less and
         # the gateway rejects Claude Code's own default model.

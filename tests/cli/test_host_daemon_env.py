@@ -240,6 +240,28 @@ def test_host_slice_key_gate_reaches_daemon_and_runner(
     assert runner_env["OMNIGENT_HOST_SLICE_KEY_ENABLED"] == enabled
 
 
+def test_ambient_gateway_custom_headers_reach_local_daemon_and_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A passthrough gateway's custom headers survive the local daemon and runner envs."""
+    headers = "x-litellm-api-key: sk-virtual"
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://litellm.example.com")
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", headers)
+
+    daemon_env = _build_host_daemon_env(server_url=None)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=_REMOTE_SERVER_URL,
+        runner_id="runner_custom_headers",
+        binding_token="binding-custom-headers",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    assert daemon_env["ANTHROPIC_CUSTOM_HEADERS"] == headers
+    assert runner_env["ANTHROPIC_CUSTOM_HEADERS"] == headers
+
+
 _CLAUDE_TOOL_SEARCH_ENV: Final = {
     "CLAUDE_CODE_USE_GATEWAY": "1",
     "ENABLE_TOOL_SEARCH": "true",
