@@ -1748,6 +1748,7 @@ def prepare_bridge_dir(
         payload: dict[str, object] = {
             "bridge_id": resolved_bridge_id,
             "active_session_id": conversation_id,
+            "active_session_generation": _fresh_ownership_generation(),
             "conversation_id": conversation_id,
             "workspace": str(workspace),
             "token": token,
@@ -2015,6 +2016,22 @@ def _atomic_write_user_json(path: Path, payload: _JsonObject) -> None:
                 tmp_path.unlink()
 
 
+@dataclass(frozen=True)
+class BridgeOwner:
+    """The conversation recorded as owning a bridge's pane, under one ownership generation."""
+
+    session_id: str
+    generation: str | None
+
+
+def _active_session_id_from_config(config: _JsonObject) -> str | None:
+    active = config.get("active_session_id")
+    if isinstance(active, str) and active:
+        return active
+    legacy = config.get("conversation_id")
+    return legacy if isinstance(legacy, str) and legacy else None
+
+
 def read_active_session_id(bridge_dir: Path) -> str | None:
     """
     Read the Omnigent session currently receiving bridge-originated events.
@@ -2023,14 +2040,30 @@ def read_active_session_id(bridge_dir: Path) -> str | None:
     :returns: Active Omnigent session id, e.g. ``"conv_abc123"``, or
         ``None`` when the bridge config is absent or malformed.
     """
+    return _active_session_id_from_config(_read_json_file(bridge_dir / _CONFIG_FILE))
+
+
+def read_bridge_owner(bridge_dir: Path) -> BridgeOwner | None:
+    """
+    Read the conversation currently owning the bridge's pane.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: The owner, or ``None`` when the bridge config records none.
+        ``generation`` changes on every ownership write and is ``None`` for
+        a config written before generations were recorded.
+    """
     config = _read_json_file(bridge_dir / _CONFIG_FILE)
-    if not isinstance(config, dict):
+    session_id = _active_session_id_from_config(config)
+    if session_id is None:
         return None
-    active = config.get("active_session_id")
-    if isinstance(active, str) and active:
-        return active
-    legacy = config.get("conversation_id")
-    return legacy if isinstance(legacy, str) and legacy else None
+    generation = config.get("active_session_generation")
+    return BridgeOwner(
+        session_id, generation if isinstance(generation, str) and generation else None
+    )
+
+
+def _fresh_ownership_generation() -> str:
+    return secrets.token_hex(16)
 
 
 def read_launch_model(bridge_dir: Path) -> str | None:
@@ -2145,14 +2178,43 @@ def record_model_vocabulary(
 
 
 @contextlib.contextmanager
-def _bridge_metadata_write_lock(bridge_dir: Path) -> Iterator[None]:
+def _bridge_metadata_write_lock(bridge_dir: Path, *, timeout_s: float = -1) -> Iterator[None]:
     """Cross-process mutual exclusion for bridge metadata read-modify-writes.
 
     Shares bridge-dir preparation's on-disk lock, so metadata updates and
     :func:`prepare_bridge_dir` exclude each other across processes.
+
+    :param timeout_s: Seconds to wait for the lock; ``-1`` waits indefinitely.
+    :raises filelock.Timeout: If the lock is still held after *timeout_s*.
     """
-    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
+    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir, timeout_s=timeout_s):
         yield
+
+
+# How long a failed delivery's cleanup waits for a concurrent ownership writer
+# before leaving the pane alone.
+_OWNER_CLEANUP_LOCK_TIMEOUT_S = 1.0
+
+
+@contextlib.contextmanager
+def pane_owner_for_cleanup(bridge_dir: Path) -> Iterator[BridgeOwner | None]:
+    """
+    Read the pane's owner and hold ownership writers off until the caller leaves.
+
+    Holding the metadata lock across the owner check and the kill keeps a
+    ``/clear`` rotation or bridge re-preparation from handing the pane to a
+    newer conversation in between.
+
+    :param bridge_dir: Bridge directory path.
+    :yields: The recorded owner, or ``None`` when the bridge records none.
+    :raises RuntimeError: If a writer still holds the lock after the bounded
+        wait; ownership is in flux, so the caller must not kill.
+    """
+    try:
+        with _bridge_metadata_write_lock(bridge_dir, timeout_s=_OWNER_CLEANUP_LOCK_TIMEOUT_S):
+            yield read_bridge_owner(bridge_dir)
+    except FileLockTimeout as exc:
+        raise RuntimeError("bridge ownership is being updated; the pane was left running") from exc
 
 
 def read_bridge_id(bridge_dir: Path) -> str | None:
@@ -2174,6 +2236,8 @@ def write_active_session_id(bridge_dir: Path, session_id: str) -> None:
     """
     Atomically update the bridge's active Omnigent session.
 
+    Each update starts a new ownership generation (see :func:`read_bridge_owner`).
+
     :param bridge_dir: Bridge directory path.
     :param session_id: New active Omnigent session id, e.g.
         ``"conv_abc123"``.
@@ -2185,6 +2249,7 @@ def write_active_session_id(bridge_dir: Path, session_id: str) -> None:
         if not config:
             raise RuntimeError(f"bridge config missing: {bridge_dir / _CONFIG_FILE}")
         config["active_session_id"] = session_id
+        config["active_session_generation"] = _fresh_ownership_generation()
         config["conversation_id"] = session_id
         config["updated_at"] = time.time()
         _write_json_file(bridge_dir / _CONFIG_FILE, config)

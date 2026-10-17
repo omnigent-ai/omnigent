@@ -16,6 +16,7 @@ from omnigent.harnesses.claude_native.bridge import (
     CLAUDE_FRAMEWORK_CONTEXT_FILE,
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
+    BridgeOwner,
     ClaudeMessageNotAccepted,
     ClaudePromptTimeout,
     ClaudeSignInPending,
@@ -28,7 +29,8 @@ from omnigent.harnesses.claude_native.bridge import (
     inject_user_message,
     is_auth_slash_command,
     kill_session,
-    read_active_session_id,
+    pane_owner_for_cleanup,
+    read_bridge_owner,
     read_claude_status_model,
     read_launch_model,
     read_model_env,
@@ -110,7 +112,8 @@ class ClaudeNativeExecutor(Executor):
         :returns: ``True`` when tmux accepted the keystrokes.
         """
         del session_key
-        if not _session_is_active(self._bridge_dir, self._request_session_id):
+        owner = read_bridge_owner(self._bridge_dir)
+        if not _session_is_active(owner, self._request_session_id):
             return False
         text = _content_to_text(content, self._bridge_dir)
         if not text:
@@ -125,19 +128,21 @@ class ClaudeNativeExecutor(Executor):
             return False
         try:
             async with self._inject_lock:
-                await self._inject_prompt(text, framework_notices(content))
+                await self._inject_prompt(text, framework_notices(content), owner)
         except RuntimeError:
             return False
         return True
 
-    async def _inject_prompt(self, text: str, notices: list[str]) -> None:
+    async def _inject_prompt(
+        self, text: str, notices: list[str], owner: BridgeOwner | None
+    ) -> None:
         """Inject user text with one-shot context while holding the injection lock."""
         context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
         context_path.unlink(missing_ok=True)
         if notices:
             context_path.write_text("\n\n".join(notices), encoding="utf-8")
         try:
-            await self._inject(partial(inject_user_message, self._bridge_dir, content=text))
+            await self._inject(partial(inject_user_message, self._bridge_dir, content=text), owner)
         except BaseException:
             context_path.unlink(missing_ok=True)
             raise
@@ -173,7 +178,8 @@ class ClaudeNativeExecutor(Executor):
             or :class:`ExecutorError` on bridge failure.
         """
         del tools, system_prompt
-        if not _session_is_active(self._bridge_dir, self._request_session_id):
+        owner = read_bridge_owner(self._bridge_dir)
+        if not _session_is_active(owner, self._request_session_id):
             yield ExecutorError(
                 message=(
                     "Claude native session is no longer active after /clear; "
@@ -243,12 +249,13 @@ class ClaudeNativeExecutor(Executor):
                                 command=f"/model {wanted_model_arg}",
                                 auto_confirm=True,
                                 confirm_hint=SWITCH_MODEL_DIALOG_HINT,
-                            )
+                            ),
+                            owner,
                         )
                         # Track the routed id, not the alias: the next turn's
                         # comparison is against what routing asked for.
                         self._applied_model = wanted_model
-                    await self._inject_prompt(text, notices)
+                    await self._inject_prompt(text, notices, owner)
         except ClaudeTerminalExited as exc:
             # Claude Code exits 0 on /quit or a closed window. The turn still
             # fails, but the person's own teardown is not a defect; a pane that
@@ -261,7 +268,7 @@ class ClaudeNativeExecutor(Executor):
                 exc_info=not clean_exit,
                 extra={"session_id": self._request_session_id},
             )
-            cleanup_error = self._reap_failed_turn()
+            cleanup_error = self._reap_failed_turn(owner)
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
@@ -272,7 +279,7 @@ class ClaudeNativeExecutor(Executor):
                 "claude-native: prompt delivery to harness timed out",
                 extra={"session_id": self._request_session_id},
             )
-            cleanup_error = self._reap_failed_turn()
+            cleanup_error = self._reap_failed_turn(owner)
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
@@ -331,7 +338,7 @@ class ClaudeNativeExecutor(Executor):
             return
         yield TurnComplete(response=None)
 
-    async def _inject(self, operation: Callable[[], None]) -> None:
+    async def _inject(self, operation: Callable[[], None], owner: BridgeOwner | None) -> None:
         """Drain cancelled delivery workers before releasing the pane's injection lock."""
         cancelled = threading.Event()
         with cancellable_injection(cancelled):
@@ -345,13 +352,32 @@ class ClaudeNativeExecutor(Executor):
                     await asyncio.shield(worker)
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 worker.result()
-            self._reap_failed_turn()
+            self._reap_failed_turn(owner)
             raise
 
-    def _reap_failed_turn(self) -> str | None:
-        """Kill the Claude pane before a delivery timeout becomes ``failed``."""
+    def _reap_failed_turn(self, owner: BridgeOwner | None = None) -> str | None:
+        """
+        Kill the Claude pane before a delivery failure becomes ``failed``.
+
+        One physical pane serves every conversation ``/clear`` rotates through
+        the bridge, so the kill happens only while the bridge still records
+        this executor's conversation under the same generation as *owner*.
+
+        :param owner: The owner read when the delivery was authorized. ``None``
+            (no owner was recorded then) refuses the kill.
+        :returns: A cleanup error to show beside the delivery error, or ``None``.
+        """
         try:
-            kill_session(self._bridge_dir, timeout_s=1.0)
+            with pane_owner_for_cleanup(self._bridge_dir) as current_owner:
+                if not self._owns_pane(current_owner, owner):
+                    _logger.info(
+                        "claude-native: failed delivery no longer owns the pane "
+                        "(owner now %s); leaving it running",
+                        current_owner.session_id if current_owner is not None else "unrecorded",
+                        extra={"session_id": self._request_session_id},
+                    )
+                    return None
+                kill_session(self._bridge_dir, timeout_s=1.0)
         except TmuxSessionNotAdvertised:
             _logger.debug(
                 "claude-native: timed-out session already disappeared",
@@ -365,6 +391,14 @@ class ClaudeNativeExecutor(Executor):
             )
             return describe_exception(exc)
         return None
+
+    def _owns_pane(self, current: BridgeOwner | None, captured: BridgeOwner | None) -> bool:
+        """Whether the advertised pane still belongs to the delivery that failed."""
+        if current is None or captured is None:
+            return False
+        if self._request_session_id is not None and current.session_id != self._request_session_id:
+            return False
+        return current == captured
 
     def _model_command_arg(self, wanted_model: str | None) -> str | None:
         """
@@ -496,11 +530,12 @@ def _request_session_id_from_env() -> str | None:
     return raw or None
 
 
-def _session_is_active(bridge_dir: Path, request_session_id: str | None) -> bool:
+def _session_is_active(owner: BridgeOwner | None, request_session_id: str | None) -> bool:
     """
     Return whether a request may inject into the shared Claude pane.
 
-    :param bridge_dir: Native bridge directory.
+    :param owner: The conversation recorded as owning the pane, or ``None``
+        when the bridge records none.
     :param request_session_id: Omnigent session id from
         :data:`REQUEST_SESSION_ID_ENV_VAR`, e.g. ``"conv_abc123"``.
         ``None`` preserves old harness spawns that lack the guard env.
@@ -508,8 +543,7 @@ def _session_is_active(bridge_dir: Path, request_session_id: str | None) -> bool
     """
     if request_session_id is None:
         return True
-    active_session_id = read_active_session_id(bridge_dir)
-    return active_session_id is None or active_session_id == request_session_id
+    return owner is None or owner.session_id == request_session_id
 
 
 def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:

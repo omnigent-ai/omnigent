@@ -288,6 +288,51 @@ def test_prepare_bridge_dir_preserves_token_and_updates_runtime(
     assert "headers" not in second_config
 
 
+def test_ownership_writers_record_a_fresh_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every owner write starts a generation no earlier owner shared, so a pane
+    handed away and back (or re-prepared) is not mistaken for an unchanged one."""
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
+
+    bridge_dir = prepare_bridge_dir("conv_a", workspace=tmp_path)
+    prepared = claude_native_bridge.read_bridge_owner(bridge_dir)
+    assert prepared is not None
+    assert prepared.session_id == "conv_a"
+    assert prepared.generation
+
+    claude_native_bridge.write_active_session_id(bridge_dir, "conv_b")
+    rotated = claude_native_bridge.read_bridge_owner(bridge_dir)
+    assert rotated is not None
+    assert rotated.session_id == "conv_b"
+    assert rotated.generation not in {None, prepared.generation}
+
+    claude_native_bridge.write_active_session_id(bridge_dir, "conv_a")
+    returned = claude_native_bridge.read_bridge_owner(bridge_dir)
+    assert returned is not None
+    assert returned.session_id == "conv_a"
+    assert returned.generation not in {None, prepared.generation, rotated.generation}
+    assert claude_native_bridge.read_active_session_id(bridge_dir) == "conv_a"
+
+    prepare_bridge_dir("conv_a", workspace=tmp_path)
+    reprepared = claude_native_bridge.read_bridge_owner(bridge_dir)
+    assert reprepared is not None
+    assert reprepared.generation not in {None, returned.generation}
+
+
+def test_read_bridge_owner_reads_configs_written_before_generations(tmp_path: Path) -> None:
+    bridge_dir = tmp_path / "bridge"
+    assert claude_native_bridge.read_bridge_owner(bridge_dir) is None
+
+    bridge_dir.mkdir()
+    (bridge_dir / "bridge.json").write_text(json.dumps({"conversation_id": "conv_old"}))
+
+    assert claude_native_bridge.read_bridge_owner(bridge_dir) == claude_native_bridge.BridgeOwner(
+        "conv_old", None
+    )
+
+
 def test_prepare_bridge_dir_preserves_permission_hook_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import json
 import logging
 import threading
 from pathlib import Path
@@ -25,6 +26,7 @@ from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
 from omnigent.inner.native_attachments import attachment_cache_dir
+from omnigent.native import native_bridge_common
 
 # Minimal valid 1x1 white PNG used for multimodal attachment tests.
 _TINY_PNG_B64 = (
@@ -33,6 +35,17 @@ _TINY_PNG_B64 = (
 )
 _TINY_PNG_DATA_URI = f"data:image/png;base64,{_TINY_PNG_B64}"
 _TINY_PNG_BYTES = base64.b64decode(_TINY_PNG_B64)
+
+
+def _owned_bridge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owner: str = "conv_a") -> Path:
+    """A bridge dir whose pane *owner* is also the conversation this executor serves."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    (bridge_dir / "bridge.json").write_text(
+        json.dumps({"active_session_id": owner, "active_session_generation": "gen-0"})
+    )
+    monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, owner)
+    return bridge_dir
 
 
 @pytest.mark.asyncio
@@ -1580,7 +1593,7 @@ async def test_run_turn_reaps_tmux_before_reporting_prompt_timeout(
     tmp_path: Path,
 ) -> None:
     """A readiness timeout cannot leave a failed turn's pane alive."""
-    bridge_dir = tmp_path / "bridge"
+    bridge_dir = _owned_bridge(tmp_path, monkeypatch)
     killed: list[Path] = []
 
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
@@ -1969,7 +1982,8 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
     monkeypatch.setattr(claude_native_executor, "inject_user_message", inject)
     monkeypatch.setattr(claude_native_executor, "inject_slash_command", inject)
     monkeypatch.setattr(claude_native_executor, "kill_session", reap)
-    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    bridge_dir = _owned_bridge(tmp_path, monkeypatch)
+    executor = ClaudeNativeExecutor(bridge_dir)
     monkeypatch.setattr(
         executor, "_model_command_arg", lambda model: "sonnet" if delivery == "model" else None
     )
@@ -2008,7 +2022,7 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
             task.result()
         assert finished.is_set()
         assert not executor._inject_lock.locked()
-        assert reaped == [tmp_path / "bridge"]
+        assert reaped == [bridge_dir]
         assert commands == []
     finally:
         release.set()
@@ -2074,7 +2088,7 @@ async def test_run_turn_reports_reap_failure_with_prompt_timeout(
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
     monkeypatch.setattr(claude_native_executor, "kill_session", fail_kill)
 
-    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    executor = ClaudeNativeExecutor(_owned_bridge(tmp_path, monkeypatch))
     events = [
         event
         async for event in executor.run_turn(
@@ -2108,7 +2122,7 @@ async def test_run_turn_ignores_missing_tmux_during_timeout_reap(
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
     monkeypatch.setattr(claude_native_executor, "kill_session", absent_kill)
 
-    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+    executor = ClaudeNativeExecutor(_owned_bridge(tmp_path, monkeypatch))
     events = [
         event
         async for event in executor.run_turn(
@@ -2120,3 +2134,186 @@ async def test_run_turn_ignores_missing_tmux_during_timeout_reap(
 
     assert isinstance(events[0], ExecutorError)
     assert events[0].message == "terminal did not become ready"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rotation",
+    [
+        pytest.param(["conv_b"], id="handed-to-another-conversation"),
+        pytest.param(["conv_b", "conv_a"], id="handed-away-and-back"),
+    ],
+)
+async def test_failed_delivery_cleanup_spares_a_pane_that_changed_hands(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, rotation: list[str]
+) -> None:
+    """A delivery that fails after ``/clear`` moved the pane to a newer conversation
+    must not kill it -- even if the same conversation id owns it again later, since
+    that is a new ownership generation."""
+    bridge_dir = _owned_bridge(tmp_path, monkeypatch)
+    killed: list[Path] = []
+
+    def rotate_then_fail(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del content, timeout_s
+        # Each rotation records a new owner generation, as the real writers do.
+        for generation, session_id in enumerate(rotation, start=1):
+            (bridge_dir_arg / "bridge.json").write_text(
+                json.dumps(
+                    {
+                        "active_session_id": session_id,
+                        "active_session_generation": f"gen-{generation}",
+                    }
+                )
+            )
+        raise ClaudePromptTimeout("terminal did not become ready")
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", rotate_then_fail)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "kill_session",
+        lambda bridge_dir_arg, *, timeout_s: killed.append(bridge_dir_arg),
+    )
+
+    events = [
+        event
+        async for event in ClaudeNativeExecutor(bridge_dir).run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+        )
+    ]
+
+    assert killed == []
+    assert isinstance(events[0], ExecutorError)
+    assert events[0].message == "terminal did not become ready"
+    assert events[0].undelivered is True
+
+
+@pytest.mark.asyncio
+async def test_failed_delivery_cleanup_refuses_while_ownership_is_being_rewritten(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """While an ownership writer holds the bridge metadata lock, the cleanup waits
+    briefly, then leaves the pane running and reports that, instead of stalling."""
+    bridge_dir = _owned_bridge(tmp_path, monkeypatch)
+    killed: list[Path] = []
+    monkeypatch.setattr(claude_bridge, "_OWNER_CLEANUP_LOCK_TIMEOUT_S", 0.1)
+
+    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir_arg, content, timeout_s
+        raise ClaudePromptTimeout("terminal did not become ready")
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "kill_session",
+        lambda bridge_dir_arg, *, timeout_s: killed.append(bridge_dir_arg),
+    )
+
+    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
+        events = [
+            event
+            async for event in ClaudeNativeExecutor(bridge_dir).run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="",
+            )
+        ]
+
+    assert killed == []
+    assert isinstance(events[0], ExecutorError)
+    assert "Cleanup also failed: bridge ownership is being updated" in events[0].message
+    assert events[0].undelivered is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owner_at_start", "owner_at_failure"),
+    [
+        pytest.param(None, None, id="never-recorded"),
+        pytest.param(None, "conv_a", id="recorded-after-the-delivery-began"),
+        pytest.param("conv_a", None, id="record-lost-after-the-delivery-began"),
+    ],
+)
+async def test_failed_delivery_cleanup_spares_a_pane_without_a_continuous_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    owner_at_start: str | None,
+    owner_at_failure: str | None,
+) -> None:
+    """Cleanup may reap only a pane whose owner was recorded when the delivery was
+    authorized and is still recorded, unchanged, when the delivery fails."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "conv_a")
+    if owner_at_start is not None:
+        (bridge_dir / "bridge.json").write_text(
+            json.dumps({"active_session_id": owner_at_start, "active_session_generation": "gen-0"})
+        )
+    killed: list[Path] = []
+
+    def rewrite_owner_then_fail(
+        bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0
+    ) -> None:
+        del content, timeout_s
+        config: dict[str, str] = {}
+        if owner_at_failure is not None:
+            config = {"active_session_id": owner_at_failure, "active_session_generation": "gen-1"}
+        (bridge_dir_arg / "bridge.json").write_text(json.dumps(config))
+        raise ClaudePromptTimeout("terminal did not become ready")
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", rewrite_owner_then_fail)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "kill_session",
+        lambda bridge_dir_arg, *, timeout_s: killed.append(bridge_dir_arg),
+    )
+
+    events = [
+        event
+        async for event in ClaudeNativeExecutor(bridge_dir).run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+        )
+    ]
+
+    assert killed == []
+    assert isinstance(events[0], ExecutorError)
+    assert events[0].message == "terminal did not become ready"
+
+
+@pytest.mark.asyncio
+async def test_failed_delivery_cleanup_still_reaps_an_owner_recorded_without_a_generation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A bridge written before generations were recorded still gets its unchanged
+    owner's pane reaped."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    (bridge_dir / "bridge.json").write_text(json.dumps({"active_session_id": "conv_a"}))
+    monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "conv_a")
+    killed: list[Path] = []
+
+    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir_arg, content, timeout_s
+        raise ClaudePromptTimeout("terminal did not become ready")
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "kill_session",
+        lambda bridge_dir_arg, *, timeout_s: killed.append(bridge_dir_arg),
+    )
+
+    events = [
+        event
+        async for event in ClaudeNativeExecutor(bridge_dir).run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+        )
+    ]
+
+    assert killed == [bridge_dir]
+    assert isinstance(events[0], ExecutorError)
