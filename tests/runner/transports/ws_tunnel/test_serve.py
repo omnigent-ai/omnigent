@@ -1860,13 +1860,13 @@ async def test_serve_tunnel_stops_reconnecting_after_graceful_shutdown(
 
 
 @pytest.mark.asyncio
-async def test_serve_tunnel_disconnect_row_names_local_shutdown(
+async def test_serve_tunnel_terminal_row_names_local_shutdown(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A close that breaks while the runner is stopping is a local shutdown.
 
-    The disconnect row shares its classification inputs with the OTel
+    The terminal row shares its classification inputs with the OTel
     counter, so a reset close handshake during shutdown is not reported as a
     transport error announcing a retry the loop never makes.
 
@@ -1886,13 +1886,7 @@ async def test_serve_tunnel_disconnect_row_names_local_shutdown(
         shutdown_event.set()
         raise ConnectionError("close handshake reset")
 
-    sleeps: list[float] = []
-
-    async def _sleep(delay: float) -> None:
-        sleeps.append(delay)
-
     monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
-    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
     await asyncio.wait_for(
         serve_tunnel(
             _noop_app,
@@ -1907,13 +1901,15 @@ async def test_serve_tunnel_disconnect_row_names_local_shutdown(
     rows = [
         r.attributes
         for r in caplog.records
-        if getattr(r, "event_name", None) == "runner_tunnel_disconnected"
+        if getattr(r, "event_name", None) == "runner_tunnel_attempt_finished"
     ]
     assert [r["disconnect_reason"] for r in rows] == ["local_shutdown"]
     assert rows[0]["connected"] is True
-    assert rows[0]["error_type"] == "ConnectionError"
-    # The loop slept once and then honoured the shutdown instead of reconnecting.
-    assert len(sleeps) == 1
+    assert rows[0]["source_error_type"] == "ConnectionError"
+    assert rows[0]["outcome"] == "shutdown_after_error"
+    assert not any(
+        getattr(r, "event_name", None) == "runner_tunnel_disconnected" for r in caplog.records
+    )
 
 
 @pytest.mark.asyncio

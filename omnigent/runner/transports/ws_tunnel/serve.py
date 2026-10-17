@@ -19,7 +19,6 @@ import contextlib
 import logging
 import os
 import random
-import sys
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -546,167 +545,175 @@ async def serve_tunnel(
         attempt += 1
         connection_id = uuid.uuid4().hex
         diagnostics = TunnelDiagnostics()
+        terminal_error: BaseException | None = None
         try:
-            activity_kwargs = {"on_activity": on_activity} if on_activity is not None else {}
-            close_details = await _serve_tunnel_once(
-                app,
-                tunnel_url=tunnel_url,
-                server_url=server_url,
-                runner_id=runner_id,
-                runner_version=runner_version,
-                auth_token=auth_token,
-                tunnel_token=tunnel_token,
-                shutdown_event=shutdown_event,
-                on_graceful_shutdown=on_graceful_shutdown,
-                on_connected=_mark_connected,
-                on_ready=_notify_reconnected if reconnecting else None,
-                on_resume_note=_note_resume_from_suspend,
-                direct_attach_port=direct_attach_port,
-                direct_attach_token=direct_attach_token,
-                connection_id=connection_id,
-                reconnect=reconnecting,
-                attempt=attempt,
-                disconnected_monotonic=disconnected_monotonic,
-                event_dispatcher=event_dispatcher,
-                diagnostics=diagnostics,
-                **activity_kwargs,
-            )
-            # A graceful shutdown drains and closes the connection cleanly,
-            # then returns here; stop looping instead of reconnecting.
-            if shutdown_event is not None and shutdown_event.is_set():
-                return
-            delay_s = _INITIAL_RECONNECT_DELAY_S
-        except asyncio.CancelledError as exc:
-            disconnect_error = exc
-            raise
-        except WebSocketException as exc:
-            disconnect_error = exc
-            redirect_url = _websocket_auth_redirect_url(exc)
-            if redirect_url is not None:
-                login_redirect_streak += 1
-                await asyncio.to_thread(_prepare_auth_retry, auth_token_factory)
-                # The websockets library auto-followed a redirect away
-                # from our ws:// endpoint to an http(s):// URL —
-                # typically the Databricks App login page. On a runner
-                # that never authenticated this is a credentials
-                # problem retrying can't fix, so after a short streak
-                # (allowing for a server mid-restart) fail loud with
-                # the actual URL. On a runner that HAS served this
-                # tunnel it usually means the bearer expired
-                # mid-session (Apps signals that as this redirect, not
-                # a 401) — keep retrying: the loop-top refresh mints a
-                # fresh token each attempt, so the session survives
-                # once credentials become valid again.
-                if not ever_connected and login_redirect_streak >= _LOGIN_REDIRECT_FATAL_ATTEMPTS:
-                    raise RunnerTunnelAuthRejectedError(
-                        f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
-                        f"(redirect to non-WebSocket URL {redirect_url} "
-                        f"persisted across {login_redirect_streak} attempts); "
-                        "the server likely requires auth — "
-                        f"{_reauth_hint(server_url)}, or "
-                        f"run `{cli_invocation()} setup` to configure credentials"
-                    ) from exc
-                retry_reason = (
-                    f"login-page redirect during upgrade ({redirect_url}); "
-                    "retrying with refreshed credentials"
+            try:
+                activity_kwargs = {"on_activity": on_activity} if on_activity is not None else {}
+                close_details = await _serve_tunnel_once(
+                    app,
+                    tunnel_url=tunnel_url,
+                    server_url=server_url,
+                    runner_id=runner_id,
+                    runner_version=runner_version,
+                    auth_token=auth_token,
+                    tunnel_token=tunnel_token,
+                    shutdown_event=shutdown_event,
+                    on_graceful_shutdown=on_graceful_shutdown,
+                    on_connected=_mark_connected,
+                    on_ready=_notify_reconnected if reconnecting else None,
+                    on_resume_note=_note_resume_from_suspend,
+                    direct_attach_port=direct_attach_port,
+                    direct_attach_token=direct_attach_token,
+                    connection_id=connection_id,
+                    reconnect=reconnecting,
+                    attempt=attempt,
+                    disconnected_monotonic=disconnected_monotonic,
+                    event_dispatcher=event_dispatcher,
+                    diagnostics=diagnostics,
+                    **activity_kwargs,
                 )
-            else:
-                http_status = _websocket_http_status(exc)
-                if http_status is not None and http_status in _REFRESHABLE_HTTP_STATUSES:
-                    http_auth_rejection_streak += 1
-                    if (
-                        not ever_connected
-                        and auth_token is None
-                        and auth_token_factory is not None
-                        and not getattr(auth_token_factory, "declined", False)
-                        and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
-                    ):
-                        # Same streak as the rejection below: a transient mint
-                        # failure (factory returned None) still gets the loop-top
-                        # re-mint; only the message names the local cause.
-                        raise RunnerTunnelAuthRejectedError(
-                            f"{RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX}"
-                            f"(HTTP {http_status} persisted across "
-                            f"{http_auth_rejection_streak} unauthenticated attempts; the "
-                            "credential source returned no token, e.g. the host "
-                            "credential service's grant expired or was rejected); "
-                            f"{_reauth_hint(server_url)}"
-                        ) from exc
-                    if (
-                        not ever_connected
-                        and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
-                    ):
-                        raise RunnerTunnelAuthRejectedError(
-                            f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
-                            f"(HTTP {http_status} persisted across "
-                            f"{http_auth_rejection_streak} attempts); "
-                            f"{_reauth_hint(server_url)}"
-                        ) from exc
-                    # Invalidate the cached token so the loop-top _refresh_auth_token
-                    # fetches a fresh one on the next attempt. The loop-top call is
-                    # already guarded against transient factory errors (OSError etc.),
-                    # so we don't call the factory directly here. Also clear a
-                    # 5xx-latched mint decline: the rejection proves the server
-                    # requires auth, so the next refresh must re-mint.
+                # A graceful shutdown drains and closes the connection cleanly,
+                # then returns here; stop looping instead of reconnecting.
+                if shutdown_event is not None and shutdown_event.is_set():
+                    return
+                delay_s = _INITIAL_RECONNECT_DELAY_S
+            except asyncio.CancelledError as exc:
+                disconnect_error = exc
+                raise
+            except WebSocketException as exc:
+                disconnect_error = exc
+                redirect_url = _websocket_auth_redirect_url(exc)
+                if redirect_url is not None:
+                    login_redirect_streak += 1
                     await asyncio.to_thread(_prepare_auth_retry, auth_token_factory)
-                    retry_reason = f"HTTP {http_status}; retrying with refreshed token"
-                    if ever_connected:
-                        # Escalate the backoff rather than resetting it: a rejection
-                        # that outlives the token refresh is a network path answering
-                        # the upgrade, and the base delay would retry every ~0.5s for
-                        # the whole outage.
-                        _logger.warning(
-                            "HTTP %d after a successful upgrade; retrying — "
-                            "check VPN/network connectivity",
-                            http_status,
-                            extra={"session_id": runner_primary_session_id()},
-                        )
-                    else:
-                        _logger.info(
-                            "HTTP %d; invalidated auth token, retrying",
-                            http_status,
-                            extra={"session_id": runner_primary_session_id()},
-                        )
-                        delay_s = _INITIAL_RECONNECT_DELAY_S
-                else:
-                    close_code = _websocket_close_code(exc)
-                    if close_code in _FATAL_SERVER_CLOSE_CODES:
-                        raise RuntimeError(
-                            f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
-                            f"(close code {close_code}); check frame protocol compatibility"
-                        ) from exc
+                    # The websockets library auto-followed a redirect away
+                    # from our ws:// endpoint to an http(s):// URL —
+                    # typically the Databricks App login page. On a runner
+                    # that never authenticated this is a credentials
+                    # problem retrying can't fix, so after a short streak
+                    # (allowing for a server mid-restart) fail loud with
+                    # the actual URL. On a runner that HAS served this
+                    # tunnel it usually means the bearer expired
+                    # mid-session (Apps signals that as this redirect, not
+                    # a 401) — keep retrying: the loop-top refresh mints a
+                    # fresh token each attempt, so the session survives
+                    # once credentials become valid again.
                     if (
-                        close_code in _TUNNEL_RECYCLE_CLOSE_CODES
-                        or http_status in _TUNNEL_RECYCLE_HTTP_STATUSES
+                        not ever_connected
+                        and login_redirect_streak >= _LOGIN_REDIRECT_FATAL_ATTEMPTS
                     ):
-                        # Routine ingress recycle — reconnect promptly, don't
-                        # escalate the backoff (which would leave the runner
-                        # unregistered for seconds each recycle and drop
-                        # in-flight message delivery).
-                        delay_s = _INITIAL_RECONNECT_DELAY_S
-                        recycle = True
-                        server_recycle = True
-                        detail = (
-                            f"close {close_code}" if close_code else f"HTTP {http_status or 0}"
-                        )
-                        retry_reason = (
-                            f"server recycled the tunnel ({detail}); reconnecting promptly"
-                        )
+                        raise RunnerTunnelAuthRejectedError(
+                            f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
+                            f"(redirect to non-WebSocket URL {redirect_url} "
+                            f"persisted across {login_redirect_streak} attempts); "
+                            "the server likely requires auth — "
+                            f"{_reauth_hint(server_url)}, or "
+                            f"run `{cli_invocation()} setup` to configure credentials"
+                        ) from exc
+                    retry_reason = (
+                        f"login-page redirect during upgrade ({redirect_url}); "
+                        "retrying with refreshed credentials"
+                    )
+                else:
+                    http_status = _websocket_http_status(exc)
+                    if http_status is not None and http_status in _REFRESHABLE_HTTP_STATUSES:
+                        http_auth_rejection_streak += 1
+                        if (
+                            not ever_connected
+                            and auth_token is None
+                            and auth_token_factory is not None
+                            and not getattr(auth_token_factory, "declined", False)
+                            and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+                        ):
+                            # Same streak as the rejection below: a transient mint
+                            # failure (factory returned None) still gets the loop-top
+                            # re-mint; only the message names the local cause.
+                            raise RunnerTunnelAuthRejectedError(
+                                f"{RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX}"
+                                f"(HTTP {http_status} persisted across "
+                                f"{http_auth_rejection_streak} unauthenticated attempts; the "
+                                "credential source returned no token, e.g. the host "
+                                "credential service's grant expired or was rejected); "
+                                f"{_reauth_hint(server_url)}"
+                            ) from exc
+                        if (
+                            not ever_connected
+                            and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+                        ):
+                            raise RunnerTunnelAuthRejectedError(
+                                f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
+                                f"(HTTP {http_status} persisted across "
+                                f"{http_auth_rejection_streak} attempts); "
+                                f"{_reauth_hint(server_url)}"
+                            ) from exc
+                        # Invalidate the cached token so the loop-top _refresh_auth_token
+                        # fetches a fresh one on the next attempt. The loop-top call is
+                        # already guarded against transient factory errors (OSError etc.),
+                        # so we don't call the factory directly here. Also clear a
+                        # 5xx-latched mint decline: the rejection proves the server
+                        # requires auth, so the next refresh must re-mint.
+                        await asyncio.to_thread(_prepare_auth_retry, auth_token_factory)
+                        retry_reason = f"HTTP {http_status}; retrying with refreshed token"
+                        if ever_connected:
+                            # Escalate the backoff rather than resetting it: a rejection
+                            # that outlives the token refresh is a network path answering
+                            # the upgrade, and the base delay would retry every ~0.5s for
+                            # the whole outage.
+                            _logger.warning(
+                                "HTTP %d after a successful upgrade; retrying — "
+                                "check VPN/network connectivity",
+                                http_status,
+                                extra={"session_id": runner_primary_session_id()},
+                            )
+                        else:
+                            _logger.info(
+                                "HTTP %d; invalidated auth token, retrying",
+                                http_status,
+                                extra={"session_id": runner_primary_session_id()},
+                            )
+                            delay_s = _INITIAL_RECONNECT_DELAY_S
                     else:
-                        retry_reason = str(exc)
-        except (ConnectionError, OSError, ValueError) as exc:
-            disconnect_error = exc
-            retry_reason = str(exc)
+                        close_code = _websocket_close_code(exc)
+                        if close_code in _FATAL_SERVER_CLOSE_CODES:
+                            raise RuntimeError(
+                                f"{RUNNER_TUNNEL_REJECTION_PREFIX}"
+                                f"(close code {close_code}); check frame protocol compatibility"
+                            ) from exc
+                        if (
+                            close_code in _TUNNEL_RECYCLE_CLOSE_CODES
+                            or http_status in _TUNNEL_RECYCLE_HTTP_STATUSES
+                        ):
+                            # Routine ingress recycle — reconnect promptly, don't
+                            # escalate the backoff (which would leave the runner
+                            # unregistered for seconds each recycle and drop
+                            # in-flight message delivery).
+                            delay_s = _INITIAL_RECONNECT_DELAY_S
+                            recycle = True
+                            server_recycle = True
+                            detail = (
+                                f"close {close_code}" if close_code else f"HTTP {http_status or 0}"
+                            )
+                            retry_reason = (
+                                f"server recycled the tunnel ({detail}); reconnecting promptly"
+                            )
+                        else:
+                            retry_reason = str(exc)
+            except (ConnectionError, OSError, ValueError) as exc:
+                disconnect_error = exc
+                retry_reason = str(exc)
+            except BaseException as exc:
+                # Unexpected post-connect failures (e.g. a raising callback) must
+                # not be recorded as clean peer closes.
+                disconnect_error = exc
+                raise
         except BaseException as exc:
-            # Unexpected post-connect failures (e.g. a raising callback) must
-            # not be recorded as clean peer closes.
-            disconnect_error = exc
+            terminal_error = exc
             raise
         finally:
             # Classified once, for the counter and the debug-log row alike.
             local_shutdown = (
                 shutdown_event is not None and shutdown_event.is_set()
-            ) or isinstance(disconnect_error, asyncio.CancelledError)
+            ) or isinstance(terminal_error, asyncio.CancelledError)
             if connected_this_attempt:
                 record_websocket_disconnected(
                     "runner",
@@ -714,7 +721,6 @@ async def serve_tunnel(
                     local_shutdown=local_shutdown,
                     resumed_from_suspend=woke_from_suspend,
                 )
-            terminal_error = sys.exception()
             if terminal_error is not None or (
                 shutdown_event is not None and shutdown_event.is_set()
             ):
@@ -733,11 +739,18 @@ async def serve_tunnel(
                             connection_id=connection_id,
                             attempt=attempt,
                             connected=connected_this_attempt,
+                            disconnect_reason=classify_disconnect_reason(
+                                disconnect_error,
+                                local_shutdown=local_shutdown,
+                                resumed_from_suspend=woke_from_suspend,
+                            ),
                             outcome=(
                                 "cancelled"
                                 if isinstance(terminal_error, asyncio.CancelledError)
                                 else "fatal"
                                 if terminal_error is not None
+                                else "shutdown_after_error"
+                                if disconnect_error is not None
                                 else "graceful_shutdown"
                             ),
                             terminal_error_type=type(terminal_error).__name__
@@ -753,6 +766,8 @@ async def serve_tunnel(
                             **diagnostics.snapshot(),
                         ),
                     )
+        if shutdown_event is not None and shutdown_event.is_set():
+            return
         resumed_from_suspend = woke_from_suspend
         if woke_from_suspend:
             # A wake from system suspend already aborted the live tunnel (see
@@ -951,12 +966,11 @@ async def _refresh_auth_token(
             exc_info=True,
             extra={"session_id": runner_primary_session_id()},
         )
+    except BaseException as exc:
+        outcome = "cancelled" if isinstance(exc, asyncio.CancelledError) else "raised"
+        error_type = type(exc).__name__
+        raise
     finally:
-        pending = sys.exception()
-        if isinstance(pending, asyncio.CancelledError):
-            outcome = "cancelled"
-        if pending is not None:
-            error_type = type(pending).__name__
         elapsed_ms = round((time.monotonic() - started) * 1000)
         with contextlib.suppress(Exception):
             _logger.log(
