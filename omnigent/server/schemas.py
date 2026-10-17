@@ -2430,7 +2430,10 @@ class UpdateSessionRequest(BaseModel):
         ``"plan"`` enters Plan mode and ``"default"`` returns to Default
         mode for subsequent Codex turns. Only valid for sessions stamped
         with the codex-native wrapper label. Omitted leaves unchanged.
-    :param permission_mode: Claude-native permission mode to switch a
+    :param permission_mode: Session permission mode. ACP accepts ``auto``
+        (ask) or ``bypassPermissions`` (approve policy-silent requests), with
+        an exact acknowledgement from the live runner before persistence.
+        For Claude-native, the permission mode switches a
         running session to, e.g. ``"auto"``. Only the modes Claude Code's
         shift+tab cycle can reach are accepted (``default``,
         ``acceptEdits``, ``plan``, ``auto``) — ``dontAsk`` and

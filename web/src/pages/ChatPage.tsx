@@ -249,6 +249,7 @@ import { useSessionReconnect } from "@/hooks/useSessionReconnect";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { effortLevelsForFamily, supportsEffortControl } from "@/lib/sessionCapabilities";
+import { ACP_PERMISSION_MODES, isAcpSession } from "@/lib/acpPermissionMode";
 import {
   CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
   claudePermissionModeLabel,
@@ -2447,6 +2448,8 @@ function ComposerImpl(
   const { session: composerSession } = useSession(composerSessionId);
   const composerBranch = useChatStore((s) => s.gitBranch);
   const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
+  const acpPermissionMode = useChatStore((s) => s.acpPermissionMode);
+  const showAcpPermissionMode = isAcpSession(composerSession);
   const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
   const [configBusy, setConfigBusy] = useState(false);
   const configBusyRef = useRef(false);
@@ -2486,25 +2489,32 @@ function ComposerImpl(
   // Devin shares this control but not Claude's vocabulary: its rungs are
   // normal / accept-edits / smart / dangerous, cycled in the TUI.
   const devinPermissionControl = modelPickerKind === "devin";
-  const permissionOptions = showClaudePermissionMode
-    ? devinPermissionControl
-      ? DEVIN_NATIVE_PERMISSION_MODES
-      : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
-    : CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS;
-  const permissionLabel = showClaudePermissionMode
-    ? devinPermissionControl
-      ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === claudePermissionMode)?.label ??
-        claudePermissionMode)
-      : claudePermissionModeLabel(claudePermissionMode)
-    : codexApprovalModeLabel(codexApprovalMode);
+  const permissionOptions = showAcpPermissionMode
+    ? ACP_PERMISSION_MODES
+    : showClaudePermissionMode
+      ? devinPermissionControl
+        ? DEVIN_NATIVE_PERMISSION_MODES
+        : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
+      : CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS;
+  const permissionLabel = showAcpPermissionMode
+    ? (ACP_PERMISSION_MODES.find((option) => option.value === acpPermissionMode)?.label ??
+      "Permissions")
+    : showClaudePermissionMode
+      ? devinPermissionControl
+        ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === claudePermissionMode)?.label ??
+          claudePermissionMode)
+        : claudePermissionModeLabel(claudePermissionMode)
+      : codexApprovalModeLabel(codexApprovalMode);
   const changePermission = async (mode: string) => {
     if (isReadOnly || unreachable || configBusyRef.current) return;
+    setCommandError(null);
     configBusyRef.current = true;
     setConfigBusy(true);
     const sourceSessionId = useChatStore.getState().conversationId;
     try {
       const store = useChatStore.getState();
-      if (showClaudePermissionMode) await store.setClaudePermissionMode(mode);
+      if (showAcpPermissionMode) await store.setAcpPermissionMode(mode);
+      else if (showClaudePermissionMode) await store.setClaudePermissionMode(mode);
       else if (showCodexApprovalMode) await store.setCodexApprovalMode(mode);
     } catch (error) {
       if (useChatStore.getState().conversationId === sourceSessionId)
@@ -3881,13 +3891,17 @@ function ComposerImpl(
                   onReconnect={onShowReconnectHelp}
                 />
               )}
-              {(showClaudePermissionMode || showCodexApprovalMode) && (
+              {(showClaudePermissionMode || showCodexApprovalMode || showAcpPermissionMode) && (
                 <ComposerPermissionPicker
                   label="Permission mode"
                   value={permissionLabel || "Permission mode"}
                   harness={sessionHarness}
                   selectedValue={
-                    showClaudePermissionMode ? claudePermissionMode : codexApprovalMode
+                    showAcpPermissionMode
+                      ? acpPermissionMode
+                      : showClaudePermissionMode
+                        ? claudePermissionMode
+                        : codexApprovalMode
                   }
                   options={permissionOptions}
                   disabled={isReadOnly || unreachable || configBusy}

@@ -1036,6 +1036,8 @@ export async function updateSession(
      * promise means the mode really changed.
      */
     claudePermissionMode?: string;
+    /** Session-scoped ACP approval stance, confirmed by the live runner. */
+    acpPermissionMode?: string;
     /**
      * Codex-native approval mode to switch a RUNNING session to, one of
      * `"ask-for-approval"`, `"approve-for-me"`, `"full-access"`, `"read-only"`
@@ -1069,6 +1071,9 @@ export async function updateSession(
   }
   if (updates.claudePermissionMode !== undefined) {
     body.permission_mode = updates.claudePermissionMode;
+  }
+  if (updates.acpPermissionMode !== undefined) {
+    body.permission_mode = updates.acpPermissionMode;
   }
   if (updates.codexApprovalMode !== undefined) {
     body.approval_mode = updates.codexApprovalMode;

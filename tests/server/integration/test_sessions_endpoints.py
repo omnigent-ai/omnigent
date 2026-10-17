@@ -11390,6 +11390,53 @@ async def test_patch_permission_mode_persists_label_and_forwards_event(
     }
 
 
+@pytest.mark.parametrize(
+    "status,echo", [(200, "bypassPermissions"), (204, None), (200, "auto"), (503, None)]
+)
+@pytest.mark.parametrize("override", [None, "acp:cline"])
+async def test_patch_acp_permission_requires_exact_confirmation(
+    client: httpx.AsyncClient, status: int, echo: str | None, override: str | None
+) -> None:
+    captured: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/events"):
+            captured.append(json.loads(request.content))
+            return httpx.Response(status, json={"permission_mode": echo})
+        return httpx.Response(204)
+
+    async with _runtime_runner(handler):
+        agent = await create_test_agent(
+            client, executor={"type": "omnigent", "config": {"harness": "acp:cline"}}
+        )
+        session = (
+            await client.post(
+                "/v1/sessions",
+                json={
+                    "agent_id": agent["id"],
+                    **({"harness_override": override} if override else {}),
+                },
+            )
+        ).json()
+        response = await client.patch(
+            f"/v1/sessions/{session['id']}", json={"permission_mode": "bypassPermissions"}
+        )
+        snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
+        other = await _create_session(client, agent["id"])
+    if status == 200 and echo == "bypassPermissions":
+        assert response.status_code == 200, response.text
+        assert snapshot["labels"]["omnigent.acp.permission_mode"] == echo
+    else:
+        assert response.status_code == 503, response.text
+        assert "omnigent.acp.permission_mode" not in snapshot["labels"]
+    assert snapshot["terminal_launch_args"] is None
+    assert "omnigent.claude_native.permission_mode" not in snapshot["labels"]
+    assert "omnigent.acp.permission_mode" not in other["labels"]
+    assert captured == [
+        {"type": "acp_permission_mode_change", "permission_mode": "bypassPermissions"}
+    ]
+
+
 async def test_patch_permission_mode_rewrites_launch_arg_and_keeps_other_args(
     client: httpx.AsyncClient,
 ) -> None:

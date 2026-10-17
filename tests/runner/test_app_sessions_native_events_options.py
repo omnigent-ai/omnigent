@@ -392,6 +392,131 @@ async def test_events_permission_mode_change_on_non_native_session_is_204_noop(
 
 
 @pytest.mark.asyncio
+async def test_acp_permission_switch_reaches_own_authenticated_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.inner import acp_harness
+
+    harness_app = acp_harness.create_app()
+    sid = "4f99519bd9daa4e9bc2df649fe468522"
+    harness_app.state.conversation_id = sid
+    harness_app.state.harness_auth_token = "own-harness"
+    app, pm = await _build_app_for_spec(
+        AgentSpec(
+            spec_version=1,
+            name="t",
+            executor=ExecutorSpec(
+                type="omnigent",
+                config={
+                    "harness": "acp:cline",
+                    "acp_agent": {"name": "Cline fixture", "command": "must-not-run"},
+                },
+            ),
+        )
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=harness_app),
+        base_url="http://harness",
+        headers={"Authorization": "Bearer own-harness"},
+    ) as harness_client:
+        monkeypatch.setattr(pm, "_client", harness_client)
+        async with _runner_client(app) as client:
+            created = await client.post(
+                "/v1/sessions",
+                json={"session_id": sid, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+            )
+            assert created.status_code == 201, created.text
+            for mode in ("bypassPermissions", "auto"):
+                response = await client.post(
+                    f"/v1/sessions/{sid}/events",
+                    json={"type": "acp_permission_mode_change", "permission_mode": mode},
+                )
+                assert response.status_code == 200, response.text
+                assert response.json() == {"permission_mode": mode}
+            rejected = await client.post(
+                f"/v1/sessions/{sid}/events",
+                json={"type": "acp_permission_mode_change", "permission_mode": "yolo"},
+            )
+            assert rejected.status_code == 400
+    assert not pm.released
+
+
+@pytest.mark.asyncio
+async def test_acp_permission_selection_restores_before_a_cold_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sid = "4f99519bd9daa4e9bc2df649fe468522"
+    aid = "880b5afda28ad55ff74cbeb9b5fc67fb"
+    app, pm = await _build_app_for_spec(
+        AgentSpec(
+            spec_version=1,
+            name="t",
+            executor=ExecutorSpec(
+                type="omnigent",
+                config={
+                    "harness": "acp",
+                    "acp_agent": {"name": "Fixture", "command": "must-not-run"},
+                },
+            ),
+        )
+    )
+    applied = []
+
+    async def post(url, *, json, timeout=None):
+        applied.append((url, json))
+        return httpx.Response(
+            200,
+            json={"permission_mode": json.get("permission_mode")},
+            request=httpx.Request("POST", "http://harness" + url),
+        )
+
+    monkeypatch.setattr(pm._client, "post", post)
+    streamed = asyncio.Event()
+    pm._client._stream_finished = streamed
+    pm._client._sse_frames = [
+        _sse({"type": "response.created", "response": {"id": "permission-resume"}}),
+        _sse({"type": "response.completed", "response": {"id": "permission-resume"}}),
+    ]
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": sid,
+                "agent_id": aid,
+                "session_init": {
+                    "protocol_version": 2,
+                    "server_version": "0.18.0",
+                    "session_id": sid,
+                    "agent_id": aid,
+                    "suppress_recovery_turn": True,
+                    "snapshot": {
+                        "created_at": 1,
+                        "updated_at": 1,
+                        "labels": {"omnigent.acp.permission_mode": "bypassPermissions"},
+                    },
+                },
+            },
+        )
+        assert created.status_code == 201, created.text
+        response = await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={
+                "type": "message",
+                "agent_id": aid,
+                "content": [{"type": "input_text", "text": "Continue"}],
+            },
+        )
+        assert response.status_code == 202, response.text
+        await asyncio.wait_for(streamed.wait(), timeout=3)
+    assert applied[0] == (
+        f"/v1/sessions/{sid}/acp-permission-mode",
+        {"permission_mode": "bypassPermissions"},
+    )
+    assert len(pm._client.posted_bodies) == 1
+    assert not pm.released
+
+
+@pytest.mark.asyncio
 async def test_events_compact_on_native_session_types_slash_command(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
