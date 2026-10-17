@@ -71,7 +71,7 @@ describe("seedReadState", () => {
     expect(mod.isExplicitlyUnread("conv-2")).toBe(true);
   });
 
-  it("seeds a session only once — a later list value can't clobber a local write", async () => {
+  it("ignores a stale list value — it can't clobber a local write", async () => {
     const mod = await loadFresh();
     mod.seedReadState([{ id: "conv-1", viewer_last_seen: 1_000 }]);
     // User marks it unread locally (optimistic).
@@ -81,6 +81,7 @@ describe("seedReadState", () => {
     // A stale poll arrives still showing it as seen — must be ignored.
     mod.seedReadState([{ id: "conv-1", viewer_last_seen: 1_000, viewer_unread: false }]);
     expect(mod.isExplicitlyUnread("conv-1")).toBe(true);
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
   });
 
   it("keeps the mark-seen gate closed while the list is still loading (undefined)", async () => {
@@ -103,6 +104,86 @@ describe("seedReadState", () => {
     rerender({ c: [] });
     mod.markConversationSeen("conv-1");
     expect(mod.isConversationUnseen("conv-1", 6_000, "idle")).toBe(true); // 6000 > 5000 baseline
+  });
+});
+
+describe("live cross-device merge", () => {
+  it("adopts a newer server baseline from a list refresh — a read on another device clears the dot without a reload", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 1_000 }]);
+    const { result } = renderHook(() => mod.useUnseenTick());
+    const before = result.current;
+    expect(mod.isConversationUnseen("conv-1", 2_000, "idle")).toBe(true);
+
+    // The other device read up to 3_000 and the next list refresh carries it.
+    act(() => mod.seedReadState([{ id: "conv-1", viewer_last_seen: 3_000, viewer_unread: false }]));
+
+    expect(mod.isConversationUnseen("conv-1", 2_000, "idle")).toBe(false);
+    expect(result.current).not.toBe(before); // rows, Inbox and badge recompute now
+    expect(putCount()).toBe(0); // adopting the server's value is not a local write
+
+    // The merged baseline is durable: a reload served by a pod without this
+    // user's read-state still reads the session as seen.
+    const reloaded = await reloadKeepingStorage();
+    reloaded.seedReadState([{ id: "conv-1", viewer_last_seen: null, updated_at: 2_000 }]);
+    expect(reloaded.isConversationUnseen("conv-1", 2_000, "idle")).toBe(false);
+  });
+
+  it("keeps an explicitly-unread session visibly unread through a stale higher server read — a replica can't revert Mark as unread", async () => {
+    const mod = await loadFresh();
+    // Read up to 3_000 on the server, then Mark as unread here: the baseline
+    // drops to 1_999 and the explicit flag is set.
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 3_000 }]);
+    mod.markConversationUnread("conv-1", 2_000); // baseline 1_999 + override
+
+    // A replica that missed the unread PUT still serves the old, higher read
+    // (3_000, not unread). Raising the baseline to it would clear the dot, row
+    // and badge and undo the action, so the merge skips an explicitly-unread row.
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 3_000, viewer_unread: false }]);
+
+    // The dot, Inbox row and badge all read the unseen bit, so the session
+    // stays visibly unread until read/reopened here; it reconciles on reload.
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(true);
+    expect(mod.isConversationUnseen("conv-1", 2_500, "idle")).toBe(true);
+  });
+
+  it("adopts only the baseline live — a cross-device Mark as unread reconciles on the next reload", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 1_000 }]);
+
+    // A live refresh carrying another device's unread flag raises the baseline
+    // but must not flag an already-seeded row unread on its own — a stale
+    // replica serving a cleared flag would otherwise flip it straight back.
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 4_999, viewer_unread: true }]);
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(false);
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(true); // 5000 > 4999 baseline
+
+    // The explicit flag reconciles on the next full seed (a reload re-seeds
+    // every row from scratch).
+    const reloaded = await reloadKeepingStorage();
+    reloaded.seedReadState([{ id: "conv-1", viewer_last_seen: 4_999, viewer_unread: true }]);
+    expect(reloaded.isExplicitlyUnread("conv-1")).toBe(true);
+  });
+
+  it("ignores older, equal and missing server values — a stale replica can't lower the baseline or re-flag unread", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 1_000 }]);
+    mod.markConversationSeen("conv-1", 3_000);
+    const { result } = renderHook(() => mod.useUnseenTick());
+    const before = result.current;
+
+    // Each stale value is applied and checked on its own, so an accepted older
+    // one can't be repaired by a later equal value and slip past the assert.
+    act(() => mod.seedReadState([{ id: "conv-1", viewer_last_seen: 2_000, viewer_unread: true }]));
+    expect(mod.isConversationUnseen("conv-1", 2_500, "idle")).toBe(false); // older ignored
+    act(() => mod.seedReadState([{ id: "conv-1", viewer_last_seen: 3_000, viewer_unread: true }]));
+    expect(mod.isConversationUnseen("conv-1", 2_500, "idle")).toBe(false); // equal ignored
+    act(() => mod.seedReadState([{ id: "conv-1", viewer_last_seen: null, viewer_unread: true }]));
+    expect(mod.isConversationUnseen("conv-1", 2_500, "idle")).toBe(false); // missing ignored
+
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(false);
+    expect(mod.isConversationUnseen("conv-1", 3_500, "idle")).toBe(true);
+    expect(result.current).toBe(before); // ignored values must not notify subscribers
   });
 });
 
