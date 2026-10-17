@@ -258,6 +258,9 @@ class ZygoteManager:
                 stderr=log_fh,
                 # Avoid pinning the daemon's potentially transient cwd.
                 cwd="/",
+                # Own session, inherited by every fork: a hangup of the daemon's
+                # terminal must not reach runners or harnesses mid-turn.
+                **_proc.spawn_kwargs(),
             )
 
     def fork_runner(self, env: dict[str, str], log_path: str, workspace: str) -> ZygoteRunnerProc:

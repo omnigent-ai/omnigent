@@ -292,6 +292,27 @@ def test_process_alive_false_for_bogus_pid() -> None:
     assert _proc.process_alive(-1) is False
 
 
+def test_process_create_time_matches_psutil_for_a_live_process() -> None:
+    proc = subprocess.Popen(_spin_cmd(), **_proc.spawn_kwargs())
+    try:
+        assert _proc.process_create_time(proc.pid) == psutil.Process(proc.pid).create_time()
+    finally:
+        _proc.kill_tree(proc)
+        proc.wait(timeout=5)
+
+
+def test_process_create_time_is_none_for_a_bogus_pid() -> None:
+    assert _proc.process_create_time(2_000_000_000) is None
+
+
+def test_process_create_time_swallows_access_denied(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _deny(pid: int) -> psutil.Process:
+        raise psutil.AccessDenied(pid)
+
+    monkeypatch.setattr(_proc.psutil, "Process", _deny)
+    assert _proc.process_create_time(1234) is None
+
+
 def test_killpg_refuses_the_broadcast_group(monkeypatch: pytest.MonkeyPatch) -> None:
     """A target pgid of 1 must never be signalled.
 

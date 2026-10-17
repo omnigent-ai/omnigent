@@ -704,6 +704,29 @@ def test_malloc_tuning_is_applied_at_the_zygote_exec(monkeypatch, tmp_path) -> N
     assert captured["MALLOC_TRIM_THRESHOLD_"] == "134217728"
 
 
+def test_zygote_exec_starts_its_own_session(monkeypatch, tmp_path) -> None:
+    """The zygote, and so every runner and harness it forks, leaves the daemon's session.
+
+    A hangup of the daemon's terminal would otherwise reach them mid-turn.
+
+    :param monkeypatch: Fixture used to stub the zygote's Popen.
+    :param tmp_path: Temp dir for the zygote log path.
+    """
+    captured: dict[str, object] = {}
+
+    class _FakePopen:
+        pid = 4321
+
+        def __init__(self, argv, env, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    mgr = ZygoteManager(log_path=tmp_path / "zygote.log")
+    mgr._spawn_zygote_process(child_fd=7)
+
+    assert captured["start_new_session"] is True
+
+
 def test_operator_malloc_override_wins_at_the_zygote_exec(monkeypatch, tmp_path) -> None:
     """An explicit MALLOC_ARENA_MAX in the daemon env is not overwritten.
 

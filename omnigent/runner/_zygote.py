@@ -814,7 +814,7 @@ class _ZygoteServer:
             if harness_pid in self._live:
                 self._orphaned.add(harness_pid)
                 # Signal the pid, never the group: everything the zygote forks
-                # shares the daemon's group, so a killpg would take it down too.
+                # shares the zygote's group, so a killpg would take it down too.
                 with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
                     os.kill(harness_pid, signal.SIGTERM)
         with contextlib.suppress(OSError):
