@@ -315,6 +315,18 @@ def test_non_git_create_file(
         "The net-operation logic may have incorrectly classified the write."
     )
 
+    # The response must flag limited tracking for this non-git workspace so the
+    # UI can say why the list is partial instead of reading it as "no changes".
+    changes_body = non_git_client.get(_changes_url(session_id)).json()
+    assert changes_body.get("tracking") == {
+        "complete": False,
+        "reason": "non_git_workspace",
+    }, (
+        f"Expected non-git limited-tracking flag, got {changes_body.get('tracking')!r}. "
+        "A non-git workspace must report incomplete tracking so the panel can "
+        "surface the limitation."
+    )
+
     # Verify the file was actually written to the workspace root.
     # OS-env tools dispatched through proxy_stream use runner_workspace
     # (the shared root) as the agent CWD.

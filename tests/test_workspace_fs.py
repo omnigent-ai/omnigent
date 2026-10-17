@@ -381,6 +381,9 @@ def test_changes_lists_git_working_tree_modifications(tmp_path: Path) -> None:
     by_path = {e["path"]: e for e in result["data"]}
     assert by_path["committed.txt"]["status"] == "modified"
     assert by_path["new.txt"]["status"] == "created"
+    # git status sees every working-tree write, so the host reports complete
+    # tracking exactly like the runner endpoint does.
+    assert result["tracking"] == {"complete": True, "reason": None}
     # Line counts come from numstat (git diff HEAD), so the host-served
     # list surfaces them just like the runner endpoint. The tracked edit
     # rewrote one line; the untracked file isn't in numstat → no counts.
@@ -420,12 +423,13 @@ def test_diff_unchanged_file_raises_not_found(tmp_path: Path) -> None:
     assert excinfo.value.status == 404
 
 
-def test_changes_non_git_workspace_is_empty(tmp_path: Path) -> None:
-    """A non-git workspace reports no changes from the host.
+def test_changes_non_git_workspace_reports_limited_tracking(tmp_path: Path) -> None:
+    """A non-git workspace reports no changes from the host, flagged as limited.
 
     The host has no access to the live agent's in-memory edit history, so
     the changed-files list is empty (documented degradation) — but the
-    call must succeed, not error.
+    call must succeed, and the payload must say tracking is limited so the
+    panel does not render that empty list as "no changes".
     """
     (tmp_path / "a.txt").write_text("x")
     reader = WorkspaceReader(tmp_path)
@@ -433,6 +437,7 @@ def test_changes_non_git_workspace_is_empty(tmp_path: Path) -> None:
     result = reader.changes("conv_x")
 
     assert result["data"] == []
+    assert result["tracking"] == {"complete": False, "reason": "non_git_workspace"}
 
 
 # ── GitHub ops (host fallback) ────────────────────────────────────────
