@@ -1,10 +1,14 @@
-"""Unit tests for the byte-cap request-size overflow parser."""
+"""Unit tests for the request-size and prompt-token overflow parsers."""
 
 from __future__ import annotations
 
 import time
 
-from omnigent.llms.errors import detect_request_size_overflow
+from omnigent.llms.errors import (
+    PromptTokenOverflow,
+    detect_prompt_token_overflow,
+    detect_request_size_overflow,
+)
 
 # Enough repeated request fields that a backtracking parser takes many seconds;
 # the linear scanner needs milliseconds. The budget is deliberately generous so
@@ -105,3 +109,19 @@ def test_detect_request_size_overflow_overlong_limit_field_is_none() -> None:
         )
         is None
     )
+
+
+def test_detect_prompt_token_overflow_parses_anthropic_rejection() -> None:
+    message = '400 {"message":"prompt is too long: 1070450 tokens > 1000000 maximum"}'
+    assert detect_prompt_token_overflow(message) == PromptTokenOverflow(
+        actual_tokens=1070450, limit_tokens=1000000
+    )
+
+
+def test_detect_prompt_token_overflow_without_counts_is_none() -> None:
+    assert detect_prompt_token_overflow("Prompt is too long") is None
+
+
+def test_detect_prompt_token_overflow_overlong_count_is_none() -> None:
+    message = f"prompt is too long: {_OVERLONG_DIGITS} tokens > 1000000 maximum"
+    assert detect_prompt_token_overflow(message) is None
