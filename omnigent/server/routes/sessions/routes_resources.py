@@ -184,6 +184,8 @@ class _RunnerStreamResponse(StreamingResponse):
     send that fails before that, or a client that disconnects (where
     Starlette skips background tasks), would leak the tunnel request.
     Closing in ``__call__`` covers every exit.
+    After send, its stream is wrapped in ``_ShieldedCloseByteStream`` so
+    ``__call__`` cleanup completes even when the request is cancelled.
 
     :param upstream: The runner's streamed response.
     :param headers: Response headers to forward.
