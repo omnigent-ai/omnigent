@@ -4630,6 +4630,7 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "model_override",
     "reasoning_effort",
     "permission_mode",
+    "max_cost_usd",
     "workspace",
     "host_id",
     "execution_target",
