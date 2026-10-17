@@ -18,6 +18,7 @@ from click.testing import CliRunner
 
 from omnigent import cli as cli_module
 from omnigent.cli import _add_daemon_host_status, _ensure_host_daemon, _host_daemon_alive, cli
+from omnigent.host.identity import HOST_TOKEN_ENV_VAR
 from omnigent.host.local_server import LocalServerStartup
 
 
@@ -42,6 +43,16 @@ class _HostRun:
     """
 
     server_url: str
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_launch_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop a managed-host launch token so host starts here see an ordinary host.
+
+    With ``OMNIGENT_HOST_TOKEN`` set, the host-start commands skip the user
+    sign-in pre-flight; tests that want a launch-token host set it themselves.
+    """
+    monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
 
 
 def _persist_fake_daemon_claim(
@@ -342,6 +353,47 @@ def test_host_enable_subcommand_installs_user_service(
     assert result.exit_code == 0, result.output
     assert captured == [(None, {"HOME": str(tmp_path)})]
     assert "Enabled the Omnigent host user service for local" in result.output
+
+
+@pytest.mark.parametrize(
+    ("launch_token", "expected_preflight"),
+    [(None, [("https://myapp-1234.aws.databricksapps.com", True)]), ("launch-token", [])],
+    ids=["user-host", "launch-token-host"],
+)
+def test_host_enable_preflight_follows_launch_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    launch_token: str | None,
+    expected_preflight: list[tuple[str, bool]],
+) -> None:
+    """``host enable`` runs the sign-in pre-flight unless a launch token covers the host."""
+    from omnigent.host.service import HostService
+
+    server = "https://myapp-1234.aws.databricksapps.com"
+    if launch_token is not None:
+        monkeypatch.setenv(HOST_TOKEN_ENV_VAR, launch_token)
+    preflight: list[tuple[str, bool]] = []
+
+    def _capture(server_url: str, *, non_interactive: bool = False) -> None:
+        preflight.append((server_url, non_interactive))
+
+    monkeypatch.setattr("omnigent.cli._ensure_databricks_server_auth", _capture)
+    monkeypatch.setattr("omnigent.cli._find_daemon_record", lambda target: None)
+    monkeypatch.setattr("omnigent.cli._build_host_daemon_env", lambda *, server_url: {})
+    service_path = tmp_path / "omnigent-host.service"
+    enabled: list[str | None] = []
+
+    def _enable(server_url: str | None, *, environment: dict[str, str]) -> HostService:
+        enabled.append(server_url)
+        return HostService(kind="systemd_user", path=service_path, label=service_path.name)
+
+    monkeypatch.setattr("omnigent.host.service.enable_user_host_service", _enable)
+
+    result = CliRunner().invoke(cli, ["host", "enable", "--server", server, "--non-interactive"])
+
+    assert result.exit_code == 0, result.output
+    assert preflight == expected_preflight
+    assert enabled == [server]
 
 
 def test_host_disable_subcommand_removes_user_service(

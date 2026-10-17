@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import pytest
 
+from omnigent.host.identity import HOST_TOKEN_ENV_VAR
+
 
 @pytest.fixture(autouse=True)
 def _no_ambient_host(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Isolate the machine's own host identity and runner slice-key env var.
+    """Isolate the machine's own host identity, slice-key and launch-token env vars.
 
     ``databricks_request_headers`` (reached via ``_remote_headers``,
     ``open_daemon_client``, and the auth flow) resolves the slice key from,
@@ -19,6 +21,10 @@ def _no_ambient_host(monkeypatch: pytest.MonkeyPatch) -> None:
     depending on where the suite runs. Force the read-only lookup to ``None``
     and clear the routing settings so tests exercise only the host they name.
 
+    A managed-host launch token (``OMNIGENT_HOST_TOKEN``) is dropped too: the
+    host-start commands skip the user sign-in pre-flight when it is set, so a
+    suite run inside a server-managed sandbox would otherwise flip those tests.
+
     ``autouse=True`` keeps the isolation on by default; tests that need a real
     host identity re-patch ``load_host_identity_if_present`` themselves.
     """
@@ -28,3 +34,4 @@ def _no_ambient_host(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.delenv("OMNIGENT_RUNNER_SLICE_KEY", raising=False)
     monkeypatch.delenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", raising=False)
+    monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)

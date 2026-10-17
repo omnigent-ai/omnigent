@@ -46,6 +46,7 @@ from omnigent.cli import (
 from omnigent.cli import (
     cli as cli_group,
 )
+from omnigent.host.identity import HOST_TOKEN_ENV_VAR
 from omnigent.host.local_server import LocalServerStartup
 
 
@@ -3131,6 +3132,25 @@ def test_ensure_backend_databricks_preflight_hints_headless(
     assert login_calls == []
 
 
+def test_ensure_backend_databricks_preflight_ignores_launch_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session-create client keeps the user preflight despite an inherited launch token.
+
+    Executors inside a managed sandbox see ``OMNIGENT_HOST_TOKEN``, but the
+    launch token only authenticates the host tunnel, not session creation.
+    """
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-token")
+    login_calls = _patch_auth_preflight(monkeypatch, probe_status=302, tty=False)
+    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda server: False)
+
+    with pytest.raises(click.ClickException) as exc:
+        _ensure_backend("https://myapp-1234.aws.databricksapps.com")
+
+    assert "omnigent login https://myapp-1234.aws.databricksapps.com" in str(exc.value)
+    assert login_calls == []
+
+
 def test_ensure_backend_databricks_preflight_skips_when_authenticated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3402,6 +3422,45 @@ def test_databricks_preflight_non_interactive_overrides_tty(
 
     assert f"omnigent login {_HOST_DATABRICKS_SERVER}" in str(exc.value)
     # The browser login never ran despite the TTY.
+    assert login_calls == []
+
+
+def test_host_with_launch_token_skips_user_preflight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A launch-token host connects without the user sign-in preflight.
+
+    Server-managed sandboxes authenticate the tunnel with ``OMNIGENT_HOST_TOKEN``
+    alone and hold no user credentials, so a Databricks-fronted server's
+    sign-in redirect on the unauthenticated probe must not abort the start.
+    """
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-token")
+    login_calls = _patch_auth_preflight(monkeypatch, probe_status=302, tty=False)
+    user_credential_lookups: list[str | None] = []
+
+    def _spy_remote_headers(
+        server_url: str | None = None,
+        *,
+        host_id: str | None = None,
+        org_id: str | None = None,
+    ) -> dict[str, str]:
+        user_credential_lookups.append(server_url)
+        return {}
+
+    monkeypatch.setattr("omnigent.chat._remote_headers", _spy_remote_headers)
+    # A credential-less sandbox resolves no workspace token.
+    monkeypatch.setattr(cli, "_databricks_workspace_auth_info", lambda workspace: None)
+    connected = _patch_foreground_host(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(cli_group, ["host", _HOST_DATABRICKS_SERVER, "--non-interactive"])
+
+    assert result.exit_code == 0, (
+        "launch-token host start aborted at the user preflight "
+        f"(user credential lookups: {user_credential_lookups}):\n{result.output}"
+    )
+    # The launch token is the tunnel credential: no user credential is looked up.
+    assert user_credential_lookups == []
+    assert connected == [_HOST_DATABRICKS_SERVER]
     assert login_calls == []
 
 
@@ -3712,6 +3771,35 @@ def test_host_remote_preflight_skips_when_authenticated(
     assert result.exit_code == 0, result.output
     assert login_calls == []
     assert connected == [_HOST_DATABRICKS_SERVER]
+
+
+@pytest.mark.parametrize(
+    "entry_point", [["host", "--background"], ["start"]], ids=["host-background", "start"]
+)
+def test_background_host_with_launch_token_skips_user_preflight(
+    monkeypatch: pytest.MonkeyPatch, entry_point: list[str]
+) -> None:
+    """``host --background`` and ``start`` spawn a launch-token host without the user pre-flight.
+
+    The ordinary-host pre-flight on these entry points is covered by
+    ``tests/host/test_cli_host.py``.
+    """
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-token")
+    preflight = _capture_preflight(monkeypatch)
+    monkeypatch.setattr(cli, "_load_effective_config", dict)
+    spawned: list[str | None] = []
+    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda server: spawned.append(server))
+    # The registry already holds this target's daemon, so the spawn reports a reuse.
+    monkeypatch.setattr(cli, "_find_daemon_record", _server_record)
+    monkeypatch.setattr(cli, "_confirm_background_host_registered", lambda record: None)
+
+    result = CliRunner().invoke(
+        cli_group, [*entry_point, "--server", _HOST_DATABRICKS_SERVER, "--non-interactive"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert preflight == []
+    assert spawned == [_HOST_DATABRICKS_SERVER]
 
 
 # ── Workspace-URL expansion for attach / resume / host ──────────────
