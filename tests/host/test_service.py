@@ -64,6 +64,39 @@ def test_enable_launchd_user_service(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert installed.path.stat().st_mode & 0o777 == 0o600
 
 
+def test_installed_user_host_service_reads_launchd_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(service.platform, "system", lambda: "Darwin")
+    path = tmp_path / "Library/LaunchAgents/ai.omnigent.host.plist"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(
+        service._launchd_payload(
+            service.HostService(
+                kind="launchd",
+                path=path,
+                label=service.LAUNCHD_LABEL,
+                log_path=tmp_path / "service.log",
+            ),
+            command=[
+                "/opt/python",
+                "-m",
+                "omnigent.host.service_entry",
+                "--server",
+                "https://example.com",
+            ],
+            environment={},
+        )
+    )
+
+    installed = service.installed_user_host_service()
+
+    assert installed is not None
+    assert installed[0].path == path
+    assert installed[1] == "https://example.com"
+
+
 def test_disable_launchd_user_service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(service.platform, "system", lambda: "Darwin")
@@ -187,6 +220,27 @@ def test_systemd_unit_escapes_specifiers_and_literal_dollars() -> None:
     assert (
         'ExecStart="/opt/$$tools/python" "--server" "https://example.com/%%h/$$target"'
     ) in unit
+
+
+def test_stop_and_start_systemd_user_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setattr(service.platform, "system", lambda: "Linux")
+    installed = service.HostService(
+        kind="systemd_user",
+        path=tmp_path / "xdg/systemd/user/omnigent-host.service",
+        label=service.SYSTEMD_UNIT,
+    )
+    calls = _capture_runs(monkeypatch)
+
+    service.stop_user_host_service(installed)
+    service.start_user_host_service(installed)
+
+    assert calls == [
+        ["systemctl", "--user", "stop", "omnigent-host.service"],
+        ["systemctl", "--user", "start", "omnigent-host.service"],
+    ]
 
 
 def test_disable_systemd_user_service(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
