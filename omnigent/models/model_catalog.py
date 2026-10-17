@@ -1432,83 +1432,98 @@ def _fetch_devin_cli_listing(provider: ResolvedModelProvider) -> ModelListing:
     )
 
 
-def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListing:
-    """Build the (empty) pre-launch listing for a subscription CLI login.
-
-    Subscription logins expose no model-listing API, and the curated
-    stand-ins this used to serve are gone — the live harness probes are the
-    source of truth, so a path that cannot probe reports nothing rather
-    than a plausible-but-stale list.
-
-    :param provider: A ``kind="subscription"`` provider descriptor.
-    :returns: A ``source="static"`` listing with no models.
+def _native_catalog_probe(provider: ResolvedModelProvider) -> tuple[str, str, str] | None:
+    """Return the ``(native harness, fingerprint, label)`` a login's catalog is
+    cached under in ``model_catalog_store``, or ``None`` when it has no probe.
     """
+    if provider.cli == "claude":
+        from omnigent.harnesses.claude_native.main import claude_catalog_fingerprint
+
+        return ("claude-native", claude_catalog_fingerprint(None), "Claude Code")
+    if provider.cli == "codex":
+        from omnigent.harnesses.codex_native.app_server import (
+            NativeCodexLaunch,
+            codex_catalog_fingerprint,
+            resolve_native_codex_launch,
+        )
+
+        if provider.kind == CLI_CONFIG_KIND:
+            if not provider.model_provider:
+                return None
+            # Pin the worker's selected provider rather than resolving the ambient default.
+            launch = NativeCodexLaunch(
+                config_overrides=[f"model_provider={json.dumps(provider.model_provider)}"],
+                model=None,
+                profile=None,
+            )
+        else:
+            # Match the host's boot probe: resolve the login's own launch shape.
+            try:
+                launch = resolve_native_codex_launch(model=None)
+            except Exception:  # noqa: BLE001 — a broken provider config means no catalog
+                return None
+        return ("codex-native", codex_catalog_fingerprint(launch), "Codex")
+    return None
+
+
+def _native_catalog_listing(
+    provider: ResolvedModelProvider, *, fallback: ModelListing
+) -> ModelListing:
+    """Return the host's cached native catalog for *provider*, else *fallback*."""
+    probe = _native_catalog_probe(provider)
+    if probe is None:
+        return fallback
+
+    from omnigent.models import model_catalog_store
+
+    harness, fingerprint, label = probe
+    rows = model_catalog_store.read_catalog(harness, fingerprint)
+    if rows is None:
+        return fallback
+    stale = model_catalog_store.catalog_is_stale(harness, fingerprint)
+    model_ids = dict.fromkeys(str(row.get("model") or row["id"]) for row in rows)
     return ModelListing(
-        source="static",
-        verified=False,
-        models=(),
+        source="cli",
+        verified=not stale,
+        models=tuple(
+            ModelEntry(id=model_id, family=model_family_token(model_id)) for model_id in model_ids
+        ),
         note=(
-            f"the {provider.cli or 'unknown'} CLI login exposes no model-listing "
-            "API before launch; the live listing comes from probing the harness"
+            f"cached {label} model probe; catalog needs refreshing"
+            if stale
+            else f"models advertised by the {label} model probe"
+        ),
+    )
+
+
+def _static_subscription_listing(provider: ResolvedModelProvider) -> ModelListing:
+    """Return a subscription login's probed native catalog, else an empty listing."""
+    return _native_catalog_listing(
+        provider,
+        fallback=ModelListing(
+            source="static",
+            verified=False,
+            models=(),
+            note=(
+                f"the {provider.cli or 'unknown'} CLI login exposes no model-listing "
+                "API before launch; the live listing comes from probing the harness"
+            ),
         ),
     )
 
 
 def _static_cli_config_listing(provider: ResolvedModelProvider) -> ModelListing:
-    """Read a CLI-owned catalog, or report that it has not been probed yet.
-
-    Claude managed gateways and Codex config.toml providers share their
-    native launch catalogs. Credentials remain the CLI's responsibility.
-
-    :param provider: A ``kind="cli-config"`` provider descriptor.
-    :returns: A probe-backed listing when cached, else an empty static listing.
-    """
-    from omnigent.models import model_catalog_store
-
-    probe: tuple[str, str, str] | None = None
-    if provider.cli == "claude":
-        from omnigent.harnesses.claude_native.main import claude_catalog_fingerprint
-
-        probe = ("claude-native", claude_catalog_fingerprint(None), "Claude Code")
-    elif provider.cli == "codex" and provider.model_provider:
-        from omnigent.harnesses.codex_native.app_server import (
-            NativeCodexLaunch,
-            codex_catalog_fingerprint,
-        )
-
-        # Pin the worker's selected provider rather than resolving the ambient default.
-        launch = NativeCodexLaunch(
-            config_overrides=[f"model_provider={json.dumps(provider.model_provider)}"],
-            model=None,
-            profile=None,
-        )
-        probe = ("codex-native", codex_catalog_fingerprint(launch), "Codex")
-    if probe is not None:
-        harness, fingerprint, label = probe
-        rows = model_catalog_store.read_catalog(harness, fingerprint)
-        if rows is not None:
-            stale = model_catalog_store.catalog_is_stale(harness, fingerprint)
-            model_ids = dict.fromkeys(str(row.get("model") or row["id"]) for row in rows)
-            return ModelListing(
-                source="cli",
-                verified=not stale,
-                models=tuple(
-                    ModelEntry(id=model_id, family=model_family_token(model_id))
-                    for model_id in model_ids
-                ),
-                note=(
-                    f"cached {label} model probe; catalog needs refreshing"
-                    if stale
-                    else f"models advertised by the {label} model probe"
-                ),
-            )
-    return ModelListing(
-        source="static",
-        verified=False,
-        models=(),
-        note=(
-            f"{provider.detail} enumerates its models only from the CLI's own "
-            "config at launch; the live listing comes from probing the harness"
+    """Return a CLI-config login's probed native catalog, else an empty listing."""
+    return _native_catalog_listing(
+        provider,
+        fallback=ModelListing(
+            source="static",
+            verified=False,
+            models=(),
+            note=(
+                f"{provider.detail} enumerates its models only from the CLI's own "
+                "config at launch; the live listing comes from probing the harness"
+            ),
         ),
     )
 
