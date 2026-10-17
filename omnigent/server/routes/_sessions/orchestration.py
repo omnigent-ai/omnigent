@@ -3766,7 +3766,7 @@ async def _publish_runner_recovered_status_impl(
     conversation_store: ConversationStore,
     *,
     require_disconnect_code: bool = False,
-    turn_completed: bool = False,
+    resumed_signal: str | None = None,
 ) -> None:
     """
     Clear a stale failed session status after runner recovery.
@@ -3810,9 +3810,9 @@ async def _publish_runner_recovered_status_impl(
         ``runner_disconnected``; when ``False`` (default, explicit
         rebind/handshake), clear any stale ``failed`` state. Labels are
         cleared in both cases.
-    :param turn_completed: With ``require_disconnect_code``, the caller saw
-        the failed turn make progress and then finish, so its recovery is
-        recorded at once instead of arming the resume watch.
+    :param resumed_signal: With ``require_disconnect_code``, what the relay saw
+        of the failed turn (``"turn_running"`` or ``"turn_completed"``), so its
+        outcome is recorded at once instead of arming the resume watch.
     :returns: None.
     """
     if _session_status_cache.get(session_id) != "failed":
@@ -3832,6 +3832,9 @@ async def _publish_runner_recovered_status_impl(
             exc_info=True,
             extra={"session_id": session_id},
         )
+    # Re-check after the await: a failure set during the read must stay.
+    if _session_status_cache.get(session_id) != "failed":
+        return
     last_error = _last_task_error_from_labels(conv.labels) if conv is not None else None
     failure_code = last_error.get("code") if last_error is not None else None
     # A passive reconnect must distinguish a benign runner disconnect
@@ -3845,11 +3848,20 @@ async def _publish_runner_recovered_status_impl(
     _session_status_cache[session_id] = "idle"
     session_live_state.persist_live_status(session_id, "idle")
     runner_id = conv.runner_id if conv is not None else None
-    if require_disconnect_code and turn_completed:
-        disconnect_outcome.note_turn_completed(
-            session_id, failure_code="runner_disconnected", runner_id=runner_id
+    if not require_disconnect_code:
+        recovery_path = "explicit_rebind"
+    elif resumed_signal is not None:
+        recovery_path = resumed_signal
+    else:
+        recovery_path = "passive_reconnect"
+    if require_disconnect_code and resumed_signal is not None:
+        disconnect_outcome.note_turn_resumed(
+            session_id,
+            failure_code="runner_disconnected",
+            runner_id=runner_id,
+            signal=resumed_signal,
         )
-    elif require_disconnect_code:
+    elif recovery_path == "passive_reconnect":
         # Only a passive reconnect can show the same turn resuming on its own.
         # Armed before the idle publish so concurrent progress cannot slip past.
         disconnect_outcome.watch_for_resume(
@@ -3862,12 +3874,6 @@ async def _publish_runner_recovered_status_impl(
         error=None,
     )
     session_stream.publish(session_id, event.model_dump())
-    if not require_disconnect_code:
-        recovery_path = "explicit_rebind"
-    elif turn_completed:
-        recovery_path = "turn_completed"
-    else:
-        recovery_path = "passive_reconnect"
     _logger.info(
         "Runner recovered for session=%s (%s); cleared %s failure",
         session_id,
@@ -7708,14 +7714,11 @@ async def _dispatch_session_event_to_runner_impl(
     """
     if runner_router is not None:
         await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
-    if body.type == "message":
-        # Noted before the forward: a false resume would hide a lost turn, while
-        # a failed forward only leaves the failure counted.
-        disconnect_outcome.note_user_turn(conv.id)
     if body.type == "message" and conv.kind == "sub_agent" and _is_codex_native_subagent(conv):
         # Codex /side follow-up: drive the child on its own Codex thread via the
         # parent's runner/bridge; do not persist AP-side (the forwarder mirrors
         # the child thread echo, staying the single writer).
+        disconnect_outcome.note_user_turn(conv.id)
         side_result = await _forward_codex_side_chat_turn(conv, body, runner_client)
         if side_result is not None:
             return side_result
@@ -7966,6 +7969,8 @@ async def _dispatch_session_event_to_runner_impl(
         try:
             if pending_id is not None:
                 pending_inputs.mark_delivery_stage(session_id, pending_id, "forward_requested")
+            # A genuinely new turn (retries were answered above); see note_user_turn.
+            disconnect_outcome.note_user_turn(conv.id)
             await _forward_native_terminal_message(
                 runner_client,
                 session_id,
@@ -8037,6 +8042,8 @@ async def _dispatch_session_event_to_runner_impl(
                     decision_id=_native_decision_id,
                 )
         return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
+    if body.type == "message":
+        disconnect_outcome.note_user_turn(conv.id)
     item_id = await _forward_event_to_runner(
         session_id,
         conv,
@@ -8613,6 +8620,39 @@ async def _relay_runner_stream(
             return
 
 
+async def _recover_disconnect_failure_from_relay(
+    session_id: str,
+    conversation_store: ConversationStore,
+    *,
+    resumed_signal: str | None,
+) -> bool:
+    """Clear a disconnect failure the relay saw recover; a genuine failure stays.
+
+    :param session_id: Session the relay streams for.
+    :param conversation_store: Store the recovery publisher reads and clears.
+    :param resumed_signal: What the relay saw of the failed turn, or ``None`` to
+        arm the resume watch instead.
+    :returns: ``False`` when the check itself failed; the relay then keeps the
+        failed status and goes on streaming.
+    """
+    try:
+        await _publish_runner_recovered_status(
+            session_id,
+            conversation_store,
+            require_disconnect_code=True,
+            resumed_signal=resumed_signal,
+        )
+    except Exception:  # noqa: BLE001 — a read error must not kill the relay
+        _logger.warning(
+            "Relay: disconnect-recovery check failed for session=%s; keeping failed status",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return False
+    return True
+
+
 async def _relay_runner_stream_once(
     session_id: str,
     runner_client: httpx.AsyncClient,
@@ -8723,8 +8763,10 @@ async def _relay_runner_stream_once(
                         continue
                     evt_type = event.get("type", "")
                     if not progress_seen and disconnect_outcome.is_progress(event):
-                        # Native message deltas can replay committed text.
-                        progress_seen = not event.get("message_id")
+                        # Only native text deltas can replay committed text.
+                        progress_seen = not (
+                            evt_type == "response.output_text.delta" and event.get("message_id")
+                        )
                     # The runner emits session.status events
                     # directly.
                     # Re-publish via _publish_status so the event
@@ -8834,6 +8876,16 @@ async def _relay_runner_stream_once(
                                 if isinstance(raw_err, dict)
                                 else None
                             )
+                            if (
+                                status in ("running", "waiting")
+                                and _session_status_cache.get(session_id) == "failed"
+                            ):
+                                # The runner reports the written-off turn in flight:
+                                # record a disconnect failure's recovery before the
+                                # running edge below clears its labels.
+                                await _recover_disconnect_failure_from_relay(
+                                    session_id, conversation_store, resumed_signal="turn_running"
+                                )
                             if status == "failed" and status_error is not None:
                                 await _persist_session_status_error_labels(
                                     session_id,
@@ -8856,37 +8908,21 @@ async def _relay_runner_stream_once(
                             # would deliver a premature, lock-out completion.
                             raw_blocked_on = event.get("blocked_on")
                             raw_response_id = event.get("response_id")
-                            # The runner finishing a turn the server had written
-                            # off as a runner drop proves the drop was transient:
-                            # honor the completion and clear the disconnect cause.
-                            # A genuine task failure keeps its sticky ``failed``
-                            # (the guard only clears a ``runner_disconnected`` label).
-                            # Progress seen on this stream makes the clear a
-                            # recorded resumption rather than a watch.
+                            # The runner finishing a turn the server wrote off as a
+                            # drop proves the drop was transient: clear the disconnect
+                            # cause and, if this stream saw progress, record the resumption.
                             if (
                                 status == "idle"
                                 and _session_status_cache.get(session_id) == "failed"
+                                and await _recover_disconnect_failure_from_relay(
+                                    session_id,
+                                    conversation_store,
+                                    resumed_signal="turn_completed" if progress_seen else None,
+                                )
                             ):
-                                try:
-                                    await _publish_runner_recovered_status(
-                                        session_id,
-                                        conversation_store,
-                                        require_disconnect_code=True,
-                                        turn_completed=progress_seen,
-                                    )
-                                except Exception:  # noqa: BLE001 — a read error must not kill the relay
-                                    # Fail soft: the session keeps its existing
-                                    # failed status (the sticky rule below drops
-                                    # this idle) and the relay keeps streaming.
-                                    _logger.warning(
-                                        "Relay: disconnect-recovery check failed for session=%s; "
-                                        "keeping failed status",
-                                        session_id,
-                                        exc_info=True,
-                                        extra={"session_id": session_id},
-                                    )
-                                else:
-                                    continue
+                                # The recovery published idle; a failed check falls
+                                # through to the sticky rule, which drops this idle.
+                                continue
                             _publish_status(
                                 session_id,
                                 status,

@@ -11,9 +11,12 @@ When a passive reconnect clears a disconnect failure, the session is watched:
   running) before any new user message logs ``session_turn_failure_outcome``
   with ``outcome=turn_resumed``;
 - a new user message first logs ``outcome=superseded_by_user_turn``, and the
-  failure stands;
-- the runner reporting the failed turn finished, after its relay saw the turn
-  make progress, logs ``outcome=turn_resumed`` at once (``signal=turn_completed``).
+  failure stands.
+
+When the relay itself sees the written-off turn in flight or finishing, the
+clear records the outcome at once (``signal=turn_running`` or
+``turn_completed``), unless a user turn was just started for the session, in
+which case that turn supersedes the failed one.
 
 A failure that is never cleared, or whose session never resumes, gets no
 outcome row and keeps counting. Watches are per process; an outcome observed
@@ -24,8 +27,9 @@ counted.
 from __future__ import annotations
 
 import logging
+import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -35,14 +39,12 @@ _logger = logging.getLogger(__name__)
 
 # A turn that resumes later than this is not plausibly the same turn.
 _WATCH_TTL_S = 12 * 3600.0
+# A running edge this soon after a new user turn belongs to that turn.
+_USER_TURN_ATTRIBUTION_S = 300.0
 _MAX_WATCHES = 10_000
 
 _PROGRESS_DELTA_TYPES = frozenset(
-    {
-        "response.output_text.delta",
-        "response.reasoning_text.delta",
-        "response.function_call_output.delta",
-    }
+    {"response.reasoning_text.delta", "response.function_call_output.delta"}
 )
 # Items only an agent produces mid-turn. User input, slash commands and child
 # lifecycle notifications also arrive as ``response.output_item.done``.
@@ -61,6 +63,10 @@ class _Watch:
 
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by globally unique session id
 _watches: dict[str, _Watch] = {}
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by globally unique session id
+_recent_user_turns: dict[str, float] = {}
+# publish() observes events from worker threads while the server loop arms watches.
+_lock = threading.Lock()
 
 
 def watch_for_resume(session_id: str, *, failure_code: str, runner_id: str | None = None) -> None:
@@ -77,44 +83,63 @@ def watch_for_resume(session_id: str, *, failure_code: str, runner_id: str | Non
     :returns: None.
     """
     now = time.monotonic()
-    if len(_watches) >= _MAX_WATCHES:
-        _drop_expired(now)
-        # Other threads may pop entries between the length check and this read.
-        oldest = next(iter(_watches), None) if len(_watches) >= _MAX_WATCHES else None
-        if oldest is not None:
-            _watches.pop(oldest, None)
-    _watches[session_id] = _Watch(cleared_at=now, failure_code=failure_code, runner_id=runner_id)
+    with _lock:
+        _make_room(_watches, now, lambda watch: watch.cleared_at, _WATCH_TTL_S)
+        # Pop first so a re-armed watch takes the newest insertion slot.
+        _watches.pop(session_id, None)
+        _watches[session_id] = _Watch(
+            cleared_at=now, failure_code=failure_code, runner_id=runner_id
+        )
 
 
 def note_user_turn(session_id: str) -> None:
-    """Resolve a watch as lost because the user started a new turn first.
+    """Record that the user started a new turn, superseding any watched failure.
 
-    :param session_id: Session receiving a new user message.
+    Callers note the turn after rejection and de-duplication checks but before
+    forwarding it. Noting it only after the runner accepted the input could let
+    the new turn's first output pass for the old turn resuming, which would
+    hide a lost turn; a failed forward only leaves the failure counted.
+
+    :param session_id: Session receiving a new user message or skill command.
     :returns: None.
     """
-    watch = _watches.pop(session_id, None)
-    if watch is None or time.monotonic() - watch.cleared_at > _WATCH_TTL_S:
+    now = time.monotonic()
+    with _lock:
+        _make_room(_recent_user_turns, now, lambda started: started, _USER_TURN_ATTRIBUTION_S)
+        _recent_user_turns.pop(session_id, None)
+        _recent_user_turns[session_id] = now
+        watch = _watches.pop(session_id, None)
+    if watch is None or now - watch.cleared_at > _WATCH_TTL_S:
         return
     _log_outcome(session_id, watch, "superseded_by_user_turn", signal="user_turn")
 
 
-def note_turn_completed(
-    session_id: str, *, failure_code: str, runner_id: str | None = None
+def note_turn_resumed(
+    session_id: str, *, failure_code: str, runner_id: str | None = None, signal: str
 ) -> None:
-    """Record a failed turn as resumed because the runner reported it finished.
+    """Record a failed turn's outcome when the relay saw it running or finishing.
 
-    The completion is the progress, so no watch is armed and any earlier watch
-    for the session is resolved by it.
+    That observation is the progress, so no watch is armed and any earlier
+    watch for the session is resolved by it. A running edge that follows a
+    user turn started moments ago belongs to that new turn, so the failed turn
+    is recorded as superseded rather than resumed.
 
     :param session_id: Session whose ``failed`` status was cleared.
     :param failure_code: Code of the cleared failure, e.g.
         ``"runner_disconnected"``.
     :param runner_id: Runner bound to the session, when known.
+    :param signal: What the relay saw, ``"turn_running"`` or ``"turn_completed"``.
     :returns: None.
     """
-    _watches.pop(session_id, None)
-    watch = _Watch(cleared_at=time.monotonic(), failure_code=failure_code, runner_id=runner_id)
-    _log_outcome(session_id, watch, "turn_resumed", signal="turn_completed")
+    now = time.monotonic()
+    with _lock:
+        _watches.pop(session_id, None)
+        user_turn_at = _recent_user_turns.pop(session_id, None)
+    watch = _Watch(cleared_at=now, failure_code=failure_code, runner_id=runner_id)
+    if user_turn_at is not None and now - user_turn_at <= _USER_TURN_ATTRIBUTION_S:
+        _log_outcome(session_id, watch, "superseded_by_user_turn", signal="user_turn")
+        return
+    _log_outcome(session_id, watch, "turn_resumed", signal=signal)
 
 
 def is_progress(event: Mapping[str, Any]) -> bool:
@@ -154,20 +179,35 @@ def observe_event(session_id: str, event: dict[str, Any]) -> None:
         return
     # publish() also runs on worker threads; pop so only one caller resolves it,
     # and resolve the watch that was actually popped.
-    watch = _watches.pop(session_id, None)
+    with _lock:
+        watch = _watches.pop(session_id, None)
     if watch is None or time.monotonic() - watch.cleared_at > _WATCH_TTL_S:
         return
     _log_outcome(session_id, watch, "turn_resumed", signal=str(event.get("type")))
 
 
 def reset_for_tests() -> None:
-    """Forget every watch."""
-    _watches.clear()
+    """Forget every watch and noted user turn."""
+    with _lock:
+        _watches.clear()
+        _recent_user_turns.clear()
 
 
-def _drop_expired(now: float) -> None:
-    for session_id in [s for s, w in list(_watches.items()) if now - w.cleared_at > _WATCH_TTL_S]:
-        _watches.pop(session_id, None)
+def _make_room(
+    registry: dict[str, Any], now: float, started_at: Callable[[Any], float], ttl: float
+) -> None:
+    """Keep *registry* under the cap by dropping expired, then oldest, entries.
+
+    The caller holds ``_lock``.
+    """
+    if len(registry) < _MAX_WATCHES:
+        return
+    for key in [k for k, value in list(registry.items()) if now - started_at(value) > ttl]:
+        registry.pop(key, None)
+    if len(registry) >= _MAX_WATCHES:
+        oldest = next(iter(registry), None)
+        if oldest is not None:
+            registry.pop(oldest, None)
 
 
 def _log_outcome(session_id: str, watch: _Watch, outcome: str, *, signal: str) -> None:

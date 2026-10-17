@@ -31,6 +31,7 @@ from omnigent.debug_logging import debug_event
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.diagnostics import (
+    CLEAN_CLOSE_CODES,
     TunnelDiagnosticAttrs,
     silence_source,
 )
@@ -61,8 +62,6 @@ PING_INTERVAL_S = 30.0
 PING_MISS_THRESHOLD = 3
 RUNNER_ID_MISMATCH_CLOSE_CODE = 4004
 _RUNNER_RECOVERY_SLOW_SEC = 30.0
-# WebSocket close codes a runner sends on purpose: 1000 normal, 1001 going away.
-_CLEAN_CLOSE_CODES = frozenset({1000, 1001})
 
 # Lifetime of a managed runner's minted owner bearer (POST
 # /v1/runners/{id}/token). Short by design: the runner re-mints on demand
@@ -674,7 +673,7 @@ def create_runner_tunnel_router(
                 session.peer_close_reason = close_reason or None
             # A normal or going-away close (idle shutdown, host restart) is expected.
             _logger.log(
-                logging.INFO if close_code in _CLEAN_CLOSE_CODES else logging.WARNING,
+                logging.INFO if close_code in CLEAN_CLOSE_CODES else logging.WARNING,
                 "Runner %s websocket disconnected (code=%s, reason=%r)",
                 runner_id,
                 close_code,

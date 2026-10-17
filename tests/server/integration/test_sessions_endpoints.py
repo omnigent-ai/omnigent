@@ -733,7 +733,7 @@ async def test_native_message_repeat_with_same_stable_id_forwards_once(
     the entry already queued and is not forwarded to the runner again. The
     first forward reached the host; a second would run the prompt twice.
     """
-    from omnigent.runtime import pending_inputs
+    from omnigent.runtime import disconnect_outcome, pending_inputs, session_stream
     from omnigent.server.routes import sessions as sessions_module
 
     pending_inputs.reset_for_tests()
@@ -794,14 +794,30 @@ async def test_native_message_repeat_with_same_stable_id_forwards_once(
             )
             assert forwarded_body["stable_id"] == "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
 
-            second = await client.post(f"/v1/sessions/{session_id}/events", json=message)
-            assert second.status_code == 202, second.text
-            # Same queued entry, no second message forward (the idempotent
-            # terminal ensure may still probe), still exactly one queued message.
-            assert second.json()["pending_id"] == first.json()["pending_id"]
-            assert message_forwards() == 1
-            assert len(pending_inputs.snapshot_for(session_id)) == 1
+            # The turn then drops and a passive reconnect clears the failure.
+            disconnect_outcome.reset_for_tests()
+            disconnect_outcome.watch_for_resume(session_id, failure_code="runner_disconnected")
+            with capture_debug_rows("server") as rows:
+                second = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+                assert second.status_code == 202, second.text
+                # Same queued entry, no second message forward (the idempotent
+                # terminal ensure may still probe), still exactly one queued message.
+                assert second.json()["pending_id"] == first.json()["pending_id"]
+                assert message_forwards() == 1
+                assert len(pending_inputs.snapshot_for(session_id)) == 1
+                # A retry starts no turn, so it must not supersede the watched one.
+                assert not any(row["event_name"] == "session_turn_failure_outcome" for row in rows)
+                session_stream.publish(
+                    session_id, {"type": "response.output_text.delta", "delta": "still working"}
+                )
+            outcomes = [
+                row["attributes"]["outcome"]
+                for row in rows
+                if row["event_name"] == "session_turn_failure_outcome"
+            ]
+            assert outcomes == ["turn_resumed"]
         finally:
+            disconnect_outcome.reset_for_tests()
             for pending in pending_inputs.snapshot_for(session_id):
                 pending_inputs.resolve(session_id, pending["pending_id"])
 

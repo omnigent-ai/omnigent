@@ -116,6 +116,19 @@ session impact or changes KPI eligibility.
   per-session disconnect decision records that), `error_category` (`runner`
   for a silent peer, `server` for a local stall) and `error_phase = unknown`.
   Logged at INFO for a silent peer and WARNING for a local stall.
+- `session_runner_recovered`: one row each time the server clears a session's
+  `failed` status because its runner is reachable again, with the cleared
+  `failure_code` and the `recovery_path` (`passive_reconnect`, `turn_running`,
+  `turn_completed` or `explicit_rebind`). This records status recovery only;
+  whether the failed turn itself went on is the next row.
+- `session_turn_failure_outcome`: whether a turn failed as `runner_disconnected`
+  was actually lost. `outcome = turn_resumed` carries the `signal` that proved
+  it (the agent output or in-flight status seen first, or `turn_running` /
+  `turn_completed` when the relay saw it); `outcome = superseded_by_user_turn`
+  means a new message or skill command came first and the failure stands. A
+  failure with no `turn_resumed` row keeps counting. Watches are per process,
+  so an outcome observed on another replica is not recorded, and typed input
+  to a native terminal pane is not treated as a new user turn.
 - `runner_stream_connected` and `runner_stream_ready` carry `runner_id` and
   `telemetry_schema = runner_stream_recovery.v1`. `connected` means the runner
   accepted the HTTP stream; `ready` means the first `session.heartbeat` arrived.

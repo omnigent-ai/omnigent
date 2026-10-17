@@ -3770,17 +3770,21 @@ def test_runner_disconnect_grace_exceeds_runner_worst_case_reconnect() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reports_running_first", [False, True], ids=["output-first", "running-first"]
+)
 async def test_relay_records_a_disconnect_failed_turn_that_finishes_as_resumed(
-    db_uri: str,
+    db_uri: str, reports_running_first: bool
 ) -> None:
     """
     A failed turn whose output and completion reach the relay is recovered once.
 
     Reconnect recovery leaves dependent children ``failed``, so a resumed
     child's output passes through its relay before any resume watch exists.
-    The final ``idle`` clears the failure; because this relay saw the turn
-    make progress, the clear records ``turn_resumed`` at once instead of
-    arming a watch nothing would resolve.
+    A ``running`` report records the recovery before the running edge clears
+    the labels; otherwise the final ``idle`` clears the failure and, because
+    this relay saw the turn make progress, records ``turn_resumed`` at once
+    instead of arming a watch nothing would resolve.
     """
     from omnigent.runtime import disconnect_outcome, session_stream
     from omnigent.server.routes import sessions as sessions_module
@@ -3801,6 +3805,9 @@ async def test_relay_records_a_disconnect_failed_turn_that_finishes_as_resumed(
         {"type": "response.completed", "response": {"id": "resp_resumed"}},
         {"type": "session.status", "status": "idle"},
     ]
+    if reports_running_first:
+        events.insert(0, {"type": "session.status", "status": "running"})
+    expected_signal = "turn_running" if reports_running_first else "turn_completed"
     gate = asyncio.Event()
     gate.set()
     disconnect_outcome.reset_for_tests()
@@ -3818,13 +3825,13 @@ async def test_relay_records_a_disconnect_failed_turn_that_finishes_as_resumed(
             and row["session_id"] == session_id
         ]
         assert [row["outcome"] for row in outcomes] == ["turn_resumed"]
-        assert outcomes[0]["signal"] == "turn_completed"
+        assert outcomes[0]["signal"] == expected_signal
         [recovered] = [
             row
             for row in rows
             if row["event_name"] == "session_runner_recovered" and row["session_id"] == session_id
         ]
-        assert recovered["attributes"]["recovery_path"] == "turn_completed"
+        assert recovered["attributes"]["recovery_path"] == expected_signal
         assert sessions_module._session_status_cache.get(session_id) == "idle"
         refreshed = store.get_conversation(session_id)
         assert refreshed is not None

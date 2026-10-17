@@ -10,18 +10,22 @@ from tests.debug_log_helpers import capture_debug_rows
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("passive", "turn_completed", "next_step", "expected"),
+    ("passive", "resumed_signal", "next_step", "expected"),
     [
-        (True, False, "resume", ["turn_resumed"]),
-        (True, False, "user_turn", ["superseded_by_user_turn"]),
+        (True, None, "resume", ["turn_resumed"]),
+        (True, None, "user_turn", ["superseded_by_user_turn"]),
         # The relay saw the turn finish: recorded at the clear, later output adds nothing.
-        (True, True, "resume", ["turn_resumed"]),
+        (True, "turn_completed", "resume", ["turn_resumed"]),
         # An explicit rebind is already a user action; the old turn can't resume.
-        (False, False, "resume", []),
+        (False, None, "resume", []),
     ],
 )
 async def test_disconnect_failure_outcome_after_reconnect(
-    db_uri: str, passive: bool, turn_completed: bool, next_step: str, expected: list[str]
+    db_uri: str,
+    passive: bool,
+    resumed_signal: str | None,
+    next_step: str,
+    expected: list[str],
 ) -> None:
     """A reconnect-cleared disconnect failure records whether its turn resumed."""
     from omnigent.runtime import disconnect_outcome, session_stream
@@ -45,7 +49,7 @@ async def test_disconnect_failure_outcome_after_reconnect(
         assert sessions_module._session_status_cache.get(session_id) == "failed"
         with capture_debug_rows("server") as rows:
             await sessions_module._publish_runner_recovered_status(
-                session_id, store, require_disconnect_code=passive, turn_completed=turn_completed
+                session_id, store, require_disconnect_code=passive, resumed_signal=resumed_signal
             )
             if next_step == "user_turn":
                 disconnect_outcome.note_user_turn(session_id)
@@ -59,16 +63,16 @@ async def test_disconnect_failure_outcome_after_reconnect(
             if row["event_name"] == "session_turn_failure_outcome"
         ]
         assert [row["outcome"] for row in outcome_rows] == expected
-        if turn_completed:
-            assert outcome_rows[0]["signal"] == "turn_completed"
+        if resumed_signal is not None:
+            assert outcome_rows[0]["signal"] == resumed_signal
         # Every clear is logged against the failure it cleared, naming its path.
         [recovered] = [row for row in rows if row["event_name"] == "session_runner_recovered"]
         assert recovered["session_id"] == session_id
         assert recovered["attributes"]["failure_code"] == "runner_disconnected"
         if not passive:
             expected_path = "explicit_rebind"
-        elif turn_completed:
-            expected_path = "turn_completed"
+        elif resumed_signal is not None:
+            expected_path = resumed_signal
         else:
             expected_path = "passive_reconnect"
         assert recovered["attributes"]["recovery_path"] == expected_path

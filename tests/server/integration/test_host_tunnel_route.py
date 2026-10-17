@@ -813,7 +813,9 @@ async def test_host_tunnel_accepts_and_registers(
     assert conn.hello.name == "test-laptop"
 
 
-@pytest.mark.parametrize("code,reason", [(1000, "done"), (1006, ""), (1012, "restart")])
+@pytest.mark.parametrize(
+    "code,reason", [(1000, "done"), (1001, "going away"), (1006, ""), (1012, "restart")]
+)
 async def test_host_tunnel_deregisters_on_disconnect(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
     caplog: pytest.LogCaptureFixture,

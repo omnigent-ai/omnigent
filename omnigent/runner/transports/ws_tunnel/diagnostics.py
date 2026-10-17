@@ -25,6 +25,8 @@ _MAX_TRACKED_PINGS = 8
 # A healthy peer's last frame can predate a local stall by up to one ping
 # interval (30 s), so a stall this close to the silence explains all of it.
 _LOCAL_STALL_SLACK_S = 35.0
+# WebSocket close codes a peer sends on purpose: 1000 normal, 1001 going away.
+CLEAN_CLOSE_CODES = frozenset({1000, 1001})
 
 
 class TunnelKeepaliveSettings(TypedDict, total=False):

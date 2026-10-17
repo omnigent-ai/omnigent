@@ -67,7 +67,7 @@ from omnigent.host.frames import (
     encode_host_frame,
 )
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
-from omnigent.runner.transports.ws_tunnel.diagnostics import silence_source
+from omnigent.runner.transports.ws_tunnel.diagnostics import CLEAN_CLOSE_CODES, silence_source
 from omnigent.runner.transports.ws_tunnel.frames import (
     PingFrame,
     PongFrame,
@@ -91,8 +91,6 @@ PING_MISS_THRESHOLD = 3
 _HEARTBEAT_FAILURE_LOG_INTERVAL_S = 60.0
 # Per phase: persistence/workers, diagnostics and notification total at most 15s.
 _DISCONNECT_CLEANUP_TIMEOUT_S = 5.0
-# WebSocket close codes a host sends on purpose: 1000 normal, 1001 going away.
-_CLEAN_CLOSE_CODES = frozenset({1000, 1001})
 
 RunnerExitedCallback = Callable[[str, str, str], Awaitable[None]]
 """Async ``(host_id, runner_id, error)`` hook for a ``host.runner_exited`` report."""
@@ -604,7 +602,7 @@ def create_host_tunnel_router(
                 # A normal or going-away close (host stop, restart) is expected.
                 clean_close = (
                     isinstance(disconnect_error, WebSocketDisconnect)
-                    and disconnect_error.code in _CLEAN_CLOSE_CODES
+                    and disconnect_error.code in CLEAN_CLOSE_CODES
                 )
                 if (
                     disconnect_error is not None

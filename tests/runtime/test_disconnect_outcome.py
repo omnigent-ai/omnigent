@@ -89,17 +89,45 @@ def test_user_turn_first_records_superseded_and_stops_watching() -> None:
     assert [o["attributes"]["outcome"] for o in _outcomes(rows)] == ["superseded_by_user_turn"]
 
 
-def test_turn_completion_records_resumed_without_a_watch() -> None:
-    """A runner finishing the failed turn is itself the recovery."""
+@pytest.mark.parametrize("signal", ["turn_running", "turn_completed"])
+def test_relay_observed_resume_is_recorded_without_a_watch(signal: str) -> None:
+    """The relay seeing the failed turn in flight or finishing is itself the recovery."""
     disconnect_outcome.watch_for_resume("conv_a", failure_code="runner_disconnected")
     with capture_debug_rows("server") as rows:
-        disconnect_outcome.note_turn_completed("conv_a", failure_code="runner_disconnected")
+        disconnect_outcome.note_turn_resumed(
+            "conv_a", failure_code="runner_disconnected", signal=signal
+        )
         disconnect_outcome.observe_event(
             "conv_a", {"type": "response.output_text.delta", "delta": "late"}
         )
     [outcome] = _outcomes(rows)
     assert outcome["attributes"]["outcome"] == "turn_resumed"
-    assert outcome["attributes"]["signal"] == "turn_completed"
+    assert outcome["attributes"]["signal"] == signal
+
+
+def test_running_edge_right_after_a_user_turn_supersedes_the_failed_turn() -> None:
+    """A new turn's running edge is not the failed turn resuming."""
+    disconnect_outcome.note_user_turn("conv_a")
+    with capture_debug_rows("server") as rows:
+        disconnect_outcome.note_turn_resumed(
+            "conv_a", failure_code="runner_disconnected", signal="turn_running"
+        )
+    [outcome] = _outcomes(rows)
+    assert outcome["attributes"]["outcome"] == "superseded_by_user_turn"
+    assert outcome["attributes"]["signal"] == "user_turn"
+
+
+def test_rearming_a_watch_makes_it_newest_for_eviction(monkeypatch: pytest.MonkeyPatch) -> None:
+    """At the cap the oldest armed watch goes, not a session that just re-failed."""
+    monkeypatch.setattr(disconnect_outcome, "_MAX_WATCHES", 2)
+    disconnect_outcome.watch_for_resume("conv_a", failure_code="runner_disconnected")
+    disconnect_outcome.watch_for_resume("conv_b", failure_code="runner_disconnected")
+    disconnect_outcome.watch_for_resume("conv_a", failure_code="runner_disconnected")
+    disconnect_outcome.watch_for_resume("conv_c", failure_code="runner_disconnected")
+    with capture_debug_rows("server") as rows:
+        for cid in ("conv_a", "conv_b", "conv_c"):
+            disconnect_outcome.observe_event(cid, {"type": "session.status", "status": "running"})
+    assert sorted(str(o["session_id"]) for o in _outcomes(rows)) == ["conv_a", "conv_c"]
 
 
 def test_unwatched_sessions_log_nothing() -> None:

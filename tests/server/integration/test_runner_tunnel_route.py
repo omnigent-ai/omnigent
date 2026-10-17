@@ -332,8 +332,8 @@ async def test_ws_tunnel_route_round_trips_request_to_runner(
 
 @pytest.mark.parametrize(
     ("close_code", "expected_level"),
-    [(1000, logging.INFO), (1006, logging.WARNING)],
-    ids=["clean-close", "abnormal-close"],
+    [(1000, logging.INFO), (1001, logging.INFO), (1006, logging.WARNING)],
+    ids=["clean-close", "going-away", "abnormal-close"],
 )
 async def test_ws_tunnel_status_reports_registration(
     app: FastAPI, caplog: pytest.LogCaptureFixture, close_code: int, expected_level: int
