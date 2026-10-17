@@ -667,22 +667,23 @@ def create_runner_tunnel_router(
                 )
 
         except WebSocketDisconnect as exc:
-            shutdown_state.note_tunnel_close_code(getattr(exc, "code", None))
-            if session is not None:
-                session.peer_close_reason = getattr(exc, "reason", None) or None
             close_code = getattr(exc, "code", None)
+            close_reason = getattr(exc, "reason", None)
+            shutdown_state.note_tunnel_close_code(close_code)
+            if session is not None:
+                session.peer_close_reason = close_reason or None
             # A normal or going-away close (idle shutdown, host restart) is expected.
             _logger.log(
                 logging.INFO if close_code in _CLEAN_CLOSE_CODES else logging.WARNING,
                 "Runner %s websocket disconnected (code=%s, reason=%r)",
                 runner_id,
-                getattr(exc, "code", None),
-                getattr(exc, "reason", None),
+                close_code,
+                close_reason,
                 extra=debug_event(
                     "runner_tunnel",
                     phase="disconnected",
-                    code=getattr(exc, "code", None),
-                    reason=getattr(exc, "reason", None),
+                    code=close_code,
+                    reason=close_reason,
                     **_connection_attrs(),
                 ),
             )
@@ -997,9 +998,8 @@ async def _ping_loop(
             return
         if elapsed > PING_INTERVAL_S * PING_MISS_THRESHOLD:
             # Runner tunnel went silent past the liveness window. A sleeping or
-            # offline machine is the usual peer cause and reconnects on its own;
-            # whether a turn was lost is logged per session by the disconnect
-            # decision. A stall of this server's own loop is a server fault.
+            # offline peer is expected and reconnects on its own; a stall of this
+            # server's own loop is a server fault.
             diagnostics = session.diagnostics.snapshot()
             source = silence_source(elapsed, diagnostics)
             local_stall = source == "local_event_loop"

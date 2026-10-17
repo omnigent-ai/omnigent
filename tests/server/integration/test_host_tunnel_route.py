@@ -840,12 +840,15 @@ async def test_host_tunnel_deregisters_on_disconnect(
 
     assert registry.get(_HOST_ID) is None
     await comm.wait(timeout=budget(2.0))
-    (end,) = [
-        r.attributes
+    (end_record,) = [
+        r
         for r in caplog.records
         if getattr(r, "event_name", None) == "host_tunnel"
         and r.attributes.get("phase") == "disconnected"
     ]
+    # A normal or going-away close is expected; any other close code warns.
+    assert end_record.levelno == (logging.INFO if code in (1000, 1001) else logging.WARNING)
+    end = end_record.attributes
     assert end["connection_id"] == "host-close"
     assert end["close_code"] == code
     assert end["close_reason"] == reason

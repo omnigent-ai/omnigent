@@ -330,14 +330,24 @@ async def test_ws_tunnel_route_round_trips_request_to_runner(
     assert response.json() == {"status": "ok"}
 
 
+@pytest.mark.parametrize(
+    ("close_code", "expected_level"),
+    [(1000, logging.INFO), (1006, logging.WARNING)],
+    ids=["clean-close", "abnormal-close"],
+)
 async def test_ws_tunnel_status_reports_registration(
-    app: FastAPI, caplog: pytest.LogCaptureFixture
+    app: FastAPI, caplog: pytest.LogCaptureFixture, close_code: int, expected_level: int
 ) -> None:
     """Runner status flips online after tunnel registration.
+
+    The disconnect row logs at INFO for a normal or going-away close and warns
+    for any other close code.
 
     :param app: Production FastAPI app from ``tests.server``
         fixtures.
     :param caplog: Pytest log capture fixture.
+    :param close_code: WebSocket close code the runner sends.
+    :param expected_level: Level of the resulting disconnect row.
     :returns: None.
     """
     registry = app.state.tunnel_registry
@@ -354,7 +364,7 @@ async def test_ws_tunnel_status_reports_registration(
             await _send_hello(communicator, registry, connection_id="conn-status-1")
             online = await client.get(f"/v1/runners/{_RUNNER_ID}/status")
             await communicator.send_input(
-                {"type": "websocket.disconnect", "code": 1000, "reason": "runner shutdown"}
+                {"type": "websocket.disconnect", "code": close_code, "reason": "runner shutdown"}
             )
             await asyncio.wait_for(communicator.future, timeout=budget(1.0))
         finally:
@@ -376,8 +386,15 @@ async def test_ws_tunnel_status_reports_registration(
     disconnected = ends[0]
     assert disconnected["phase"] == "disconnected"
     assert disconnected["connection_id"] == "conn-status-1"
-    assert disconnected["code"] == 1000
+    assert disconnected["code"] == close_code
     assert disconnected["reason"] == "runner shutdown"
+    [end_record] = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_tunnel"
+        and r.attributes["phase"] == "disconnected"
+    ]
+    assert end_record.levelno == expected_level
     assert disconnected["ended_by"] == "tunnel-receive"
     assert disconnected["connection_age_s"] >= 0
     assert disconnected["tunnel_side"] == "server"

@@ -3767,3 +3767,70 @@ def test_runner_disconnect_grace_exceeds_runner_worst_case_reconnect() -> None:
         f"({_MAX_RECONNECT_DELAY_S} * (1 + {_RECONNECT_JITTER_FRACTION}) = "
         f"{worst_case_reconnect_s}s)"
     )
+
+
+@pytest.mark.asyncio
+async def test_relay_records_a_disconnect_failed_turn_that_finishes_as_resumed(
+    db_uri: str,
+) -> None:
+    """
+    A failed turn whose output and completion reach the relay is recovered once.
+
+    Reconnect recovery leaves dependent children ``failed``, so a resumed
+    child's output passes through its relay before any resume watch exists.
+    The final ``idle`` clears the failure; because this relay saw the turn
+    make progress, the clear records ``turn_resumed`` at once instead of
+    arming a watch nothing would resolve.
+    """
+    from omnigent.runtime import disconnect_outcome, session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(runner_id="runner-resumed-child")
+    session_id = conv.id
+    store.set_labels(
+        session_id,
+        {
+            sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY: "runner_disconnected",
+            sessions_module._LAST_TASK_ERROR_MESSAGE_LABEL_KEY: "Runner disconnected unexpectedly.",
+        },
+    )
+    store.set_session_live_status(session_id, "failed")
+    sessions_module._session_status_cache[session_id] = "failed"
+    events: list[dict[str, Any]] = [
+        {"type": "response.output_text.delta", "delta": "still working"},
+        {"type": "response.completed", "response": {"id": "resp_resumed"}},
+        {"type": "session.status", "status": "idle"},
+    ]
+    gate = asyncio.Event()
+    gate.set()
+    disconnect_outcome.reset_for_tests()
+    try:
+        with capture_debug_rows("server") as rows:
+            await sessions_module._relay_runner_stream(
+                session_id,
+                _ScriptedRunnerClient(gate, events),  # type: ignore[arg-type]
+                store,  # type: ignore[arg-type]
+            )
+        outcomes = [
+            row["attributes"]
+            for row in rows
+            if row["event_name"] == "session_turn_failure_outcome"
+            and row["session_id"] == session_id
+        ]
+        assert [row["outcome"] for row in outcomes] == ["turn_resumed"]
+        assert outcomes[0]["signal"] == "turn_completed"
+        [recovered] = [
+            row
+            for row in rows
+            if row["event_name"] == "session_runner_recovered" and row["session_id"] == session_id
+        ]
+        assert recovered["attributes"]["recovery_path"] == "turn_completed"
+        assert sessions_module._session_status_cache.get(session_id) == "idle"
+        refreshed = store.get_conversation(session_id)
+        assert refreshed is not None
+        assert sessions_module._last_task_error_from_labels(refreshed.labels) is None
+    finally:
+        disconnect_outcome.reset_for_tests()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)

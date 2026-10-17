@@ -56,8 +56,10 @@ termination now also gets a disconnect row. `host_tunnel_health` warns only
 for a scheduling/send/queue delay of at least one second, at most once per
 minute per side and connection. The five-second sampler emits no regular
 health rows. Normal application pings/pongs add no INFO/WARNING rows. A timeout
-adds one `host_ping_timeout` warning; an unexpected ping enqueue failure adds
-one `host_ping_failed` warning before the ping loop exits.
+adds one `host_ping_timeout` row with `silence_source`: INFO when the peer went
+silent (`peer`, a sleeping or offline machine), WARNING when this server's own
+event loop stalled for the silence (`local_event_loop`). An unexpected ping
+enqueue failure adds one `host_ping_failed` warning before the ping loop exits.
 
 These fields distinguish local scheduling gaps, queued pings and blocked sends;
 they cannot alone identify a network device, OOM killer or signal sender.
@@ -109,7 +111,11 @@ session impact or changes KPI eligibility.
   Update queries that select only `closed` to use `disconnected` after the
   server upgrade is complete.
 - `runner_ping_timeout`: `runner_id`, `connection_id`, `connection_age_s`,
-  `silent_s`.
+  `silent_s`, `silence_source` (`peer` or `local_event_loop`) and the error
+  dimensions `error_impact = transient` (a timeout alone loses no turn; the
+  per-session disconnect decision records that), `error_category` (`runner`
+  for a silent peer, `server` for a local stall) and `error_phase = unknown`.
+  Logged at INFO for a silent peer and WARNING for a local stall.
 - `runner_stream_connected` and `runner_stream_ready` carry `runner_id` and
   `telemetry_schema = runner_stream_recovery.v1`. `connected` means the runner
   accepted the HTTP stream; `ready` means the first `session.heartbeat` arrived.

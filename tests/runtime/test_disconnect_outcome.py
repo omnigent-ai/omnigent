@@ -28,10 +28,11 @@ def _outcomes(rows: list[dict[str, object]]) -> list[dict[str, object]]:
         {"type": "response.reasoning_text.delta", "delta": "thinking"},
         {"type": "response.function_call_output.delta", "delta": "ok"},
         {"type": "response.output_item.done", "item": {"type": "function_call"}},
+        {"type": "response.output_item.done", "item": {"type": "message", "role": "assistant"}},
         {"type": "session.status", "status": "running"},
         {"type": "session.status", "status": "waiting"},
     ],
-    ids=lambda e: f"{e['type']}:{e.get('status', '')}",
+    ids=lambda e: f"{e['type']}:{e.get('status', '')}{e.get('item', {}).get('type', '')}",
 )
 def test_progress_before_a_user_turn_records_resumed(event: dict[str, object]) -> None:
     with capture_debug_rows("server") as rows:
@@ -55,6 +56,14 @@ def test_progress_before_a_user_turn_records_resumed(event: dict[str, object]) -
         {"type": "response.output_text.delta", "delta": "done", "final": True},
         {"type": "session.usage"},
         {"type": "session.presence"},
+        # A child's lifecycle notification reaches the parent as an output item.
+        {
+            "type": "response.output_item.done",
+            "item": {"type": "resource_event", "event_type": "session.subagent.returned"},
+        },
+        # User input mirrored or echoed back is not the agent making progress.
+        {"type": "response.output_item.done", "item": {"type": "message", "role": "user"}},
+        {"type": "response.output_item.done", "item": {"type": "slash_command"}},
     ],
 )
 def test_non_progress_events_keep_watching(event: dict[str, object]) -> None:
@@ -62,9 +71,12 @@ def test_non_progress_events_keep_watching(event: dict[str, object]) -> None:
     with capture_debug_rows("server") as rows:
         disconnect_outcome.observe_event("conv_a", event)
         disconnect_outcome.observe_event(
-            "conv_a", {"type": "response.output_text.delta", "delta": "x"}
+            "conv_a", {"type": "response.reasoning_text.delta", "delta": "x"}
         )
-    assert [o["attributes"]["outcome"] for o in _outcomes(rows)] == ["turn_resumed"]
+    [outcome] = _outcomes(rows)
+    assert outcome["attributes"]["outcome"] == "turn_resumed"
+    # Only the genuine delta may resolve the watch, never the earlier event.
+    assert outcome["attributes"]["signal"] == "response.reasoning_text.delta"
 
 
 def test_user_turn_first_records_superseded_and_stops_watching() -> None:
@@ -75,6 +87,19 @@ def test_user_turn_first_records_superseded_and_stops_watching() -> None:
             "conv_a", {"type": "response.output_text.delta", "delta": "new turn"}
         )
     assert [o["attributes"]["outcome"] for o in _outcomes(rows)] == ["superseded_by_user_turn"]
+
+
+def test_turn_completion_records_resumed_without_a_watch() -> None:
+    """A runner finishing the failed turn is itself the recovery."""
+    disconnect_outcome.watch_for_resume("conv_a", failure_code="runner_disconnected")
+    with capture_debug_rows("server") as rows:
+        disconnect_outcome.note_turn_completed("conv_a", failure_code="runner_disconnected")
+        disconnect_outcome.observe_event(
+            "conv_a", {"type": "response.output_text.delta", "delta": "late"}
+        )
+    [outcome] = _outcomes(rows)
+    assert outcome["attributes"]["outcome"] == "turn_resumed"
+    assert outcome["attributes"]["signal"] == "turn_completed"
 
 
 def test_unwatched_sessions_log_nothing() -> None:
@@ -103,3 +128,43 @@ def test_signals_after_the_watch_window_are_not_recorded(
                 "conv_a", {"type": "session.status", "status": "running"}
             )
     assert _outcomes(rows) == []
+
+
+def test_replayed_native_deltas_are_not_progress() -> None:
+    """Deltas the stream suppresses as replays of committed text leave the watch armed."""
+    from omnigent.runtime import inflight_text, session_stream
+
+    cid = "conv_replay"
+    committed = {
+        "type": "response.output_item.done",
+        "item": {
+            "type": "message",
+            "role": "assistant",
+            "id": "ci_1",
+            "content": [{"type": "output_text", "text": "Hello big world"}],
+        },
+    }
+
+    def native_delta(index: int, text: str, message_id: str = "m1") -> dict[str, object]:
+        return {
+            "type": "response.output_text.delta",
+            "delta": text,
+            "message_id": message_id,
+            "index": index,
+            "final": False,
+        }
+
+    inflight_text.reset_for_tests()
+    try:
+        # The message committed before the drop; the reconnected runner replays its chunks.
+        session_stream.publish(cid, committed)
+        disconnect_outcome.watch_for_resume(cid, failure_code="runner_disconnected")
+        with capture_debug_rows("server") as rows:
+            session_stream.publish(cid, native_delta(0, "Hello "))
+            session_stream.publish(cid, native_delta(1, "big "))
+            assert _outcomes(rows) == []
+            session_stream.publish(cid, native_delta(0, "Next step", message_id="m2"))
+        assert [o["attributes"]["outcome"] for o in _outcomes(rows)] == ["turn_resumed"]
+    finally:
+        inflight_text.reset_for_tests()
+        session_stream.close(cid)

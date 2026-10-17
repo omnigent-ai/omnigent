@@ -331,10 +331,12 @@ def publish(conversation_id: str, event: dict[str, Any]) -> int:
     # no-op unless a sink is enabled). Done first so it captures every event the
     # server produces — including ones with no live subscriber.
     _log_sse_event(conversation_id, event)
-    disconnect_outcome.observe_event(conversation_id, event)
     # Track reconnect state and centrally suppress or rewrite native deltas
     # before they reach subscribers.
     live_event = inflight_text.record_publish(conversation_id, event)
+    # A replayed delta suppressed above is not new progress for a resume watch.
+    if live_event is not None:
+        disconnect_outcome.observe_event(conversation_id, live_event)
     # Side-channel: keep the cross-session pending-elicitations
     # index in step with the SSE stream. Only acts on
     # ``response.elicitation_request`` events; every other event
