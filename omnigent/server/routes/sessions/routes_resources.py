@@ -478,7 +478,8 @@ def register_resources_routes(
             runner's own error body and status for a missing file, a
             directory, or an out-of-grant path.
         :raises OmnigentError: ``runner_unavailable`` when no runner is
-            available or a send-time connection failure confirms it is offline.
+            available, a send-time connection failure shows it is unreachable,
+            or the runner predates downloads.
         :raises HTTPException: 502 when a download or error-body read fails.
         """
         try:
