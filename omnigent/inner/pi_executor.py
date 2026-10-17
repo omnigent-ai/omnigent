@@ -55,6 +55,7 @@ from importlib.resources import files
 from typing import Any, NotRequired, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
+from omnigent.databricks_ai_gateway import PI_AGENT, gateway_attribution_headers
 from omnigent.harnesses.pi_native.credentials import (
     _databricks_workspace_url_for_gateway,
     _is_databricks_ai_gateway_url,
@@ -197,6 +198,7 @@ class _PiProviderConfig(TypedDict):
     models: list[_JsonObject]
     authHeader: NotRequired[bool]
     compat: NotRequired[_JsonObject]
+    headers: NotRequired[dict[str, str]]
 
 
 class _PiModelsConfig(TypedDict):
@@ -955,6 +957,9 @@ def _build_models_json(
             if pi_model_is_reasoning(model):
                 entry["reasoning"] = True
             provider["models"] = [*provider["models"], entry]
+    for provider_config in config["providers"].values():
+        if _is_databricks_ai_gateway_url(provider_config["baseUrl"]):
+            provider_config["headers"] = gateway_attribution_headers(PI_AGENT)
     return config
 
 
