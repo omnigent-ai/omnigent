@@ -20,11 +20,13 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
+from omnigent.db.account_authority import account_checks_scope
 from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import ScheduledTask
@@ -196,6 +198,7 @@ class FakePermissionStore:
         fail_grant: bool = False,
         fail_grant_users: set[str] | None = None,
         users: set[str] | None = None,
+        generations: dict[str, str] | None = None,
     ) -> None:
         self.ensured: list[str] = []
         self.grants: list[tuple[str, str, int]] = []
@@ -206,6 +209,7 @@ class FakePermissionStore:
         self.fail_grant_users = fail_grant_users or set()
         # ``None`` means every owner exists (the default for most tests).
         self.users: set[str] | None = set(users) if users is not None else None
+        self.generations: dict[str, str] = dict(generations or {})
 
     def ensure_user(self, user_id: str, *, is_admin: bool = False) -> None:
         self.ensured.append(user_id)
@@ -218,7 +222,11 @@ class FakePermissionStore:
     def get_user(self, user_id: str):
         from omnigent.entities.account import Account
 
-        return Account(user_id, False, None, None, False) if self.user_exists(user_id) else None
+        if not self.user_exists(user_id):
+            return None
+        return Account(
+            user_id, False, None, None, False, account_generation=self.generations.get(user_id)
+        )
 
     def grant(self, user_id: str, conversation_id: str, level: int) -> Any:
         self.grant_workspace_ids.append(current_workspace_id())
@@ -330,6 +338,7 @@ def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
         artifact_store=overrides.get("artifact_store"),
         sandbox_config=overrides.get("sandbox_config"),
         managed_launches=overrides.get("managed_launches"),
+        app_state=overrides.get("app_state"),
     )
 
 
@@ -527,12 +536,16 @@ async def test_deleted_owner_disables_task_and_records_failed_run() -> None:
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(user_id="alice")})
     launched: list[Any] = []
+    removed_timers: list[str] = []
 
     async def _launch(conv: Any, task: Any) -> None:
         launched.append(conv)
 
+    app_state = SimpleNamespace(
+        scheduled_task_scheduler=SimpleNamespace(remove=removed_timers.append)
+    )
     on_fire = build_on_fire(
-        _deps(store, permission_store=perm, conversation_store=conv_store),
+        _deps(store, permission_store=perm, conversation_store=conv_store, app_state=app_state),
         launch_dispatch=_launch,
     )
     await on_fire(0, "task_1")
@@ -543,10 +556,72 @@ async def test_deleted_owner_disables_task_and_records_failed_run() -> None:
     assert perm.ensured == []
     assert perm.grants == []
     assert {"id": "task_1", "state": "deleted"} in store.updates
+    assert removed_timers == ["task_1"]
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "owner_deleted"
     assert "alice" in store.runs[0]["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("checks_enabled", "task_generation", "owner_generation"),
+    [
+        pytest.param(False, "gen-1", "gen-2", id="external-auth-rotated-saved-generation"),
+        pytest.param(True, None, "gen-1", id="accounts-mode-null-saved-generation"),
+    ],
+)
+async def test_owner_generation_mismatch_still_disables_task(
+    checks_enabled: bool, task_generation: str | None, owner_generation: str
+) -> None:
+    """A saved generation is always compared; under account checks NULL never matches."""
+    owner = "alice@example.test"
+    perm = FakePermissionStore(users={owner}, generations={owner: owner_generation})
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(user_id=owner, account_generation=task_generation)}
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        pytest.fail("a task with a stale owner registration must not launch")
+
+    on_fire = build_on_fire(
+        _deps(store, permission_store=perm, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    with account_checks_scope(checks_enabled):
+        await on_fire(0, "task_1")
+        await _drain()
+
+    assert conv_store.created == []
+    assert {"id": "task_1", "state": "deleted"} in store.updates
+    assert [run["error_code"] for run in store.runs] == ["owner_deleted"]
+
+
+@pytest.mark.asyncio
+async def test_external_auth_task_without_generation_fires_for_live_owner() -> None:
+    """External auth saves no task generation; a live owner's row may still carry one."""
+    owner = "alice@example.test"
+    perm = FakePermissionStore(users={owner}, generations={owner: "gen-1"})
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(user_id=owner)})
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    on_fire = build_on_fire(
+        _deps(store, permission_store=perm, conversation_store=conv_store),
+        launch_dispatch=_launch,
+    )
+    with account_checks_scope(False):
+        await on_fire(0, "task_1")
+        await _drain()
+
+    assert {"id": "task_1", "state": "deleted"} not in store.updates
+    assert [run["status"] for run in store.runs] == ["running"]
+    assert len(conv_store.created) == 1
+    assert len(launched) == 1
 
 
 def _claude_agent_deps(

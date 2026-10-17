@@ -3,8 +3,9 @@
  * tasks, a search + Active/Paused filter, a "New automation" manual-create action,
  * and a static Suggestions section below.
  *
- * Data comes from `useScheduledTasks`. Pause/resume and delete go through the
- * update/delete mutations, which invalidate the list.
+ * Data comes from `useScheduledTasks`; tasks the server has marked `deleted`
+ * are hidden. Pause/resume and delete go through the update/delete mutations,
+ * which invalidate the list.
  * The human-readable schedule and next-run text are computed client-side from
  * each task's stored RRULE (`scheduleText`) — there is no backend next-run
  * endpoint.
@@ -42,7 +43,10 @@ const FILTER_TABS: { value: FilterTab; label: string }[] = [
 ];
 
 export function TasksPage() {
-  const { data: tasks, isLoading, isError, refetch } = useScheduledTasks();
+  const { data, isLoading, isError, refetch } = useScheduledTasks();
+  // A `deleted` task is a server-side tombstone (its owner registration is
+  // gone): it can't fire, run, or be resumed, so it is not an automation here.
+  const tasks = useMemo(() => (data ?? []).filter((t) => t.state !== "deleted"), [data]);
   const { trackClick } = useOmnigentAnalytics();
   // A single shared, slowly-ticking clock for the whole list. Passing it down to
   // each row (rather than each row owning a timer) keeps the relative next-run
@@ -82,9 +86,8 @@ export function TasksPage() {
   }
 
   const filtered = useMemo(() => {
-    const all = tasks ?? [];
     const q = search.trim().toLowerCase();
-    const matches = all.filter((t) => {
+    const matches = tasks.filter((t) => {
       if (filter === "active" && t.state !== "active") return false;
       if (filter === "paused" && t.state !== "paused") return false;
       if (q && !t.name.toLowerCase().includes(q)) return false;
@@ -146,7 +149,7 @@ export function TasksPage() {
     setManualOpen(true);
   }
 
-  const hasAnyTasks = (tasks ?? []).length > 0;
+  const hasAnyTasks = tasks.length > 0;
 
   return (
     <PageScroll contentClassName="px-4 md:px-6">

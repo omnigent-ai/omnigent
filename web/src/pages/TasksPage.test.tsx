@@ -150,6 +150,37 @@ describe("TasksPage list", () => {
     expect(line).not.toContain("Next run");
   });
 
+  it("does not present a server-disabled task as an active automation", () => {
+    // A fire-time disable leaves `state: "deleted"`; another replica's scheduler
+    // can still report a next run for it.
+    setTasks([
+      task({
+        id: "st_3",
+        name: "Disabled one",
+        state: "deleted",
+        nextRunAt: new Date(Date.now() + 86_400_000).toISOString(),
+      }),
+    ]);
+    renderPage();
+    expect(screen.queryAllByTestId("scheduled-task-row")).toHaveLength(0);
+    expect(screen.queryByText("Disabled one")).toBeNull();
+    // With no live automation left, the page is in its true empty state.
+    expect(screen.getByText("No automations yet")).toBeInTheDocument();
+  });
+
+  it("hides server-disabled tasks from a list of live automations", () => {
+    setTasks([
+      task({ id: "st_1", name: "Nightly triage" }),
+      task({ id: "st_3", name: "Disabled one", state: "deleted" }),
+    ]);
+    renderPage();
+    const rows = screen.getAllByTestId("scheduled-task-row");
+    expect(rows).toHaveLength(1);
+    expect(within(rows[0]).getByText("Nightly triage")).toBeInTheDocument();
+    expect(screen.queryByText("Disabled one")).toBeNull();
+    expect(screen.getByTestId("tasks-filter-all")).toBeInTheDocument();
+  });
+
   it("resumes a paused task via the row menu (Resume label reflects state)", () => {
     setTasks([task({ id: "st_2", state: "paused" })]);
     renderPage();
