@@ -48,6 +48,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_model,
     read_mcp_startup,
     read_unmirrored_codex_settings,
+    record_app_server_stopped,
     update_active_turn_id,
 )
 from omnigent.inner.codex_goal_command import (
@@ -90,6 +91,9 @@ _LEGACY_BRIDGE_STATE_WAIT_SECONDS = 60.0
 _BRIDGE_STATE_FAST_POLL_SECONDS = 0.05
 _BRIDGE_STATE_FAST_POLL_WINDOW_SECONDS = 2.0
 _BRIDGE_STATE_SLOW_POLL_SECONDS = 0.25
+# A live app-server answers each delivery RPC in seconds, MCP startup included (it replies to
+# turn/start before any MCP wait), so a silent one must not hold the turn and inject lock.
+_APP_SERVER_RPC_TIMEOUT_SECONDS = 30.0
 
 
 class _CodexNativeInputUndelivered(RuntimeError):
@@ -98,6 +102,71 @@ class _CodexNativeInputUndelivered(RuntimeError):
     def __init__(self, failure: CodexStartupFailure) -> None:
         self.failure = failure
         super().__init__(failure.message)
+
+
+class _CodexAppServerUnresponsive(RuntimeError):
+    """The app-server kept its connection open but left a request unanswered."""
+
+    def __init__(self, method: str) -> None:
+        super().__init__(
+            f"Codex's app-server for this session stopped responding: no reply to {method} "
+            f"within {_APP_SERVER_RPC_TIMEOUT_SECONDS:g}s"
+        )
+
+
+def _record_unresponsive_app_server(
+    bridge_dir: Path, state: CodexNativeBridgeState, method: str
+) -> None:
+    """Log the unanswered stage and record the app-server stopped, so the runner replaces it."""
+    _logger.warning(
+        "Codex native app-server stopped responding during %s; recording it as stopped",
+        method,
+        extra=with_input_attributes(
+            debug_event(
+                "codex_app_server_unresponsive",
+                session_id=state.session_id,
+                thread_id=state.thread_id,
+                stage=method.replace("/", "_"),
+            )
+        ),
+    )
+    current = read_bridge_state(bridge_dir)
+    # Once a relaunch publishes a new transport, this record would condemn the new app-server.
+    if current is not None and current.socket_path == state.socket_path:
+        record_app_server_stopped(bridge_dir)
+
+
+async def _bounded_request(
+    client: CodexAppServerClient,
+    method: str,
+    params: CodexParams,
+    state: CodexNativeBridgeState,
+    *,
+    bridge_dir: Path,
+) -> CodexMessage:
+    """Send one RPC; raise :class:`_CodexAppServerUnresponsive` if it goes unanswered."""
+    try:
+        return await asyncio.wait_for(
+            client.request(method, params), timeout=_APP_SERVER_RPC_TIMEOUT_SECONDS
+        )
+    except TimeoutError as exc:
+        _record_unresponsive_app_server(bridge_dir, state, method)
+        raise _CodexAppServerUnresponsive(method) from exc
+
+
+async def _pre_delivery_request(
+    client: CodexAppServerClient,
+    method: str,
+    params: CodexParams,
+    state: CodexNativeBridgeState,
+    *,
+    bridge_dir: Path,
+) -> CodexMessage:
+    """Send a request that precedes the turn input; unanswered, the input stays undelivered."""
+    try:
+        return await _bounded_request(client, method, params, state, bridge_dir=bridge_dir)
+    except _CodexAppServerUnresponsive as exc:
+        raise _CodexNativeInputUndelivered(CODEX_APP_SERVER_STOPPED) from exc
 
 
 async def _wait_for_bridge_state(
@@ -151,17 +220,21 @@ def _bridge_state_wait_seconds(bridge_dir: Path) -> float:
     )
 
 
-async def _connect_to_app_server(state: CodexNativeBridgeState) -> CodexAppServerClient | None:
+async def _connect_to_app_server(
+    state: CodexNativeBridgeState, bridge_dir: Path
+) -> CodexAppServerClient | None:
     """
     Connect to the bridge's app-server, or return ``None`` when it is unreachable.
 
-    A socket/handshake failure or explicit drain refusal during initialization
-    leaves the turn provably undelivered. Other protocol failures remain the
-    caller's responsibility.
+    A socket/handshake failure, an unanswered initialize, or explicit drain
+    refusal during initialization leaves the turn provably undelivered. Other
+    protocol failures remain the caller's responsibility.
     Any other exit, a cancel included, closes the half-open client first.
 
     :param state: Bridge state naming the app-server transport.
-    :returns: A connected client, or ``None`` when the connection was refused or lost.
+    :param bridge_dir: Bridge directory that records an unresponsive app-server.
+    :returns: A connected client, or ``None`` when the connection was refused, lost
+        or left unanswered.
     """
     client = client_for_transport(
         state.socket_path,
@@ -169,9 +242,13 @@ async def _connect_to_app_server(state: CodexNativeBridgeState) -> CodexAppServe
     )
     connected = False
     try:
-        await client.connect()
+        await asyncio.wait_for(client.connect(), timeout=_APP_SERVER_RPC_TIMEOUT_SECONDS)
         connected = True
         return client
+    except TimeoutError:
+        # Before OSError, which TimeoutError subclasses: the socket is open but nothing answers.
+        _record_unresponsive_app_server(bridge_dir, state, "initialize")
+        return None
     except CodexAppServerResponseError as exc:
         if not is_server_draining_error(exc):
             raise
@@ -214,9 +291,11 @@ async def _native_delivery_request(
     *,
     bridge_dir: Path,
 ) -> CodexMessage:
-    """Reconnect once after an authoritative refusal; never retry socket loss."""
+    """Reconnect once after an authoritative refusal; never retry socket loss or no reply."""
     try:
-        return await _native_delivery_request_once(client, method, params, state)
+        return await _native_delivery_request_once(
+            client, method, params, state, bridge_dir=bridge_dir
+        )
     except CodexAppServerResponseError as error:
         if not is_server_draining_error(error):
             raise
@@ -232,8 +311,10 @@ async def _native_delivery_request(
         )
         try:
             await client.close()
-            await client.connect()
+            await asyncio.wait_for(client.connect(), timeout=_APP_SERVER_RPC_TIMEOUT_SECONDS)
         except Exception as exc:
+            if isinstance(exc, TimeoutError):
+                _record_unresponsive_app_server(bridge_dir, state, "initialize")
             # The rejected request cannot have delivered input, and reconnecting
             # does not send any. Keep the sender's copy if this step fails.
             raise _CodexNativeInputUndelivered(CODEX_APP_SERVER_STOPPED) from exc
@@ -252,7 +333,9 @@ async def _native_delivery_request(
             ) from error
         # A second refusal still proves non-delivery. Any other failure after
         # this submission is ambiguous and must reach the caller unchanged.
-        return await _native_delivery_request_once(client, method, params, state)
+        return await _native_delivery_request_once(
+            client, method, params, state, bridge_dir=bridge_dir
+        )
 
 
 async def _native_delivery_request_once(
@@ -260,6 +343,8 @@ async def _native_delivery_request_once(
     method: Literal["turn/start", "turn/steer"],
     params: CodexParams,
     state: CodexNativeBridgeState,
+    *,
+    bridge_dir: Path,
 ) -> CodexMessage:
     """Pair each RPC attempt with its result, including a rejected stale steer."""
     attempt_id = uuid.uuid4().hex
@@ -279,11 +364,14 @@ async def _native_delivery_request_once(
         requested_native_turn_id=requested_turn_id,
     )
     try:
-        response = await client.request(method, params)
+        # Unanswered, Codex may still have started the turn, so the input stays ambiguous.
+        response = await _bounded_request(client, method, params, state, bridge_dir=bridge_dir)
     except BaseException as exc:
         outcome = "rpc_error"
         if isinstance(exc, asyncio.CancelledError):
             outcome = "cancelled"
+        elif isinstance(exc, _CodexAppServerUnresponsive):
+            outcome = "timeout"
         elif isinstance(exc, CodexAppServerResponseError) and is_server_draining_error(exc):
             outcome = "rpc_rejected_draining"
         log_input_event(
@@ -357,12 +445,15 @@ async def _start_codex_turn(
             effort,
         )
     if settings_overrides:
-        await client.request(
+        await _pre_delivery_request(
+            client,
             "thread/settings/update",
             {
                 "threadId": state.thread_id,
                 **settings_overrides,
             },
+            state,
+            bridge_dir=bridge_dir,
         )
         # The forwarder and a fresh forwarder state (thread resume / reconnect)
         # re-read config.toml, so mirror what applied; without it they would
@@ -541,7 +632,7 @@ class CodexNativeExecutor(Executor):
             if state.active_turn_id is None:
                 _logger.info("Codex native injection skipped: no active turn")
                 return False
-            client = await _connect_to_app_server(state)
+            client = await _connect_to_app_server(state, self._bridge_dir)
             if client is None:
                 return False
             try:
@@ -797,7 +888,7 @@ class CodexNativeExecutor(Executor):
                 elif not _session_is_active(state.session_id, self._request_session_id):
                     error_msg = "Codex native session is no longer active"
                     undelivered = True
-                elif (client := await _connect_to_app_server(state)) is None:
+                elif (client := await _connect_to_app_server(state, self._bridge_dir)) is None:
                     # Nothing reached the app-server, so the sender's copy is the only record.
                     startup_failure = CODEX_APP_SERVER_STOPPED
                     error_msg = startup_failure.message
@@ -814,12 +905,15 @@ class CodexNativeExecutor(Executor):
                             side_chat.request_side_chat(self._bridge_dir, side_question)
                         else:
                             if goal_objective is not None:
-                                await client.request(
+                                await _pre_delivery_request(
+                                    client,
                                     "thread/goal/set",
                                     {
                                         "threadId": state.thread_id,
                                         "objective": goal_objective,
                                     },
+                                    state,
+                                    bridge_dir=self._bridge_dir,
                                 )
                             await _inject_codex_turn(
                                 client,

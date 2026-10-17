@@ -903,6 +903,8 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
         "different_thread",
         "launch_error",
         "launch_cancelled",
+        "app_server_stopped",
+        "sign_in_pending",
     ],
 )
 @pytest.mark.asyncio
@@ -1032,13 +1034,14 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
 
     async def _parking_forward_known_thread(**kwargs: Any) -> None:
         """Park forever in place of the known-thread forwarder."""
-        del kwargs
         run = _ForwarderRun(task=asyncio.current_task())
         runs.append(run)
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
             run.cancelled = True
+            # Like the real forwarder, a cancelled one closes its own app-server.
+            await kwargs["app_server"].close()
             raise
 
     launched_specs: list[Any] = []
@@ -1126,6 +1129,13 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
                     cwd=bridge_state.cwd,
                 ),
             )
+        elif recovery_state == "app_server_stopped":
+            # What the executor records once the live app-server stops answering.
+            codex_native_bridge.record_app_server_stopped(bridge_dir)
+        elif recovery_state == "sign_in_pending":
+            codex_native_bridge.write_bridge_startup_error(
+                bridge_dir, "Codex is waiting for a sign-in.", code="databricks_sign_in_pending"
+            )
 
         recovery = runner_app_mod._auto_create_codex_terminal(
             session_id,
@@ -1144,18 +1154,25 @@ async def test_auto_create_codex_terminal_recovers_without_restarting_healthy_se
             await recovery
         await asyncio.sleep(0)
 
-        reused = recovery_state in {"live", "launch_error", "launch_cancelled"}
+        reused = recovery_state in {"live", "sign_in_pending", "launch_error", "launch_cancelled"}
         assert len(app_servers) == (1 if reused else 2)
         assert len(runs) == (1 if reused else 2)
         assert runs[0].cancelled is not reused
+        assert original_server.closed is not reused
         if reused:
             assert runner_app_mod._AUTO_CODEX_APP_SERVERS[session_id] is original_server
             assert runner_app_mod._AUTO_FORWARDER_TASKS[session_id] is original_forwarder
-            assert not original_server.closed
             assert codex_native_bridge.read_bridge_state(bridge_dir) == bridge_state
         else:
             assert runner_app_mod._AUTO_CODEX_APP_SERVERS[session_id] is app_servers[1]
             assert runs[1].cancelled is False
+        if recovery_state == "app_server_stopped":
+            # The replacement published its own transport and cleared the stop
+            # record, so the next ensure reuses it instead of relaunching again.
+            new_state = codex_native_bridge.read_bridge_state(bridge_dir)
+            assert new_state is not None
+            assert new_state.socket_path == app_servers[1].listen_url != bridge_state.socket_path
+            assert codex_native_bridge.read_bridge_startup_failure(bridge_dir) is None
         assert len(launched_specs) == 2
         for spec in launched_specs:
             assert spec.keep_alive_after_exit is True
