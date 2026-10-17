@@ -3354,3 +3354,690 @@ def test_describe_active_credential_declines_own_auth_acp_harnesses() -> None:
     # resolver: qwen consumes the openai family at spawn.
     qwen_cred = describe_active_credential(config, "qwen")
     assert qwen_cred is not None and qwen_cred.provider_name == "openai"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Stream-gap reconciliation: /stream does not replay, so events a
+# proxy idle-cut drops must be recovered from REST on reconnect.
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _gap_status(session_id: str, status: str) -> object:
+    from omnigent.server.schemas import SessionStatusEvent
+
+    return SessionStatusEvent(type="session.status", conversation_id=session_id, status=status)
+
+
+def _gap_item(item: dict[str, object]) -> object:
+    from omnigent.server.schemas import OutputItemDoneEvent
+
+    return OutputItemDoneEvent(type="response.output_item.done", item=item)
+
+
+def _gap_delta(text: str) -> object:
+    from omnigent.server.schemas import OutputTextDeltaEvent
+
+    return OutputTextDeltaEvent(type="response.output_text.delta", delta=text)
+
+
+def _gap_heartbeat() -> object:
+    from omnigent.server.schemas import SessionHeartbeatEvent
+
+    return SessionHeartbeatEvent(type="session.heartbeat")
+
+
+def _describe_gap_event(event: object) -> tuple[str, ...]:
+    from omnigent.server.schemas import (
+        OutputItemDoneEvent,
+        OutputTextDeltaEvent,
+        SessionHeartbeatEvent,
+        SessionStatusEvent,
+    )
+
+    if isinstance(event, SessionHeartbeatEvent):
+        return ("heartbeat",)
+    if isinstance(event, SessionStatusEvent):
+        return ("status", event.status)
+    if isinstance(event, OutputTextDeltaEvent):
+        return ("delta", event.delta)
+    assert isinstance(event, OutputItemDoneEvent)
+    return ("item", str(event.item["id"]))
+
+
+async def _gap_first_subscription(session_id: str, *events: object):
+    """The tail every scenario starts from: a running turn, then an idle-cut."""
+    import httpx
+
+    yield _gap_heartbeat()
+    yield _gap_status(session_id, "running")
+    for event in events:
+        yield event
+    raise httpx.RemoteProtocolError("idle cut")
+
+
+def _gap_adapter(
+    *, stream: object, list_items: object, get: object, rendered: list[object]
+) -> object:
+    """Bare adapter wired to fake ``sessions`` calls, as ``run_repl`` leaves it.
+
+    The bookkeeping starts out stale on purpose: a pump for a new session
+    must not reconcile from a previous session's cursor or prose.
+    """
+    import asyncio
+    import types
+
+    from omnigent.repl._repl import _SessionsChatReplAdapter
+
+    adapter = object.__new__(_SessionsChatReplAdapter)
+    adapter._session_id = "conv_gap"
+    adapter._client = types.SimpleNamespace(
+        sessions=types.SimpleNamespace(stream=stream, list_items=list_items, get=get)
+    )
+    adapter._on_event = rendered.append
+    adapter._runner_recover = None
+    adapter._turn_done = asyncio.Event()
+    adapter._last_streamed_item_id = "item_from_previous_session"
+    adapter._last_streamed_status = "idle"
+    adapter._replayed_item_ids = {"item_from_previous_session"}
+    adapter._replayed_status = None
+    adapter._replay_from_start = False
+    adapter._streamed_text_parts = ["prose from previous session"]
+    adapter._pending_dup_texts = ["prose from previous session"]
+    return adapter
+
+
+async def _run_gap_pump(adapter: object, settled: object) -> None:
+    import asyncio
+    import contextlib
+
+    pump = asyncio.create_task(adapter._stream_pump())  # type: ignore[attr-defined]
+    try:
+        await asyncio.wait_for(settled.wait(), timeout=10)  # type: ignore[attr-defined]
+        await asyncio.sleep(0)
+    finally:
+        pump.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pump
+
+
+def _gap_message(item_id: str, text: str) -> dict[str, object]:
+    return {
+        "id": item_id,
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": text}],
+    }
+
+
+_GAP_H0 = _gap_message("h0", "earlier")
+_GAP_M1 = _gap_message("m1", "hi")
+_GAP_FINAL = _gap_message("m2", "done")
+_GAP_TOOL = {"id": "t1", "type": "function_call_output", "call_id": "c1", "output": "ok"}
+_GAP_SECOND = _gap_message("m3", "more")
+_GAP_SEED_CALL = {"limit": 1, "order": "desc"}
+
+
+def _gap_seed_page(**kwargs: object) -> PaginatedList | None:
+    """The pump's start-up ``list_items(limit=1, order="desc")`` read, else ``None``."""
+    if kwargs.get("order") != "desc":
+        return None
+    return PaginatedList(data=[_GAP_H0], last_id="h0")
+
+
+@pytest.mark.asyncio
+async def test_stream_pump_reconciles_output_and_status_missed_during_reconnect() -> None:
+    """A turn that ends while /stream is reconnecting still renders and ends.
+
+    Failure meaning: the REPL shows "streaming…" forever and never prints the
+    final answer when the server-side turn finished during a reconnect gap.
+    """
+    import asyncio
+    import types
+
+    subscriptions = 0
+    rendered: list[object] = []
+    calls: list[dict[str, object]] = []
+    settled = asyncio.Event()
+
+    async def _stream(session_id: str):
+        nonlocal subscriptions
+        subscriptions += 1
+        calls.append({"subscribed": subscriptions})
+        if subscriptions == 1:
+            async for event in _gap_first_subscription(session_id, _gap_item(_GAP_M1)):
+                yield event
+        # Live copies of what reconciliation already delivered, then a new turn.
+        yield _gap_heartbeat()
+        yield _gap_item(_GAP_FINAL)
+        yield _gap_status(session_id, "idle")
+        yield _gap_status(session_id, "running")
+        settled.set()
+        await asyncio.Event().wait()
+
+    async def _list_items(session_id: str, **kwargs: object) -> PaginatedList:
+        calls.append(kwargs)
+        if (seed := _gap_seed_page(**kwargs)) is not None:
+            return seed
+        # The first subscription reconciles too, but the gap only opens when it
+        # cuts, so nothing new is waiting after the seed until the reconnect.
+        if subscriptions < 2:
+            return PaginatedList(data=[])
+        user = {"id": "u2", "type": "message", "role": "user", "content": "next"}
+        return PaginatedList(data=[user, _GAP_FINAL], last_id="m2")
+
+    async def _get(session_id: str):
+        # The turn finishes during the gap, so it is still running while the
+        # first subscription reconciles.
+        return types.SimpleNamespace(status="idle" if subscriptions >= 2 else "running")
+
+    adapter = _gap_adapter(stream=_stream, list_items=_list_items, get=_get, rendered=rendered)
+    await _run_gap_pump(adapter, settled)
+
+    assert [_describe_gap_event(e) for e in rendered] == [
+        ("status", "running"),
+        ("heartbeat",),
+        ("item", "m1"),
+        ("item", "m2"),
+        ("status", "idle"),
+        ("heartbeat",),
+        ("status", "running"),
+    ], "missed output renders once, user echo and live duplicates are skipped"
+    assert adapter._turn_done.is_set()  # type: ignore[attr-defined]
+    # Seed once before subscribing, then reconcile on every subscription,
+    # including the first, so a gap in any window after the seed is recovered.
+    assert calls == [
+        _GAP_SEED_CALL,
+        {"subscribed": 1},
+        {"limit": 100, "after": "h0", "order": "asc"},
+        {"subscribed": 2},
+        {"limit": 100, "after": "m1", "order": "asc"},
+    ]
+    assert adapter._replayed_item_ids == set()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_stream_pump_reconciles_a_turn_that_ends_while_resubscribing() -> None:
+    """REST is read only once the new live tail is registered.
+
+    Here the turn completes after the pump decides to resubscribe but before
+    the server sends the new stream's first event, so its idle status was
+    published to nobody. Reading REST before subscribing would still see the
+    turn running and lose it for good. The tail also queued the same prose as
+    deltas; printing them after the replayed item would show it twice.
+
+    The gap holds two prose segments split by a tool boundary. A single
+    "drop until the next item" flag would stop suppressing at the first
+    replayed item and re-print the second segment, so each segment's prose
+    is tracked and dropped on its own.
+    """
+    import asyncio
+    import types
+
+    server: dict[str, object] = {"status": "running", "items": []}
+    subscriptions = 0
+    rendered: list[object] = []
+    settled = asyncio.Event()
+
+    async def _stream(session_id: str):
+        nonlocal subscriptions
+        subscriptions += 1
+        if subscriptions == 1:
+            async for event in _gap_first_subscription(session_id, _gap_item(_GAP_M1)):
+                yield event
+        server["status"] = "idle"
+        server["items"] = [_GAP_FINAL, _GAP_TOOL, _GAP_SECOND]
+        yield _gap_heartbeat()
+        yield _gap_delta("do")
+        yield _gap_delta("ne")
+        yield _gap_item(_GAP_FINAL)
+        yield _gap_item(_GAP_TOOL)
+        yield _gap_delta("mo")
+        yield _gap_delta("re")
+        yield _gap_item(_GAP_SECOND)
+        yield _gap_status(session_id, "idle")
+        yield _gap_status(session_id, "running")
+        yield _gap_delta("next")
+        settled.set()
+        await asyncio.Event().wait()
+
+    async def _list_items(session_id: str, **kwargs: object) -> PaginatedList:
+        if (seed := _gap_seed_page(**kwargs)) is not None:
+            return seed
+        return PaginatedList(data=list(server["items"]))  # type: ignore[call-overload]
+
+    async def _get(session_id: str):
+        return types.SimpleNamespace(status=server["status"])
+
+    adapter = _gap_adapter(stream=_stream, list_items=_list_items, get=_get, rendered=rendered)
+    await _run_gap_pump(adapter, settled)
+
+    assert [_describe_gap_event(e) for e in rendered] == [
+        ("status", "running"),
+        ("heartbeat",),
+        ("item", "m1"),
+        ("item", "m2"),
+        ("item", "t1"),
+        ("item", "m3"),
+        ("status", "idle"),
+        ("heartbeat",),
+        ("status", "running"),
+        ("delta", "next"),
+    ], "both replayed segments drop their queued prose once; the next turn streams"
+    assert adapter._turn_done.is_set()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_stream_pump_streams_a_fresh_message_after_a_replayed_one() -> None:
+    """A new message that starts streaming right after a replayed one still renders.
+
+    Reconciliation replays the message that committed inside the gap, then the
+    tail opens a brand-new message. Its deltas must render: the dup-prose guard
+    covers only the replayed message, not everything that follows it. A single
+    drop flag would swallow the new message's prose until its item arrived.
+    """
+    import asyncio
+    import types
+
+    subscriptions = 0
+    rendered: list[object] = []
+    settled = asyncio.Event()
+
+    async def _stream(session_id: str):
+        nonlocal subscriptions
+        subscriptions += 1
+        if subscriptions == 1:
+            async for event in _gap_first_subscription(session_id, _gap_item(_GAP_M1)):
+                yield event
+        yield _gap_heartbeat()
+        yield _gap_delta("mo")
+        yield _gap_delta("re")
+        yield _gap_item(_GAP_SECOND)
+        yield _gap_status(session_id, "idle")
+        settled.set()
+        await asyncio.Event().wait()
+
+    async def _list_items(session_id: str, **kwargs: object) -> PaginatedList:
+        if (seed := _gap_seed_page(**kwargs)) is not None:
+            return seed
+        # The first subscription reconciles too; the gap opens only when it
+        # cuts, so the committed message appears only on the reconnect read.
+        if subscriptions < 2:
+            return PaginatedList(data=[])
+        # Only the message that committed inside the gap is in REST; the new
+        # message is still in flight on the tail.
+        return PaginatedList(data=[_GAP_FINAL])
+
+    async def _get(session_id: str):
+        # The turn is still running when reconciliation reads REST.
+        return types.SimpleNamespace(status="running")
+
+    adapter = _gap_adapter(stream=_stream, list_items=_list_items, get=_get, rendered=rendered)
+    await _run_gap_pump(adapter, settled)
+
+    assert [_describe_gap_event(e) for e in rendered] == [
+        ("status", "running"),
+        ("heartbeat",),
+        ("item", "m1"),
+        ("item", "m2"),
+        ("heartbeat",),
+        ("delta", "mo"),
+        ("delta", "re"),
+        ("item", "m3"),
+        ("status", "idle"),
+    ], "the replayed message renders once and the fresh message still streams"
+    assert adapter._turn_done.is_set()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_stream_gap_reconciliation_pages_through_a_long_gap() -> None:
+    """A gap holding more items than one page replays every item, in order."""
+    import asyncio
+    import types
+
+    page_one = [
+        {"id": f"i{n:03d}", "type": "function_call_output", "call_id": f"c{n}", "output": "ok"}
+        for n in range(100)
+    ]
+    pages = {
+        "m1": PaginatedList(data=page_one, last_id="i099", has_more=True),
+        "i099": PaginatedList(data=[_GAP_FINAL], last_id="m2"),
+    }
+    cursors: list[object] = []
+    subscriptions = 0
+    rendered: list[object] = []
+    settled = asyncio.Event()
+
+    async def _stream(session_id: str):
+        nonlocal subscriptions
+        subscriptions += 1
+        if subscriptions == 1:
+            async for event in _gap_first_subscription(session_id, _gap_item(_GAP_M1)):
+                yield event
+        yield _gap_heartbeat()
+        settled.set()
+        await asyncio.Event().wait()
+
+    async def _list_items(session_id: str, **kwargs: object) -> PaginatedList:
+        if (seed := _gap_seed_page(**kwargs)) is not None:
+            return seed
+        cursors.append(kwargs["after"])
+        # The first subscription reconciles too; the paged gap opens only when
+        # it cuts, so nothing follows the seed cursor yet.
+        if subscriptions < 2:
+            return PaginatedList(data=[])
+        return pages[kwargs["after"]]  # type: ignore[index]
+
+    async def _get(session_id: str):
+        return types.SimpleNamespace(status="idle" if subscriptions >= 2 else "running")
+
+    adapter = _gap_adapter(stream=_stream, list_items=_list_items, get=_get, rendered=rendered)
+    await _run_gap_pump(adapter, settled)
+
+    assert [_describe_gap_event(e) for e in rendered] == [
+        ("status", "running"),
+        ("heartbeat",),
+        ("item", "m1"),
+        *(("item", str(item["id"])) for item in page_one),
+        ("item", "m2"),
+        ("status", "idle"),
+        ("heartbeat",),
+    ]
+    assert cursors == ["h0", "m1", "i099"]
+
+
+@pytest.mark.asyncio
+async def test_stream_gap_reconciliation_survives_a_stale_cursor() -> None:
+    """A deleted cursor item still ends the turn, and the next gap replays again.
+
+    The stale cursor cannot recover what followed it, so the pump re-baselines
+    on the newest remaining item instead of giving up on item replay.
+    """
+    import asyncio
+    import types
+
+    import httpx
+    from omnigent_client import StaleCursorError
+
+    subscriptions = 0
+    desc_reads = 0
+    cursors: list[object] = []
+    rendered: list[object] = []
+    settled = asyncio.Event()
+
+    async def _stream(session_id: str):
+        nonlocal subscriptions
+        subscriptions += 1
+        if subscriptions == 1:
+            async for event in _gap_first_subscription(session_id, _gap_item(_GAP_M1)):
+                yield event
+        yield _gap_heartbeat()
+        if subscriptions == 2:
+            raise httpx.RemoteProtocolError("second cut")
+        settled.set()
+        await asyncio.Event().wait()
+
+    async def _list_items(session_id: str, **kwargs: object) -> PaginatedList:
+        nonlocal desc_reads
+        if kwargs.get("order") == "desc":
+            # The first read seeds the pump; the second re-baselines after the clear.
+            desc_reads += 1
+            newest = _GAP_H0 if desc_reads == 1 else _gap_message("m3", "later")
+            return PaginatedList(data=[newest], last_id=str(newest["id"]))
+        cursors.append(kwargs["after"])
+        # The first subscription reconciles too; the gap opens only when it
+        # cuts, so nothing follows the seed cursor yet.
+        if subscriptions < 2:
+            return PaginatedList(data=[])
+        if kwargs["after"] == "m1":
+            raise StaleCursorError("cursor 'm1' no longer exists", 400, "stale_cursor")
+        return PaginatedList(data=[_gap_message("m4", "after the clear")], last_id="m4")
+
+    async def _get(session_id: str):
+        return types.SimpleNamespace(status="idle" if subscriptions >= 2 else "running")
+
+    adapter = _gap_adapter(stream=_stream, list_items=_list_items, get=_get, rendered=rendered)
+    await _run_gap_pump(adapter, settled)
+
+    assert [_describe_gap_event(e) for e in rendered] == [
+        ("status", "running"),
+        ("heartbeat",),
+        ("item", "m1"),
+        ("status", "idle"),
+        ("heartbeat",),
+        ("item", "m4"),
+        ("heartbeat",),
+    ]
+    assert cursors == ["h0", "m1", "m3"]
+    assert adapter._turn_done.is_set()  # type: ignore[attr-defined]
+    assert adapter._last_streamed_item_id == "m4"  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("existing", "expected_after"),
+    [([_GAP_H0], "h0"), ([], None)],
+    ids=["resumed-session", "empty-session"],
+)
+async def test_stream_gap_reconciliation_covers_a_gap_before_any_live_item(
+    existing: list[dict[str, object]], expected_after: str | None
+) -> None:
+    """A cut before this pump delivered any item still replays the gap's output.
+
+    The cursor is seeded from the newest item at pump start (or the session
+    start when it has none), so the boundary never defaults to "unknown".
+    """
+    import asyncio
+    import types
+
+    subscriptions = 0
+    rendered: list[object] = []
+    cursors: list[object] = []
+    settled = asyncio.Event()
+
+    async def _stream(session_id: str):
+        nonlocal subscriptions
+        subscriptions += 1
+        if subscriptions == 1:
+            async for event in _gap_first_subscription(session_id):
+                yield event
+        yield _gap_heartbeat()
+        settled.set()
+        await asyncio.Event().wait()
+
+    async def _list_items(session_id: str, **kwargs: object) -> PaginatedList:
+        if kwargs.get("order") == "desc":
+            return PaginatedList(data=list(existing))
+        cursors.append(kwargs.get("after"))
+        # The first subscription reconciles too; the gap opens only when it
+        # cuts, so nothing follows the seed yet.
+        if subscriptions < 2:
+            return PaginatedList(data=[])
+        return PaginatedList(data=[_GAP_FINAL], last_id="m2")
+
+    async def _get(session_id: str):
+        return types.SimpleNamespace(status="idle" if subscriptions >= 2 else "running")
+
+    adapter = _gap_adapter(stream=_stream, list_items=_list_items, get=_get, rendered=rendered)
+    await _run_gap_pump(adapter, settled)
+
+    assert [_describe_gap_event(e) for e in rendered] == [
+        ("status", "running"),
+        ("heartbeat",),
+        ("item", "m2"),
+        ("status", "idle"),
+        ("heartbeat",),
+    ]
+    assert cursors == [expected_after, expected_after]
+    assert adapter._turn_done.is_set()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("streamed", "persisted", "expected_suffix"),
+    [
+        (["Hel"], "Hello world", "lo world"),
+        (["Hello", " world"], "Hello world", None),
+        (["Hel"], "Bye", None),
+    ],
+    ids=["prefix-streamed", "fully-streamed", "unrelated-prose"],
+)
+async def test_stream_gap_reconciliation_completes_partially_streamed_prose(
+    streamed: list[str], persisted: str, expected_suffix: str | None
+) -> None:
+    """A message cut mid-stream is finished, not repeated or dropped.
+
+    The renderer skips an assistant message while its prose is in flight, so
+    the pump emits only the unseen remainder as a delta ahead of the replayed
+    item; fully streamed or unrelated prose gets no synthetic delta.
+    """
+    import asyncio
+    import types
+
+    subscriptions = 0
+    rendered: list[object] = []
+    settled = asyncio.Event()
+
+    async def _stream(session_id: str):
+        nonlocal subscriptions
+        subscriptions += 1
+        if subscriptions == 1:
+            deltas = [_gap_delta(text) for text in streamed]
+            async for event in _gap_first_subscription(session_id, *deltas):
+                yield event
+        yield _gap_heartbeat()
+        settled.set()
+        await asyncio.Event().wait()
+
+    async def _list_items(session_id: str, **kwargs: object) -> PaginatedList:
+        if (seed := _gap_seed_page(**kwargs)) is not None:
+            return seed
+        # The first subscription reconciles too; the cut-off message commits
+        # only once the gap opens on the reconnect.
+        if subscriptions < 2:
+            return PaginatedList(data=[])
+        return PaginatedList(data=[_gap_message("m2", persisted)], last_id="m2")
+
+    async def _get(session_id: str):
+        return types.SimpleNamespace(status="idle" if subscriptions >= 2 else "running")
+
+    adapter = _gap_adapter(stream=_stream, list_items=_list_items, get=_get, rendered=rendered)
+    await _run_gap_pump(adapter, settled)
+
+    expected: list[tuple[str, ...]] = [("status", "running"), ("heartbeat",)]
+    expected += [("delta", text) for text in streamed]
+    if expected_suffix is not None:
+        expected.append(("delta", expected_suffix))
+    expected += [("item", "m2"), ("status", "idle"), ("heartbeat",)]
+    assert [_describe_gap_event(e) for e in rendered] == expected
+
+
+@pytest.mark.asyncio
+async def test_stream_gap_reconciliation_recovers_the_first_subscription_window() -> None:
+    """A turn that finishes before the first tail registers is still recovered.
+
+    No reconnect happens here: the gap is the window between seeding the cursor
+    and the first live subscription registering. The first subscription
+    reconciles it instead of waiting for a later reconnect that may never come.
+    """
+    import asyncio
+    import types
+
+    subscriptions = 0
+    rendered: list[object] = []
+    calls: list[dict[str, object]] = []
+    settled = asyncio.Event()
+
+    async def _stream(session_id: str):
+        nonlocal subscriptions
+        subscriptions += 1
+        calls.append({"subscribed": subscriptions})
+        # The turn committed and ended inside the attach-to-registration
+        # window, so the live tail only carries the heartbeat and idle copy.
+        yield _gap_heartbeat()
+        yield _gap_item(_GAP_FINAL)
+        yield _gap_status(session_id, "idle")
+        settled.set()
+        await asyncio.Event().wait()
+
+    async def _list_items(session_id: str, **kwargs: object) -> PaginatedList:
+        calls.append(kwargs)
+        if (seed := _gap_seed_page(**kwargs)) is not None:
+            return seed
+        return PaginatedList(data=[_GAP_FINAL], last_id="m2")
+
+    async def _get(session_id: str):
+        return types.SimpleNamespace(status="idle")
+
+    adapter = _gap_adapter(stream=_stream, list_items=_list_items, get=_get, rendered=rendered)
+    await _run_gap_pump(adapter, settled)
+
+    assert [_describe_gap_event(e) for e in rendered] == [
+        ("item", "m2"),
+        ("status", "idle"),
+        ("heartbeat",),
+    ], "the window's item and idle status are recovered on the first subscription"
+    assert adapter._turn_done.is_set()  # type: ignore[attr-defined]
+    assert calls == [
+        _GAP_SEED_CALL,
+        {"subscribed": 1},
+        {"limit": 100, "after": "h0", "order": "asc"},
+    ]
+    assert adapter._replayed_item_ids == set()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_stream_gap_reconciliation_status_does_not_swallow_a_later_turn() -> None:
+    """A reconciled status whose live copy never arrives can't stick the spinner.
+
+    The window turn's ``idle`` is reconciled from REST, but the live tail does
+    not re-send a status committed before this subscription, so that reconciled
+    ``idle`` lingers with no live copy to consume it. The next turn's own
+    ``idle`` must still render; otherwise the toolbar would read ``streaming…``
+    forever again, one turn later.
+    """
+    import asyncio
+    import types
+
+    rendered: list[object] = []
+    calls: list[dict[str, object]] = []
+    settled = asyncio.Event()
+
+    async def _stream(session_id: str):
+        calls.append({"subscribed": 1})
+        # Window turn: finished before this subscription registered, so the
+        # live tail only carries the heartbeat (no committed-status replay).
+        yield _gap_heartbeat()
+        # A fresh turn runs on the same subscription, no reconnect.
+        yield _gap_status(session_id, "running")
+        yield _gap_item(_GAP_SECOND)
+        yield _gap_status(session_id, "idle")
+        settled.set()
+        await asyncio.Event().wait()
+
+    async def _list_items(session_id: str, **kwargs: object) -> PaginatedList:
+        calls.append(kwargs)
+        if (seed := _gap_seed_page(**kwargs)) is not None:
+            return seed
+        return PaginatedList(data=[_GAP_FINAL], last_id="m2")
+
+    async def _get(session_id: str):
+        return types.SimpleNamespace(status="idle")
+
+    adapter = _gap_adapter(stream=_stream, list_items=_list_items, get=_get, rendered=rendered)
+    await _run_gap_pump(adapter, settled)
+
+    assert [_describe_gap_event(e) for e in rendered] == [
+        ("item", "m2"),
+        ("status", "idle"),
+        ("heartbeat",),
+        ("status", "running"),
+        ("item", "m3"),
+        ("status", "idle"),
+    ], "the second turn's idle must render, not be deduped against the stale reconciled one"
+    assert adapter._replayed_status is None  # type: ignore[attr-defined]
+    assert adapter._turn_done.is_set()  # type: ignore[attr-defined]
+    assert calls == [
+        _GAP_SEED_CALL,
+        {"subscribed": 1},
+        {"limit": 100, "after": "h0", "order": "asc"},
+    ]
