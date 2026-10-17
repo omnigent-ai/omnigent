@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json as _json
+import logging
 import sqlite3 as _sqlite3
 from collections.abc import Callable
 from pathlib import Path
@@ -147,6 +148,42 @@ def test_capture_cursor_pane_returns_pane_or_none(
 
     monkeypatch.setattr(cnb, "read_tmux_info", lambda _d: None)
     assert cnb.capture_cursor_pane(tmp_path) is None  # no tmux target advertised
+
+
+def test_cursor_pane_gone_distinguishes_dead_live_and_unknown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Dead, live, or indeterminate pane as ``True``, ``False``, ``None``."""
+    monkeypatch.setattr(cnb, "read_tmux_info", lambda _d: {"socket_path": "s", "tmux_target": "t"})
+    monkeypatch.setattr(cnb, "_probe_session", lambda _s, _t: True)
+    assert cnb.cursor_pane_gone(tmp_path) is False
+
+    monkeypatch.setattr(cnb, "_probe_session", lambda _s, _t: False)
+    assert cnb.cursor_pane_gone(tmp_path) is True
+
+    monkeypatch.setattr(cnb, "_probe_session", lambda _s, _t: None)  # probe timed out
+    assert cnb.cursor_pane_gone(tmp_path) is None
+
+    monkeypatch.setattr(cnb, "read_tmux_info", lambda _d: None)
+    assert cnb.cursor_pane_gone(tmp_path) is True  # no tmux target advertised
+
+
+@pytest.mark.parametrize(
+    "error",
+    [cnb.subprocess.TimeoutExpired(cmd="tmux", timeout=1), OSError("tmux: cannot spawn")],
+    ids=["timeout", "spawn-error"],
+)
+def test_probe_session_reports_failed_probe_as_unknown(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    """A ``has-session`` timeout or spawn error is ``None``, not a dead pane."""
+
+    def _fail(*_a: object, **_k: object) -> None:
+        raise error
+
+    monkeypatch.setattr(cnb.subprocess, "run", _fail)
+    assert cnb._probe_session("s", "t") is None
+    assert cnb._session_alive("s", "t") is False
 
 
 def test_send_cursor_pane_keys_invokes_tmux_send_keys(
@@ -921,6 +958,261 @@ async def test_send_cursor_keys_reports_undelivered_keystroke(
     assert await cnp._send_cursor_keys(tmp_path, "conv_live", "y") is True
 
 
+_KEYSTROKE_ERROR_PREFIX = "failed to send cursor keystroke"
+
+
+def _keystroke_error_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """The raw keystroke-delivery ERROR records captured so far."""
+    return [
+        record
+        for record in caplog.records
+        if record.levelno >= logging.ERROR
+        and record.getMessage().startswith(_KEYSTROKE_ERROR_PREFIX)
+    ]
+
+
+async def test_send_cursor_keys_attributes_dead_pane_without_error_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A keystroke failing because the pane died is a warning, not the raw ERROR.
+
+    The pane's tmux server dying while a verdict is parked is an expected
+    end-of-life state (terminal teardown, temp cleanup, machine sleep) — it
+    must be attributed instead of surfacing as an unhandled-looking traceback.
+    """
+    caplog.set_level(logging.DEBUG)
+
+    def _boom(_bridge: Path, _key: str) -> None:
+        raise RuntimeError("tmux command failed (rc=1): error connecting to tmux.sock")
+
+    monkeypatch.setattr(cnp, "send_cursor_pane_keys", _boom)
+    monkeypatch.setattr(cnp, "cursor_pane_gone", lambda _bridge: True)
+
+    assert await cnp._send_cursor_keys(tmp_path, "conv_gone", "y") is False
+
+    assert not _keystroke_error_records(caplog)
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "cursor pane is gone" in record.getMessage()
+    ]
+    assert warnings and "error connecting to tmux.sock" in warnings[0]
+
+
+async def test_send_cursor_keys_still_errors_when_live_pane_send_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A send failure on a LIVE pane keeps the loud ERROR (a real malfunction)."""
+    caplog.set_level(logging.DEBUG)
+
+    def _boom(_bridge: Path, _key: str) -> None:
+        raise RuntimeError("tmux command failed (rc=1): unknown key")
+
+    monkeypatch.setattr(cnp, "send_cursor_pane_keys", _boom)
+    monkeypatch.setattr(cnp, "cursor_pane_gone", lambda _bridge: False)
+
+    assert await cnp._send_cursor_keys(tmp_path, "conv_live_fail", "y") is False
+    assert _keystroke_error_records(caplog)
+
+
+async def test_send_cursor_keys_reports_spawn_failure_as_undelivered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A tmux process that cannot be spawned is an undelivered keystroke, not an escape."""
+    caplog.set_level(logging.DEBUG)
+
+    def _boom(_bridge: Path, _key: str) -> None:
+        raise OSError("tmux: cannot spawn")
+
+    monkeypatch.setattr(cnp, "send_cursor_pane_keys", _boom)
+    monkeypatch.setattr(cnp, "cursor_pane_gone", lambda _bridge: True)
+
+    assert await cnp._send_cursor_keys(tmp_path, "conv_spawn_fail", "y") is False
+    assert not _keystroke_error_records(caplog)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [RuntimeError("tmux command timed out after 5s"), OSError("tmux: cannot spawn")],
+    ids=["send-timeout", "spawn-error"],
+)
+async def test_send_cursor_keys_keeps_error_when_probe_is_indeterminate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    error: Exception,
+) -> None:
+    """A failed send with an unprobeable pane keeps the ERROR: death is not confirmed."""
+    caplog.set_level(logging.DEBUG)
+
+    def _boom(_bridge: Path, _key: str) -> None:
+        raise error
+
+    monkeypatch.setattr(cnp, "send_cursor_pane_keys", _boom)
+    monkeypatch.setattr(cnp, "cursor_pane_gone", lambda _bridge: None)
+
+    assert await cnp._send_cursor_keys(tmp_path, "conv_unprobeable", "y") is False
+    assert _keystroke_error_records(caplog)
+
+
+def _shell_approval_prompt() -> CursorApprovalPrompt:
+    return CursorApprovalPrompt(
+        operation_type="shell",
+        message="Cursor wants to run Shell",
+        preview="rm -rf build/",
+        accept_key="y",
+        decline_key="Escape",
+    )
+
+
+async def test_run_one_approval_dead_pane_notifies_user(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A keystroke that hits a dead pane posts the relaunch notice; no raw ERROR.
+
+    The card settles as answered the moment the web verdict lands, so a
+    keystroke that has nowhere to go must produce user-facing feedback.
+    """
+    caplog.set_level(logging.DEBUG)
+    attempts: list[tuple[str, ...]] = []
+
+    def _boom(_bridge: Path, *keys: str) -> None:
+        attempts.append(keys)
+        raise RuntimeError("tmux command failed (rc=1): error connecting to tmux.sock")
+
+    monkeypatch.setattr(cnp, "send_cursor_pane_keys", _boom)
+    monkeypatch.setattr(cnp, "cursor_pane_gone", lambda _bridge: True)
+    client = _QueueClient([httpx.Response(200, json={"action": "accept"}), httpx.Response(200)])
+
+    await cnp._run_one_approval(
+        client,  # type: ignore[arg-type]
+        session_id="conv_dead_pane",
+        bridge_dir=tmp_path,
+        prompt=_shell_approval_prompt(),
+        elicitation_id="elic_dead",
+    )
+
+    assert attempts == [("y",)]  # delivery is always attempted first
+    url, body = client.posts[-1]
+    assert url == "/v1/sessions/conv_dead_pane/events"
+    assert body["type"] == "external_assistant_message"
+    assert "could not be delivered" in body["data"]["text"]
+    assert "no longer running" in body["data"]["text"]
+    assert "Cursor wants to run Shell" in body["data"]["text"]
+    assert not _keystroke_error_records(caplog)
+
+
+async def test_run_one_approval_undelivered_keystroke_notifies_user(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A send that fails on a live pane tells the user without claiming the pane died."""
+    monkeypatch.setattr(cnp, "cursor_pane_gone", lambda _bridge: False)
+
+    async def _fail_send(_bridge: Path, _session: str, *_keys: str) -> bool:
+        return False
+
+    monkeypatch.setattr(cnp, "_send_cursor_keys", _fail_send)
+    client = _QueueClient([httpx.Response(200, json={"action": "accept"}), httpx.Response(200)])
+
+    await cnp._run_one_approval(
+        client,  # type: ignore[arg-type]
+        session_id="conv_send_fail",
+        bridge_dir=tmp_path,
+        prompt=_shell_approval_prompt(),
+        elicitation_id="elic_fail",
+    )
+
+    url, body = client.posts[-1]
+    assert url == "/v1/sessions/conv_send_fail/events"
+    assert body["type"] == "external_assistant_message"
+    assert "could not be delivered" in body["data"]["text"]
+    assert "embedded terminal" in body["data"]["text"]
+    assert "no longer running" not in body["data"]["text"]
+
+
+async def test_run_one_approval_indeterminate_probe_still_delivers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An unprobeable pane never suppresses delivery: the keystroke is sent, no notice."""
+    monkeypatch.setattr(cnp, "cursor_pane_gone", lambda _bridge: None)
+    sent: list[tuple[str, ...]] = []
+    monkeypatch.setattr(cnp, "send_cursor_pane_keys", lambda _d, *keys: sent.append(keys))
+    client = _QueueClient([httpx.Response(200, json={"action": "accept"})])
+
+    await cnp._run_one_approval(
+        client,  # type: ignore[arg-type]
+        session_id="conv_unprobeable",
+        bridge_dir=tmp_path,
+        prompt=_shell_approval_prompt(),
+        elicitation_id="elic_unprobeable",
+    )
+
+    assert sent == [("y",)]
+    assert len(client.posts) == 1  # only the hook POST; no undelivered notice
+
+
+async def test_run_one_approval_indeterminate_probe_after_failed_send_stays_neutral(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed send plus an unprobeable pane must not claim the terminal died."""
+    monkeypatch.setattr(cnp, "cursor_pane_gone", lambda _bridge: None)
+
+    async def _fail_send(_bridge: Path, _session: str, *_keys: str) -> bool:
+        return False
+
+    monkeypatch.setattr(cnp, "_send_cursor_keys", _fail_send)
+    client = _QueueClient([httpx.Response(200, json={"action": "accept"}), httpx.Response(200)])
+
+    await cnp._run_one_approval(
+        client,  # type: ignore[arg-type]
+        session_id="conv_probe_failed",
+        bridge_dir=tmp_path,
+        prompt=_shell_approval_prompt(),
+        elicitation_id="elic_probe_failed",
+    )
+
+    _url, body = client.posts[-1]
+    assert "could not be delivered" in body["data"]["text"]
+    assert "no longer running" not in body["data"]["text"]
+
+
+async def test_post_verdict_undelivered_notice_logs_rejection_without_raising(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A rejected notice POST is logged; the delivery task must not blow up."""
+    caplog.set_level(logging.DEBUG)
+    client = _QueueClient([httpx.Response(503, text="down")])
+
+    await cnp._post_verdict_undelivered_notice(
+        client,  # type: ignore[arg-type]
+        session_id="conv_notice_503",
+        description="Cursor wants to run Shell",
+        pane_gone=True,
+    )
+
+    assert any("undelivered-verdict notice rejected" in r.getMessage() for r in caplog.records)
+
+
+async def test_post_verdict_undelivered_notice_logs_transport_error_without_raising(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A transport failure while posting the notice is logged, not raised."""
+    caplog.set_level(logging.DEBUG)
+
+    class _Client:
+        async def post(self, url: str, *, json: dict, **_kw: object) -> httpx.Response:
+            raise httpx.ConnectError("server is away")
+
+    await cnp._post_verdict_undelivered_notice(
+        _Client(),  # type: ignore[arg-type]
+        session_id="conv_notice_down",
+        description="Cursor wants to run Shell",
+        pane_gone=False,
+    )
+
+    assert any("undelivered-verdict notice POST failed" in r.getMessage() for r in caplog.records)
+
+
 # ── AskQuestion (structured multiple-choice) ─────────────────────────────────
 #
 # cursor's ``AskQuestion`` tool is NOT an approval gate — it is a multi-question
@@ -1140,6 +1432,40 @@ async def test_run_one_question_decline_skips_via_escape(
         elicitation_id="e",
     )
     assert [k for group in sent_keys for k in group] == ["Escape"]
+
+
+async def test_run_one_question_dead_pane_notifies_user_instead_of_typing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The question path gets the same dead-pane feedback as approvals."""
+    monkeypatch.setattr(cnp, "cursor_pane_gone", lambda _bridge: True)
+
+    def _boom(_bridge: Path, *_keys: str) -> None:
+        raise RuntimeError("tmux command failed (rc=1): error connecting to tmux.sock")
+
+    monkeypatch.setattr(cnp, "send_cursor_pane_keys", _boom)
+    client = _QueueClient(
+        [
+            httpx.Response(
+                200,
+                json={"action": "accept", "content": {"demo_topic": "A fun preference question"}},
+            ),
+            httpx.Response(200),
+        ]
+    )
+
+    await cnp._run_one_question(
+        client,  # type: ignore[arg-type]
+        session_id="conv_q_dead",
+        bridge_dir=tmp_path,
+        call=CursorPendingToolCall("tc", "AskQuestion", _ASKQUESTION_ARGS),
+        elicitation_id="e",
+    )
+
+    notices = [(u, j) for u, j in client.posts if j.get("type") == "external_assistant_message"]
+    assert notices, f"no chat notice posted; posts={client.posts!r}"
+    assert "could not be delivered" in notices[0][1]["data"]["text"]
+    assert "no longer running" in notices[0][1]["data"]["text"]
 
 
 class _FakeAsyncCM:
