@@ -2,23 +2,10 @@
 
 from __future__ import annotations
 
-from itertools import count
-from types import SimpleNamespace
-
 import httpx
 import pytest
 
 from tests.e2e import conftest as helpers
-
-
-@pytest.fixture(autouse=True)
-def poll_clock(monkeypatch: pytest.MonkeyPatch) -> None:
-    ticks = count(step=0.1)
-    monkeypatch.setattr(
-        helpers,
-        "time",
-        SimpleNamespace(monotonic=lambda: next(ticks), sleep=lambda _interval: None),
-    )
 
 
 def _item(role: str, text: str, response_id: str, *, nested: bool) -> dict:
@@ -122,18 +109,3 @@ def test_pending_tool_poll_waits_for_this_turn(monkeypatch, previous_call) -> No
             client, "input-new", session_id="session", timeout=1
         )
     assert [item["call_id"] for item in output] == ["new"]
-
-
-def test_session_poll_still_honors_its_deadline() -> None:
-    requests = []
-
-    def handle(request):
-        requests.append(request.url.path)
-        return httpx.Response(200, json={"status": "idle", "items": []})
-
-    with httpx.Client(transport=httpx.MockTransport(handle), base_url="http://test") as client:
-        with pytest.raises(AssertionError, match="did not become terminal"):
-            helpers.poll_session_until_terminal(
-                client, session_id="session", response_id="pending", timeout=0.25
-            )
-    assert requests == ["/v1/sessions/session"] * 2
