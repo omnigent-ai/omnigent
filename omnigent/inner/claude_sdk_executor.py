@@ -1897,8 +1897,7 @@ class ClaudeSDKExecutor(Executor):
 
             options.stderr = _tee_stderr
             client = sdk.ClaudeSDKClient(options)
-            # bwrap binds the credentials file as it is now; see
-            # _evict_client_with_replaced_credentials.
+            # bwrap binds the credentials file as it is now; see _credentials_replaced.
             sandboxed_credentials = (
                 _claude_credentials_identity() if self._cli_bind_mounts_credentials() else None
             )
@@ -2047,8 +2046,8 @@ class ClaudeSDKExecutor(Executor):
         """Whether the CLI runs under bwrap, which binds its credentials file by path."""
         return self._cli_wrapper_path is not None and sys.platform == "linux"
 
-    async def _evict_client_with_replaced_credentials(self, session_key: str) -> None:
-        """Discard a sandboxed CLI whose credentials file was replaced after it started.
+    def _credentials_replaced(self, state: _ClaudeClientState) -> bool:
+        """Whether a sandboxed CLI's credentials file was replaced after it started.
 
         bwrap binds the file it saw at launch. Once another Claude process saves
         a refreshed sign-in (a new file renamed over the old one), that bind is
@@ -2056,17 +2055,9 @@ class ClaudeSDKExecutor(Executor):
         its own refresh and a rotated refresh token is lost. A new CLI binds the
         current file.
         """
-        state = self._clients.get(session_key)
-        if state is None or state.sandboxed_credentials is None:
-            return
-        if _claude_credentials_identity() == state.sandboxed_credentials:
-            return
-        logger.info(
-            "Claude credentials file was replaced since the sandboxed CLI for "
-            "session %s started; restarting the CLI so it can save refreshed sign-ins.",
-            session_key,
-        )
-        await self._close_live_client(session_key)
+        if state.sandboxed_credentials is None:
+            return False
+        return _claude_credentials_identity() != state.sandboxed_credentials
 
     async def _evict_terminated_client(self, session_key: str) -> None:
         """Discard a cached client after its CLI child exits."""
@@ -2580,7 +2571,6 @@ class ClaudeSDKExecutor(Executor):
             )
             return
         await self._evict_terminated_client(session_key)
-        await self._evict_client_with_replaced_credentials(session_key)
         resume_session = session_key in self._clients
         prompt = self._build_prompt(
             messages,
@@ -2593,9 +2583,21 @@ class ClaudeSDKExecutor(Executor):
             return
 
         state = self._clients.get(session_key)
-        if state is not None and state.effort != reasoning_effort and prompt != "/compact":
-            # Effort is a launch option. Rebuild with history for conversational
+        credentials_replaced = state is not None and self._credentials_replaced(state)
+        if (
+            state is not None
+            and (state.effort != reasoning_effort or credentials_replaced)
+            and prompt != "/compact"
+        ):
+            # Effort is a launch option, and a CLI whose credentials bind went
+            # stale needs a new launch. Rebuild with history for conversational
             # turns, but let /compact operate on the existing client's context.
+            if credentials_replaced:
+                logger.info(
+                    "Claude credentials file was replaced since the sandboxed CLI for "
+                    "session %s started; restarting the CLI so it can save refreshed sign-ins.",
+                    session_key,
+                )
             await self._close_live_client(session_key)
             resume_session = False
             prompt = self._build_prompt(messages, resume_session=False)

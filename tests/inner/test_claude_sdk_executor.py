@@ -5730,6 +5730,35 @@ async def test_sandboxed_cli_restarts_after_its_credentials_file_is_replaced(
         assert old_client.prompts == ["second question"]
 
 
+@pytest.mark.asyncio
+async def test_compact_runs_on_the_existing_cli_even_after_credentials_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """/compact needs the live context, so a stale-bind restart waits for the next turn."""
+    from omnigent.inner import claude_sdk_executor as module
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
+
+    fake_sdk = _make_recovery_fake_sdk()
+    executor = ClaudeSDKExecutor()
+    monkeypatch.setattr(module, "_claude_credentials_identity", lambda: (7, 200))
+    old_client = fake_sdk.ClaudeSDKClient(options=None)
+    fake_sdk.created_clients.clear()
+    executor._clients["sess-1"] = _ClaudeClientState(
+        client=old_client, model=None, sandboxed_credentials=(7, 100)
+    )
+    messages = [
+        {"role": "user", "content": "first question", "session_id": "sess-1"},
+        {"role": "assistant", "content": "first answer", "session_id": "sess-1"},
+        {"role": "user", "content": "/compact", "session_id": "sess-1"},
+    ]
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk):
+        events = [e async for e in executor.run_turn(messages, [], "")]
+
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert fake_sdk.created_clients == []
+    assert old_client.prompts == ["/compact"]
+
+
 @pytest.mark.parametrize(
     ("wrapper", "platform", "expected"),
     [
