@@ -7,6 +7,7 @@ import contextlib
 import logging
 import threading
 import time
+from types import SimpleNamespace
 
 import anyio
 import pytest
@@ -424,12 +425,15 @@ async def test_host_tunnel_slow_heartbeat_does_not_delay_ping_or_offline_cleanup
     assert not store.is_online(_HOST_ID)
 
 
+@pytest.mark.parametrize("wall_clock_step", [-3600.0, 0.0, 3600.0])
 async def test_host_tunnel_failed_heartbeat_still_times_out_silent_host(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    wall_clock_step: float,
 ) -> None:
     import omnigent.server.routes.host_tunnel as tunnel_mod
+    from omnigent.server import host_registry
 
     monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
     monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 3)
@@ -442,13 +446,19 @@ async def test_host_tunnel_failed_heartbeat_still_times_out_silent_host(
     monkeypatch.setattr(store, "heartbeat", fail_heartbeat)
     comm = await _connect_route(app, _TUNNEL_PATH)
     await _send_hello_and_wait(comm, registry, connection_id="host-silent")
+    shifted_clock = SimpleNamespace(
+        time=lambda: time.time() + wall_clock_step, monotonic=time.monotonic
+    )
+    monkeypatch.setattr(tunnel_mod, "time", shifted_clock)
+    monkeypatch.setattr(host_registry, "time", shifted_clock)
     try:
-        while True:
-            message = await comm.receive_output(timeout=budget(2.0))
-            if message["type"] == "websocket.close":
-                assert message["code"] == 4003
-                assert message["reason"] == "ping timeout"
-                break
+        async with asyncio.timeout(budget(2.0)):
+            while True:
+                message = await comm.receive_output(timeout=budget(2.0))
+                if message["type"] == "websocket.close":
+                    assert message["code"] == 4003
+                    assert message["reason"] == "ping timeout"
+                    break
         await comm.wait(timeout=budget(2.0))
         assert registry.get(_HOST_ID) is None
         assert not store.is_online(_HOST_ID)
@@ -458,6 +468,13 @@ async def test_host_tunnel_failed_heartbeat_still_times_out_silent_host(
             if getattr(r, "event_name", None) == "host_ping_timeout"
         ]
         assert timeout["connection_id"] == "host-silent"
+        # A sleeping or offline host is expected; only a local stall warns.
+        assert timeout["silence_source"] == "peer"
+        assert all(
+            r.levelno == logging.INFO
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "host_ping_timeout"
+        )
         assert timeout["app_silence_timeout_s"] == 0.06
         assert timeout["last_app_ping_sent_age_s"] is not None
         assert timeout["last_app_pong_received_age_s"] is None

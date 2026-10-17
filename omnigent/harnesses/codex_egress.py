@@ -50,6 +50,13 @@ _CONNECTION_FAILURE_FRAGMENTS = (
     "network is unreachable",
 )
 _NO_STATUS_FIELD = object()
+# Codex tracing line: ``<ts>  WARN [span{..}:]* <target>: <message>``.
+_TRACING_TARGET = re.compile(
+    r"^\s*(?:\S+\s+)?(?:TRACE|DEBUG|INFO|WARN|ERROR)\s+(?:\w+\{[^}]*\}:)*\s*(?P<target>\w+(?:::\w+)*):\s"
+)
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+# MCP-client targets: their TLS failures concern an MCP server, not the model endpoint.
+_NON_MODEL_TARGET_PREFIXES = ("codex_mcp", "rmcp")
 
 
 @dataclass(frozen=True)
@@ -78,12 +85,16 @@ def detect_certificate_failure(text: str | None) -> CertificateFailure | None:
     """Return the TLS certificate failure a stderr line reports, if any.
 
     Only lines naming a certificate problem count; an expired token or a
-    gateway 401 is an auth failure, not a transport one.
+    gateway 401 is an auth failure, not a transport one. Lines Codex's MCP
+    client logs describe an MCP server's connection and never count.
 
     :param text: One stderr line.
     :returns: The failure, or ``None`` for ordinary output.
     """
     if not text:
+        return None
+    target = _TRACING_TARGET.match(_ANSI_ESCAPE.sub("", text))
+    if target is not None and target.group("target").startswith(_NON_MODEL_TARGET_PREFIXES):
         return None
     expired = _CERTIFICATE_EXPIRED.search(text) is not None
     if not expired and _CERTIFICATE_REJECTED.search(text) is None:

@@ -1332,6 +1332,8 @@ def build_native_controls(
                 row_model = row.get("model")
                 if isinstance(row_model, str) and row_model:
                     expected.add(row_model)
+        # A switch typed into a busy pane is queued; its turn may settle before the deadline.
+        was_busy = _native_pane_status.get(conv_id) in ("running", "waiting")
         deadline = time.monotonic() + _CLAUDE_MODEL_CONFIRM_TIMEOUT_S
         while True:
             current = await asyncio.to_thread(read_claude_status_model, bridge_dir)
@@ -1359,10 +1361,12 @@ def build_native_controls(
             await asyncio.to_thread(
                 confirm_dialog_if_open, bridge_dir, hint=SWITCH_MODEL_DIALOG_HINT
             )
+            if _native_pane_status.get(conv_id) in ("running", "waiting"):
+                was_busy = True
             if time.monotonic() >= deadline:
                 break
             await asyncio.sleep(_CLAUDE_MODEL_CONFIRM_POLL_S)
-        if _native_pane_status.get(conv_id) in ("running", "waiting"):
+        if was_busy:
             # Mid-turn switch: Claude queues the typed command and applies it
             # when the turn settles — its confirm dialog can pop minutes from
             # now. Not a failure: answer success, keep a detached watcher on

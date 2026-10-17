@@ -878,7 +878,11 @@ async def test_managed_create_returns_during_provision_and_message_rendezvouses(
     # create returns — what the navigating Web UI cold-loads.
     snapshot = await env.client.get(f"/v1/sessions/{session_id}")
     assert snapshot.status_code == 200, snapshot.text
-    assert snapshot.json()["sandbox_status"] == {"stage": "provisioning", "error": None}
+    assert snapshot.json()["sandbox_status"] == {
+        "stage": "provisioning",
+        "error": None,
+        "provider": "modal",
+    }
 
     message_task = asyncio.create_task(
         env.client.post(
@@ -1005,12 +1009,17 @@ async def test_managed_launch_progress_surfaces_on_snapshot_and_stream(
     # session page to a silent dead chat during provisioning.
     snapshot = await env.client.get(f"/v1/sessions/{session_id}")
     assert snapshot.status_code == 200, snapshot.text
-    assert snapshot.json()["sandbox_status"] == {"stage": "provisioning", "error": None}
+    assert snapshot.json()["sandbox_status"] == {
+        "stage": "provisioning",
+        "error": None,
+        "provider": "modal",
+    }
 
     # Tail live progress at the layer the SSE endpoint reads it from.
     # (The endpoint itself never terminates under the in-process ASGI
     # transport — see the stream test in test_sessions_permissions.)
     stages: list[str] = []
+    providers: set[str | None] = set()
     subscribed = asyncio.Event()
     settled = asyncio.Event()
 
@@ -1025,6 +1034,7 @@ async def test_managed_launch_progress_surfaces_on_snapshot_and_stream(
             if event.get("type") != "session.sandbox_status":
                 continue
             stages.append(event["stage"])
+            providers.add(event["provider"])
             if event["stage"] in ("ready", "failed"):
                 settled.set()
                 return
@@ -1048,6 +1058,8 @@ async def test_managed_launch_progress_surfaces_on_snapshot_and_stream(
     # means the background task stopped reporting after the host
     # bound; "failed" here means the launch itself broke.
     assert stages == ["cloning", "starting", "connecting", "ready"]
+    # Later stages keep the provider seeded at create, so the web UI keeps naming it.
+    assert providers == {"modal"}
 
     # A settled launch clears the snapshot field — from here the
     # session looks like any host-bound session and a reloading
@@ -1388,7 +1400,7 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
     tracker = ManagedLaunchTracker()
     calls: list[str] = []
     host_deregistered: list[str] = []
-    runner_deregistered: list[str] = []
+    runner_deregistered: list[tuple[str, bool]] = []
     fresh_host_conn = SimpleNamespace(last_frame_at=time.time())
     fresh_runner_session = object()
     host_registry_state: dict[str, object | None] = {"conn": fresh_host_conn}
@@ -1415,7 +1427,9 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
         tunnel_registry=SimpleNamespace(
             get=lambda _runner_id: fresh_runner_session,
             seconds_since_last_frame=lambda _session: 0.0,
-            deregister=lambda runner_id: runner_deregistered.append(runner_id),
+            deregister=lambda runner_id, *, retire: runner_deregistered.append(
+                (runner_id, retire)
+            ),
         ),
     )
 
@@ -1429,7 +1443,8 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
     assert exc.value.code == ErrorCode.WRONG_REPLICA
     assert calls == ["wake"]
     assert host_deregistered == ["055e31f38d07908f171ebad4ff5cbe9c"]
-    assert runner_deregistered == ["runner_stale_tunnel"]
+    # A stale tunnel is torn down, not handed off: its turns stay reconcilable here.
+    assert runner_deregistered == [("runner_stale_tunnel", False)]
 
 
 async def test_managed_wake_fails_when_runner_never_reconnects(

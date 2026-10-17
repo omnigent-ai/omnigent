@@ -259,6 +259,12 @@ async def _drive(rig: ManagedReplicas, model_url: str) -> None:
             snapshot = (await client.get(rig.a + session_path)).json()
             assert snapshot["host_id"] is None and snapshot["runner_id"] is None
             await expect(page.get_by_test_id("runner-starting-indicator")).to_be_visible()
+            # The unbound sandbox is launching; the composer must not report a missing host.
+            host_chip = page.get_by_test_id("composer-host-select")
+            await expect(host_chip).to_have_attribute(
+                "aria-label", "Host Modal Sandbox, Provisioning sandbox"
+            )
+            await expect(host_chip.locator(".lucide-monitor-cloud")).to_be_visible()
 
             # Keep the real keyless stream healthy across an actual heartbeat;
             # timeout-based stale-stream recovery must not be what fixes this.
@@ -319,6 +325,10 @@ async def _drive(rig: ManagedReplicas, model_url: str) -> None:
             (await client.post(f"{model_url}/gate/release")).raise_for_status()
             await expect(assistant.filter(has_text=_FOLLOWUP_REPLY)).to_be_visible(timeout=20_000)
             await expect(page.get_by_test_id("runner-starting-indicator")).to_have_count(0)
+            await expect(host_chip).to_have_attribute(
+                "aria-label", "Host Modal Sandbox, online", timeout=20_000
+            )
+            await expect(host_chip.locator(".lucide-monitor-cloud")).to_be_visible()
             rows = (await client.get(network_url)).json()
             assert len(streams(rows)) == stream_count
             assert len(posts(rows)) == 3
