@@ -406,6 +406,183 @@ def test_kill_tree_reaps_descendant_that_left_process_group(tmp_path: Path) -> N
                 psutil.Process(child_pid).kill()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="requires a POSIX shell")
+def test_run_isolated_timeout_kills_the_whole_tree(tmp_path: Path) -> None:
+    child_pid_path = tmp_path / "child.pid"
+    # The direct child forks a long-lived grandchild, then hangs past the timeout.
+    script = f"sleep 300 & echo $! > '{child_pid_path}'; exec sleep 300"
+    child_pid: int | None = None
+    try:
+        # A 2s timeout keeps the grandchild's pid write ahead of the kill even
+        # on a loaded machine, so this does not race the process teardown.
+        with pytest.raises(subprocess.TimeoutExpired):
+            _proc.run_isolated(["sh", "-c", script], timeout=2, capture_output=True, text=True)
+        assert child_pid_path.exists()
+        child_pid = int(child_pid_path.read_text())
+        deadline = time.monotonic() + 5
+        while _proc.process_alive(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not _proc.process_alive(child_pid)
+    finally:
+        if child_pid is not None and _proc.process_alive(child_pid):
+            with contextlib.suppress(psutil.Error):
+                psutil.Process(child_pid).kill()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires a POSIX shell")
+def test_run_isolated_kills_the_tree_on_non_timeout_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A non-timeout failure from communicate() must still tear down the tree and
+    # propagate the original exception, not just the timeout path.
+    child_pid_path = tmp_path / "child.pid"
+    script = f"sleep 300 & echo $! > '{child_pid_path}'; exec sleep 300"
+
+    real_communicate = subprocess.Popen.communicate
+    state = {"raised": False}
+
+    def flaky_communicate(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if not state["raised"]:
+            # Let the grandchild come up so there is a real tree to tear down.
+            deadline = time.monotonic() + 5
+            while not child_pid_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            state["raised"] = True
+            raise RuntimeError("boom")
+        return real_communicate(self, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", flaky_communicate)
+
+    child_pid: int | None = None
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            _proc.run_isolated(["sh", "-c", script], timeout=30, capture_output=True, text=True)
+        assert child_pid_path.exists()
+        child_pid = int(child_pid_path.read_text())
+        deadline = time.monotonic() + 5
+        while _proc.process_alive(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not _proc.process_alive(child_pid)
+    finally:
+        if child_pid is not None and _proc.process_alive(child_pid):
+            with contextlib.suppress(psutil.Error):
+                psutil.Process(child_pid).kill()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires a POSIX shell")
+def test_run_isolated_timeout_kills_a_same_group_child_after_the_leader_exits(
+    tmp_path: Path,
+) -> None:
+    # The leader exits right away, but a same-group child keeps the stdout/stderr
+    # pipes open so communicate() blocks until the timeout; cleanup must still
+    # reach that orphaned child through the remembered process group.
+    child_pid_path = tmp_path / "child.pid"
+    script = f"sleep 300 & echo $! > '{child_pid_path}'"
+    child_pid: int | None = None
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            _proc.run_isolated(["sh", "-c", script], timeout=2, capture_output=True, text=True)
+        assert child_pid_path.exists()
+        child_pid = int(child_pid_path.read_text())
+        deadline = time.monotonic() + 5
+        while _proc.process_alive(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not _proc.process_alive(child_pid)
+    finally:
+        if child_pid is not None and _proc.process_alive(child_pid):
+            with contextlib.suppress(psutil.Error):
+                psutil.Process(child_pid).kill()
+
+
+# POSIX interrupts a genuinely hung waitpid() with SIGALRM for a clean per-test
+# failure; Windows has no SIGALRM and skips these tests anyway, so fall back to
+# the default thread timer there to avoid crashing pytest-timeout's setup.
+_HANG_GUARD = pytest.mark.timeout(30, method="signal" if os.name == "posix" else "thread")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process semantics")
+@_HANG_GUARD
+def test_run_isolated_timeout_kills_the_leader_when_group_teardown_is_denied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # If kill_tree cannot reach the leader (a denied killpg, say), the bounded
+    # reap also times out, so run_isolated must still kill the leader directly;
+    # otherwise Popen.__exit__'s unbounded wait() hangs past the probe timeout.
+    seen: dict[str, int] = {}
+
+    def noop_kill_tree(process: object) -> None:
+        pid = getattr(process, "pid", None)
+        if isinstance(pid, int):
+            seen["pid"] = pid
+
+    monkeypatch.setattr(_proc, "kill_tree", noop_kill_tree)
+
+    leader_pid: int | None = None
+    try:
+        start = time.monotonic()
+        with pytest.raises(subprocess.TimeoutExpired):
+            _proc.run_isolated(["sleep", "300"], timeout=1, capture_output=True, text=True)
+        # Without the direct kill, __exit__ would wait on the live leader for the
+        # whole sleep; finishing in seconds proves the fallback bounded teardown.
+        assert time.monotonic() - start < 15
+        assert "pid" in seen
+        leader_pid = seen["pid"]
+        deadline = time.monotonic() + 5
+        while _proc.process_alive(leader_pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not _proc.process_alive(leader_pid)
+    finally:
+        if leader_pid is not None and _proc.process_alive(leader_pid):
+            with contextlib.suppress(psutil.Error):
+                psutil.Process(leader_pid).kill()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process semantics")
+@_HANG_GUARD
+def test_run_isolated_kills_the_leader_even_if_kill_tree_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # kill_tree can raise an unexpected error from its psutil descendant walk;
+    # the teardown must still run so the live leader is killed and __exit__'s
+    # unbounded wait() cannot hang. The original kill_tree error propagates.
+    seen: dict[str, int] = {}
+
+    def boom_kill_tree(process: object) -> None:
+        pid = getattr(process, "pid", None)
+        if isinstance(pid, int):
+            seen["pid"] = pid
+        raise OSError("descendant walk failed")
+
+    monkeypatch.setattr(_proc, "kill_tree", boom_kill_tree)
+
+    leader_pid: int | None = None
+    try:
+        start = time.monotonic()
+        with pytest.raises(OSError, match="descendant walk failed"):
+            _proc.run_isolated(["sleep", "300"], timeout=1, capture_output=True, text=True)
+        assert time.monotonic() - start < 15
+        assert "pid" in seen
+        leader_pid = seen["pid"]
+        deadline = time.monotonic() + 5
+        while _proc.process_alive(leader_pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not _proc.process_alive(leader_pid)
+    finally:
+        if leader_pid is not None and _proc.process_alive(leader_pid):
+            with contextlib.suppress(psutil.Error):
+                psutil.Process(leader_pid).kill()
+
+
+def test_run_isolated_returns_the_completed_process() -> None:
+    completed = _proc.run_isolated(
+        [sys.executable, "-c", "import sys; print('out'); sys.exit(3)"],
+        timeout=30,
+        capture_output=True,
+        text=True,
+    )
+    assert (completed.returncode, completed.stdout.strip()) == (3, "out")
+
+
 # --------------------------------------------------------------------------
 # Harness IPC endpoint abstraction
 # --------------------------------------------------------------------------
