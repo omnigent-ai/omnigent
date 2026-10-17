@@ -484,6 +484,18 @@ def test_render_menu_compact_truncates_long_description_to_one_line() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_render_menu_status_is_green_unless_a_style_is_given() -> None:
+    """The status line keeps its green default; ``status_style`` overrides it."""
+    kwargs = {"descriptions": None, "width": 80, "selectable": [True, True]}
+    saved = interactive._render_menu("Pick", ["a", "b"], 0, status="✓ saved", **kwargs)
+    drift = interactive._render_menu(
+        "Pick", ["a", "b"], 0, status="⚠ drift", status_style="bold yellow", **kwargs
+    )
+    assert "\x1b[1;32m  ✓ saved" in saved
+    assert "\x1b[1;33m  ⚠ drift" in drift
+    assert "\x1b[1;32m  ⚠ drift" not in drift
+
+
 def test_count_terminal_lines_no_wrap() -> None:
     """Short lines count as one row each; no wrapping."""
     rendered = "foo\nbar\nbaz\n"
