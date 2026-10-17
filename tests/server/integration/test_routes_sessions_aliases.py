@@ -296,19 +296,6 @@ async def test_delete_session_cancels_relays_waiting_out_runner_grace(
     store = SqlAlchemyConversationStore(db_uri)
     conv_id = (await create_test_session(client))["id"]
     child_id = store.create_conversation(kind="sub_agent", parent_conversation_id=conv_id).id
-    handles = []
-    for session_id in (conv_id, child_id):
-        sessions_module._session_status_cache[session_id] = "running"
-        handle = sessions_module._ensure_runner_relay(
-            session_id,
-            "runner_dropped",
-            _DroppedRunnerClient(),  # type: ignore[arg-type]
-            conversation_store=store,
-        )
-        assert handle is not None
-        handles.append(handle)
-    await asyncio.sleep(0.05)
-    assert not any(h.task.done() for h in handles), "relays should be inside the grace"
 
     class _OfflineRunnerRouter:
         def client_for_session_resources(self, session_id: str) -> object:
@@ -318,9 +305,23 @@ async def test_delete_session_cancels_relays_waiting_out_runner_grace(
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
 
+    handles = []
     prior = _globals._runner_router
-    set_runner_router(_OfflineRunnerRouter())  # type: ignore[arg-type]
     try:
+        for session_id in (conv_id, child_id):
+            sessions_module._session_status_cache[session_id] = "running"
+            handle = sessions_module._ensure_runner_relay(
+                session_id,
+                "runner_dropped",
+                _DroppedRunnerClient(),  # type: ignore[arg-type]
+                conversation_store=store,
+            )
+            assert handle is not None
+            handles.append(handle)
+        await asyncio.sleep(0.05)
+        assert not any(h.task.done() for h in handles), "relays should be inside the grace"
+
+        set_runner_router(_OfflineRunnerRouter())  # type: ignore[arg-type]
         del_resp = await client.delete(f"/v1/sessions/{conv_id}")
         assert del_resp.status_code == 200
         for handle in handles:
@@ -331,5 +332,8 @@ async def test_delete_session_cancels_relays_waiting_out_runner_grace(
             assert sessions_module._session_status_cache.get(session_id) != "failed"
     finally:
         set_runner_router(prior)
+        # A failed assertion must not leave relays retrying into later tests.
+        for handle in handles:
+            handle.task.cancel()
         for session_id in (conv_id, child_id):
             sessions_module._session_status_cache.pop(session_id, None)

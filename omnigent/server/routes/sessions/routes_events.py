@@ -173,7 +173,6 @@ from omnigent.server.routes._sessions.helpers import (
     _background_task_delivery_status,
     _build_actor,
     _build_skill_slash_command_policy_body,
-    _collect_descendant_conversation_ids,
     _dispatch_skill_slash_command_to_runner,
     _evaluate_output_policy,
     _filesystem_attachment_in_history,
@@ -3261,15 +3260,8 @@ def register_events_routes(
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
             raise _session_not_found()
-        await _best_effort_stop(session_id, conversation_store, runner_router)
-        # The subtree's relays are cancelled once the rows are gone (see below).
-        relay_session_ids = [session_id]
-        try:
-            relay_session_ids += await _collect_descendant_conversation_ids(
-                conversation_store, session_id
-            )
-        except Exception:
-            _logger.debug("Descendant lookup failed for %s", session_id, exc_info=True)
+        # Capture relay IDs before subtree deletion removes parent links.
+        descendant_ids = await _best_effort_stop(session_id, conversation_store, runner_router)
         # Runner-side resource cleanup is best-effort: if the bound
         # runner is offline or unbound, the session must still be
         # deletable. Server-owned records (files and conversation row
@@ -3364,7 +3356,7 @@ def register_events_routes(
             raise _session_not_found()
         # A relay still inside an offline runner's reconnect grace must not
         # fail the deleted turns when that grace expires.
-        _cancel_runner_relays(relay_session_ids)
+        _cancel_runner_relays([session_id, *descendant_ids])
         # The session is gone, so is its launch-progress state. Failed
         # launches are retained in the cache for reload visibility while
         # the session exists; without this eviction every deleted
