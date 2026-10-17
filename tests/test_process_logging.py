@@ -351,9 +351,10 @@ def test_redact_log_text_handles_large_non_token_input_in_linear_time(
 ) -> None:
     """Long possible key names do not trigger quadratic regex backtracking."""
 
-    started = time.perf_counter()
+    # Measure this thread's CPU work, excluding parallel CI scheduling delays.
+    started = time.thread_time()
     output = redact_log_text(text, include_whitespace_credentials=include_whitespace_credentials)
-    elapsed = time.perf_counter() - started
+    elapsed = time.thread_time() - started
 
     assert output == text
     assert elapsed < 0.5
@@ -363,9 +364,9 @@ def test_redact_log_text_handles_large_bearer_token_in_linear_time() -> None:
     """A maximum-size stderr line can be redacted without blocking the runner."""
     text = "Bearer " + ("synthetic-token-marker" * 4_000)[:65_529]
 
-    started = time.perf_counter()
+    started = time.thread_time()
     output = redact_log_text(text)
-    elapsed = time.perf_counter() - started
+    elapsed = time.thread_time() - started
 
     assert output == "Bearer [REDACTED]"
     assert elapsed < 0.5
@@ -381,10 +382,10 @@ def test_redact_log_text_handles_large_whitespace_credentials_in_linear_time(
     """Maximum-size credential values retain bounded redaction cost on repeated passes."""
     text = f"ERROR failed: {label} " + (value * 4_000)[:65_000] + " status=401"
 
-    started = time.perf_counter()
+    started = time.thread_time()
     output = redact_log_text(text, include_whitespace_credentials=True)
     repeated = redact_log_text(output, include_whitespace_credentials=True)
-    elapsed = time.perf_counter() - started
+    elapsed = time.thread_time() - started
 
     assert output == f"ERROR failed: {label} [REDACTED] status=401"
     assert repeated == output
@@ -400,10 +401,10 @@ def test_redact_log_text_handles_large_prefixed_keys_in_linear_time(
     label = prefix * 32_000 + suffix
     text = f"ERROR failed: {label} synthetic-value status=401"
 
-    started = time.perf_counter()
+    started = time.thread_time()
     output = redact_log_text(text, include_whitespace_credentials=True)
     repeated = redact_log_text(output, include_whitespace_credentials=True)
-    elapsed = time.perf_counter() - started
+    elapsed = time.thread_time() - started
 
     assert output == f"ERROR failed: {label} [REDACTED] status=401"
     assert repeated == output
@@ -784,10 +785,12 @@ def test_redact_log_text_strips_url_userinfo(text: str, expected: str) -> None:
 
 def test_redact_log_text_handles_large_url_without_userinfo_in_linear_time() -> None:
     text = "https://" + "a" * 200_000 + " " + "://" * 50_000
-    started = time.perf_counter()
+    started = time.thread_time()
     output = redact_log_text(text)
-    assert time.perf_counter() - started < 0.5
+    elapsed = time.thread_time() - started
+
     assert output == text
+    assert elapsed < 0.5
 
 
 class _FakeStream:

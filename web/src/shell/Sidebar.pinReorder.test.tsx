@@ -236,5 +236,6 @@ describe("unpinning from a sidebar row", () => {
     await waitFor(() =>
       expect(mocks.pinFn).toHaveBeenLastCalledWith({ id: "conv_a", pinned: true, pinnedAt: 1000 }),
     );
+    await waitFor(() => expect(pill).not.toBeInTheDocument());
   });
 });

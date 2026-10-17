@@ -1129,3 +1129,62 @@ def test_mint_codex_thread_id_is_uuidv7() -> None:
     parsed = _uuid.UUID(minted)
     assert parsed.version == 7
     assert codex_native._CODEX_THREAD_ID_RE.fullmatch(minted)
+
+
+def test_rollout_records_replay_parallel_tool_outputs_in_call_order() -> None:
+    """Outputs of parallel calls that finished out of order replay in call order."""
+
+    def call(call_id: str) -> dict[str, Any]:
+        return {
+            "id": f"fc_{call_id}",
+            "response_id": "codex_turn_1",
+            "type": "function_call",
+            "name": "exec_command",
+            "arguments": f'{{"cmd":"run {call_id}"}}',
+            "call_id": call_id,
+        }
+
+    def output(call_id: str) -> dict[str, Any]:
+        return {
+            "id": f"fco_{call_id}",
+            "response_id": "codex_turn_1",
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": f"{call_id} done",
+        }
+
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            call("call_a"),
+            call("call_b"),
+            output("call_b"),
+            output("call_orphan"),
+            output("call_a"),
+            {
+                "id": "msg_1",
+                "response_id": "codex_turn_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "both finished"}],
+            },
+        ],
+        session_id="conv_codex",
+        external_session_id="019e96aa-0be2-7343-8d3b-6f914d60936b",
+        cwd=Path("/workspace"),
+        model_provider="omnigent_databricks",
+        cli_version="0.154.0",
+    )
+
+    replayed = [
+        (record["payload"]["type"], record["payload"].get("call_id"))
+        for record in records
+        if record["type"] == "response_item"
+    ]
+    assert replayed == [
+        ("function_call", "call_a"),
+        ("function_call", "call_b"),
+        ("function_call_output", "call_a"),
+        ("function_call_output", "call_b"),
+        ("function_call_output", "call_orphan"),
+        ("message", None),
+    ]

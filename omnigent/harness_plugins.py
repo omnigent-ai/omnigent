@@ -644,7 +644,9 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _IM.SDK_IN_PROCESS,
         _EL.NONE,
         _RS.COLD_ONLY,
-        _EF.GEMINI,
+        # NONE until AntigravityExecutor forwards ``reasoning_effort`` to the SDK:
+        # advertising GEMINI here would show a dial whose pick changes nothing.
+        _EF.NONE,
         _MF.GEMINI,
         _AU.OWN_AUTH,
         subagents=False,
