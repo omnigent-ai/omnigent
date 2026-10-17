@@ -34,6 +34,7 @@ from websockets.exceptions import (
     InvalidURI,
     WebSocketException,
 )
+from websockets.protocol import State
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.debug_logging import debug_event, runner_primary_session_id
@@ -44,6 +45,12 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
     mark_sign_in_pending,
     touch_connect_marker,
+)
+from omnigent.runner.transports.ws_tunnel.binary_requests import (
+    BINARY_REQUEST_BODY_CAPABILITY,
+    BINARY_REQUEST_DISPATCH_TIMEOUT_S,
+    BinaryRequestError,
+    decode_binary_request,
 )
 from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
@@ -150,6 +157,8 @@ _GRACEFUL_SHUTDOWN_CLOSE_TIMEOUT_S = 5.0
 # end-of-stream sentinel is enqueued. A task still running past this is
 # cancelled — a stuck stream must not wedge shutdown forever.
 _GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_S = 5.0
+# A cancellation acknowledgement must not delay cancellation on a stalled socket.
+_CANCELLED_RESPONSE_END_TIMEOUT_S = 1.0
 RUNNER_TUNNEL_REJECTION_PREFIX = "runner tunnel rejected by server "
 # Raised instead of the rejection above when the runner had no credential
 # to send, so the message names the local cause rather than the server.
@@ -211,6 +220,9 @@ async def dispatch_via_asgi(
     app: _ASGIApp,
     frame: RequestFrame,
     send_text: Callable[[str], Awaitable[None]],
+    *,
+    raw_body: bytes | None = None,
+    is_tunnel_open: Callable[[], bool] | None = None,
 ) -> None:
     """Run a tunneled ``request`` frame through the runner's ASGI app
     and stream the response back as frames via ``send_text``.
@@ -219,8 +231,12 @@ async def dispatch_via_asgi(
     :param frame: The incoming ``request`` frame the server sent.
     :param send_text: Async callback that writes a frame onto the
         WebSocket back to the server (typically ``ws.send_text``).
+    :param raw_body: Raw envelope bytes, bypassing JSON body decoding when present.
+    :param is_tunnel_open: Optional socket-state check to skip cancellation ends after close.
     """
-    body_bytes = decode_body(frame.body, frame.encoding) if frame.body is not None else b""
+    body_bytes = raw_body
+    if body_bytes is None:
+        body_bytes = decode_body(frame.body, frame.encoding) if frame.body is not None else b""
 
     scope: Scope = {
         "type": "http",
@@ -241,7 +257,20 @@ async def dispatch_via_asgi(
     response_status: list[int] = []
     response_headers_raw: list[tuple[bytes, bytes]] = []
     head_sent_to_ws: bool = False
-    end_sent_to_ws: bool = False
+    terminal_send_task: asyncio.Future[None] | None = None
+
+    def consume_terminal_send_exception(task: asyncio.Future[None]) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    async def send_end(error: str | None = None) -> None:
+        nonlocal terminal_send_task
+        if terminal_send_task is None:
+            terminal_send_task = asyncio.ensure_future(
+                send_text(encode_frame(ResponseEndFrame(id=frame.id, error=error)))
+            )
+            terminal_send_task.add_done_callback(consume_terminal_send_exception)
+        await asyncio.shield(terminal_send_task)
 
     async def receive() -> Message:
         nonlocal body_sent
@@ -263,7 +292,7 @@ async def dispatch_via_asgi(
         return await disconnect
 
     async def send(event: Message) -> None:
-        nonlocal head_sent_to_ws, end_sent_to_ws
+        nonlocal head_sent_to_ws
         ev_type = event.get("type")
         if ev_type == "http.response.start":
             response_status.append(event["status"])
@@ -303,11 +332,22 @@ async def dispatch_via_asgi(
                     )
                 )
             if not event.get("more_body", False):
-                await send_text(encode_frame(ResponseEndFrame(id=frame.id)))
-                end_sent_to_ws = True
+                await send_end()
 
+    deadline = asyncio.timeout(BINARY_REQUEST_DISPATCH_TIMEOUT_S if raw_body is not None else None)
     try:
-        await app(scope, receive, send)
+        async with deadline:
+            await app(scope, receive, send)
+    except asyncio.CancelledError as cancellation:
+        try:
+            with contextlib.suppress(Exception):
+                async with asyncio.timeout(_CANCELLED_RESPONSE_END_TIMEOUT_S):
+                    if is_tunnel_open is None or is_tunnel_open():
+                        await send_end("runner_request_cancelled")
+        finally:
+            if terminal_send_task is not None and not terminal_send_task.done():
+                terminal_send_task.cancel()
+            raise cancellation
     except Exception:
         # If the app crashed BEFORE sending head, surface a 500 so
         # the server's request-side awaiter doesn't hang. If it
@@ -319,7 +359,7 @@ async def dispatch_via_asgi(
                 encode_frame(
                     ResponseHeadFrame(
                         id=frame.id,
-                        status=500,
+                        status=504 if deadline.expired() else 500,
                         headers=[["content-type", "application/json"]],
                     )
                 )
@@ -328,20 +368,25 @@ async def dispatch_via_asgi(
                 encode_frame(
                     ResponseBodyFrame(
                         id=frame.id,
-                        body='{"error": "runner_dispatch_failed"}',
+                        body=(
+                            '{"error": "runner_dispatch_timeout"}'
+                            if deadline.expired()
+                            else '{"error": "runner_dispatch_failed"}'
+                        ),
                         encoding="utf-8",
                     )
                 )
             )
-        # If a clean end already went out (more_body=False), the response is
-        # complete on the wire; a second, error-flagged end frame could race
-        # the consumer and spuriously abort a fully-delivered response. Send
-        # at most one end frame per request.
-        if not end_sent_to_ws:
+        # Reuse an in-flight terminal send instead of racing a second end frame.
+        if terminal_send_task is None:
             # Only flag the end frame as an error when head was already sent;
-            # the pre-head path delivers a well-formed 500 that closes cleanly.
-            end_error = "runner_stream_error" if head_sent_to_ws else None
-            await send_text(encode_frame(ResponseEndFrame(id=frame.id, error=end_error)))
+            # the pre-head error response closes cleanly.
+            end_error = (
+                ("runner_request_timeout" if deadline.expired() else "runner_stream_error")
+                if head_sent_to_ws
+                else None
+            )
+            await send_end(end_error)
         raise
 
 
@@ -1171,6 +1216,9 @@ async def _serve_tunnel_once(
         async def send_text(data: str) -> None:
             await diagnostics.send(ws.send, data)
 
+        def is_tunnel_open() -> bool:
+            return ws.state is State.OPEN
+
         if on_connected is not None:
             on_connected()
         downtime_s = (
@@ -1255,6 +1303,7 @@ async def _serve_tunnel_once(
                         on_activity=on_activity,
                         event_dispatcher=event_dispatcher,
                         diagnostics=diagnostics,
+                        is_tunnel_open=is_tunnel_open,
                     )
             else:
                 # Race reads against the shutdown signal. When it fires,
@@ -1324,6 +1373,7 @@ async def _serve_tunnel_once(
                             on_activity=on_activity,
                             event_dispatcher=event_dispatcher,
                             diagnostics=diagnostics,
+                            is_tunnel_open=is_tunnel_open,
                         )
                 finally:
                     shutdown_wait.cancel()
@@ -1447,6 +1497,7 @@ async def _send_hello(
                 capabilities=[
                     CAP_FILESYSTEM_ATTACHMENTS,
                     CAP_MCP_REGISTRY,
+                    BINARY_REQUEST_BODY_CAPABILITY,
                     *([EVENT_INGEST_CAPABILITY] if event_dispatcher is not None else []),
                 ],
                 telemetry_opt_out=_tel_opt_out,
@@ -1477,11 +1528,12 @@ async def _handle_tunnel_frame(
     on_activity: Callable[[], None] | None = None,
     event_dispatcher: RunnerEventDispatcher | None = None,
     diagnostics: TunnelDiagnostics | None = None,
+    is_tunnel_open: Callable[[], bool] | None = None,
 ) -> None:
     """Handle one server-to-runner tunnel frame.
 
-    Malformed frames (bad JSON, unknown ``kind``, missing required
-    fields, non-utf8 bytes) are logged and skipped.
+    Malformed frames are logged; binary envelopes with a recoverable
+    request id also receive an HTTP 400 response.
 
     :param app: Runner ASGI application.
     :param raw: Raw WebSocket message from the server.
@@ -1492,13 +1544,27 @@ async def _handle_tunnel_frame(
     :param on_activity: Optional sync callback fired for non-ping
         frames that represent real runner work.
     :param diagnostics: Connection-local application frame and heartbeat observations.
+    :param is_tunnel_open: Optional live socket-state check for cancellation acknowledgements.
     :returns: None.
     """
     if diagnostics is not None:
         diagnostics.frame_received()
+    raw_body = None
     try:
-        text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
-        frame = decode_frame(text)
+        if isinstance(raw, bytes):
+            frame, raw_body = decode_binary_request(raw)
+        else:
+            frame = decode_frame(raw)
+    except BinaryRequestError as exc:
+        _logger.warning(
+            "runner received malformed binary request: %s",
+            exc,
+            extra={"session_id": runner_primary_session_id()},
+        )
+        if exc.request_id is not None:
+            await send_text(encode_frame(ResponseHeadFrame(id=exc.request_id, status=400)))
+            await send_text(encode_frame(ResponseEndFrame(id=exc.request_id)))
+        return
     except ValueError as exc:
         _logger.warning(
             "runner received malformed tunnel frame; dropping: %s",
@@ -1522,7 +1588,9 @@ async def _handle_tunnel_frame(
         if on_activity is not None:
             on_activity()
         task = asyncio.create_task(
-            dispatch_via_asgi(app, frame, send_text),
+            dispatch_via_asgi(
+                app, frame, send_text, raw_body=raw_body, is_tunnel_open=is_tunnel_open
+            ),
             name=f"ws-tunnel-dispatch:{frame.id}",
         )
         dispatch_tasks[frame.id] = task
@@ -1532,7 +1600,8 @@ async def _handle_tunnel_frame(
             on_activity()
         dispatch_task = dispatch_tasks.get(frame.id)
         if dispatch_task is not None:
-            dispatch_task.cancel()
+            # Let a newly queued dispatch enter its cancellation/terminal handler first.
+            asyncio.get_running_loop().call_soon(_cancel_request_dispatch, dispatch_task)
     elif isinstance(frame, WSOpenFrame):
         if on_activity is not None:
             on_activity()
@@ -1772,6 +1841,12 @@ def _forget_ws_channel(
             )
 
     return _callback
+
+
+def _cancel_request_dispatch(task: asyncio.Task[None]) -> None:
+    """Cancel once, after the dispatch has had its first event-loop turn."""
+    if not task.done() and not task.cancelling():
+        task.cancel()
 
 
 def _forget_dispatch_task(

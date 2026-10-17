@@ -8,6 +8,9 @@ for ``admins`` / ``allowed_domains``.
 
 from __future__ import annotations
 
+import builtins
+import logging
+import os
 from collections.abc import Callable
 from io import BytesIO
 from pathlib import Path
@@ -43,6 +46,79 @@ def _image_bytes(image_format: str, *, size: tuple[int, int] = (2, 2)) -> bytes:
         save_kwargs["lossless"] = True
     image.save(output, format=image_format, **save_kwargs)
     return output.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("setting", "expected"),
+    [("", True), ("true", True), ("false", False), ('"false"', True), ("0", True)],
+    ids=["default", "enabled", "disabled", "invalid-string", "invalid-number"],
+)
+def test_runner_tunnel_binary_setting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    setting: str,
+    expected: bool,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(f"runner_tunnel_binary_request_body: {setting}\n" if setting else "{}\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+    assert server_config_module.runner_tunnel_binary_request_body() is expected
+
+
+@pytest.mark.parametrize("enabled", [True, False], ids=["disable-live", "enable-live"])
+def test_binary_kill_switch_caches_unchanged_config_and_reloads_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    enabled: bool,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(f"runner_tunnel_binary_request_body: {str(enabled).lower()}\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+    caplog.set_level(logging.INFO, logger="omnigent.server.server_config")
+    for _ in range(10):
+        assert server_config_module.runner_tunnel_binary_request_body() is enabled
+    loads = [record for record in caplog.records if "loaded server config" in record.message]
+    assert len(loads) == 1
+    old_stat = config.stat()
+    config.write_text(f"runner_tunnel_binary_request_body: {str(not enabled).lower()}\n")
+    os.utime(config, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns + 1_000_000_000))
+    for _ in range(10):
+        assert server_config_module.runner_tunnel_binary_request_body() is not enabled
+    loads = [record for record in caplog.records if "loaded server config" in record.message]
+    assert len(loads) == 2
+    config.unlink()
+    assert server_config_module.runner_tunnel_binary_request_body() is True
+
+
+def test_binary_kill_switch_retries_transient_read_failure_at_same_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("runner_tunnel_binary_request_body: false\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+    before = config.stat()
+    failed = False
+    real_open = builtins.open
+
+    def flaky_open(path, *args, **kwargs):
+        nonlocal failed
+        if Path(path) == config and not failed:
+            failed = True
+            raise OSError("transient config read failure")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(server_config_module, "open", flaky_open, raising=False)
+    assert server_config_module.runner_tunnel_binary_request_body() is True
+    assert server_config_module.runner_tunnel_binary_request_body() is False
+    after = config.stat()
+    assert (after.st_mtime_ns, after.st_ctime_ns, after.st_size, after.st_ino) == (
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+        before.st_size,
+        before.st_ino,
+    )
 
 
 def _ico_bytes(entries: list[tuple[tuple[int, int], bytes]]) -> bytes:
