@@ -4674,9 +4674,41 @@ async def run_repl(
         # Background poll that keeps the sub-agent tree (badge + ↓ menu)
         # current at nested depths for the lifetime of ``host.run``.
         subagent_poll_task = asyncio.create_task(_subagent_poll_loop())
+
+        async def _follow_tmux_viewers() -> None:
+            """Pause painting while no tmux client views this pane; replay on return."""
+            from omnigent.repl._tmux_pane import watch_tmux_clients
+
+            def _on_clients_changed(attached: int) -> None:
+                # A failed replay re-pauses the host with its backlog intact; the
+                # watcher stays alive, but only a last-detach/first-attach boundary
+                # wakes it, so recovery waits for all viewers to leave and return.
+                try:
+                    if attached == 0:
+                        host.pause_rendering()
+                    else:
+                        host.resume_rendering()
+                except Exception:  # noqa: BLE001 — a failed repaint must not stop monitoring
+                    _log.exception("tmux viewer render toggle failed")
+
+            try:
+                await watch_tmux_clients(_on_clients_changed)
+            except Exception:  # noqa: BLE001 — a lost viewer signal must never take the REPL down
+                _log.exception("tmux viewer watch stopped")
+            finally:
+                # Without signals we cannot tell when a viewer returns, so paint.
+                try:
+                    host.resume_rendering()
+                except Exception:  # noqa: BLE001 — best-effort final paint during teardown
+                    _log.exception("final viewer-resume paint failed")
+
+        viewer_watch_task = asyncio.create_task(_follow_tmux_viewers())
         try:
             await host.run(on_input)
         finally:
+            viewer_watch_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await viewer_watch_task
             subagent_poll_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await subagent_poll_task

@@ -21,6 +21,7 @@ import os
 import pathlib
 import shlex
 import sys
+from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -206,6 +207,10 @@ _SPINNER_FRAMES: tuple[str, ...] = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "�
 # to feel animated (10 fps) and slow enough that the invalidate
 # calls don't dominate the event loop.
 _SPINNER_TICK_SECONDS: float = 0.1
+
+# Output items kept while rendering is paused. Older items are dropped and
+# reported once on resume; the pane's scrollback could not show them anyway.
+_PAUSED_OUTPUT_LIMIT: int = 20_000
 
 # Debounce window for the "N agents running" badge / spinner only. A
 # sub-agent that just reached a terminal task status keeps counting as
@@ -923,6 +928,15 @@ class TerminalHost:
         self.theme = get_theme(theme) if isinstance(theme, str) else theme
         self._console = Console(highlight=False, theme=self.theme.rich_theme)
         self._stream_start: float | None = None
+        # Set while nobody views the pane: output queues for replay and repaint
+        # requests are dropped (see ``pause_rendering``).
+        self._render_paused = False
+        self._render_resumed = asyncio.Event()
+        self._render_resumed.set()
+        self._paused_output: deque[FormattedItem] = deque(maxlen=_PAUSED_OUTPUT_LIMIT)
+        self._paused_output_dropped = 0
+        # A clear_streamed_text() requested while paused, deferred to resume.
+        self._pending_streamed_clear = False
         # Live sub-agent tree shown on the main interface (state badge +
         # ``↓`` menu). Keyed by child session id; the tree is reconstructed
         # from each node's ``parent_id``. ``_subagent_root`` is the session
@@ -1394,8 +1408,7 @@ class TerminalHost:
         """
         self._tokens_used = tokens_used
         self._context_window = context_window
-        with contextlib.suppress(RuntimeError):
-            get_app().invalidate()
+        self._invalidate_app()
 
     def set_theme(self, theme: TerminalTheme | str) -> None:
         """Switch prompt/status-bar colors for future TUI renders."""
@@ -1409,8 +1422,7 @@ class TerminalHost:
         app = getattr(self._prompt, "app", None)
         if app is not None:
             app.style = self._style
-        with contextlib.suppress(RuntimeError):
-            get_app().invalidate()
+        self._invalidate_app()
 
     def set_model_name(self, model_name: str) -> None:
         """
@@ -1430,8 +1442,7 @@ class TerminalHost:
         if self._window_title is not None:
             self._window_title = model_name
             self._try_set_window_title()
-        with contextlib.suppress(RuntimeError):
-            get_app().invalidate()
+        self._invalidate_app()
 
     def add_overlay(self, overlay: Overlay) -> None:
         """
@@ -1704,8 +1715,10 @@ class TerminalHost:
               hint linger for up to that window past expiry.
             - **Idle**: 500 ms — nothing to animate, just keep
               the toolbar responsive to late ``is_busy`` flips.
+            - **Paused**: no ticks until :meth:`resume_rendering`.
             """
             while True:
+                await self._render_resumed.wait()
                 if self._stream_start is not None or self.is_busy or self.has_active_subagents():
                     if self._prompt.app:
                         self._prompt.app.invalidate()
@@ -1857,6 +1870,18 @@ class TerminalHost:
         if task in self._tasks:
             self._tasks.remove(task)
         self._invalidate_prompt()
+
+    def _overlay_signature_to_store(
+        self, signature: tuple[str | None, str]
+    ) -> tuple[str | None, str] | None:
+        """Signature to remember after an overlay content rebuild.
+
+        While rendering is paused the overlay is unviewed and is not repainted,
+        so remembering the signature would let the first rebuild after resume
+        match it and skip, leaving the stale pre-pause frame on screen. Return
+        ``None`` while paused so that rebuild repaints instead.
+        """
+        return None if self._render_paused else signature
 
     async def _show_overlay(self, overlay: Overlay) -> None:
         """
@@ -2023,9 +2048,11 @@ class TerminalHost:
                 scroll_offset[0] = 0
                 cursor_anchor[0] = "top"
             current_target_key[0] = target_key
-            last_signature[0] = signature
+            last_signature[0] = self._overlay_signature_to_store(signature)
             app = app_holder[0]
-            if app is not None:
+            # A rebuild already in flight when the last viewer left must not
+            # repaint the unviewed pane; resume_rendering repaints on return.
+            if app is not None and not self._render_paused:
                 app.invalidate()
 
         await _rebuild_content(force=True)
@@ -2046,6 +2073,7 @@ class TerminalHost:
             try:
                 while True:
                     await asyncio.sleep(0.5)
+                    await self._render_resumed.wait()
                     await _rebuild_content(reset_scroll=False)
             except asyncio.CancelledError:
                 return
@@ -2813,8 +2841,14 @@ class TerminalHost:
           nearly identical to the streamed raw text.
         - Rich renderables: rendered to ANSI via a temp console, printed.
         - ``None``: ignored.
+
+        While rendering is paused the item is queued and replayed by
+        :meth:`resume_rendering` instead.
         """
         if item is None:
+            return
+        if self._render_paused:
+            self._queue_paused_output(item)
             return
         if isinstance(item, StreamLive):
             self._replace_live_region(item.renderable, commit=False)
@@ -2942,6 +2976,18 @@ class TerminalHost:
         ceiling = max(1, _term_height() - _BOTTOM_RESERVED_ROWS)
         return self._streamed_line_count < ceiling
 
+    def _erase_streamed_region(self) -> None:
+        """Erase the on-screen streamed + live lines and reset their counts.
+
+        Writes one cursor-up + clear-line sequence per tracked line; a no-op
+        when nothing is tracked.
+        """
+        total = self._streamed_line_count + self._live_line_count
+        for _ in range(total):
+            print("\033[A\033[2K", end="", flush=True)
+        self._streamed_line_count = 0
+        self._live_line_count = 0
+
     def clear_streamed_text(self) -> None:
         """Clear the previously streamed text lines using ANSI escapes.
 
@@ -2966,14 +3012,22 @@ class TerminalHost:
         (no blank-then-redraw flicker on plain prose). This method is
         kept for callers that need to clear without an immediate
         replacement (e.g. cancel paths).
+
+        While rendering is paused the clear first drops the streaming queued
+        since the pause, which is what it cancels. If nothing else is queued,
+        the pre-pause lines stay on the unviewed screen with their counts and
+        the erase is deferred to the start of :meth:`resume_rendering`, before
+        any queued output, so it survives an empty or non-stream replay. If a
+        committed item is queued, its replay replaces or finishes those lines
+        exactly as it would have unpaused, so nothing further is deferred.
         """
-        total = self._streamed_line_count + self._live_line_count
-        if total > 0:
-            # Move cursor up and clear each line.
-            for _ in range(total):
-                print("\033[A\033[2K", end="", flush=True)
-            self._streamed_line_count = 0
-            self._live_line_count = 0
+        if self._render_paused:
+            self._drop_queued_streaming()
+            if self._paused_output:
+                return
+            self._pending_streamed_clear = True
+        else:
+            self._erase_streamed_region()
         self._text_buffer = ""
         self._last_was_streaming = False
 
@@ -2981,16 +3035,16 @@ class TerminalHost:
         """
         Atomically erase the streamed-text region and render in its place.
 
-        Backward-compatible wrapper around :meth:`_replace_live_region`
-        with ``commit=True``. Kept for external callers (cancel paths,
-        etc.) that hold a replacement renderable and need the
-        clear+render+state-reset sequence in one call.
+        Equivalent to ``output(StreamReplace(renderable))``. Kept for
+        external callers (cancel paths, etc.) that hold a replacement
+        renderable and need the clear+render+state-reset sequence in one
+        call.
 
         :param renderable: The Rich renderable to display in place of
             the cleared lines, e.g.
             ``Padding(Markdown(text), (0, 1, 0, 3))``.
         """
-        self._replace_live_region(renderable, commit=True)
+        self.output(StreamReplace(renderable))
 
     def _replace_live_region(
         self,
@@ -3089,11 +3143,139 @@ class TerminalHost:
 
         :returns: ``None``. The method is best-effort because tests
             and pre-run host instances may not have an active
-            prompt-toolkit application yet.
+            prompt-toolkit application yet. Dropped while rendering is
+            paused; :meth:`resume_rendering` repaints once instead.
         """
+        if self._render_paused:
+            return
         app = self._prompt.app
         if app is not None:
             app.invalidate()
+
+    def _invalidate_app(self) -> None:
+        """Repaint the running application for a metadata change, unless paused.
+
+        Toolbar/title updates reach the live application through ``get_app()``
+        rather than the ``PromptSession`` slot :meth:`_invalidate_prompt` uses.
+        Dropped while paused so a detached pane is not repainted for a background
+        session event; :meth:`resume_rendering` repaints once with the latest
+        state on return.
+        """
+        if self._render_paused:
+            return
+        with contextlib.suppress(RuntimeError):
+            get_app().invalidate()
+
+    @property
+    def rendering_paused(self) -> bool:
+        """Whether output is being queued instead of painted."""
+        return self._render_paused
+
+    def pause_rendering(self) -> None:
+        """Stop painting until :meth:`resume_rendering`.
+
+        For a pane nobody is viewing: output queues for replay, repaint
+        requests are dropped, and the spinner ticker and overlay refresh sleep.
+        """
+        if self._render_paused:
+            return
+        self._render_paused = True
+        self._render_resumed.clear()
+
+    def resume_rendering(self) -> None:
+        """Replay output queued while paused and repaint the prompt.
+
+        A clear requested while paused is deferred to here and erases the
+        preserved pre-pause region before replaying, so stale lines do not
+        survive an empty or non-stream replay. A mid-replay write failure (a
+        pane that vanished) re-pauses the host and keeps the items it never
+        reached, so the next resume on reattach finishes them rather than
+        painting ahead of a stranded backlog. The failing item is dropped, with
+        any text it left unflushed, because it may have been written in part; a
+        failed skipped-output notice keeps its count so a later resume re-emits
+        it.
+        """
+        if not self._render_paused:
+            return
+        dropped = self._paused_output_dropped
+        pending_clear = self._pending_streamed_clear
+        queued = list(self._paused_output)
+        replay: list[FormattedItem] = []
+        if dropped:
+            # A StreamReplace also erases the pre-pause live region, whose
+            # replacement is among the dropped items.
+            replay.append(
+                StreamReplace(
+                    Text(
+                        f"  … {dropped} earlier output "
+                        f"{'item was' if dropped == 1 else 'items were'} skipped "
+                        "while no terminal client was attached",
+                        style=self.theme.muted,
+                    )
+                )
+            )
+        replay.extend(queued)
+
+        self._render_paused = False
+        self._paused_output_dropped = 0
+        self._pending_streamed_clear = False
+        self._paused_output.clear()
+        if pending_clear:
+            try:
+                self._erase_streamed_region()
+            except Exception:
+                # The deferred erase never ran; keep it pending and preserve the
+                # whole backlog (the notice re-derives from the dropped count).
+                self._render_paused = True
+                self._pending_streamed_clear = True
+                self._paused_output_dropped = dropped
+                for leftover in reversed(queued):
+                    self._paused_output.appendleft(leftover)
+                raise
+        for index, item in enumerate(replay):
+            try:
+                self.output(item)
+            except Exception:
+                self._render_paused = True
+                self._text_buffer = ""
+                self._last_was_streaming = False
+                if dropped and index == 0:
+                    # The skipped-output notice never printed; keep its count so
+                    # a later resume re-emits it with the whole retained backlog.
+                    self._paused_output_dropped = dropped
+                for leftover in reversed(replay[index + 1 :]):
+                    self._paused_output.appendleft(leftover)
+                raise
+        self._render_resumed.set()
+        self._invalidate_prompt()
+
+    def _queue_paused_output(self, item: FormattedItem) -> None:
+        """Queue *item* for replay, dropping what a later item supersedes.
+
+        A ``StreamReplace`` repaints everything streamed since the last commit
+        boundary, so ``StreamingText``/``StreamLive`` items queued since then
+        would only be erased again; consecutive ``StreamLive`` renders keep the
+        latest. This bounds the replay to committed content.
+        """
+        if isinstance(item, StreamReplace):
+            self._drop_queued_streaming()
+        elif (
+            isinstance(item, StreamLive)
+            and self._paused_output
+            and isinstance(self._paused_output[-1], StreamLive)
+        ):
+            self._paused_output[-1] = item
+            return
+        if len(self._paused_output) == self._paused_output.maxlen:
+            self._paused_output_dropped += 1
+        self._paused_output.append(item)
+
+    def _drop_queued_streaming(self) -> None:
+        """Drop the ``StreamingText``/``StreamLive`` items queued since the last commit."""
+        while self._paused_output and isinstance(
+            self._paused_output[-1], StreamingText | StreamLive
+        ):
+            self._paused_output.pop()
 
     def start_timer(self) -> None:
         """Start the elapsed timer shown in the toolbar.

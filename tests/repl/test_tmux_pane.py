@@ -17,16 +17,22 @@ documented in ``designs/REPL_TMUX_PANE_SPLIT.md`` § 6 phase 5.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import shlex
 import shutil
 import subprocess
-from collections.abc import Iterator
+import tempfile
+import time
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from omnigent.inner.tmux_hooks import client_hook_commands
 from omnigent.repl._tmux_pane import (
     OPT_AGENT_NAME,
     OPT_AGENT_YAML,
@@ -39,6 +45,7 @@ from omnigent.repl._tmux_pane import (
     _parse_bind_line,
     _wrap_binding,
     register_pane,
+    watch_tmux_clients,
 )
 
 # ── shared subprocess.run stub helpers ───────────────────────
@@ -1120,3 +1127,258 @@ def test_register_pane_skips_on_old_tmux(
         f"behave inconsistently with our design."
     )
     assert captured[0][:2] == ["tmux", "-V"]
+
+
+# ── watch_tmux_clients ─────────────────────────────────────────
+
+_TMUX_BIN = shutil.which("tmux")
+requires_tmux = pytest.mark.skipif(_TMUX_BIN is None, reason="requires a real tmux binary")
+
+
+@dataclass
+class _ScratchTmux:
+    """A private tmux server standing in for the runner-launched terminal."""
+
+    socket: Path
+    session: str
+    pane_id: str = ""
+
+    def run(self, *args: str) -> str:
+        assert _TMUX_BIN is not None
+        return subprocess.run(
+            [_TMUX_BIN, "-S", str(self.socket), "-f", "/dev/null", *args],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        ).stdout
+
+    def session_attached(self) -> int:
+        """``#{session_attached}`` for this scratch session right now."""
+        return int(
+            self.run("display-message", "-p", "-t", self.session, "#{session_attached}").strip()
+        )
+
+    def attach_client(self) -> subprocess.Popen[bytes]:
+        """Attach a control-mode client, held open by its stdin like the web bridge's."""
+        assert _TMUX_BIN is not None
+        return subprocess.Popen(
+            [
+                _TMUX_BIN,
+                "-S",
+                str(self.socket),
+                "-f",
+                "/dev/null",
+                "-C",
+                "attach",
+                "-t",
+                self.session,
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
+@pytest.fixture()
+def scratch_tmux(monkeypatch: pytest.MonkeyPatch) -> Iterator[_ScratchTmux]:
+    """A fresh tmux server, with ``$TMUX`` / ``$TMUX_PANE`` set as inside its pane.
+
+    The socket lives under a short ``/tmp`` path because macOS caps AF_UNIX
+    paths well below pytest's ``tmp_path`` length.
+    """
+    parent = Path(tempfile.mkdtemp(prefix="omni-repl-", dir="/tmp"))
+    server = _ScratchTmux(socket=parent / "tmux.sock", session="main")
+    try:
+        server.run("new-session", "-d", "-s", server.session, "-x", "80", "-y", "24", "sleep 600")
+        server.pane_id = server.run(
+            "display-message", "-p", "-t", server.session, "#{pane_id}"
+        ).strip()
+        monkeypatch.setenv("TMUX", f"{server.socket},1,0")
+        monkeypatch.setenv("TMUX_PANE", server.pane_id)
+        yield server
+    finally:
+        assert _TMUX_BIN is not None
+        subprocess.run(
+            [_TMUX_BIN, "-S", str(server.socket), "kill-server"],
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+async def _eventually(
+    predicate: Callable[[], bool], *, what: str, timeout_s: float = 10.0
+) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    while not predicate():
+        if asyncio.get_running_loop().time() > deadline:
+            raise TimeoutError(f"timed out waiting for {what}")
+        await asyncio.sleep(0.05)
+
+
+@requires_tmux
+@pytest.mark.asyncio
+async def test_watch_tmux_clients_reports_attach_and_last_detach(
+    scratch_tmux: _ScratchTmux,
+) -> None:
+    """
+    The runner's exact hook commands wake the watcher only on the transitions
+    the REPL acts on -- the first viewer arriving and the last one leaving. A
+    second viewer joining, or one of two leaving, is silent, so a drift between
+    the hooks and the REPL's channel shows up here.
+    """
+    for hook in client_hook_commands():
+        scratch_tmux.run(*hook)
+    counts: list[int] = []
+    watcher = asyncio.create_task(watch_tmux_clients(counts.append))
+    first = scratch_tmux.attach_client()
+    second: subprocess.Popen[bytes] | None = None
+    try:
+        await _eventually(lambda: counts[-1:] == [1], what="the first viewer")
+        reported = len(counts)
+
+        # A second viewer joining is not a transition the REPL cares about:
+        # someone is already watching, so the attach hook stays silent.
+        second = scratch_tmux.attach_client()
+        await _eventually(
+            lambda: scratch_tmux.session_attached() == 2,
+            what="tmux to record the second viewer",
+        )
+        # One of two viewers leaving is likewise silent.
+        first.terminate()
+        first.wait(timeout=10)
+        await _eventually(
+            lambda: scratch_tmux.session_attached() == 1,
+            what="tmux to record the intermediate detach",
+        )
+        # Only the last viewer leaving wakes the watcher again, reporting zero.
+        second.terminate()
+        second.wait(timeout=10)
+        await _eventually(lambda: counts[-1] == 0, what="the last viewer to leave")
+        # Exactly one wake after the first viewer: the final detach's zero, with
+        # no spurious wake for the silent second attach or intermediate detach.
+        assert counts[reported:] == [0]
+        assert not watcher.done()
+    finally:
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
+        for client in (first, second):
+            if client is not None and client.poll() is None:
+                client.kill()
+                client.wait(timeout=10)
+
+
+@requires_tmux
+@pytest.mark.asyncio
+async def test_watch_tmux_clients_recovers_when_viewers_reconnect_during_rearm(
+    scratch_tmux: _ScratchTmux,
+) -> None:
+    """
+    Two viewers reconnecting in the gap between a detach wake-up and the next
+    ``wait-for`` must still wake the watcher. The attach hook signals the change
+    channel only on the first client, so the paired signals cannot cancel each
+    other and leave the pane paused with viewers attached.
+    """
+    for hook in client_hook_commands():
+        scratch_tmux.run(*hook)
+    reconnects: list[subprocess.Popen[bytes]] = []
+    counts: list[int] = []
+
+    def on_change(count: int) -> None:
+        counts.append(count)
+        if count != 0 or reconnects or not any(counts):
+            # ``not any(counts)`` skips the watcher's startup sample of an empty
+            # pane; reconnect only on the first detach that follows a viewer.
+            return
+        # Reconnect two viewers before the watcher re-arms: both land inside the
+        # rearm gap, the window where paired attach signals would collapse.
+        reconnects.append(scratch_tmux.attach_client())
+        reconnects.append(scratch_tmux.attach_client())
+        deadline = time.monotonic() + 10.0
+        while scratch_tmux.session_attached() < 2:
+            if time.monotonic() > deadline:
+                raise TimeoutError("reconnecting viewers never attached")
+            time.sleep(0.02)
+
+    watcher = asyncio.create_task(watch_tmux_clients(on_change))
+    first = scratch_tmux.attach_client()
+    try:
+        await _eventually(lambda: counts[-1:] == [1], what="the first viewer")
+        first.terminate()
+        first.wait(timeout=10)
+        # The detach wakes the watcher with 0; its callback reconnects two
+        # viewers in the gap. The watcher must still report the restored count.
+        await _eventually(lambda: counts[-1] == 2, what="both viewers after reconnect")
+        assert not watcher.done()
+    finally:
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
+        for client in (first, *reconnects):
+            if client.poll() is None:
+                client.kill()
+                client.wait(timeout=10)
+
+
+@requires_tmux
+@pytest.mark.asyncio
+async def test_watch_tmux_clients_reports_zero_when_a_viewer_leaves_before_startup(
+    scratch_tmux: _ScratchTmux,
+) -> None:
+    """
+    A viewer that attaches and fully detaches before the watcher starts delivers
+    both channel signals with nobody waiting, so they cancel. The watcher must
+    still sample the empty pane and report zero -- otherwise its first
+    ``wait-for`` blocks forever and the pane keeps rendering with no viewer.
+    """
+    for hook in client_hook_commands():
+        scratch_tmux.run(*hook)
+
+    # Attach and detach before any watcher waits: the paired signals land with
+    # nobody waiting and collapse, so a wait-for started now would block.
+    early = scratch_tmux.attach_client()
+    await _eventually(lambda: scratch_tmux.session_attached() == 1, what="the pre-start viewer")
+    early.terminate()
+    early.wait(timeout=10)
+    await _eventually(
+        lambda: scratch_tmux.session_attached() == 0, what="the pre-start viewer to leave"
+    )
+
+    counts: list[int] = []
+    watcher = asyncio.create_task(watch_tmux_clients(counts.append))
+    try:
+        await _eventually(lambda: counts[-1:] == [0], what="the watcher to sample the empty pane")
+        assert not watcher.done()
+    finally:
+        watcher.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watcher
+        if early.poll() is None:
+            early.kill()
+            early.wait(timeout=10)
+
+
+@requires_tmux
+@pytest.mark.asyncio
+async def test_watch_tmux_clients_ignores_servers_without_viewer_hooks(
+    scratch_tmux: _ScratchTmux,
+) -> None:
+    """A user's own tmux has no viewer hooks, so the watcher returns at once."""
+    counts: list[int] = []
+    await asyncio.wait_for(watch_tmux_clients(counts.append), timeout=10)
+    assert counts == []
+
+
+@pytest.mark.asyncio
+async def test_watch_tmux_clients_is_a_no_op_outside_tmux(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without ``$TMUX`` there is no pane to follow and tmux is never invoked."""
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.delenv("TMUX_PANE", raising=False)
+    counts: list[int] = []
+    await asyncio.wait_for(watch_tmux_clients(counts.append), timeout=5)
+    assert counts == []

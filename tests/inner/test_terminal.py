@@ -35,6 +35,7 @@ from omnigent.inner.terminal_lifecycle import (
     TERMINAL_LAUNCH_ID_ENV,
     TERMINAL_LAUNCH_SESSION_ID_ENV,
 )
+from omnigent.inner.tmux_hooks import START_ON_ATTACH_CHANNEL, client_hook_commands
 from omnigent.native import owner_claim
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 from omnigent.runner.resource_registry import trim_terminal_output
@@ -1853,7 +1854,7 @@ async def test_launch_preserves_prompt_and_following_args_real_tmux(
     try:
         await instance.launch(cwd=tmp_path)
         if start_on_attach:
-            await instance._tmux("wait-for", "-S", terminal_mod._TMUX_START_ON_ATTACH_CHANNEL)
+            await instance._tmux("wait-for", "-S", START_ON_ATTACH_CHANNEL)
         async with asyncio.timeout(5):
             while await instance.is_alive():
                 await asyncio.sleep(0.01)
@@ -1974,7 +1975,7 @@ async def test_exit_history_preserves_error_in_tall_pane_real_tmux(
         await instance.launch(cwd=tmp_path)
         await instance._tmux("resize-window", "-t", "main", "-x", str(width), "-y", str(height))
         # Release the existing launch gate only after the final geometry is applied.
-        await instance._tmux("wait-for", "-S", terminal_mod._TMUX_START_ON_ATTACH_CHANNEL)
+        await instance._tmux("wait-for", "-S", START_ON_ATTACH_CHANNEL)
         async with asyncio.timeout(5):
             while await instance.is_alive():
                 await asyncio.sleep(0.01)
@@ -2129,6 +2130,7 @@ async def _capture_launch_argv(
     monkeypatch: pytest.MonkeyPatch,
     *,
     keep_alive_after_exit: bool,
+    tmux_start_on_attach: bool = False,
 ) -> list[str]:
     """
     Launch a terminal with mocked tmux and return the single setup argv.
@@ -2136,6 +2138,7 @@ async def _capture_launch_argv(
     :param tmp_path: Temporary directory for the fake tmux socket.
     :param monkeypatch: Pytest monkeypatch fixture.
     :param keep_alive_after_exit: Value for the instance's opt-in flag.
+    :param tmux_start_on_attach: Whether to gate the command on the first attach.
     :returns: The flattened tmux launch argv.
     """
     captured: list[list[str]] = []
@@ -2166,10 +2169,47 @@ async def _capture_launch_argv(
         socket_path=tmp_path / "tmux.sock",
         private_dir=tmp_path,
         keep_alive_after_exit=keep_alive_after_exit,
+        tmux_start_on_attach=tmux_start_on_attach,
     )
     await instance.launch(cwd=tmp_path)
     assert len(captured) == 1
     return captured[0]
+
+
+@pytest.mark.asyncio
+async def test_launch_start_on_attach_installs_viewer_hooks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A start-on-attach terminal's hook table also reports later viewer changes,
+    which the embedded REPL needs to pause painting while nobody is attached.
+
+    :param tmp_path: Temporary directory for the fake tmux socket.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    cmd = await _capture_launch_argv(
+        tmp_path, monkeypatch, keep_alive_after_exit=False, tmux_start_on_attach=True
+    )
+    for hook in client_hook_commands():
+        assert contains_subsequence(cmd, hook), hook
+    assert any(f"tmux wait-for {START_ON_ATTACH_CHANNEL}; exec " in arg for arg in cmd)
+
+
+@pytest.mark.asyncio
+async def test_launch_without_start_on_attach_sets_no_client_hooks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Terminals that start immediately keep an empty client hook table.
+
+    :param tmp_path: Temporary directory for the fake tmux socket.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    cmd = await _capture_launch_argv(tmp_path, monkeypatch, keep_alive_after_exit=False)
+    assert "client-attached" not in cmd
+    assert "client-detached" not in cmd
 
 
 @pytest.mark.parametrize("launch_fails", [False, True])
