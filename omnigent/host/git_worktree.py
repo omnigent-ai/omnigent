@@ -124,6 +124,8 @@ def _run_git(
         )
     except FileNotFoundError as exc:
         raise WorktreeError("git is not installed on the host") from exc
+    except OSError as exc:
+        raise WorktreeError(f"could not run git: {exc}") from exc
     except subprocess.TimeoutExpired as exc:
         raise WorktreeError(f"git command timed out after {_GIT_TIMEOUT_S:.0f}s") from exc
 
@@ -383,6 +385,35 @@ def _ensure_base_resolvable(repo_root: str, base_branch: str) -> None:
         raise WorktreeError(f"base branch does not exist: {base_branch}")
 
 
+def _discard_created_branch(repo_root: str, branch_name: str, created_commit: str) -> None:
+    """Best-effort deletion of the branch created for a ``git worktree add`` that failed.
+
+    Git keeps the branch when the add fails, so a retry would hit "branch already
+    exists". The branch is kept while a worktree has it checked out (for example
+    the half-built worktree a killed add leaves registered), and ``update-ref -d``
+    with the expected tip deletes it only if it still points at the commit it was
+    created from, so a branch another operation advanced survives as well.
+
+    :param repo_root: Absolute main work-tree root, e.g. ``"/Users/alice/myrepo"``.
+    :param branch_name: Branch this request created, e.g. ``"feature/login"``.
+    :param created_commit: Commit the branch was created at.
+    """
+    try:
+        if any(worktree.branch == branch_name for worktree in list_worktrees(repo_path=repo_root)):
+            _logger.warning("Keeping branch %s: a worktree has it checked out", branch_name)
+            return
+        deleted = _run_git(
+            ["update-ref", "-d", f"refs/heads/{branch_name}", created_commit], cwd=repo_root
+        )
+        if deleted.returncode != 0:
+            detail = deleted.stderr.strip() or f"exit {deleted.returncode}"
+            _logger.warning("Keeping branch %s: %s", branch_name, detail)
+    except WorktreeError:
+        _logger.warning(
+            "Could not roll back branch %s after a failed worktree add", branch_name, exc_info=True
+        )
+
+
 @dataclass
 class CreatedWorktree:
     """Result of a successful worktree creation.
@@ -410,11 +441,13 @@ def create_worktree(
     """Create a git worktree with a new — or existing — branch checked out.
 
     Resolves the repo root, picks a collision-free sibling directory,
-    and runs ``git worktree add -b`` (fetching once if ``base_branch``
-    isn't locally resolvable). With ``existing_branch`` the branch must
-    already exist and not be checked out in any live worktree; stale
-    registrations (a worktree whose directory was deleted from disk)
-    are pruned first, and the branch is checked out without ``-b`` —
+    creates the branch (fetching once if ``base_branch`` isn't locally
+    resolvable) and runs ``git worktree add``. If the add fails, the
+    branch created for it is deleted again so the same request can be
+    retried. With ``existing_branch`` the branch must already exist and
+    not be checked out in any live worktree; stale registrations (a
+    worktree whose directory was deleted from disk) are pruned first,
+    the existing branch is checked out, and a failure leaves it intact —
     the recreate path for a deleted worktree.
 
     :param repo_path: Absolute path inside the source repo — the
@@ -503,20 +536,45 @@ def create_worktree(
     worktree_path = _resolve_worktree_path(repo_root, branch_name)
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if existing_branch:
-        # --end-of-options: treat the branch as a rev, never a git flag
-        # (argv-only, no shell). No ``-b`` — the branch already exists.
-        add_args = ["worktree", "add", str(worktree_path), "--end-of-options", branch_name]
-    else:
-        add_args = ["worktree", "add", "-b", branch_name, str(worktree_path)]
-        if validated_commit is not None:
-            # Let Git set up tracking from the requested ref before checking out the pinned commit.
-            add_args.insert(2, "--no-checkout")
+    created_commit: str | None = None
+    if not existing_branch:
+        # Create the branch separately from ``worktree add -b`` so a failed add can
+        # roll back exactly this request's branch; resolve its start point first so
+        # the created commit is known the moment the branch exists.
+        created_commit = validated_commit
+        if created_commit is None:
+            start_point = _run_git(
+                [
+                    "rev-parse",
+                    "--verify",
+                    "--end-of-options",
+                    f"{base_branch or 'HEAD'}^{{commit}}",
+                ],
+                cwd=repo_root,
+            )
+            if start_point.returncode != 0:
+                raise _git_error("could not resolve the branch start point", start_point)
+            created_commit = start_point.stdout.strip()
+        branch_args = ["branch", branch_name]
         if base_branch is not None:
-            add_args += ["--end-of-options", base_branch]
-    result = _run_git(add_args, cwd=repo_root)
-    if result.returncode != 0:
-        raise _git_error("git worktree add failed", result)
+            branch_args += ["--end-of-options", base_branch]
+        created_branch = _run_git(branch_args, cwd=repo_root)
+        if created_branch.returncode != 0:
+            raise _git_error("could not create branch", created_branch)
+    # --end-of-options: treat the branch as a rev, never a git flag (argv-only, no shell).
+    add_args = ["worktree", "add", str(worktree_path), "--end-of-options", branch_name]
+    if validated_commit is not None and not existing_branch:
+        # Tracking already follows the requested ref; the pinned commit is checked out below.
+        add_args.insert(2, "--no-checkout")
+    try:
+        result = _run_git(add_args, cwd=repo_root)
+        if result.returncode != 0:
+            raise _git_error("git worktree add failed", result)
+    except WorktreeError:
+        # Existing-branch mode created nothing this request could roll back.
+        if created_commit is not None:
+            _discard_created_branch(repo_root, branch_name, created_commit)
+        raise
     if validated_commit is not None:
         try:
             if existing_branch:
