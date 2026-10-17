@@ -22,6 +22,20 @@ Which bridge should we use?
   4. Chat about this
 Enter to select · ↑/↓ to navigate · Esc to cancel
 """
+# A narrow pane wraps the question's footer across two rows.
+_QUESTION_WRAPPED_FOOTER = _QUESTION.replace("Esc to cancel", "Esc to\ncancel")
+# The plan-approval dialog has no "Enter to …" footer.
+_PLAN_APPROVAL = """\
+   - Read the new field in the parser
+   - Add a regression test
+  ──────────────────────────────────────────────────────────────────────────────
+   Claude has written up a plan and is ready to execute. Would you like to proceed?
+   ❯ 1. Yes, and use auto mode
+     2. Yes, manually approve edits
+     3. Tell Claude what to change
+        shift+tab to approve with this feedback
+   ctrl+g to edit in Vim · ~/.claude/plans/example-plan.md
+"""
 _PERMISSION = """\
 ╭──────────────────────────────────────────────────────────╮
 │ Bash command                                             │
@@ -69,7 +83,9 @@ def test_live_hook_protects_a_prompt_even_during_a_torn_capture(
     [
         _QUESTION,
         _QUESTION.replace("Enter to select", "Space to select · Enter to submit"),
+        _QUESTION_WRAPPED_FOOTER,
         _PERMISSION,
+        _PLAN_APPROVAL,
     ],
 )
 @pytest.mark.parametrize("operation", ["message", "settings"])
@@ -91,11 +107,20 @@ def test_terminal_fallback_prompt_receives_no_injected_keystrokes(
     assert sent == []
 
 
-@pytest.mark.parametrize("pane", [_QUESTION, _PERMISSION])
+@pytest.mark.parametrize("pane", [_QUESTION, _PERMISSION, _PLAN_APPROVAL])
 def test_decision_text_above_a_ready_composer_does_not_block_delivery(
     native_bridge: Path, monkeypatch: pytest.MonkeyPatch, pane: str
 ) -> None:
     monkeypatch.setattr(bridge, "_capture_pane", lambda *_: pane + _COMPOSER)
+    assert not bridge.has_pending_user_prompt(native_bridge)
+
+
+def test_a_proceed_question_in_the_transcript_is_not_a_plan_dialog(
+    native_bridge: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a rule above it, an echoed option list is transcript, not a dialog."""
+    transcript = "❯ 1. try the parser first\n● I drafted both steps. Would you like to proceed?\n"
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: transcript)
     assert not bridge.has_pending_user_prompt(native_bridge)
 
 
@@ -134,10 +159,12 @@ def test_question_appearing_after_readiness_prevents_paste(
     assert sent == []
 
 
+@pytest.mark.parametrize("pane", [_QUESTION, _QUESTION_WRAPPED_FOOTER, _PLAN_APPROVAL])
 def test_question_appearing_during_readiness_does_not_become_a_terminal_timeout(
-    native_bridge: Path, monkeypatch: pytest.MonkeyPatch
+    native_bridge: Path, monkeypatch: pytest.MonkeyPatch, pane: str
 ) -> None:
-    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: _QUESTION)
+    """Refused at once, so the executor keeps the pane instead of reaping it at the cap."""
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: pane)
     with pytest.raises(bridge.ClaudeUserPromptPending):
         bridge._wait_for_claude_prompt_ready(
             "/tmp/example.sock", "main", timeout_s=0, bridge_dir=native_bridge

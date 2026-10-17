@@ -303,6 +303,8 @@ _DIALOG_FOOTER_RE = re.compile(
     r"enter to (confirm|continue)|press enter to continue|esc to (cancel|exit|reject)",
     re.IGNORECASE,
 )
+# The selected row of a numbered option list, e.g. "❯ 1. Yes".
+_NUMBERED_SELECTOR_ROW_RE = re.compile(r"❯\s*\d+\.")
 # Lines scanned for a dialog when no box rule anchors the region.
 _DIALOG_SCAN_TAIL_LINES = 15
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
@@ -5607,15 +5609,37 @@ def _user_prompt_visible(pane: str) -> bool:
     lines = [line for line in pane.splitlines() if line.strip()]
     rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
     region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
+    # A narrow pane wraps the footer ("Esc to" / "cancel"), so its hints are
+    # matched with the line breaks collapsed.
+    footer = " ".join(region.split())
     return (
         _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_CONSENT)
         or "Do you want to " in region
         or "Yes, and don't ask again" in region
         or (
-            any(hint in region for hint in ("Enter to select", "Enter to submit"))
-            and "Esc to cancel" in region
+            any(hint in footer for hint in ("Enter to select", "Enter to submit"))
+            and "Esc to cancel" in footer
         )
+        or _plan_approval_dialog_visible(lines, rules)
     )
+
+
+def _plan_approval_dialog_visible(lines: list[str], rules: list[int]) -> bool:
+    """Recognize the plan-approval dialog, which has no "Enter to …" footer.
+
+    It is drawn below the last rule: the "Would you like to proceed?" question
+    and a numbered option list led by the ``❯`` selector.
+
+    :param lines: The pane's non-blank lines.
+    :param rules: Indices into *lines* of the box rules.
+    :returns: Whether the dialog is holding the terminal.
+    """
+    if not rules:
+        return False
+    region = lines[rules[-1] + 1 :]
+    if "Would you like to proceed?" not in " ".join(" ".join(region).split()):
+        return False
+    return any(_NUMBERED_SELECTOR_ROW_RE.match(line.strip().lstrip("│ ")) for line in region)
 
 
 def _has_approval_wait(bridge_dir: Path) -> bool:
@@ -6139,13 +6163,14 @@ def _terminal_dialog_headline(pane: str) -> str | None:
     lines = [line for line in pane.splitlines() if line.strip()]
     last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
     region = lines[last_rule + 1 :] if last_rule is not None else lines[-_DIALOG_SCAN_TAIL_LINES:]
-    footer = next((line for line in reversed(region) if _DIALOG_FOOTER_RE.search(line)), None)
-    if footer is None:
+    # Searched with line breaks collapsed: a narrow pane wraps the footer.
+    footers = list(_DIALOG_FOOTER_RE.finditer(" ".join(" ".join(region).split())))
+    if not footers:
         return None
     has_selector = any(
         line.strip().lstrip("│ ").startswith(_CLAUDE_PROMPT_GLYPH) for line in region
     )
-    if not has_selector and "press enter" not in footer.lower():
+    if not has_selector and "press enter" not in footers[-1].group(0).lower():
         return None
     return " ".join(region[0].strip().strip("│").split())[:120]
 

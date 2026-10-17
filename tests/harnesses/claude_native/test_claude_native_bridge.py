@@ -11501,10 +11501,15 @@ _DIALOG_ECHO_ABOVE_COMPOSER_PANE = _MCP_APPROVAL_DIALOG_PANE + _READY_PANE
     [
         (_MCP_APPROVAL_DIALOG_PANE, "New MCP server found in this project: e2e-noop"),
         (_MCP_APPROVAL_CHECKLIST_PANE, "2 new MCP servers found in this project"),
+        # A narrow pane wraps the footer across rows.
+        (
+            _MCP_APPROVAL_CHECKLIST_PANE.replace("Esc to reject all", "Esc to\n reject all"),
+            "2 new MCP servers found in this project",
+        ),
         (_API_KEY_DIALOG_PANE, "Detected a custom API key in your environment"),
         (_TRUST_DIALOG_PANE, "Accessing workspace:"),
     ],
-    ids=["mcp-single", "mcp-checklist", "api-key", "folder-trust"],
+    ids=["mcp-single", "mcp-checklist", "mcp-checklist-wrapped-footer", "api-key", "folder-trust"],
 )
 def test_terminal_dialog_headline_names_startup_dialogs(pane: str, headline: str) -> None:
     """
