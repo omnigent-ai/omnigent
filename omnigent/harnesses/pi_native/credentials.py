@@ -241,6 +241,10 @@ class PiProviderConfig:
         Databricks OAuth token). Pi still launches — its ``!command`` apiKey may
         recover at request time — but the caller surfaces this so a session that
         would otherwise fail silently tells the user how to re-authenticate.
+    :param model_notice: An informational notice about how the requested model
+        was routed (e.g. a pick qualified by another configured provider that is
+        requested from the serving provider instead). The session still works,
+        so the caller surfaces it as a neutral notice, not an error.
     :param databricks_surfaces: Base URLs of the Databricks gateway surfaces
         reachable with this provider's credential, keyed by surface. Set by the
         Databricks builders; lets a model the live catalog didn't list be routed
@@ -259,6 +263,7 @@ class PiProviderConfig:
     api_key: str
     auth_header: bool
     credential_warning: str | None = None
+    model_notice: str | None = None
     # Full model list for providers that expose multiple models (e.g. the
     # Databricks Anthropic gateway). Excluded from __hash__ so the frozen
     # dataclass stays hashable even though list[dict] is not hashable.
@@ -1775,7 +1780,7 @@ def resolve_pi_native_provider(
             )
         return replace(resolved, inference_bound=True)
 
-    unmanaged_prefix_warning: str | None = None
+    unmanaged_prefix_notice: str | None = None
     try:
         # Pi is multi-family; ``omnigent setup`` marks defaults per family, not
         # for ``pi``. Use the shared house-pattern selection so pi resolves its
@@ -1813,13 +1818,13 @@ def resolve_pi_native_provider(
             # OpenRouter, "zai-org/GLM-4.7") and must stay verbatim.
             if bare and isinstance(providers, dict) and prefix in providers:
                 if prefix != entry.name:
-                    unmanaged_prefix_warning = (
+                    unmanaged_prefix_notice = (
                         f"The model override '{model}' names provider "
                         f"'{prefix}', but this Pi session is served by "
                         f"provider '{entry.name}'; the model '{bare}' was "
                         f"requested from '{entry.name}' instead."
                     )
-                    _LOGGER.warning("pi-native: %s", unmanaged_prefix_warning)
+                    _LOGGER.info("pi-native: %s", unmanaged_prefix_notice)
                 model = bare
         if entry.kind == DATABRICKS_KIND:
             resolved = _databricks_pi_provider(entry, model=model)
@@ -1870,15 +1875,8 @@ def resolve_pi_native_provider(
                 resolved = _databricks_pi_provider(db_entry, model=model)
             if resolved is None:
                 _LOGGER.warning("pi-native: no usable provider found; Pi will use its own login.")
-        if resolved is not None and unmanaged_prefix_warning is not None:
-            resolved = replace(
-                resolved,
-                credential_warning=(
-                    unmanaged_prefix_warning
-                    if resolved.credential_warning is None
-                    else f"{unmanaged_prefix_warning}\n\n{resolved.credential_warning}"
-                ),
-            )
+        if resolved is not None and unmanaged_prefix_notice is not None:
+            resolved = replace(resolved, model_notice=unmanaged_prefix_notice)
         return resolved
     except Exception:  # noqa: BLE001 — any resolution failure must not break launch
         # Any failure (malformed config, duplicate per-family default, or an
