@@ -169,6 +169,8 @@ class HostFrameKind(str, Enum):
     HARNESS_STARTUP_RESULT = "host.harness_startup_result"
     MCP_SERVERS = "host.mcp_servers"
     MCP_SERVERS_RESULT = "host.mcp_servers_result"
+    PROVIDER_OP = "host.provider_op"
+    PROVIDER_OP_RESULT = "host.provider_op_result"
     IMPORT_LOCAL = "host.import_local"
     IMPORT_LOCAL_BY_ID = "host.import_local_by_id"
     IMPORT_LOCAL_SESSION = "host.import_local_session"
@@ -1051,6 +1053,49 @@ class HostSkillsResultFrame:
 
 
 @dataclass
+class HostProviderOpFrame:
+    """Server → host: run one provider / agent-pin operation on that machine.
+
+    The generic op + params shape mirrors ``host.fs_request``: one frame
+    pair serves every config-control-plane operation — provider CRUD and
+    endpoint probes on the host's own ``~/.omnigent/config.yaml``, plus
+    per-agent provider/model pins on the host's ``~/.omnigent/agents/``
+    specs — without a frame kind per verb.
+
+    :param op: One of ``"providers_list"``, ``"provider_upsert"``,
+        ``"provider_delete"``, ``"provider_test"``, ``"agents_list"``,
+        ``"agent_pin_set"``, ``"agent_pin_clear"``.
+    :param params: Op-specific JSON arguments (the provider entry, the
+        agent name, the pin fields), interpreted by the host's op
+        handler. Params carrying secrets do so by the user's choice
+        (an inline ``api_key``), matching what ``config.yaml`` may
+        already hold; results never echo secret values back.
+    """
+
+    request_id: str
+    op: str
+    params: _JsonObject = field(default_factory=dict)
+
+
+@dataclass
+class HostProviderOpResultFrame:
+    """Host → server: outcome of one provider / agent-pin operation.
+
+    Mirrors ``host.fs_result``: ``payload`` carries the op-specific
+    result (credential *references* and source descriptors only — never
+    a resolved plaintext secret), and the ``error*`` fields carry the
+    failure classification when ``status`` is not ``"ok"``.
+    """
+
+    request_id: str
+    status: str
+    payload: _JsonObject | None = None
+    error_status: int | None = None
+    error_code: str | None = None
+    error: str | None = None
+
+
+@dataclass
 class HostHarnessStartupFrame:
     """Server → host: read host defaults for a native harness launch."""
 
@@ -1313,6 +1358,8 @@ HostFrame = (
     | HostHarnessStartupResultFrame
     | HostMcpServersFrame
     | HostMcpServersResultFrame
+    | HostProviderOpFrame
+    | HostProviderOpResultFrame
     | HostImportLocalFrame
     | HostImportLocalByIdFrame
     | HostImportLocalSessionFrame
@@ -1812,6 +1859,27 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error": frame.error,
             }
         )
+    if isinstance(frame, HostProviderOpFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.PROVIDER_OP.value,
+                "request_id": frame.request_id,
+                "op": frame.op,
+                "params": frame.params,
+            }
+        )
+    if isinstance(frame, HostProviderOpResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.PROVIDER_OP_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "payload": frame.payload,
+                "error_status": frame.error_status,
+                "error_code": frame.error_code,
+                "error": frame.error,
+            }
+        )
     if isinstance(frame, HostImportLocalFrame):
         return _encode_payload(
             {
@@ -2223,6 +2291,10 @@ def _decode_known_host_frame(
             )
         case HostFrameKind.MCP_TOOLS_RESULT:
             return _decode_mcp_tools_result(msg)
+        case HostFrameKind.PROVIDER_OP:
+            return _decode_provider_op(msg)
+        case HostFrameKind.PROVIDER_OP_RESULT:
+            return _decode_provider_op_result(msg)
         case HostFrameKind.IMPORT_LOCAL:
             return _decode_import_local(msg)
         case HostFrameKind.IMPORT_LOCAL_BY_ID:
@@ -2815,6 +2887,36 @@ def _decode_skills_result(msg: _JsonObject) -> HostSkillsResultFrame:
         error_code=_optional_nullable_str(msg, "error_code"),
         session_id=_optional_nullable_str(msg, "session_id"),
         agent_id=_optional_nullable_str(msg, "agent_id"),
+    )
+
+
+def _decode_provider_op(msg: _JsonObject) -> HostProviderOpFrame:
+    """Decode a host.provider_op request frame."""
+    params = msg.get("params", {})
+    if not isinstance(params, dict):
+        raise ValueError("frame field must be a JSON object: 'params'")
+    return HostProviderOpFrame(
+        request_id=_required_str(msg, "request_id"),
+        op=_required_str(msg, "op"),
+        params=params,
+    )
+
+
+def _decode_provider_op_result(msg: _JsonObject) -> HostProviderOpResultFrame:
+    """Decode a host.provider_op_result frame."""
+    payload = msg.get("payload")
+    if payload is not None and not isinstance(payload, dict):
+        raise ValueError("frame field must be a JSON object: 'payload'")
+    error_status = msg.get("error_status")
+    if error_status is not None and not isinstance(error_status, int):
+        raise ValueError("frame field must be an integer: 'error_status'")
+    return HostProviderOpResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        payload=payload,
+        error_status=error_status,
+        error_code=_optional_nullable_str(msg, "error_code"),
+        error=_optional_nullable_str(msg, "error"),
     )
 
 
