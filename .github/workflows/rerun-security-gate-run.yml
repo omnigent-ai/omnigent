@@ -111,7 +111,7 @@ jobs:
           scan_conclusion=""
           for _ in $(seq 1 72); do   # up to ~6 min (72 * 5s)
             read -r scan_status scan_concl < <(
-              gh api "repos/$REPO/commits/$SHA/check-runs" \
+              gh api "repos/$REPO/commits/$SHA/check-runs?check_name=Security%20Scan" \
                 --jq "$scan_q | \"\(.status // \"none\") \(.conclusion // \"none\")\"" 2>/dev/null || echo "")
             if [ "${scan_status:-}" = "completed" ]; then
               scan_conclusion="$scan_concl"
