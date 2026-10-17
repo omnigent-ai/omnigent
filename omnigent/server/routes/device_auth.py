@@ -54,7 +54,7 @@ import logging
 import os
 import secrets
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 import jwt
 from fastapi import APIRouter, HTTPException, Request
@@ -368,6 +368,7 @@ def create_oauth_token_router(
     *,
     handle_device_code: Callable[[str], Response] | None = None,
     handle_client_credentials: Callable[[Request, FormData], Response] | None = None,
+    handle_jwt_bearer: Callable[[Request, FormData], Awaitable[Response]] | None = None,
     client_secret_ok: Callable[[Request], bool] | None = None,
 ) -> APIRouter:
     """Build the ``/oauth/token`` + ``/oauth/revoke`` router.
@@ -395,6 +396,9 @@ def create_oauth_token_router(
         :func:`omnigent.server.routes.client_credentials.create_client_credentials_handler`.
         ``None`` (no machine client configured) leaves that grant type
         answering ``unsupported_grant_type``.
+    :param handle_jwt_bearer: Optional JWT bearer grant handler (RFC 7523), from
+        :func:`omnigent.server.routes.jwt_bearer.create_jwt_bearer_handler`.
+        ``None`` leaves that grant type answering ``unsupported_grant_type``.
     :param client_secret_ok: Optional client-secret gate (callable that validates
         the request). When ``None`` (standalone mounts), builds the gate from
         the ``OMNIGENT_DEVICE_CLIENT_SECRET`` env var. When provided
@@ -456,7 +460,7 @@ def create_oauth_token_router(
 
     @router.post("/oauth/token", dependencies=[])
     async def token(request: Request) -> Response:
-        """Exchange a device_code, refresh_token or client credential.
+        """Exchange a device_code, refresh_token, client credential or JWT assertion.
 
         RFC 8628 / 6749 error shapes: ``authorization_pending``,
         ``slow_down``, ``expired_token``, ``access_denied``,
@@ -491,6 +495,12 @@ def create_oauth_token_router(
             if handle_client_credentials is None:
                 return _oauth_error("unsupported_grant_type")
             return handle_client_credentials(request, form)
+        if grant_type == "urn:ietf:params:oauth:grant-type:jwt-bearer":
+            # RFC 7523 §2.1: the assertion is the credential, so like
+            # client_credentials it bypasses the device client-secret gate.
+            if handle_jwt_bearer is None:
+                return _oauth_error("unsupported_grant_type")
+            return await handle_jwt_bearer(request, form)
         return _oauth_error("unsupported_grant_type")
 
     def _handle_refresh_grant(refresh_token: str) -> Response:
@@ -628,6 +638,7 @@ def create_device_auth_router(
     device_grant_store: DeviceGrantStore,
     *,
     handle_client_credentials: Callable[[Request, FormData], Response] | None = None,
+    handle_jwt_bearer: Callable[[Request, FormData], Awaitable[Response]] | None = None,
 ) -> APIRouter:
     """Build the ``/oauth/*`` device-grant router.
 
@@ -639,6 +650,8 @@ def create_device_auth_router(
     :param handle_client_credentials: Optional client-credentials handler,
         forwarded to the token router this builds. The device flow and the
         machine grant share that one ``POST /oauth/token``.
+    :param handle_jwt_bearer: Optional JWT bearer grant handler, forwarded the
+        same way.
     :returns: APIRouter to mount at the app root.
     """
     cookie_secret, provider_name = _resolve_signing_config(auth_provider)
@@ -1000,6 +1013,7 @@ def create_device_auth_router(
             device_grant_store,
             handle_device_code=_handle_device_code_grant,
             handle_client_credentials=handle_client_credentials,
+            handle_jwt_bearer=handle_jwt_bearer,
             client_secret_ok=_client_secret_ok,
         )
     )
