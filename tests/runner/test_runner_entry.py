@@ -3061,15 +3061,18 @@ def test_main_configures_runner_process_logging(
     assert captured == {"destination": "runner", "force": True}
 
 
+@pytest.mark.parametrize("already_present", [False, True])
 def test_main_makes_the_workspace_importable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    already_present: bool,
 ) -> None:
-    """``main`` puts the workspace back on ``sys.path`` for local tools.
+    """``main`` puts the workspace last on ``sys.path`` for local tools.
 
     The runner is spawned with ``-P`` so its workspace cannot shadow the
     installed omnigent. Spec-declared local tools are still imported by dotted
-    path, so the workspace has to be restored once omnigent itself is imported.
+    path, so the workspace is added once omnigent itself is imported, behind
+    every other entry so it cannot shadow their dependencies either.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Stands in for the session workspace.
@@ -3087,11 +3090,13 @@ def test_main_makes_the_workspace_importable(
         _stop_immediately,
     )
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(sys, "path", [p for p in sys.path if p != str(tmp_path)])
+    others = [p for p in sys.path if p != str(tmp_path)]
+    startup = [str(tmp_path), *others, str(tmp_path)] if already_present else list(others)
+    monkeypatch.setattr(sys, "path", startup)
 
     main()
 
-    assert str(tmp_path) in sys.path
+    assert sys.path == [*others, str(tmp_path)]
 
 
 def test_main_preserves_unexpected_runtime_errors(
