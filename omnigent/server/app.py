@@ -19,7 +19,7 @@ from typing import Any, Literal, Protocol
 
 import httpx
 from fastapi import FastAPI, Query, Request
-from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exception_handlers import http_exception_handler, request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -133,6 +133,7 @@ from omnigent.server.runner_session_init import (
     runner_response_error_body,
 )
 from omnigent.server.scheduled import ScheduledTaskScheduler
+from omnigent.server.validation_audit import validation_audit_attrs
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -2383,6 +2384,25 @@ def create_app(
             content={"error": {"code": exc.code, "message": exc.message}},
         )
 
+    @app.exception_handler(StarletteHTTPException)
+    async def _handle_http_exception(request: Request, exc: StarletteHTTPException) -> Response:
+        if exc.status_code == 422 and isinstance(exc.detail, list):
+            errors = [
+                error
+                for error in exc.detail
+                if isinstance(error, dict) and "type" in error and "loc" in error
+            ]
+            if errors:
+                add_audit_attrs(
+                    code=str(ErrorCode.INVALID_INPUT),
+                    http_status="422",
+                    error_category=ErrorCategory.USER.value,
+                    error_impact=ErrorImpact.BENIGN.value,
+                    error_phase=ErrorPhase.REQUEST.value,
+                    **validation_audit_attrs(errors),
+                )
+        return await http_exception_handler(request, exc)
+
     @app.exception_handler(RequestValidationError)
     async def _handle_validation_error(
         request: Request,
@@ -2406,6 +2426,7 @@ def create_app(
             error_impact=ErrorImpact.BENIGN.value,
             error_phase=ErrorPhase.REQUEST.value,
         )
+        add_audit_attrs(**validation_audit_attrs(exc.errors()))
         return await request_validation_exception_handler(request, exc)
 
     @app.exception_handler(ConversationNotFoundError)
