@@ -31,6 +31,7 @@ from omnigent._wrapper_labels import (
 )
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
@@ -74,6 +75,7 @@ from omnigent.harnesses.codex_native.forwarder import (
     codex_rollout_last_turn_model,
     supervise_forwarder,
 )
+from omnigent.harnesses.codex_native.history_diagnostics import history_shape_statistics
 from omnigent.harnesses.codex_native.state import read_launch_state, write_launch_state
 from omnigent.host.daemon_launch import (
     error_text,
@@ -2077,6 +2079,16 @@ async def _ensure_local_codex_resume_rollout(
         if tmp is not None:
             with contextlib.suppress(FileNotFoundError):
                 tmp.unlink()
+    extra = debug_event(
+        "codex_resume_history_shape",
+        session_id=session_id,
+        history_source="server_snapshot",
+        native_cli_version=cli_version,
+    )
+    with contextlib.suppress(Exception):
+        attributes = extra.get("attributes")
+        if isinstance(attributes, dict):
+            attributes.update(history_shape_statistics(records))
     _logger.info(
         "Refreshed Codex resume rollout from server history: "
         "session=%s thread=%s items=%d target=%s",
@@ -2084,6 +2096,7 @@ async def _ensure_local_codex_resume_rollout(
         external_session_id,
         len(items),
         target,
+        extra=extra,
     )
     return target
 
