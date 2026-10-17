@@ -49,7 +49,7 @@ Hourly-equivalent rules such as `FREQ=MINUTELY;INTERVAL=60` and
 `FREQ=SECONDLY;INTERVAL=3600` remain valid, including when loaded from storage.
 Validation and next-fire lookup have an eight-year occurrence horizon and a
 100,000-step search budget that counts calendar candidates, position selections,
-and inner time-filter searches. Each search also has a 250 ms monotonic deadline.
+and inner time-filter searches. Each search also has a 250 ms CPU-time deadline.
 Every `BY*` list is deduplicated and limited to 24 distinct values before parsing.
 Create and update validation runs off the HTTP event loop. Exhausting
 the budget raises a validation error. If this happens while re-arming a task,

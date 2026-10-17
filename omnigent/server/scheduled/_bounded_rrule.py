@@ -43,7 +43,7 @@ import calendar
 import datetime
 from collections.abc import Iterator
 from math import gcd
-from time import monotonic
+from time import thread_time
 from typing import Any, cast
 
 from dateutil.rrule import (  # type: ignore[import-untyped]
@@ -63,14 +63,16 @@ def iter_bounded(
     rule: rrule, *, max_steps: int, max_seconds: float
 ) -> Iterator[datetime.datetime]:
     remaining = max_steps
-    deadline = monotonic() + max_seconds
+    # Bound CPU spent by this thread, so a descheduled or GIL-starved search
+    # (a loaded server) is not rejected for time it never ran.
+    deadline = thread_time() + max_seconds
 
     def spend(steps: int = 1) -> None:
         nonlocal remaining
         remaining -= steps
         if remaining < 0:
             raise ValueError("RRULE search exceeds the supported work limit")
-        if monotonic() >= deadline:
+        if thread_time() >= deadline:
             raise ValueError("RRULE search exceeds the supported time limit")
 
     # Public dateutil stubs omit the iterator state and mask types.
