@@ -8056,21 +8056,32 @@ async def _session_host_id(
     conv: Conversation | _RelayStatusSnapshot, conversation_store: ConversationStore
 ) -> str | None:
     """
-    Return the host a session runs on; a sub-agent rides its parent's host.
+    Return the host a session runs on, following hostless ancestors to it.
 
     :param conv: The session row, or a relay's saved snapshot of it.
-    :param conversation_store: Store used to read a sub-agent's parent.
+    :param conversation_store: Store used to read the ancestor rows.
     :returns: The host id, or ``None`` when unknown or unreadable.
     """
-    if conv.host_id is not None or conv.parent_conversation_id is None:
+    from omnigent.runner.routing import routing_host_id
+
+    if conv.host_id is not None:
         return conv.host_id
     try:
-        parent = await asyncio.to_thread(
-            conversation_store.get_conversation, conv.parent_conversation_id
-        )
-    except Exception:  # noqa: BLE001 — an unreadable parent leaves the host unknown
+        if isinstance(conv, _RelayStatusSnapshot):
+            # A snapshot keeps no labels to follow; resolve from its parent's row.
+            if conv.parent_conversation_id is None:
+                return None
+            parent = await asyncio.to_thread(
+                conversation_store.get_conversation, conv.parent_conversation_id
+            )
+            if parent is None:
+                return None
+            return await asyncio.to_thread(
+                routing_host_id, parent, conversation_store, max_ancestor_reads=15
+            )
+        return await asyncio.to_thread(routing_host_id, conv, conversation_store)
+    except Exception:  # noqa: BLE001 — an unreadable ancestor leaves the host unknown
         return None
-    return parent.host_id if parent is not None else None
 
 
 def _split_host_offline_holds(
@@ -8129,7 +8140,6 @@ def _log_host_offline_hold(
 async def _relay_host_offline(
     session_id: str,
     conversation_store: ConversationStore,
-    runner_id: str | None,
 ) -> bool:
     """
     Report whether a lost relay's session sits on a host that went offline.
@@ -8140,7 +8150,6 @@ async def _relay_host_offline(
 
     :param session_id: Session whose relay gave up.
     :param conversation_store: Store used to find the session's host.
-    :param runner_id: Runner the relay streamed from, or ``None`` when unknown.
     :returns: ``True`` only when the session's user-run host is confirmed offline.
     """
     if get_server_host_store() is None:
@@ -8149,14 +8158,11 @@ async def _relay_host_offline(
     conv: Conversation | _RelayStatusSnapshot | None = (
         handle.status_snapshot if handle is not None else None
     )
-    if conv is None and runner_id is not None:
+    if conv is None:
         try:
-            bound = await asyncio.to_thread(
-                conversation_store.list_conversations_by_runner_id, runner_id
-            )
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         except Exception:  # noqa: BLE001 — unknown session state fails as before
             return False
-        conv = next((c for c in bound if c.id == session_id), None)
     if conv is None:
         return False
     host_id = await _session_host_id(conv, conversation_store)
@@ -8603,7 +8609,7 @@ async def _relay_runner_stream(
                 decision = "server_shutdown"
             elif await _relay_runner_live_elsewhere(session_id, conversation_store):
                 decision = "live_elsewhere"
-            elif await _relay_host_offline(session_id, conversation_store, outage_runner_id):
+            elif await _relay_host_offline(session_id, conversation_store):
                 decision = "held_host_offline"
             elif await _runner_disconnect_requires_failure(
                 session_id, conversation_store, origin="runner_disconnected_mid_turn"

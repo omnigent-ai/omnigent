@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
 from omnigent.db.utils import now_epoch
 from omnigent.server.routes._sessions import orchestration
+from omnigent.server.routes._sessions.common import _RelayStatusSnapshot
 from omnigent.stores.host_store import Host
 
 _HOST_ID = "host_0123456789abcdef"
@@ -85,3 +87,46 @@ async def test_host_offline_state_without_a_host_id(monkeypatch: pytest.MonkeyPa
     """A session with no known host never waits for one."""
     monkeypatch.setattr(orchestration, "get_server_host_store", lambda: _FakeHostStore(_host))
     assert await orchestration._host_offline_state(None) is False
+
+
+class _AncestorStore:
+    """Serve sub-agent rows by id, like the conversation store's point read."""
+
+    def __init__(self, *rows: SimpleNamespace) -> None:
+        self.rows = {row.id: row for row in rows}
+
+    def get_conversation(self, conversation_id: str) -> SimpleNamespace | None:
+        return self.rows.get(conversation_id)
+
+
+def _row(row_id: str, *, parent: str | None, host_id: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=row_id,
+        kind="sub_agent" if parent is not None else "default",
+        labels={},
+        parent_conversation_id=parent,
+        root_conversation_id="root" if parent is not None else None,
+        runner_id="runner_shared",
+        host_id=host_id,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("as_snapshot", [False, True])
+async def test_session_host_id_follows_hostless_parents(as_snapshot: bool) -> None:
+    """A grandchild under a hostless child still waits on the root's host."""
+    root = _row("root", parent=None, host_id=_HOST_ID)
+    child = _row("child", parent="root")
+    grandchild = _row("grandchild", parent="child")
+    store = _AncestorStore(root, child, grandchild)
+    conv: object = grandchild
+    if as_snapshot:
+        conv = _RelayStatusSnapshot(
+            live_status="running",
+            kind="sub_agent",
+            parent_conversation_id="child",
+            runner_id="runner_shared",
+            host_id=None,
+            updated_at=0,
+        )
+    assert await orchestration._session_host_id(conv, store) == _HOST_ID  # type: ignore[arg-type]

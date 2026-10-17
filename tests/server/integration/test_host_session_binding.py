@@ -2185,6 +2185,69 @@ async def test_runner_exited_after_connect_fails_mid_turn_session(
     assert attributes["fail_idle_top_level"] is False
 
 
+async def test_runner_exited_during_host_offline_hold_fails_turn_and_ends_hold(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A crash report for a runner held while its host is offline fails the turn.
+
+    The report is authoritative, so it cancels the hold; the hold still logs
+    its end so every start row has a matching end row.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+    from tests.debug_log_helpers import capture_debug_rows
+    from tests.server.integration.test_sessions_tunnel_three_layer import (
+        _connect_runner_tunnel,
+        _send_hello_and_wait,
+        _stub_connect_hook_for_pumpless_ws,
+    )
+
+    async def host_offline(_host_id: str | None) -> bool:
+        return True
+
+    monkeypatch.setattr(sessions_module, "RUNNER_DISCONNECT_GRACE_S", 0.05)
+    monkeypatch.setattr(sessions_module, "_host_offline_state", host_offline)
+    app, conv_store = _runner_exited_app(db_uri, tmp_path)
+    _stub_connect_hook_for_pumpless_ws(app, monkeypatch)
+    runner_id = "runner_held_then_crashed"
+    conv = conv_store.create_conversation(agent_id=None, runner_id=runner_id)
+    runner = await _connect_runner_tunnel(app, runner_id)
+    await _send_hello_and_wait(runner, app, runner_id, harnesses=[])
+    sessions_module._session_status_cache[conv.id] = "running"
+
+    def _seen(rows: list[dict[str, object]], event: str) -> bool:
+        return any(r["event_name"] == event for r in rows)
+
+    try:
+        with capture_debug_rows("server") as rows:
+            await runner.send_input({"type": "websocket.disconnect", "code": 1000})
+            await runner.wait(timeout=5.0)
+            async with asyncio.timeout(5.0):
+                while not _seen(rows, "runner_disconnect_held_host_offline"):
+                    await asyncio.sleep(0.01)
+            assert _persisted_task_error(conv_store, conv.id) is None
+
+            _comm = await _report_runner_exited(app, runner_id, had_connected=True)
+            async with asyncio.timeout(5.0):
+                while (
+                    not _seen(rows, "runner_disconnect_hold_ended")
+                    or _persisted_task_error(conv_store, conv.id) is None
+                ):
+                    await asyncio.sleep(0.01)
+
+        ended = [r for r in rows if r["event_name"] == "runner_disconnect_hold_ended"]
+        assert [(r["session_id"], r["attributes"]["outcome"]) for r in ended] == [  # type: ignore[index]
+            (conv.id, "cancelled")
+        ]
+        error = _persisted_task_error(conv_store, conv.id)
+        assert error is not None
+        assert error["code"] == "runner_failed_to_start"
+    finally:
+        sessions_module._session_status_cache.pop(conv.id, None)
+
+
 _CONCRETE_FAILURE = "Claude Code could not continue: the project settings file is not valid JSON."
 
 

@@ -3783,9 +3783,7 @@ async def test_relay_leaves_a_turn_on_an_offline_host_to_the_disconnect_hold(
         0.0,
     )
 
-    async def scripted_host_offline(
-        _session_id: str, _store: object, _runner_id: str | None
-    ) -> bool:
+    async def scripted_host_offline(_session_id: str, _store: object) -> bool:
         return host_offline
 
     monkeypatch.setattr(
