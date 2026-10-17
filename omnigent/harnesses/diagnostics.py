@@ -213,6 +213,10 @@ def sign_in_running_elsewhere(screen: str | None) -> bool:
     return bool(screen) and _SIGN_IN_ELSEWHERE.search(screen) is not None
 
 
+# Closes a sign-in card's next step; dropped for a held message, which is sent on its own.
+SIGN_IN_RESEND_STEP = "; then send your message again."
+
+
 def sign_in_next_step(agent: str) -> str:
     """Phrase the next step for a card whose harness is waiting on a launcher sign-in.
 
@@ -227,5 +231,5 @@ def sign_in_next_step(agent: str) -> str:
     """
     return (
         f"Open the sign-in link and sign in. {agent} continues on its own once the "
-        "sign-in completes; then send your message again."
+        f"sign-in completes{SIGN_IN_RESEND_STEP}"
     )
