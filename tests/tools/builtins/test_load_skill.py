@@ -181,6 +181,28 @@ def test_load_skill_schema_lists_skill_names(
     assert "code-review" in desc
 
 
+def test_load_skill_schema_summarizes_bundled_skills_only(tmp_path: Path) -> None:
+    """Bundled skills carry a one-line summary; host-discovered skills stay names-only.
+
+    A harness without native skill support decides when to load a skill from
+    this description alone, so a bare name gives it nothing to match on.
+    """
+    host_skill = tmp_path / ".agents" / "skills" / "host-only"
+    host_skill.mkdir(parents=True)
+    (host_skill / "SKILL.md").write_text(
+        "---\nname: host-only\ndescription: From the host.\n---\nbody"
+    )
+    bundled = SkillSpec(name="guide", description="Use when asked.\n" + "x" * 400, content="body")
+
+    desc = LoadSkillTool([bundled], agent_root=tmp_path).get_schema()["function"]["description"]
+
+    assert "- guide: Use when asked. xxx" in desc
+    assert len(desc.splitlines()[2]) <= len("- guide: ") + 300
+    others = desc.splitlines()[-1]
+    assert others.startswith("Other skills: ") and "host-only" in others
+    assert "From the host" not in desc
+
+
 def test_list_skill_resources_includes_root_level_files(tmp_path: Path) -> None:
     """Auxiliary docs beside SKILL.md are readable resources."""
     from omnigent.tools.builtins.load_skill import list_skill_resources

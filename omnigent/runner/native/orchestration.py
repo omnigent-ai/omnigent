@@ -95,13 +95,10 @@ from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
 )
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
+from omnigent.spec.framework_skills import FRAMEWORK_SKILL_NAMES, framework_skills_dir
 from omnigent.spec.types import AgentSpec
 
 _logger = logging.getLogger("omnigent.runner.app")
-
-#: Root of the installed ``omnigent`` package, for locating packaged assets
-#: (e.g. ``onboarding/agent/skills/``) independently of this module's depth.
-_OMNIGENT_PACKAGE_DIR = Path(__file__).resolve().parent.parent.parent
 
 _NATIVE_TERMINAL_START_FAILED_CODE = "native_terminal_start_failed"
 _NATIVE_TERMINAL_LIFECYCLE_ERROR_CODES = {
@@ -8135,14 +8132,13 @@ def _ensure_orchestrator_skills_in_bundle(
     agent_spec: object,
 ) -> None:
     """
-    Link the ``build-omnigent`` skill into a bundle's ``skills/`` dir.
+    Link the framework skills into a bundle's ``skills/`` dir.
 
     Called before native bridge launches so ``--plugin-dir`` (claude) or
-    ``CODEX_HOME/skills/`` (codex) picks up the skill. Injects
-    unconditionally for every agent — every ``omnigent claude`` /
-    ``omnigent codex`` user should be able to author new agents. The
-    skill isn't already present guard is idempotent. Best-effort: a
-    failure to link is logged but does not abort the terminal launch.
+    ``CODEX_HOME/skills/`` (codex) picks them up. Every agent gets them;
+    a skill the bundle already ships is left alone, so repeat calls are
+    idempotent. Best-effort: a failure to link is logged but does not
+    abort the terminal launch.
 
     :param bundle_dir: Materialized agent-bundle root, e.g.
         ``/tmp/omnigent-ap-chat-xyz/bundle``.
@@ -8150,31 +8146,31 @@ def _ensure_orchestrator_skills_in_bundle(
         removal; retained for call-site compat).
     """
     del agent_spec  # no longer gated; inject unconditionally
-    skill_name = "build-omnigent"
-    target_dir = bundle_dir / "skills" / skill_name
-    if target_dir.exists():
-        return
-    # Anchored on the package root, not a ``.parent`` count off this file:
-    # moving this module deeper must not silently break the source path.
-    source = _OMNIGENT_PACKAGE_DIR / "onboarding" / "agent" / "skills" / skill_name
-    if not source.is_dir():
-        _logger.debug(
-            "Orchestrator skill source %s is not a directory; skipping injection",
-            source,
-            extra={"session_id": runner_primary_session_id()},
-        )
-        return
-    try:
-        target_dir.parent.mkdir(parents=True, exist_ok=True)
-        target_dir.symlink_to(source)
-    except OSError:
-        _logger.debug(
-            "Could not link %s skill into bundle %s",
-            skill_name,
-            bundle_dir,
-            exc_info=True,
-            extra={"session_id": runner_primary_session_id()},
-        )
+    source_dir = framework_skills_dir()
+    for skill_name in FRAMEWORK_SKILL_NAMES:
+        target_dir = bundle_dir / "skills" / skill_name
+        if target_dir.exists():
+            continue
+        source = source_dir / skill_name
+        if not source.is_dir():
+            # A wheel without the skill files is a broken install, not a choice.
+            _logger.warning(
+                "Framework skill source %s is missing; skipping injection",
+                source,
+                extra={"session_id": runner_primary_session_id()},
+            )
+            continue
+        try:
+            target_dir.parent.mkdir(parents=True, exist_ok=True)
+            target_dir.symlink_to(source)
+        except OSError:
+            _logger.debug(
+                "Could not link %s skill into bundle %s",
+                skill_name,
+                bundle_dir,
+                exc_info=True,
+                extra={"session_id": runner_primary_session_id()},
+            )
 
 
 #: Omnigent MCP tools an auto-harness Claude session must be able to call

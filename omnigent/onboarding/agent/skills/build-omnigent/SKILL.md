@@ -11,9 +11,10 @@ the minimal set of files needed — don't over-engineer.
 Every template below has been validated with the same parser/validator
 that `omnigent server` uses. If your environment exposes the
 `validate_agent` tool (the dedicated agent-authoring environment does),
-run it after generating files to confirm the spec loads. Load the
-**`omnigent-knowledge`** skill if you need the deeper field reference
-(executor types, os_env, guardrails, sandboxing).
+run it after generating files to confirm the spec loads. For the full
+field reference (executor types, os_env, policies, sandboxing), read
+`docs/AGENT_YAML_SPEC.md` for the installed version; the
+**`omnigent-guide`** skill says where to find it.
 
 ## Step 1: Choose a directory name
 
@@ -39,7 +40,9 @@ Include if needed:
 - `os_env` — filesystem/shell access for harness agents (see the
   shell-capable template).
 - `interaction.modalities` — if the agent handles images or files.
-- `guardrails` — runtime policy gates (see `omnigent-knowledge`).
+- `guardrails.policies` — runtime gates on requests and tool calls (see
+  `docs/POLICIES.md`). In a bundle's `config.yaml` they nest under
+  `guardrails:`; a single-file agent YAML puts `policies:` at the top level.
 
 ## Step 2a: Choose an executor
 
@@ -60,7 +63,7 @@ be one of: `claude-native` (Claude Code, full coding tools), `claude-sdk`,
 Model selection is optional — if omitted, the executor resolves the
 provider's default model from the configured credentials (e.g. an
 Anthropic key, a Claude subscription, or a Databricks profile). Pin one
-only when asked; see `omnigent-knowledge` for `executor.model` / `auth`.
+only when asked; see `docs/AGENT_YAML_SPEC.md` for `executor.model` / `auth`.
 
 ## Step 3: Generate AGENTS.md
 
