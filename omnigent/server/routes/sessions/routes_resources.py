@@ -477,9 +477,9 @@ def register_resources_routes(
         :returns: The attachment, streamed as the runner sends it, or the
             runner's own error body and status for a missing file, a
             directory, or an out-of-grant path.
-        :raises OmnigentError: ``runner_unavailable`` when the runner
-            predates downloads.
-        :raises HTTPException: 502 when no runner can be reached.
+        :raises OmnigentError: ``runner_unavailable`` when no runner is
+            available or a send-time connection failure confirms it is offline.
+        :raises HTTPException: 502 when a download or error-body read fails.
         """
         try:
             runner_client = await _get_runner_client_for_resource_access(
@@ -515,7 +515,7 @@ def register_resources_routes(
                 stream=True,
             )
         except (httpx.HTTPError, ConnectionError) as exc:
-            if isinstance(exc, httpx.ConnectError):
+            if isinstance(exc, (httpx.ConnectError, ConnectionError)):
                 raise OmnigentError(
                     "The session runner is offline. Reconnect the host and retry.",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
