@@ -7,6 +7,11 @@
 !.github/triage_v2
 .github/triage_v2/*
 !.github/triage_v2/pyproject.toml
+integrations/slack/deploy/
+integrations/slack/docs/
+integrations/slack/tests/
+integrations/slack/DESIGN.md
+integrations/slack/.env.example
 .vscode
 .idea
 
