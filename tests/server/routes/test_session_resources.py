@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import re
+import shutil
 import threading
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
@@ -5055,6 +5056,123 @@ async def test_kiro_native_dispatch_clears_pending_when_injection_fails(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("earlier_pending", ["none", "source_id", "source_less"])
+async def test_codex_spilled_paste_settles_its_own_input_and_survives_cache_removal(
+    earlier_pending: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.inner import codex_native_executor
+    from omnigent.inner.native_attachments import attachment_cache_dir
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    conv.labels["omnigent.wrapper"] = "codex-native-ui"
+    bridge = tmp_path / "bridge"
+    monkeypatch.setattr(codex_native_executor, "_MAX_INLINE_TEXT_CHARS", 350)
+    original = [
+        {"type": "input_text", "text": "résumé line\n" * 120},
+        {"type": "input_text", "text": "keep this tail inline"},
+    ]
+    first = None
+    if earlier_pending != "none":
+        first = pending_inputs.record(
+            sid,
+            [{"type": "input_text", "text": "summarize the readme"}],
+            created_by="earlier@example.test",
+            stable_id="a" * 32,
+        )
+        pending_inputs.mark_delivery_stage(sid, first, "forward_accepted")
+    second = pending_inputs.record(
+        sid, original, created_by="paste@example.test", stable_id="b" * 32
+    )
+    items = codex_native_executor._content_to_input_items(original, bridge)
+    mirror = "\n".join(str(item["text"]) for item in items)
+    assert "pasted_text_" in mirror and "keep this tail inline" in mirror
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {"role": "user", "content": [{"type": "input_text", "text": mirror}]},
+            "response_id": "codex:spilled-paste",
+            **({"source_id": "codex:spilled-paste:0"} if earlier_pending != "source_less" else {}),
+        },
+    )
+
+    try:
+        item_id = await _persist_external_conversation_item(sid, conv, body, store)  # type: ignore[arg-type]
+        committed = store.get_item(sid, item_id)
+        assert committed.created_by == "paste@example.test"
+        assert committed.data.content == original
+        assert second not in pending_inputs.pending_ids(sid)
+        if earlier_pending == "source_less":
+            assert pending_inputs.pending_ids(sid) == [first]
+            assert store.persisted_by_stable_id["b" * 32] is committed
+        elif earlier_pending == "source_id":
+            assert store.appended_items[0].data.content[0]["text"] == "summarize the readme"
+            assert store.appended_items[0].created_by == "earlier@example.test"
+            assert store.appended_items[1].type == "error"
+
+        # Rebuild from the serialized durable message after the runner's cache is gone.
+        durable = ConversationItem.model_validate_json(committed.model_dump_json())
+        shutil.rmtree(attachment_cache_dir(bridge))
+        replay = codex_native_executor._content_to_input_items(durable.data.content, bridge)
+        restored_path = Path(str(replay[0]["text"])[len("[Attached file: ") : -1])
+        assert restored_path.read_text() == original[0]["text"]
+        assert replay[1] == {"type": "text", "text": original[1]["text"]}
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_unmatched_spilled_paste_does_not_consume_an_unrelated_upload() -> None:
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    conv.labels["omnigent.wrapper"] = "codex-native-ui"
+    earlier = pending_inputs.record(
+        sid,
+        [
+            {"type": "input_file", "file_id": "earlier-upload"},
+            {"type": "input_text", "text": "tail"},
+        ],
+        created_by="earlier@example.test",
+    )
+    mirror = f"[Attached file: /runner/attachments/{'a' * 32}/pasted_text_{'0' * 12}.txt]\ntail"
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {"role": "user", "content": [{"type": "input_text", "text": mirror}]},
+            "source_id": "codex:unknown-paste:0",
+        },
+    )
+
+    try:
+        item_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,
+            created_by="terminal@example.test",  # type: ignore[arg-type]
+        )
+        committed = store.get_item(sid, item_id)
+        assert committed.created_by == "terminal@example.test"
+        assert committed.data.content == [{"type": "input_text", "text": mirror}]
+        assert pending_inputs.pending_ids(sid) == [earlier]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_kiro_external_prompt_matches_pending_and_reports_skipped_input() -> None:
     """A failed Kiro prompt must not make the next prompt clear the wrong pending input."""
     from omnigent.runtime import pending_inputs
@@ -9805,5 +9923,169 @@ async def test_native_message_that_is_not_a_claude_btw_is_still_queued(
         assert result.pending_id is not None
         assert [entry["content"] for entry in pending_inputs.snapshot_for(sid)] == [content]
         assert client.post_json_calls[-1][0] == f"/v1/sessions/{sid}/events"
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_relay_settles_a_message_codex_refused_and_the_next_mirror_is_clean(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A turn Codex refused settles its queued message once, with no false "not recorded".
+
+    Codex answers an over-long ``turn/start`` with a JSON-RPC error, which proves
+    the turn never started. The real executor and adapter report that as a coded,
+    undelivered failure; the relay commits the message (so it survives a reload)
+    and drains its queue entry. When the forwarder then mirrors the user's NEXT
+    message, nothing is left queued ahead of it to be reported as never recorded.
+    """
+    from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
+    from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState, write_bridge_state
+    from omnigent.inner.codex_native_executor import CodexNativeExecutor
+    from omnigent.runtime import pending_inputs
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.routes.sessions import (
+        _persist_external_conversation_item,
+        _relay_runner_stream,
+    )
+    from omnigent.server.schemas import CreateResponseRequest
+
+    class _RefusingCodexClient:
+        """App-server client that refuses every turn as over-long."""
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        async def connect(self) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            assert method == "turn/start", f"unexpected pre-delivery request: {method}"
+            raise CodexAppServerResponseError(
+                {
+                    "code": -32602,
+                    "data": {
+                        "input_error_code": "input_too_large",
+                        "max_chars": 1048576,
+                        "actual_chars": 1309439,
+                    },
+                    "message": "Input exceeds the maximum length of 1048576 characters.",
+                }
+            )
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _RefusingCodexClient
+    )
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_codex",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_codex",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None,
+        ),
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: CodexNativeExecutor(bridge_dir=tmp_path))
+    ctx = TurnContext(
+        response_id="resp_refused", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    try:
+        with pytest.raises(InnerExecutorError) as raised:
+            await adapter.run_turn(
+                CreateResponseRequest(model="test-agent", input="huge paste"), ctx
+            )
+    finally:
+        await adapter.on_shutdown()
+    refusal = adapter._build_error_detail(raised.value).model_dump(exclude_none=True)
+
+    pending_inputs.reset_for_tests()
+    sid = "2f7e1c0a9d3b4e5f8a6b7c8d9e0f1a2b"
+    store = _ConversationStore()
+    conv = Conversation(
+        id=sid,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=sid,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        labels={"omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui"},
+    )
+    store._conversations[sid] = conv
+    refused_stable = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "huge paste"}],
+        created_by="alice@example.com",
+        stable_id=refused_stable,
+    )
+    client = _ScriptedStreamingRunnerClient(
+        [
+            _sse_frame(
+                {"type": "response.in_progress", "response": {"id": "resp_refused", "model": "x"}}
+            ),
+            _sse_frame(
+                {
+                    "type": "response.failed",
+                    "input_stable_id": refused_stable,
+                    "response": {"id": "resp_refused", "model": "x", "error": refusal},
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    try:
+        await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+
+        # The refused message is committed ahead of its error, and nothing stays queued.
+        assert [i.type for i in store.appended_items] == ["message", "error"]
+        message, error = store.appended_items
+        assert message.data.content == [{"type": "input_text", "text": "huge paste"}]
+        assert message.data.user_authored is True
+        assert message.created_by == "alice@example.com"
+        assert error.data.code == "input_too_large"
+        assert pending_inputs.snapshot_for(sid) == []
+
+        # The user's next message: queued, sent, then mirrored back by the forwarder.
+        pending_inputs.record(
+            sid,
+            [{"type": "input_text", "text": "summarize the readme instead"}],
+            created_by="alice@example.com",
+            stable_id="8a4b0d2f6c3e5a7b9d1f2e3c4b5a6d7e",
+        )
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            SessionEventInput(
+                type="external_conversation_item",
+                data={
+                    "item_type": "message",
+                    "item_data": {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "summarize the readme instead"}
+                        ],
+                    },
+                    "response_id": "resp_next",
+                    "source_id": "codex:next:0",
+                },
+            ),
+            store,  # type: ignore[arg-type]
+        )
+
+        # Only the next message itself was added: no "not recorded" pair for the refused one.
+        assert [i.type for i in store.appended_items[2:]] == ["message"]
+        assert not [
+            i
+            for i in store.appended_items
+            if i.type == "error" and i.data.code == "native_prompt_not_recorded"
+        ]
+        assert pending_inputs.snapshot_for(sid) == []
     finally:
         pending_inputs.reset_for_tests()

@@ -2990,7 +2990,12 @@ async def _persist_external_conversation_item_unlocked(
             # message would brand everything queued in between undelivered.
             # Leave the older entries queued for a later mirror instead.
             held_older = [*matched.skipped, *matched.uncertain]
-        if drained is None and not agent_message_candidate and not _is_kiro_native_session(conv):
+        if (
+            drained is None
+            and not agent_message_candidate
+            and not _is_kiro_native_session(conv)
+            and not pending_inputs.contains_spilled_text_marker(text)
+        ):
             drained = pending_inputs.resolve_oldest(session_id, hold=True)
             if drained is not None:
                 match_method = "fifo_fallback"
@@ -2999,7 +3004,13 @@ async def _persist_external_conversation_item_unlocked(
                 pending_inputs.mark_uncertain(session_id)
         if drained is not None:
             cleared_pending_id = drained.pending_id
-            item = _merge_pending_file_blocks(item, drained.content)
+            if match_method == "spilled_text_digest":
+                # The cache is disposable; history retains the original paste and uploads.
+                item = item.model_copy(
+                    update={"data": item.data.model_copy(update={"content": drained.content})}
+                )
+            else:
+                item = _merge_pending_file_blocks(item, drained.content)
             # Apply the original sender's identity recorded at POST time.
             # The transcript forwarder is the single writer here and has no
             # auth context, so the persisted item would otherwise have
