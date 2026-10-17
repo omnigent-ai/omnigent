@@ -23,6 +23,14 @@ from omnigent.cli_diagnostics import suppresses_recovery_hint
 from omnigent.host.local_server import LocalServerStartup
 
 
+@pytest.fixture(autouse=True)
+def _no_workspace_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep CLI tests off the network: the workspace probe answers "unknown"."""
+    monkeypatch.setattr(
+        "omnigent.host.daemon_lifecycle.probe_workspace_id", lambda url, **_kwargs: None
+    )
+
+
 @dataclass(frozen=True)
 class _SpawnedDaemon:
     """
@@ -1403,6 +1411,80 @@ def test_foreground_host_refuses_another_url_for_the_workspace(
     assert cli_module._find_daemon_record(_VANITY_API) is None
 
 
+def _foreground_workspace_setup(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Run a foreground host on ``_VANITY_API`` whose server names workspace ``1``."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_HOST_ID", "a" * 32)
+    monkeypatch.setenv("OMNIGENT_HOST_NAME", "test-host")
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(
+        "omnigent.cli_auth._token_file_path", lambda: tmp_path / "auth_tokens.json"
+    )
+    monkeypatch.setattr(
+        "omnigent.cli._pid_is_recorded_daemon", lambda record: record.pid == os.getpid()
+    )
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_databricks_server_auth", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "omnigent.host.daemon_lifecycle.probe_workspace_id", lambda url, **_kwargs: "1"
+    )
+
+
+def test_foreground_host_holds_the_workspace_lock_while_connected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The foreground host records its workspace and owns it until it exits."""
+    from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
+
+    _foreground_workspace_setup(monkeypatch, tmp_path)
+    seen: list[str | None] = []
+
+    def _run(server_url: str, **kwargs: object) -> None:
+        other = DaemonLifecycleLock.for_workspace("a" * 32, "1", base_dir=tmp_path)
+        assert other.try_acquire() is False
+        record = cli_module._find_daemon_record(_VANITY_API)
+        seen.append(record.workspace_id if record is not None else None)
+
+    with patch("omnigent.host.connect.run_host_process", _run):
+        result = CliRunner().invoke(cli, ["host", "--server", _VANITY_API, "--no-open"])
+
+    assert result.exit_code == 0, result.output
+    assert seen == ["1"]
+    released = DaemonLifecycleLock.for_workspace("a" * 32, "1", base_dir=tmp_path)
+    assert released.try_acquire() is True
+    released.release()
+
+
+def test_foreground_host_exits_before_connecting_when_the_workspace_is_held(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Another daemon holding the workspace lock stops a foreground host before it connects."""
+    from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
+
+    _foreground_workspace_setup(monkeypatch, tmp_path)
+    holder = DaemonLifecycleLock.for_workspace("a" * 32, "1", base_dir=tmp_path)
+    assert holder.try_acquire() is True
+    runs: list[str] = []
+    try:
+        with patch(
+            "omnigent.host.connect.run_host_process",
+            lambda server_url, **kwargs: runs.append(server_url),
+        ):
+            result = CliRunner().invoke(
+                cli, ["host", "--server", _VANITY_API, "--no-open"], standalone_mode=False
+            )
+    finally:
+        holder.release()
+
+    assert isinstance(result.exception, click.ClickException)
+    assert "already serves workspace 1" in result.exception.format_message()
+    assert runs == []
+    assert cli_module._find_daemon_record(_VANITY_API) is None
+
+
 def test_host_status_selects_daemon_on_another_url_for_the_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1432,6 +1514,165 @@ def test_host_status_selects_daemon_on_another_url_for_the_workspace(
     assert daemon["pid"] == _SAME_WORKSPACE_PID
     assert daemon["target"] == _WORKSPACE_API
     assert daemon["same_workspace_as"] == _VANITY_API
+
+
+def _seed_yielding_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    registered_late: bool = False,
+    requested_login: bool = True,
+    failed_probes: int = 0,
+) -> list[str]:
+    """
+    Make the spawned daemon yield to a same-workspace daemon on another URL.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Test-scoped directory for the registry and login records.
+    :param registered_late: Whether the winner's record appears only after a
+        few claim polls, rather than before the spawned child exits.
+    :param requested_login: Whether the requested URL has a login record that
+        names its workspace.
+    :param failed_probes: How many probes of the requested URL fail first.
+    :returns: The URLs probed, in order.
+    """
+    from omnigent.cli import _SpawnedDaemonProcess
+    from omnigent.cli_auth import store_databricks_auth
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_HOST_ID", "a" * 32)
+    monkeypatch.setenv("OMNIGENT_HOST_NAME", "test-host")
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(
+        "omnigent.cli_auth._token_file_path", lambda: tmp_path / "auth_tokens.json"
+    )
+    monkeypatch.setattr(
+        "omnigent.cli._pid_is_recorded_daemon",
+        lambda record: record.pid == _SAME_WORKSPACE_PID,
+    )
+    store_databricks_auth(_WORKSPACE_API, "https://dbc-1.cloud.databricks.com", org_id="1")
+    if requested_login:
+        store_databricks_auth(_VANITY_API, "https://dbc-1.cloud.databricks.com", org_id="1")
+    monkeypatch.setattr(
+        "omnigent.cli._stop_spawned_host_daemon_process",
+        lambda spawned: pytest.fail("the yielded-to daemon must not be stopped"),
+    )
+
+    probed: list[str] = []
+
+    def _probe(url: str, *, org_id: str | None = None, **_kwargs: object) -> str | None:
+        probed.append(url)
+        if url == _VANITY_API and probed.count(url) <= failed_probes:
+            return None
+        return "1"
+
+    monkeypatch.setattr("omnigent.host.daemon_lifecycle.probe_workspace_id", _probe)
+
+    class _ExitedChild:
+        def poll(self) -> int:
+            return 0
+
+    def _register_winner() -> None:
+        cli_module._write_daemon_record(
+            cli_module._HostDaemonRecord(
+                pid=_SAME_WORKSPACE_PID,
+                target=_WORKSPACE_API,
+                mode="server",
+                server_url=_WORKSPACE_API,
+                log_path=str(tmp_path / "existing.log"),
+                started_at=int(time.time()),
+                host_id="a" * 32,
+                workspace_id="1",
+            )
+        )
+
+    sleeps: list[float] = []
+
+    def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if registered_late and len(sleeps) == 3:
+            _register_winner()
+
+    monkeypatch.setattr("omnigent.cli.time.sleep", _sleep)
+
+    def _spawn(*, args: list[str], env: dict[str, str]) -> _SpawnedDaemonProcess:
+        # The workspace's daemon registered after the pre-spawn check ran.
+        if not registered_late:
+            _register_winner()
+        return _SpawnedDaemonProcess(
+            pid=_SAME_WORKSPACE_PID + 1,
+            log_path=str(tmp_path / "yielded.log"),
+            process=_ExitedChild(),  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr("omnigent.cli._spawn_host_daemon_process", _spawn)
+    return probed
+
+
+@pytest.mark.parametrize(
+    ("registered_late", "requested_login", "failed_probes"),
+    [
+        (False, True, 0),
+        # The winner's record appears a few polls later.
+        (True, True, 0),
+        # No login record names the requested URL's workspace, and the first
+        # probes fail; a later probe still finds the winner.
+        (False, False, 2),
+    ],
+)
+def test_ensure_host_daemon_reuses_the_daemon_a_spawned_daemon_yielded_to(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    registered_late: bool,
+    requested_login: bool,
+    failed_probes: int,
+) -> None:
+    """
+    A spawned daemon that finds the workspace already served exits; that's a reuse.
+
+    The daemon itself makes the final check, so a launch on another URL that
+    raced the first daemon's start still ends with one daemon. Only a
+    successful probe of the requested URL is remembered.
+    """
+    probed = _seed_yielding_spawn(
+        monkeypatch,
+        tmp_path,
+        registered_late=registered_late,
+        requested_login=requested_login,
+        failed_probes=failed_probes,
+    )
+
+    assert _ensure_host_daemon(_VANITY_API) is False
+    assert cli_module._find_daemon_record(_VANITY_API) is None
+    kept = cli_module._find_daemon_record(_WORKSPACE_API)
+    assert kept is not None and kept.pid == _SAME_WORKSPACE_PID
+    assert probed.count(_VANITY_API) == failed_probes + 1
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["host", "--background", "--server", _VANITY_API, "--no-open"],
+        ["start", "--server", _VANITY_API, "--no-open"],
+    ],
+)
+def test_background_commands_report_reuse_when_the_spawned_daemon_yields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: list[str],
+) -> None:
+    """``host --background`` and ``start`` report the daemon the spawned one yielded to."""
+    _seed_yielding_spawn(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_databricks_server_auth", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr("omnigent.cli._confirm_background_host_registered", lambda record: None)
+
+    result = CliRunner().invoke(cli, command)
+
+    assert result.exit_code == 0, result.output
+    assert f"already running (pid {_SAME_WORKSPACE_PID})" in result.output
+    assert "same workspace through another URL" in result.output
 
 
 # ── omnigent start ────────────────────────────────────────────────
