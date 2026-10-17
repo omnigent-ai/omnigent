@@ -54,9 +54,14 @@ def test_mock_session_uses_owned_config(monkeypatch, tmp_path, harness, owned):
     delete.assert_called_once_with("http://server/v1/sessions/session", timeout=10.0)
 
 
-@pytest.mark.parametrize("present", range(1, 7))
+@pytest.mark.parametrize("present", range(1, 15))
 def test_partial_environment_fails_before_spawn(monkeypatch, tmp_path, present):
-    keys = ("OMNIGENT_REPRO_SERVER_URL", "OMNIGENT_REPRO_MODEL_URL", "OMNIGENT_REPRO_RUNNER_ID")
+    keys = (
+        "OMNIGENT_REPRO_SERVER_URL",
+        "OMNIGENT_REPRO_MODEL_URL",
+        "OMNIGENT_REPRO_RUNNER_ID",
+        "OMNIGENT_REPRO_ENV_DIR",
+    )
     for index, key in enumerate(keys):
         monkeypatch.setenv(key, "configured" if present & (1 << index) else "")
     spawn = Mock(side_effect=AssertionError("must not spawn a replacement mock"))
@@ -72,4 +77,4 @@ def test_partial_environment_fails_before_spawn(monkeypatch, tmp_path, present):
     spawn.assert_not_called()
 """
     )
-    pytester.runpytest_subprocess("-q").assert_outcomes(passed=10)
+    pytester.runpytest_subprocess("-q").assert_outcomes(passed=18)
