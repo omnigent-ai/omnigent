@@ -21,7 +21,11 @@ from dataclasses import dataclass
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory
-from omnigent.llms.errors import detect_prompt_token_overflow, detect_request_size_overflow
+from omnigent.llms.errors import (
+    CONTEXT_OVERFLOW_GUIDANCE,
+    detect_prompt_token_overflow,
+    detect_request_size_overflow,
+)
 
 __all__ = [
     "FailureDiagnosis",
@@ -280,6 +284,7 @@ def classify_native_turn_error(code: str, message: str) -> str:
     if (
         detect_request_size_overflow(message) is not None
         or detect_prompt_token_overflow(message) is not None
+        or CONTEXT_OVERFLOW_GUIDANCE in message
     ):
         return "context_length_exceeded"
     status_match = _NATIVE_ERROR_HTTP_STATUS.search(message)

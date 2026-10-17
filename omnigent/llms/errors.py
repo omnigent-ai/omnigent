@@ -128,6 +128,15 @@ _PROMPT_TOKEN_OVERFLOW = re.compile(
 )
 
 
+# Guidance the Claude-native bridge shows in place of Claude's "prompt is too
+# long"; a failed turn carrying it is a context-window overflow.
+CONTEXT_OVERFLOW_GUIDANCE = (
+    "Context limit reached — the conversation has grown too long for "
+    "the model’s context window. Use /compact to summarize and free up "
+    "space, or /clear to start a new conversation."
+)
+
+
 @dataclass(frozen=True)
 class PromptTokenOverflow:
     """

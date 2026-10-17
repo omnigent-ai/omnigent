@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from omnigent.errors import ErrorCategory
+from omnigent.llms.errors import CONTEXT_OVERFLOW_GUIDANCE
 from omnigent.runner.launch_failure import (
     FailureDiagnosis,
     classify_native_turn_error,
@@ -241,6 +242,8 @@ _PROMPT_TOO_LONG_OUTPUT = '400 {"message":"prompt is too long: 1070450 tokens > 
             'API Error: 400 {"type":"error","error":{"type":"invalid_request_error",'
             '"message":"prompt is too long: 250000 tokens > 200000 maximum"}}'
         ),
+        # The bridge shows its own guidance in place of Claude's text.
+        CONTEXT_OVERFLOW_GUIDANCE,
     ],
 )
 def test_classifies_prompt_too_long_as_context_overflow(code: str, message: str) -> None:
