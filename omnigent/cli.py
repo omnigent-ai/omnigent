@@ -8,6 +8,7 @@ import contextlib
 import contextvars
 import copy
 import errno
+import functools
 import hashlib
 import json
 import logging
@@ -89,6 +90,7 @@ from omnigent.host.local_server import (
     consume_failed_server_log_tail,
     ensure_local_omnigent_server,
     local_server_status,
+    local_server_still_serves,
     local_server_url_if_healthy,
     server_config_signature,
     stop_local_omnigent_server,
@@ -9325,10 +9327,12 @@ def host(
     # gates the Ctrl-C stop-server prompt so we never offer to stop a server
     # we didn't bring up.
     spawned_local_server = False
+    server_still_ours = None
     if not server:
         startup = ensure_local_omnigent_server()
         server = startup.url
         spawned_local_server = startup.spawned
+        server_still_ours = functools.partial(local_server_still_serves, server)
     record = _foreground_daemon_record(
         target=target,
         server_url=server,
@@ -9349,7 +9353,9 @@ def host(
         if remote_mode:
             _ensure_databricks_server_auth(server, non_interactive=non_interactive)
         _maybe_open_host_web_ui(server, non_interactive=non_interactive, no_open=no_open, cfg=cfg)
-        run_host_process(server_url=server, daemon_target=target)
+        run_host_process(
+            server_url=server, daemon_target=target, server_still_ours=server_still_ours
+        )
         stopped_cleanly = True
     except KeyboardInterrupt:
         # Ctrl-C is the normal way to stop the foreground daemon — swallow it

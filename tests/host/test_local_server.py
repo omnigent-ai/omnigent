@@ -107,6 +107,40 @@ def test_local_server_url_if_healthy_none_when_pid_dead(
     assert local_server.local_server_url_if_healthy() is None
 
 
+@pytest.mark.parametrize(
+    ("pidfile", "alive", "url", "expected"),
+    [
+        ("4242\n6767\n", True, "http://127.0.0.1:6767", True),
+        # Our server exited and another data dir's server now answers on :6767.
+        ("4242\n6767\n", False, "http://127.0.0.1:6767", False),
+        # Our server was respawned elsewhere; the old port belongs to someone else.
+        ("4242\n41234\n", True, "http://127.0.0.1:6767", False),
+        (None, True, "http://127.0.0.1:6767", False),
+    ],
+)
+def test_local_server_still_serves_trusts_only_this_data_dirs_record(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    pidfile: str | None,
+    alive: bool,
+    url: str,
+    expected: bool,
+) -> None:
+    """Ownership comes from the pidfile alone, never from whoever answers the port."""
+    pid_file = tmp_path / "local_server.pid"
+    if pidfile is not None:
+        pid_file.write_text(pidfile)
+    monkeypatch.setattr(local_server, "_LOCAL_SERVER_PID_PATH", pid_file)
+    monkeypatch.setattr(local_server, "_pid_alive", lambda pid: alive and pid == 4242)
+
+    def _must_not_probe(*_args: object, **_kwargs: object) -> Any:
+        raise AssertionError("a foreign server's /health would look identical")
+
+    monkeypatch.setattr("httpx.get", _must_not_probe)
+
+    assert local_server.local_server_still_serves(url) is expected
+
+
 def test_local_server_url_if_healthy_none_when_no_pidfile(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
