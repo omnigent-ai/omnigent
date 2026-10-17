@@ -17,6 +17,7 @@ import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import { sessionRoutingHostId, setSessionHost, setSessionParent } from "./sessionHost";
 import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
+import { recordRelaunch } from "@/store/stoppedSessions";
 import { parseBackgroundTasks } from "./sse";
 import type {
   BackgroundTaskInfo,
@@ -913,8 +914,14 @@ export async function createSideChat(sourceId: string): Promise<{ childSessionId
     source.hostId != null &&
     (source.hostOnline !== false || source.hostResumable)
   ) {
-    await retrySession(sourceId);
+    const retryResult = await retrySession(sourceId);
     source = await getSession(sourceId);
+    // Record a relaunch only once it took effect: a generic side chat never
+    // passes through the composer that would clear the band, and the bumped
+    // sequence stops a stop completion still in flight from re-stamping it.
+    if (retryResult.recovered || source.runnerOnline !== false) {
+      recordRelaunch(sourceId);
+    }
   }
   const { runnerId } = source;
   const canUseRunner =

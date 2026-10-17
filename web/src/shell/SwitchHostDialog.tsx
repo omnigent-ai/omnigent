@@ -230,8 +230,9 @@ function SupportedSwitchHostDialog({
       await launchRunner(selectedHostId, sessionId, workspaceTrimmed);
       // The new runner is booting but nothing on the wire says so yet, and
       // no turn is in flight to imply it — without this the session reads as
-      // idle and the move lands on a silent, empty chat.
-      markRunnerLaunched();
+      // idle and the move lands on a silent, empty chat. Name the switched
+      // session: this await can resolve after the user navigated elsewhere.
+      markRunnerLaunched(sessionId);
       addRecent(workspaceTrimmed);
       // Close before refreshing. The session refetch reports the new host,
       // and keeping the dialog on screen for two round trips leaves it
