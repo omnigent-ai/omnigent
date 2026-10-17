@@ -1,7 +1,7 @@
 """Provider-agnostic per-user credential store.
 
 The SQLAlchemy backend (:class:`CredentialStore`) behind the
-:class:`SecretCipher` port (AWS-KMS implementation). Provider façades live in
+:class:`SecretCipher` port. Provider façades live in
 :mod:`omnigent.connections`. See ``designs/CREDENTIAL_STORE.md``.
 """
 

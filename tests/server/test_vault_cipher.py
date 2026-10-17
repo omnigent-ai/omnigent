@@ -1,12 +1,13 @@
-"""Verify the ``SecretCipher`` PORT works for BOTH AWS KMS and Vault Transit.
+"""Verify the ``SecretCipher`` PORT works for AWS KMS, Vault Transit and Azure Key Vault.
 
-One behavioral contract, parametrized over two backends:
-  - ``KmsSecretCipher`` with an in-memory fake KMS client (no AWS), and
-  - ``VaultSecretCipher`` against a live Vault dev server (localhost:8200).
+One behavioral contract, parametrized over three backends:
+  - ``KmsSecretCipher`` with an in-memory fake KMS client (no AWS),
+  - ``VaultSecretCipher`` against a live Vault dev server (localhost:8200), and
+  - ``AzureKeyVaultSecretCipher`` with an in-memory fake crypto client (no Azure).
 
-If both pass the same assertions, the port abstraction genuinely generalizes
-rather than being KMS-shaped. The Vault params skip cleanly when no dev server
-is reachable. Requires a Transit key created with ``derived=true``.
+If all three pass the same assertions, the port abstraction genuinely
+generalizes rather than being KMS-shaped. The Vault params skip cleanly when no
+dev server is reachable. Requires a Transit key created with ``derived=true``.
 """
 
 from __future__ import annotations
@@ -17,17 +18,23 @@ from typing import Any
 import pytest
 from botocore.exceptions import ClientError
 
+from omnigent.stores.credential_store.azure_cipher import (
+    CREDENTIAL_AZURE_KEY_ENV_VAR,
+    AzureKeyVaultSecretCipher,
+)
 from omnigent.stores.credential_store.secret_cipher import (
     CREDENTIAL_CIPHER_ENV_VAR,
     CREDENTIAL_KMS_KEY_ENV_VAR,
     KmsSecretCipher,
     SecretCipher,
     build_secret_cipher,
+    canonical_context_json,
 )
 from omnigent.stores.credential_store.vault_cipher import (
     CREDENTIAL_VAULT_KEY_ENV_VAR,
     VaultSecretCipher,
 )
+from tests.server.test_azure_cipher import _make_azure
 
 CTX_ALICE = {"workspace_id": "0", "user_id": "alice", "provider": "github", "account_id": ""}
 CTX_BOB = {"workspace_id": "0", "user_id": "bob", "provider": "github", "account_id": ""}
@@ -35,6 +42,7 @@ CTX_BOB = {"workspace_id": "0", "user_id": "bob", "provider": "github", "account
 VAULT_ADDR = os.environ.get("VAULT_ADDR", "http://127.0.0.1:8200")
 VAULT_TOKEN = os.environ.get("VAULT_TOKEN", "devroot")
 VAULT_KEY = os.environ.get("OMNIGENT_CREDENTIAL_VAULT_KEY", "omnigent-cred")
+AZURE_KEY_ID = "https://kv.vault.azure.net/keys/omnigent-credentials/9f8e7d"
 
 
 class _FakeKmsClient:
@@ -77,9 +85,13 @@ def _make_vault() -> SecretCipher:
     return VaultSecretCipher(VAULT_KEY, client=client)
 
 
-@pytest.fixture(params=["kms", "vault"])
+@pytest.fixture(params=["kms", "vault", "azure"])
 def cipher(request: pytest.FixtureRequest) -> SecretCipher:
-    return _make_kms() if request.param == "kms" else _make_vault()
+    if request.param == "kms":
+        return _make_kms()
+    if request.param == "azure":
+        return _make_azure()
+    return _make_vault()
 
 
 def test_satisfies_port(cipher: SecretCipher) -> None:
@@ -150,6 +162,7 @@ def _clear_backend_env(mp: pytest.MonkeyPatch) -> None:
         CREDENTIAL_CIPHER_ENV_VAR,
         CREDENTIAL_KMS_KEY_ENV_VAR,
         CREDENTIAL_VAULT_KEY_ENV_VAR,
+        CREDENTIAL_AZURE_KEY_ENV_VAR,
     ):
         mp.delenv(var, raising=False)
 
@@ -183,3 +196,75 @@ def test_autodetect_single_then_ambiguous(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setenv(CREDENTIAL_KMS_KEY_ENV_VAR, "alias/x")
     with pytest.raises(ValueError):  # both + no selector → ambiguous, no silent precedence
         build_secret_cipher()
+
+
+def test_azure_selector_picks_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_backend_env(monkeypatch)
+    monkeypatch.setenv(CREDENTIAL_CIPHER_ENV_VAR, "azure")
+    monkeypatch.setenv(CREDENTIAL_AZURE_KEY_ENV_VAR, AZURE_KEY_ID)
+    assert isinstance(build_secret_cipher(), AzureKeyVaultSecretCipher)
+
+
+def test_azure_selector_requires_its_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_backend_env(monkeypatch)
+    monkeypatch.setenv(CREDENTIAL_CIPHER_ENV_VAR, "azure")
+    with pytest.raises(ValueError, match="key is unset") as excinfo:
+        build_secret_cipher()
+    # A known selector with no key, not an unregistered backend.
+    assert "not a known credential" not in str(excinfo.value)
+
+
+def test_azure_autodetects_and_conflicts(monkeypatch: pytest.MonkeyPatch) -> None:
+    _clear_backend_env(monkeypatch)
+    monkeypatch.setenv(CREDENTIAL_AZURE_KEY_ENV_VAR, AZURE_KEY_ID)
+    assert isinstance(build_secret_cipher(), AzureKeyVaultSecretCipher)  # single → that one
+    monkeypatch.setenv(CREDENTIAL_VAULT_KEY_ENV_VAR, "omnigent-cred")
+    with pytest.raises(ValueError):  # two configured, no selector → ambiguous
+        build_secret_cipher()
+
+
+def test_azure_malformed_key_id_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A typo in config must fail at build with a message naming the env var,
+    # not produce a confusing SDK error on the first encrypt.
+    _clear_backend_env(monkeypatch)
+    monkeypatch.setenv(CREDENTIAL_AZURE_KEY_ENV_VAR, "kv.vault.azure.net/omnigent-cred")
+    with pytest.raises(ValueError, match=CREDENTIAL_AZURE_KEY_ENV_VAR):
+        build_secret_cipher()
+
+
+def test_canonical_context_is_order_independent() -> None:
+    a = canonical_context_json({"user_id": "alice", "workspace_id": "0"})
+    b = canonical_context_json({"workspace_id": "0", "user_id": "alice"})
+    assert a == b
+    assert isinstance(a, bytes)
+
+
+def test_canonical_context_drops_empty_values() -> None:
+    assert canonical_context_json({"a": "1", "b": ""}) == canonical_context_json({"a": "1"})
+
+
+def test_canonical_context_golden_bytes() -> None:
+    ctx = {"workspace_id": "0", "user_id": "alice", "provider": "github", "account_id": ""}
+    assert (
+        canonical_context_json(ctx)
+        == b'{"provider":"github","user_id":"alice","workspace_id":"0"}'
+    )
+
+
+def test_canonical_context_cannot_collide_distinct_identities() -> None:
+    # A value containing a delimiter must not collide two distinct identities
+    # onto the same AAD.
+    left = canonical_context_json({"provider": "github", "account_id": "a=b"})
+    right = canonical_context_json({"provider": "github", "account_id": "a", "b": ""})
+    assert left != right
+    nl = canonical_context_json({"account_id": "a\nprovider=x"})
+    assert nl != canonical_context_json({"account_id": "a", "provider": "x"})
+
+
+def test_vault_context_b64_matches_canonical() -> None:
+    import base64
+
+    from omnigent.stores.credential_store.vault_cipher import _context_b64
+
+    ctx = {"workspace_id": "0", "user_id": "alice", "provider": "github", "account_id": ""}
+    assert base64.b64decode(_context_b64(ctx)) == canonical_context_json(ctx)

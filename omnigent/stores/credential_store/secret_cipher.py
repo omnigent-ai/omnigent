@@ -1,23 +1,28 @@
-"""AWS KMS-backed encryption for integration secrets stored at rest.
+"""Encryption for integration secrets stored at rest, and the backend registry.
 
 Integration credentials (GitHub App tokens today; MCP connector secrets later)
-are encrypted before they touch the database. Encryption is delegated to AWS
-KMS: the key material never leaves KMS, and the server holds only an IAM
-permission to call ``Encrypt``/``Decrypt`` (granted via IRSA — no key or master
-secret lives in the process or its environment). Each secret is bound to its
-row's identity — ``(workspace_id, user_id, provider, account_id)`` — passed as
-the KMS *encryption context*, so a ciphertext can only be decrypted by
-presenting the same identity. That is per-user encryption enforced by KMS, not
-by a key the server derives, and there is no global-key path.
+are encrypted before they touch the database. Encryption is delegated to a
+managed key service, so key material never leaves it and the server holds only
+permission to call encrypt/decrypt — no key or master secret lives in the
+process or its environment. Each secret is bound to its row's identity —
+``(workspace_id, user_id, provider, account_id)`` — so a ciphertext can only be
+decrypted by presenting the same identity. That is per-user encryption enforced
+by the backend, not by a key the server derives, and there is no global-key path.
 
-A deployment selects the key with ``OMNIGENT_CREDENTIAL_KMS_KEY_ID``; unset ⇒
-the credential store, and every integration built on it, is disabled. There is
-no non-KMS fallback. See ``designs/CREDENTIAL_STORE.md``.
+Three backends implement the :class:`SecretCipher` port: AWS KMS
+(:class:`KmsSecretCipher`, below), Vault Transit
+(:mod:`~omnigent.stores.credential_store.vault_cipher`) and Azure Key Vault /
+Managed HSM (:mod:`~omnigent.stores.credential_store.azure_cipher`). A
+deployment selects one via :func:`build_secret_cipher`; configuring none
+disables the credential store and every integration built on it — the feature
+is off, not silently encrypting with a local key. See
+``designs/CREDENTIAL_STORE.md``.
 """
 
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 from collections.abc import Callable, Mapping
@@ -29,14 +34,27 @@ _logger = logging.getLogger(__name__)
 #: ``(workspace, user, provider, account)`` is bound to its own ciphertext.
 SecretContext = Mapping[str, str]
 
+
+def canonical_context_json(context: SecretContext) -> bytes:
+    """Serialize the row identity to stable, unambiguous bytes.
+
+    Empty values are dropped so ``account_id=""`` and an absent account bind
+    identically. Sorted-key JSON keeps the encoding order-independent and makes
+    a value containing ``=`` or a newline unable to collide two distinct
+    identities, which a ``k=v``-joined string cannot guarantee.
+    """
+    items = {k: v for k, v in context.items() if v != ""}
+    return json.dumps(items, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
 #: Names the AWS KMS key (id, ARN, or ``alias/…``) used to encrypt integration
 #: secrets. Owned by the credential store, not any one provider, so every
 #: "Connect …" integration shares it. Unset ⇒ the store is disabled.
 CREDENTIAL_KMS_KEY_ENV_VAR = "OMNIGENT_CREDENTIAL_KMS_KEY_ID"
 
 #: Optional explicit backend selector for the credential store's cipher
-#: (``kms`` | ``vault``). Set it to pick a backend per server; its key env var is
-#: then required. Unset ⇒ the single configured backend is auto-detected, and
+#: (``kms`` | ``vault`` | ``azure``). Set it to pick a backend per server; its key
+#: env var is then required. Unset ⇒ the single configured backend is auto-detected, and
 #: configuring more than one without this selector is an error.
 CREDENTIAL_CIPHER_ENV_VAR = "OMNIGENT_CREDENTIAL_CIPHER"
 
@@ -89,22 +107,25 @@ def build_secret_cipher() -> SecretCipher | None:
     """Construct the credential store's cipher from deployment config, or ``None``.
 
     The backend is configurable per server. Set ``OMNIGENT_CREDENTIAL_CIPHER`` to
-    choose one explicitly (``kms`` or ``vault``); its key env var
-    (``OMNIGENT_CREDENTIAL_KMS_KEY_ID`` / ``OMNIGENT_CREDENTIAL_VAULT_KEY``) is then
-    required, and a mismatch raises rather than silently disabling the store. When
-    the selector is unset, the single configured backend is auto-detected as a
-    zero-config convenience; configuring more than one without a selector is an
-    error (no silent precedence), and configuring none disables the store
+    choose one explicitly (``kms``, ``vault`` or ``azure``); its key env var
+    (``OMNIGENT_CREDENTIAL_KMS_KEY_ID`` / ``OMNIGENT_CREDENTIAL_VAULT_KEY`` /
+    ``OMNIGENT_CREDENTIAL_AZURE_KEY_ID``) is then required, and a mismatch raises
+    rather than silently disabling the store. When the selector is unset, the single
+    configured backend is auto-detected as a zero-config convenience; configuring
+    more than one without a selector is an error (no silent precedence), and
+    configuring none disables the store
     (``None`` — the caller decides how to surface that). Adding a backend is a new
     registry entry, not a new branch. See ``designs/CREDENTIAL_STORE.md``.
     """
-    # hvac / boto3 stay optional: each builder only reads env and constructs, so
+    # hvac / boto3 / azure stay optional: each builder only reads env and constructs, so
     # importing and calling them here pulls no SDK and makes no network call.
+    from omnigent.stores.credential_store.azure_cipher import build_azure_secret_cipher
     from omnigent.stores.credential_store.vault_cipher import build_vault_secret_cipher
 
     builders: dict[str, Callable[[], SecretCipher | None]] = {
         "kms": build_kms_secret_cipher,
         "vault": build_vault_secret_cipher,
+        "azure": build_azure_secret_cipher,
     }
 
     selected = os.environ.get(CREDENTIAL_CIPHER_ENV_VAR, "").strip().lower()

@@ -39,12 +39,11 @@ token, sealed Vault) raise. Selected with ``OMNIGENT_CREDENTIAL_VAULT_KEY`` (see
 from __future__ import annotations
 
 import base64
-import json
 import logging
 import os
 from typing import Any
 
-from omnigent.stores.credential_store.secret_cipher import SecretContext
+from omnigent.stores.credential_store.secret_cipher import SecretContext, canonical_context_json
 
 _logger = logging.getLogger(__name__)
 
@@ -90,18 +89,11 @@ def build_vault_secret_cipher() -> VaultSecretCipher | None:
 def _context_b64(context: SecretContext) -> str:
     """Serialize the row identity into Vault Transit's base64 ``context``.
 
-    Empty values are dropped — consistently on encrypt and decrypt, exactly as the
-    KMS cipher drops them — so ``account_id=""`` and an absent account bind
-    identically, while a named account yields a distinct (still-decryptable)
-    context. Serialized as sorted-key JSON so the encoding is both stable
-    (order-independent) and unambiguous: a value containing ``=`` or a newline
-    cannot collide two distinct identities onto the same context, unlike a
-    ``k=v``-joined string. Matches the field-by-field binding KMS gets from its
-    structured ``EncryptionContext``.
+    The canonical form is shared with the other backends — see
+    :func:`~omnigent.stores.credential_store.secret_cipher.canonical_context_json`
+    — so the binding cannot drift between them.
     """
-    items = {k: v for k, v in context.items() if v != ""}
-    canonical = json.dumps(items, sort_keys=True, separators=(",", ":"))
-    return base64.b64encode(canonical.encode("utf-8")).decode("ascii")
+    return base64.b64encode(canonical_context_json(context)).decode("ascii")
 
 
 def _wrap(key_name: str, transit_ciphertext: str) -> str:
