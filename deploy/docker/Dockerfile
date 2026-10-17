@@ -177,7 +177,19 @@ RUN test -f ./omnigent/server/static/web-ui/index.html \
 # Optional managed-sandbox provider extras for the SERVER. Build with
 # `--build-arg OMNIGENT_EXTRAS=kubernetes` (comma-separate for several).
 ARG OMNIGENT_EXTRAS=
-RUN python -c 'import os, subprocess; extras = [x.strip() for x in os.environ.get("OMNIGENT_EXTRAS", "").split(",") if x.strip()]; cmd = ["uv", "export", "--frozen", "--no-dev", "--no-emit-project", "--no-emit-workspace", "--extra", "postgres"]; [cmd.extend(("--extra", extra)) for extra in extras]; cmd.extend(("--output-file", "/tmp/locked-requirements.txt")); subprocess.run(cmd, check=True); subprocess.run(["uv", "pip", "install", "--no-cache-dir", "--index-url", os.environ["PYPI_INDEX_URL"], "--no-config", "--no-deps", "-r", "/tmp/locked-requirements.txt"], check=True)'
+RUN set -f; \
+    extras="${OMNIGENT_EXTRAS},"; \
+    set --; \
+    while [ -n "$extras" ]; do \
+        extra="${extras%%,*}"; \
+        extras="${extras#*,}"; \
+        extra="$(printf '%s' "$extra" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"; \
+        if [ -n "$extra" ]; then set -- "$@" --extra "$extra"; fi; \
+    done; \
+    uv export --frozen --no-dev --no-emit-project --no-emit-workspace \
+        --extra postgres "$@" --output-file /tmp/locked-requirements.txt \
+ && uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} \
+        --no-config --no-deps -r /tmp/locked-requirements.txt
 
 # ── Node alias stage ─────────────────────────────────────
 # Pure alias so the host stage can COPY node out of a version-pinned

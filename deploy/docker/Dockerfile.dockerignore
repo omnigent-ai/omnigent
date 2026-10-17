@@ -3,9 +3,9 @@
 # VCS + IDE
 .git
 .gitignore
-.github
-!.github/
-!.github/triage_v2/
+.github/*
+!.github/triage_v2
+.github/triage_v2/*
 !.github/triage_v2/pyproject.toml
 .vscode
 .idea
