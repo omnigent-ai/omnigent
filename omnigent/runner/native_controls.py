@@ -858,6 +858,7 @@ def build_native_controls(
         try:
             from omnigent.harnesses.codex_native.app_server import (
                 codex_catalog_fingerprint,
+                codex_configured_launch_model,
                 mark_launch_default,
                 resolve_native_codex_launch,
             )
@@ -873,9 +874,15 @@ def build_native_controls(
                 (row.get("id") for row in stored or [] if row.get("isDefault") is True),
                 None,
             )
-            shaped = mark_launch_default(
-                rows, stored_default if isinstance(stored_default, str) else None
-            )
+            if isinstance(stored_default, str):
+                pinned: str | None = stored_default
+            elif launch.model is not None or launch.profile is not None:
+                # A profile's default needs workspace discovery; never run it here.
+                pinned = launch.model
+            else:
+                # No stored default: pin the model Codex's config resolves, as the probe does.
+                pinned = await asyncio.to_thread(codex_configured_launch_model)
+            shaped = mark_launch_default(rows, pinned)
             await asyncio.to_thread(
                 model_catalog_store.write_catalog, "codex-native", fingerprint, shaped
             )

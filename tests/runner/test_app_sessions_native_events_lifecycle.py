@@ -24,6 +24,7 @@ from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.cursor_native import main as cursor_native
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.harnesses.kiro_native import main as kiro_native
+from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
 from omnigent.runner import create_runner_app, model_option_routes, subagent_work
 from omnigent.runner.resource_registry import (
     KIRO_NATIVE_TERMINAL_ROLE,
@@ -1605,6 +1606,19 @@ async def test_codex_native_model_options_query_model_list(
     assert fake_client.closed
 
 
+async def _stored_codex_catalog(fingerprint: str) -> list[dict[str, Any]] | None:
+    """Read the shared catalog once the runner's background write-back has persisted it."""
+    from omnigent.models import model_catalog_store
+
+    deadline = asyncio.get_running_loop().time() + 10.0
+    while asyncio.get_running_loop().time() < deadline:
+        rows = model_catalog_store.read_catalog("codex-native", fingerprint)
+        if rows is not None:
+            return rows
+        await asyncio.sleep(0.01)
+    return None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["default", "other", "missing-spec", "invalid-config"])
 async def test_codex_model_catalog_writeback_uses_session_provider(
@@ -1666,7 +1680,12 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
         fingerprint = codex.codex_catalog_fingerprint(codex.NativeCodexLaunch([], None, provider))
         model_catalog_store.write_catalog("codex-native", fingerprint, rows)
         catalogs[provider], fingerprints[provider] = rows, fingerprint
-    live_rows = [dict(row, displayName="Live model") for row in catalogs[profile]]
+    # Codex marks a different row than the stored default, so the write-back's
+    # precedence (stored default first) is observable in the persisted rows.
+    live_rows = codex.mark_launch_default(
+        [dict(row, displayName="Live model") for row in catalogs[profile]], "second-picker"
+    )
+    stored_live_rows = codex.mark_launch_default(live_rows, "shared-picker")
     codex_home = tmp_path / "codex-home"
     codex_home.mkdir()
     (codex_home / "config.toml").write_text('model = "second-picker"\n')
@@ -1737,7 +1756,7 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
             )
             for provider in ("default", "other"):
                 expected = (
-                    live_rows
+                    stored_live_rows
                     if provider == profile and case in {"default", "other"}
                     else catalogs[provider]
                 )
@@ -1765,6 +1784,109 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
     else:
         assert launch_resolver.call_count == 2
         launch_resolver.assert_called_with(model=None, spec=spec)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("launch_model", "launch_profile", "configured", "expected_default"),
+    [
+        pytest.param(None, None, "second-picker", "second-picker", id="configured-model"),
+        pytest.param(None, None, "hidden-picker", None, id="hidden-configured-model"),
+        pytest.param(None, None, None, CODEX_DEFAULT_MODEL, id="nothing-configured"),
+        pytest.param(
+            "second-picker", None, CODEX_DEFAULT_MODEL, "second-picker", id="provider-default"
+        ),
+        pytest.param(None, "work", "second-picker", CODEX_DEFAULT_MODEL, id="profile-shape"),
+    ],
+)
+async def test_codex_model_catalog_writeback_miss_pins_the_shapes_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    launch_model: str | None,
+    launch_profile: str | None,
+    configured: str | None,
+    expected_default: str | None,
+) -> None:
+    """A store miss is shaped like the probe: the shape's own default, never the pane's pin.
+
+    The next no-model launch pins the fresh catalog's default row, so a cold store
+    must name the configured (or provider) model rather than Omnigent's default; a
+    configured model no visible row names marks no default, like the probe's
+    hidden-default shaping. A Databricks-profile shape keeps today's shaping: its
+    real default needs workspace discovery the write-back never runs.
+    """
+    from omnigent.harnesses.codex_native import app_server as codex
+    from omnigent.models import model_catalog_store
+
+    source_home = tmp_path / "source-codex-home"
+    source_home.mkdir()
+    if configured is not None:
+        (source_home / "config.toml").write_text(f'model = "{configured}"\n')
+    monkeypatch.setattr(codex, "_codex_home_config_source_from_env", lambda: source_home)
+    monkeypatch.setattr(codex, "_find_codex_cli", lambda: sys.executable)
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    cfg = tmp_path / "databrickscfg"
+    cfg.write_text("[work]\nhost = https://w.example\n")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    shape = codex.NativeCodexLaunch([], launch_model, launch_profile)
+    monkeypatch.setattr(
+        codex,
+        "resolve_native_codex_launch",
+        lambda *, model, spec=None, terminal_launch_args=(): shape,
+    )
+    fingerprint = codex.codex_catalog_fingerprint(shape)
+    assert model_catalog_store.read_catalog("codex-native", fingerprint) is None
+
+    live_rows = [
+        {"id": "shared-picker", "model": "shared-picker", "isDefault": True},
+        {"id": "second-picker", "model": "second-picker"},
+        {"id": CODEX_DEFAULT_MODEL, "model": CODEX_DEFAULT_MODEL},
+    ]
+    session_codex_home = tmp_path / "session-codex-home"
+    session_codex_home.mkdir()
+    (session_codex_home / "config.toml").write_text('model = "shared-picker"\n')
+    fake_client = _RecordingCodexAppServerClient("ws://codex.test", "test")
+    fake_client.model_list_responses = [{"result": {"data": [dict(row) for row in live_rows]}}]
+    monkeypatch.setattr(codex, "client_for_transport", lambda *args, **kwargs: fake_client)
+
+    async def fake_launch(session_id: str, *args: Any, **kwargs: Any) -> SessionResourceView:
+        return SessionResourceView(
+            id="terminal_codex_main",
+            type="terminal",
+            session_id=session_id,
+            name="codex:main",
+            metadata={"running": True},
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal", fake_launch
+    )
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native"))
+    session_id = uuid.uuid4().hex
+    codex_native_bridge.write_bridge_state(
+        codex_native_bridge.bridge_dir_for_bridge_id(session_id),
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=session_id,
+            socket_path="ws://codex.test",
+            thread_id="test-thread",
+            codex_home=str(session_codex_home),
+        ),
+    )
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": session_id, "agent_id": "test-agent"}
+        )
+        assert created.status_code == 201, created.text
+        response = await client.get(f"/v1/sessions/{session_id}/codex-model-options")
+        assert response.status_code == 200, response.text
+        stored = await _stored_codex_catalog(fingerprint)
+
+    # The picker still marks the pane's own model; the store does not inherit it.
+    assert response.json()["models"] == codex.mark_launch_default(live_rows, "shared-picker")
+    assert stored is not None, "the write-back did not persist the live rows"
+    assert [row["id"] for row in stored if row.get("isDefault")] == (
+        [expected_default] if expected_default else []
+    )
 
 
 @pytest.mark.asyncio

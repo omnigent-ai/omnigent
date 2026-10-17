@@ -3870,6 +3870,19 @@ def _codex_login_usable() -> bool:
     return codex_auth_has_credential(_codex_home_config_source_from_env() / "auth.json")
 
 
+def codex_configured_launch_model() -> str | None:
+    """The model Codex's own config selects for an unpinned launch.
+
+    :returns: The root ``profile``'s ``model``, else the top-level ``model``, as
+        ``config/read`` reports it; ``None`` when the source config is missing,
+        unreadable, or names no model.
+    """
+    from omnigent.onboarding.codex_auth_readiness import effective_codex_model, load_codex_config
+
+    config = load_codex_config(_codex_home_config_source_from_env() / "config.toml")
+    return effective_codex_model(config) if config is not None else None
+
+
 def _ambient_builtin_codex_provider(config_profile: str | None) -> str | None:
     """Built-in provider the bridged config selects without any Codex login, if any.
 
