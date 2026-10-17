@@ -2121,6 +2121,13 @@ class CodexNativeAppServer:
         )
         if self.trust_project:
             _trust_codex_project(self.codex_home, self.cwd)
+        # A session in the user's home directory gets the user's hooks from codex's own
+        # project layer; bridging them into the private home too runs each one twice.
+        user_hooks_from_project = _codex_loads_source_home_as_project(
+            self.codex_home, config_source, self.cwd
+        )
+        if user_hooks_from_project and (self.codex_home / _CODEX_HOOKS_FILE).is_symlink():
+            (self.codex_home / _CODEX_HOOKS_FILE).unlink()
         _add_codex_writable_roots(self.codex_home, self.writable_roots)
         # Write the MCP server config into config.toml so the app-server
         # discovers it at config load. The -c overrides may not be honored
@@ -2173,7 +2180,9 @@ class CodexNativeAppServer:
                 self.python_executable,
                 router_bridge_dir=router_bridge_dir,
                 router_session_id=codex_router_session_id(self.env),
-                user_hooks_source=config_source / _CODEX_HOOKS_FILE,
+                user_hooks_source=None
+                if user_hooks_from_project
+                else config_source / _CODEX_HOOKS_FILE,
                 # The runner only advertises a route-turn endpoint for a
                 # session that launched with Smart Routing on, so its presence
                 # is the switch for the first-message routing hook. Same
@@ -3127,6 +3136,32 @@ async def trust_native_policy_hooks(client: CodexAppServerClient, *, cwd: str) -
             "tool-call policy enforcement would not run. Untrusted hooks: "
             f"{_untrusted_hook_detail(still_untrusted)}.{hint}"
         )
+
+
+def _codex_loads_source_home_as_project(codex_home: Path, config_source: Path, cwd: Path) -> bool:
+    """
+    Report whether codex will load the user's real Codex home as a project layer.
+
+    Codex reads ``<cwd>/.codex`` as trusted project config, ``hooks.json``
+    included, and skips it only when it is ``CODEX_HOME``. The private home
+    removes that skip, so a session run in the user's home directory gets the
+    user's hooks from that layer as well as from anything bridged in.
+
+    :param codex_home: Private per-session ``CODEX_HOME`` holding the project trust table.
+    :param config_source: The user's real Codex home, e.g. ``Path.home() / ".codex"``.
+    :param cwd: Session workspace, e.g. ``Path.home()``.
+    :returns: ``True`` when ``<cwd>/.codex`` is *config_source* and *cwd* is trusted.
+    """
+    # Only cwd itself: codex also walks parents up to the project root.
+    resolved_cwd = cwd.resolve()
+    if (resolved_cwd / ".codex").resolve() != config_source.resolve():
+        return False
+    config_path = codex_home / "config.toml"
+    if not config_path.is_file():
+        return False
+    projects = tomlkit.parse(config_path.read_text(encoding="utf-8")).get("projects") or {}
+    project = projects.get(str(resolved_cwd)) or {}
+    return project.get("trust_level") == "trusted"
 
 
 def _trust_codex_project(codex_home: Path, cwd: Path) -> None:
