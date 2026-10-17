@@ -109,6 +109,14 @@ describe("useDictationInsert", () => {
     expect(result.current.value).toBe("Hello, world. next");
   });
 
+  it("readDraft returns the inserted text in the same turn as the insert", () => {
+    const { result } = renderDictation("Hi");
+    act(() => {
+      result.current.appendFinal("there");
+      expect(result.current.readDraft()).toBe("Hi there");
+    });
+  });
+
   it("space-separates from an existing draft without doubling spaces", () => {
     const { result } = renderDictation("draft");
     act(() => result.current.replaceInterim("spoken"));

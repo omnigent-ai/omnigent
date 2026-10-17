@@ -1,6 +1,5 @@
-// ⌘⌥V (Ctrl+Alt+V on Win/Linux) toggles voice dictation — the same action as
-// clicking the composer mic button, reachable from anywhere in the app so you
-// can start/stop talking without leaving the keyboard (WhisperFlow-style).
+// ⌘⌥V (Ctrl+Alt+V on Win/Linux) toggles voice dictation from the keyboard.
+// The chord keeps the text. A mic click or Enter while listening sends.
 //
 // Why this chord: single-modifier letter combos collide with OS/browser
 // defaults (⌘M minimizes the window on macOS; most ⌘⇧-letter combos are browser
