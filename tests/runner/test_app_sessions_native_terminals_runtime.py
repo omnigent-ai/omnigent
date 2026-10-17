@@ -4658,8 +4658,10 @@ async def test_cold_start_agy_conversation_accepts_a_locally_owned_cascade(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("freshness", ["fresh", "stale"])
+@pytest.mark.parametrize("configured", [None, "gpt-6.1-sol", "gpt-5.4-retired", "work-profile"])
 async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
     freshness: str,
+    configured: str | None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4670,7 +4672,9 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
     ``isDefault`` row can name a model the account no longer serves, and
     pinning it hard-fails the launch. A fresh entry resolves the Default
     launch; a stale one defers to codex's own account default (no model
-    pin) while the store re-probes in the background.
+    pin) while the store re-probes in the background. The user's configured
+    Codex model (the ``--profile`` one first) wins whenever the catalog lists
+    it; an unlisted one never governs, so a stale catalog is refreshed first.
     """
     import os
     import time
@@ -4678,7 +4682,10 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
     from omnigent.models import model_catalog_store
     from omnigent.runner import app as runner_app_mod
-    from tests.runner.conftest import REAL_CODEX_LAUNCH_CATALOG
+    from tests.runner.conftest import (
+        REAL_CODEX_LAUNCH_CATALOG,
+        REAL_CODEX_REPROBED_LAUNCH_CATALOG,
+    )
 
     session_id = "83acdbadf84d4149b2a7d7441b6966aa"
     thread_id = "019e96aa-0be2-7343-8d3b-6f914d60936c"
@@ -4687,6 +4694,17 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
     monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    user_codex_home = tmp_path / "user-codex-home"
+    user_codex_home.mkdir()
+    snapshot_extra: dict[str, object] = {}
+    if configured == "work-profile":
+        (user_codex_home / "config.toml").write_text(
+            'model = "gpt-5.4-yesterday"\n[profiles.work]\nmodel = "gpt-6.1-sol"\n'
+        )
+        snapshot_extra["terminal_launch_args"] = ["--profile", "work"]
+    elif configured is not None:
+        (user_codex_home / "config.toml").write_text(f'model = "{configured}"\n')
+    monkeypatch.setenv("CODEX_HOME", str(user_codex_home))
 
     # A bare subscription default shape, with the real store-backed catalog
     # serving the seeded rows; the re-probe is stubbed off the real CLI.
@@ -4698,6 +4716,9 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
         ),
     )
     monkeypatch.setattr(codex_app_mod, "codex_launch_catalog", REAL_CODEX_LAUNCH_CATALOG)
+    monkeypatch.setattr(
+        codex_app_mod, "codex_reprobed_launch_catalog", REAL_CODEX_REPROBED_LAUNCH_CATALOG
+    )
     refreshed = [{"id": "gpt-5.6-terra", "model": "gpt-5.6-terra", "isDefault": True}]
 
     async def _fake_probe(
@@ -4722,7 +4743,10 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
     model_catalog_store.write_catalog(
         "codex-native",
         fingerprint,
-        [{"id": "gpt-5.4-yesterday", "model": "gpt-5.4-yesterday", "isDefault": True}],
+        [
+            {"id": "gpt-5.4-yesterday", "model": "gpt-5.4-yesterday", "isDefault": True},
+            {"id": "gpt-6.1-sol", "model": "gpt-6.1-sol"},
+        ],
     )
     if freshness == "stale":
         path = model_catalog_store.catalog_path("codex-native", fingerprint)
@@ -4760,7 +4784,7 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
                 )
             return httpx.Response(
                 200,
-                json={"external_session_id": thread_id},
+                json={"external_session_id": thread_id} | snapshot_extra,
                 request=httpx.Request("GET", url),
             )
 
@@ -4900,12 +4924,15 @@ async def test_auto_create_codex_terminal_default_pin_requires_a_fresh_catalog(
         runner_app_mod._AUTO_CODEX_APP_SERVERS.pop(session_id, None)
 
     assert build_calls, "the app-server was never built"
-    if freshness == "fresh":
-        assert build_calls[0]["model"] == "gpt-5.4-yesterday"
+    if configured in {"gpt-6.1-sol", "work-profile"}:
+        expected = "gpt-6.1-sol"
+    elif freshness == "fresh":
+        expected = "gpt-5.4-yesterday"
     else:
-        assert build_calls[0]["model"] is None, (
-            f"a stale default was still pinned: {build_calls[0]['model']!r}"
-        )
+        # A retired configured model refreshes the stale catalog and pins its default.
+        expected = "gpt-5.6-terra" if configured else None
+    assert build_calls[0]["model"] == expected
+    if freshness == "stale":
         task = model_catalog_store._inflight.get(("codex-native", fingerprint))
         if task is not None:
             await task
