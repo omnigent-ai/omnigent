@@ -638,6 +638,9 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
     (real_home / ".gemini" / "antigravity-cli").mkdir(parents=True)
     user_settings = real_home / ".gemini" / "antigravity-cli" / "settings.json"
     user_settings.write_text('{"model":"gemini-3-pro"}', encoding="utf-8")
+    user_mcp = real_home / ".gemini" / "config" / "mcp_config.json"
+    user_mcp.parent.mkdir(parents=True)
+    user_mcp.write_text('{"mcpServers":{"graft":{"command":"graft"}}}', encoding="utf-8")
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: real_home))
 
     captured_args: list[str] = []
@@ -674,6 +677,9 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
     relay_config = iso_gemini / "config" / "mcp_config.json"
     payload = json.loads(relay_config.read_text(encoding="utf-8"))
     assert "sys_session_create" in payload["mcpServers"]["omnigent"]["enabledTools"]
+    # The user's own MCP servers ride along with the relay; their file is untouched.
+    assert payload["mcpServers"]["graft"] == {"command": "graft"}
+    assert user_mcp.read_text(encoding="utf-8") == '{"mcpServers":{"graft":{"command":"graft"}}}'
     assert (bridge_dir / "bridge.json").is_file()
     # The survey/trust seeds landed in the isolated dir, never the user's own file.
     iso_settings = json.loads(
