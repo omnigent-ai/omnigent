@@ -131,6 +131,8 @@ const { composerSessionSnapshot } = vi.hoisted(() => ({
     workspace: null as string | null,
     labels: {} as Record<string, string>,
     gitBranch: null as string | null,
+    parentSessionId: null as string | null,
+    reasoningEffort: null as string | null,
   },
 }));
 vi.mock("@/hooks/useSession", async (importOriginal) => ({
@@ -1926,6 +1928,10 @@ describe("Composer cached model labels", () => {
 
 describe("Composer model/effort label", () => {
   beforeEach(() => {
+    Object.assign(composerSessionSnapshot, {
+      parentSessionId: null,
+      reasoningEffort: null,
+    });
     setComposerState({
       conversationId: "conv_test",
       skills: [],
@@ -1943,6 +1949,10 @@ describe("Composer model/effort label", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+    Object.assign(composerSessionSnapshot, {
+      parentSessionId: null,
+      reasoningEffort: null,
+    });
   });
 
   const label = () => screen.getByTestId("composer-agent-config-value");
@@ -2026,6 +2036,27 @@ describe("Composer model/effort label", () => {
     expect(label()).toHaveTextContent("Opus");
     expect(label()).not.toHaveTextContent("High");
     expect(screen.queryByTestId("composer-agent-effort-value")).toBeNull();
+  });
+
+  it("shows a read-only child's persisted effort when effort controls are hidden", () => {
+    Object.assign(composerSessionSnapshot, {
+      parentSessionId: "parent-session",
+      reasoningEffort: "high",
+    });
+    useChatStore.setState({ llmModel: "databricks-gpt-5-4", sessionReasoningEffort: null });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: false,
+          showEffort: false,
+          modelPickerKind: null,
+        })}
+      />,
+    );
+
+    expect(label()).toHaveTextContent("databricks-gpt-5-4");
+    expect(label()).toHaveTextContent("High");
+    expect(within(label()).getByText("High")).toHaveClass("text-muted-foreground");
   });
 
   it("reads 'Smart Routing' with no model/effort when routing is on", async () => {

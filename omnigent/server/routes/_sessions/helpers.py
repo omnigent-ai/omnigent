@@ -3603,6 +3603,7 @@ async def _persist_external_acp_subagent_start(
             parent_conversation_id=parent_id,
             agent_id=parent_conv.agent_id,
             runner_id=parent_conv.runner_id,
+            reasoning_effort=parent_conv.reasoning_effort,
             sub_agent_name=title_raw,
         )
     except NameAlreadyExistsError:
@@ -3851,6 +3852,7 @@ async def _persist_external_subagent_start(
             parent_conversation_id=parent_id,
             agent_id=parent_conv.agent_id,
             runner_id=parent_conv.runner_id,
+            reasoning_effort=parent_conv.reasoning_effort,
             sub_agent_name=agent_type,
         )
     except NameAlreadyExistsError:
@@ -3973,6 +3975,7 @@ async def _create_and_publish_antigravity_child(
             parent_conversation_id=parent_id,
             agent_id=parent_conv.agent_id,
             runner_id=parent_conv.runner_id,
+            reasoning_effort=parent_conv.reasoning_effort,
             sub_agent_name=agent_type or _ANTIGRAVITY_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
         )
     except NameAlreadyExistsError:
@@ -4253,6 +4256,7 @@ async def _create_and_publish_codex_child(
             parent_conversation_id=parent_id,
             agent_id=parent_conv.agent_id,
             runner_id=parent_conv.runner_id,
+            reasoning_effort=parent_conv.reasoning_effort,
             sub_agent_name=_CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
         )
     except NameAlreadyExistsError:
@@ -4381,6 +4385,7 @@ async def _create_and_publish_devin_child(
             parent_conversation_id=parent_id,
             agent_id=parent_conv.agent_id,
             runner_id=parent_conv.runner_id,
+            reasoning_effort=parent_conv.reasoning_effort,
             sub_agent_name=_DEVIN_NATIVE_SUBAGENT_DISPLAY_FALLBACK,
         )
     except NameAlreadyExistsError:
@@ -10994,6 +10999,9 @@ def _child_session_summary_from_conversation(
             last_message_preview = collapsed[:_CHILD_PREVIEW_LIMIT] or None
 
     routing_decision_id = conv.labels.get(ROUTING_DECISION_LABEL_KEY)
+    llm_model = concrete_reported_model(conv.reported_model) or _child_llm_model_from_conversation(
+        conv
+    )
     return ChildSessionSummary(
         id=conv.id,
         parent_session_id=parent_session_id,
@@ -11023,8 +11031,54 @@ def _child_session_summary_from_conversation(
         # two fields contradict each other. The decision is joined through a
         # conversation label rather than a new column.
         routed_model=conv.model_override if routing_decision_id is not None else None,
+        model_override=conv.model_override,
+        llm_model=llm_model,
+        reasoning_effort=conv.reasoning_effort,
         routing_decision_id=routing_decision_id,
     )
+
+
+def _child_llm_model_from_conversation(conv: Conversation) -> str | None:
+    """Resolve the model declared by a child's agent or sub-agent spec."""
+    if conv.agent_id is None:
+        return None
+    try:
+        from omnigent.runtime import get_agent_cache
+        from omnigent.runtime._globals import _agent_store
+        from omnigent.runtime.workflow import _find_spec_by_name
+
+        if _agent_store is None:
+            return None
+        agent = _agent_store.get(conv.agent_id)
+        if agent is None or agent.bundle_location is None:
+            return None
+        loaded = get_agent_cache().load(
+            agent.id,
+            agent.bundle_location,
+            expand_env=agent.operator_authored,
+        )
+        spec = loaded.spec
+        if conv.sub_agent_name:
+            child_spec = _find_spec_by_name(spec, conv.sub_agent_name)
+            if child_spec is not None:
+                spec = child_spec
+        llm_model = getattr(getattr(spec, "llm", None), "model", None)
+        if isinstance(llm_model, str) and llm_model:
+            return llm_model
+        executor_model = getattr(getattr(spec, "executor", None), "model", None)
+        return executor_model if isinstance(executor_model, str) and executor_model else None
+    except (
+        KeyError,
+        AttributeError,
+        ImportError,
+        OSError,
+        RuntimeError,
+        StatementError,
+        ValueError,
+        OmnigentError,
+    ):
+        # A display-only lookup must not make a child-session list unavailable.
+        return None
 
 
 def _mcp_tool_result(rpc_id: int | str | None, text: str) -> Response:

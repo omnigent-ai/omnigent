@@ -91,6 +91,8 @@ def _seed_child(
     parent_id: str,
     title: str,
     agent_id: str | None = None,
+    model_override: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> Conversation:
     """
     Create a child sub-agent conversation.
@@ -114,6 +116,8 @@ def _seed_child(
         title=title,
         parent_conversation_id=parent_id,
         agent_id=agent_id,
+        model_override=model_override,
+        reasoning_effort=reasoning_effort,
     )
 
 
@@ -220,6 +224,29 @@ async def test_child_sessions_returns_seeded_child_with_full_shape(
     # No outstanding elicitations → 0 (the index is empty for a freshly
     # seeded child that never published an elicitation_request).
     assert row["pending_elicitations_count"] == 0
+
+
+async def test_child_sessions_surfaces_model_and_reasoning_effort(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The child summary returns the settings needed by the Agents rail."""
+    session = await _create_parent_session(client)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="researcher:effort-cue",
+        agent_id=session["agent_id"],
+        model_override="databricks-gpt-5-4",
+        reasoning_effort="high",
+    )
+
+    response = await client.get(f"/v1/sessions/{session['id']}/child_sessions")
+    assert response.status_code == 200
+    row = response.json()["data"][0]
+    assert row["model_override"] == "databricks-gpt-5-4"
+    assert row["reasoning_effort"] == "high"
 
 
 async def test_child_sessions_surfaces_durable_failure_error(
@@ -1702,6 +1729,11 @@ async def test_multipart_create_with_parent_links_child(
     the runner builds the orchestrator's handle from them.
     """
     parent = await _create_parent_session(client, agent_name="bundle-parent")
+    parent_effort = await client.patch(
+        f"/v1/sessions/{parent['id']}",
+        json={"reasoning_effort": "high"},
+    )
+    assert parent_effort.status_code == 200, parent_effort.text
     child_bundle = build_agent_bundle(name="bundle-child")
     resp = await client.post(
         "/v1/sessions",
@@ -1724,6 +1756,7 @@ async def test_multipart_create_with_parent_links_child(
     # Parent linkage + agent binding traversed metadata → store → row.
     assert snap.json()["parent_session_id"] == parent["id"]
     assert snap.json()["agent_id"] == body["agent_id"]
+    assert snap.json()["reasoning_effort"] == "high"
 
     listing = await client.get(f"/v1/sessions/{parent['id']}/child_sessions")
     assert listing.status_code == 200, listing.text

@@ -170,6 +170,7 @@ async def _create_session(
     title: str | None = None,
     labels: dict[str, str] | None = None,
     terminal_launch_args: list[str] | None = None,
+    reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
     """
     Create a session and return the response JSON.
@@ -202,6 +203,8 @@ async def _create_session(
         payload["labels"] = labels
     if terminal_launch_args is not None:
         payload["terminal_launch_args"] = terminal_launch_args
+    if reasoning_effort is not None:
+        payload["reasoning_effort"] = reasoning_effort
     resp = await client.post("/v1/sessions", json=payload)
     assert resp.status_code == 201, f"session create failed: {resp.status_code} {resp.text}"
     return resp.json()
@@ -253,6 +256,32 @@ async def test_create_session_with_title_and_labels(
     assert session["title"] == "my test session"
     assert session["labels"]["env"] == "test"
     assert session["labels"]["priority"] == "high"
+
+
+async def test_child_session_inherits_parent_reasoning_effort(
+    client: httpx.AsyncClient,
+) -> None:
+    """A child create inherits the parent's persisted effort unless overridden."""
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"], reasoning_effort="high")
+
+    inherited = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "parent_session_id": parent["id"]},
+    )
+    assert inherited.status_code == 201, inherited.text
+    assert inherited.json()["reasoning_effort"] == "high"
+
+    explicit = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent["id"],
+            "reasoning_effort": "low",
+        },
+    )
+    assert explicit.status_code == 201, explicit.text
+    assert explicit.json()["reasoning_effort"] == "low"
 
 
 async def test_create_session_without_title_returns_none(
@@ -1396,6 +1425,7 @@ async def test_external_subagent_start_mints_child_session(
         client,
         agent["id"],
         labels={"omnigent.wrapper": "claude-code-native-ui"},
+        reasoning_effort="high",
     )
 
     resp = await client.post(
@@ -1425,6 +1455,7 @@ async def test_external_subagent_start_mints_child_session(
     child = matching[0]
     assert child["parent_session_id"] == parent["id"]
     assert child["kind"] == "sub_agent"
+    assert child["reasoning_effort"] == "high"
     # Title format mirrors omnigent-spawned children (``tool:name``).
     # The session_name half encodes ``subagent_id`` so two children
     # with the same agent_type + description don't collide on the

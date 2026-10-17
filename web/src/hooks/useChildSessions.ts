@@ -62,6 +62,12 @@ export interface ChildSessionInfo {
    * not routed (routing off, or a server that predates the field).
    */
   routed_model?: string | null;
+  /** Explicit model override selected for this child, if any. */
+  model_override?: string | null;
+  /** Model declared by the child's agent or sub-agent spec. */
+  llm_model?: string | null;
+  /** Persisted reasoning effort selected for this child, if any. */
+  reasoning_effort?: string | null;
 }
 
 /**
@@ -82,6 +88,9 @@ interface ChildSessionWire {
   last_message_preview?: string | null;
   pending_elicitations_count?: number;
   routed_model?: string | null;
+  model_override?: string | null;
+  llm_model?: string | null;
+  reasoning_effort?: string | null;
 }
 
 interface ChildSessionsResponse {
@@ -226,6 +235,9 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
     last_message_preview: row.last_message_preview ?? null,
     pending_elicitations_count: row.pending_elicitations_count ?? 0,
     routed_model: row.routed_model ?? null,
+    model_override: row.model_override ?? null,
+    llm_model: row.llm_model ?? null,
+    reasoning_effort: row.reasoning_effort ?? null,
   }));
 }
 
