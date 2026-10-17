@@ -50,6 +50,7 @@ import httpx
 from fastapi.responses import JSONResponse, Response
 
 from omnigent._platform import IS_WINDOWS, resolve_cli_binary
+from omnigent.cli_invocation import cli_invocation
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.entities.session_resources import (
     SessionResourceView,
@@ -7844,6 +7845,19 @@ def _native_terminal_start_failure_cause(exc: BaseException) -> str:
     return class_name
 
 
+def _is_stale_host_import_error(exc: BaseException) -> bool:
+    """Return whether *exc* is a mixed-version in-tree lazy-import failure.
+
+    An in-place upgrade leaves a running host's in-memory ``omnigent`` modules
+    older than the on-disk copies, so a lazy import raises ``cannot import name``
+    with ``name_from`` set — the in-process twin of ``_refuse_if_upgraded``.
+    """
+    if not isinstance(exc, ImportError) or getattr(exc, "name_from", None) is None:
+        return False
+    name = exc.name
+    return isinstance(name, str) and (name == "omnigent" or name.startswith("omnigent."))
+
+
 def _native_terminal_start_error_payload(
     exc: BaseException, runtime_name: str, *, session_id: str
 ) -> dict[str, str]:
@@ -7854,9 +7868,12 @@ def _native_terminal_start_error_payload(
         e.g. ``ImportError("Native Codex requires the 'codex' CLI on PATH.")``.
     :param runtime_name: Human-readable runtime name, e.g. ``"Codex"``.
     :param session_id: Session whose terminal failed, which may be a runner's child.
-    :returns: ``{"code": ..., "message": ...}`` payload for SSE and
-        JSON error responses. Known actionable configuration errors surface
-        their safe message directly; other causes point to the runner log.
+    :returns: ``{"code": ..., "message": ...}`` payload for SSE and JSON
+        error responses. Known actionable configuration errors surface their
+        safe message directly; other causes point to the runner log. A
+        recognized failure also sets ``title``/``cause``/``remediation`` so
+        the card reads as classified and each part survives the reload-visible
+        label budget.
     """
     error_id = f"err_{uuid.uuid4().hex}"
     lifecycle_code = (
@@ -7943,6 +7960,61 @@ def _native_terminal_start_error_payload(
         exc_info=exc,
         extra=extra,
     )
+    # Classify a mixed-version host before the lazy imports below: in that
+    # state those imports can raise the same stale-host ImportError and lose
+    # the guidance, so this path must not depend on them.
+    if _is_stale_host_import_error(exc):
+        # The label-length limit lives in the ORM module; import it lazily to
+        # keep SQLAlchemy out of the runner's import graph, and fall back to the
+        # known schema limit if this stale host cannot import it either.
+        try:
+            from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
+        except ImportError:
+            LABEL_VALUE_MAX_LEN = 256
+
+        cli = cli_invocation()
+        # The web card shows `cause`/`remediation` and hides `message` once a
+        # cause is set, so carry the log-correlation ID at the end of `cause`,
+        # reserving room so a long runtime name cannot clip it on reload.
+        error_id_suffix = f" Error ID: {error_id}."
+        diagnosis = (
+            f"Native {runtime_name} terminal failed to start: this host is "
+            "likely running an older Omnigent build than the one now on disk, "
+            "which an in-place upgrade can leave behind (mixed-version)."
+        )
+        cause = diagnosis
+        cause_room = LABEL_VALUE_MAX_LEN - len(error_id_suffix)
+        if len(cause) > cause_room:
+            cause = cause[: cause_room - 1] + "…"
+        cause = f"{cause}{error_id_suffix}"
+        # A bare `host` re-run resolves the server from config or starts a
+        # local one, so both restart recipes must carry the original options.
+        remediation = (
+            "Restart the host to load the upgraded code, keeping `--server` for "
+            f"a remote host. For a foreground host, re-run `{cli} host` with the "
+            "options you started it with. For a host user service, re-enable it "
+            "with the options you installed it with."
+        )
+        if len(remediation) > LABEL_VALUE_MAX_LEN:
+            # A long OMNIGENT_WRAPPER_COMMAND would push this past the per-field
+            # label budget and truncate on reload; name the host command
+            # generically so the guidance survives intact.
+            remediation = (
+                "Restart the host to load the upgraded code, keeping `--server` "
+                "for a remote host. For a foreground host, re-run your host "
+                "command with the options you started it with. For a host user "
+                "service, re-enable it with the options you installed it with."
+            )
+        return {
+            "code": _NATIVE_TERMINAL_START_FAILED_CODE,
+            "error_id": error_id,
+            # The labelless fallback ends with the ID like every other branch.
+            "message": f"{diagnosis} {remediation}{error_id_suffix}",
+            "title": f"{runtime_name} can't start until you restart the host",
+            "cause": cause,
+            "remediation": remediation,
+        }
+
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeHookInterpreterMismatchError
     from omnigent.harnesses.pi_native.main import PiNativeCliOutdatedError
     from omnigent.terminals.registry import TerminalExitedDuringLaunch
