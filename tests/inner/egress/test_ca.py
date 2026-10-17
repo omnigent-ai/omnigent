@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import datetime
+import os
 import ssl
+import threading
 from pathlib import Path
 
 from cryptography import x509
@@ -66,6 +68,60 @@ def test_ensure_ca_bundle_includes_system_and_custom_ca(tmp_path: Path) -> None:
     # At minimum: 1 system CA + our CA = 2
     assert cert_count >= 2, (
         f"Expected at least 2 certs in bundle (system + ours), got {cert_count}"
+    )
+
+
+def test_ensure_ca_bundle_rewrite_never_exposes_partial_bundle(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A reader racing a bundle rewrite must only ever see the complete bundle.
+
+    Every proxy start rewrites the shared ``ca-bundle.pem``; a second Codex
+    process starting moments later reads it as its TLS trust store, so a
+    truncate-then-write rewrite hands that process an empty or partial file.
+    """
+    monkeypatch.setattr(ca_module, "_system_ca_bundle", lambda: b"X" * 256 * 1024)
+    cert_path, _key_path = ensure_ca(cache_dir=tmp_path)
+    bundle_path = ensure_ca_bundle(cert_path, cache_dir=tmp_path)
+    expected = bundle_path.read_bytes()
+    assert expected.endswith(cert_path.read_bytes())
+
+    real_replace = os.replace
+    swaps = 0
+
+    def complete_swap(src: str, dst: str) -> None:
+        # The published file must be whole on both sides of the rename.
+        nonlocal swaps
+        assert Path(dst).read_bytes() == expected
+        assert Path(src).read_bytes() == expected
+        swaps += 1
+        real_replace(src, dst)
+
+    monkeypatch.setattr(ca_module.os, "replace", complete_swap)
+    stop = threading.Event()
+    partial_sizes: list[int] = []
+
+    def read_until_stopped() -> None:
+        while not stop.is_set():
+            data = bundle_path.read_bytes()
+            if data != expected:
+                partial_sizes.append(len(data))
+
+    readers = [threading.Thread(target=read_until_stopped) for _ in range(4)]
+    for reader in readers:
+        reader.start()
+    try:
+        for _ in range(200):
+            ensure_ca_bundle(cert_path, cache_dir=tmp_path)
+    finally:
+        stop.set()
+        for reader in readers:
+            reader.join(timeout=10)
+
+    assert swaps == 200
+    assert not partial_sizes, (
+        f"{len(partial_sizes)} concurrent reads saw a partial CA bundle "
+        f"(sizes {sorted(set(partial_sizes))[:5]} of {len(expected)} bytes)"
     )
 
 
