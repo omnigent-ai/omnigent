@@ -749,6 +749,7 @@ function renderItem(
         >
           <FilePathAwareMessageResponse
             className="chat-markdown"
+            breaks
             mode={isTextStreaming ? "streaming" : "static"}
           >
             {item.text}
