@@ -35,9 +35,7 @@ def _outcomes(rows: list[dict[str, object]]) -> list[dict[str, object]]:
 )
 def test_progress_before_a_user_turn_records_resumed(event: dict[str, object]) -> None:
     with capture_debug_rows("server") as rows:
-        disconnect_outcome.watch_for_resume(
-            "conv_a", failure_code="runner_disconnected"
-        )
+        disconnect_outcome.watch_for_resume("conv_a", failure_code="runner_disconnected")
         disconnect_outcome.observe_event("conv_a", event)
         disconnect_outcome.observe_event("conv_a", event)
 
@@ -60,9 +58,7 @@ def test_progress_before_a_user_turn_records_resumed(event: dict[str, object]) -
     ],
 )
 def test_non_progress_events_keep_watching(event: dict[str, object]) -> None:
-    disconnect_outcome.watch_for_resume(
-        "conv_a", failure_code="runner_disconnected"
-    )
+    disconnect_outcome.watch_for_resume("conv_a", failure_code="runner_disconnected")
     with capture_debug_rows("server") as rows:
         disconnect_outcome.observe_event("conv_a", event)
         disconnect_outcome.observe_event(
@@ -72,9 +68,7 @@ def test_non_progress_events_keep_watching(event: dict[str, object]) -> None:
 
 
 def test_user_turn_first_records_superseded_and_stops_watching() -> None:
-    disconnect_outcome.watch_for_resume(
-        "conv_a", failure_code="runner_disconnected"
-    )
+    disconnect_outcome.watch_for_resume("conv_a", failure_code="runner_disconnected")
     with capture_debug_rows("server") as rows:
         disconnect_outcome.note_user_turn("conv_a")
         disconnect_outcome.observe_event(

@@ -2537,7 +2537,8 @@ async def test_skill_slash_command_supersedes_a_watched_disconnect_failure(
     outcomes = [
         row["attributes"]["outcome"]
         for row in rows
-        if row["event_name"] == "session_turn_failure_outcome" and row["session_id"] == session["id"]
+        if row["event_name"] == "session_turn_failure_outcome"
+        and row["session_id"] == session["id"]
     ]
     assert outcomes == ["superseded_by_user_turn"]
 

@@ -3819,7 +3819,7 @@ async def _publish_runner_recovered_status_impl(
     conv: Conversation | None = None
     try:
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-    except Exception:  # noqa: BLE001
+    except Exception:
         if require_disconnect_code:
             raise
         _logger.warning(
