@@ -49,9 +49,19 @@ export function detectIdleTransitions(
 }
 
 /** Snapshot of each conversation's pending-elicitation count, keyed by id. */
-export function buildElicitationMap(conversations: Conversation[]): Map<string, number> {
+export function buildElicitationMap(
+  conversations: Conversation[],
+  previous: ReadonlyMap<string, number> = new Map(),
+): Map<string, number> {
   const map = new Map<string, number>();
   for (const conversation of conversations) {
+    if (conversation.runner_online === false) {
+      // The server reports 0 for an offline runner and restores the count on
+      // reconnect; keep the last live count so the restore isn't a new prompt.
+      const lastLive = previous.get(conversation.id);
+      if (lastLive !== undefined) map.set(conversation.id, lastLive);
+      continue;
+    }
     map.set(conversation.id, conversation.pending_elicitations_count ?? 0);
   }
   return map;
