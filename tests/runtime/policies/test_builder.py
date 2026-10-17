@@ -47,6 +47,24 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from tests.runtime.policies.conftest import make_fixed_function_policy_spec
 
 
+def _rebind(store: SqlAlchemyConversationStore, conversation_id: str, agent_id: str) -> None:
+    """Repoint a session at another agent, as an out-of-band binding change."""
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlConversation, current_workspace_id
+
+    with store._conv_engine.begin() as conn:
+        result = conn.execute(
+            update(SqlConversation)
+            .where(
+                SqlConversation.workspace_id == current_workspace_id(),
+                SqlConversation.id == conversation_id,
+            )
+            .values(agent_id=agent_id)
+        )
+    assert result.rowcount == 1, f"rebind matched {result.rowcount} rows for {conversation_id!r}"
+
+
 def _sub_agent_title() -> str:
     """Return a unique sub-agent title (production sub-agents always have one)."""
     return f"test-agent:{uuid.uuid4().hex[:8]}"
@@ -91,7 +109,7 @@ name: no-guardrails
     )
     # No user-declared guardrails, but the hardcoded
     # ask_on_add_policy guard is always present.
-    assert len(engine.policies) == 1
+    assert len(engine.policies) == 2
     assert engine.policies[0].spec.name == "__ask_on_add_policy"
     assert engine.label_defs == {}
     assert engine.labels == {}
@@ -120,8 +138,8 @@ guardrails: {}
         conversation_id=conv.id,
         conversation_store=conversation_store,
     )
-    # The only policy is the hardcoded ask_on_add_policy guard.
-    assert len(engine.policies) == 1
+    # Mandatory approval guards remain even without configured policies.
+    assert len(engine.policies) == 2
     assert engine.policies[0].spec.name == "__ask_on_add_policy"
     assert engine.label_defs == {}
     assert engine.labels == {}
@@ -171,7 +189,13 @@ guardrails:
     names = [p.spec.name for p in engine.policies]
     # Declared policies in YAML order, plus the hardcoded
     # ask_on_add_policy guard appended by the builder.
-    assert names == ["alpha", "bravo", "charlie", "__ask_on_add_policy"]
+    assert names == [
+        "alpha",
+        "bravo",
+        "charlie",
+        "__ask_on_add_policy",
+        "__ask_on_scheduled_task_change",
+    ]
 
 
 def test_build_resolves_model_override_then_spec(
@@ -511,7 +535,10 @@ def test_build_from_programmatic_spec(
     )
     assert engine.ask_timeout == 45
     assert engine.policies[0].spec.name == "taint_web"
-    assert engine.policies[-1].spec.name == "__ask_on_add_policy"
+    assert [p.spec.name for p in engine.policies[-2:]] == [
+        "__ask_on_add_policy",
+        "__ask_on_scheduled_task_change",
+    ]
     assert engine.labels == {"integrity": "1"}
 
 
@@ -548,7 +575,12 @@ def test_default_policies_appended_after_agent_policies(
         default_policies=[admin_policy],
     )
     names = [p.spec.name for p in engine.policies]
-    assert names == ["agent_policy", "admin_policy", "__ask_on_add_policy"]
+    assert names == [
+        "agent_policy",
+        "admin_policy",
+        "__ask_on_add_policy",
+        "__ask_on_scheduled_task_change",
+    ]
 
 
 def test_default_policies_alone_builds_live_engine(
@@ -573,7 +605,10 @@ def test_default_policies_alone_builds_live_engine(
         default_policies=[admin_policy],
     )
     assert engine.policies[0].spec.name == "admin_audit"
-    assert engine.policies[-1].spec.name == "__ask_on_add_policy"
+    assert [p.spec.name for p in engine.policies[-2:]] == [
+        "__ask_on_add_policy",
+        "__ask_on_scheduled_task_change",
+    ]
 
 
 def test_empty_default_policies_preserves_existing_behaviour(
@@ -598,9 +633,9 @@ def test_empty_default_policies_preserves_existing_behaviour(
         default_policies=[],
     )
     # Only the hardcoded ask_on_add_policy guard.
-    assert len(engine_none.policies) == 1
+    assert len(engine_none.policies) == 2
     assert engine_none.policies[0].spec.name == "__ask_on_add_policy"
-    assert len(engine_empty.policies) == 1
+    assert len(engine_empty.policies) == 2
     assert engine_empty.policies[0].spec.name == "__ask_on_add_policy"
 
 
@@ -1335,19 +1370,7 @@ def test_agent_rebind_after_spec_resolution_fails_closed(
     agent_a = "1" * 32
 
     def _switch(conv_id: str, new_agent_id: str) -> None:
-        # switch_conversation_agent inserts the target agent row, so each
-        # switch needs its own id.
-        conversation_store.switch_conversation_agent(
-            conv_id,
-            new_agent_id=new_agent_id,
-            new_agent_name="other",
-            new_agent_bundle_location="other/bundle",
-            new_agent_description=None,
-            copy_model_settings=False,
-            carry_history_into_native=False,
-            presentation_labels={},
-            previous_builtin_id=None,
-        )
+        _rebind(conversation_store, conv_id, new_agent_id)
 
     # Matching agent proceeds (guard must not be a blanket refusal).
     ok_conv = conversation_store.create_conversation(title="match", agent_id=agent_a)
@@ -1683,17 +1706,7 @@ def test_mid_build_change_fails_closed_on_every_provenance(
     if hazard == "switch":
 
         def _apply() -> None:
-            conversation_store.switch_conversation_agent(
-                conv.id,
-                new_agent_id=uuid.uuid4().hex,
-                new_agent_name="other",
-                new_agent_bundle_location="other/bundle",
-                new_agent_description=None,
-                copy_model_settings=False,
-                carry_history_into_native=False,
-                presentation_labels={},
-                previous_builtin_id=None,
-            )
+            _rebind(conversation_store, conv.id, uuid.uuid4().hex)
 
         expected = "no longer resolves to agent"
     else:
@@ -1847,17 +1860,7 @@ def test_engine_refuses_a_tree_assembled_across_a_change(
             if not self._fired and any(c.id == child.id for c in page.data):
                 self._fired = True
                 if mutation == "switch":
-                    self._inner.switch_conversation_agent(
-                        child.id,
-                        new_agent_id=uuid.uuid4().hex,
-                        new_agent_name="other",
-                        new_agent_bundle_location="other/bundle",
-                        new_agent_description=None,
-                        copy_model_settings=False,
-                        carry_history_into_native=False,
-                        presentation_labels={},
-                        previous_builtin_id=None,
-                    )
+                    _rebind(self._inner, child.id, uuid.uuid4().hex)
                 else:
                     asyncio.run(self._inner.delete_conversation(child.id))
             return page

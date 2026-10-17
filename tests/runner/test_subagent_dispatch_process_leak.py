@@ -34,7 +34,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from omnigent.runner import app as runner_app
+from omnigent.runner import subagent_work
 from omnigent.runner.tool_dispatch import execute_tool
 
 PARENT_ID = "conv_parent"
@@ -107,7 +107,7 @@ async def test_create_timeout_reaps_orphaned_child() -> None:
         return httpx.Response(404, json={"error": f"unmocked {method} {path}"})
 
     inbox: asyncio.Queue = asyncio.Queue()
-    runner_app._session_inboxes_ref[PARENT_ID] = inbox
+    subagent_work._session_inboxes_ref[PARENT_ID] = inbox
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://server"
     ) as server_client:
@@ -123,9 +123,9 @@ async def test_create_timeout_reaps_orphaned_child() -> None:
                 session_inbox=inbox,
             )
         finally:
-            runner_app._session_inboxes_ref.pop(PARENT_ID, None)
-            runner_app.unregister_child_session(CHILD_ID)
-            runner_app.unregister_subagent_work(CHILD_ID)
+            subagent_work._session_inboxes_ref.pop(PARENT_ID, None)
+            subagent_work.unregister_child_session(CHILD_ID)
+            subagent_work.unregister_subagent_work(CHILD_ID)
 
     # The server committed a child; the dispatch must have surfaced the failure
     # as an error string (not raised an unhandled ReadTimeout to the caller).

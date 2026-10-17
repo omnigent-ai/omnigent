@@ -20,6 +20,7 @@ from fastapi import APIRouter, Request, Response, status
 from omnigent.debug_logging import add_audit_attrs
 from omnigent.entities import Agent
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.mcp_selection import MCP_SELECTION_PREFIX, selected_mcp_spec
 from omnigent.runtime import session_stream
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider, local_single_user_enabled
@@ -83,6 +84,8 @@ def assert_mcp_server_request_safe(body: UpsertMCPServerRequest) -> None:
                 "stdio MCP servers are not permitted on this server; use an http transport.",
                 code=ErrorCode.FORBIDDEN,
             )
+        return
+    if body.transport == "registry":
         return
     if body.transport == "http" and body.url:
         # A single-user / local server has no other tenant to protect and is
@@ -151,12 +154,15 @@ def create_session_mcp_servers_router(
             agent_cache.load,
             agent.id,
             agent.bundle_location,
-            expand_env=agent.session_id is None,
+            expand_env=agent.operator_authored,
         )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        assert conv is not None
         return {
             "object": "list",
             "data": [
-                _summary_from_config(server).model_dump() for server in loaded.spec.mcp_servers
+                _summary_from_config(server).model_dump()
+                for server in selected_mcp_spec(loaded.spec, conv.labels).mcp_servers
             ],
         }
 
@@ -167,12 +173,15 @@ def create_session_mcp_servers_router(
         body: UpsertMCPServerRequest,
     ) -> MCPServerSummary:
         """Create one MCP server declaration on a session-scoped agent."""
+        if body.transport == "registry":
+            return await _select_registry(request, session_id, body, mode="create")
         agent, user_id = await _editable_agent(request, session_id)
         await asyncio.to_thread(assert_mcp_server_request_safe, body)
         spec = await asyncio.to_thread(
             _mutate_bundle,
             agent,
             body,
+            session_id=session_id,
             mode="create",
             target_name=None,
             created_by=user_id,
@@ -190,12 +199,17 @@ def create_session_mcp_servers_router(
         body: UpsertMCPServerRequest,
     ) -> MCPServerSummary:
         """Replace one MCP server declaration on a session-scoped agent."""
+        if body.transport == "registry":
+            return await _select_registry(
+                request, session_id, body, mode="update", target_name=server_name
+            )
         agent, user_id = await _editable_agent(request, session_id)
         await asyncio.to_thread(assert_mcp_server_request_safe, body)
         spec = await asyncio.to_thread(
             _mutate_bundle,
             agent,
             body,
+            session_id=session_id,
             mode="update",
             target_name=server_name,
             created_by=user_id,
@@ -215,11 +229,36 @@ def create_session_mcp_servers_router(
         server_name: str,
     ) -> Response:
         """Delete one MCP server declaration from a session-scoped agent."""
+        agent = await _bound_agent(request, session_id, LEVEL_OWNER)
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise session_not_found()
+        selected = conv.labels.get(MCP_SELECTION_PREFIX + server_name) == "1"
+        if not selected:
+            spec = await _selection_spec(session_id, agent)
+            selected = any(
+                s.name == server_name and s.transport == "registry" for s in spec.mcp_servers
+            )
+        if selected:
+            if conv.sub_agent_name:
+                raise OmnigentError(
+                    "Named sub-agents use their authored MCP services",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            await asyncio.to_thread(
+                conversation_store.set_labels,
+                session_id,
+                {MCP_SELECTION_PREFIX + server_name: "0"},
+            )
+            await _reset_runner_session_agent_cache(session_id, agent.id, runner_router)
+            _publish_agent_changed(session_id, agent)
+            return Response(status_code=status.HTTP_204_NO_CONTENT)
         agent, user_id = await _editable_agent(request, session_id)
         await asyncio.to_thread(
             _mutate_bundle,
             agent,
             None,
+            session_id=session_id,
             mode="delete",
             target_name=server_name,
             created_by=user_id,
@@ -228,6 +267,75 @@ def create_session_mcp_servers_router(
         _publish_agent_changed(session_id, agent)
         add_audit_attrs(server_name=server_name)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    async def _selection_spec(session_id: str, agent: Agent) -> AgentSpec:
+        if agent_cache is None:
+            raise OmnigentError("Agent cache not configured", code=ErrorCode.INTERNAL_ERROR)
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise session_not_found()
+        loaded = await asyncio.to_thread(
+            agent_cache.load, agent.id, agent.bundle_location, expand_env=agent.operator_authored
+        )
+        return selected_mcp_spec(loaded.spec, conv.labels)
+
+    async def _select_registry(
+        request: Request,
+        session_id: str,
+        body: UpsertMCPServerRequest,
+        *,
+        mode: str,
+        target_name: str | None = None,
+    ) -> MCPServerSummary:
+        agent = await _bound_agent(request, session_id, LEVEL_OWNER)
+        user_id = get_user_id(request, auth_provider)
+        _require_registry_service(request, body.name, user_id)
+        await _require_registry_runtime(request, session_id, body.name)
+        spec = await _selection_spec(session_id, agent)
+        existing = {server.name: server for server in spec.mcp_servers}
+        if mode == "create" and body.name in existing:
+            raise OmnigentError(
+                f"MCP server {body.name!r} already exists", code=ErrorCode.CONFLICT
+            )
+        if mode == "update":
+            assert target_name is not None
+            target = existing.get(target_name)
+            if target is None:
+                raise OmnigentError("MCP server not found", code=ErrorCode.NOT_FOUND)
+            if target.transport != "registry" or target_name != body.name:
+                raise OmnigentError(
+                    "Remove the existing MCP service before selecting another",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+        # A service selection cannot change authored tool restrictions.
+        updates = {MCP_SELECTION_PREFIX + body.name: "1"}
+        next_spec = selected_mcp_spec(spec, updates)
+        await asyncio.to_thread(conversation_store.set_labels, session_id, updates)
+        await _reset_runner_session_agent_cache(session_id, agent.id, runner_router)
+        _publish_agent_changed(session_id, agent)
+        add_audit_attrs(server_name=body.name)
+        return _summary_from_spec(next_spec, body.name)
+
+    async def _require_registry_runtime(request: Request, session_id: str, service: str) -> None:
+        from omnigent.runner.routing import routing_host_id
+        from omnigent.server.mcp_compatibility import require_registry_mcp_runtime
+
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise session_not_found()
+        if conv.sub_agent_name:
+            raise OmnigentError(
+                "Named sub-agents use their authored MCP services",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        require_registry_mcp_runtime(
+            [service],
+            host_id=await asyncio.to_thread(routing_host_id, conv, conversation_store),
+            runner_id=conv.runner_id,
+            host_registry=getattr(request.app.state, "host_registry", None),
+            tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+            runner_router=runner_router,
+        )
 
     async def _editable_agent(request: Request, session_id: str) -> tuple[Agent, str | None]:
         """Authorize the owner and return an editable session-scoped agent.
@@ -259,6 +367,7 @@ def create_session_mcp_servers_router(
         agent: Agent,
         body: UpsertMCPServerRequest | None,
         *,
+        session_id: str,
         mode: Literal["create", "update", "delete"],
         target_name: str | None,
         created_by: str | None = None,
@@ -266,6 +375,9 @@ def create_session_mcp_servers_router(
         """Edit the bundle, validate it, store it, and refresh cache."""
         assert artifact_store is not None
         assert agent_cache is not None
+        conv = conversation_store.get_conversation(session_id)
+        if conv is None:
+            raise session_not_found()
 
         bundle_bytes = artifact_store.get(agent.bundle_location)
         if bundle_bytes is None:
@@ -279,7 +391,9 @@ def create_session_mcp_servers_router(
                 bundle_bytes,
                 enforce_handler_allowlist=not local_single_user_enabled(),
             )
-            current_names = {server.name for server in current_spec.mcp_servers}
+            current_names = {server.name for server in current_spec.mcp_servers} | {
+                server.name for server in selected_mcp_spec(current_spec, conv.labels).mcp_servers
+            }
             if mode == "create":
                 assert body is not None
                 if body.name in current_names:
@@ -307,7 +421,7 @@ def create_session_mcp_servers_router(
                     raise OmnigentError("MCP server not found", code=ErrorCode.NOT_FOUND)
                 _delete_mcp_server(location, target_name)
 
-            new_bundle = _tar_gz_dir(root)
+            new_bundle = _tar_gz_dir(root, original_bundle=bundle_bytes)
             new_spec = validate_agent_bundle(
                 new_bundle,
                 enforce_handler_allowlist=not local_single_user_enabled(),
@@ -317,20 +431,31 @@ def create_session_mcp_servers_router(
                     "MCP edit changed the agent name; refusing to save.",
                     code=ErrorCode.INVALID_INPUT,
                 )
+            new_spec = selected_mcp_spec(new_spec, conv.labels)
 
         new_location = bundle_location(agent.id, new_bundle)
         # Sha-segment compare: legacy rows keep an ``ag_``-prefixed left
         # segment (physical artifact key); only the sha encodes content.
         if new_location.rsplit("/", 1)[-1] != agent.bundle_location.rsplit("/", 1)[-1]:
             artifact_store.put(new_location, new_bundle)
-            updated = agent_store.update(agent.id, new_location, created_by)
+            if agent_store.supports_config_edit:
+                updated = agent_store.update_configuration(
+                    agent, new_location, description=agent.description, created_by=created_by
+                )
+                if updated is None:
+                    raise OmnigentError(
+                        "Agent changed during MCP edit; reload before saving",
+                        code=ErrorCode.CONFLICT,
+                    )
+            else:
+                updated = agent_store.update(agent.id, new_location, created_by)
             if updated is None:
                 raise OmnigentError("Agent not found", code=ErrorCode.NOT_FOUND)
             agent_cache.replace(
                 agent.id,
                 new_location,
                 new_bundle,
-                expand_env=agent.session_id is None,
+                expand_env=agent.operator_authored,
             )
         return new_spec
 
@@ -398,6 +523,19 @@ def _summary_from_spec(spec: AgentSpec, name: str) -> MCPServerSummary:
         if server.name == name:
             return _summary_from_config(server)
     raise OmnigentError("MCP server was not saved", code=ErrorCode.INTERNAL_ERROR)
+
+
+def _require_registry_service(request: Request, service_id: str, user_id: str | None) -> None:
+    from omnigent.server.auth import RESERVED_USER_LOCAL
+    from omnigent.server.routes.connections_base import ConnectionError
+
+    registry = getattr(request.app.state, "mcp_registry", None)
+    try:
+        if registry is None:
+            raise ConnectionError("MCP registry is not configured")
+        registry.service(service_id, user_id or RESERVED_USER_LOCAL)
+    except ConnectionError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.FORBIDDEN) from exc
 
 
 def _write_new_mcp_server(root: Path, body: UpsertMCPServerRequest) -> None:
@@ -601,12 +739,19 @@ def _normalize_tarinfo(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo:
     tarinfo.gid = 0
     tarinfo.uname = ""
     tarinfo.gname = ""
-    tarinfo.mode = 0o755 if tarinfo.isdir() else 0o644
+    tarinfo.mode = 0o755 if tarinfo.isdir() or tarinfo.mode & 0o111 else 0o644
     return tarinfo
 
 
-def _tar_gz_dir(bundle_dir: Path) -> bytes:
+def _tar_gz_dir(bundle_dir: Path, *, original_bundle: bytes | None = None) -> bytes:
     """Pack a bundle directory into deterministic ``.tar.gz`` bytes."""
+    # extract_safe drops attributes; restore only executable bits from the validated archive.
+    if original_bundle is not None:
+        with tarfile.open(fileobj=io.BytesIO(original_bundle), mode="r:*") as archive:
+            for member in archive:
+                path = bundle_dir / member.name
+                if member.isfile() and path.is_file():
+                    path.chmod(0o644 | (member.mode & 0o111))
     buf = io.BytesIO()
     with (
         gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz,

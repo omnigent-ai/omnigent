@@ -468,7 +468,7 @@ export function FilesPanel({
     >
       {/* Header — single row: [workingDir] [copy] [close?] */}
       <div className="flex h-11 shrink-0 items-center gap-[2px] px-2">
-        {flatView && <h2 className="shrink-0 font-medium text-ui">Changes</h2>}
+        {flatView && <h2 className="shrink-0 pl-1 font-medium text-ui">Changes</h2>}
         {!flatView && workingDir && workspaceRoot && (
           <BrowseLocationBar
             current={workingDir}

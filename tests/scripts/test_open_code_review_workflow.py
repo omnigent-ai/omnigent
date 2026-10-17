@@ -212,7 +212,7 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
         # PyYAML's YAML 1.1 loader reads the workflow's `on` key as True.
         triggers = WORKFLOW[True]
         polly = yaml.safe_load((ROOT / ".github/workflows/polly-review.yml").read_text())
-        self.assertEqual(triggers["pull_request_target"], polly[True]["pull_request"])
+        self.assertEqual(triggers["pull_request_target"], polly[True]["pull_request_target"])
         self.assertNotIn("pull_request", triggers)
         self.assertNotIn("synchronize", triggers["pull_request_target"]["types"])
         for action in triggers["pull_request_target"]["types"]:
@@ -309,6 +309,26 @@ class OpenCodeReviewWorkflowTest(unittest.TestCase):
                     {"base": "main", "head": "new-head"} if state == "open" and not draft else {}
                 )
                 self.assertEqual(result["outputs"], expected)
+
+    def test_requested_head_cannot_silently_change_while_queued(self):
+        for expected_head in ("old-head", "new-head", ""):
+            with self.subTest(expected_head=expected_head):
+                result = self.run_script(
+                    self.comment(),
+                    script=RESOLVE,
+                    pr={
+                        "state": "open",
+                        "draft": False,
+                        "base": {"ref": "main"},
+                        "head": {"sha": "new-head"},
+                    },
+                    extra_env={"EXPECTED_HEAD": expected_head},
+                )
+                if expected_head == "old-head":
+                    self.assertEqual(result["outputs"], {})
+                    self.assertIn("PR moved", result["error"])
+                else:
+                    self.assertEqual(result["outputs"], {"base": "main", "head": "new-head"})
 
     def completed_comment(self, marker=None, *, login="github-actions[bot]", user_type="Bot"):
         return {

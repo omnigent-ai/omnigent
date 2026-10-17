@@ -44,22 +44,10 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.routes import sessions as sessions_route
+from tests.server.helpers import create_session_for_agent as _create_session
 from tests.server.helpers import create_test_agent, start_session_stream_collector
 
 pytestmark = pytest.mark.asyncio
-
-
-async def _create_session(client: httpx.AsyncClient, agent_id: str) -> str:
-    """
-    Create a minimal session and return its id.
-
-    :param client: Test HTTP client.
-    :param agent_id: Agent to bind.
-    :returns: New session id.
-    """
-    resp = await client.post("/v1/sessions", json={"agent_id": agent_id})
-    assert resp.status_code == 201, f"create failed: {resp.status_code} {resp.text}"
-    return resp.json()["id"]
 
 
 async def _drain_until_elicitation(
@@ -100,6 +88,7 @@ async def _post_approval(
     elicitation_id: str,
     action: str,
     content: dict[str, Any] | None = None,
+    meta: dict[str, Any] | None = None,
 ) -> httpx.Response:
     """
     Resolve a published elicitation through the session event API.
@@ -111,11 +100,15 @@ async def _post_approval(
     :param action: MCP ``ElicitResult.action`` literal,
         e.g. ``"accept"`` or ``"decline"``.
     :param content: Optional MCP ``ElicitResult.content`` payload.
+    :param meta: Optional MCP ``_meta`` payload, e.g. a persistence
+        choice ``{"persist": "always"}``.
     :returns: The HTTP response from the session event route.
     """
     data: dict[str, Any] = {"elicitation_id": elicitation_id, "action": action}
     if content is not None:
         data["content"] = content
+    if meta is not None:
+        data["_meta"] = meta
     return await client.post(
         f"/v1/sessions/{session_id}/events",
         json={
@@ -2871,7 +2864,7 @@ async def test_codex_command_approval_hook_accepts_execpolicy_amendment(
             "startedAtMs": 1,
             "approvalId": None,
             "reason": "test command approval",
-            "command": ".venv/bin/python -m pytest tests/test_codex_native.py -q",
+            "command": (".venv/bin/python -m pytest tests/harnesses/codex_native/session/ -q"),
             "cwd": "/tmp/workspace",
             "commandActions": [],
             "availableDecisions": [
@@ -2939,7 +2932,7 @@ async def test_codex_command_approval_hook_rejects_malformed_execpolicy_amendmen
             "startedAtMs": 1,
             "approvalId": None,
             "reason": "test command approval",
-            "command": ".venv/bin/python -m pytest tests/test_codex_native.py -q",
+            "command": (".venv/bin/python -m pytest tests/harnesses/codex_native/session/ -q"),
             "cwd": "/tmp/workspace",
             "commandActions": [],
             "availableDecisions": [
@@ -4163,6 +4156,60 @@ async def test_antigravity_elicitation_hook_accept_round_trip(
     assert resp.json() == {
         "action": "accept",
         "content": {"selectedOptionIds": ["1"]},
+    }
+
+
+async def test_antigravity_elicitation_hook_accept_persist_round_trip(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Antigravity elicitation hook: an always-allow accept keeps ``_meta.persist``.
+
+    When a web approver picks one of agy's always-allow entries, the verdict
+    carries ``_meta.persist``. The hook must return that metadata verbatim so
+    the bridge types agy's persist menu entry rather than a one-time approve.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    agent = await create_test_agent(client, "test-agy-elicit-persist")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = "elicit_agy_00000000000000000000000000000003"
+    params_body = {
+        "mode": "form",
+        "message": "Antigravity wants to run a command",
+        "phase": "agy_permission",
+        "policy_name": "agy_native_permission",
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/antigravity-elicitation-request",
+            json={"elicitation_id": elicitation_id, "params": params_body},
+        )
+    )
+
+    event = await drain_task
+    assert event["elicitation_id"] == elicitation_id
+    assert event["params"]["phase"] == "agy_permission"
+
+    verdict = await _post_approval(
+        client,
+        session_id,
+        elicitation_id,
+        "accept",
+        meta={"persist": "always"},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "action": "accept",
+        "content": None,
+        "_meta": {"persist": "always"},
     }
 
 

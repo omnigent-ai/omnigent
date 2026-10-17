@@ -14,7 +14,19 @@
 
 "use strict";
 
-const { contextBridge, ipcRenderer } = require("electron");
+const { contextBridge, ipcRenderer, webFrame } = require("electron");
+
+// Native window controls stay in window pixels while the page zooms.
+if (process.platform === "darwin") {
+  const syncTitlebarZoom = () => {
+    document.documentElement.style.setProperty(
+      "--omnigent-electron-zoom",
+      String(webFrame.getZoomFactor()),
+    );
+  };
+  window.addEventListener("DOMContentLoaded", syncTitlebarZoom, { once: true });
+  window.addEventListener("resize", syncTitlebarZoom);
+}
 
 // Collapse the update states the in-page UpdateBanner renders on
 // (available / downloading / downloaded / error-security) to `idle` so the server page can
@@ -100,6 +112,8 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * rejects in the main process).
    */
   switchServer: (url) => ipcRenderer.invoke("omnigent:switch-server", url),
+  /** Sign this window's server out; every window on it returns to the setup page. */
+  signOutOfServer: () => ipcRenderer.invoke("omnigent:sign-out-of-server"),
   /** Return this window to the bundled "connect to server" setup page. */
   openServerSetup: () => {
     ipcRenderer.send("omnigent:open-server-setup");
@@ -131,6 +145,8 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * process. Resolves a `{ ok, error?, authError? }` result.
    */
   connectArcaHost: () => ipcRenderer.invoke("omnigent:arca-connect"),
+  /** Extend the local Arca instance with one of the main process's approved modes. */
+  extendArca: (mode) => ipcRenderer.invoke("omnigent:arca-extend", mode),
 
   /**
    * Subscribe to host status-change pings. Fired only on real events (a host
@@ -204,7 +220,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   // The relay hook (web/src/hooks/useBrowserAgentRelay.ts) drives a native
   // WebContentsView per conversation through these; all args/results are
   // structured-clone-safe. SECURITY: no generic agent `evaluate` is exposed —
-  // `browserExecute` runs relay templates only (see README).
+  // `browserPerformAction` accepts fixed actions only (see README).
 
   /**
    * Open (create-if-absent) or navigate a conversation's view. `opts.force`
@@ -213,7 +229,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @param {string} conversationId
    * @param {string} url
    * @param {{x:number,y:number,width:number,height:number,devicePixelRatio?:number}} [bounds]
-   * @param {{force?: boolean, agent?: boolean}} [opts]
+   * @param {{force?: boolean, agent?: boolean, sourceHostId?: string, rememberedArcaHostId?: string}} [opts]
    */
   browserOpenOrNavigate: (conversationId, url, bounds, opts) =>
     ipcRenderer.invoke("omnigent:browser-open-or-navigate", { conversationId, url, bounds, opts }),
@@ -245,14 +261,10 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   browserScreenshot: (conversationId) =>
     ipcRenderer.invoke("omnigent:browser-screenshot", { conversationId }),
-  /**
-   * Run a relay-template JS string in the conversation's view. PRIVATE to the
-   * relay's fixed templates (snapshot / click / type) — never an agent-facing
-   * generic evaluate.
-   * @param {string} conversationId
-   * @param {string} js
-   * @returns {Promise<{ ok: boolean, result?: string, error?: string }>}
-   */
+  /** Perform a fixed snapshot, click or type action in the conversation's view. */
+  browserPerformAction: (conversationId, action, params) =>
+    ipcRenderer.invoke("omnigent:browser-perform-action", { conversationId, action, params }),
+  /** @deprecated Until v0.21: main translates only recognized v0.18 action templates. */
   browserExecute: (conversationId, js) =>
     ipcRenderer.invoke("omnigent:browser-execute", { conversationId, js }),
   /**
@@ -274,6 +286,23 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     ipcRenderer.on("browser-host-active-changed", listener);
     return () => ipcRenderer.removeListener("browser-host-active-changed", listener);
   },
+  /**
+   * Forward Ctrl+Tab, Control release, and Escape from the focused embedded
+   * Browser WebContents so the shell's recent-session switcher can own them.
+   * @param {(payload: Record<string, unknown>) => void} callback
+   * @returns {() => void}
+   */
+  onBrowserRecentSessionInput: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("browser-recent-session-input", listener);
+    return () => ipcRenderer.removeListener("browser-recent-session-input", listener);
+  },
+  /** Enable native Ctrl+Tab forwarding only while this renderer supports it. */
+  browserSetRecentSessionSwitchSupported: (supported) =>
+    ipcRenderer.invoke("omnigent:browser-set-recent-session-switch-supported", { supported }),
+  /** Clear the native Ctrl+Tab latch when the renderer has no sessions to show. */
+  browserCancelRecentSessionSwitch: () =>
+    ipcRenderer.invoke("omnigent:browser-cancel-recent-session-switch"),
   /**
    * Subscribe to browser-view creation (`{conversationId}`), fired the first
    * time a view is created — including detached (fresh conversation), which is
@@ -454,6 +483,8 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
   getManagedServers: () => ipcRenderer.invoke("omnigent:get-managed-servers"),
   /** Display names for those servers, server URL → name. */
   getManagedServerNames: () => ipcRenderer.invoke("omnigent:get-managed-server-names"),
+  /** Names servers gave themselves in their manifest, origin → name (display only). */
+  getServerNames: () => ipcRenderer.invoke("omnigent:get-server-names"),
   /** Wizard capabilities, e.g. `{v2Forced}` — v2Forced disables "Switch to
    *  legacy" because the env var pins the selector on. */
   getSetupCapabilities: () => ipcRenderer.invoke("omnigent:get-setup-capabilities"),

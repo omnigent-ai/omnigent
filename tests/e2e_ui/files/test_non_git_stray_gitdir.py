@@ -23,7 +23,6 @@ fails there — the regression guard for the fix.
 
 from __future__ import annotations
 
-import json
 import re
 import subprocess
 from collections.abc import Iterator
@@ -33,6 +32,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.session import bind_session_runner, post_session_bundle
 from tests.e2e_ui.conftest import (
     _build_hello_world_bundle,
     _ensure_runner_online,
@@ -70,20 +70,16 @@ def non_git_workspace_session(
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
     bundle = _build_hello_world_bundle()
-    create = httpx.post(
+    create = post_session_bundle(
+        httpx.post,
         f"{live_server}/v1/sessions",
-        data={"metadata": json.dumps({"workspace": str(workspace)})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+        bundle,
+        metadata={"workspace": str(workspace)},
         timeout=30.0,
     )
     create.raise_for_status()
     session_id = create.json()["session_id"]
-    patch = httpx.patch(
-        f"{live_server}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch.raise_for_status()
+    bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
     try:
         yield (live_server, session_id)
     finally:

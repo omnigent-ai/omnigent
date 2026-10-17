@@ -24,28 +24,22 @@
         justify-content: center;
         gap: 12px;
         height: 46px;
-        border: 1px solid #8885;
-        border-radius: 12px;
-        background: #fff;
-        color: #222;
+        font-size: 13px;
+        color: #71717a;
       }
       .spinner {
         width: 16px;
         height: 16px;
-        border: 2px solid #8884;
+        border: 2px solid transparent;
         border-top-color: currentColor;
+        border-left-color: currentColor;
+        border-bottom-color: currentColor;
         border-radius: 50%;
         animation: spin 0.8s linear infinite;
       }
       @keyframes spin {
         to {
           transform: rotate(360deg);
-        }
-      }
-      @media (prefers-color-scheme: dark) {
-        .card {
-          background: #1e1927;
-          color: #eee;
         }
       }
       @media (prefers-reduced-motion: reduce) {

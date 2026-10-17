@@ -385,12 +385,16 @@ class FunctionCallData(BaseModel):
     :param arguments: JSON-encoded arguments string.
     :param call_id: Unique call identifier from the LLM,
         e.g. ``"call_abc123"``.
+    :param namespace: Tool namespace the model emitted the call under,
+        e.g. ``"container"``. ``None`` for the default namespace. Harnesses
+        that replay history must round-trip it with the call.
     """
 
     agent: str = Field(serialization_alias="model")
     name: str
     arguments: str
     call_id: str
+    namespace: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class FunctionCallOutputData(BaseModel):

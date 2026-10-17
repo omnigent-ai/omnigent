@@ -21,8 +21,6 @@ reattach when the session moves to another host.
   agent terminal attach to the new host's terminal, not the old one.
 - `direct-attach`: when the runner is on the same machine the terminal connects
   directly, and falls back to the relay when the direct route is unreachable.
-- `agent-switch-cleanup`: switching the session's agent removes the old agent's
-  terminals instead of leaving closed tabs.
 - `tmux-outage`: terminals stay usable through temporary tmux health-check
   failures and still notice a real exit afterwards.
 - `hidden-terminal`: in chat view, the background terminal never draws over the
@@ -35,6 +33,8 @@ reattach when the session moves to another host.
 **Agent terminal** (sessions whose harness has a terminal):
 
 - Use the Chat/Terminal switcher in the session header.
+- Press ⌘/Ctrl+Alt+\ to toggle between Chat and Terminal view. The chord is
+  off while a rail-opened shell owns the main view.
 - On a phone, use the view mode choice in the header menu.
 - Choose Resume when the terminal shows as stopped.
 
@@ -42,10 +42,16 @@ reattach when the session moves to another host.
 
 - Open a new shell from the workspace rail on desktop, or from the header menu
   on a phone.
+- Press ⌘/Ctrl+Alt+T to open a shell of the remembered default type. The chord
+  is inert while the host is offline, the session is stranded, or a shell is
+  still being created, and it yields to a focused terminal or editor.
 - Select an open shell from the rail's shell list; close it from its tab.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host, then look at both the terminal strip and the agent terminal.
+Sandbox-backed sessions, including Databricks Sandbox and Arclet, cannot switch
+hosts. Their "Switch host…" item is disabled; hover or focus it for the
+unsupported explanation.
 
 **Local terminal:** a native harness launched from the CLI runs in the user's
 own terminal; see [native harnesses](./native-harnesses.md).
@@ -62,14 +68,24 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 ```
 
 - **`agent-terminal-view`:**
-  `tests/e2e_ui/shells/test_new_shell.py::test_empty_terminal_view_remains_selectable_and_resumable`,
   `tests/e2e_ui/shells/test_new_shell.py::test_starting_terminal_view_shows_loading_without_resume`,
-  `tests/e2e_ui/shells/test_new_shell.py::test_stopped_terminal_view_keeps_resume`
+  `tests/e2e_ui/shells/test_new_shell.py::test_stopped_terminal_view_keeps_resume`.
+  The stopped state with a selectable empty terminal (own environment):
+  `tests/e2e_ui/shells/test_new_shell.py::test_empty_terminal_view_remains_selectable_and_resumable`
+  kills the session's runner, so it fails under `verify-env run`; run it with
+  plain `uv run pytest`.
 - **`user-shell`:**
   `tests/e2e_ui/shells/test_new_shell.py::test_new_shell_launches_and_opens`,
   `tests/e2e_ui/shells/test_new_shell.py::test_new_shell_accepts_typed_command`.
   Closing a shell has no e2e coverage: close its tab, confirm, and expect the
   tab to disappear.
+- **`agent-terminal-view`, `user-shell`, keyboard:** no e2e coverage; component
+  tests `web/src/hooks/useViewModeToggleHotkey.test.tsx` and
+  `web/src/hooks/useNewShellHotkey.test.tsx` (`pnpm --dir web test`). Manually,
+  in a Claude or Codex session with the composer focused: press ⌘/Ctrl+Alt+\
+  twice and expect Terminal view, then Chat view; press ⌘/Ctrl+Alt+T and
+  expect a new shell tab to open and take focus. Repeat ⌘/Ctrl+Alt+T with the
+  shell focused and expect no second shell.
 - **`scrollback`, wheel:**
   `tests/e2e_ui/shells/test_new_shell.py::test_shell_wheel_scroll_reaches_mouse_tracking_program`
 - **`scrollback`, touch:**
@@ -86,12 +102,21 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 - **`direct-attach`:**
   `tests/e2e_ui/shells/test_terminal_direct_attach.py::test_terminal_upgrades_to_loopback_attach_when_runner_is_local`,
   `tests/e2e_ui/shells/test_terminal_direct_attach.py::test_terminal_falls_back_to_relay_when_loopback_is_unreachable`
-- **`agent-switch-cleanup`:**
-  `tests/e2e_ui/agent_switch/test_switch_agent_terminals.py::test_switch_agent_prunes_dead_terminals`
-  (opt-in; read the test for the environment variable it needs).
 - **`tmux-outage`:**
   `tests/e2e_ui/shells/test_antigravity_tmux_recovery.py::test_antigravity_survives_probe_outage_then_detects_exit`
   (opt-in; Antigravity only).
+- **Launch failure and cancellation (plain `uv run pytest`, own tmux):**
+  `tests/terminals/test_launch_failure_cleanup.py` checks a missing tmux
+  executable at spawn and cancellation after a real pane starts, including
+  during the initial liveness check. Each must release its private directory
+  and tmux server before registry ownership; a caller cancelled during that
+  cleanup still gets a completed close first. This registry is shared by native
+  agent terminals, user shells, and `sys_terminal_launch`; no vendor model or
+  browser is used in these process checks.
+  `tests/e2e/test_terminal_launch_retry_cleanup_e2e.py` also drives the runner's
+  resource facade through three failed launches and a successful retry for
+  Claude/Codex terminal roles and an auxiliary shell. The successful real pane
+  must accept input, and final cleanup must release every allocated instance.
 - **`hidden-terminal`:**
   `tests/e2e_ui/chat/test_hidden_terminal_scrollbar.py::test_hidden_terminal_scrollbar_never_paints_over_foreground`
 - **`dialog-routing`:**
@@ -103,6 +128,8 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   are different surfaces. A reattach or reconnect fix must be checked on both.
 - A host switch updates the host badge immediately. The badge changing is not
   proof the terminal reattached; look for the new host's terminal content.
+- The ⌘/Ctrl+Alt chords use ⌘ on macOS and Ctrl elsewhere, and they match the
+  physical key, so AltGr+T on an international layout must not open a shell.
 - Key bindings added for scrollback can change how full-screen harness terminals
   behave. After a scrollback change, drive the harness terminal itself, not only
   a plain shell.

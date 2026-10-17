@@ -64,13 +64,14 @@ def test_setting_routes_plain_clicks_in_app(page: Page, seeded_session: tuple[st
     expect(toggle).to_have_attribute("aria-checked", "true")
     page.get_by_role("link", name="Back", exact=True).click()
 
-    # With a file open in the rail, the link still brings the Browser forward.
+    # With a file open in the rail, the link creates and selects a Browser soft tab.
     page.goto(f"{base_url}/c/{session_id}?file=README.md")
     link.click()
     page.wait_for_function("window.__calls.length === 1")
     assert page.evaluate("window.__calls") == [{"conversationId": session_id, "url": LINK_URL}]
     rail = page.get_by_role("complementary", name="Workspace")
-    expect(rail.get_by_role("tab", name=re.compile("Browser"), selected=True)).to_be_visible()
+    expect(rail.get_by_role("tab", name="Browser 1", exact=True)).to_be_visible()
+    expect(rail.get_by_role("button", name="Close Browser 1", exact=True)).to_be_visible()
     expect(page).not_to_have_url(re.compile("file="))
 
     # A modified click stays external.

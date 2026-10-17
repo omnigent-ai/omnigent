@@ -85,6 +85,58 @@ function readConfig() {
   }
 }
 
+function nativeAuthFailure(message, ctx) {
+  const authDir = process.env.OMNIGENT_PI_NATIVE_AUTH_DIR;
+  const error = message && message.errorMessage;
+  const provider =
+    (message && message.provider) || (ctx && ctx.model && ctx.model.provider);
+  if (!authDir || typeof provider !== "string" || typeof error !== "string")
+    return null;
+  // Match wrap_auth_command's provider key and Pi's resolver error wording.
+  const id = crypto
+    .createHash("sha256")
+    .update(provider)
+    .digest("hex")
+    .slice(0, 16);
+  const file = `auth-${id}.json`;
+  if (
+    !error.includes("Failed to resolve API key for provider") ||
+    !error.includes(file)
+  )
+    return null;
+  try {
+    const resultPath = path.join(authDir, `${file}.result.json`);
+    const result = JSON.parse(fs.readFileSync(resultPath, "utf8"));
+    const age = Date.now() - result.at;
+    if (
+      result.piPid !== process.pid ||
+      !Number.isFinite(age) ||
+      age < 0 ||
+      age > 30_000
+    )
+      return null;
+    const reasons = {
+      timeout: "timed out before Pi's ten-second deadline",
+      failed_exit: "exited unsuccessfully",
+      empty: "returned an empty token",
+      invalid_output: "returned invalid UTF-8",
+      output_limit: "exceeded the output limit",
+      start_failed: "could not start",
+      invalid_command: "has no command configured",
+      cancelled: "was cancelled",
+    };
+    const reason = reasons[result.kind];
+    if (!reason) return null;
+    fs.unlinkSync(resultPath);
+    return {
+      code: `pi_auth_${result.kind}`,
+      message: `Pi authentication helper ${reason}. Check the configured token command, then send another message to retry. Your session is preserved.`,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
 // Re-read authHeaders from config.json on each outbound request. The bearer
 // baked at launch dies with the ~1h Databricks OAuth lifetime; the runner
 // re-mints it into config.json each turn (PiNativeExecutor), so re-reading
@@ -779,7 +831,29 @@ function headers(config) {
   };
 }
 
-async function postEvent(config, body) {
+const _ASSISTANT_ITEM_MAX_ATTEMPTS = 3;
+const _ASSISTANT_ITEM_INITIAL_BACKOFF_MS = 50;
+const _ASSISTANT_ITEM_MAX_BACKOFF_MS = 250;
+const _ASSISTANT_ITEM_POST_TIMEOUT_MS = 5_000;
+
+function boundedSourceId(sourceId) {
+  const value = typeof sourceId === "string" ? sourceId.trim() : "";
+  if (!value) throw new Error("assistant conversation item requires source_id");
+  if (value.length <= 256) return value;
+  return `pi:${crypto.createHash("sha256").update(value).digest("hex")}`;
+}
+
+function eventPostError(response) {
+  const status = response && response.status;
+  if (typeof status === "number" && Number.isFinite(status)) {
+    const error = new Error(`Omnigent event POST failed with HTTP ${status}`);
+    error.status = status;
+    return error;
+  }
+  return new Error("Omnigent event POST returned an invalid response");
+}
+
+async function postEventChecked(config, body, signal) {
   if (
     !config ||
     !config.serverUrl ||
@@ -788,15 +862,91 @@ async function postEvent(config, body) {
   )
     return;
   const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/events`;
+  const request = {
+    method: "POST",
+    headers: headers(config),
+    body: JSON.stringify(body),
+  };
+  if (signal) request.signal = signal;
+  const response = await fetch(url, request);
+  const status = response && response.status;
+  if (
+    !response ||
+    (typeof status === "number" &&
+      (!Number.isFinite(status) || status < 200 || status >= 300)) ||
+    (typeof status !== "number" && response.ok !== true)
+  ) {
+    throw eventPostError(response);
+  }
+  return response;
+}
+
+async function postEvent(config, body) {
   try {
-    await fetch(url, {
-      method: "POST",
-      headers: headers(config),
-      body: JSON.stringify(body),
-    });
+    await postEventChecked(config, body);
   } catch (_err) {
     // Keep Pi responsive even if Omnigent is temporarily unavailable.
   }
+}
+
+function isRetryableAssistantError(error) {
+  const status = error && error.status;
+  if (typeof status !== "number") return true;
+  return status === 408 || status === 429 || (status >= 500 && status <= 599);
+}
+
+function assistantItemPostTimeoutMs(config) {
+  const configured = config && config.assistantItemPostTimeoutMs;
+  return typeof configured === "number" &&
+    Number.isFinite(configured) &&
+    configured > 0
+    ? configured
+    : _ASSISTANT_ITEM_POST_TIMEOUT_MS;
+}
+
+// Final assistant messages and errors survive transient transport failures.
+async function postConversationItem(config, data, sourceId) {
+  const body = {
+    type: "external_conversation_item",
+    data: { ...data, source_id: boundedSourceId(sourceId) },
+  };
+  let backoff = _ASSISTANT_ITEM_INITIAL_BACKOFF_MS;
+  let lastError;
+  for (let attempt = 1; attempt <= _ASSISTANT_ITEM_MAX_ATTEMPTS; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      assistantItemPostTimeoutMs(config),
+    );
+    try {
+      return await postEventChecked(config, body, controller.signal);
+    } catch (err) {
+      lastError = err;
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (
+      attempt === _ASSISTANT_ITEM_MAX_ATTEMPTS ||
+      !isRetryableAssistantError(lastError)
+    )
+      break;
+    await sleep(backoff);
+    backoff = Math.min(backoff * 2, _ASSISTANT_ITEM_MAX_BACKOFF_MS);
+  }
+  throw lastError || new Error("assistant conversation item POST failed");
+}
+
+function assistantMessageSourceId(message, responseId, text) {
+  const response =
+    message && typeof message.responseId === "string" && message.responseId
+      ? `response:${message.responseId}`
+      : "";
+  const timestamp =
+    message && typeof message.timestamp === "number"
+      ? `timestamp:${message.timestamp}`
+      : "";
+  const identity = response || timestamp || `turn:${responseId}:${fingerprint(text)}`;
+  return boundedSourceId(`pi:assistant:${identity}`);
 }
 
 async function patchExternalSessionId(config, nativeSessionId) {
@@ -1278,6 +1428,7 @@ function startInboxPoller(
 }
 
 module.exports = function (pi) {
+  process.env.OMNIGENT_PI_NATIVE_PID = String(process.pid);
   const config = readConfig();
   let sequence = 0;
   let turnOrdinal = 0;
@@ -1298,6 +1449,7 @@ module.exports = function (pi) {
   const postedToolCalls = new Set();
   const postedToolResults = new Set();
   const postedReasoning = new Set();
+  const postedAssistantMessages = new Set();
   const streamedReasoningBlocks = new Set();
   const toolCallsById = new Map();
   const pendingInterruptMs = 30_000;
@@ -1948,6 +2100,7 @@ module.exports = function (pi) {
     postedToolCalls.clear();
     postedToolResults.clear();
     postedReasoning.clear();
+    postedAssistantMessages.clear();
     streamedReasoningBlocks.clear();
     toolCallsById.clear();
     streamedTextIndex.clear();
@@ -2117,9 +2270,15 @@ module.exports = function (pi) {
     rememberContext(ctx);
     replayPendingInterrupt(ctx);
     setOmnigentStatus(config, ctx, undefined);
-    const message = event ? event.message : undefined;
+    let message = event ? event.message : undefined;
     const role = messageRole(message);
     if (role !== "assistant") return;
+    const authFailure = nativeAuthFailure(message, ctx);
+    if (authFailure) {
+      message = { ...message, errorMessage: authFailure.message };
+      if (ctx && ctx.ui && ctx.ui.notify)
+        ctx.ui.notify(authFailure.message, "error");
+    }
     const responseId = currentResponseId();
     // Close the live preview for this message (no-op if nothing streamed),
     // then bump the ordinal so the NEXT assistant message of this turn
@@ -2146,28 +2305,31 @@ module.exports = function (pi) {
         ? message.errorMessage
         : "";
     if (stopReason === "error" && errorMessage) {
-      await postEvent(config, {
-        type: "external_conversation_item",
-        data: {
+      await postConversationItem(
+        config,
+        {
           response_id: responseId,
           item_type: "error",
           item_data: {
             source: "execution",
-            code: "RuntimeError",
+            code: authFailure ? authFailure.code : "RuntimeError",
             message: `Pi model error: ${errorMessage}`,
           },
         },
-      });
+        assistantMessageSourceId(message, responseId, errorMessage),
+      );
       return;
     }
     const text = textFromMessage(message);
     if (!text) return;
+    const sourceId = assistantMessageSourceId(message, responseId, text);
+    if (postedAssistantMessages.has(sourceId)) return;
     // The authoritative assistant item. The web UI retires + replaces the
     // oldest in-flight live preview in place with this (FIFO; one preview
     // per message), so the streamed partials never duplicate the final.
-    await postEvent(config, {
-      type: "external_conversation_item",
-      data: {
+    await postConversationItem(
+      config,
+      {
         response_id: responseId,
         item_type: "message",
         item_data: {
@@ -2176,7 +2338,11 @@ module.exports = function (pi) {
           content: [{ type: "output_text", text }],
         },
       },
-    });
+      sourceId,
+    );
+    // Retry a failed callback on its next delivery; only suppress duplicates
+    // after the authoritative POST has been accepted.
+    postedAssistantMessages.add(sourceId);
   });
 
   pi.on("turn_end", async (event, ctx) => {

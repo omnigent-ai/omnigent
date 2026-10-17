@@ -69,13 +69,13 @@ function isBlockedHostname(hostname) {
 
 /**
  * Decide whether an AGENT-issued navigation to `url` is allowed: `{ ok: true }`
- * for an http(s) URL to a non-internal host, else `{ ok: false, error }`. Never
- * throws — an unparseable URL is a rejection.
+ * for an http(s) URL to a non-internal host (or eligible Arca loopback), else
+ * `{ ok: false, error }`. Never throws — an unparseable URL is a rejection.
  *
  * @param {string} url
  * @returns {{ ok: true } | { ok: false, error: string }}
  */
-function isAgentNavigationAllowed(url) {
+function isAgentNavigationAllowed(url, { allowLocalhost = false } = {}) {
   if (typeof url !== "string" || url.trim() === "") {
     return { ok: false, error: "navigation blocked: empty url" };
   }
@@ -92,6 +92,9 @@ function isAgentNavigationAllowed(url) {
     };
   }
   const hostname = parsed.hostname;
+  if (allowLocalhost && ["localhost", "127.0.0.1", "[::1]"].includes(hostname)) {
+    return { ok: true };
+  }
   if (isBlockedHostname(hostname)) {
     return {
       ok: false,

@@ -42,11 +42,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import io
 import json
 import shutil
-import tarfile
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +51,7 @@ import httpx
 import pytest
 
 from tests._helpers.live_server import isolated_local_server
+from tests._helpers.native_session import create_native_session
 
 # CI shells can carry an egress proxy; every HTTP call here targets 127.0.0.1.
 _http = httpx.Client(trust_env=False)
@@ -65,57 +63,6 @@ _http = httpx.Client(trust_env=False)
 _MARKER_ALPHA = "stall-replay-alpha-committed-before-the-stall"
 _MARKER_BRAVO = "stall-replay-bravo-the-stalled-post"
 _MARKER_CHARLIE = "stall-replay-charlie-after-the-stall"
-
-
-def _create_claude_native_session(base_url: str) -> str:
-    """Create a claude-native wrapper session exactly like ``omnigent claude``.
-
-    Reuses the production spec materializer and stamps the same wrapper /
-    terminal-first labels the CLI writes, so the created session is a real
-    claude-native conversation -- the kind whose transcript the forwarder
-    mirrors in production.
-
-    :param base_url: Spawned server base URL.
-    :returns: The new session/conversation id.
-    """
-    from omnigent._wrapper_labels import (
-        CLAUDE_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
-    )
-    from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
-
-    with tempfile.TemporaryDirectory() as tmp:
-        yaml_text = _materialize_claude_agent_spec(Path(tmp)).read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        # Non-config.yaml arcname routes through the omnigent compat translator
-        # (the wrapper spec has no ``spec_version``).
-        info = tarfile.TarInfo("claude-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    labels = {
-        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY: CLAUDE_NATIVE_WRAPPER_VALUE,
-    }
-    create = _http.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({"labels": labels})},
-        files={
-            "bundle": (
-                "claude-native-ui.tar.gz",
-                buf.getvalue(),
-                "application/gzip",
-            )
-        },
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    return str(create.json()["session_id"])
 
 
 def _seed_transcript(bridge_dir: Path) -> Path:
@@ -265,7 +212,9 @@ def test_forward_loop_stall_does_not_duplicate_committed_items(tmp_path: Path) -
 
     try:
         with isolated_local_server(tmp_path) as base_url:
-            session_id = _create_claude_native_session(base_url)
+            session_id = str(
+                create_native_session(_http, base_url, harness="claude")["session_id"]
+            )
             # Root the bridge dir under the production claude-native bridge root
             # (prepare_bridge_dir is the same helper the runner uses at launch), so
             # the forwarder tails a genuinely-rooted bridge exactly as in production.

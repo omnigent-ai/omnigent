@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import builtins
 from abc import ABC, abstractmethod
+from typing import Any
 
 from omnigent.entities import Agent, PagedList
+
+_UNSET: Any = object()
 
 
 class AgentStore(ABC):
@@ -121,6 +124,8 @@ class AgentStore(ABC):
         agent_id: str,
         bundle_location: str,
         created_by: str | None = None,
+        *,
+        description: str | None = _UNSET,
     ) -> Agent | None:
         """
         Update an agent's bundle location, bump its version, and
@@ -136,6 +141,8 @@ class AgentStore(ABC):
             session-scoped mutation routes to heal pre-migration rows
             whose ``created_by`` is ``None``; template-refresh callers
             leave it ``None`` so template rows stay unowned.
+        :param description: Replacement description; omit to preserve, or pass
+            ``None`` to clear the stored description.
         :returns: The updated :class:`Agent`, or ``None`` if not
             found.
         """
@@ -154,3 +161,87 @@ class AgentStore(ABC):
             it did not exist.
         """
         ...
+
+    # ── User agents ─────────────────────────────────────────────
+    # Agents a user installed or uploaded (kind "user", owned via created_by).
+    # Non-abstract with safe defaults, so a store that doesn't implement them
+    # keeps working and the server reports user agents as unsupported.
+
+    @property
+    def supports_config_edit(self) -> bool:
+        """Whether :meth:`update_configuration` supports atomic configuration edits."""
+        return False
+
+    def update_configuration(
+        self,
+        expected: Agent,
+        bundle_location: str,
+        *,
+        description: str | None,
+        created_by: str | None = None,
+    ) -> Agent | None:
+        """Replace configuration only if the observed agent revision still matches.
+
+        Match ID, creation time, kind, owner, version and bundle location in the
+        current workspace.
+        An unchanged bundle, description and owner checks the revision without
+        bumping version or timestamp. Returns ``None`` on conflict or deletion.
+
+        :param expected: Previously read agent, including its observed revision.
+        :param bundle_location: New immutable artifact key.
+        :param description: Replacement description; ``None`` clears it.
+        :param created_by: Claim an unowned user agent on a successful comparison;
+            never replace an existing owner or claim a server agent.
+        :returns: The current or updated agent, or ``None`` on a failed comparison.
+        :raises NotImplementedError: When atomic configuration edits are unsupported.
+        """
+        raise NotImplementedError("this agent store does not support configuration edits")
+
+    @property
+    def supports_user_agents(self) -> bool:
+        """Whether :meth:`create_user_agent` and :meth:`list_user_agents` work."""
+        return False
+
+    def create_user_agent(
+        self,
+        agent_id: str,
+        name: str,
+        bundle_location: str,
+        owner: str | None,
+        description: str | None = None,
+    ) -> Agent:
+        """
+        Insert a user agent owned by *owner*.
+
+        :param agent_id: Id for the new row, e.g. ``"0f1a2b3c..."``.
+        :param name: Agent name, e.g. ``"orion"``.
+        :param bundle_location: Artifact key, ``"<agent_id>/<sha256>"``.
+        :param owner: Owning user id, or ``None`` on an auth-less server.
+        :param description: Optional description.
+        :returns: The created :class:`Agent`.
+        :raises NotImplementedError: When the store doesn't support user agents.
+        """
+        raise NotImplementedError("this agent store does not support user agents")
+
+    def list_user_agents(
+        self,
+        owner: str | None,
+        limit: int = 50,
+        after: str | None = None,
+    ) -> PagedList[Agent]:
+        """
+        List *owner*'s own agents, newest first, each by its own id.
+
+        Returns originals only (a bundle stored under the row's own id; legacy
+        fork and switch copies are skipped). Names may repeat: callers address
+        an agent by id. Reads a bounded number of rows per call, so a page may
+        hold fewer than ``limit`` agents; ``last_id`` is the last row read and
+        continues the listing.
+
+        :param owner: Owning user id, or ``None`` on an auth-less server.
+        :param limit: Maximum agents to return, e.g. ``50``.
+        :param after: ``last_id`` of the previous page.
+        :returns: The page; empty when the store doesn't support user agents.
+        """
+        del owner, limit, after
+        return PagedList(data=[], first_id=None, last_id=None, has_more=False)

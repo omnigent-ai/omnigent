@@ -30,18 +30,17 @@ Usage::
 
 from __future__ import annotations
 
-import io
-import json
 import os
 import socket
 import subprocess
 import sys
-import tarfile
 import time
 from pathlib import Path
 
 import httpx
 import yaml
+
+from tests._helpers.session import bundle_files, post_session_bundle
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -160,13 +159,8 @@ def _make_inline_bundle(name: str) -> bytes:
             },
         },
     }
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml.dump(config).encode()
-        info = tarfile.TarInfo(f"{name}.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-    return buf.getvalue()
+    data = yaml.dump(config).encode()
+    return bundle_files({f"{name}.yaml": data})
 
 
 def _seed_history(database_uri: str, session_id: str, n_items: int) -> None:
@@ -264,16 +258,10 @@ def test_fork_does_not_pay_per_item_encode_round_trips(tmp_path: Path) -> None:
 
         # A long-lived source session: agent-bound (fork requires it), with
         # a 600-item committed history.
-        create = _http.post(
+        create = post_session_bundle(
+            _http.post,
             f"{base_url}/v1/sessions",
-            data={"metadata": json.dumps({})},
-            files={
-                "bundle": (
-                    "agent.tar.gz",
-                    _make_inline_bundle("fork-encode-bench"),
-                    "application/gzip",
-                )
-            },
+            _make_inline_bundle("fork-encode-bench"),
             timeout=30.0,
         )
         assert create.status_code in (200, 201), create.text[:500]

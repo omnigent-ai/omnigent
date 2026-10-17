@@ -481,14 +481,14 @@ def test_detection_priority_order(clean_env, monkeypatch: pytest.MonkeyPatch) ->
 
 # ── Codex config.toml custom provider (cli-config) detection ───────────────
 
-# The exact shape `isaac configure codex` writes (AI Gateway mode): a custom
+# The exact shape `isaac configure codex` writes (Unity Gateway mode): a custom
 # [model_providers.Databricks] table authenticated by a token-printing
 # command, selected via a top-level model_provider — and NO auth.json.
 _ISAAC_STYLE_CODEX_CONFIG = """
 model_provider = "Databricks"
 
 [model_providers.Databricks]
-name = "Databricks AI Gateway"
+name = "Databricks Unity Gateway"
 base_url = "https://example.ai-gateway.cloud.databricks.com/codex/v1"
 wire_api = "responses"
 
@@ -511,7 +511,7 @@ _ISAAC_STYLE_DETECTION = DetectedProvider(
     family="openai",
     source="~/.codex/config.toml provider 'Databricks'",
     model_provider="Databricks",
-    display_name="Databricks AI Gateway",
+    display_name="Databricks Unity Gateway",
 )
 
 
@@ -955,7 +955,7 @@ def test_claude_managed_gateway_synthesizes_a_subscription_entry(clean_env, monk
 @pytest.mark.parametrize(
     "payload,expected",
     [
-        (_ISAAC_CLAUDE_SETTINGS, "Databricks AI Gateway"),
+        (_ISAAC_CLAUDE_SETTINGS, "Databricks Unity Gateway"),
         (
             {
                 "env": {"ANTHROPIC_BASE_URL": "https://llm.corp.example.com/v1"},

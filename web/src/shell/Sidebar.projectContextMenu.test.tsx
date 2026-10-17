@@ -170,6 +170,18 @@ describe("project folder header context menu", () => {
     expect(screen.getByTestId("rename-project-confirm")).toBeInTheDocument();
   });
 
+  it("focuses and selects the project name when the rename dialog opens", async () => {
+    renderSidebar();
+
+    fireEvent.contextMenu(folderHeader());
+    fireEvent.click(screen.getByTestId("rename-project"));
+
+    const input = screen.getByDisplayValue(PROJECT_NAME) as HTMLInputElement;
+    await waitFor(() => expect(input).toHaveFocus());
+    expect(input.selectionStart).toBe(0);
+    expect(input.selectionEnd).toBe(PROJECT_NAME.length);
+  });
+
   it("drives Rename into the shared dialog and mutation", async () => {
     renderSidebar();
 
@@ -326,9 +338,13 @@ describe("project folder header context menu", () => {
     expect(screen.getByTestId("rename-project")).toBeInTheDocument();
   });
 
-  it("toggles on the first keyboard activation after dismissal", async () => {
+  it("restores keyboard focus on dismissal after a previous menu opened a dialog", async () => {
     renderSidebar();
     const header = folderHeader();
+    fireEvent.contextMenu(header);
+    fireEvent.click(screen.getByTestId("rename-project"));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     header.focus();
 
     fireEvent.contextMenu(header, { detail: 0 });

@@ -1,9 +1,14 @@
 import { PanelLeftOpenIcon, PanelRightOpenIcon, SearchIcon, SettingsIcon } from "lucide-react";
 
+import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
+
+const SIDEBAR_TOGGLE_KEYS = [MOD_KEY, ALT_KEY, "["] as const;
+const SEARCH_KEYS = [MOD_KEY, "K"] as const;
+const SETTINGS_KEYS = [MOD_KEY, ALT_KEY, ","] as const;
 
 /**
  * Search / Settings / sidebar-toggle cluster from the sidebar's header row.
@@ -65,6 +70,7 @@ export function SidebarHeaderActions({
             variant="ghost"
             size="icon-xs"
             aria-label={expanded ? "Close sidebar" : "Open sidebar"}
+            aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+[`}
             onClick={onToggle}
             onPointerEnter={onTogglePointerEnter}
             onPointerDown={onTogglePointerDown}
@@ -85,24 +91,17 @@ export function SidebarHeaderActions({
             )}
           </Button>
         </TooltipTrigger>
-        <TooltipContent side="bottom">
-          {expanded ? "Collapse sidebar" : "Open sidebar"}
+        <TooltipContent side="bottom" shortcut={SIDEBAR_TOGGLE_KEYS}>
+          <span>{expanded ? "Collapse sidebar" : "Open sidebar"}</span>
         </TooltipContent>
       </Tooltip>
     </div>
   );
 }
 
-/**
- * Mobile treatment shared by the two floating icon buttons: a thumb-sized round
- * chip in iOS liquid glass. The look lives in one CSS class
- * (`.sidebar-glass-chip` in index.css) that both chips wear, so Search and
- * Settings can't drift apart — they had, one landing opaque with a heavier
- * shadow than the other. On desktop the class is inert (it is scoped to the
- * mobile breakpoint) and these stay flat 24px ghost icons in the header row.
- */
+/** Shared sizing for the mobile icon-only Search and Settings actions. */
 const SIDEBAR_FLOAT_BUTTON =
-  "sidebar-glass-chip size-6 text-muted-foreground hover:text-foreground max-md:size-11 max-md:rounded-full max-md:text-foreground";
+  "size-6 text-muted-foreground hover:text-foreground max-md:size-11 max-md:text-foreground";
 
 const SIDEBAR_FLOAT_ICON = "size-4 max-md:size-[22px]";
 
@@ -132,6 +131,7 @@ export function SidebarSearchButton({
           variant="ghost"
           size="icon-xs"
           aria-label="Search"
+          aria-keyshortcuts={`${ARIA_MOD_KEY}+K`}
           onClick={() => onOpenSearch?.()}
           className={cn(SIDEBAR_FLOAT_BUTTON, className)}
           data-testid="sidebar-search-button"
@@ -141,7 +141,9 @@ export function SidebarSearchButton({
       </TooltipTrigger>
       {/* Bottom placement keeps the tooltip clear of the macOS Electron
       shell's traffic lights at the window's top edge. */}
-      <TooltipContent side="bottom">Search</TooltipContent>
+      <TooltipContent side="bottom" shortcut={SEARCH_KEYS}>
+        <span>Search</span>
+      </TooltipContent>
     </Tooltip>
   );
 }
@@ -172,6 +174,7 @@ export function SidebarSettingsButton({
           variant="ghost"
           size="icon-xs"
           aria-label="Settings"
+          aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+,`}
           className={cn(SIDEBAR_FLOAT_BUTTON, "rounded-[8px] bg-transparent", className)}
         >
           <Link to="/settings" onClick={onSettingsClick} data-testid={testId}>
@@ -179,8 +182,8 @@ export function SidebarSettingsButton({
           </Link>
         </Button>
       </TooltipTrigger>
-      <TooltipContent side="bottom" sideOffset={14}>
-        Settings
+      <TooltipContent side="bottom" shortcut={SETTINGS_KEYS}>
+        <span>Settings</span>
       </TooltipContent>
     </Tooltip>
   );

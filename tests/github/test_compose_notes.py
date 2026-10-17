@@ -33,21 +33,21 @@ def _raw(highlights: str) -> str:
         "## Bug fixes\n\n- Fixed crashes (#1, @alice)",
     ],
 )
-def test_curated_sections_and_remaining_contributions(highlights: str) -> None:
+def test_curated_sections_omit_other_contributions(highlights: str) -> None:
     notes = compose_notes(_raw(highlights), CREDITS, REPO)
     highlighted = set(re.findall(r"#(\d+)", highlights))
-    summary, others = notes.split("## Other contributions")
+    summary, thanks = notes.split("### 💜 Thanks to our community")
     assert re.findall(r"(?m)^## .+$", summary) == re.findall(r"(?m)^## .+$", highlights)
     assert summary.count("- ") == highlights.count("- ")
     for credit in CREDITS:
         link = f"[#{credit['pr']}](https://github.com/o/o/pull/{credit['pr']})"
-        assert notes.count(link) == 1
+        assert notes.count(link) == int(str(credit["pr"]) in highlighted)
         assert (link in summary) == (str(credit["pr"]) in highlighted)
-        assert (link in others) == (str(credit["pr"]) not in highlighted)
-        assert f"[@{credit['author']}]({credit['author_url']})" in notes
-    assert "[#2](https://github.com/o/o/pull/2), [#5](https://github.com/o/o/pull/5), " in others
-    assert "\n- " not in others
+        assert f"[@{credit['author']}]({credit['author_url']})" in thanks
+    assert "/pull/" not in thanks
+    assert "## Other contributions" not in notes
     assert "## All contributions" not in notes
+    assert notes.endswith("Full Changelog: https://github.com/o/o/blob/main/CHANGELOG.md\n")
 
 
 @pytest.mark.parametrize(
@@ -61,22 +61,27 @@ def test_curated_sections_and_remaining_contributions(highlights: str) -> None:
         _raw("## Bug fixes\n## Bug fixes\n- Duplicate headings (#1)"),
         _raw("## Bug fixes\n- Unknown PR (#999)"),
         _raw("## Bug fixes\n- Missing PR citation"),
+        _raw("## Bug fixes\n- Fixed (#1)\n\n## Other contributions\n- Other (#2)"),
     ],
 )
 def test_unavailable_or_invalid_highlights_keep_every_credit(raw: str) -> None:
     assert compose_notes(raw, CREDITS, REPO) == compose_notes("", CREDITS, REPO)
     notes = compose_notes(raw, CREDITS, REPO)
-    assert notes.startswith("## Other contributions\n")
-    assert notes.count("/pull/") == len(CREDITS)
+    assert notes.startswith("### 💜 Thanks to our community\n")
+    assert "Other contributions" not in notes
+    assert "/pull/" not in notes
+    for credit in CREDITS:
+        assert f"[@{credit['author']}]({credit['author_url']})" in notes
 
 
 def test_highlight_credits_use_github_authors_and_deduplicate() -> None:
     notes = compose_notes(_raw("## Bug fixes\n- Fixed issues (#2, #5, #2, @wrong)"), CREDITS, REPO)
-    summary, others = notes.split("## Other contributions")
+    summary, thanks = notes.split("### 💜 Thanks to our community")
     assert "@wrong" not in notes
     assert summary.count("[@bob]") == 1
     assert summary.count("/pull/2)") == 1
-    assert "/pull/2)" not in others and "/pull/5)" not in others
+    assert summary.count("/pull/5)") == 1
+    assert "/pull/" not in thanks
 
 
 def test_all_highlighted_omits_empty_other_section() -> None:
@@ -85,17 +90,19 @@ def test_all_highlighted_omits_empty_other_section() -> None:
     assert "Full Changelog:" in notes
 
 
-def test_grouping_handles_bots_deleted_authors_and_sorting() -> None:
+@pytest.mark.parametrize("raw", ["", _raw("## Bug fixes\n- Fixed (#3)")])
+def test_community_handles_bots_and_deleted_authors(raw: str) -> None:
     credits = [
         {"pr": 3, "author": "", "author_url": ""},
         {"pr": 2, "author": "bot[bot]", "author_url": "https://github.com/apps/bot"},
         {"pr": 1, "author": "bot[bot]", "author_url": "https://github.com/apps/bot"},
     ]
-    notes = compose_notes("", credits, REPO)
-    assert "[#3](https://github.com/o/o/pull/3), Author unavailable" in notes
-    assert "Author unavailable; [#1]" in notes
-    assert "[#1](https://github.com/o/o/pull/1), [#2](https://github.com/o/o/pull/2)" in notes
-    assert notes.count("[@bot[bot]](https://github.com/apps/bot)") == 2
+    notes = compose_notes(raw, credits, REPO)
+    assert "Author unavailable" not in notes
+    assert "Other contributions" not in notes
+    assert "/pull/1)" not in notes and "/pull/2)" not in notes
+    assert ("/pull/3)" in notes) == bool(raw)
+    assert notes.count("[@bot[bot]](https://github.com/apps/bot)") == 1
 
 
 @pytest.mark.parametrize("raw", ["", _raw("## Bug fixes\n- Fixed (#1, #2, #3, #4, #5)")])
@@ -132,7 +139,15 @@ def test_community_note_without_known_authors() -> None:
     assert "Author unavailable" not in thanks
 
 
-def test_cli_missing_highlights_uses_grouped_fallback(tmp_path: Path) -> None:
+def test_empty_release_keeps_community_note_and_changelog_link() -> None:
+    notes = compose_notes("", [], REPO)
+    assert notes.startswith("### 💜 Thanks to our community\n")
+    assert "Other contributions" not in notes
+    assert "[@" not in notes
+    assert notes.endswith("Full Changelog: https://github.com/o/o/blob/main/CHANGELOG.md\n")
+
+
+def test_cli_missing_highlights_uses_community_fallback(tmp_path: Path) -> None:
     credits = tmp_path / "credits.json"
     credits.write_text(json.dumps(CREDITS))
     out = tmp_path / "notes.md"
@@ -181,7 +196,7 @@ def test_fallback_warning_explains_reason_and_preserves_credits(raw, reason, cap
     warning = capsys.readouterr().err
     assert "::warning::Release highlights omitted:" in warning
     assert reason in warning
-    assert "Keeping complete contributor groups" in warning
+    assert "Keeping community thanks and the full changelog link" in warning
 
 
 def test_valid_highlights_and_intentional_fallback_do_not_warn(capsys) -> None:
@@ -198,7 +213,7 @@ def test_repeated_pr_across_highlights_falls_back_with_reason(capsys) -> None:
     assert "repeats an already-cited PR" in capsys.readouterr().err
 
 
-def test_cli_invalid_utf8_preserves_complete_fallback(tmp_path: Path) -> None:
+def test_cli_invalid_utf8_preserves_community_fallback(tmp_path: Path) -> None:
     credits = tmp_path / "credits.json"
     credits.write_text(json.dumps(CREDITS))
     highlights = tmp_path / "highlights.txt"

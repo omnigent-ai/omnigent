@@ -20,11 +20,13 @@ import contextlib
 import os
 import re
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 from tests.e2e.conftest import configure_mock_llm, reset_mock_llm
 
 pexpect = pytest.importorskip("pexpect")
@@ -71,6 +73,7 @@ def _build_repl_env(mock_llm_server_url: str, tmp_home: Path) -> dict[str, str]:
         "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
         "HOME": str(tmp_home),
         "OMNIGENT_CONFIG_HOME": str(config_home),
+        "OMNIGENT_DATA_DIR": str(config_home),
         "DATABRICKS_CONFIG_FILE": str(real_databrickscfg),
         "OMNIGENT_SKIP_ONBOARD": "1",
         "OMNIGENT_NO_UPDATE_CHECK": "1",
@@ -80,7 +83,14 @@ def _build_repl_env(mock_llm_server_url: str, tmp_home: Path) -> dict[str, str]:
         "COLUMNS": "120",
         "PROMPT_TOOLKIT_NO_CPR": "1",
     }
-    for k in ("ANTHROPIC_API_KEY", "CLAUDE_CODE", "CLAUDECODE", "CODEX", "DATABRICKS_TOKEN"):
+    for k in (
+        "ANTHROPIC_API_KEY",
+        "CLAUDE_CODE",
+        "CLAUDECODE",
+        "CODEX",
+        "DATABRICKS_TOKEN",
+        "OMNIGENT_DATABASE_URI",
+    ):
         env.pop(k, None)
     return ensure_repl_test_theme_env(env)
 
@@ -92,22 +102,7 @@ def _spawn_sessions_repl(
     timeout: int = 120,
 ) -> Any:
     """Spawn ``omnigent run`` under a PTY (sessions API is default)."""
-    return pexpect.spawn(
-        sys.executable,
-        [
-            "-m",
-            "omnigent",
-            "run",
-            str(yaml_path),
-            "--no-session",
-        ],
-        env=env,
-        cwd=str(_REPO_ROOT),
-        encoding="utf-8",
-        codec_errors="replace",
-        timeout=timeout,
-        dimensions=(40, 120),
-    )
+    return _spawn_repl_with_args(yaml_path, env, timeout=timeout)
 
 
 def _spawn_repl_with_args(
@@ -127,7 +122,7 @@ def _spawn_repl_with_args(
     ]
     if extra_args:
         args.extend(extra_args)
-    return pexpect.spawn(
+    child = pexpect.spawn(
         sys.executable,
         args,
         env=env,
@@ -137,6 +132,16 @@ def _spawn_repl_with_args(
         timeout=timeout,
         dimensions=(40, 120),
     )
+    try:
+        log_dir = Path(env["OMNIGENT_DATA_DIR"]) / "logs" / "cli"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        child.logfile_read = (log_dir / f"sessions-repl-{child.pid}.log").open(
+            "w", encoding="utf-8"
+        )
+    except BaseException:
+        child.close(force=True)
+        raise
+    return child
 
 
 def _wait_for_prompt_ready(child: Any, timeout: float = 60.0) -> None:
@@ -161,23 +166,37 @@ def _read_pending(child: Any, seconds: float = 0.3) -> str:
 
 def _clean_exit(child: Any) -> None:
     """Best-effort clean exit of the REPL."""
+    original_error = sys.exception()
     try:
-        child.sendcontrol("d")
-        child.expect(pexpect.EOF, timeout=10)
-    except pexpect.ExceptionPexpect:
-        pass
-    if child.isalive():
-        child.terminate(force=True)
+        try:
+            if child.isalive():
+                with contextlib.suppress(pexpect.ExceptionPexpect, OSError):
+                    child.sendcontrol("d")
+                    child.expect(pexpect.EOF, timeout=10)
+            if child.isalive():
+                child.terminate(force=True)
+        finally:
+            if child.logfile_read is not None:
+                child.logfile_read.close()
+    except (pexpect.ExceptionPexpect, OSError) as cleanup_error:
+        if original_error is None:
+            raise
+        original_error.add_note(f"REPL cleanup failed: {cleanup_error}")
 
 
 @pytest.fixture(scope="module")
 def repl_env(
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
-) -> dict[str, str]:
+) -> Iterator[dict[str, str]]:
     """Build the env dict for REPL spawning with mock LLM."""
     tmp_home = tmp_path_factory.mktemp("repl_sessions_home")
-    return _build_repl_env(mock_llm_server_url, tmp_home)
+    env = _build_repl_env(mock_llm_server_url, tmp_home)
+    try:
+        yield env
+    finally:
+        _, survivors = reap_leaked_omnigent_processes(env["OMNIGENT_DATA_DIR"])
+        assert not survivors, f"sessions REPL processes survived cleanup: {survivors}"
 
 
 def _configure_simple_response(mock_llm_server_url: str) -> None:
@@ -223,11 +242,7 @@ def test_sessions_single_approval_allows_llm_response(
         child.send("y\r")
         child.expect("approved", timeout=10)
 
-        buffered = _read_pending(child, seconds=5.0)
-        buffered += _read_pending(child, seconds=3.0)
-        assert re.search(r"[A-Za-z]{3,}", buffered), (
-            f"No LLM response after approval.\nBuffer:\n{buffered[:800]}"
-        )
+        child.expect("I am a friendly assistant", timeout=8)
     except pexpect.EOF:
         buf = _strip_ansi(child.before or "")
         pytest.fail(f"REPL exited early. Full buffer:\n{buf[-2000:]}")

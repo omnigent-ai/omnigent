@@ -76,6 +76,17 @@ describe("ApprovePage states", () => {
     expect(screen.getByRole("button", { name: /Reject/ })).toBeInTheDocument();
   });
 
+  it("renders a native permission message with its tool name in bold", async () => {
+    // WHY: the hook's "… wants to call **Bash**" must not show its asterisks here
+    // any more than on the chat card.
+    vi.mocked(identity.authenticatedFetch).mockResolvedValue(
+      jsonResponse({ status: "pending", message: "Claude wants to call **Bash**" }),
+    );
+    renderPage();
+    const bold = await screen.findByText("Bash", { selector: "strong" });
+    expect(bold.parentElement?.textContent).toBe("Claude wants to call Bash");
+  });
+
   it("shows the resolved state when the elicitation is no longer pending", async () => {
     // WHY: a `status: "resolved"` payload means the prompt was already
     // resolved/timed-out/cancelled — no buttons, just an informational alert.

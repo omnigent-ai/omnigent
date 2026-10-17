@@ -431,3 +431,63 @@ async def test_request_phase_skips_gate_when_web_prompt_pending(
     # Skipped → clean ALLOW, and the ASK gate was never entered.
     assert resp.json()["result"] == "POLICY_ACTION_ALLOW"
     assert gate_ran["called"] is False, "dedup must skip the gate when a web prompt is pending"
+
+
+async def test_request_phase_gate_runs_when_the_only_queued_web_prompt_was_interrupted(
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
+) -> None:
+    """
+    A cancelled web prompt does not exempt a later prompt from the request-phase gate.
+
+    The dedup reads a queued entry as "a web prompt is in flight". After the
+    person pressed Stop that entry is a cancelled message, so a prompt typed
+    directly in the TUI afterwards, which has no other request-phase gate, must
+    still be evaluated. If the interrupted entry counted, the ASK policy below
+    would be skipped and the prompt let through.
+    """
+    from omnigent.runtime import pending_inputs
+
+    held: dict[str, Any] = {}
+
+    async def _hold_and_decline(_request: Any, **kwargs: Any) -> bool:
+        held["phase"] = kwargs["phase"]
+        return False  # declined
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._hold_native_ask_gate",
+        _hold_and_decline,
+    )
+    ask_policy = FunctionPolicySpec(
+        name="admin__ask",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._ask_on_request"),
+    )
+    original_caps = get_caps()
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.get_caps",
+        lambda: RuntimeCaps(
+            execution_timeout=original_caps.execution_timeout,
+            default_policies=[ask_policy],
+        ),
+    )
+
+    agent = await create_test_agent(auth_client, user=OWNER)
+    session_id = await _create_session_as(auth_client, OWNER, agent["id"])
+
+    cancelled = pending_inputs.record(session_id, [{"type": "input_text", "text": "delete prod"}])
+    pending_inputs.mark_interrupted(session_id, [cancelled])
+    try:
+        resp = await auth_client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_request_request("typed in the terminal"),
+            headers={"X-Forwarded-Email": OWNER},
+        )
+    finally:
+        pending_inputs.reset_for_tests()
+
+    assert resp.status_code == 200, resp.text
+    # The gate was entered at the REQUEST phase and its decline applied.
+    assert held.get("phase") == Phase.REQUEST
+    assert resp.json()["result"] == "POLICY_ACTION_DENY"

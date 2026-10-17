@@ -465,11 +465,11 @@ def test_import_command_limits_batch_size() -> None:
     """The CLI rejects batch sizes above the safety cap."""
     result = CliRunner().invoke(
         cli,
-        ["import", "--harness", "codex", "--last", "101"],
+        ["import", "--harness", "codex", "--last", "1001"],
     )
 
     assert result.exit_code == 2
-    assert "101 is not in the range 1<=x<=100" in result.output
+    assert "1001 is not in the range 1<=x<=1000" in result.output
 
 
 def test_import_command_all_harnesses_requires_last() -> None:

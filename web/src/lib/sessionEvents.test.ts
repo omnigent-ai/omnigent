@@ -916,6 +916,75 @@ describe("response.elicitation_request (FLAT envelope)", () => {
     const ev = out[0] as ElicitationRequest;
     expect(ev.codexPersistModes).toEqual(["session", "always"]);
   });
+
+  it("lifts agy permission action description and advertised persist pattern", () => {
+    const out = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_agy",
+      params: {
+        mode: "form",
+        message: "Antigravity wants to run: pwd",
+        phase: "agy_permission",
+        policy_name: "agy_native_permission",
+        content_preview: "",
+        requestedSchema: {},
+        action_description: "Running pwd command",
+        always_allow_pattern: "pwd",
+      },
+    });
+
+    expect(out).toHaveLength(1);
+    const ev = out[0] as ElicitationRequest;
+    expect(ev.agyPermission).toEqual({
+      actionDescription: "Running pwd command",
+      alwaysAllowPattern: "pwd",
+    });
+  });
+
+  it("defaults agy permission extras to null when absent or malformed", () => {
+    const out = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_agy_bare",
+      params: {
+        mode: "form",
+        message: "Antigravity wants to run: pwd",
+        phase: "agy_permission",
+        policy_name: "agy_native_permission",
+        content_preview: "",
+        requestedSchema: {},
+        // action_description absent; always_allow_pattern a non-string.
+        always_allow_pattern: 123,
+      },
+    });
+
+    expect(out).toHaveLength(1);
+    const ev = out[0] as ElicitationRequest;
+    expect(ev.agyPermission).toEqual({
+      actionDescription: null,
+      alwaysAllowPattern: null,
+    });
+  });
+
+  it("ignores agy permission extras outside the agy_permission phase", () => {
+    const out = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_not_agy",
+      params: {
+        mode: "form",
+        message: "Codex wants to run date",
+        phase: "codex_command_approval",
+        policy_name: "codex_native_command_approval",
+        content_preview: "",
+        requestedSchema: {},
+        action_description: "Running pwd command",
+        always_allow_pattern: "pwd",
+      },
+    });
+
+    expect(out).toHaveLength(1);
+    const ev = out[0] as ElicitationRequest;
+    expect(ev.agyPermission).toBeNull();
+  });
 });
 
 describe("response.elicitation_resolved (FLAT envelope)", () => {
@@ -1329,12 +1398,13 @@ describe("session.terminal_pending (FLAT envelope)", () => {
 });
 
 describe("session.sandbox_status (FLAT envelope)", () => {
-  it("lifts conversation_id, stage, and error", () => {
+  it("lifts conversation_id, stage, error, and provider", () => {
     const out = parse("session.sandbox_status", {
       type: "session.sandbox_status",
       conversation_id: "conv_abc",
       stage: "cloning",
       error: null,
+      provider: "arclet",
     });
     expect(out).toHaveLength(1);
     const ev = out[0] as SessionSandboxStatusEvent;
@@ -1342,6 +1412,7 @@ describe("session.sandbox_status (FLAT envelope)", () => {
     expect(ev.conversationId).toBe("conv_abc");
     expect(ev.stage).toBe("cloning");
     expect(ev.error).toBeNull();
+    expect(ev.provider).toBe("arclet");
   });
 
   it("carries the failure reason on stage=failed", () => {

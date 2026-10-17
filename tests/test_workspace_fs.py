@@ -88,6 +88,20 @@ def test_read_text_file_returns_utf8_content(tmp_path: Path) -> None:
     assert result["content"] == "# Title\nbody\n"
 
 
+def test_read_text_file_has_no_agent_line_cap(tmp_path: Path) -> None:
+    """Host fallback serves the full file even when it exceeds 2,000 lines."""
+    content = "".join(f"# line {i}: café\n" for i in range(1, 3_001))
+    (tmp_path / "large.py").write_text(content, encoding="utf-8")
+    reader = WorkspaceReader(tmp_path)
+
+    result = reader.list_or_read("large.py")
+
+    assert result["truncated"] is False
+    assert result["encoding"] == "utf-8"
+    assert result["content"] == content
+    assert result["bytes"] == len(content.encode("utf-8"))
+
+
 def test_read_binary_file_returns_base64(tmp_path: Path) -> None:
     """Reading a non-UTF-8 file returns base64-encoded content.
 
@@ -451,10 +465,10 @@ def test_github_info_without_gh_reports_no_pr(tmp_path: Path, monkeypatch) -> No
 
     The tab is a pure PR view, so ``base_ref`` stays null until a PR resolves it.
     """
-    from omnigent import workspace_fs
+    from omnigent.runner import github_resource
 
     _git_branch_repo(tmp_path)
-    monkeypatch.setattr(workspace_fs.github_resource.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: None)
     reader = WorkspaceReader(tmp_path)
 
     info = reader.github_info()
@@ -467,7 +481,7 @@ def test_github_info_without_gh_reports_no_pr(tmp_path: Path, monkeypatch) -> No
 
 def test_github_changes_lists_pr_files(tmp_path: Path, monkeypatch) -> None:
     """``github_changes`` delegates to the gh-backed PR file list."""
-    from omnigent import workspace_fs
+    from omnigent.runner import github_resource
 
     _git_branch_repo(tmp_path)
 
@@ -482,7 +496,7 @@ def test_github_changes_lists_pr_files(tmp_path: Path, monkeypatch) -> None:
             )
         return (1, "", "")
 
-    monkeypatch.setattr(workspace_fs.github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
     reader = WorkspaceReader(tmp_path)
 
     result = reader.github_changes()
@@ -504,7 +518,7 @@ def test_github_file_diff_returns_before_after(tmp_path: Path) -> None:
 
 def test_github_pr_diff_returns_whole_patch(tmp_path: Path, monkeypatch) -> None:
     """``github_pr_diff`` resolves the PR number, then delegates to ``gh pr diff <n>``."""
-    from omnigent import workspace_fs
+    from omnigent.runner import github_resource
 
     _git_branch_repo(tmp_path)
 
@@ -515,7 +529,7 @@ def test_github_pr_diff_returns_whole_patch(tmp_path: Path, monkeypatch) -> None
             return (0, "diff --git a/app.txt b/app.txt\n+changed\n", "")
         return (1, "", "")
 
-    monkeypatch.setattr(workspace_fs.github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
     reader = WorkspaceReader(tmp_path)
 
     result = reader.github_pr_diff()

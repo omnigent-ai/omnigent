@@ -27,7 +27,7 @@ import type {
   ToolExecution,
   ToolResultBlock,
 } from "./blocks";
-import { LIVE_ITEM_PREFIX } from "./blocks";
+import { isTerminalCommandInput, LIVE_ITEM_PREFIX } from "./blocks";
 import { isUserInputElicitation } from "./askUserQuestion";
 import {
   type RoutingDecisionExtras,
@@ -35,7 +35,7 @@ import {
   routingExtras,
 } from "./routingDecision";
 import { isSystemUserContent } from "./systemMessage";
-import type { CodexPersistMode, RememberScope } from "./types";
+import type { AgyPermission, CodexPersistMode, RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
 
 /**
@@ -157,6 +157,7 @@ export type RenderItem =
       allowAutoMode?: boolean;
       rememberScope?: RememberScope | null;
       codexPersistModes?: CodexPersistMode[];
+      agyPermission?: AgyPermission | null;
     };
 
 /** A bubble cluster. The page maps over these. */
@@ -166,7 +167,11 @@ export type Bubble =
       itemId: string;
       /** Queued input that does not yet have a persisted transcript item. */
       pending?: boolean;
+      /** Pending input sent mid-turn that the agent hasn't read yet. */
+      awaitingAgent?: boolean;
       content: MessageContentBlock[];
+      /** Shell input is literal command text, not Markdown or attachment markers. */
+      shellCommand?: string;
       /** Human author email, when known. */
       createdBy?: string;
       /** Epoch seconds of this message, when known — server-stamped from
@@ -325,6 +330,7 @@ function newestAssistantTurnId(blocks: AnyBlock[]): string | null {
     const b = blocks[i]!;
     if (
       b.type === "user_message" ||
+      isTerminalCommandInput(b) ||
       b.type === "compaction" ||
       b.type === "compaction_loading" ||
       b.type === "routing_decision"
@@ -842,13 +848,14 @@ function walkBubbles(
       continue;
     }
 
-    if (b.type === "user_message") {
+    if (b.type === "user_message" || isTerminalCommandInput(b)) {
       // A native harness can accept a steering message without ending the
       // response already in progress. In persisted history that user message
       // has the same response id as assistant work immediately before it.
       // The answer and the resumed work then share one assistant bubble; do
       // not hide the answer merely because more work followed it.
-      expandNextAssistantResponseId = midResponseUserMessageId(blocks, i);
+      expandNextAssistantResponseId =
+        b.type === "user_message" ? midResponseUserMessageId(blocks, i) : null;
       const chipIndexes = deferred.byMessage.get(i);
       const firstChip = chipIndexes?.[0];
       // The pair's region starts at whichever block came first, so an
@@ -862,7 +869,9 @@ function walkBubbles(
       bubbles.push({
         kind: "user",
         itemId: b.ctx.itemId ?? `user_${i}`,
-        content: b.content,
+        content:
+          b.type === "user_message" ? b.content : [{ type: "input_text", text: `!${b.input}` }],
+        ...(b.type === "terminal_command" ? { shellCommand: b.input } : {}),
         ...(b.ctx.createdBy !== undefined ? { createdBy: b.ctx.createdBy } : {}),
         // Server stamp on cold load, client stamp while live — display
         // only, so either clock is correct here.
@@ -871,7 +880,7 @@ function walkBubbles(
           : {}),
         // Carry the optimistic temp id (when promoted) so bubbleKey holds
         // steady across the optimistic→committed swap — no remount/flink.
-        stableKey: b.stableKey,
+        stableKey: b.type === "user_message" ? b.stableKey : undefined,
       });
       if (chipIndexes !== undefined) {
         for (const chipIndex of chipIndexes) {
@@ -997,6 +1006,7 @@ function walkBubbles(
       // carries `state.responseId` into `ctx()` for all events).
       if (
         cur.type === "user_message" ||
+        isTerminalCommandInput(cur) ||
         cur.type === "compaction" ||
         cur.type === "compaction_loading" ||
         cur.type === "routing_decision" ||
@@ -1424,6 +1434,7 @@ function isAssistantSideBlock(b: AnyBlock): boolean {
   return (
     !isSubagentActivityBlock(b) &&
     b.type !== "user_message" &&
+    !isTerminalCommandInput(b) &&
     b.type !== "compaction" &&
     // compaction_loading has its own top-level bubble slot and must not
     // end up in an assistant bubble's item list.
@@ -1667,6 +1678,7 @@ function buildAssistantItems(
         allowAutoMode: b.allowAutoMode,
         rememberScope: b.rememberScope,
         codexPersistModes: b.codexPersistModes,
+        agyPermission: b.agyPermission,
       });
       i += 1;
       continue;
@@ -1851,9 +1863,11 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
     if (
       a.itemId !== b.itemId ||
       Boolean(a.pending) !== Boolean(b.pending) ||
+      Boolean(a.awaitingAgent) !== Boolean(b.awaitingAgent) ||
       a.createdBy !== b.createdBy ||
       a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||
+      a.shellCommand !== b.shellCommand ||
       a.content.length !== b.content.length
     )
       return false;

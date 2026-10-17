@@ -22,18 +22,22 @@ from collections.abc import Iterator
 import pytest
 from playwright.sync_api import Page, expect
 
+from omnigent.server.oidc import derive_code_challenge, generate_code_verifier
 from tests.e2e_ui.auth._oidc_server import OIDCServer, spawn_oidc_server
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(
+    scope="module", params=[False, True], ids=["discovery-confidential", "explicit-public-ps256"]
+)
 def oidc_server(
     built_spa: None,
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
+    request: pytest.FixtureRequest,
 ) -> Iterator[OIDCServer]:
     """A dedicated OIDC-mode server wired to a fake IdP."""
     server_tmp = tmp_path_factory.mktemp("e2e_ui_oidc_login")
-    yield from spawn_oidc_server(mock_llm_server_url, server_tmp)
+    yield from spawn_oidc_server(mock_llm_server_url, server_tmp, public_client=request.param)
 
 
 def test_oidc_login_redirects_through_idp_to_authenticated_app(
@@ -66,3 +70,38 @@ def test_oidc_login_redirects_through_idp_to_authenticated_app(
     #    the post-login landing route need not be a chat with a composer.
     expect(page).not_to_have_url(re.compile(r"/authorize|/auth/login"), timeout=15_000)
     expect(page.locator('[data-testid="sidebar-brand"]')).to_be_visible(timeout=15_000)
+
+
+def test_oidc_cli_ticket_completes_through_browser(oidc_server: OIDCServer, page: Page) -> None:
+    """The CLI's browser-ticket flow authenticates against either provider profile.
+
+    The ticket is PKCE-bound: signing in lands on a consent page, and the CLI's
+    poll receives the session only after the user approves it there.
+    """
+    verifier = generate_code_verifier()
+    response = page.request.post(
+        f"{oidc_server.base_url}/auth/cli-login",
+        data={"code_challenge": derive_code_challenge(verifier), "code_challenge_method": "S256"},
+    )
+    assert response.status == 200
+    ticket = response.json()
+    poll_url = f"{oidc_server.base_url}/auth/cli-poll"
+    poll_args = {
+        "params": {"ticket": ticket["ticket"]},
+        "headers": {"X-Omnigent-Code-Verifier": verifier},
+    }
+    page.goto(f"{oidc_server.public_url}{ticket['login_url']}")
+    continue_link = page.locator("#fake-idp-continue")
+    expect(continue_link).to_be_visible(timeout=15_000)
+    continue_link.click()
+    expect(page.get_by_role("heading", name="Authorize sign-in")).to_be_visible(timeout=15_000)
+    expect(page.get_by_text(ticket["user_code"])).to_be_visible()
+    assert page.request.get(poll_url, **poll_args).status == 202
+    page.get_by_role("button", name="Approve").click()
+    expect(page.get_by_role("heading", name="Approved")).to_be_visible(timeout=15_000)
+    poll = page.request.get(poll_url, **poll_args)
+    assert poll.status == 200
+    assert poll.json()["user_id"] == oidc_server.idp.email
+    assert poll.json()["token"]
+    replay = page.request.get(poll_url, **poll_args)
+    assert replay.status == 410

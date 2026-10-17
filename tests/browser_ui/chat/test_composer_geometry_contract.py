@@ -236,7 +236,9 @@ def test_label_collapse_preserves_submit_geometry(
     _surface(page, chat, surface, DESKTOP)
     card_locator = page.locator("[data-composer-card]")
     expanded_inset = right_inset(box(card_locator), box(_submit(page, surface)))
-    page.set_viewport_size({"width": 280, "height": PHONE["height"]})
+    # Exercise the narrowest common phone width after the mobile composer
+    # adopted 24px outer gutters.
+    page.set_viewport_size({"width": 320, "height": PHONE["height"]})
     expect(_action_row(page, surface)).to_have_attribute("data-labels", "collapsed")
     collapsed_inset = right_inset(box(card_locator), box(_submit(page, surface)))
     assert collapsed_inset == pytest.approx(expanded_inset, abs=TOLERANCE)
@@ -618,18 +620,21 @@ def test_queued_rows_and_nested_workspace_share_the_tray_grid(
 
 
 @pytest.mark.parametrize(
-    ("viewport_width", "expected_frame", "expected_prose"),
-    [(1920, 768, 768), (2400, 896, 768), (3200, 1280, 960), (4096, 1600, 1024)],
+    ("viewport_width", "expected_frame", "prose_ch"),
+    [(1920, 768, 80), (2400, 896, 80), (3200, 1280, 120), (4096, 1600, 120)],
     ids=["desktop", "wide", "ultrawide", "4k"],
 )
+@pytest.mark.parametrize("font_size", [13, 16])
 def test_chat_width_scales_while_prose_remains_readable(
     page: Page,
     chat_session_contract: ChatSessionContract,
     viewport_width: int,
     expected_frame: float,
-    expected_prose: float,
+    prose_ch: int,
+    font_size: int,
 ) -> None:
     chat = chat_session_contract
+    page.add_init_script(f"localStorage.setItem('omnigent:ui-font-size', '{font_size}')")
     seed_items(
         chat,
         list(
@@ -668,12 +673,22 @@ def test_chat_width_scales_while_prose_remains_readable(
           const prose = bubbles.find(b => b.textContent.includes('Responsive prose'));
           const table = bubbles.find(b => b.textContent.includes('Responsive table'));
           const style = getComputedStyle(frame);
+          const paragraph = prose.querySelector('.chat-markdown > p');
+          const font = getComputedStyle(paragraph);
+          const measure = document.createElement('span');
+          measure.style.cssText = 'display: inline-block; width: 1ch';
+          paragraph.append(measure);
+          const ch = measure.getBoundingClientRect().width;
+          measure.remove();
           return {
             frame: frame.getBoundingClientRect().width,
             inner: frame.clientWidth
               - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
-            prose: prose.getBoundingClientRect().width,
+            prose: paragraph.getBoundingClientRect().width,
+            ch,
+            fontSize: parseFloat(font.fontSize),
             table: table.getBoundingClientRect().width,
+            tableProse: table.querySelector('.chat-markdown > p').getBoundingClientRect().width,
             composer: composer.getBoundingClientRect().width,
             workspace: workspace.getBoundingClientRect().width,
             composerLeft: composer.getBoundingClientRect().left,
@@ -682,11 +697,35 @@ def test_chat_width_scales_while_prose_remains_readable(
         }"""
     )
     assert widths["frame"] == pytest.approx(expected_frame, abs=TOLERANCE)
+    expected_prose = min(widths["inner"], prose_ch * widths["ch"])
+    assert widths["fontSize"] == font_size
     assert widths["prose"] == pytest.approx(expected_prose, abs=TOLERANCE)
     assert widths["table"] == pytest.approx(widths["inner"], abs=TOLERANCE)
+    assert widths["tableProse"] == pytest.approx(expected_prose, abs=TOLERANCE)
     assert widths["composer"] == pytest.approx(expected_frame, abs=TOLERANCE)
     assert widths["workspace"] == pytest.approx(expected_frame, abs=TOLERANCE)
     assert widths["composerLeft"] == pytest.approx(widths["frameLeft"], abs=TOLERANCE)
+
+    if viewport_width == 3200:
+        page.get_by_role("button", name="Expand right panel").click()
+        workspace = page.get_by_role("complementary", name="Workspace")
+        expect(workspace).to_be_visible()
+        workspace.evaluate(
+            "el => Promise.all(el.getAnimations().map(animation => animation.finished))"
+        )
+        handle = box(workspace.get_by_label("Resize panel"))
+        pane = box(page.locator('[class~="@container/chat"]'))
+        x, y = handle["x"] + handle["width"] / 2, handle["y"] + handle["height"] / 2
+        page.mouse.move(x, y)
+        page.mouse.down()
+        page.mouse.move(pane["x"] + 980, y, steps=10)
+        page.mouse.up()
+        page.wait_for_function(
+            "document.querySelector('.chat-conversation-content').clientWidth < 1024"
+        )
+        for marker in ("Responsive prose width marker.", "Responsive table width marker."):
+            paragraph = page.get_by_text(marker, exact=False)
+            assert box(paragraph)["width"] == pytest.approx(80 * widths["ch"], abs=TOLERANCE)
 
 
 def test_composer_fits_available_space_while_resizing(
@@ -1072,6 +1111,9 @@ def test_panel_resize_does_not_summon_a_ghost_scrollbar(
     page.get_by_role("button", name="Expand right panel").click()
     workspace = page.get_by_role("complementary", name="Workspace")
     expect(workspace).to_be_visible()
+    workspace.evaluate(
+        "el => Promise.all(el.getAnimations().map(animation => animation.finished))"
+    )
     before = _fully_visible_state(page)
     handle = box(workspace.get_by_label("Resize panel"))
     x, y = handle["x"] + handle["width"] / 2, handle["y"] + handle["height"] / 2

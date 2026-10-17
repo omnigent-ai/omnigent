@@ -2198,6 +2198,63 @@ def test_provider_ui_capabilities_enable_inference_only_on_configured_target() -
     }
 
 
+def test_provider_ui_capabilities_advertise_default_models_for_unbound_discovery() -> None:
+    launcher = FakeSandboxLauncher()
+    gateway = {
+        "providers": {
+            "gateway": {
+                "kind": "gateway",
+                "openai": {
+                    "base_url": "https://gateway.example/v1",
+                    "api_key_ref": "env:POD_KEY",
+                    "wire_api": "responses",
+                },
+            }
+        }
+    }
+    discovery = {"gateway": {"base_url": "https://catalog.example/v1", "api_key_ref": "env:KEY"}}
+    bound = {**gateway, "inference": {"harnesses": {"codex-native": {"provider": "gateway"}}}}
+
+    async def hook(harness: str, user_id: str | None) -> list[dict[str, Any]]:
+        return []
+
+    def config(provider: str, **fields: Any) -> ManagedSandboxConfig:
+        return ManagedSandboxConfig(
+            server_url="https://s",
+            provider=provider,
+            token_ttl_s=3600,
+            launcher_factory=lambda: launcher,
+            **fields,
+        )
+
+    deployment = ManagedSandboxDeployment(
+        configs=(
+            config("hooked", default_model_options=hook),
+            config("discovered", host_config=gateway, model_discovery=discovery),
+            config("static", host_config=gateway),
+            config("bound", host_config=bound, model_discovery=discovery),
+            config(
+                "malformed",
+                host_config={"providers": {"gateway": "nope"}},
+                model_discovery=discovery,
+            ),
+            config(
+                "malformed-inference",
+                host_config={**gateway, "inference": "nope"},
+                model_discovery=discovery,
+            ),
+        )
+    )
+    assert deployment.provider_ui_capabilities() == {
+        "hooked": {"multi_repo": False, "default_models": True},
+        "discovered": {"multi_repo": False, "default_models": True},
+        "static": {"multi_repo": False},
+        "bound": {"multi_repo": False, "inference_models": True},
+        "malformed": {"multi_repo": False},
+        "malformed-inference": {"multi_repo": False},
+    }
+
+
 # ── GET /v1/info: managed_sandboxes_enabled ─────────────────
 
 
@@ -2348,10 +2405,14 @@ async def test_info_reports_enabled_for_injected_custom_launcher(
 # ── launch_managed_host ─────────────────────────────────────
 
 
-async def test_launch_success_registers_host_and_returns_workspace(db_uri: str) -> None:
+@pytest.mark.parametrize("requested_host_id", [None, "0123456789abcdef0123456789abcdef"])
+async def test_launch_success_registers_host_and_returns_workspace(
+    db_uri: str, requested_host_id: str | None
+) -> None:
     """
     Golden path: provision → pre-register the host row with its token
-    → start host → host online.
+    → start host → host online. A requested id is the one the host starts
+    under, and only then does the host route by it.
 
     The launcher arrives through the config's factory seam (no
     patching), and the fake's ``on_host_start`` connects exactly as
@@ -2375,9 +2436,17 @@ async def test_launch_success_registers_host_and_returns_workspace(db_uri: str) 
         config=_injected_config(fake),
         owner=_OWNER,
         host_store=host_store,
+        host_id=requested_host_id,
     )
 
     assert fake.prepared is True
+    # Only a requested id needs the host to key off its default here.
+    config_writes = [cmd for cmd in fake.commands if cmd.startswith("python3 -c")]
+    if requested_host_id is None:
+        assert config_writes == []
+    else:
+        slice_key = {"host": {"slice_key_enabled": True}}
+        assert config_writes == [render_host_config_write_command(slice_key)]
     # The workspace was created in the sandbox's home and returned.
     assert result.workspace == "/root/workspace"
     assert any("mkdir -p /root/workspace" in cmd for cmd in fake.commands)
@@ -2385,6 +2454,9 @@ async def test_launch_success_registers_host_and_returns_workspace(db_uri: str) 
     start = fake.host_starts[0]
     assert "--server https://srv.example.com" in start.command
     assert result.host_id == start.host_id
+    assert start.host_name == f"managed-{start.host_id[:8]}"
+    if requested_host_id is not None:
+        assert start.host_id == requested_host_id
     # The hosts row carries the managed binding with full content; the
     # provider comes from the LAUNCHER (not config), so injected custom
     # launchers record their own name.
@@ -2513,7 +2585,9 @@ async def test_resume_rematerializes_host_config_before_host_restart(db_uri: str
     Waking a dormant sandbox re-runs the config write before re-execing the
     host — resume_managed_host bypasses _register_and_start_host, so this is a
     distinct wiring point, and re-materializing is what lets an operator's
-    host_config change land on the next wake without a new sandbox.
+    host_config change land on the next wake without a new sandbox. The wake
+    also re-materializes the host's keying, which the caller derives from the
+    session.
     """
     host_store = HostStore(db_uri)
 
@@ -2532,15 +2606,28 @@ async def test_resume_rematerializes_host_config_before_host_restart(db_uri: str
     host_store.set_offline(result.host_id)
     commands_before = len(fake.commands)
 
-    await resume_managed_host(result.host_id, host_store, config)
+    await resume_managed_host(result.host_id, host_store, config, slice_key_enabled=True)
 
     assert fake.resumed == ["sb-fake-1"]
     resumed_commands = fake.commands[commands_before:]
-    write_index = resumed_commands.index(render_host_config_write_command(host_config))
+    write_index = resumed_commands.index(
+        render_host_config_write_command({**host_config, "host": {"slice_key_enabled": True}})
+    )
     host_index = next(
         i for i, cmd in enumerate(resumed_commands) if "omnigent host --server" in cmd
     )
     assert write_index < host_index
+
+
+def test_host_slice_key_enabled_only_for_the_requested_host() -> None:
+    """Relaunch and wake key only the host the create named, so a later host can't inherit it."""
+    from omnigent.server.managed_hosts import host_slice_key_enabled
+
+    requested = {"omnigent.sandbox.requested_host_id": "0123456789abcdef0123456789abcdef"}
+
+    assert host_slice_key_enabled(requested, "0123456789abcdef0123456789abcdef") is True
+    assert host_slice_key_enabled(requested, "fedcba9876543210fedcba9876543210") is False
+    assert host_slice_key_enabled({}, "0123456789abcdef0123456789abcdef") is False
 
 
 async def test_launch_without_host_config_writes_no_config(db_uri: str) -> None:
@@ -3053,7 +3140,13 @@ async def test_relaunch_rolls_sandbox_generation_under_same_host(db_uri: str) ->
     assert gen1 is not None
     gen1_token = fake.host_starts[0].token
 
-    relaunched = await relaunch_managed_host(config=config, host=gen1, host_store=host_store)
+    commands_before = len(fake.commands)
+    relaunched = await relaunch_managed_host(
+        config=config, host=gen1, host_store=host_store, slice_key_enabled=True
+    )
+    # The relaunch applies the keying its caller derived from the session.
+    slice_key = render_host_config_write_command({"host": {"slice_key_enabled": True}})
+    assert slice_key in fake.commands[commands_before:]
 
     # Same identity, new generation: the session's host binding (which
     # references host_id) survives the roll.
@@ -4524,6 +4617,71 @@ async def test_launch_defaults_to_first_provider(db_uri: str) -> None:
     host = host_store.get_host(result.host_id)
     assert host is not None
     assert host.sandbox_provider == "alpha"
+
+
+@pytest.mark.parametrize(
+    ("server_url", "host_config", "enabled", "expected"),
+    [
+        ("https://srv.example.com", None, False, None),
+        ("https://srv.example.com", None, True, {"host": {"slice_key_enabled": True}}),
+        ("https://ws.example.com/api/2.0/omnigent", None, True, None),
+        (
+            "https://ws.example.com/api/2.0/omnigent",
+            None,
+            False,
+            {"host": {"slice_key_enabled": False}},
+        ),
+        # An explicit deployment value that contradicts the launch is overwritten,
+        # whichever way the URL's default points.
+        (
+            "https://ws.example.com/api/2.0/omnigent",
+            {"host": {"slice_key_enabled": False}},
+            True,
+            {"host": {"slice_key_enabled": True}},
+        ),
+        (
+            "https://srv.example.com",
+            {"host": {"slice_key_enabled": True}},
+            False,
+            {"host": {"slice_key_enabled": False}},
+        ),
+        # One that already agrees with the launch is passed through unchanged.
+        (
+            "https://srv.example.com",
+            {"host": {"slice_key_enabled": True}},
+            True,
+            {"host": {"slice_key_enabled": True}},
+        ),
+    ],
+)
+def test_host_slice_key_is_injected_only_to_override_the_hosts_default(
+    server_url: str,
+    host_config: dict[str, object] | None,
+    enabled: bool,
+    expected: dict[str, object] | None,
+) -> None:
+    """
+    A host keys by default only on the workspace mount, so a launch adds the
+    setting only to change what the host would otherwise do, leaving legacy
+    launchers an unchanged call; an explicit deployment value never wins over
+    the launch's decision.
+    """
+    from omnigent.server.managed_hosts import _with_host_slice_key
+
+    assert _with_host_slice_key(host_config, enabled, server_url) == expected
+
+
+def test_host_slice_key_keeps_the_deployments_host_section() -> None:
+    """The setting joins an operator's ``host`` section without mutating it."""
+    from omnigent.server.managed_hosts import _with_host_slice_key
+
+    config = {"host": {"name": "kept"}, "runner": {"idle_timeout_s": 60}}
+
+    assert _with_host_slice_key(config, True, "https://srv.example.com") == {
+        "host": {"name": "kept", "slice_key_enabled": True},
+        "runner": {"idle_timeout_s": 60},
+    }
+    assert config["host"] == {"name": "kept"}
 
 
 async def test_launch_unknown_provider_rejects_before_provisioning(db_uri: str) -> None:

@@ -1,9 +1,21 @@
-"""OIDC authentication routes: login, callback, logout, CLI login.
+"""OIDC authentication routes: login, callback, logout, CLI and native login.
 
 Provides ``/auth/login``, ``/auth/callback``, ``/auth/logout``,
-``/auth/cli-login``, and ``/auth/cli-poll`` endpoints that implement
-the full OIDC authorization code flow with PKCE. The ``cli-login``
-/ ``cli-poll`` pair supports the ``omnigent login`` CLI command.
+``/auth/cli-login``, ``/auth/cli-consent``, ``/auth/cli-approve``,
+``/auth/cli-deny``, ``/auth/cli-upgrade``, ``/auth/cli-poll``, and
+``/auth/native-token`` endpoints that implement the full OIDC
+authorization code flow with PKCE. The ``cli-login`` / ``cli-poll`` pair
+supports the ``omnigent login`` CLI command.
+
+Native apps sign in through the system browser with an RFC 8252
+redirect: a loopback (the desktop shell) or an allowlisted private-use
+scheme (the iOS and Android apps, see :data:`NATIVE_APP_REDIRECT_URIS`).
+``/auth/login`` accepts that
+``native_redirect_uri`` plus a PKCE ``code_challenge``, the callback
+redirects the browser to it with a one-time code, and the app exchanges
+the code and its verifier at ``/auth/native-token``. The code only
+reaches the device whose browser signed in, and is useless without the
+verifier held by the app that started the flow.
 
 See ``designs/OIDC_AUTH.md`` for the complete design.
 
@@ -12,17 +24,23 @@ These routes are only mounted when ``OMNIGENT_AUTH_PROVIDER=oidc``.
 
 from __future__ import annotations
 
+import hmac
+import html
+import json
 import logging
+import re
 import secrets
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import httpx
 import jwt
-from fastapi import APIRouter, Query, Request
-from starlette.responses import RedirectResponse, Response
+from fastapi import APIRouter, HTTPException, Query, Request
+from starlette.datastructures import URL
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.admin_list import AdminList, promote_if_listed
@@ -38,7 +56,11 @@ from omnigent.server.oidc import (
     mint_session_cookie,
 )
 from omnigent.server.oidc_access import OidcAdmissionPolicy, resolve_allowed_domains_path
-from omnigent.server.routes.device_auth import issue_login_grant
+from omnigent.server.routes._oauth import NO_STORE_HEADERS, oauth_error
+from omnigent.server.routes.device_auth import (
+    _generate_user_code,
+    issue_login_grant,
+)
 from omnigent.stores.permission_store import PermissionStore
 
 _logger = logging.getLogger(__name__)
@@ -48,6 +70,37 @@ _AUTH_STATE_COOKIE_SECURE = "__Host-ap_auth_state"
 _AUTH_STATE_COOKIE_PLAIN = "ap_auth_state"
 _AUTH_STATE_TTL_SECONDS = 300  # 5 minutes
 _CLI_TICKET_TTL_SECONDS = 300  # 5 minutes
+# An upgrade notice, never a key in the login-ticket store.
+_CLI_UPGRADE_TICKET = "upgrade-required"
+_CLI_UPGRADE_MESSAGE = (
+    "Upgrade Omnigent to sign in: this server requires a newer login client. "
+    "For the CLI, run `omni upgrade`, then retry `omnigent login`. "
+    "For mobile, update the app. For Slack, ask your administrator to update the integration."
+)
+_CLI_LOGIN_MAX_BODY_BYTES = 4096
+_CLI_BROWSER_HEADERS = {
+    "Content-Security-Policy": "frame-ancestors 'none'",
+    "X-Frame-Options": "DENY",
+    "Cache-Control": "no-store",
+}
+# A native sign-in code is exchanged by the app right after the browser
+# hands it over, so it only needs to outlive one redirect round trip.
+_NATIVE_CODE_TTL_SECONDS = 60
+# RFC 8252 §7.3 loopback literals. ``localhost`` is excluded (§8.3): its
+# resolution can be redirected away from this machine.
+_NATIVE_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
+# RFC 8252 §7.1 private-use-scheme redirects of first-party apps, matched
+# exactly. The well-known manifest lists them so an app can tell whether
+# this server accepts its redirect before opening the browser.
+NATIVE_APP_REDIRECT_URIS: frozenset[str] = frozenset(
+    {"ai.omnigent.android:/oauth/callback", "ai.omnigent.ios:/oauth/callback"}
+)
+_NATIVE_PARAMS = ("native_redirect_uri", "native_state", "code_challenge", "code_challenge_method")
+# RFC 7636: an S256 challenge is a 43-char base64url SHA-256 digest, and a
+# verifier is 43-128 unreserved characters.
+_S256_CHALLENGE_RE = re.compile(r"[A-Za-z0-9_-]{43}")
+_CODE_VERIFIER_RE = re.compile(r"[A-Za-z0-9._~-]{43,128}")
+_NATIVE_STATE_RE = re.compile(r"[A-Za-z0-9._~-]{1,256}")
 # How long an OIDC invite URL stays redeemable. Matches the accounts
 # provider's default invite window (72h) — long enough to share
 # out-of-band, short enough to bound exposure of an unused link.
@@ -57,28 +110,73 @@ if TYPE_CHECKING:
     from omnigent.server.oidc import OIDCConfig
 
 
+def _canonical_cli_origin(value: str) -> tuple[str, str, int | None] | None:
+    try:
+        url = httpx.URL(value)
+    except httpx.InvalidURL:
+        return None
+    if (
+        url.scheme not in ("http", "https")
+        or not url.host
+        or url.userinfo
+        or url.path != "/"
+        or url.query
+        or url.fragment
+    ):
+        return None
+    return url.scheme, url.host, url.port
+
+
 @dataclass
 class _CliTicket:
     """A pending CLI login ticket.
 
-    Created by ``POST /auth/cli-login``, fulfilled by the browser
-    callback, polled by ``GET /auth/cli-poll``.
+    Created by ``POST /auth/cli-login``, fulfilled when the signed-in
+    user approves it at ``POST /auth/cli-approve``, polled by
+    ``GET /auth/cli-poll`` with the matching PKCE verifier.
 
     :param created_at: Unix timestamp when the ticket was created.
-    :param token: The session JWT, set when the browser callback
-        fulfills the ticket. ``None`` while pending.
+    :param token: The session JWT, set when the browser approves the
+        ticket. ``None`` while pending.
     :param user_id: The authenticated user's email, set when
         fulfilled. ``None`` while pending.
     :param refresh_token: Login-issued refresh grant material, set at
         fulfillment when a grant store is wired. ``None`` while pending
         or when grants are unavailable. Handed to the CLI exactly once
         by the poll response.
+    :param code_challenge: PKCE S256 challenge supplied by the CLI.
+    :param user_code: Human-readable code shown on the browser consent page.
+    :param denied: Whether the browser denied this login request.
     """
 
     created_at: float = field(default_factory=time.time)
     token: str | None = None
     user_id: str | None = None
     refresh_token: str | None = None
+    code_challenge: str = ""
+    user_code: str = ""
+    denied: bool = False
+
+
+@dataclass
+class _NativeCode:
+    """A one-time code issued to a native app's redirect.
+
+    Created by ``/auth/callback`` for a native sign-in and consumed by
+    ``POST /auth/native-token``.
+
+    :param user_id: The authenticated user's email.
+    :param code_challenge: The PKCE S256 challenge the app sent to
+        ``/auth/login``; the exchange must present its verifier.
+    :param redirect_uri: The redirect URI the code was delivered to; the
+        exchange must name the same URI.
+    :param created_at: Unix timestamp when the code was issued.
+    """
+
+    user_id: str
+    code_challenge: str
+    redirect_uri: str
+    created_at: float = field(default_factory=time.time)
 
 
 def create_auth_router(
@@ -115,7 +213,8 @@ def create_auth_router(
         ``omnigent login``. ``None`` keeps the legacy
         session-JWT-only response.
     :returns: A FastAPI router with ``/login``, ``/callback``,
-        ``/logout`` (and ``/invite`` when invites are enabled).
+        ``/logout``, ``/cli-login``, ``/cli-poll``, ``/native-token``,
+        ``/users`` (and ``/invite`` when invites are enabled).
     """
     router = APIRouter()
     config = auth_provider._oidc_config
@@ -148,6 +247,27 @@ def create_auth_router(
     # In-memory store for CLI login tickets. Tickets are short-lived
     # (5 min) and single-use. Keyed by ticket ID.
     _cli_tickets: dict[str, _CliTicket] = {}
+    # One-time codes for native sign-ins. Single-use, 60 s.
+    _native_codes: dict[str, _NativeCode] = {}
+
+    def _verified_state(request: Request, state: str | None) -> dict[str, object] | None:
+        """Return the signed auth state when its cookie is valid and matches ``state``."""
+        raw = request.cookies.get(_state_cookie)
+        if not state or not raw:
+            return None
+        try:
+            payload = jwt.decode(raw, config.cookie_secret, algorithms=["HS256"])
+        except jwt.InvalidTokenError:
+            return None
+        return payload if payload.get("state") == state else None
+
+    def _native_failure(native: Mapping[str, str], error: str, description: str) -> Response:
+        """Report a failed native sign-in to the app's redirect URI."""
+        response = _native_redirect(native, {"error": error, "error_description": description})
+        response.delete_cookie(
+            key=_state_cookie, path="/", secure=_secure, httponly=True, samesite="lax"
+        )
+        return response
 
     @router.get("/login")
     async def login(request: Request) -> Response:
@@ -178,20 +298,32 @@ def create_auth_router(
         # Optional CLI login ticket — threaded through the state
         # cookie so the callback can fulfill it.
         ticket = request.query_params.get("ticket")
+        # Optional native sign-in — also threaded through the
+        # signed state, so the callback knows where to deliver the code.
+        try:
+            native = _parse_native_sign_in(request.query_params)
+        except ValueError:
+            return JSONResponse(
+                status_code=400, content={"error": "Invalid native sign-in parameters"}
+            )
+        if native is not None and ticket:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "A native sign-in cannot also carry a CLI ticket"},
+            )
         # Optional OIDC invite token — threaded through the signed state
         # cookie (not a bare query param) so it can't be tampered with
         # before the callback redeems it. Only meaningful when invites
         # are enabled; ignored otherwise.
         invite = request.query_params.get("invite") if _invites_enabled else None
-        # Forced re-authentication for the device-consent anti-phishing
-        # gate: reauth=1 tells the IdP to require the user to
-        # re-authenticate rather than reusing an existing session
-        # (OIDC Core 3.1.2.1 `prompt=login`, `max_age=0`).
-        # Not applicable to GitHub OAuth, which has no prompt parameter.
-        reauth = request.query_params.get("reauth") == "1" and config.provider_type != "github"
+        # CLI tickets require fresh IdP authentication; device consent can
+        # also request it. GitHub OAuth has no reauthentication parameter.
+        reauth = config.provider_type != "github" and (
+            bool(ticket) or request.query_params.get("reauth") == "1"
+        )
 
         # Store state + code_verifier in a short-lived signed cookie.
-        state_payload: dict[str, str | int] = {
+        state_payload: dict[str, object] = {
             "state": state,
             "code_verifier": code_verifier,
             "return_to": return_to,
@@ -199,6 +331,8 @@ def create_auth_router(
         }
         if ticket:
             state_payload["ticket"] = ticket
+        if native is not None:
+            state_payload["native"] = native
         if invite:
             state_payload["invite"] = invite
         if reauth:
@@ -223,7 +357,13 @@ def create_auth_router(
             # rather than silently reusing an existing IdP session.
             params["prompt"] = "login"
             params["max_age"] = "0"
-        auth_url = config.authorization_endpoint + "?" + urlencode(params)
+        endpoint = urlsplit(config.authorization_endpoint)
+        query = [
+            (name, value)
+            for name, value in parse_qsl(endpoint.query, keep_blank_values=True)
+            if name not in params
+        ]
+        auth_url = urlunsplit(endpoint._replace(query=urlencode(query + list(params.items()))))
 
         response = RedirectResponse(url=auth_url, status_code=302)
         response.set_cookie(
@@ -256,6 +396,15 @@ def create_auth_router(
         code = request.query_params.get("code")
         state = request.query_params.get("state")
         if not code or not state:
+            # An IdP error (e.g. the user declined) arrives without a code.
+            # A native sign-in hears about it at its redirect URI.
+            early_native = _native_from_state(_verified_state(request, state))
+            if early_native is not None:
+                return _native_failure(
+                    early_native,
+                    "access_denied",
+                    "Sign-in was cancelled or declined at the identity provider.",
+                )
             return JSONResponse(
                 status_code=400,
                 content={"error": "Missing code or state parameter"},
@@ -283,6 +432,15 @@ def create_auth_router(
                 content={"error": "State mismatch (possible CSRF)"},
             )
 
+        native = _native_from_state(state_payload)
+
+        def fail(status_code: int, message: str, error: str = "access_denied") -> Response:
+            # A native sign-in hears about failures at its redirect URI
+            # instead of waiting out its timeout.
+            if native is not None:
+                return _native_failure(native, error, message)
+            return JSONResponse(status_code=status_code, content={"error": message})
+
         code_verifier = state_payload.get("code_verifier", "")
         # Re-sanitize on the way out: /login sanitizes at ingest, but a
         # cookie minted before this fix (or by a tampering attempt that
@@ -296,9 +454,10 @@ def create_auth_router(
             "code": code,
             "redirect_uri": config.redirect_uri,
             "client_id": config.client_id,
-            "client_secret": config.client_secret,
             "code_verifier": code_verifier,
         }
+        if config.client_secret:
+            token_data["client_secret"] = config.client_secret
 
         async with httpx.AsyncClient() as client:
             # GitHub requires Accept: application/json to get JSON
@@ -317,18 +476,12 @@ def create_auth_router(
                     token_resp.status_code,
                     token_resp.text,
                 )
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": "Token exchange failed"},
-                )
+                return fail(400, "Token exchange failed", "server_error")
 
             token_json = _json_object(_response_json(token_resp))
             if token_json is None:
                 _logger.error("Token exchange returned a non-object JSON response")
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": "Token exchange returned an invalid response"},
-                )
+                return fail(400, "Token exchange returned an invalid response", "server_error")
 
             # Extract user email.
             if config.provider_type == "github":
@@ -341,10 +494,7 @@ def create_auth_router(
                 email = _resolve_oidc_email(token_json, config)
 
         if not email:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "Could not determine user email from IdP"},
-            )
+            return fail(400, "Could not determine user email from IdP", "server_error")
 
         # Forced re-auth verification (anti-phishing device-consent gate).
         # /login stamped reauth_at when it sent prompt=login + max_age=0.
@@ -361,10 +511,7 @@ def create_auth_router(
                     "Rejecting reauth login: IdP id_token has no auth_time claim, "
                     "so forced re-authentication (prompt=login) cannot be verified"
                 )
-                return JSONResponse(
-                    status_code=403,
-                    content={"error": "IdP did not confirm re-authentication"},
-                )
+                return fail(403, "IdP did not confirm re-authentication")
             if auth_time < reauth_at:
                 _logger.warning(
                     "Rejecting reauth login: id_token auth_time %d predates the "
@@ -372,10 +519,7 @@ def create_auth_router(
                     auth_time,
                     reauth_at,
                 )
-                return JSONResponse(
-                    status_code=403,
-                    content={"error": "IdP did not re-authenticate the user"},
-                )
+                return fail(403, "IdP did not re-authenticate the user")
 
         # Normalize email to lowercase.
         email = email.lower()
@@ -399,17 +543,11 @@ def create_auth_router(
         # means "no restriction" (admit any IdP user) — the OSS default.
         if not admission.is_admitted(email):
             domain = email.rsplit("@", 1)[-1] if "@" in email else ""
-            return JSONResponse(
-                status_code=403,
-                content={"error": f"Email domain {domain!r} is not permitted on this server"},
-            )
+            return fail(403, f"Email domain {domain!r} is not permitted on this server")
 
         # Reject reserved user names.
         if email in _RESERVED_USERS:
-            return JSONResponse(
-                status_code=403,
-                content={"error": f"Reserved user name {email!r}"},
-            )
+            return fail(403, f"Reserved user name {email!r}")
 
         # Ensure user exists in the permission store, then apply the
         # file-backed admin list. Promotion is additive (never demotes)
@@ -420,51 +558,50 @@ def create_auth_router(
             permission_store.ensure_user(email)
             promote_if_listed(admin_list, permission_store, email)
 
+        # A native sign-in gets a one-time code at its redirect URI;
+        # the session is minted when the app exchanges it with its verifier.
+        # The browser gets no session cookie: it never asked for one.
+        if native is not None:
+            _evict_expired_native_codes(_native_codes)
+            native_code = secrets.token_urlsafe(32)
+            _native_codes[native_code] = _NativeCode(
+                user_id=email,
+                code_challenge=native["code_challenge"],
+                redirect_uri=native["redirect_uri"],
+            )
+            response = _native_redirect(native, {"code": native_code})
+            response.delete_cookie(
+                key=_state_cookie, path="/", secure=_secure, httponly=True, samesite="lax"
+            )
+            return response
+
         # Mint session cookie.
+        ticket_id = state_payload.get("ticket")
+        authenticated_ticket = (
+            ticket_id
+            if isinstance(ticket_id, str)
+            and (config.provider_type == "github" or isinstance(reauth_at, int))
+            else None
+        )
         session_jwt = mint_session_cookie(
             user_id=email,
             cookie_secret=config.cookie_secret,
             ttl_hours=config.session_ttl_hours,
             provider=config.provider_type,
+            cli_login_ticket=authenticated_ticket,
         )
 
         # Check if this callback fulfills a CLI login ticket.
-        ticket_id = state_payload.get("ticket")
         if ticket_id and ticket_id in _cli_tickets:
             ticket = _cli_tickets[ticket_id]
-            ticket.token = session_jwt
-            ticket.user_id = email
-            # A CLI login is a long-lived unattended credential holder
-            # (hosts especially) — issue a refresh grant so it can renew
-            # instead of dying at session-JWT expiry. Best-effort: a
-            # grant-store failure must not break login itself.
-            if device_grant_store is not None:
-                try:
-                    ticket.refresh_token = issue_login_grant(
-                        device_grant_store,
-                        user_id=email,
-                        cookie_secret=config.cookie_secret,
-                    )
-                except Exception:
-                    _logger.exception("cli-login: refresh grant issuance failed")
-            # Return a simple HTML page — the CLI is polling
-            # /auth/cli-poll and will pick up the token.
-            import html as _html
-
-            from starlette.responses import HTMLResponse
-
-            safe_email = _html.escape(email)
-            html = (
-                "<html><body style='font-family:system-ui;text-align:center;"
-                "padding:60px'>"
-                "<h2>Login successful</h2>"
-                f"<p>Authenticated as <strong>{safe_email}</strong>.</p>"
-                "<p>You can close this tab and return to the terminal.</p>"
-                "</body></html>"
-            )
-            resp = HTMLResponse(content=html)
-            # Still set the session cookie (useful if they also open
-            # the web UI in the same browser).
+            if time.time() - ticket.created_at <= _CLI_TICKET_TTL_SECONDS:
+                base_path = getattr(request.app.state, "base_path", "")
+                resp = RedirectResponse(
+                    url=f"{base_path}/auth/cli-consent?ticket={quote(str(ticket_id))}",
+                    status_code=302,
+                )
+            else:
+                resp = RedirectResponse(url=return_to, status_code=302)
             resp.set_cookie(
                 key=_session_cookie,
                 value=session_jwt,
@@ -581,25 +718,237 @@ def create_auth_router(
     # ── CLI login ticket endpoints ─────────────────────────────
 
     @router.post("/cli-login")
-    async def cli_login() -> dict[str, str]:
+    async def cli_login(request: Request) -> Response:
         """Create a one-time CLI login ticket.
 
         The CLI calls this, then opens the returned ``login_url``
-        in the user's browser. The browser completes the OIDC flow,
-        the callback fulfills the ticket, and the CLI polls
+        in the user's browser. The browser completes the OIDC flow and
+        explicitly approves the request, and the CLI polls
         ``/auth/cli-poll`` to retrieve the session token.
 
-        :returns: ``{"ticket": "<id>", "login_url": "/auth/login?ticket=<id>"}``.
+        :returns: Ticket metadata and a browser consent code, or a
+            non-redeemable upgrade notice for a legacy, empty request.
         """
-        # Evict expired tickets to prevent unbounded growth.
+        from fastapi.responses import JSONResponse
+
+        raw_body = bytearray()
+        async for chunk in request.stream():
+            if len(raw_body) + len(chunk) > _CLI_LOGIN_MAX_BODY_BYTES:
+                return JSONResponse(status_code=413, content={"error": "Login request too large"})
+            raw_body.extend(chunk)
+
+        if not raw_body:
+            # Old clients hide HTTP error bodies but open login_url on 200.
+            # Give them an instruction page without creating a login ticket.
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "ticket": _CLI_UPGRADE_TICKET,
+                    "login_url": "/auth/cli-upgrade",
+                    "error": _CLI_UPGRADE_MESSAGE,
+                },
+                headers={"Cache-Control": "no-store"},
+            )
+
+        try:
+            body = json.loads(raw_body)
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        code_challenge = body.get("code_challenge")
+        code_challenge_method = body.get("code_challenge_method")
+        if (
+            not isinstance(code_challenge, str)
+            or _S256_CHALLENGE_RE.fullmatch(code_challenge) is None
+            or (code_challenge_method is not None and code_challenge_method != "S256")
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"code_challenge (S256) is required. {_CLI_UPGRADE_MESSAGE}"},
+            )
+
         _evict_expired_tickets(_cli_tickets)
 
         ticket_id = secrets.token_urlsafe(32)
-        _cli_tickets[ticket_id] = _CliTicket()
-        return {
-            "ticket": ticket_id,
-            "login_url": f"/auth/login?ticket={ticket_id}",
+        user_code = _generate_user_code()
+        _cli_tickets[ticket_id] = _CliTicket(
+            code_challenge=code_challenge,
+            user_code=user_code,
+        )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "ticket": ticket_id,
+                "login_url": f"/auth/login?ticket={ticket_id}&reauth=1",
+                "user_code": user_code,
+                "expires_in": _CLI_TICKET_TTL_SECONDS,
+            },
+        )
+
+    @router.get("/cli-upgrade")
+    async def cli_upgrade() -> Response:
+        """Explain how to update an unsupported login client before signing in."""
+        return HTMLResponse(
+            _cli_consent_html(upgrade_required=True),
+            headers=_CLI_BROWSER_HEADERS,
+        )
+
+    def _bounce_to_login(request: Request, ticket_id: str, *, reauth: bool) -> RedirectResponse:
+        base_path = getattr(request.app.state, "base_path", "")
+        return_to = f"{base_path}/auth/cli-consent?ticket={quote(ticket_id)}"
+        url = f"{base_path}/auth/login?return_to={quote(return_to, safe='')}"
+        url += f"&ticket={quote(ticket_id)}"
+        if reauth:
+            url += "&reauth=1"
+        return RedirectResponse(url=url, status_code=302, headers=_CLI_BROWSER_HEADERS)
+
+    def _session_iat(request: Request, ticket_id: str) -> int | None:
+        token = request.cookies.get(_session_cookie)
+        if not token:
+            return None
+        try:
+            payload = jwt.decode(token, config.cookie_secret, algorithms=["HS256"])
+        except jwt.InvalidTokenError:
+            return None
+        if payload.get("cli_login_ticket") != ticket_id:
+            return None
+        iat = payload.get("iat")
+        return iat if isinstance(iat, int) else None
+
+    def _cli_ticket(ticket_id: str) -> _CliTicket | None:
+        ticket = _cli_tickets.get(ticket_id)
+        if ticket is None:
+            return None
+        if time.time() - ticket.created_at > _CLI_TICKET_TTL_SECONDS:
+            del _cli_tickets[ticket_id]
+            return None
+        return ticket
+
+    @router.get("/cli-consent")
+    async def cli_consent(request: Request) -> Response:
+        """Render the browser consent page for a CLI login ticket."""
+        user_id = auth_provider.get_user_id(request)
+        ticket_id = (request.query_params.get("ticket") or "").strip()
+        if user_id is None:
+            return _bounce_to_login(request, ticket_id, reauth=True)
+
+        ticket = _cli_ticket(ticket_id)
+        if ticket is None or ticket.token is not None or ticket.denied:
+            return HTMLResponse(
+                _cli_consent_html(error="This login request is invalid or has expired."),
+                status_code=200,
+                headers=_CLI_BROWSER_HEADERS,
+            )
+
+        session_iat = _session_iat(request, ticket_id)
+        if session_iat is None or session_iat < int(ticket.created_at):
+            return _bounce_to_login(request, ticket_id, reauth=True)
+
+        return HTMLResponse(
+            _cli_consent_html(
+                ticket_id=ticket_id,
+                user_id=user_id,
+                user_code=ticket.user_code,
+                base_path=getattr(request.app.state, "base_path", ""),
+            ),
+            status_code=200,
+            headers=_CLI_BROWSER_HEADERS,
+        )
+
+    def _require_cli_browser_origin(request: Request) -> None:
+        # These forms are server-rendered; API/WebSocket origin exceptions
+        # must not authorize browser consent. The callback covers proxy origins.
+        allowed = {
+            _canonical_cli_origin(str(request.url.replace(path="", query=""))),
+            _canonical_cli_origin(str(URL(config.redirect_uri).replace(path="", query=""))),
         }
+        origin = _canonical_cli_origin(request.headers.get("origin", ""))
+        if origin is None or origin not in allowed:
+            raise HTTPException(status_code=403, detail="Untrusted browser Origin")
+
+    @router.post("/cli-approve")
+    async def cli_approve(request: Request) -> Response:
+        """Approve a pending CLI login ticket from the browser."""
+        from fastapi.responses import JSONResponse
+
+        _require_cli_browser_origin(request)
+        user_id = auth_provider.get_user_id(request)
+        if user_id is None:
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
+        form = await request.form()
+        ticket_id = (str(form.get("ticket") or "")).strip()
+        ticket = _cli_ticket(ticket_id)
+        if ticket is None or ticket.token is not None or ticket.denied:
+            return HTMLResponse(
+                _cli_consent_html(error="This login request is invalid or has expired."),
+                status_code=200,
+                headers=_CLI_BROWSER_HEADERS,
+            )
+
+        session_iat = _session_iat(request, ticket_id)
+        if session_iat is None or session_iat < int(ticket.created_at):
+            return HTMLResponse(
+                _cli_consent_html(
+                    error="Sign in again to approve this login. "
+                    "Run `omnigent login` again and sign in when prompted."
+                ),
+                status_code=200,
+                headers=_CLI_BROWSER_HEADERS,
+            )
+
+        ticket.token = mint_session_cookie(
+            user_id=user_id,
+            cookie_secret=config.cookie_secret,
+            ttl_hours=config.session_ttl_hours,
+            provider=config.provider_type,
+        )
+        ticket.user_id = user_id
+        if device_grant_store is not None:
+            try:
+                ticket.refresh_token = issue_login_grant(
+                    device_grant_store,
+                    user_id=user_id,
+                    cookie_secret=config.cookie_secret,
+                )
+            except Exception:
+                _logger.exception("cli-login: refresh grant issuance failed")
+        _logger.info("cli-approve: %s approved CLI login", user_id)
+        return HTMLResponse(
+            _cli_consent_html(approved_as=user_id),
+            status_code=200,
+            headers=_CLI_BROWSER_HEADERS,
+        )
+
+    @router.post("/cli-deny")
+    async def cli_deny(request: Request) -> Response:
+        """Deny a pending CLI login ticket from the browser."""
+        from fastapi.responses import JSONResponse
+
+        _require_cli_browser_origin(request)
+        user_id = auth_provider.get_user_id(request)
+        if user_id is None:
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
+        form = await request.form()
+        ticket_id = (str(form.get("ticket") or "")).strip()
+        ticket = _cli_ticket(ticket_id)
+        if ticket is None or ticket.token is not None or ticket.denied:
+            return HTMLResponse(
+                _cli_consent_html(error="This login request is invalid or has expired."),
+                status_code=200,
+                headers=_CLI_BROWSER_HEADERS,
+            )
+        session_iat = _session_iat(request, ticket_id)
+        if session_iat is None or session_iat < int(ticket.created_at):
+            return HTMLResponse(
+                _cli_consent_html(error="Sign in again to deny this login."),
+                status_code=200,
+                headers=_CLI_BROWSER_HEADERS,
+            )
+        ticket.denied = True
+        return HTMLResponse(
+            _cli_consent_html(denied=True), status_code=200, headers=_CLI_BROWSER_HEADERS
+        )
 
     @router.get("/cli-poll")
     async def cli_poll(request: Request) -> Response:
@@ -616,10 +965,17 @@ def create_auth_router(
         from fastapi.responses import JSONResponse
 
         ticket_id = request.query_params.get("ticket")
+        if ticket_id == _CLI_UPGRADE_TICKET:
+            return JSONResponse(
+                status_code=410,
+                content={"error": _CLI_UPGRADE_MESSAGE},
+                headers=NO_STORE_HEADERS,
+            )
         if not ticket_id or ticket_id not in _cli_tickets:
             return JSONResponse(
                 status_code=410,
                 content={"error": "Ticket not found or expired"},
+                headers=NO_STORE_HEADERS,
             )
 
         ticket = _cli_tickets[ticket_id]
@@ -630,6 +986,38 @@ def create_auth_router(
             return JSONResponse(
                 status_code=410,
                 content={"error": "Ticket expired"},
+                headers=NO_STORE_HEADERS,
+            )
+
+        code_verifier = request.headers.get("X-Omnigent-Code-Verifier")
+        if code_verifier is None:
+            # Retain query transport for API compatibility; clients use the
+            # header so the proof does not appear in default access logs.
+            code_verifier = request.query_params.get("code_verifier")
+        if not code_verifier:
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"code_verifier is required. {_CLI_UPGRADE_MESSAGE}"},
+                headers=NO_STORE_HEADERS,
+            )
+        if _CODE_VERIFIER_RE.fullmatch(code_verifier) is None:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Invalid code_verifier"},
+                headers=NO_STORE_HEADERS,
+            )
+        if not hmac.compare_digest(derive_code_challenge(code_verifier), ticket.code_challenge):
+            return JSONResponse(
+                status_code=403,
+                content={"error": "code_verifier does not match this login ticket"},
+                headers=NO_STORE_HEADERS,
+            )
+        if ticket.denied:
+            del _cli_tickets[ticket_id]
+            return JSONResponse(
+                status_code=410,
+                content={"error": "Login request was denied in the browser"},
+                headers=NO_STORE_HEADERS,
             )
 
         # Still pending — browser hasn't completed the flow yet.
@@ -637,6 +1025,7 @@ def create_auth_router(
             return JSONResponse(
                 status_code=202,
                 content={"status": "pending"},
+                headers=NO_STORE_HEADERS,
             )
 
         # Fulfilled — return the token and clean up.
@@ -653,7 +1042,68 @@ def create_auth_router(
         # extra key, new CLIs against old servers see it absent.
         if refresh_token is not None:
             content["refresh_token"] = refresh_token
-        return JSONResponse(status_code=200, content=content)
+        return JSONResponse(status_code=200, content=content, headers=NO_STORE_HEADERS)
+
+    # ── Native sign-in ──────────────────────────────────────────────────────
+
+    @router.post("/native-token")
+    async def native_token(request: Request) -> Response:
+        """Exchange a native sign-in code for a session token.
+
+        The form carries ``code`` (delivered to the app's redirect URI
+        by ``/auth/callback``), the PKCE ``code_verifier`` whose
+        S256 digest the app sent to ``/auth/login``, and the same
+        ``redirect_uri``. A code is consumed by its first exchange
+        attempt, whatever the outcome.
+
+        :param request: The incoming form-encoded POST.
+        :returns: 200 ``{"token", "user_id", "expires_in"}`` plus
+            ``refresh_token`` when a grant store is wired, or a 400
+            RFC 6749 error (``invalid_request`` / ``invalid_grant``).
+        """
+        form = await request.form()
+        code = form.get("code")
+        verifier = form.get("code_verifier")
+        redirect_uri = form.get("redirect_uri")
+        if not isinstance(code, str) or not code:
+            return oauth_error("invalid_request")
+        _evict_expired_native_codes(_native_codes)
+        # Consumed before anything else is checked, so even a malformed
+        # attempt burns the code.
+        pending = _native_codes.pop(code, None)
+        if not isinstance(verifier, str) or not isinstance(redirect_uri, str):
+            return oauth_error("invalid_request")
+        if (
+            pending is None
+            or time.time() - pending.created_at > _NATIVE_CODE_TTL_SECONDS
+            or redirect_uri != pending.redirect_uri
+            or not _CODE_VERIFIER_RE.fullmatch(verifier)
+            or not hmac.compare_digest(derive_code_challenge(verifier), pending.code_challenge)
+        ):
+            return oauth_error("invalid_grant")
+
+        content: dict[str, object] = {
+            "token": mint_session_cookie(
+                user_id=pending.user_id,
+                cookie_secret=config.cookie_secret,
+                ttl_hours=config.session_ttl_hours,
+                provider=config.provider_type,
+            ),
+            "user_id": pending.user_id,
+            "expires_in": config.session_ttl_hours * 3600,
+        }
+        # The desktop renews from this grant instead of reopening the
+        # browser when the session expires. Best-effort, as for CLI logins.
+        if device_grant_store is not None:
+            try:
+                content["refresh_token"] = issue_login_grant(
+                    device_grant_store,
+                    user_id=pending.user_id,
+                    cookie_secret=config.cookie_secret,
+                )
+            except Exception:
+                _logger.exception("native sign-in: refresh grant issuance failed")
+        return JSONResponse(status_code=200, content=content, headers=NO_STORE_HEADERS)
 
     # ── Admin: read-only user list ────────────────────────────────
 
@@ -712,6 +1162,83 @@ def create_auth_router(
     return router
 
 
+def _cli_consent_html(
+    *,
+    ticket_id: str = "",
+    user_id: str = "",
+    user_code: str = "",
+    error: str = "",
+    approved_as: str = "",
+    denied: bool = False,
+    upgrade_required: bool = False,
+    base_path: str = "",
+) -> str:
+    """Render the minimal, dependency-free CLI login consent page."""
+
+    def esc(value: object) -> str:
+        return html.escape(str(value or ""))
+
+    if upgrade_required:
+        body = (
+            "<h1>Update Omnigent to sign in</h1>"
+            "<p>This server has a security update that requires a newer version "
+            "of the app you used to start sign-in. This login attempt did not "
+            "grant access.</p>"
+            "<ul><li><b>CLI:</b> Run <code>omni upgrade</code>, then run your "
+            "<code>omnigent login</code> command again. If the upgrade command "
+            "is unavailable, update using your original installer.</li>"
+            "<li><b>iOS or Android:</b> Update the Omnigent app through your "
+            "app store or your organization's distribution channel, then "
+            "start sign-in again.</li>"
+            "<li><b>Slack:</b> Ask your administrator to update the Omnigent "
+            "Slack integration, then restart setup in Slack.</li></ul>"
+            "<p>If no compatible update is available, contact your server "
+            "administrator. Retrying with this version will not sign you in.</p>"
+        )
+    elif error:
+        body = f'<p class="err">{esc(error)}</p>'
+    elif approved_as:
+        body = (
+            "<h1>Approved</h1><p>Approved — your client is now signed in as "
+            f"<b>{esc(approved_as)}</b>. You can close this tab.</p>"
+        )
+    elif denied:
+        body = "<h1>Denied</h1><p>No access was granted. You can close this tab.</p>"
+    else:
+        body = (
+            "<h1>Authorize sign-in</h1>"
+            f"<p>An Omnigent client is requesting a session as "
+            f"<b>{esc(user_id)}</b> on this Omnigent server.</p>"
+            f'<p class="muted">Code: {esc(user_code)}</p>'
+            '<p class="warn">⚠️ Only approve if you just started this sign-in '
+            "from Omnigent. For CLI or Slack sign-in, also check that this code "
+            "matches the one shown in your terminal or Slack. If you didn't "
+            "start this sign-in, click Deny — approving gives that client "
+            "access as you.</p>"
+            f'<form method="post" action="{esc(base_path)}/auth/cli-approve" class="row">'
+            f'<input type="hidden" name="ticket" value="{esc(ticket_id)}">'
+            '<button type="submit" class="primary">Approve</button></form>'
+            f'<form method="post" action="{esc(base_path)}/auth/cli-deny" class="row">'
+            f'<input type="hidden" name="ticket" value="{esc(ticket_id)}">'
+            '<button type="submit">Deny</button></form>'
+        )
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        f"<title>{'Update required' if upgrade_required else 'Authorize access'}"
+        " — Omnigent</title><style>"
+        "body{font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;"
+        "padding:0 1rem;line-height:1.5}h1{font-size:1.4rem}.muted{color:#666;"
+        "font-size:.9rem}.warn{color:#8a5a00;background:#fff7e6;padding:.6rem .8rem;"
+        "border-radius:.375rem;font-size:.9rem}.err{color:#b00}"
+        "button{font-size:1rem;padding:.5rem 1rem;"
+        "margin:.25rem 0;cursor:pointer}.primary{background:#2563eb;color:#fff;"
+        "border:none;border-radius:.375rem}.row{display:inline-block;margin-right:.5rem}"
+        "input{font-size:1rem;padding:.4rem;margin:.5rem}</style></head>"
+        f"<body>{body}</body></html>"
+    )
+
+
 # ── Private helpers ──────────────────────────────────────────────
 
 
@@ -727,6 +1254,99 @@ def _evict_expired_tickets(tickets: dict[str, _CliTicket]) -> None:
     expired = [k for k, v in tickets.items() if now - v.created_at > _CLI_TICKET_TTL_SECONDS]
     for k in expired:
         del tickets[k]
+
+
+def _evict_expired_native_codes(codes: dict[str, _NativeCode]) -> None:
+    """Remove native sign-in codes past their TTL.
+
+    :param codes: The mutable code dict to prune.
+    """
+    now = time.time()
+    expired = [k for k, v in codes.items() if now - v.created_at > _NATIVE_CODE_TTL_SECONDS]
+    for k in expired:
+        del codes[k]
+
+
+def _is_loopback_redirect_uri(raw: str) -> bool:
+    """Whether ``raw`` is an RFC 8252 loopback redirect a native app can listen on.
+
+    Only ``http://127.0.0.1:<port>/...`` and ``http://[::1]:<port>/...``
+    qualify: an explicit port, no userinfo, query, or fragment. Anything
+    else could deliver the sign-in code off this machine.
+
+    :param raw: The ``native_redirect_uri`` query parameter, e.g.
+        ``"http://127.0.0.1:53682/callback"``.
+    :returns: True when the URI is an acceptable loopback redirect.
+    """
+    if not raw or "?" in raw or "#" in raw or "\\" in raw or any(c.isspace() for c in raw):
+        return False
+    try:
+        parts = urlsplit(raw)
+        port = parts.port
+    except ValueError:
+        return False
+    return (
+        parts.scheme == "http"
+        and parts.hostname in _NATIVE_LOOPBACK_HOSTS
+        and port is not None
+        and port > 0
+        and parts.username is None
+        and parts.password is None
+    )
+
+
+def _parse_native_sign_in(params: Mapping[str, str]) -> dict[str, str] | None:
+    """Read the native sign-in parameters of a ``/auth/login`` request.
+
+    :param params: The request's query parameters.
+    :returns: ``{"redirect_uri", "state", "code_challenge"}``, or ``None``
+        when the request carries no native parameter.
+    :raises ValueError: When any native parameter is present but the set
+        is incomplete or invalid. Only S256 challenges are accepted.
+    """
+    if not any(name in params for name in _NATIVE_PARAMS):
+        return None
+    redirect_uri = params.get("native_redirect_uri", "")
+    native_state = params.get("native_state", "")
+    challenge = params.get("code_challenge", "")
+    if (
+        params.get("code_challenge_method") != "S256"
+        or not (
+            redirect_uri in NATIVE_APP_REDIRECT_URIS or _is_loopback_redirect_uri(redirect_uri)
+        )
+        or not _NATIVE_STATE_RE.fullmatch(native_state)
+        or not _S256_CHALLENGE_RE.fullmatch(challenge)
+    ):
+        raise ValueError("invalid native sign-in parameters")
+    return {"redirect_uri": redirect_uri, "state": native_state, "code_challenge": challenge}
+
+
+def _native_from_state(state_payload: Mapping[str, object] | None) -> dict[str, str] | None:
+    """Return the native sign-in recorded in a verified auth state, if any.
+
+    :param state_payload: The decoded, signature-checked state cookie.
+    :returns: The dict :func:`_parse_native_sign_in` produced at login, or
+        ``None`` for a browser or CLI-ticket sign-in.
+    """
+    native = state_payload.get("native") if state_payload else None
+    if not isinstance(native, dict):
+        return None
+    fields = ("redirect_uri", "state", "code_challenge")
+    if not all(isinstance(native.get(name), str) for name in fields):
+        return None
+    return {name: native[name] for name in fields}
+
+
+def _native_redirect(native: Mapping[str, str], params: dict[str, str]) -> RedirectResponse:
+    """Redirect the browser to a native app's redirect URI.
+
+    :param native: The native sign-in from :func:`_native_from_state`.
+    :param params: Query parameters to deliver, e.g. ``{"code": ...}``;
+        the app's ``state`` is appended.
+    :returns: A 302 to the native redirect URI.
+    """
+    query = urlencode({**params, "state": native["state"]})
+    return RedirectResponse(url=f"{native['redirect_uri']}?{query}", status_code=302)
 
 
 def _sanitize_return_to(raw: str | None) -> str:
@@ -881,7 +1501,7 @@ def _validate_id_token(
         return jwt.decode(
             id_token,
             signing_key.key,
-            algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
+            algorithms=["RS256", "RS384", "RS512", "PS256", "ES256", "ES384", "ES512"],
             audience=config.client_id,
             issuer=config.issuer,
         )

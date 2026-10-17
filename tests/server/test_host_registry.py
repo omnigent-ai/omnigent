@@ -182,6 +182,78 @@ def test_register_replacement_fails_stale_pending_import_streams() -> None:
     assert data["status"] == "failed"
 
 
+async def test_deregister_fails_inventory_waiters_and_ignores_settled_futures() -> None:
+    """A dropped host settles live inventory requests without invalid future writes."""
+    registry = HostRegistry()
+    conn = registry.register("host_inventory", FakeWebSocket(), _make_hello(), owner="bob")
+    loop = asyncio.get_running_loop()
+    live_skills = loop.create_future()
+    live_mcp = loop.create_future()
+    cancelled_skills = loop.create_future()
+    cancelled_skills.cancel()
+    completed_mcp = loop.create_future()
+    completed_mcp.set_result(None)
+    conn.pending_skills.update({"live": live_skills, "cancelled": cancelled_skills})
+    conn.pending_mcp_servers.update({"live": live_mcp, "completed": completed_mcp})
+
+    assert registry.deregister(conn.host_id) is True
+
+    for future in (live_skills, live_mcp):
+        with pytest.raises(ConnectionError, match="disconnected"):
+            future.result()
+    assert cancelled_skills.cancelled()
+    assert completed_mcp.result() is None
+    assert conn.pending_skills == {}
+    assert conn.pending_mcp_servers == {}
+
+
+async def test_replacement_only_fails_old_inventory_waiters() -> None:
+    """A reconnect cannot settle pending requests belonging to the new generation."""
+    registry = HostRegistry()
+    old = registry.register("host_inventory_replace", FakeWebSocket(), _make_hello(), owner="bob")
+    loop = asyncio.get_running_loop()
+    old_skills = loop.create_future()
+    old_mcp = loop.create_future()
+    old.pending_skills["old"] = old_skills
+    old.pending_mcp_servers["old"] = old_mcp
+
+    new = registry.register("host_inventory_replace", FakeWebSocket(), _make_hello(), owner="bob")
+
+    for future in (old_skills, old_mcp):
+        with pytest.raises(ConnectionError, match="disconnected"):
+            future.result()
+    assert old.pending_skills == {}
+    assert old.pending_mcp_servers == {}
+
+    new_skills = loop.create_future()
+    new_mcp = loop.create_future()
+    new.pending_skills["new"] = new_skills
+    new.pending_mcp_servers["new"] = new_mcp
+    assert registry.deregister(new.host_id, conn=old) is False
+    assert not new_skills.done()
+    assert not new_mcp.done()
+    new_skills.cancel()
+    new_mcp.cancel()
+
+
+async def test_inventory_waiters_on_closed_owner_loop_are_ignored() -> None:
+    """Closing an owner loop during teardown leaves no callback to schedule."""
+    registry = HostRegistry()
+    conn = registry.register("host_inventory_closed", FakeWebSocket(), _make_hello(), owner="bob")
+    owner_loop = asyncio.new_event_loop()
+    closed_skills = owner_loop.create_future()
+    closed_mcp = owner_loop.create_future()
+    owner_loop.close()
+    conn.pending_skills["closed"] = closed_skills
+    conn.pending_mcp_servers["closed"] = closed_mcp
+
+    assert registry.deregister(conn.host_id) is True
+    assert conn.pending_skills == {}
+    assert conn.pending_mcp_servers == {}
+    closed_skills.cancel()
+    closed_mcp.cancel()
+
+
 def test_deregister_returns_false_for_unknown() -> None:
     """
     Verify that deregister reports whether it removed an entry.
@@ -214,15 +286,17 @@ def test_mark_frame_seen_refreshes_current_connection() -> None:
     """
     Verify that a frame on the live connection refreshes its liveness.
 
-    The ping loop reads last_frame_at to decide whether a host is
+    The ping loop reads last_frame_monotonic to decide whether a host is
     dead, so a real frame must move it forward.
     """
     registry = HostRegistry()
     conn = registry.register("host_seen", FakeWebSocket(), _make_hello(), owner="bob")
     conn.last_frame_at = 0.0
+    conn.last_frame_monotonic = 0.0
 
     assert registry.mark_frame_seen(conn) is True
     assert conn.last_frame_at > 0.0
+    assert conn.last_frame_monotonic > 0.0
 
 
 def test_mark_frame_seen_rejects_superseded_connection() -> None:
@@ -328,7 +402,9 @@ def test_send_text_enqueues_frame() -> None:
 
     # Frame should be on the outbound queue.
     frame = conn.outbound_queue.get_nowait()
-    assert frame == '{"kind": "host.launch_runner"}'
+    assert frame is not None
+    assert frame.data == '{"kind": "host.launch_runner"}'
+    assert conn.diagnostics.snapshot()["outbound_queue_depth"] == 1
 
 
 def test_send_text_raises_if_connection_replaced() -> None:
@@ -391,8 +467,8 @@ def test_same_host_id_isolated_across_workspaces() -> None:
     # send_text routes to the right workspace's tunnel (no "replaced" error).
     registry.send_text(conn_a, "a")
     registry.send_text(conn_b, "b")
-    assert conn_a.outbound_queue.get_nowait() == "a"
-    assert conn_b.outbound_queue.get_nowait() == "b"
+    assert conn_a.outbound_queue.get_nowait().data == "a"
+    assert conn_b.outbound_queue.get_nowait().data == "b"
 
     # Deregister is workspace-scoped: removing A leaves B live.
     with workspace_scope(111):

@@ -21,6 +21,7 @@ import pytest
 
 from omnigent.runtime import get_caps
 from omnigent.spec.types import FunctionPolicySpec, FunctionRef, Phase, PhaseSelector
+from tests.server.helpers import create_session_for_agent as _create_session
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -83,12 +84,6 @@ def _tool_result_request(result: str) -> dict[str, Any]:
             "request_data": {"name": "Bash", "arguments": {"command": "ls"}},
         },
     }
-
-
-async def _create_session(client: httpx.AsyncClient, agent_id: str) -> str:
-    resp = await client.post("/v1/sessions", json={"agent_id": agent_id})
-    assert resp.status_code == 201, f"create failed: {resp.status_code} {resp.text}"
-    return resp.json()["id"]
 
 
 async def _evaluate(

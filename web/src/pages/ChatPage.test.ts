@@ -496,6 +496,15 @@ describe("buildPendingBubbles", () => {
     ) as [Extract<Bubble, { kind: "user" }>];
     expect(replayed.createdAtS).toBeUndefined();
   });
+
+  it("flags only mid-turn sends as awaiting the agent", () => {
+    const [midTurn, plain] = buildPendingBubbles(
+      [{ ...pending[0]!, sentMidTurn: true }, pending[0]!],
+      null,
+    ) as [Extract<Bubble, { kind: "user" }>, Extract<Bubble, { kind: "user" }>];
+    expect(midTurn.awaitingAgent).toBe(true);
+    expect(plain.awaitingAgent).toBeUndefined();
+  });
 });
 
 // ── mergePendingBubbles ────────────────────────────────────────────────────
@@ -1738,6 +1747,28 @@ describe("splitSlashCommand", () => {
       token: "/dev-productivity:simplify",
       after: " now",
     });
+  });
+
+  it("treats a known skill name with spaces as one token", () => {
+    const name = "/Simplified Technical English (ASD-STE100)";
+    expect(splitSlashCommand(`${name} rewrite this`, ["/compact", name])).toEqual({
+      before: "",
+      token: name,
+      after: " rewrite this",
+    });
+    // Without a catalog match only the first word reads as the command.
+    expect(splitSlashCommand(`${name} rewrite this`, ["/compact"])?.token).toBe("/Simplified");
+  });
+
+  it("matches a known skill whose first word is not command-shaped", () => {
+    const name = "/Node.js Best Practices";
+    expect(splitSlashCommand(`${name} here`, [name])).toEqual({
+      before: "",
+      token: name,
+      after: " here",
+    });
+    // Not command-shaped and not in the catalog: nothing to tint.
+    expect(splitSlashCommand(`${name} here`)).toBeNull();
   });
 
   it("returns null when the text isn't a command", () => {

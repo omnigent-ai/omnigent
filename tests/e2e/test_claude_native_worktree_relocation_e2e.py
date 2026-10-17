@@ -58,15 +58,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import io
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
-import tarfile
-import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -76,6 +73,7 @@ import httpx
 import pytest
 
 from tests._helpers.live_server import isolated_local_server, local_server_env, terminate_process
+from tests._helpers.native_session import create_native_session
 
 # CI shells can carry an egress proxy; every HTTP call here targets 127.0.0.1.
 _http = httpx.Client(trust_env=False)
@@ -94,50 +92,6 @@ _EXIT_TOOL_USE_ID = "toolu_bdrk_01ExitWorktreeKeep"
 _PROMPT = "marker-user-prompt-work-in-the-existing-universe-worktree"
 _ASSISTANT_TEXT = "marker-assistant-entering-the-worktree-first"
 _REATTACH_PROMPT = "marker-preexisting-history-before-reattach"
-
-
-def _create_claude_native_session(base_url: str) -> str:
-    """Create a claude-native wrapper session exactly like ``omnigent claude``.
-
-    :param base_url: Spawned server base URL.
-    :returns: The new session/conversation id.
-    """
-    from omnigent._wrapper_labels import (
-        CLAUDE_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
-    )
-    from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
-
-    with tempfile.TemporaryDirectory() as tmp:
-        yaml_text = _materialize_claude_agent_spec(Path(tmp)).read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        info = tarfile.TarInfo("claude-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    labels = {
-        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY: CLAUDE_NATIVE_WRAPPER_VALUE,
-    }
-    create = _http.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({"labels": labels})},
-        files={
-            "bundle": (
-                "claude-native-ui.tar.gz",
-                buf.getvalue(),
-                "application/gzip",
-            )
-        },
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    return str(create.json()["session_id"])
 
 
 def _project_dir(claude_home: Path, cwd: Path) -> Path:
@@ -697,7 +651,9 @@ def test_terminal_approved_enter_worktree_clears_the_web_approval_card(
 
     try:
         with isolated_local_server(tmp_path, poll_interval=_POLL_S) as base_url:
-            session_id = _create_claude_native_session(base_url)
+            session_id = str(
+                create_native_session(_http, base_url, harness="claude")["session_id"]
+            )
             bridge_dir = prepare_bridge_dir(session_id, workspace=cwd)
             # The very settings fragment the runner hands Claude via --settings.
             settings = build_hook_settings(

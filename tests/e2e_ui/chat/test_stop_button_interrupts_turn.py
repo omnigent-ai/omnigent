@@ -52,7 +52,6 @@ from __future__ import annotations
 
 import contextlib
 import io
-import json
 import os
 import re
 import secrets
@@ -68,6 +67,8 @@ from pathlib import Path
 import httpx
 import pytest
 from playwright.sync_api import Page, Route, expect
+
+from tests._helpers.session import bind_session_runner, post_session_bundle
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -325,21 +326,11 @@ def _create_stub_session(base_url: str, runner_id: str, harness: str) -> str:
             tar.addfile(info, io.BytesIO(payload))
         bundle = buf.getvalue()
 
-    create_resp = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        timeout=30.0,
-    )
+    create_resp = post_session_bundle(httpx.post, f"{base_url}/v1/sessions", bundle, timeout=30.0)
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
 
-    patch_resp = httpx.patch(
-        f"{base_url}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch_resp.raise_for_status()
+    bind_session_runner(httpx.patch, base_url, session_id, runner_id, timeout=10.0)
     return session_id
 
 

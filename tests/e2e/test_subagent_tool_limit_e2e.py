@@ -37,6 +37,7 @@ import httpx
 import pytest
 import yaml
 
+from tests._helpers.session import post_session_bundle
 from tests.e2e.conftest import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
     configure_mock_llm,
@@ -128,11 +129,8 @@ def _register_limit_bundle(
             )
         bundle = buf.getvalue()
 
-    resp = client.post(
-        "/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    resp = post_session_bundle(
+        client.post, "/v1/sessions", bundle, headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
     )
     if resp.status_code not in (200, 201, 409):
         raise RuntimeError(f"bundle register failed: {resp.status_code} {resp.text[:500]}")

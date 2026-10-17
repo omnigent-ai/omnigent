@@ -6,9 +6,12 @@ import atexit
 import base64
 import codecs
 import contextlib
+import errno
 import json
+import logging
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -37,6 +40,7 @@ from .credential_proxy import (
     prepare_credential_proxy_runtime,
 )
 from .datamodel import CredentialProxySpec, OSEnvSpec
+from .git_ssh import GitSshBroker, apply_git_ssh_env, start_git_ssh_broker
 from .sandbox import (
     ContainmentHandle,
     SandboxPolicy,
@@ -60,12 +64,12 @@ from .sandbox import (
     run_launcher as _run_launcher,
 )
 
-# Result dict returned by ``read`` / ``write`` / ``edit`` / ``shell`` and the
-# corresponding ``_*_impl`` helpers. Keys vary by op (content/offset/total_lines
-# for read; bytes_written/created for write; stdout/stderr/exit_code for shell;
-# error/ok markers for all of them) and values mix str/int/bool, so we expose
-# an opaque JSON-shaped dict at this boundary rather than enumerating every
-# shape as a TypedDict tree.
+# Result dict returned by ``read`` / ``write`` / ``edit`` / ``shell`` / ``delete``
+# and the corresponding ``_*_impl`` helpers. Keys vary by op (content/offset/
+# total_lines for read; bytes_written/created for write; stdout/stderr/exit_code
+# for shell; deleted/type for delete; error/ok markers for all of them) and
+# values mix str/int/bool, so we expose an opaque JSON-shaped dict at this
+# boundary rather than enumerating every shape as a TypedDict tree.
 OpResult: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 
 # JSON-RPC payload exchanged between the parent ``_HelperProcessClient`` and
@@ -74,6 +78,8 @@ OpResult: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 # opaque JSON object at this boundary with runtime validation in
 # ``_handle_helper_request``.
 OpRequest: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
+
+logger = logging.getLogger(__name__)
 
 # A single ``edit`` list entry — an {oldText, newText} pair of strings.
 EditEntry: TypeAlias = dict[str, str]
@@ -321,7 +327,7 @@ class OSEnvironment(ABC):
         path: str,
         offset: int = 1,
         limit: int | None = None,
-        max_binary_bytes: int | None = None,
+        max_bytes: int | None = None,
     ) -> OpResult:
         raise NotImplementedError
 
@@ -348,6 +354,16 @@ class OSEnvironment(ABC):
         max_output: int | None = None,
     ) -> OpResult:
         raise NotImplementedError
+
+    async def delete(self, path: str, *, recursive: bool = False) -> OpResult:
+        """Remove the entry *path* names, confined like ``write``.
+
+        :param path: Path relative to the environment root.
+        :param recursive: Also remove a directory's contents.
+        :returns: The helper's result; environments without a helper refuse.
+        """
+        del path, recursive
+        return {"error": "This environment does not support delete", "code": "unsupported"}
 
     def prepare_sandbox(self, policy: SandboxPolicy) -> None:
         """Attach environment-owned resources before launching a consumer."""
@@ -416,6 +432,7 @@ class _HelperProcessClient:
         # introspects them, but the lifecycle is driven through
         # the handle when present.
         self._egress_handle: EgressProxyHandle | None = None
+        self._git_ssh_broker: GitSshBroker | None = None
         self._lock = threading.Lock()
         self._closed = False
         atexit.register(self.close)
@@ -466,6 +483,13 @@ class _HelperProcessClient:
         self._start_locked()
 
     def _start_locked(self) -> None:
+        try:
+            self._start_unchecked_locked()
+        except BaseException:
+            self._stop_locked()
+            raise
+
+    def _start_unchecked_locked(self) -> None:
         sandbox = self.sandbox
         if self._copy_on_write_environment is not None:
             self._copy_on_write_environment.prepare(sandbox)
@@ -524,6 +548,11 @@ class _HelperProcessClient:
                     credential_runtime.rewrites if credential_runtime is not None else None
                 ),
             )
+
+        if sandbox.git_ssh and self._tmpdir is not None:
+            self._git_ssh_broker = start_git_ssh_broker(sandbox.git_ssh, self._tmpdir)
+            apply_git_ssh_env(env, self._git_ssh_broker)
+            sandbox = replace(sandbox, git_ssh_socket_path=str(self._git_ssh_broker.socket_path))
 
         if self._tmpdir is not None:
             set_sandbox_env(env, self._tmpdir)
@@ -586,6 +615,9 @@ class _HelperProcessClient:
             config_arg = ["--config-fd", str(r_fd)]
         helper_argv = [
             sys.executable,
+            # Load tools from the runtime even when the checkout's package is broken.
+            # Unlike PYTHONSAFEPATH, -P does not change the agent's shell commands.
+            "-P",
             "-m",
             "omnigent.inner.os_env",
             "helper",
@@ -629,8 +661,7 @@ class _HelperProcessClient:
                 **popen_kwargs,
             )
         except Exception:
-            cleanup_private_tmpdir(self._tmpdir)
-            self._tmpdir = None
+            self._stop_locked()
             raise
         finally:
             # Close the parent's copy of the read end either way —
@@ -646,10 +677,14 @@ class _HelperProcessClient:
         # launcher backends (they isolate via wrap_launcher_argv before
         # exec); on Windows this assigns the helper to a kill-on-close
         # Job Object so the whole tree is torn down in ``_stop_locked``.
-        if sandbox.active and self._proc.pid is not None:
-            self._sandbox_handle = get_backend(sandbox.backend_type).post_spawn(
-                sandbox, self._proc.pid
-            )
+        try:
+            if sandbox.active and self._proc.pid is not None:
+                self._sandbox_handle = get_backend(sandbox.backend_type).post_spawn(
+                    sandbox, self._proc.pid
+                )
+        except Exception:
+            self._stop_locked()
+            raise
 
     def _helper_exit_detail_locked(self) -> str:
         if self._proc is None:
@@ -702,6 +737,12 @@ class _HelperProcessClient:
                     self._sandbox_handle.close()
                 self._sandbox_handle = None
             self._stop_egress_proxy_locked()
+            if self._git_ssh_broker is not None:
+                try:
+                    self._git_ssh_broker.stop()
+                except Exception:
+                    logger.exception("Git SSH broker stop failed")
+                self._git_ssh_broker = None
             cleanup_private_tmpdir(self._tmpdir)
             self._tmpdir = None
 
@@ -901,7 +942,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
         path: str,
         offset: int = 1,
         limit: int | None = None,
-        max_binary_bytes: int | None = None,
+        max_bytes: int | None = None,
     ) -> OpResult:
         if offset < 1:
             return {"error": "offset must be >= 1"}
@@ -914,7 +955,7 @@ class CallerProcessOSEnvironment(OSEnvironment):
                 "path": path,
                 "offset": offset,
                 "limit": limit,
-                "max_binary_bytes": max_binary_bytes,
+                "max_bytes": max_bytes,
             },
         )
         return cast(OpResult, result)
@@ -969,6 +1010,13 @@ class CallerProcessOSEnvironment(OSEnvironment):
         if max_output is not None:
             request["max_output"] = max_output
         result = await run_sync_on_thread(self._helper.request, request)
+        return cast(OpResult, result)
+
+    async def delete(self, path: str, *, recursive: bool = False) -> OpResult:
+        result = await run_sync_on_thread(
+            self._helper.request,
+            {"op": "delete", "path": path, "recursive": recursive},
+        )
         return cast(OpResult, result)
 
     def close(self) -> None:
@@ -1066,13 +1114,13 @@ def _handle_helper_request(
             return {"error": str(exc)}
         offset_raw = request.get("offset", 1)
         offset = offset_raw if isinstance(offset_raw, int) else 1
-        max_binary_raw = request.get("max_binary_bytes")
-        max_binary_bytes = max_binary_raw if isinstance(max_binary_raw, int) else None
+        max_bytes_raw = request.get("max_bytes")
+        max_bytes = max_bytes_raw if isinstance(max_bytes_raw, int) else None
         return _read_impl(
             path,
             offset,
             request.get("limit"),
-            max_binary_bytes=max_binary_bytes,
+            max_bytes=max_bytes,
         )
 
     if op == "write":
@@ -1113,6 +1161,15 @@ def _handle_helper_request(
             request.get("newText"),
             request.get("edits"),
         )
+
+    if op == "delete":
+        raw_path = request.get("path")
+        recursive = request.get("recursive", False)
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return {"error": "path must be a non-empty string", "code": "invalid_path"}
+        if not isinstance(recursive, bool):
+            return {"error": "recursive must be a boolean", "code": "invalid_path"}
+        return _delete_impl(cwd, sandbox, raw_path, recursive=recursive)
 
     if op == "shell":
         command = request.get("command")
@@ -1270,6 +1327,182 @@ def _assert_write_allowed(policy: SandboxPolicy, path: Path) -> None:
     raise PermissionError(f"Write access to '{path}' is blocked by sandbox.")
 
 
+_NOFOLLOW_DELETE_SUPPORTED = (
+    all(fn in os.supports_dir_fd for fn in (os.open, os.stat, os.unlink, os.rmdir))
+    and hasattr(os, "O_NOFOLLOW")
+    and hasattr(os, "O_DIRECTORY")
+)
+# ``O_PATH`` (Linux) and ``O_SEARCH`` (macOS 13+, BSDs) need only search
+# permission. Older kernels may ignore ``O_SEARCH`` and require read permission.
+_DIR_TRAVERSE_FLAGS = (
+    (getattr(os, "O_PATH", 0) or getattr(os, "O_SEARCH", 0) or os.O_RDONLY)
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+def _delete_impl(cwd: Path, sandbox: SandboxPolicy, raw_path: str, *, recursive: bool) -> OpResult:
+    """Remove the entry *raw_path* names, confined like a write and never followed.
+
+    The parent is resolved and the entry must be within write reach, exactly as
+    for ``write``; the leaf itself is not resolved, so deleting a symlink removes
+    the link rather than its target. The resolved parent is then reopened one
+    component at a time with ``O_NOFOLLOW`` from the grant that admitted it, so
+    a directory swapped for a symlink after the check is refused, and the leaf
+    is removed relative to that descriptor. A non-recursive directory delete is
+    a single ``rmdir``, which refuses a non-empty directory atomically. Deletion
+    is refused if safe traversal is unavailable or a parent cannot be opened.
+
+    :param cwd: The environment root.
+    :param sandbox: Resolved sandbox policy carrying the declared grants.
+    :param raw_path: Path to remove, relative to *cwd*.
+    :param recursive: Also remove a directory's contents.
+    :returns: ``{"deleted": True, "type": ..., "bytes_deleted": ...}``, or
+        ``{"error": ..., "code": ...}`` with code ``invalid_path``,
+        ``not_found``, ``directory_not_empty``, ``permission_denied`` or
+        ``delete_failed``.
+    """
+    if "\x00" in raw_path:
+        return {"error": "Path contains NUL bytes", "code": "invalid_path"}
+    parent_raw, name = os.path.split(os.path.normpath(raw_path))
+    if name in ("", ".", ".."):
+        return {
+            "error": f"Path {raw_path!r} does not name a deletable entry",
+            "code": "invalid_path",
+        }
+    parent = _resolve_path(cwd, parent_raw or ".")
+    entry = parent / name
+    try:
+        _assert_within_reach(cwd, sandbox, entry, need_write=True)
+    except PermissionError:
+        # Not str(exc): that names where an outward symlink points.
+        return {"error": f"Path {raw_path!r} escapes the environment root", "code": "invalid_path"}
+    resolved_cwd = cwd.resolve()
+    if resolved_cwd.is_relative_to(entry):
+        return {
+            "error": "Cannot delete the environment root or a directory containing it",
+            "code": "invalid_path",
+        }
+    try:
+        _assert_write_allowed(sandbox, entry)
+    except PermissionError:
+        return {
+            "error": f"Write access to {raw_path!r} is blocked by sandbox",
+            "code": "permission_denied",
+        }
+    anchor = _delete_anchor(cwd, sandbox, parent, entry)
+    if anchor is None:
+        return {"error": f"Cannot delete the reachable root {raw_path!r}", "code": "invalid_path"}
+    try:
+        return _delete_beneath(*anchor, name, recursive=recursive)
+    except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+            code = "not_found"
+        elif exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
+            code = "directory_not_empty"
+        elif exc.errno in (errno.EACCES, errno.EPERM, errno.EROFS):
+            code = "permission_denied"
+        else:
+            code = "delete_failed"
+        return {"error": str(exc), "code": code}
+
+
+def _delete_anchor(
+    cwd: Path, sandbox: SandboxPolicy, parent: Path, entry: Path
+) -> tuple[Path, tuple[str, ...]] | None:
+    """Pick the trusted directory a delete walks from.
+
+    :param cwd: The environment root.
+    :param sandbox: Resolved sandbox policy carrying the declared grants.
+    :param parent: Resolved parent of the entry.
+    :param entry: The entry, parent resolved and leaf not.
+    :returns: ``(base, parts)``: a write grant to open by path and the
+        components from it down to *parent*, or ``None`` when *entry* is a
+        grant root whose parent no grant covers.
+    """
+    for root in reachable_roots(cwd, sandbox):
+        if root.access != "write":
+            continue
+        if root.kind == "tree" and root.contains(parent):
+            return root.path, parent.relative_to(root.path).parts
+        if root.kind == "file" and root.path == entry:
+            return parent, ()
+    return None
+
+
+def _delete_beneath(base: Path, parts: Sequence[str], name: str, *, recursive: bool) -> OpResult:
+    """Remove *name* inside *base*/*parts*, refusing any symlinked component.
+
+    Refuse deletion when descriptor traversal is unavailable or a directory
+    cannot be opened. Falling back to a checked pathname would allow a replaced
+    intermediate directory to redirect the removal.
+
+    :param base: Directory to open by path.
+    :param parts: Components from *base* to the entry's parent.
+    :param name: The entry's final component.
+    :param recursive: Also remove a directory's contents.
+    :returns: The delete result in :func:`_delete_impl`'s shape.
+    :raises OSError: When a component or the entry cannot be removed.
+    """
+    if not _NOFOLLOW_DELETE_SUPPORTED:
+        return {
+            "error": "Safe directory traversal is unavailable on this platform",
+            "code": "permission_denied",
+        }
+    fd = os.open(base, _DIR_TRAVERSE_FLAGS)
+    try:
+        for part in parts:
+            try:
+                next_fd = os.open(part, _DIR_TRAVERSE_FLAGS | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR) and stat.S_ISLNK(
+                    os.stat(part, dir_fd=fd, follow_symlinks=False).st_mode
+                ):
+                    return {
+                        "error": f"{part!r} became a symbolic link during the delete",
+                        "code": "invalid_path",
+                    }
+                raise
+            os.close(fd)
+            fd = next_fd
+        return _delete_leaf(name, fd, recursive=recursive)
+    finally:
+        os.close(fd)
+
+
+def _delete_leaf(name: str, dir_fd: int, *, recursive: bool) -> OpResult:
+    """Remove *name* without following it.
+
+    :param name: Entry to remove, relative to *dir_fd*.
+    :param dir_fd: Descriptor of the entry's parent.
+    :param recursive: Also remove a directory's contents.
+    :returns: The delete result in :func:`_delete_impl`'s shape.
+    :raises OSError: When the entry cannot be removed.
+    """
+    st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    if stat.S_ISDIR(st.st_mode):
+        if not recursive:
+            os.rmdir(name, dir_fd=dir_fd)
+        elif shutil.rmtree.avoids_symlink_attacks:
+            shutil.rmtree(name, dir_fd=dir_fd)
+        else:
+            return {"error": "Recursive delete is not symlink-safe here", "code": "delete_failed"}
+        entry_type = "directory"
+    else:
+        os.unlink(name, dir_fd=dir_fd)
+        if stat.S_ISLNK(st.st_mode):
+            entry_type = "symlink"
+        elif stat.S_ISREG(st.st_mode):
+            entry_type = "file"
+        else:
+            entry_type = "other"
+    return {
+        "deleted": True,
+        "type": entry_type,
+        "bytes_deleted": st.st_size if entry_type == "file" else None,
+    }
+
+
 # Bytes sampled to classify a file as text vs binary. A NUL byte or an invalid
 # UTF-8 sequence in this prefix marks the file binary (the same prefix-sniff
 # heuristic git uses), so a multi-MB binary is never read in full just to find
@@ -1302,21 +1535,21 @@ def _is_binary_file(path: Path) -> bool:
     return False
 
 
-def _read_binary_impl(path: Path, max_binary_bytes: int | None) -> OpResult:
-    """Read a binary file as base64, bounded by *max_binary_bytes*.
+def _read_binary_impl(path: Path, max_bytes: int | None) -> OpResult:
+    """Read a binary file as base64, bounded by *max_bytes*.
 
-    Only ``stat`` (for the total size) and at most *max_binary_bytes* are read
+    Only ``stat`` (for the total size) and at most *max_bytes* are read
     from disk, so a large file neither saturates memory nor inflates IPC.
 
     :param path: Absolute path of the binary file.
-    :param max_binary_bytes: Byte cap. ``None`` returns a descriptor only (the
+    :param max_bytes: Byte cap. ``None`` returns a descriptor only (the
         agent ``sys_os_read`` path); a positive int inlines up to that many
         base64-encoded bytes (the filesystem-service path).
     :returns: An :class:`OpResult` with ``encoding="base64"`` (see
         :func:`_read_impl`).
     """
     total = path.stat().st_size
-    if max_binary_bytes is None:
+    if max_bytes is None:
         # Agent tool path: return a descriptor only — inlining base64 the
         # model cannot use would waste (and risk saturating) the context.
         return {
@@ -1332,7 +1565,7 @@ def _read_binary_impl(path: Path, max_binary_bytes: int | None) -> OpResult:
             ),
         }
     with path.open("rb") as fh:
-        payload = fh.read(max_binary_bytes)
+        payload = fh.read(max_bytes)
     return {
         "path": str(path),
         "content": base64.b64encode(payload).decode("ascii"),
@@ -1347,18 +1580,19 @@ def _read_impl(
     path: Path,
     offset: int,
     limit: JsonValue,
-    max_binary_bytes: int | None = None,
+    max_bytes: int | None = None,
 ) -> OpResult:
     """
     Read a file as UTF-8 text, or as base64-encoded bytes when it is binary.
 
     The file's first chunk is sniffed for UTF-8 validity (see
     :func:`_is_binary_file`). Files that look like text are read and returned
-    with the usual line-oriented ``offset``/``limit`` windowing. Files that do
-    *not* (images, archives, fonts, …) cannot be line-windowed, so they are
-    capped by *bytes* instead, reading at most ``max_binary_bytes`` from disk.
+    with the usual line-oriented ``offset``/``limit`` windowing. ``max_bytes``
+    bounds both text and binary reads before decoding or returning content
+    through the helper's IPC channel. Text reads use one extra byte to detect
+    truncation, dropping an incomplete trailing UTF-8 character.
 
-    For binary files the behaviour depends on ``max_binary_bytes``:
+    For binary files the behaviour depends on ``max_bytes``:
 
     * ``None`` (the default, used by the agent ``sys_os_read`` tool) — the
       base64 payload is **not** inlined. A model cannot decode base64, and a
@@ -1374,11 +1608,12 @@ def _read_impl(
         limit (return all lines from *offset* to end of file).  Callers
         that want the default agent-tool cap should pass
         :data:`_DEFAULT_READ_LIMIT` explicitly.  Ignored for binary files.
-    :param max_binary_bytes: Byte cap for binary files (see above). ``None``
-        returns a descriptor only.
+    :param max_bytes: Byte cap applied before text line-windowing. ``None``
+        leaves text uncapped and returns a descriptor only for binary files.
     :returns: For text, an :class:`OpResult` with ``encoding="utf-8"``,
         ``content``, ``offset``, ``limit``, ``returned_lines``, and
-        ``total_lines``.  For binary, ``encoding="base64"``, ``total_bytes``,
+        ``total_lines`` (unknown when byte-truncated), and ``truncated``.
+        For binary, ``encoding="base64"``, ``total_bytes``,
         ``truncated`` and either ``content`` (the base64 string, byte-capped
         callers) or a ``note`` (descriptor-only callers).
     """
@@ -1387,19 +1622,28 @@ def _read_impl(
     if limit is not None:
         if not isinstance(limit, int) or limit < 1:
             return {"error": "limit must be >= 1"}
-    if max_binary_bytes is not None and max_binary_bytes < 1:
-        return {"error": "max_binary_bytes must be >= 1"}
+    if max_bytes is not None and max_bytes < 1:
+        return {"error": "max_bytes must be >= 1"}
 
     if _is_binary_file(path):
-        return _read_binary_impl(path, max_binary_bytes)
+        return _read_binary_impl(path, max_bytes)
 
+    truncated = False
     try:
-        text = path.read_text(encoding="utf-8", errors="strict")
+        if max_bytes is None:
+            text = path.read_text(encoding="utf-8", errors="strict")
+        else:
+            with path.open("rb") as fh:
+                raw = fh.read(max_bytes + 1)
+            truncated = len(raw) > max_bytes
+            text = codecs.getincrementaldecoder("utf-8")("strict").decode(
+                raw[:max_bytes], final=not truncated
+            )
     except UnicodeDecodeError:
         # The sniffed prefix decoded cleanly but bytes further in did not (a
         # file that is text up front and binary later). Fall back to the binary
         # path so we never return garbled text.
-        return _read_binary_impl(path, max_binary_bytes)
+        return _read_binary_impl(path, max_bytes)
 
     lines = text.splitlines(keepends=True)
     start = offset - 1
@@ -1413,7 +1657,8 @@ def _read_impl(
         "offset": offset,
         "limit": effective_limit,
         "returned_lines": max(0, resolved_limit - start),
-        "total_lines": len(lines),
+        "total_lines": None if truncated else len(lines),
+        "truncated": truncated,
     }
 
 

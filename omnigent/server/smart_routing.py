@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.models.model_fallbacks import (
     SMART_ROUTING_CLAUDE_LADDER,
+    SMART_ROUTING_CODEX_NATIVE_EXCLUDED,
     SMART_ROUTING_CURRENT_GENERATION_GPT,
     SMART_ROUTING_FAMILY_FALLBACKS,
     SMART_ROUTING_GPT_LADDER,
@@ -1115,11 +1116,12 @@ _MULTI_MODEL_FAMILY = "pi"
 # Canonical harness names required by routers such as task_v3.
 _ROUTER_HARNESS_BY_FAMILY: dict[str, str] = {"claude": "claude", "gpt": "codex"}
 
-# (harness, model) pairs the harness's own gateway 400s on: under pi, Claude
-# models on its ``eager_input_streaming`` field and gpt-5.5/5.6 reasoning models
-# on its openai-completions default ``reasoning_effort``. Probed against a
-# live gateway; tests/e2e/routing/ exercises the exclusions.
-_HARNESS_EXCLUDED_MODELS: dict[str, tuple[str, ...]] = {"pi": SMART_ROUTING_PI_EXCLUDED}
+# Availability catalogs omit harness request-shape limits. Correct known
+# incompatible pairs before applying an automatic routing decision.
+_HARNESS_EXCLUDED_MODELS: dict[str, tuple[str, ...]] = {
+    "pi": SMART_ROUTING_PI_EXCLUDED,
+    "codex-native": SMART_ROUTING_CODEX_NATIVE_EXCLUDED,
+}
 
 
 def _configured_prefixes(prefixes: Sequence[str] | None) -> Sequence[str]:
