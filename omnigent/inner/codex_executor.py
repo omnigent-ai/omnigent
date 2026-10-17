@@ -32,7 +32,7 @@ from collections.abc import (
     Sequence,
 )
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Any, Protocol, TypeAlias, cast
@@ -94,6 +94,9 @@ from .executor import (
     ExecutorEvent,
     Message,
     ReasoningChunk,
+    SubAgentCompleted,
+    SubAgentStarted,
+    SubAgentToolCall,
     TextChunk,
     ToolArgs,
     ToolCallComplete,
@@ -2587,6 +2590,87 @@ def _result_text(result: CodexToolResult) -> str:
         return str(result)
 
 
+# Codex multi-agent items: the parent's agent-control tool calls (``spawnAgent``,
+# ``sendInput``, ``wait``, ``closeAgent``...) and the child-thread announcement.
+_CODEX_COLLAB_ITEM_TYPE = "collabAgentToolCall"
+_CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE = "subAgentActivity"
+_CODEX_COLLAB_FAILED_STATUSES = frozenset({"errored", "notFound"})
+_CODEX_COLLAB_FINISHED_STATUSES = frozenset({"completed", "interrupted", "shutdown"})
+# Row label when Codex exposes no nickname for a helper thread.
+_CODEX_HELPER_TITLE_FALLBACK = "Codex helper"
+_CODEX_CHILD_THREAD_READ_TIMEOUT_S = 5.0
+_CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+
+
+def _event_thread_id(params: CodexParams) -> str | None:
+    """Return the Codex thread id a notification is scoped to, if any."""
+
+    thread_id = params.get("threadId")
+    if isinstance(thread_id, str) and thread_id:
+        return thread_id
+    thread = params.get("thread")
+    if isinstance(thread, dict):
+        nested_thread_id = thread.get("id")
+        if isinstance(nested_thread_id, str) and nested_thread_id:
+            return nested_thread_id
+    return None
+
+
+def _collab_tool_name(tool: str) -> str:
+    """Spell a Codex agent-control tool the way the model calls it (``spawn_agent``)."""
+
+    return _CAMEL_BOUNDARY_RE.sub("_", tool).lower()
+
+
+def _collab_child_thread_ids(item: CodexParams) -> list[str]:
+    """Return the helper thread ids a ``collabAgentToolCall`` item addresses."""
+
+    raw = item.get("receiverThreadIds")
+    if not isinstance(raw, list):
+        return []
+    seen: set[str] = set()
+    thread_ids: list[str] = []
+    for value in raw:
+        if isinstance(value, str) and value and value not in seen:
+            seen.add(value)
+            thread_ids.append(value)
+    return thread_ids
+
+
+def _collab_agent_states(item: CodexParams) -> dict[str, CodexParams]:
+    """Return the per-helper state snapshot of a ``collabAgentToolCall`` item."""
+
+    states = item.get("agentsStates")
+    if not isinstance(states, dict):
+        return {}
+    return {
+        thread_id: state
+        for thread_id, state in states.items()
+        if isinstance(thread_id, str) and thread_id and isinstance(state, dict)
+    }
+
+
+def _spawned_child_tasks(item: object) -> dict[str, str]:
+    """Map helper thread ids a spawn item names to the task prompt it carries.
+
+    Mirrors the registration sources in :meth:`_observe_parent_item`: the
+    ``collabAgentToolCall`` receivers and a ``subAgentActivity`` start.
+    """
+
+    if not isinstance(item, dict):
+        return {}
+    item_type = item.get("type")
+    if item_type == _CODEX_COLLAB_ITEM_TYPE:
+        prompt = item.get("prompt")
+        task = prompt if isinstance(prompt, str) else ""
+        return dict.fromkeys(_collab_child_thread_ids(item), task)
+    if item_type == _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE and item.get("kind") == "started":
+        thread_id = item.get("agentThreadId")
+        if isinstance(thread_id, str) and thread_id:
+            return {thread_id: ""}
+    return {}
+
+
 def _codex_builtin_tool_request(
     item: CodexParams,
     *,
@@ -2599,7 +2683,8 @@ def _codex_builtin_tool_request(
     ``completed`` distinguishes the live start from the durable lifecycle
     update emitted alongside the result. Malformed items return ``None``.
 
-    :param item: Codex ``commandExecution`` or ``fileChange`` item.
+    :param item: Codex ``commandExecution``, ``fileChange`` or
+        ``collabAgentToolCall`` item.
     :param completed: Whether Codex has completed the item.
     :returns: A correlated observed request, or ``None`` for an invalid item.
     """
@@ -2608,6 +2693,29 @@ def _codex_builtin_tool_request(
     item_type = item.get("type")
     if not isinstance(call_id, str) or not call_id:
         return None
+    if item_type == _CODEX_COLLAB_ITEM_TYPE:
+        tool = item.get("tool")
+        if not isinstance(tool, str) or not tool:
+            return None
+        collab_args: ToolArgs = {}
+        prompt = item.get("prompt")
+        if isinstance(prompt, str) and prompt:
+            collab_args["prompt"] = prompt
+        collab_model = item.get("model")
+        if isinstance(collab_model, str) and collab_model:
+            collab_args["model"] = collab_model
+        thread_ids = _collab_child_thread_ids(item)
+        if thread_ids:
+            collab_args["agent_thread_ids"] = thread_ids
+        return ToolCallRequest(
+            name=_collab_tool_name(tool),
+            args=collab_args,
+            metadata={
+                "call_id": call_id,
+                "internally_executed": True,
+                "observed_call_completed": completed,
+            },
+        )
     if item_type == "commandExecution":
         command = item.get("command")
         if not isinstance(command, str) or not command:
@@ -2653,7 +2761,8 @@ def _codex_builtin_tool_request(
 def _codex_builtin_tool_completion(item: CodexParams) -> ToolCallComplete | None:
     """Translate a completed Codex built-in item into a correlated result.
 
-    :param item: Completed Codex ``commandExecution`` or ``fileChange`` item.
+    :param item: Completed Codex ``commandExecution``, ``fileChange`` or
+        ``collabAgentToolCall`` item.
     :returns: The observed result, or ``None`` for an invalid item.
     """
 
@@ -2672,6 +2781,19 @@ def _codex_builtin_tool_completion(item: CodexParams) -> ToolCallComplete | None
             error = f"Command exited with status {exit_code}."
             suffix = f"[exit code: {exit_code}]"
             result = f"{result}\n{suffix}" if result else suffix
+    elif item.get("type") == _CODEX_COLLAB_ITEM_TYPE:
+        lines: list[str] = []
+        for thread_id, state in _collab_agent_states(item).items():
+            agent_status = state.get("status")
+            line = f"{thread_id}: {agent_status}" if isinstance(agent_status, str) else thread_id
+            message = state.get("message")
+            if isinstance(message, str) and message:
+                line = f"{line}\n{message}"
+            lines.append(line)
+        result = "\n".join(lines)
+        if item.get("status") == "failed":
+            status = ToolCallStatus.ERROR
+            error = f"{request.name} failed."
     else:
         changes = item.get("changes")
         assert isinstance(changes, list)
@@ -2725,6 +2847,37 @@ def _dynamic_tool_result_payload(result: CodexToolResult) -> CodexParams:
             }
         ],
     }
+
+
+@dataclass
+class _CodexChildThread:
+    """A helper thread Codex spawned for this session's ``spawn_agent`` calls.
+
+    The helper runs as its own thread inside the same app-server process, so
+    its notifications interleave with the parent turn's on one connection.
+    Tracked for the whole app-server session because a helper can outlive the
+    turn that spawned it. The event queue is only serviced while a parent turn
+    runs, so a helper event or blocking tool request that arrives between turns
+    stays queued and is delivered (and answered) when the next parent turn runs.
+    Closing the session tears down the app-server process and its in-process
+    helpers together, so a deferred request no later turn delivers strands no one.
+
+    :param thread_id: Codex thread id of the helper; doubles as the child key.
+    :param title: Row label (the Codex nickname when readable).
+    :param task: The prompt the helper was spawned with, if known.
+    :param announced: Whether a :class:`SubAgentStarted` has ever been emitted.
+    :param finished: Whether the helper's latest turn has been closed out.
+    :param last_message: The helper's latest completed assistant text.
+    :param tool_call_ids: Built-in tool items already surfaced for the helper.
+    """
+
+    thread_id: str
+    title: str
+    task: str = ""
+    announced: bool = False
+    finished: bool = False
+    last_message: str = ""
+    tool_call_ids: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -2804,6 +2957,7 @@ class _CodexAppServerSession:
         self._loop: asyncio.AbstractEventLoop | None = None
         self.thread_id: str | None = None
         self.active_turn_id: str | None = None
+        self._child_threads: dict[str, _CodexChildThread] = {}
         # Last requested override on this thread; None means its original default.
         self._applied_effort: str | None = None
         self._default_effort: str | None = None
@@ -3300,6 +3454,7 @@ class _CodexAppServerSession:
             self._started = False
             self.thread_id = None
             self.active_turn_id = None
+            self._child_threads.clear()
             self._recent_events.clear()
             if worker_reaped:
                 self._proc = None
@@ -3348,6 +3503,7 @@ class _CodexAppServerSession:
         self._started = False
         self.thread_id = None
         self.active_turn_id = None
+        self._child_threads.clear()
         self._recent_events.clear()
         self._cleanup_worker_launch()
         self._cleanup_process_cwd()
@@ -3516,52 +3672,104 @@ class _CodexAppServerSession:
         :returns: The best final response observed during the drain window.
         """
         deadline = time.monotonic() + _TURN_COMPLETED_DRAIN_SECONDS
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return final_response
-            try:
-                message = await asyncio.wait_for(self._events.get(), timeout=remaining)
-            except asyncio.TimeoutError:
-                return final_response
-            if isinstance(message, HarnessTransportClosedError):
-                # A completed turn remains successful when its process exits.
-                return final_response
-            self._record_event(message)
-            params = message.get("params", {})
-            if not isinstance(params, dict):
-                continue
-            event_turn_id = params.get("turnId")
-            if (
-                isinstance(event_turn_id, str)
-                and event_turn_id
-                and event_turn_id != active_turn_id
-            ):
-                continue
-            if message.get("method") == "item/agentMessage/delta":
-                item_id = params.get("itemId")
-                delta = params.get("delta")
-                if isinstance(item_id, str) and isinstance(delta, str) and delta:
-                    prior = message_buffers.get(item_id, "")
-                    message_buffers[item_id] = f"{prior}{delta}"
-                    if not final_response:
-                        final_response = message_buffers[item_id]
-                continue
-            if message.get("method") != "item/completed":
-                continue
-            item = params.get("item", {})
-            if not isinstance(item, dict) or item.get("type") != "agentMessage":
-                continue
-            phase, completed_text = _completed_agent_message_text(item, message_buffers)
-            if phase == "commentary":
-                item_id = item.get("id")
-                if isinstance(item_id, str):
-                    message_buffers.pop(item_id, None)
-                continue
-            if phase == "final_answer" or phase is None:
-                final_response = completed_text
-            if phase == "final_answer":
-                return final_response
+        # A helper can outlive its spawning turn; defer its notifications and
+        # blocking requests to the next turn (answering here would strand it).
+        # Spawn items register their helper so that helper's events defer too.
+        deferred: list[CodexMessage | HarnessTransportClosedError] = []
+        spawned_in_drain: dict[str, str] = {}
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return final_response
+                try:
+                    message = await asyncio.wait_for(self._events.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    return final_response
+                if isinstance(message, HarnessTransportClosedError):
+                    # A completed turn remains successful when its process exits.
+                    return final_response
+                params = message.get("params", {})
+                if not isinstance(params, dict):
+                    self._record_event(message)
+                    continue
+                event_thread_id = _event_thread_id(params)
+                if (
+                    event_thread_id is not None
+                    and event_thread_id != self.thread_id
+                    and (
+                        event_thread_id in self._child_threads
+                        or event_thread_id in spawned_in_drain
+                    )
+                ):
+                    deferred.append(message)
+                    continue
+                for child_thread_id, child_task in _spawned_child_tasks(
+                    params.get("item")
+                ).items():
+                    if (
+                        child_thread_id != self.thread_id
+                        and child_thread_id not in self._child_threads
+                    ):
+                        spawned_in_drain.setdefault(child_thread_id, child_task)
+                self._record_event(message)
+                event_turn_id = params.get("turnId")
+                if (
+                    isinstance(event_turn_id, str)
+                    and event_turn_id
+                    and event_turn_id != active_turn_id
+                ):
+                    continue
+                if message.get("method") == "item/agentMessage/delta":
+                    item_id = params.get("itemId")
+                    delta = params.get("delta")
+                    if isinstance(item_id, str) and isinstance(delta, str) and delta:
+                        prior = message_buffers.get(item_id, "")
+                        message_buffers[item_id] = f"{prior}{delta}"
+                        if not final_response:
+                            final_response = message_buffers[item_id]
+                    continue
+                if message.get("method") != "item/completed":
+                    continue
+                item = params.get("item", {})
+                if not isinstance(item, dict) or item.get("type") != "agentMessage":
+                    continue
+                phase, completed_text = _completed_agent_message_text(item, message_buffers)
+                if phase == "commentary":
+                    item_id = item.get("id")
+                    if isinstance(item_id, str):
+                        message_buffers.pop(item_id, None)
+                    continue
+                if phase == "final_answer" or phase is None:
+                    final_response = completed_text
+                if phase == "final_answer":
+                    return final_response
+        finally:
+            # Requeue first so deferred helper events survive even if a
+            # registration below raises.
+            self._requeue_deferred_events(deferred)
+            for child_thread_id, child_task in spawned_in_drain.items():
+                if child_thread_id not in self._child_threads:
+                    await self._register_child_thread(child_thread_id, task=child_task)
+
+    def _requeue_deferred_events(
+        self, deferred: list[CodexMessage | HarnessTransportClosedError]
+    ) -> None:
+        """Put drained helper events back ahead of later arrivals, in order.
+
+        The tail drain reads from the shared queue, so helper messages it set
+        aside must return before any that arrived afterwards; the next turn then
+        delivers them in their original order.
+        """
+        if not deferred:
+            return
+        tail: list[CodexMessage | HarnessTransportClosedError] = []
+        while not self._events.empty():
+            tail.append(self._events.get_nowait())
+        for message in deferred:
+            self._events.put_nowait(message)
+        for message in tail:
+            self._events.put_nowait(message)
 
     async def _resolve_default_effort(self) -> str:
         """Resolve the thread's original configured or model-default effort."""
@@ -3591,6 +3799,237 @@ class _CodexAppServerSession:
             "the app-server did not provide a default. Select an explicit effort or "
             "start a new session."
         )
+
+    async def _child_thread_title(self, thread_id: str) -> str:
+        """Read a helper's Codex nickname for its row label; cosmetic, so best-effort."""
+
+        try:
+            response = await asyncio.wait_for(
+                self._request("thread/read", {"threadId": thread_id, "includeTurns": False}),
+                timeout=_CODEX_CHILD_THREAD_READ_TIMEOUT_S,
+            )
+        except Exception as exc:  # noqa: BLE001 — a missing label must never fail the turn
+            logger.info("Codex helper thread %s nickname unavailable: %s", thread_id, exc)
+            return _CODEX_HELPER_TITLE_FALLBACK
+        result = response.get("result")
+        thread = result.get("thread") if isinstance(result, dict) else None
+        nickname = thread.get("agentNickname") if isinstance(thread, dict) else None
+        if isinstance(nickname, str) and nickname:
+            return nickname
+        return _CODEX_HELPER_TITLE_FALLBACK
+
+    async def _register_child_thread(self, thread_id: str, *, task: str) -> _CodexChildThread:
+        child = _CodexChildThread(
+            thread_id=thread_id, title=await self._child_thread_title(thread_id), task=task
+        )
+        self._child_threads[thread_id] = child
+        logger.info(
+            "Codex helper thread %s spawned from thread %s (title=%r)",
+            thread_id,
+            self.thread_id,
+            child.title,
+        )
+        return child
+
+    async def _announce_child(
+        self, child: _CodexChildThread, announced: set[str]
+    ) -> AsyncIterator[ExecutorEvent]:
+        """Emit the child's start marker once per turn.
+
+        The runner mints the child session idempotently on the thread id but
+        tracks children per turn, so a helper that outlives its spawning turn is
+        re-announced in each later turn that carries its events. Only the first
+        announcement carries the task, which seeds the child's transcript.
+        """
+
+        if child.thread_id in announced:
+            return
+        announced.add(child.thread_id)
+        task = "" if child.announced else child.task
+        child.announced = True
+        yield SubAgentStarted(child_key=child.thread_id, title=child.title, task=task)
+
+    async def _finish_child(
+        self,
+        child: _CodexChildThread,
+        announced: set[str],
+        *,
+        ok: bool,
+        summary: str,
+    ) -> AsyncIterator[ExecutorEvent]:
+        # A helper finishes once per turn. A terminal collab snapshot and the
+        # helper's own ``turn/completed`` can both arrive; ``turn/started``
+        # clears this flag to reopen the child for its next turn.
+        if child.finished:
+            return
+        async for event in self._announce_child(child, announced):
+            yield event
+        child.finished = True
+        logger.info(
+            "Codex helper thread %s finished (ok=%s) while thread %s turn %s was active",
+            child.thread_id,
+            ok,
+            self.thread_id,
+            self.active_turn_id,
+        )
+        yield SubAgentCompleted(child_key=child.thread_id, ok=ok, summary=summary)
+
+    async def _observe_parent_item(
+        self, item: CodexParams, announced: set[str]
+    ) -> AsyncIterator[ExecutorEvent]:
+        """Register helpers a spawn item names and close out ones its snapshot ends."""
+
+        item_type = item.get("type")
+        if item_type == _CODEX_COLLAB_ITEM_TYPE:
+            prompt = item.get("prompt")
+            task = prompt if isinstance(prompt, str) else ""
+            for thread_id in _collab_child_thread_ids(item):
+                if thread_id == self.thread_id:
+                    continue
+                child = self._child_threads.get(thread_id)
+                if child is None:
+                    child = await self._register_child_thread(thread_id, task=task)
+                async for event in self._announce_child(child, announced):
+                    yield event
+            for thread_id, state in _collab_agent_states(item).items():
+                child = self._child_threads.get(thread_id)
+                if child is None or child.finished:
+                    continue
+                agent_status = state.get("status")
+                failed = agent_status in _CODEX_COLLAB_FAILED_STATUSES
+                if not failed and agent_status not in _CODEX_COLLAB_FINISHED_STATUSES:
+                    continue
+                message = state.get("message")
+                summary = message if isinstance(message, str) and message else child.last_message
+                async for event in self._finish_child(
+                    child, announced, ok=not failed, summary=summary
+                ):
+                    yield event
+            return
+        if item_type == _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE and item.get("kind") == "started":
+            thread_id = item.get("agentThreadId")
+            if not isinstance(thread_id, str) or not thread_id or thread_id == self.thread_id:
+                return
+            child = self._child_threads.get(thread_id)
+            if child is None:
+                child = await self._register_child_thread(thread_id, task="")
+            async for event in self._announce_child(child, announced):
+                yield event
+
+    async def _route_child_event(
+        self,
+        method: str | None,
+        params: CodexParams,
+        child: _CodexChildThread,
+        announced: set[str],
+    ) -> AsyncIterator[ExecutorEvent]:
+        """Translate a helper thread's notification into child-directed events.
+
+        Only the helper's tool items and its turn outcome are surfaced; its text
+        deltas, reasoning and token usage stay out of the parent's stream and
+        accounting.
+        """
+
+        if method == "turn/started":
+            # A new helper turn (e.g. after ``send_input``) reopens the child.
+            child.finished = False
+            child.last_message = ""
+            async for event in self._announce_child(child, announced):
+                yield event
+            return
+        if method in ("item/started", "item/completed"):
+            item = params.get("item")
+            if not isinstance(item, dict):
+                return
+            # A helper spawning helpers of its own attaches them to this session.
+            async for event in self._observe_parent_item(item, announced):
+                yield event
+            request = _codex_builtin_tool_request(item)
+            if request is not None:
+                call_id = request.metadata["call_id"]
+                if isinstance(call_id, str) and call_id not in child.tool_call_ids:
+                    child.tool_call_ids.add(call_id)
+                    async for event in self._announce_child(child, announced):
+                        yield event
+                    yield SubAgentToolCall(
+                        child_key=child.thread_id,
+                        call_id=call_id,
+                        name=request.name,
+                        args=request.args,
+                    )
+            if method == "item/completed" and item.get("type") == "agentMessage":
+                text = item.get("text")
+                if isinstance(text, str) and text and item.get("phase") != "commentary":
+                    child.last_message = text
+            return
+        if method == "turn/completed":
+            turn = params.get("turn")
+            turn_status = _codex_turn_status(turn)
+            summary = child.last_message
+            if turn_status == "failed":
+                error = turn.get("error") if isinstance(turn, dict) else None
+                summary = str(error) if error else summary
+            async for event in self._finish_child(
+                child, announced, ok=turn_status != "failed", summary=summary
+            ):
+                yield event
+            return
+        if method == "turn/failed":
+            if params.get("willRetry") is True:
+                return
+            turn = params.get("turn")
+            error_text = str(
+                params.get("message")
+                or (turn.get("error") if isinstance(turn, dict) else None)
+                or "Codex helper turn failed"
+            )
+            async for event in self._finish_child(child, announced, ok=False, summary=error_text):
+                yield event
+
+    async def _answer_child_request(
+        self,
+        message: CodexMessage,
+        method: str | None,
+        params: CodexParams,
+        child: _CodexChildThread,
+        announced: set[str],
+    ) -> AsyncIterator[ExecutorEvent]:
+        """Answer a helper thread's server-initiated request.
+
+        A request carries an ``id`` and blocks the helper (and any parent
+        ``wait`` on it) until it is answered, so it must never be dropped the
+        way a notification can. A dynamic tool call runs the Omnigent tool and
+        shows a child tool card; any other request is refused so the helper
+        fails fast instead of hanging.
+        """
+
+        result: CodexToolResult
+        if method == "item/tool/call":
+            raw_call_id = params.get("callId")
+            raw_tool_name = params.get("tool")
+            if not isinstance(raw_call_id, str) or not isinstance(raw_tool_name, str):
+                result = {"error": "Codex helper tool call missing callId or tool"}
+            else:
+                tool_args = params.get("arguments", {})
+                if not isinstance(tool_args, dict):
+                    tool_args = {}
+                if raw_call_id not in child.tool_call_ids:
+                    child.tool_call_ids.add(raw_call_id)
+                    async for event in self._announce_child(child, announced):
+                        yield event
+                    yield SubAgentToolCall(
+                        child_key=child.thread_id,
+                        call_id=raw_call_id,
+                        name=raw_tool_name,
+                        args=tool_args,
+                    )
+                result = await self._execute_dynamic_tool(raw_tool_name, tool_args)
+        else:
+            await self._send_error_response(
+                int(message["id"]), f"Codex helper request {method!r} is not supported"
+            )
+            return
+        await self._send_response(int(message["id"]), _dynamic_tool_result_payload(result))
 
     async def run_turn(
         self,
@@ -3760,6 +4199,15 @@ class _CodexAppServerSession:
             queued_turn_id: str | None = None
             queued_params = queued_message.get("params")
             if isinstance(queued_params, dict):
+                # A helper's events are never a stale tail of the prior turn.
+                queued_thread_id = _event_thread_id(queued_params)
+                if (
+                    queued_thread_id is not None
+                    and queued_thread_id != self.thread_id
+                    and queued_thread_id in self._child_threads
+                ):
+                    retained_events.append(queued_message)
+                    continue
                 raw_queued_turn_id = queued_params.get("turnId")
                 if raw_queued_turn_id is None:
                     queued_turn = queued_params.get("turn")
@@ -3781,6 +4229,7 @@ class _CodexAppServerSession:
         completed_builtin_tool_ids: set[str] = set()
         final_response = ""
         observed_turn_id: str | None = None
+        announced_children: set[str] = set()
 
         def _event_turn_matches(params: CodexParams) -> bool:
             nonlocal active_turn_id, observed_turn_id
@@ -3795,6 +4244,11 @@ class _CodexAppServerSession:
                 observed_turn_id = event_turn_id
                 return True
             if observed_turn_id is None:
+                # Only the parent thread may rewrite the active turn id; an
+                # event from an unregistered helper thread must not be adopted.
+                event_thread_id = _event_thread_id(params)
+                if event_thread_id is not None and event_thread_id != self.thread_id:
+                    return False
                 # A first event that *terminates* the turn (final-answer
                 # item) is almost certainly a stale tail from the prior
                 # turn, not a Codex-quirk rewrite. Drop it instead of
@@ -3899,12 +4353,37 @@ class _CodexAppServerSession:
                 method: str | None = raw_method if isinstance(raw_method, str) else None
                 params = message.get("params", {})
 
+                if isinstance(params, dict):
+                    event_thread_id = _event_thread_id(params)
+                    child_thread = (
+                        self._child_threads.get(event_thread_id)
+                        if event_thread_id is not None and event_thread_id != self.thread_id
+                        else None
+                    )
+                    if child_thread is not None:
+                        if message.get("id") is None:
+                            # Notifications translate into the helper's row events.
+                            async for child_event in self._route_child_event(
+                                method, params, child_thread, announced_children
+                            ):
+                                yield child_event
+                            continue
+                        # A helper's server->client request must be answered, or
+                        # the helper (and any parent waiting on it) blocks forever.
+                        async for child_event in self._answer_child_request(
+                            message, method, params, child_thread, announced_children
+                        ):
+                            yield child_event
+                        continue
+
                 if method == "item/started":
                     if not _event_turn_matches(params):
                         continue
                     item = params.get("item", {})
                     if not isinstance(item, dict):
                         continue
+                    async for child_event in self._observe_parent_item(item, announced_children):
+                        yield child_event
                     request = _codex_builtin_tool_request(item)
                     if request is not None:
                         call_id = request.metadata["call_id"]
@@ -4011,6 +4490,8 @@ class _CodexAppServerSession:
                     item = params.get("item", {})
                     if not isinstance(item, dict):
                         continue
+                    async for child_event in self._observe_parent_item(item, announced_children):
+                        yield child_event
                     raw_item_type = item.get("type")
                     item_type: str | None = (
                         raw_item_type if isinstance(raw_item_type, str) else None
@@ -4312,6 +4793,15 @@ class _CodexAppServerSession:
                 "result": result,
             }
         )
+
+    async def _send_error_response(self, request_id: int, message: str) -> None:
+        """Refuse a server-initiated request with a JSON-RPC error.
+
+        A tool-result payload can read as a successful result for a non-tool
+        request, so an unsupported request gets an explicit refusal instead.
+        """
+        # -32601 is the JSON-RPC "method not found" code.
+        await self._send_message({"id": request_id, "error": {"code": -32601, "message": message}})
 
     async def _send_message(self, payload: CodexMessage) -> None:
         assert self._proc is not None and self._proc.stdin is not None
