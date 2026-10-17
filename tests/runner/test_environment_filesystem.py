@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -2452,15 +2453,16 @@ async def test_unwritable_target_reports_an_error_not_a_crash(
         locked.chmod(0o700)
 
 
-def _git_runner_client(
+@asynccontextmanager
+async def _git_runner_client(
     ws: Path, session_id: str, *, runner_workspace: Path | None = None
-) -> httpx.AsyncClient:
+) -> AsyncIterator[httpx.AsyncClient]:
     """Runner app serving *ws* as the session's environment, for the search tests.
 
     :param ws: The session environment's working tree.
     :param session_id: Session to register the OS environment under.
     :param runner_workspace: The runner's own workspace; defaults to *ws*.
-    :returns: An httpx client bound to the runner app.
+    :yields: An httpx client bound to the runner app.
     """
     os_env = create_os_environment(
         OSEnvSpec(
@@ -2476,7 +2478,14 @@ def _git_runner_client(
         runner_workspace=runner_workspace if runner_workspace is not None else ws,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://runner")
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            yield client
+    finally:
+        if os_env is not None:
+            os_env.close()
 
 
 @pytest.mark.asyncio
