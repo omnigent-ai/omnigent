@@ -63,7 +63,7 @@ def _point_codex_auth_check_at(
         # Treat a present binary as passing the version check so these
         # tests exercise only the auth-path decision.
         monkeypatch.setattr(
-            "omnigent.onboarding.harness_install.harness_cli_installed",
+            "omnigent.onboarding.harness_install.harness_cli_readiness",
             lambda _key, **_kw: True,
         )
 

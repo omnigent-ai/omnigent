@@ -117,6 +117,12 @@ export function harnessReadinessOnHost(
       description: "Install this harness on the selected host before using it.",
     });
   }
+  if (availability === "missing-credentials") {
+    return harnessReadinessResult("setup-required", "needs-auth", true, {
+      label: "Authentication required",
+      description: "Sign in or add credentials on the selected host before using this harness.",
+    });
+  }
   if (availability === "needs-auth") {
     if (isSdkHarness(harness)) {
       // Advisory only for the in-process SDK harnesses: the host daemon
@@ -139,13 +145,15 @@ export function harnessReadinessOnHost(
   }
   if (availability === false) {
     return harnessReadinessResult("setup-required", "unconfigured", true, {
-      label: "Setup required",
-      description: "Set up this harness on the selected host before using it.",
+      label: "Needs attention",
+      description:
+        "This host reports the harness isn’t ready but didn’t provide a reason. Run omni setup on that machine to check its installation and credentials.",
     });
   }
   return harnessReadinessResult("broken", "readiness-error", true, {
-    label: "Harness is not working",
-    description: "The selected host reported a harness readiness error.",
+    label: "Needs attention",
+    description:
+      "This host reported an unrecognized harness readiness problem. Run omni setup on that machine to investigate.",
   });
 }
 
@@ -200,7 +208,6 @@ export function harnessUnavailableReasonOnHost(
   if (!harness || !host?.configured_harnesses) return null;
   const availability = host.configured_harnesses[harness];
   if (availability === false) {
-    if (isCodexHarness(harness)) return "binary-missing";
     return "unconfigured";
   }
   // Auth-aware CLI harnesses (codex, claude, opencode) report a structured
@@ -213,6 +220,8 @@ export function harnessUnavailableReasonOnHost(
   ) {
     return availability;
   }
+  // Blocking counterpart of "needs-auth"; the UI shows both as needs sign-in.
+  if (availability === "missing-credentials") return "needs-auth";
   // Any other string from a newer/older server still means "not ready";
   // show a generic warning rather than silently treating it as available.
   if (typeof availability === "string") {
@@ -248,21 +257,19 @@ export function harnessUnconfiguredOnHost(
   return harnessUnavailableReasonOnHost(harness, host) !== null;
 }
 
-/**
- * Amber-badge text for a not-ready harness in the picker rows.
- *
- * When the setup feature is OFF this is the label — per-reason, matching the
- * pre-feature UI. When the feature is ON the picker shows a single "needs
- * setup" label instead (the specific reason + fix live in the setup dialog),
- * so callers pass ``collapsed`` to get that. Keeping both here means the
- * flag-off path renders byte-for-byte the original text.
- */
-export function harnessWarningBadgeText(reason: string | null, collapsed = false): string {
-  if (collapsed) return "needs setup";
-  if (reason === "binary-missing") return "binary missing";
-  if (reason === "needs-auth") return "needs auth";
-  if (reason === "version-too-low") return "outdated";
-  return "needs setup";
+/** Specific status copy, independent of whether automatic setup is enabled. */
+export function harnessWarningBadgeText(reason: string | null): string {
+  if (reason === "binary-missing") return "Not installed";
+  if (reason === "needs-auth") return "Needs sign-in";
+  if (reason === "version-too-low") return "Outdated";
+  return "Needs attention";
+}
+
+export function harnessSetupActionText(reason: string | null): string {
+  if (reason === "binary-missing") return "Install";
+  if (reason === "needs-auth") return "Sign in";
+  if (reason === "version-too-low") return "Update";
+  return "View details";
 }
 
 /**
@@ -348,8 +355,8 @@ export function harnessAuthableOnHost(
  * Resolve a server step's done/todo status from the host's readiness value.
  *
  * The host reports one availability per harness — ``true`` (ready),
- * ``"needs-auth"`` (installed, not signed in), ``"binary-missing"`` / ``false``
- * (not installed). Each step's ``status_key`` says which sub-state it tracks:
+ * ``"needs-auth"`` (installed, not signed in), ``"binary-missing"``
+ * (not installed), or ``false`` (cause unknown). Each step's ``status_key`` says which sub-state it tracks:
  * ``"installed"`` is done once the binary is present (anything but not-installed);
  * ``"authed"`` is done only when fully ready. A ``null`` key isn't locally
  * determinable → ``"unknown"`` (informational).
@@ -358,11 +365,15 @@ function stepStatus(
   statusKey: string | null,
   availability: boolean | string | undefined,
 ): SetupStepStatus {
-  if (statusKey === null || availability === undefined) return "unknown";
-  const notInstalled =
+  if (
+    statusKey === null ||
+    availability === undefined ||
     availability === false ||
-    availability === "binary-missing" ||
-    availability === "version-too-low";
+    (typeof availability === "string" &&
+      !["binary-missing", "version-too-low", "needs-auth"].includes(availability))
+  )
+    return "unknown";
+  const notInstalled = availability === "binary-missing" || availability === "version-too-low";
   if (statusKey === "installed") return notInstalled ? "todo" : "done";
   if (statusKey === "authed") return availability === true ? "done" : "todo";
   return "unknown";

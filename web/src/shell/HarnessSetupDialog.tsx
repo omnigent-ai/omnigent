@@ -34,6 +34,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useHosts, useInstallHarness, useInstallingHarnesses, type Host } from "@/hooks/useHosts";
 import {
   harnessAuthableOnHost,
+  harnessReadinessOnHost,
   harnessInstallableOnHost,
   resolveSetupSteps,
   type ResolvedSetupStep,
@@ -75,6 +76,7 @@ export function HarnessSetupDialog({
   const installable = harnessInstallableOnHost(info, harness, host);
   const authable = harnessAuthableOnHost(info, harness, host);
   const name = agentName ?? harness ?? "this agent";
+  const readiness = harnessReadinessOnHost(harness, host);
 
   // Auth is a SECOND step: gate the credential form until the binary is
   // present, so the checklist runs Install → Set up auth in order. Without this,
@@ -129,7 +131,8 @@ export function HarnessSetupDialog({
   };
 
   const hasSteps = steps.length > 0;
-  const collapsed = !hasSteps || !anyActionable;
+  const collapsed =
+    !hasSteps || !anyActionable || ["unconfigured", "readiness-error"].includes(readiness.reason);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -138,15 +141,13 @@ export function HarnessSetupDialog({
           <DialogTitle>
             Set up {name} on {host?.name}
           </DialogTitle>
-          {/* Only show a description when it adds something the title doesn't:
-              the done / needs-more-setup states. The generic "complete these
-              steps…" just echoes the title, so it's omitted for the common
-              checklist case. */}
           {allDone ? (
             <DialogDescription>{`${name} is ready on ${host?.name}.`}</DialogDescription>
-          ) : collapsed ? (
-            <DialogDescription>{`${name} needs a bit more setup on ${host?.name}.`}</DialogDescription>
-          ) : null}
+          ) : (
+            <DialogDescription>
+              {readiness.explanation?.description ?? "Check the setup steps on this machine."}
+            </DialogDescription>
+          )}
         </DialogHeader>
 
         {collapsed && !allDone ? (
@@ -167,6 +168,7 @@ export function HarnessSetupDialog({
                 step={step}
                 label={name}
                 installable={installable}
+                updating={readiness.reason === "version-too-low"}
                 authable={authable}
                 installComplete={installComplete}
                 installing={installingThisHarness}
@@ -209,6 +211,7 @@ function SetupStepRow({
   step,
   label,
   installable,
+  updating,
   authable,
   installComplete,
   installing,
@@ -219,6 +222,7 @@ function SetupStepRow({
   /** Friendly agent/harness name for the credential form's toasts. */
   label: string;
   installable: boolean;
+  updating: boolean;
   authable: boolean;
   installComplete: boolean;
   installing: boolean;
@@ -240,7 +244,13 @@ function SetupStepRow({
   // The server's detail is future-tense ("We'll install …") — right for a
   // pending step, wrong under a green check. Show a past-tense confirmation
   // once done instead of the stale promise.
-  const detail = done ? doneDetail(step.kind) : step.detail;
+  const manualInstall = step.kind === "install" && !installable && !done;
+  const title = step.kind === "install" && updating ? `Update ${label}` : step.title;
+  const detail = done
+    ? doneDetail(step.kind)
+    : manualInstall
+      ? `Run this on ${host?.name} to ${updating ? "update" : "install"} ${label}.`
+      : step.detail;
 
   return (
     <li className="flex flex-col gap-2" data-testid={`harness-setup-step-${step.kind}`}>
@@ -249,7 +259,7 @@ function SetupStepRow({
           <StepIcon status={step.status} />
         </span>
         <div className="flex min-w-0 flex-1 flex-col gap-1">
-          <span className="text-ui font-medium">{step.title}</span>
+          <span className="text-ui font-medium">{title}</span>
           {/* While this harness's install is in flight, the detail line becomes
               the progress caption — kept next to the install step it describes
               rather than stranded at the bottom of the dialog. */}
@@ -259,6 +269,12 @@ function SetupStepRow({
             </span>
           ) : (
             detail && <span className="text-sm text-muted-foreground">{detail}</span>
+          )}
+          {/* Under the text, not beside it: install commands can be long. */}
+          {manualInstall && (
+            <span className="self-start">
+              <CopyCommand command={step.command ?? "omni setup"} />
+            </span>
           )}
         </div>
         {/* Control: one-click Install (when the allowlist accepts it), an
@@ -272,7 +288,7 @@ function SetupStepRow({
             data-testid="harness-setup-install"
             onClick={() => onInstall(step.harness)}
           >
-            Install
+            {updating ? "Update" : "Install"}
           </Button>
         ) : isAuthForm ? (
           <Button
@@ -296,7 +312,7 @@ function SetupStepRow({
           >
             Set up auth
           </Button>
-        ) : step.command ? (
+        ) : step.command && !manualInstall ? (
           <CopyCommand command={step.command} />
         ) : null}
       </div>

@@ -15,12 +15,12 @@ def test_pi_harnesses_gate_on_pi_cli(harness: str, monkeypatch: pytest.MonkeyPat
     the ``PI_SURFACE`` sentinel), so it used to hit the unknown-harness
     fail-open branch and report configured even when ``pi`` was missing — the
     host pre-spawn check then let a doomed launch through. Both spellings must
-    track ``harness_cli_installed``.
+    track ``harness_cli_readiness``.
     """
-    monkeypatch.setattr(hr, "harness_cli_installed", lambda _key, **_kw: False)
+    monkeypatch.setattr(hr, "harness_cli_readiness", lambda _key, **_kw: "binary-missing")
     assert hr.harness_is_configured(harness) is False
 
-    monkeypatch.setattr(hr, "harness_cli_installed", lambda _key, **_kw: True)
+    monkeypatch.setattr(hr, "harness_cli_readiness", lambda _key, **_kw: True)
     assert hr.harness_is_configured(harness) is True
 
 
@@ -35,11 +35,11 @@ def test_kiro_native_harnesses_gate_on_kiro_cli(
         calls.append(key)
         return False
 
-    monkeypatch.setattr(hr, "harness_cli_installed", _installed)
+    monkeypatch.setattr(hr, "harness_cli_readiness", _installed)
     assert hr.harness_is_configured(harness) is False
     assert calls[-1] == hr.KIRO_KEY
 
-    monkeypatch.setattr(hr, "harness_cli_installed", lambda _key, **_kw: True)
+    monkeypatch.setattr(hr, "harness_cli_readiness", lambda _key, **_kw: True)
     assert hr.harness_is_configured(harness) is True
 
 
@@ -50,7 +50,7 @@ def test_sdk_and_unknown_harnesses_still_fail_open(monkeypatch: pytest.MonkeyPat
     (runtime/ambient credentials) and unknown harnesses must keep failing open
     so a working launch is never blocked.
     """
-    monkeypatch.setattr(hr, "harness_cli_installed", lambda _key, **_kw: False)
+    monkeypatch.setattr(hr, "harness_cli_readiness", lambda _key, **_kw: "binary-missing")
     assert hr.harness_is_configured("claude-sdk") is True
     assert hr.harness_is_configured("openai-agents") is True
     assert hr.harness_is_configured("totally-unknown-harness") is True
@@ -64,7 +64,7 @@ def test_configured_harness_map_exposes_pi_native(monkeypatch: pytest.MonkeyPatc
     A missing binary now reports the richer ``"binary-missing"`` reason (Pi
     gained the credential axis) rather than a bare ``False``.
     """
-    monkeypatch.setattr(hr, "harness_cli_installed", lambda _key, **_kw: False)
+    monkeypatch.setattr(hr, "harness_cli_readiness", lambda _key, **_kw: "binary-missing")
     cmap = hr.configured_harness_map()
     assert cmap.get("pi-native") == "binary-missing"
     assert cmap.get("pi") == "binary-missing"
@@ -79,7 +79,7 @@ def test_configured_harness_map_pi_installed_no_provider_needs_auth(
     so an installed binary with no provider is the yellow "installed but not
     configured" state the setup dialog offers an "Add key" action for.
     """
-    monkeypatch.setattr(hr, "harness_cli_installed", lambda _key, **_kw: True)
+    monkeypatch.setattr(hr, "harness_cli_readiness", lambda _key, **_kw: True)
     monkeypatch.setattr(hr, "_family_provider_configured", lambda _h: False)
     cmap = hr.configured_harness_map()
     assert cmap.get("pi") == "needs-auth"
@@ -90,7 +90,7 @@ def test_configured_harness_map_pi_installed_with_provider_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Pi installed AND a provider configured reports ready (``True``)."""
-    monkeypatch.setattr(hr, "harness_cli_installed", lambda _key, **_kw: True)
+    monkeypatch.setattr(hr, "harness_cli_readiness", lambda _key, **_kw: True)
     monkeypatch.setattr(hr, "_family_provider_configured", lambda _h: True)
     cmap = hr.configured_harness_map()
     assert cmap.get("pi") is True
@@ -99,7 +99,7 @@ def test_configured_harness_map_pi_installed_with_provider_ready(
 
 def test_configured_harness_map_exposes_kiro_native(monkeypatch: pytest.MonkeyPatch) -> None:
     """The readiness map carries Kiro native keys for the web picker lookup."""
-    monkeypatch.setattr(hr, "harness_cli_installed", lambda _key, **_kw: False)
+    monkeypatch.setattr(hr, "harness_cli_readiness", lambda _key, **_kw: "binary-missing")
     cmap = hr.configured_harness_map()
-    assert cmap.get("kiro-native") is False
-    assert cmap.get("native-kiro") is False
+    assert cmap.get("kiro-native") == "binary-missing"
+    assert cmap.get("native-kiro") == "binary-missing"

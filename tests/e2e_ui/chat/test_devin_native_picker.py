@@ -246,7 +246,8 @@ async def _drive(base_url: str, session_id: str, *, initially_ready: bool) -> No
                 await expect(
                     page.get_by_test_id(f"new-chat-landing-agent-tooltip-{_DEVIN_AGENT_ID}")
                 ).to_contain_text(
-                    "Devin isn't configured on e2e-host — run omni setup on that machine."
+                    "e2e-host reports Devin isn’t ready but didn’t provide a recognized reason. "
+                    "Run omni setup on that machine to investigate."
                 )
                 assert not devin_requests
                 return

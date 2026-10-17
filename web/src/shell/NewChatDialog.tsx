@@ -121,6 +121,7 @@ import {
   harnessUnavailableReasonOnHost,
   harnessUnconfiguredOnHost,
   harnessWarningBadgeText,
+  harnessSetupActionText,
   isCodexHarness,
   isNativeCursorHarness,
   skillInvocationPrefix,
@@ -788,17 +789,7 @@ export async function describeCreateError(res: Response): Promise<string> {
   return `Couldn't create the session (HTTP ${res.status}).`;
 }
 
-/**
- * The pre-feature "run omni setup" guidance (ReactNode), shown under the
- * composer when the UI-driven setup feature is OFF.
- *
- * The ``needs-auth`` / ``binary-missing`` copy is Codex-specific ("run codex
- * login" / "set OMNIGENT_CODEX_PATH"), so it's gated on {@link isCodexHarness}.
- * Other harnesses that report those structured reasons (claude-native /
- * opencode-native now do) fall through to the generic "run omni setup"
- * message — matching the pre-feature behavior, where only Codex ever produced
- * these reasons and everything else showed the generic text.
- */
+/** Explain readiness on the selected machine, including known sign-in commands. */
 function harnessWarningMessage(
   agentName: string | undefined,
   hostName: string | undefined,
@@ -833,34 +824,38 @@ function harnessWarningMessage(
       </>
     );
   }
+  if (reason === "binary-missing")
+    return (
+      <>
+        {agentName} is not installed on {hostName}. Install it from Settings → Harnesses.
+      </>
+    );
+  if (reason === "needs-auth")
+    return (
+      <>
+        {agentName} needs sign-in on {hostName}. Sign in or add credentials on that machine.
+      </>
+    );
   return (
     <>
-      {agentName} isn&apos;t configured on {hostName} — run <code>omni setup</code> on that machine.
+      {hostName} reports {agentName} isn’t ready but didn’t provide a recognized reason. Run{" "}
+      <code>omni setup</code> on that machine to investigate.
     </>
   );
 }
 
-/**
- * Amber "harness not ready on this host" notice under the composer, for the
- * currently-selected agent (case A: surfaced without opening the picker).
- *
- * Gated on the setup feature: when OFF, renders the original "run omnigent
- * setup" guidance so the flag-off UI is unchanged. When ON, offers a "Set up
- * <agent>" action that opens the shared {@link HarnessSetupDialog}.
- */
+/** Guidance and a setup action for the currently selected harness. */
 function HarnessSetupNotice({
   agentName,
   hostName,
   harness,
   reason,
-  featureEnabled,
   onSetup,
 }: {
   agentName: string | undefined;
   hostName: string | undefined;
   harness: string | null | undefined;
   reason: string | null;
-  featureEnabled: boolean;
   onSetup: () => void;
 }) {
   const { trackClick } = useOmnigentAnalytics();
@@ -868,32 +863,27 @@ function HarnessSetupNotice({
     <p
       // pl-2 lines the icon up with the chips tray directly above (which has
       // pl-2), so the notice reads as part of the composer, not indented left.
-      className="flex items-center gap-2 pl-2 text-sm text-amber-600 dark:text-amber-500"
+      className={cn(
+        "flex items-center gap-2 pl-2 text-sm",
+        reason === "binary-missing"
+          ? "text-muted-foreground"
+          : "text-amber-600 dark:text-amber-500",
+      )}
       data-testid="new-chat-landing-harness-warning"
     >
-      <TriangleAlertIcon className="size-3.5 shrink-0" />
-      {featureEnabled ? (
-        <>
-          <span>
-            {agentName} isn&apos;t ready on {hostName}.
-          </span>
-          {/* Compact bordered chip — small enough to sit on the sentence's line
-              (h-5, text-sm), so it reads as part of the notice. */}
-          <button
-            type="button"
-            data-testid="new-chat-landing-harness-setup"
-            className="inline-flex h-5 shrink-0 items-center rounded-md border border-amber-300 px-2 text-sm font-medium text-amber-700 hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 dark:border-amber-500/40 dark:text-amber-400 dark:hover:bg-amber-500/20"
-            onClick={() => {
-              trackClick("new_chat.setup", "button");
-              onSetup();
-            }}
-          >
-            Set up {agentName}
-          </button>
-        </>
-      ) : (
-        <span>{harnessWarningMessage(agentName, hostName, reason, harness)}</span>
-      )}
+      {reason !== "binary-missing" && <TriangleAlertIcon className="size-3.5 shrink-0" />}
+      <span>{harnessWarningMessage(agentName, hostName, reason, harness)}</span>
+      <button
+        type="button"
+        data-testid="new-chat-landing-harness-setup"
+        className="shrink-0 rounded px-2 font-medium underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        onClick={() => {
+          trackClick("new_chat.setup", "button");
+          onSetup();
+        }}
+      >
+        {harnessSetupActionText(reason)}
+      </button>
     </p>
   );
 }
@@ -1494,9 +1484,6 @@ export function AgentHarnessPicker({
   const appliedOpenNonce = useRef(0);
   const pendingConfigAgentId = useRef<string | null>(null);
   const queryClient = useQueryClient();
-  const info = useServerInfo();
-  // Feature ON → single "needs setup" badge; OFF → per-reason original text.
-  const collapsedBadge = isFeatureEnabled(info, "harness_install");
   const triggerSdk = triggerDetails.find((detail) => detail.label === "SDK");
   const triggerModel = triggerDetails.find((detail) => detail.label === "Model");
   const triggerEffort = triggerDetails.find(
@@ -1642,7 +1629,7 @@ export function AgentHarnessPicker({
     const editable = selectedConfigContent !== undefined && (isEntryConfigurable?.(agent) ?? true);
     const readiness = harnessReadinessOnHost(agent.harness, host);
     const unavailable = !readiness.selectable && readiness.fallbackRelevant;
-    const warning = harnessWarningBadgeText(readiness.reason, collapsedBadge);
+    const warning = harnessWarningBadgeText(readiness.reason);
     const warningMessage = harnessWarningMessage(
       agent.display_name,
       host?.name,
@@ -1686,9 +1673,13 @@ export function AgentHarnessPicker({
             <span
               aria-label={warning}
               data-testid={`new-chat-landing-agent-warning-${agent.id}`}
-              className="flex size-4 shrink-0 items-center justify-center text-amber-700 dark:text-amber-300"
+              className="flex shrink-0 items-center justify-center text-amber-700 dark:text-amber-300"
             >
-              <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
+              {readiness.reason === "binary-missing" ? (
+                <span className="text-xs text-muted-foreground">Not installed</span>
+              ) : (
+                <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
+              )}
             </span>
           )
         }
@@ -1852,10 +1843,14 @@ export function AgentHarnessPicker({
         icon:
           disabledLabel !== undefined ? undefined : selectedUnavailable ? (
             <span
-              className="flex size-4 shrink-0 items-center justify-center text-amber-700 dark:text-amber-300"
+              className="flex shrink-0 items-center justify-center text-amber-700 dark:text-amber-300"
               data-testid="new-chat-landing-agent-warning"
             >
-              <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
+              {selectedReadiness.reason === "binary-missing" ? (
+                <span className="text-xs text-muted-foreground">Not installed</span>
+              ) : (
+                <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
+              )}
             </span>
           ) : visibleCachedPreview ? (
             <span
@@ -2342,10 +2337,6 @@ export function NewChatLandingScreen() {
   // reads as neither, so no routing surface flashes in before the probe lands.
   const externalRoutingConfigured = info !== "loading" && info.smart_routing_sources.external;
   const ossRoutingConfigured = info !== "loading" && info.smart_routing_sources.oss;
-  // Gates the whole UI-driven setup experience (Set up affordance + dialog +
-  // collapsed badge). OFF → the composer/picker fall back to the original
-  // "run omni setup" guidance, so a disabled flag is a no-op on the UI.
-  const harnessInstallEnabled = isFeatureEnabled(info, "harness_install");
   // Unfiltered brain-harness labels: safe for membership checks and for
   // labelling an existing pick, but the OPTIONS offered in the gear modal use
   // the gated `brainHarnessLabels` below, which drops the fully-auto row when
@@ -3836,12 +3827,17 @@ export function NewChatLandingScreen() {
                         {harnessUnconfiguredOnHost(id, harnessWarningHost) && (
                           <Badge
                             variant="outline"
-                            className="border-amber-300 bg-amber-50 text-sm text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
+                            className={cn(
+                              "text-sm",
+                              harnessUnavailableReasonOnHost(id, harnessWarningHost) ===
+                                "binary-missing"
+                                ? "border-border text-muted-foreground"
+                                : "border-amber-300 bg-amber-50 text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400",
+                            )}
                             data-testid={`new-chat-landing-harness-warning-${id}`}
                           >
                             {harnessWarningBadgeText(
                               harnessUnavailableReasonOnHost(id, harnessWarningHost),
-                              harnessInstallEnabled,
                             )}
                           </Badge>
                         )}
@@ -7187,7 +7183,6 @@ export function NewChatLandingScreen() {
               hostName={harnessWarningHost?.name}
               harness={selectedAgent?.harness ?? null}
               reason={harnessUnavailableReasonOnHost(selectedAgent?.harness, harnessWarningHost)}
-              featureEnabled={harnessInstallEnabled}
               onSetup={() =>
                 setSetupTarget({
                   agentName: selectedAgent?.display_name,

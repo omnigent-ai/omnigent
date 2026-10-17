@@ -1,5 +1,12 @@
 import { useMemo, useState } from "react";
-import { ChevronDownIcon, KeyRoundIcon, Plus, SearchIcon, SettingsIcon } from "lucide-react";
+import {
+  ChevronDownIcon,
+  KeyRoundIcon,
+  Plus,
+  SearchIcon,
+  SettingsIcon,
+  TriangleAlertIcon,
+} from "lucide-react";
 import { Link, useNavigate } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import {
@@ -8,10 +15,9 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
-import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled } from "@/lib/capabilities";
 import { ComposerAgentIcon } from "@/shell/NewChatDialog";
 import { HarnessSetupDialog } from "@/shell/HarnessSetupDialog";
 import { useHarnessStartup, useHosts, type Host } from "@/hooks/useHosts";
@@ -20,7 +26,7 @@ import { INVENTORY_HARNESS_IDS } from "@/hooks/useHarnessInventory";
 import { BRAND_HARNESSES } from "@/components/onboarding/harnessBrand";
 import {
   harnessReadinessOnHost,
-  harnessUnavailableReasonOnHost,
+  harnessSetupActionText,
   harnessWarningBadgeText,
 } from "@/lib/harnessSetup";
 import { NATIVE_CODING_AGENTS } from "@/lib/nativeCodingAgents";
@@ -80,14 +86,8 @@ export const SettingsHarnessesSection = () => {
   const { harness } = useSettingsRoute();
   const [query, setQuery] = useState("");
   const [installedOnly, setInstalledOnly] = useState(false);
-  const info = useServerInfo();
   const { data: hosts } = useHosts({ refetchOnFocus: true });
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
-
-  // Gate the "Set up" affordance on the install feature, matching New Chat: with
-  // it off the setup dialog has no runnable install step, so we show status
-  // only (no button that opens a dead-end dialog).
-  const canSetup = isFeatureEnabled(info, "harness_install");
 
   // Online hosts first, then offline (disabled in the menu). Default the
   // selection to the first online host; the picker can override.
@@ -128,7 +128,6 @@ export const SettingsHarnessesSection = () => {
           key={detail.harness}
           entry={detail}
           host={host}
-          canSetup={canSetup}
           onSetup={() => host && setSetupTarget({ entry: detail, host })}
         />
       ) : (
@@ -162,10 +161,17 @@ export const SettingsHarnessesSection = () => {
               </TabsList>
             </Tabs>
           </div>
-          {!host && <NoHostNotice />}
+          {!host ? (
+            <NoHostNotice />
+          ) : !host.configured_harnesses || Object.keys(host.configured_harnesses).length === 0 ? (
+            <p className="mb-4 text-ui text-muted-foreground">
+              {host.name} isn’t reporting harness status. Update or reconnect the host to check
+              availability.
+            </p>
+          ) : null}
           {filtered.length === 0 && (
             <p className="text-ui text-muted-foreground">
-              {query.trim() ? `No harnesses match “${query}”.` : "No installed harnesses."}
+              {query.trim() ? `No harnesses match “${query}”.` : "No configured harnesses."}
             </p>
           )}
           <div
@@ -180,7 +186,6 @@ export const SettingsHarnessesSection = () => {
                 key={entry.harness}
                 entry={entry}
                 host={host}
-                canSetup={canSetup}
                 onSetup={() => host && setSetupTarget({ entry, host })}
               />
             ))}
@@ -284,20 +289,48 @@ function harnessStatus(harness: string, host: Host | null) {
     // readiness (older host → `readiness-unknown`) stays neutral: no badge, no
     // Set-up button, rather than a false "needs setup" on a working harness.
     needsSetup: readiness.state === "setup-required" || readiness.state === "broken",
-    reason: harnessUnavailableReasonOnHost(harness, host),
+    reason: readiness.reason,
+    explanation: readiness.explanation,
   };
 }
 
-function HarnessStatusText({ status }: { status: ReturnType<typeof harnessStatus> }) {
+function HarnessStatusText({
+  status,
+  host,
+  onSetup,
+}: {
+  status: ReturnType<typeof harnessStatus>;
+  host: Host | null;
+  onSetup: () => void;
+}) {
   if (status.ready) {
     return <span className="text-xs text-green-600 dark:text-green-400">Configured</span>;
   }
+  if (status.reason === "binary-missing") return null;
   if (status.needsSetup) {
-    // Sentence case to match "Configured"; the picker keeps the shared lowercase badge.
     const text = harnessWarningBadgeText(status.reason);
     return (
-      <span className="text-xs text-amber-600 dark:text-amber-500">
-        {text.charAt(0).toUpperCase() + text.slice(1)}
+      <span className="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-500">
+        {text}
+        {text === "Needs attention" && (
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  aria-label={`Readiness details on ${host?.name}`}
+                  onClick={onSetup}
+                  className="rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <TriangleAlertIcon className="size-3.5" aria-hidden />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>
+                {host?.name}: {status.explanation?.description}
+              </TooltipContent>
+            </Tooltip>
+          </TooltipProvider>
+        )}
       </span>
     );
   }
@@ -312,19 +345,27 @@ function HarnessIcon({ entry }: { entry: HarnessEntry }) {
   );
 }
 
-function SetupButton({ entry, onSetup }: { entry: HarnessEntry; onSetup: () => void }) {
+function SetupButton({
+  entry,
+  reason,
+  onSetup,
+}: {
+  entry: HarnessEntry;
+  reason: string;
+  onSetup: () => void;
+}) {
   return (
     <Button
       variant="ghost"
-      size="icon-sm"
+      size="sm"
       className="shrink-0"
-      aria-label={`Set up ${entry.name}`}
+      aria-label={`${harnessSetupActionText(reason)} ${entry.name}`}
       data-testid={`harness-action-${entry.harness}`}
       componentId="settings.harnesses.setup"
       onClick={onSetup}
     >
-      <Plus />
-      {/* Set up */}
+      {reason === "binary-missing" && <Plus />}
+      {harnessSetupActionText(reason)}
     </Button>
   );
 }
@@ -333,12 +374,10 @@ function SetupButton({ entry, onSetup }: { entry: HarnessEntry; onSetup: () => v
 function HarnessCard({
   entry,
   host,
-  canSetup,
   onSetup,
 }: {
   entry: HarnessEntry;
   host: Host | null;
-  canSetup: boolean;
   onSetup: () => void;
 }) {
   const status = harnessStatus(entry.harness, host);
@@ -350,7 +389,7 @@ function HarnessCard({
           <HarnessIcon entry={entry} />
           <div className="flex min-w-0 flex-col">
             <span className="truncate text-ui font-medium text-foreground">{entry.name}</span>
-            <HarnessStatusText status={status} />
+            <HarnessStatusText status={status} host={host} onSetup={onSetup} />
           </div>
         </div>
         {status.ready && (
@@ -369,7 +408,9 @@ function HarnessCard({
             <SettingsIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden />
           </Button>
         )}
-        {status.needsSetup && canSetup && <SetupButton entry={entry} onSetup={onSetup} />}
+        {status.needsSetup && (
+          <SetupButton entry={entry} reason={status.reason} onSetup={onSetup} />
+        )}
       </div>
       <p className="line-clamp-2 text-ui text-muted-foreground">{entry.description}</p>
     </>
@@ -400,12 +441,10 @@ function HarnessCard({
 function HarnessDetail({
   entry,
   host,
-  canSetup,
   onSetup,
 }: {
   entry: HarnessEntry;
   host: Host | null;
-  canSetup: boolean;
   onSetup: () => void;
 }) {
   const status = harnessStatus(entry.harness, host);
@@ -417,10 +456,12 @@ function HarnessDetail({
           <HarnessIcon entry={entry} />
           <div className="flex min-w-0 flex-col">
             <h1 className="settings-page-title truncate text-2xl font-semibold">{entry.name}</h1>
-            <HarnessStatusText status={status} />
+            <HarnessStatusText status={status} host={host} onSetup={onSetup} />
           </div>
         </div>
-        {status.needsSetup && canSetup && <SetupButton entry={entry} onSetup={onSetup} />}
+        {status.needsSetup && (
+          <SetupButton entry={entry} reason={status.reason} onSetup={onSetup} />
+        )}
       </div>
     </>
   );
@@ -457,7 +498,8 @@ function HarnessDetail({
           </>
         ) : (
           <p className="text-ui text-muted-foreground">
-            Set up {entry.name} on {host.name} to manage its MCP servers, skills, and plugins.
+            {status.explanation?.description ??
+              `${host.name} hasn’t reported a status for ${entry.name}. Update or reconnect the host to check availability.`}
           </p>
         )}
       </div>

@@ -35,8 +35,7 @@ from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
     HARNESS_NEEDS_AUTH,
-    HARNESS_VERSION_TOO_LOW,
-    HarnessUnavailableReason,
+    HarnessAvailability,
 )
 from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.harnesses.claude_native.main import (
@@ -236,7 +235,7 @@ def _find_codex_cli() -> str | None:
     return resolve_cli_binary(spec.binary)
 
 
-def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
+def _codex_auth_unavailable_reason() -> HarnessAvailability | None:
     """
     Return why local Codex is unavailable, or ``None`` when available.
 
@@ -282,14 +281,15 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
     """
     from omnigent.onboarding.harness_install import (
         READINESS_CLI_PROBE_TIMEOUT_S,
-        harness_cli_installed,
+        harness_cli_readiness,
     )
     from omnigent.onboarding.provider_config import OPENAI_FAMILY
 
     if _find_codex_cli() is None:
         return HARNESS_BINARY_MISSING
-    if not harness_cli_installed(OPENAI_FAMILY, timeout=READINESS_CLI_PROBE_TIMEOUT_S):
-        return HARNESS_VERSION_TOO_LOW
+    availability = harness_cli_readiness(OPENAI_FAMILY, timeout=READINESS_CLI_PROBE_TIMEOUT_S)
+    if availability is not True:
+        return availability
     # On a host with no configured provider this may run ambient detection.
     # configured_harness_map shares one probe across all Codex aliases.
     defers_to_codex_config = False
