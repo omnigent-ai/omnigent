@@ -503,9 +503,9 @@ def register_resources_routes(
                 conversation=conversation,
             )
         if runner_client is None:
-            raise HTTPException(
-                status_code=502,
-                detail="no runner available for resource access",
+            raise OmnigentError(
+                "No runner is available to download this file.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
             )
         try:
             resp = await runner_client.send(
@@ -513,6 +513,11 @@ def register_resources_routes(
                 stream=True,
             )
         except (httpx.HTTPError, ConnectionError) as exc:
+            if isinstance(exc, httpx.ConnectError):
+                raise OmnigentError(
+                    "The session runner is offline. Reconnect the host and retry.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                ) from exc
             raise HTTPException(
                 status_code=502,
                 detail="runner download endpoint unavailable",
@@ -536,10 +541,20 @@ def register_resources_routes(
                 first_chunk = await anext(chunks)
             except StopAsyncIteration:
                 first_chunk = None
-            except (httpx.HTTPError, ConnectionError) as exc:
-                _logger.warning("Runner download failed before streaming began: %s", exc)
+            except BaseException as exc:
                 await resp.aclose()
-                raise HTTPException(status_code=502, detail="runner download failed") from exc
+                if isinstance(exc, (httpx.HTTPError, ConnectionError)):
+                    _logger.warning("Runner download failed before streaming began: %s", exc)
+                    if isinstance(exc, httpx.ConnectError):
+                        raise OmnigentError(
+                            "The session runner is offline. Reconnect the host and retry.",
+                            code=ErrorCode.RUNNER_UNAVAILABLE,
+                        ) from exc
+                    raise HTTPException(
+                        status_code=502,
+                        detail="runner download failed",
+                    ) from exc
+                raise
 
             async def stream_chunks() -> AsyncIterator[bytes]:
                 if first_chunk is not None:
@@ -547,15 +562,25 @@ def register_resources_routes(
                 async for chunk in chunks:
                     yield chunk
 
-            return _RunnerStreamResponse(
-                resp,
-                headers=forwarded,
-                content=stream_chunks(),
-            )
+            try:
+                response = _RunnerStreamResponse(
+                    resp,
+                    headers=forwarded,
+                    content=stream_chunks(),
+                )
+            except BaseException:
+                await resp.aclose()
+                raise
+            return response
         try:
             await resp.aread()
         except (httpx.HTTPError, ConnectionError) as exc:
             _logger.warning("Runner download error response could not be read: %s", exc)
+            if isinstance(exc, httpx.ConnectError):
+                raise OmnigentError(
+                    "The session runner is offline. Reconnect the host and retry.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                ) from exc
             raise HTTPException(status_code=502, detail="runner download failed") from exc
         finally:
             await resp.aclose()
