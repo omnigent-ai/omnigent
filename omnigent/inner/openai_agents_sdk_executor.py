@@ -14,8 +14,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import contextvars
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -1087,6 +1089,148 @@ def _skip_history_transform(resource: object, field: str) -> None:
     object.__setattr__(resource, "create", _create)
 
 
+# Per-request USD cost a LiteLLM-style gateway reports on an HTTP response. On a
+# streamed reply this is at best a pre-stream estimate; the exact amount is the
+# ``usage.cost`` a gateway can annotate on the final response event instead.
+_GATEWAY_COST_HEADER = "x-litellm-response-cost"
+
+# Request paths of model calls, which end in one of the terminal response events.
+_MODEL_CALL_PATHS = ("/responses", "/chat/completions")
+_TERMINAL_RESPONSE_EVENTS = ("response.completed", "response.incomplete", "response.failed")
+
+
+@dataclass
+class _GatewayCharge:
+    """Cost a gateway reported for one HTTP response the turn made.
+
+    :param header_cost: Parsed cost header, or ``None`` when absent or unusable.
+    :param usage_cost: ``usage.cost`` annotated on the response this call streamed,
+        or ``None`` when absent or unusable.
+    :param streams_response: Whether this is a model call, which ends in a
+        terminal response event carrying the usage annotation.
+    :param settled: Whether a terminal response event has been attributed to
+        this call.
+    """
+
+    header_cost: float | None = None
+    usage_cost: float | None = None
+    streams_response: bool = True
+    settled: bool = False
+
+    @property
+    def billed(self) -> float | None:
+        """The call's cost: the annotation (computed after the stream) over the header."""
+        return self.usage_cost if self.usage_cost is not None else self.header_cost
+
+
+# Charges of the HTTP responses in flight. ``run_turn`` sets it only in the
+# context the SDK's run task is created from, so it never outlives the turn.
+_turn_gateway_charges: contextvars.ContextVar[list[_GatewayCharge] | None] = (
+    contextvars.ContextVar("openai_agents_turn_gateway_charges", default=None)
+)
+
+
+def _parse_gateway_cost(value: object) -> float | None:
+    """Coerce a gateway-reported cost to a non-negative finite USD amount.
+
+    :param value: A header string such as ``"0.0123"``, a numeric usage field
+        such as ``0.0123``, or ``None`` when absent.
+    :returns: The cost, or ``None`` when the value is missing or unusable.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        try:
+            cost = float(value)
+        except ValueError:
+            return None
+    elif isinstance(value, (int, float)):
+        cost = float(value)
+    else:
+        return None
+    if not math.isfinite(cost) or cost < 0:
+        return None
+    return cost
+
+
+def _gateway_usage_cost(response: object) -> float | None:
+    """Read the cost a gateway annotated on a completed response's ``usage``.
+
+    LiteLLM adds ``usage.cost`` when ``include_cost_in_streaming_usage`` is
+    enabled; it is computed after the stream ends, so it is exact.
+
+    :param response: The ``response`` carried by a ``response.completed`` or
+        ``response.incomplete`` event, or ``None`` when the event has none.
+    :returns: The annotated ``usage.cost``, or ``None`` when absent or unusable.
+    """
+    usage = (
+        response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
+    )
+    if usage is None:
+        return None
+    cost = usage.get("cost") if isinstance(usage, dict) else getattr(usage, "cost", None)
+    return _parse_gateway_cost(cost)
+
+
+async def _record_gateway_cost(response: httpx.Response) -> None:
+    """httpx response hook: record each successful response's cost header for the turn."""
+    charges = _turn_gateway_charges.get()
+    if charges is None or not response.is_success:
+        return
+    try:
+        path = response.request.url.path
+    except RuntimeError:  # a response built without a request: bill its header alone
+        path = ""
+    charges.append(
+        _GatewayCharge(
+            header_cost=_parse_gateway_cost(response.headers.get(_GATEWAY_COST_HEADER)),
+            streams_response=bool(path) and path.endswith(_MODEL_CALL_PATHS),
+        )
+    )
+
+
+def _settle_gateway_charge(charges: list[_GatewayCharge], usage_cost: float | None) -> None:
+    """Attribute a terminal response event's usage annotation to the model call it ends.
+
+    Model calls run one at a time, so the event ends the oldest model call still
+    awaiting one. Without the response hook (a client with no httpx client) no
+    charge was recorded, so the annotation is kept on its own.
+    """
+    for charge in charges:
+        if charge.streams_response and not charge.settled:
+            charge.usage_cost = usage_cost
+            charge.settled = True
+            return
+    charges.append(_GatewayCharge(usage_cost=usage_cost, settled=True))
+
+
+def _install_gateway_cost_hook(client: AsyncOpenAIClient) -> None:
+    """Observe the gateway cost header on every HTTP response *client* receives.
+
+    The Agents SDK exposes no response headers, so the hook sits on the
+    ``AsyncOpenAI`` client's underlying httpx client. A client without one
+    (a unit-test stand-in) is left untouched.
+
+    :param client: The ``AsyncOpenAI`` (or compatible) client the SDK will use.
+    """
+    http_client = getattr(client, "_client", None)
+    if not isinstance(http_client, httpx.AsyncClient):
+        # A real openai client without one means the SDK moved the attribute.
+        level = logging.WARNING if type(client).__module__.startswith("openai") else logging.DEBUG
+        logger.log(
+            level,
+            "Gateway cost header hook not installed: %s has no httpx.AsyncClient",
+            type(client).__name__,
+        )
+        return
+    hooks = http_client.event_hooks
+    if _record_gateway_cost not in hooks["response"]:
+        http_client.event_hooks = {
+            **hooks,
+            "response": [*hooks["response"], _record_gateway_cost],
+        }
+
+
 def _count_output_items(new_items: Sequence[object]) -> int:
     """Count run items that represent user-visible output.
 
@@ -1234,6 +1378,7 @@ class OpenAIAgentsSDKExecutor(Executor):
             _skip_history_transform(getattr(raw_client, "responses", None), "input")
             _chat = getattr(raw_client, "chat", None)
             _skip_history_transform(getattr(_chat, "completions", None), "messages")
+        _install_gateway_cost_hook(raw_client)
         # Wrap the chat.completions path to strip list-type delta.content
         # (reasoning blocks emitted by models like Kimi K2).  The SDK's
         # ChatCmplStreamHandler validates delta as str; list input raises
@@ -1624,6 +1769,12 @@ class OpenAIAgentsSDKExecutor(Executor):
         config: ExecutorConfig | None = None,
     ) -> AsyncIterator[ExecutorEvent]:
         cfg = config or ExecutorConfig()
+        # Gateway-reported charges for this turn, including a retried empty attempt
+        # the gateway still billed. The list lives only in ``run_context``, which the
+        # SDK's run task copies, so the response hook sees it and the caller never does.
+        gateway_charges: list[_GatewayCharge] = []
+        run_context = contextvars.copy_context()
+        run_context.run(_turn_gateway_charges.set, gateway_charges)
         # cfg.model (per-request /model override; agent name no longer
         # leaks here) wins over the spec default
         # (HARNESS_OPENAI_AGENTS_MODEL → self._model_override).
@@ -1743,13 +1894,18 @@ class OpenAIAgentsSDKExecutor(Executor):
             # is what makes :meth:`interrupt_session`'s ``task.cancel()``
             # land at the SDK boundary instead of in our queue plumbing.
             event_queue: asyncio.Queue[object] = asyncio.Queue()
+            # A new attempt's terminal events must not settle an earlier attempt's
+            # charges; those keep whatever header cost they carried.
+            for charge in gateway_charges:
+                charge.settled = True
             try:
                 # Reuse the count already fetched above; avoids a second
                 # ``get_items()`` round-trip.
                 state.run_item_count_before = current_item_count
                 result = cast(
                     _RunResult,
-                    agents_sdk.Runner.run_streamed(
+                    run_context.run(
+                        agents_sdk.Runner.run_streamed,
                         agent,
                         input=input_value,
                         session=state.sdk_session,
@@ -1790,6 +1946,11 @@ class OpenAIAgentsSDKExecutor(Executor):
                                 yield ReasoningChunk(
                                     delta=reasoning_delta, event_type="reasoning_text"
                                 )
+                        elif data.type in _TERMINAL_RESPONSE_EVENTS:
+                            _settle_gateway_charge(
+                                gateway_charges,
+                                _gateway_usage_cost(getattr(data, "response", None)),
+                            )
 
                     elif event.type == "run_item_stream_event":
                         item_event = cast(_RunItemEvent, event)
@@ -2030,6 +2191,13 @@ class OpenAIAgentsSDKExecutor(Executor):
                 }
                 if cached_tok:
                     turn_usage["cache_read_input_tokens"] = cached_tok
+                # What the gateway billed; the server prefers it over a catalog estimate,
+                # so a turn with an unpriced model call stays catalog-priced as a whole.
+                model_calls = [charge for charge in gateway_charges if charge.streams_response]
+                if model_calls and all(charge.billed is not None for charge in model_calls):
+                    turn_usage["cost_usd"] = sum(
+                        charge.billed for charge in gateway_charges if charge.billed is not None
+                    )
         _notify_usage_from_dict(model=model, usage=turn_usage)
 
         # Emit CompactionComplete if the SDK compacted this turn.
