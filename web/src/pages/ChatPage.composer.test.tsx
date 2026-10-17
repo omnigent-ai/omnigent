@@ -4524,6 +4524,8 @@ describe("Composer file-attachment focus", () => {
     // ``types`` is the only file signal available mid-drag.
     fireEvent.dragEnter(transcript, { dataTransfer: { types: ["Files"], files: [] } });
     expect(screen.getByTestId("file-drop-overlay")).toBeTruthy();
+    expect(screen.getByText("Attach to message")).toBeTruthy();
+    expect(screen.getByText("Sent with your next message")).toBeTruthy();
 
     const file = new File([new Uint8Array(10)], "shot.png", { type: "image/png" });
     fireEvent.drop(transcript, { dataTransfer: { types: ["Files"], files: [file] } });
