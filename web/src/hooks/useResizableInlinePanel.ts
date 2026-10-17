@@ -57,12 +57,15 @@ function clamp(
       window.innerWidth - reservedPx - chatMinPx - GAP_PX,
     ),
   );
-  // The chat's width floor wins over the panel's own comfort minimum: when the
-  // viewport (with the sidebar open) is too small to grant both, the panel
-  // yields below `minPx` rather than let the chat break its minimum. Clamping
-  // the floor to the ceiling keeps the range valid so `Math.max` can't push the
-  // width back up past the chat-preserving cap.
-  return Math.max(Math.min(minPx, ceiling), Math.min(w, ceiling));
+  // The chat's width floor still caps the panel via `ceiling`, so a raised
+  // `minPx` (for example, while comments are open) yields below that comfort
+  // minimum when needed. But once `minPx` rises above the rail's 240px base,
+  // keep that base as the true floor so the chat shrinks before the rail does.
+  const floor =
+    minPx > MIN_WIDTH_PX
+      ? Math.min(MIN_WIDTH_PX, Math.max(0, window.innerWidth - reservedPx - GAP_PX))
+      : 0;
+  return Math.max(floor, Math.min(minPx, ceiling), Math.min(w, ceiling));
 }
 
 // ---------------------------------------------------------------------------

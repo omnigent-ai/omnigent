@@ -1254,14 +1254,16 @@ function WorkspacePanelImpl({
           />
         )}
         {/* The default nav tab comes first; the remaining tabs keep their relative order. */}
-        {/* Narrow rails use the picker for fixed panels, leaving room for open tabs. */}
+        {/* Static nav tabs + divider stay pinned left while the open-tabs
+          region scrolls; on very narrow rails the fixed tabs collapse behind
+          the picker, leaving room for open tabs instead of clipping them. */}
         <div
           ref={tabListRef}
           role="toolbar"
           aria-label="Workspace tabs"
           tabIndex={-1}
           onKeyDown={handlePermanentTabNumber}
-          className="workspace-tab-strip shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-3"
+          className="workspace-tab-strip shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-3 @max-md/rail:overflow-x-auto @max-md/rail:overflow-y-hidden @max-md/rail:[scrollbar-width:thin]"
         >
           <Tabs
             className={cn("shrink-0", showOpenTabs && "@max-[400px]/rail:hidden")}

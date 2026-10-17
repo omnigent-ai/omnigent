@@ -26,9 +26,8 @@ function formatCommentTime(createdAt: number, now: Date): string {
 }
 
 // ---------------------------------------------------------------------------
-// CommentsPanel — right panel for adding and viewing comments. Resizable on
-// desktop via a left-edge drag handle (see useResizableCommentsPanel); the
-// chosen width persists across panel remounts within a session.
+// Comments sit beside a wide viewer row and stack under narrow rows.
+// The dragged width and height persist across panel remounts.
 // ---------------------------------------------------------------------------
 
 export type { ActiveSelection };
@@ -93,7 +92,7 @@ export function CommentsPanel({
   const addCommentTextareaRef = useRef<HTMLTextAreaElement>(null);
   const selectedCardRef = useRef<HTMLDivElement>(null);
   const autoRouteRef = useRef<{ selection: ActiveSelection; tab: Tab } | null>(null);
-  const { width, containerRef, isDesktop, handleProps } = useResizableCommentsPanel();
+  const { width, height, containerRef, sideBySide, handleProps } = useResizableCommentsPanel();
 
   // Editing or deleting a comment is author-only (the backend enforces this
   // too; this just hides the affordances). A comment with no recorded author
@@ -165,16 +164,27 @@ export function CommentsPanel({
   return (
     <div
       ref={containerRef}
-      style={isDesktop && width != null ? { width } : undefined}
-      className="relative flex shrink-0 flex-col overflow-hidden border-border w-full h-64 border-t md:h-auto md:border-t-0 md:border-l"
+      data-testid="comments-panel"
+      // The `@md/viewer` variant applies the width only beside the viewer and
+      // the height only under it, so neither layout inherits the other's size.
+      style={
+        {
+          "--comments-panel-width": `${width}px`,
+          "--comments-panel-height": `${height}px`,
+        } as React.CSSProperties
+      }
+      className="relative flex shrink-0 flex-col overflow-hidden border-border w-full h-(--comments-panel-height) border-t @md/viewer:h-auto @md/viewer:w-(--comments-panel-width) @md/viewer:border-t-0 @md/viewer:border-l"
     >
-      {/* Resize handle — desktop only (mobile stacks the panel full-width below) */}
-      {isDesktop && (
-        <div
-          {...handleProps}
-          className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
-        />
-      )}
+      {/* Drag the left edge beside the viewer, the top edge when stacked under it. */}
+      <div
+        {...handleProps}
+        className={cn(
+          "absolute z-10 transition-colors hover:bg-primary/30 active:bg-primary/50",
+          sideBySide
+            ? "inset-y-0 left-0 w-1 cursor-col-resize"
+            : "inset-x-0 top-0 h-1 cursor-row-resize",
+        )}
+      />
       {/* Header — fixed height so layout doesn't shift when button is hidden */}
       <div className="flex h-11 shrink-0 items-center justify-between px-3 border-b border-border">
         <span className="text-sm font-semibold">Comments</span>

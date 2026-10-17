@@ -8,7 +8,7 @@
 // only useEditorState (formatting badges) and the editor.getMarkdown()
 // call on save are exercised.
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tiptap/react", () => ({
@@ -39,6 +39,7 @@ const editorStub = { getMarkdown: () => MARKDOWN } as unknown as Editor;
 
 function renderToolbar(
   overrides: Partial<{
+    editor: Editor;
     onSave: (md: string) => void;
     isSaving: boolean;
     isDirty: boolean;
@@ -50,7 +51,7 @@ function renderToolbar(
   const onSave = overrides.onSave ?? vi.fn();
   render(
     <ToolbarPlugin
-      editor={editorStub}
+      editor={overrides.editor ?? editorStub}
       onSave={onSave}
       isSaving={overrides.isSaving ?? false}
       isDirty={overrides.isDirty ?? false}
@@ -63,8 +64,168 @@ function renderToolbar(
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
   cleanup();
+});
+
+// ── Responsive overflow ─────────────────────────────────────────────────────────────────
+// jsdom has no layout: getBoundingClientRect is stubbed so the row reports the
+// given width, each clone item 28px (divider 9px) and the status pill 70px.
+
+function installToolbarWidths(rowWidth: number | (() => number)): {
+  observers: ResizeObserverCallback[];
+} {
+  const observers: ResizeObserverCallback[] = [];
+  class StubResizeObserver {
+    constructor(callback: ResizeObserverCallback) {
+      observers.push(callback);
+    }
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  vi.stubGlobal("ResizeObserver", StubResizeObserver);
+  const currentRowWidth = typeof rowWidth === "function" ? rowWidth : () => rowWidth;
+  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+    this: HTMLElement,
+  ) {
+    let width = 0;
+    if (this.getAttribute("role") === "toolbar") width = currentRowWidth();
+    else if (this.dataset.measure === "divider") width = 9;
+    else if (this.dataset.measure !== undefined) width = 28;
+    else if (this.dataset.slot === "save-status") width = 70;
+    return {
+      width,
+      height: 0,
+      top: 0,
+      left: 0,
+      right: width,
+      bottom: 0,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    } as DOMRect;
+  });
+  return { observers };
+}
+
+/** A chainable editor stub that records every command name it receives. */
+function chainRecordingEditor(): { editor: Editor; calls: string[] } {
+  const calls: string[] = [];
+  const chain: Record<string, (...args: unknown[]) => unknown> = new Proxy(
+    {},
+    {
+      get:
+        (_target, prop: string) =>
+        (..._args: unknown[]) => {
+          calls.push(prop);
+          return prop === "run" ? true : chain;
+        },
+    },
+  );
+  const editor = {
+    getMarkdown: () => MARKDOWN,
+    chain: () => chain,
+    commands: {
+      focus: () => {
+        calls.push("commands.focus");
+        return true;
+      },
+    },
+    isFocused: false,
+  } as unknown as Editor;
+  return { editor, calls };
+}
+
+const INLINE_MARKS = ["Bold (⌘B)", "Italic (⌘I)", "Strikethrough", "Inline code"];
+const LOW_PRIORITY = ["Undo (⌘Z)", "Heading 1", "Quote", "Bullet list", "Insert table", "Copy"];
+
+describe("MarkdownEditorToolbar overflow", () => {
+  it("keeps every button inline when the row is wide enough", () => {
+    installToolbarWidths(1000);
+    renderToolbar();
+    const row = within(screen.getByRole("toolbar", { name: "Formatting" }));
+    for (const name of [...INLINE_MARKS, ...LOW_PRIORITY, "All changes saved"]) {
+      expect(row.getByRole("button", { name })).toBeInTheDocument();
+    }
+    expect(row.queryByRole("button", { name: "More formatting" })).toBeNull();
+  });
+
+  it("folds low-priority tools into a ⋯ menu and keeps the inline marks and status pill", () => {
+    // Four marks (112) + ⋯ (28) + status (70) + 2px slack fit exactly; undo
+    // and its divider would not, so everything below the marks folds.
+    installToolbarWidths(212);
+    renderToolbar();
+    const row = within(screen.getByRole("toolbar", { name: "Formatting" }));
+    for (const name of [...INLINE_MARKS, "More formatting", "All changes saved"]) {
+      expect(row.getByRole("button", { name })).toBeInTheDocument();
+    }
+    for (const name of LOW_PRIORITY) {
+      expect(row.queryByRole("button", { name })).toBeNull();
+    }
+  });
+
+  it("keeps Bold inline longest and still shows the status pill in a very narrow row", () => {
+    // Bold (28) + ⋯ (28) + status (70) = 126; a second mark would overflow.
+    installToolbarWidths(130);
+    renderToolbar();
+    const row = within(screen.getByRole("toolbar", { name: "Formatting" }));
+    expect(row.getByRole("button", { name: "Bold (⌘B)" })).toBeInTheDocument();
+    expect(row.getByRole("button", { name: "All changes saved" })).toBeInTheDocument();
+    expect(row.queryByRole("button", { name: "Italic (⌘I)" })).toBeNull();
+  });
+
+  it("runs a folded command from the ⋯ menu against the editor", () => {
+    installToolbarWidths(210);
+    const { editor, calls } = chainRecordingEditor();
+    renderToolbar({ editor });
+    fireEvent.click(screen.getByRole("button", { name: "More formatting" }));
+    const folded = screen.getByRole("button", { name: "Bullet list" });
+    expect(screen.getByRole("toolbar", { name: "Formatting" })).not.toContainElement(folded);
+    fireEvent.click(folded);
+    // The menu closes once the command has run and hands focus back to the editor.
+    expect(calls).toEqual(["focus", "toggleBulletList", "run", "commands.focus"]);
+    expect(screen.queryByRole("button", { name: "Bullet list" })).toBeNull();
+  });
+
+  it("refolds as the measured row width changes after mount", () => {
+    let rowWidth = 1000;
+    const { observers } = installToolbarWidths(() => rowWidth);
+    renderToolbar();
+    const row = () => within(screen.getByRole("toolbar", { name: "Formatting" }));
+    expect(row().getByRole("button", { name: "Undo (⌘Z)" })).toBeInTheDocument();
+    expect(row().queryByRole("button", { name: "More formatting" })).toBeNull();
+
+    rowWidth = 212;
+    act(() => observers.forEach((cb) => cb([], {} as ResizeObserver)));
+    expect(row().queryByRole("button", { name: "Undo (⌘Z)" })).toBeNull();
+    expect(row().getByRole("button", { name: "More formatting" })).toBeInTheDocument();
+
+    rowWidth = 1000;
+    act(() => observers.forEach((cb) => cb([], {} as ResizeObserver)));
+    expect(row().getByRole("button", { name: "Undo (⌘Z)" })).toBeInTheDocument();
+    expect(row().queryByRole("button", { name: "More formatting" })).toBeNull();
+  });
+
+  it("closes the ⋯ menu after a folded Copy and hands focus back to the editor", () => {
+    installToolbarWidths(212);
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    try {
+      const { editor, calls } = chainRecordingEditor();
+      renderToolbar({ editor });
+      fireEvent.click(screen.getByRole("button", { name: "More formatting" }));
+      fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+      expect(writeText).toHaveBeenCalledWith(MARKDOWN);
+      // Copy has no editor chain of its own; closing the menu refocuses the editor.
+      expect(calls).toEqual(["commands.focus"]);
+      expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();
+      expect(screen.getByRole("button", { name: "More formatting" })).toBeInTheDocument();
+    } finally {
+      Reflect.deleteProperty(navigator, "clipboard");
+    }
+  });
 });
 
 describe("MarkdownEditorToolbar auto-save status", () => {

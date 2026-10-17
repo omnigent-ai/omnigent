@@ -89,17 +89,17 @@ describe("TableAlignControls visibility", () => {
   it("hides alignment buttons when the cursor is outside a table", () => {
     mockEditorState({ inTable: false, align: null });
     renderToolbar();
-    expect(screen.queryByTitle("Align column left")).toBeNull();
-    expect(screen.queryByTitle("Align column center")).toBeNull();
-    expect(screen.queryByTitle("Align column right")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Align column left" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Align column center" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Align column right" })).toBeNull();
   });
 
   it("shows all three alignment buttons when the cursor is inside a table", () => {
     mockEditorState({ inTable: true, align: null });
     renderToolbar();
-    expect(screen.getByTitle("Align column left")).toBeDefined();
-    expect(screen.getByTitle("Align column center")).toBeDefined();
-    expect(screen.getByTitle("Align column right")).toBeDefined();
+    expect(screen.getByRole("button", { name: "Align column left" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Align column center" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Align column right" })).toBeDefined();
   });
 });
 
@@ -111,33 +111,57 @@ describe("TableAlignControls active state", () => {
   it("marks only the left button active for left-aligned columns", () => {
     mockEditorState({ inTable: true, align: "left" });
     renderToolbar();
-    expect(screen.getByTitle("Align column left").className).toContain("bg-accent");
-    expect(screen.getByTitle("Align column center").className).not.toContain("bg-accent");
-    expect(screen.getByTitle("Align column right").className).not.toContain("bg-accent");
+    expect(screen.getByRole("button", { name: "Align column left" }).className).toContain(
+      "bg-accent",
+    );
+    expect(screen.getByRole("button", { name: "Align column center" }).className).not.toContain(
+      "bg-accent",
+    );
+    expect(screen.getByRole("button", { name: "Align column right" }).className).not.toContain(
+      "bg-accent",
+    );
   });
 
   it("marks only the center button active for center-aligned columns", () => {
     mockEditorState({ inTable: true, align: "center" });
     renderToolbar();
-    expect(screen.getByTitle("Align column center").className).toContain("bg-accent");
-    expect(screen.getByTitle("Align column left").className).not.toContain("bg-accent");
-    expect(screen.getByTitle("Align column right").className).not.toContain("bg-accent");
+    expect(screen.getByRole("button", { name: "Align column center" }).className).toContain(
+      "bg-accent",
+    );
+    expect(screen.getByRole("button", { name: "Align column left" }).className).not.toContain(
+      "bg-accent",
+    );
+    expect(screen.getByRole("button", { name: "Align column right" }).className).not.toContain(
+      "bg-accent",
+    );
   });
 
   it("marks only the right button active for right-aligned columns", () => {
     mockEditorState({ inTable: true, align: "right" });
     renderToolbar();
-    expect(screen.getByTitle("Align column right").className).toContain("bg-accent");
-    expect(screen.getByTitle("Align column left").className).not.toContain("bg-accent");
-    expect(screen.getByTitle("Align column center").className).not.toContain("bg-accent");
+    expect(screen.getByRole("button", { name: "Align column right" }).className).toContain(
+      "bg-accent",
+    );
+    expect(screen.getByRole("button", { name: "Align column left" }).className).not.toContain(
+      "bg-accent",
+    );
+    expect(screen.getByRole("button", { name: "Align column center" }).className).not.toContain(
+      "bg-accent",
+    );
   });
 
   it("marks no button active when the column has no alignment set", () => {
     mockEditorState({ inTable: true, align: null });
     renderToolbar();
-    expect(screen.getByTitle("Align column left").className).not.toContain("bg-accent");
-    expect(screen.getByTitle("Align column center").className).not.toContain("bg-accent");
-    expect(screen.getByTitle("Align column right").className).not.toContain("bg-accent");
+    expect(screen.getByRole("button", { name: "Align column left" }).className).not.toContain(
+      "bg-accent",
+    );
+    expect(screen.getByRole("button", { name: "Align column center" }).className).not.toContain(
+      "bg-accent",
+    );
+    expect(screen.getByRole("button", { name: "Align column right" }).className).not.toContain(
+      "bg-accent",
+    );
   });
 });
 
@@ -159,6 +183,7 @@ describe("setColumnAlign dispatch", () => {
         dispatch: mockDispatch,
         focus: vi.fn(),
       },
+      commands: { focus: vi.fn() },
     } as unknown as Editor;
     return { editor, mockSetNodeMarkup, mockDispatch };
   }
@@ -183,11 +208,54 @@ describe("setColumnAlign dispatch", () => {
     } as unknown as ReturnType<typeof TableMap.get>);
   });
 
+  it("keeps the alignment controls reachable from the ⋯ menu in a narrow toolbar", () => {
+    class StubResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+    // jsdom has no layout: a 212px row with 28px items folds the table group.
+    const rectSpy = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: HTMLElement) {
+        let width = 0;
+        if (this.getAttribute("role") === "toolbar") width = 212;
+        else if (this.dataset.measure === "divider") width = 9;
+        else if (this.dataset.measure !== undefined) width = 28;
+        else if (this.dataset.slot === "save-status") width = 70;
+        return {
+          width,
+          height: 0,
+          top: 0,
+          left: 0,
+          right: width,
+          bottom: 0,
+          x: 0,
+          y: 0,
+          toJSON: () => ({}),
+        } as DOMRect;
+      });
+    try {
+      const { editor, mockDispatch } = makeEditorWithView();
+      renderToolbar(editor);
+      expect(screen.queryByRole("button", { name: "Align column center" })).toBeNull();
+
+      fireEvent.click(screen.getByRole("button", { name: "More formatting" }));
+      fireEvent.click(screen.getByRole("button", { name: "Align column center" }));
+
+      expect(mockDispatch).toHaveBeenCalledOnce();
+    } finally {
+      rectSpy.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("clicking 'center' dispatches one transaction updating both column cells", () => {
     const { editor, mockSetNodeMarkup, mockDispatch } = makeEditorWithView();
     renderToolbar(editor);
 
-    fireEvent.click(screen.getByTitle("Align column center"));
+    fireEvent.click(screen.getByRole("button", { name: "Align column center" }));
 
     // One dispatch call carrying the built transaction.
     expect(mockDispatch).toHaveBeenCalledOnce();
@@ -200,7 +268,7 @@ describe("setColumnAlign dispatch", () => {
     const { editor, mockSetNodeMarkup, mockDispatch } = makeEditorWithView();
     renderToolbar(editor);
 
-    fireEvent.click(screen.getByTitle("Align column right"));
+    fireEvent.click(screen.getByRole("button", { name: "Align column right" }));
 
     expect(mockDispatch).toHaveBeenCalledOnce();
     expect(mockSetNodeMarkup).toHaveBeenCalledWith(5, null, { align: "right" });
@@ -211,7 +279,7 @@ describe("setColumnAlign dispatch", () => {
     const { editor, mockSetNodeMarkup, mockDispatch } = makeEditorWithView();
     renderToolbar(editor);
 
-    fireEvent.click(screen.getByTitle("Align column left"));
+    fireEvent.click(screen.getByRole("button", { name: "Align column left" }));
 
     expect(mockDispatch).toHaveBeenCalledOnce();
     expect(mockSetNodeMarkup).toHaveBeenCalledWith(5, null, { align: "left" });
@@ -230,7 +298,7 @@ describe("setColumnAlign dispatch", () => {
     const { editor, mockSetNodeMarkup, mockDispatch } = makeEditorWithView();
     renderToolbar(editor);
 
-    fireEvent.click(screen.getByTitle("Align column center"));
+    fireEvent.click(screen.getByRole("button", { name: "Align column center" }));
 
     // No cells changed — neither setNodeMarkup nor dispatch should be called,
     // avoiding a no-op history entry in the editor.
@@ -243,7 +311,7 @@ describe("setColumnAlign dispatch", () => {
     const { editor, mockDispatch } = makeEditorWithView();
     renderToolbar(editor);
 
-    fireEvent.click(screen.getByTitle("Align column left"));
+    fireEvent.click(screen.getByRole("button", { name: "Align column left" }));
 
     expect(mockDispatch).not.toHaveBeenCalled();
   });
@@ -253,7 +321,7 @@ describe("setColumnAlign dispatch", () => {
     const { editor, mockDispatch } = makeEditorWithView();
     renderToolbar(editor);
 
-    fireEvent.click(screen.getByTitle("Align column center"));
+    fireEvent.click(screen.getByRole("button", { name: "Align column center" }));
 
     expect(mockDispatch).not.toHaveBeenCalled();
   });

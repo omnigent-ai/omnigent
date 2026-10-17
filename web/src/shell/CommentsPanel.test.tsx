@@ -6,12 +6,14 @@
 //   3. Link button appears for addressed comments too (after switching the tab).
 //   4. No link button is rendered when onCopyCommentLink is omitted.
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Comment } from "@/hooks/useComments";
 import { getCurrentAuthorId } from "@/lib/identity";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { CommentsPanel } from "./CommentsPanel";
+import { resetCommentsSizeStoreForTesting } from "@/hooks/useResizableCommentsPanel";
+import { readPanelSizePreference } from "@/lib/panelSizePreferences";
 
 // CommentsPanel reads the current user's identity (getCurrentAuthorId) to
 // decide whose comments expose Edit/Delete. Mock it so author-ownership tests
@@ -404,33 +406,177 @@ describe("CommentsPanel show more / less", () => {
   });
 });
 
-// ── Resize affordance (desktop-only width handle) ───────────────────────────
+// ── Resize affordance (width handle beside the viewer, height handle under it) ──
 //
-// The panel is resizable on desktop via a left-edge drag handle, and stacks
-// full-width (no inline width, no handle) on a narrow/mobile viewport. Desktop
-// vs mobile is decided from window.innerWidth (jsdom defaults to 1024 ≥ md).
+// Parent-row size, not viewport size, controls the handle's axis and limits.
+
+const rows: HTMLElement[] = [];
+afterEach(() => rows.splice(0).forEach((row) => row.remove()));
+
+/** Render the panel inside a parent row whose pixel size the arguments report. */
+function renderPanelInRow(rowWidth: number | (() => number), rowHeight = 600) {
+  const width = typeof rowWidth === "function" ? rowWidth : () => rowWidth;
+  const row = document.createElement("div");
+  rows.push(row);
+  row.getBoundingClientRect = () =>
+    ({
+      width: width(),
+      height: rowHeight,
+      top: 0,
+      left: 0,
+      right: width(),
+      bottom: rowHeight,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    }) as DOMRect;
+  document.body.appendChild(row);
+  return render(
+    <CommentsPanel
+      comments={[makeComment("c1")]}
+      addressedComments={[]}
+      activeSelection={null}
+      onAddComment={vi.fn()}
+      onAddressAll={vi.fn()}
+      onEditComment={vi.fn()}
+      onDeleteComment={vi.fn()}
+      onClickComment={vi.fn()}
+      canAddress={false}
+      addressPending={false}
+    />,
+    { container: row },
+  );
+}
 
 describe("CommentsPanel resize affordance", () => {
-  it("renders a resize handle and applies an inline width on desktop", () => {
-    renderPanel([makeComment("c1")], []);
-
-    // The separator is the drag handle; its parent is the panel root, which
-    // gets an explicit pixel width (default 240px) so it can be dragged wider.
-    const handle = screen.getByRole("separator", { name: "Resize comments panel" });
-    expect((handle.parentElement as HTMLElement).style.width).toBe("240px");
+  afterEach(() => {
+    window.localStorage.clear();
+    resetCommentsSizeStoreForTesting();
   });
 
-  it("omits the handle and inline width on a narrow (mobile) viewport", () => {
-    const orig = window.innerWidth;
-    Object.defineProperty(window, "innerWidth", { configurable: true, value: 500 });
+  it("renders a resize handle and exposes the side-by-side width beside a wide viewer row", () => {
+    renderPanelInRow(800);
+
+    // The separator is the drag handle; its parent is the panel root, which
+    // carries the side-by-side width (default 240px) as a CSS variable that
+    // the container query applies only beside the viewer.
+    const handle = screen.getByRole("separator", { name: "Resize comments panel" });
+    expect(handle.getAttribute("aria-orientation")).toBe("vertical");
+    const panel = handle.parentElement as HTMLElement;
+    expect(panel.style.getPropertyValue("--comments-panel-width")).toBe("240px");
+    expect(panel.style.width).toBe("");
+  });
+
+  it("shrinks the default width so a tight viewer row keeps 240px for the viewer", () => {
+    // 472px row - 240px viewer minimum = 232px for the panel.
+    renderPanelInRow(472);
+    const handle = screen.getByRole("separator", { name: "Resize comments panel" });
+    const panel = handle.parentElement as HTMLElement;
+    expect(panel.style.getPropertyValue("--comments-panel-width")).toBe("232px");
+  });
+
+  it("turns the handle into a height handle when the panel stacks under a narrow row", () => {
+    renderPanelInRow(220);
+    const handle = screen.getByRole("separator", { name: "Resize comments panel" });
+    expect(handle.getAttribute("aria-orientation")).toBe("horizontal");
+    const panel = handle.parentElement as HTMLElement;
+    const height = () => panel.style.getPropertyValue("--comments-panel-height");
+    expect(height()).toBe("256px");
+
+    // Up/Down arrows change the stacked height and persist the choice.
+    fireEvent.keyDown(handle, { key: "ArrowUp" });
+    expect(height()).toBe("276px");
+    expect(readPanelSizePreference("commentsPanelHeightPx")).toBe(276);
+    fireEvent.keyDown(handle, { key: "ArrowDown" });
+    fireEvent.keyDown(handle, { key: "ArrowDown" });
+    expect(height()).toBe("236px");
+    expect(readPanelSizePreference("commentsPanelWidthPx")).toBeNull();
+  });
+
+  it("caps the stacked height so the viewer keeps 160px above the panel", () => {
+    // 360px row - 160px viewer minimum = 200px for the panel.
+    renderPanelInRow(220, 360);
+    const handle = screen.getByRole("separator", { name: "Resize comments panel" });
+    const panel = handle.parentElement as HTMLElement;
+    expect(panel.style.getPropertyValue("--comments-panel-height")).toBe("200px");
+  });
+
+  it("drags the stacked panel's top edge to change its height", () => {
+    renderPanelInRow(220);
+    const handle = screen.getByRole("separator", { name: "Resize comments panel" });
+    const panel = handle.parentElement as HTMLElement;
+    panel.getBoundingClientRect = () =>
+      ({
+        x: 0,
+        y: 344,
+        top: 344,
+        left: 0,
+        right: 220,
+        bottom: 600,
+        width: 220,
+        height: 256,
+        toJSON: () => ({}),
+      }) as DOMRect;
+
+    fireEvent.mouseDown(handle);
+    act(() => {
+      window.dispatchEvent(new MouseEvent("mousemove", { clientY: 300 }));
+    });
+    // The handle is the panel's top edge: height = panel bottom - pointer y.
+    expect(panel.style.getPropertyValue("--comments-panel-height")).toBe("300px");
+    act(() => window.dispatchEvent(new MouseEvent("mouseup")));
+    expect(readPanelSizePreference("commentsPanelHeightPx")).toBe(300);
+  });
+
+  it("follows the row across the breakpoint and restores the preferred width", () => {
+    const observers: ResizeObserverCallback[] = [];
+    class StubResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        observers.push(callback);
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", StubResizeObserver);
+    let rowWidth = 800;
     try {
-      renderPanel([makeComment("c1")], []);
-      // No drag handle, and the panel falls back to the w-full class (no inline width).
-      expect(screen.queryByRole("separator", { name: "Resize comments panel" })).toBeNull();
-      const panel = screen.getByText("Comments").closest("div")?.parentElement as HTMLElement;
-      expect(panel.style.width).toBe("");
+      renderPanelInRow(() => rowWidth);
+      const handle = () => screen.getByRole("separator", { name: "Resize comments panel" });
+      const orientation = () => handle().getAttribute("aria-orientation");
+      const panel = handle().parentElement as HTMLElement;
+      const width = () => panel.style.getPropertyValue("--comments-panel-width");
+      expect(orientation()).toBe("vertical");
+      expect(width()).toBe("240px");
+
+      // The user widens the panel by one keyboard step; that choice persists.
+      fireEvent.keyDown(handle(), { key: "ArrowLeft" });
+      expect(width()).toBe("260px");
+
+      // The rail shrinks below the breakpoint: the panel stacks, the handle
+      // becomes a height handle and the width clamps to the floor.
+      rowWidth = 300;
+      act(() => observers.forEach((cb) => cb([], {} as ResizeObserver)));
+      expect(orientation()).toBe("horizontal");
+      expect(width()).toBe("200px");
+
+      // The 28rem (448px) boundary shared with the container query.
+      rowWidth = 447;
+      act(() => observers.forEach((cb) => cb([], {} as ResizeObserver)));
+      expect(orientation()).toBe("horizontal");
+      expect(width()).toBe("207px");
+      rowWidth = 448;
+      act(() => observers.forEach((cb) => cb([], {} as ResizeObserver)));
+      expect(orientation()).toBe("vertical");
+      expect(width()).toBe("208px");
+
+      // Space returns: the saved choice, not the default, is restored.
+      rowWidth = 800;
+      act(() => observers.forEach((cb) => cb([], {} as ResizeObserver)));
+      expect(orientation()).toBe("vertical");
+      expect(width()).toBe("260px");
     } finally {
-      Object.defineProperty(window, "innerWidth", { configurable: true, value: orig });
+      vi.unstubAllGlobals();
     }
   });
 });
