@@ -78,6 +78,7 @@ from omnigent.harnesses.diagnostics import (
     sign_in_running_elsewhere,
 )
 from omnigent.harnesses.kiro_native import bridge as kiro_bridge
+from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import FailureContext
@@ -9226,7 +9227,8 @@ _CONTEXT_OVERFLOW_REPLACEMENT = (
 # web chat, where ``/login`` is a dropped command: it is escaped into
 # plain text and answered by the same expired session with the same
 # line. These records get guidance APPENDED sending the user to
-# ``omni setup`` on the host, which does re-authenticate.
+# ``omni setup`` on the host, which does re-authenticate — or, on a
+# managed sandbox that cannot run it, to a new session.
 #
 # The strings are hardcoded constants in the CLI binary (read out of
 # @anthropic-ai/claude-code 2.1.212), and there is more than one shape:
@@ -9275,6 +9277,21 @@ _LOGIN_GUIDANCE = (
     "`/login` is not available from the Omnigent web chat — run "
     "`omni setup` on the host to sign in again."
 )
+# Shared with the executor's /login short-circuit so the two surfaces cannot
+# drift apart; a new session is the only self-service step on a managed sandbox.
+MANAGED_SANDBOX_SIGN_IN_REMEDY = (
+    "This sandbox received its sign-in credentials at launch. Start a new "
+    "session; if sign-in still fails, ask the sandbox administrator to refresh "
+    "its credentials."
+)
+_LOGIN_GUIDANCE_MANAGED_SANDBOX = (
+    "`/login` is not available from the Omnigent web chat. " + MANAGED_SANDBOX_SIGN_IN_REMEDY
+)
+
+
+def _login_guidance() -> str:
+    """Return the ``/login`` remedy the user can perform where the session runs."""
+    return _LOGIN_GUIDANCE_MANAGED_SANDBOX if in_managed_sandbox() else _LOGIN_GUIDANCE
 
 
 def _is_api_error_entry(entry: _JsonObject) -> bool:
@@ -9353,7 +9370,7 @@ def _display_text(text: str, *, is_api_error: bool) -> str:
     if _CONTEXT_OVERFLOW_RE.match(stripped):
         return _CONTEXT_OVERFLOW_REPLACEMENT
     if is_api_error and _LOGIN_COMMAND_RE.search(stripped):
-        return f"{text.rstrip()}\n\n{_LOGIN_GUIDANCE}"
+        return f"{text.rstrip()}\n\n{_login_guidance()}"
     return text
 
 

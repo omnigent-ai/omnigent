@@ -67,6 +67,7 @@ from typing import Any
 from urllib.parse import quote
 
 from omnigent import config as _config
+from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.runner import pr_resource
 from omnigent.runner.git_providers import local_git
 from omnigent.runner.session_prs import PullRequestRef
@@ -161,7 +162,7 @@ def _git(argv: list[str], *, cwd: str) -> tuple[int | None, str, str]:
 
 def _in_sandbox() -> bool:
     """Whether the panel is running inside a managed sandbox (``IS_SANDBOX=1``)."""
-    return (os.environ.get("IS_SANDBOX") or "").strip() == "1"
+    return in_managed_sandbox()
 
 
 def _gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int | None, str, str]:
