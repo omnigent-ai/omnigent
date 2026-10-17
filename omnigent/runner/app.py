@@ -4877,16 +4877,25 @@ def create_runner_app(
                 # error event) is never shadowed by the generic except below.
                 raise
             except asyncio.CancelledError as exc:
-                _logger.error(
-                    "turn cancelled for %s: %s",
-                    conv,
-                    exc,
-                    exc_info=True,
-                    extra={"session_id": conv},
-                )
-                _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+                if _active_turns.get(conv) is _own_task:
+                    _logger.error(
+                        "turn cancelled for %s: %s",
+                        conv,
+                        exc,
+                        exc_info=True,
+                        extra={"session_id": conv},
+                    )
+                    _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
                 raise
             except Exception as exc:
+                if _active_turns.get(conv) is not _own_task:
+                    _logger.warning(
+                        "Ignoring failure from a superseded background turn for %s",
+                        conv,
+                        exc_info=True,
+                        extra={"session_id": conv},
+                    )
+                    return
                 _logger.error(
                     "turn setup failed for %s: %s",
                     conv,
