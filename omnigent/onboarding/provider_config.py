@@ -47,6 +47,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Literal
 
 from omnigent.cli_invocation import cli_invocation
@@ -529,7 +530,7 @@ class ResolvedCredential:
 def resolve_secret(ref: str) -> str:
     """Resolve a secret *ref* into its plaintext value, failing loud.
 
-    Accepts three shapes:
+    Accepts four shapes:
 
     - ``"env:<VAR>"`` — read ``<VAR>`` from the environment.
     - a bare inline ``$VAR`` / ``${VAR}`` reference — expanded via
@@ -538,13 +539,20 @@ def resolve_secret(ref: str) -> str:
       store (OS keychain, else a ``0600`` JSON file). The store is
       populated by ``omnigent setup --no-internal-beta`` — see
       :mod:`omnigent.onboarding.secrets`.
+    - ``"file:<path>"`` — read the secret from a host-owned file. ``~`` and
+      ``$VAR`` in the path are expanded; the path must be absolute and name
+      an existing regular file. This keeps the secret out of the config and
+      the process environment — only the path travels — so a host can carry a
+      credential in a ``0600`` file rather than an inline value.
 
     :param ref: The secret reference, e.g. ``"env:OPENROUTER_API_KEY"``,
-        ``"$ANTHROPIC_API_KEY"``, or ``"keychain:anthropic"``.
+        ``"$ANTHROPIC_API_KEY"``, ``"keychain:anthropic"``, or
+        ``"file:/etc/omnigent/secret"``.
     :returns: The resolved secret value, e.g. ``"sk-or-..."``.
     :raises OmnigentError: If an ``env:`` / ``$VAR`` reference names an
-        unset environment variable, or a ``keychain:`` reference names a
-        secret that is not stored.
+        unset environment variable, a ``keychain:`` reference names a
+        secret that is not stored, or a ``file:`` reference names a path
+        that is not an absolute readable non-empty regular file.
     """
     if ref.startswith("keychain:"):
         name = ref[len("keychain:") :]
@@ -576,6 +584,38 @@ def resolve_secret(ref: str) -> str:
         # newline (e.g. ``export KEY=$(cat file)``) must not be forwarded
         # verbatim to a harness/SDK, where the padding fails auth.
         return value.strip()
+    if ref.startswith("file:"):
+        raw_path = ref[len("file:") :]
+        expanded_path = os.path.expanduser(expand_envvars_with_omnigent_prefix(raw_path))
+        check_unresolved_env_vars(raw_path, expanded_path)
+        # Errors name the path, never the file's contents: a leaked message
+        # must not disclose the secret it was trying to load.
+        if not os.path.isabs(expanded_path):
+            raise OmnigentError(
+                f"'file:' secret reference must be an absolute path, got {expanded_path!r}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if not os.path.isfile(expanded_path):
+            raise OmnigentError(
+                f"'file:' secret reference {expanded_path!r} is not an existing regular file.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        try:
+            contents = Path(expanded_path).read_text()
+        except OSError as exc:
+            raise OmnigentError(
+                f"Could not read 'file:' secret reference {expanded_path!r}: {exc.strerror}.",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        # Strip like env: — a trailing newline in the key file must not reach
+        # the SDK verbatim, where the padding fails auth.
+        value = contents.strip()
+        if not value:
+            raise OmnigentError(
+                f"'file:' secret reference {expanded_path!r} is empty.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        return value
     # Bare inline reference, e.g. "$ANTHROPIC_API_KEY" or a literal value.
     expanded = expand_envvars_with_omnigent_prefix(ref)
     check_unresolved_env_vars(ref, expanded)

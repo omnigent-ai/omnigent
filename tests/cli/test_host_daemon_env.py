@@ -539,3 +539,27 @@ def test_gemini_gateway_survives_local_daemon_and_runner(monkeypatch, tmp_path) 
     for env in (daemon, runner):
         assert env["GEMINI_API_KEY"] == "fake-gateway-key"
         assert env["GOOGLE_GEMINI_BASE_URL"] == "https://gateway.example/gemini"
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_hindsight_key_file_path_reaches_daemon_and_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """HINDSIGHT_API_KEY_FILE (a path) survives host->daemon->runner in both
+    local and remote modes, so memory tools can read the host-owned key file."""
+    key_path = "/home/alice/.config/hindsight-repo/api-key"
+    monkeypatch.setenv("HINDSIGHT_API_KEY_FILE", key_path)
+
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    runner_env = _build_runner_env(
+        daemon_env,
+        server_url=_REMOTE_SERVER_URL,
+        runner_id="runner_hindsight",
+        binding_token="binding-hindsight",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    assert daemon_env["HINDSIGHT_API_KEY_FILE"] == key_path
+    assert runner_env["HINDSIGHT_API_KEY_FILE"] == key_path
