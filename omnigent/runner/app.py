@@ -205,6 +205,8 @@ from omnigent.runtime.prompt import (
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
+    RoutingJudgeRequest,
+    RoutingJudgeResponse,
 )
 from omnigent.spec.skill_sources import resolve_session_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
@@ -2249,25 +2251,37 @@ def create_runner_app(
     async def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.post(
-        "/v1/sessions/{conversation_id}/background-title",
-        response_model=BackgroundSessionTitleResponse,
-    )
-    async def generate_background_session_title(
+    async def _isolated_generation_context(
         conversation_id: str,
-        body: BackgroundSessionTitleRequest,
-    ) -> BackgroundSessionTitleResponse | JSONResponse:
+        *,
+        prompt: str,
+        agent_id: str | None = None,
+        model_override: str | None = None,
+        harness_override: str | None = None,
+        sub_agent_name: str | None = None,
+        additional_instructions: str | None = None,
+        instructions: str | None = None,
+        economy_only: bool = False,
+    ) -> BackgroundTitleContext | JSONResponse | None:
+        """Resolve the session's harness into an isolated one-shot generation context.
+
+        Shared by background titles and the Smart Routing host judge: both run
+        the session's own CLI on its economy model with no tools.
+
+        :returns: The context, ``None`` when the harness has no isolated
+            generator, or a 503 response when the spec could not be resolved.
+        """
         if process_manager is None:
             return JSONResponse(
                 status_code=501,
                 content={
                     "error": "not_implemented",
-                    "detail": "Background titles require a HarnessProcessManager.",
+                    "detail": "Isolated generation requires a HarnessProcessManager.",
                 },
             )
 
-        sub_agent_name = body.sub_agent_name or await _recover_sub_agent_name(conversation_id)
-        resolver_agent_id = body.agent_id or _session_agent_ids.get(conversation_id)
+        sub_agent_name = sub_agent_name or await _recover_sub_agent_name(conversation_id)
+        resolver_agent_id = agent_id or _session_agent_ids.get(conversation_id)
         resolver_cwd = await _session_runtime_cwd(conversation_id)
         try:
             effective_harness, spawn_env = await _resolve_harness_config(
@@ -2275,14 +2289,14 @@ def create_runner_app(
                 agent_id=resolver_agent_id,
                 spec_resolver=spec_resolver,
                 session_id=conversation_id,
-                model_override=body.model_override,
-                harness_override=body.harness_override,
+                model_override=model_override,
+                harness_override=harness_override,
                 sub_agent_name=sub_agent_name,
                 cwd=resolver_cwd,
             )
             generator_spec = generator_spec_for_harness(effective_harness)
             if generator_spec is None:
-                return BackgroundSessionTitleResponse(status="unsupported")
+                return None
             resolver_harness = generator_spec.resolver_harness or effective_harness
             if resolver_harness != effective_harness:
                 resolved_harness, spawn_env = await _resolve_harness_config(
@@ -2290,13 +2304,13 @@ def create_runner_app(
                     agent_id=resolver_agent_id,
                     spec_resolver=spec_resolver,
                     session_id=conversation_id,
-                    model_override=body.model_override,
+                    model_override=model_override,
                     harness_override=resolver_harness,
                     sub_agent_name=sub_agent_name,
                     cwd=resolver_cwd,
                 )
                 if resolved_harness != resolver_harness:
-                    return BackgroundSessionTitleResponse(status="unsupported")
+                    return None
         except (httpx.HTTPError, RuntimeError) as exc:
             return JSONResponse(
                 status_code=503,
@@ -2306,16 +2320,40 @@ def create_runner_app(
                 },
             )
 
-        context = BackgroundTitleContext(
-            prompt=body.prompt[:BACKGROUND_TITLE_MAX_PROMPT_CHARS],
+        return BackgroundTitleContext(
+            prompt=prompt,
             harness=effective_harness,
             spawn_env=dict(spawn_env or {}),
             process_manager=process_manager,
             cwd=resolver_cwd,
-            model_override=body.model_override,
+            model_override=model_override,
             session_spec=_unwrap_spec_entry(_session_spec_cache.get(conversation_id)),
+            additional_instructions=additional_instructions,
+            instructions=instructions,
+            economy_only=economy_only,
+        )
+
+    @app.post(
+        "/v1/sessions/{conversation_id}/background-title",
+        response_model=BackgroundSessionTitleResponse,
+    )
+    async def generate_background_session_title(
+        conversation_id: str,
+        body: BackgroundSessionTitleRequest,
+    ) -> BackgroundSessionTitleResponse | JSONResponse:
+        context = await _isolated_generation_context(
+            conversation_id,
+            prompt=body.prompt[:BACKGROUND_TITLE_MAX_PROMPT_CHARS],
+            agent_id=body.agent_id,
+            model_override=body.model_override,
+            harness_override=body.harness_override,
+            sub_agent_name=body.sub_agent_name,
             additional_instructions=body.additional_instructions,
         )
+        if context is None:
+            return BackgroundSessionTitleResponse(status="unsupported")
+        if isinstance(context, JSONResponse):
+            return context
         try:
             title = await run_background_title(context)
         except TimeoutError:
@@ -2352,6 +2390,58 @@ def create_runner_app(
             status="generated",
             title=" ".join(title.split()),
         )
+
+    @app.post(
+        "/v1/sessions/{conversation_id}/routing-judge",
+        response_model=RoutingJudgeResponse,
+    )
+    async def judge_routing_rubric(
+        conversation_id: str,
+        body: RoutingJudgeRequest,
+    ) -> RoutingJudgeResponse | JSONResponse:
+        """Answer a Smart Routing rubric with this host's own logged-in CLI.
+
+        The server sends only the rubric and the task text; the CLI runs with
+        the host's credentials, which never leave this process. Only the
+        verdict text is returned.
+        """
+        context = await _isolated_generation_context(
+            conversation_id,
+            prompt=body.message,
+            instructions=body.instructions,
+            economy_only=True,
+        )
+        if context is None:
+            return RoutingJudgeResponse(status="unsupported")
+        if isinstance(context, JSONResponse):
+            return context
+        try:
+            # Bounded here too: the server gives up at the same budget, and a
+            # cancelled generation kills its CLI process instead of leaking it.
+            async with asyncio.timeout(body.timeout_s):
+                text = await run_background_title(context)
+        except TimeoutError:
+            return JSONResponse(
+                status_code=504,
+                content={"error": "routing_judge_timeout", "detail": "Host judge timed out."},
+            )
+        except (BackgroundTitleHarnessError, ImportError, OSError, RuntimeError) as exc:
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error": "routing_judge_failed",
+                    "detail": _client_safe_error_detail(exc, context="routing judge"),
+                },
+            )
+        if not text:
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "error": "routing_judge_failed",
+                    "detail": "Host judge returned no text.",
+                },
+            )
+        return RoutingJudgeResponse(status="judged", text=text)
 
     async def _initialize_session(body: _JsonObject) -> JSONResponse:
         from omnigent.runner.session_init_protocol import RunnerInferenceConfigMismatch

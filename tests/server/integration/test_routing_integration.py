@@ -343,6 +343,55 @@ async def test_the_subagent_relay_falls_back_to_the_judge_off_the_gateway(
     assert decisions[-1].data.router_source == "oss-llm"
 
 
+async def test_the_subagent_relay_asks_the_parents_host_when_the_judge_is_host_side(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``routing.provider: host``: the spawn is judged by the parent's own runner."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.smart_routing import HostRoutingClient
+
+    parent, _child, conv_store = await _parent_and_child(
+        client, db_uri, agent_name="routing-subagent-host-judge"
+    )
+    asked: list[str] = []
+
+    def runner(request: httpx.Request) -> httpx.Response:
+        if not request.url.path.endswith("/routing-judge"):
+            return httpx.Response(200, json={"workers": {}})
+        asked.append(request.url.path)
+        verdict = {"harness": "claude-native", "model": ROUTED_MODEL, "rationale": "host"}
+        return httpx.Response(200, json={"status": "judged", "text": json.dumps(verdict)})
+
+    runner_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(runner), base_url="http://runner"
+    )
+    with (
+        patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=HostRoutingClient())),
+        patch.object(sessions_module, "_get_runner_client", AsyncMock(return_value=runner_client)),
+        patch.object(
+            subagent_routing,
+            "candidate_models",
+            lambda harness, **kwargs: {harness: [LLM_PICKED_MODEL, ROUTED_MODEL]},
+        ),
+    ):
+        resp = await client.post(
+            f"/v1/sessions/{parent['id']}/hooks/route-subagent",
+            json={
+                "harness": "claude-native",
+                "task_name": "code-reviewer",
+                "prompt": "review the auth module",
+                "parent_model": LLM_PICKED_MODEL,
+            },
+        )
+    await runner_client.aclose()
+
+    assert resp.status_code == 200, resp.text
+    assert asked == [f"/v1/sessions/{parent['id']}/routing-judge"]
+    assert resp.json()["router_source"] == "oss-llm"
+    assert _routing_decisions(conv_store, parent["id"])[-1].data.router_source == "oss-llm"
+
+
 async def test_native_subagent_relay_persists_decision_and_joins_child_row(
     client: httpx.AsyncClient,
     db_uri: str,

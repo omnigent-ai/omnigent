@@ -143,6 +143,23 @@ class BackgroundTitleContext:
     # Set by the dispatch layer to pin the generation onto the harness's
     # economy tier; generators prefer it over every other model source.
     title_model: str | None = None
+    # Replaces the title prompt for another isolated one-shot judgment on the
+    # same economy model, e.g. the Smart Routing host judge's rubric.
+    instructions: str | None = None
+    # Run on the economy model only, never retrying on the session's own
+    # (possibly premium) model; the routing judge sets this and fails open.
+    economy_only: bool = False
+
+
+def generation_instructions(context: BackgroundTitleContext) -> str:
+    """Return the system instructions an isolated generator should send.
+
+    :param context: The resolved generation inputs.
+    :returns: ``context.instructions`` when set, else the title prompt.
+    """
+    return context.instructions or build_background_title_instructions(
+        context.additional_instructions
+    )
 
 
 class BackgroundTitleGenerator(Protocol):
@@ -176,6 +193,11 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         raise RuntimeError(f"background title generator {spec.generator!r} is not callable")
     typed_generator = cast(BackgroundTitleGenerator, generator)
     title_model = background_title_model(context.harness)
+    if context.economy_only:
+        economy_model = context.title_model or title_model
+        if economy_model is None:
+            return None
+        return await typed_generator(replace(context, title_model=economy_model))
     if title_model is not None and context.title_model is None:
         try:
             title = await typed_generator(replace(context, title_model=title_model))

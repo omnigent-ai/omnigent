@@ -525,6 +525,8 @@ async def test_claude_native_title_uses_tool_free_print_mode(
     assert "--no-session-persistence" in args
     assert captured["kwargs"]["cwd"] == str(tmp_path)
     assert "CLAUDECODE" not in captured["kwargs"]["env"]
+    # Print mode waits ~3s on an inherited stdin pipe before it starts.
+    assert captured["kwargs"]["stdin"] == asyncio.subprocess.DEVNULL
 
 
 @pytest.mark.asyncio
@@ -1171,6 +1173,45 @@ async def test_background_title_dispatch_retries_with_session_model_after_econom
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("economy_fails_by", ["raising", "returning_none"])
+async def test_economy_only_dispatch_never_retries_on_the_session_model(
+    monkeypatch: pytest.MonkeyPatch,
+    economy_fails_by: str,
+) -> None:
+    """The routing judge's path: a failed economy call is the answer, not a retry."""
+    attempted_models: list[str | None] = []
+
+    async def generate_title(context: BackgroundTitleContext) -> str | None:
+        attempted_models.append(context.title_model)
+        if economy_fails_by == "raising":
+            raise RuntimeError("not logged in")
+        return None
+
+    _register_fake_title_generator(monkeypatch, "claude-native", generate_title)
+    context = _title_context("claude-native", economy_only=True)
+
+    if economy_fails_by == "raising":
+        with pytest.raises(RuntimeError):
+            await title_service.generate_background_title(context)
+    else:
+        assert await title_service.generate_background_title(context) is None
+    assert attempted_models == ["haiku"]
+
+
+@pytest.mark.asyncio
+async def test_economy_only_dispatch_skips_a_harness_with_no_economy_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def generate_title(context: BackgroundTitleContext) -> str:
+        raise AssertionError("the session model must not run")
+
+    _register_fake_title_generator(monkeypatch, "pi", generate_title)
+
+    context = _title_context("pi", economy_only=True)
+    assert await title_service.generate_background_title(context) is None
+
+
+@pytest.mark.asyncio
 async def test_background_title_dispatch_retries_after_empty_economy_title(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1399,3 +1440,157 @@ async def test_background_title_timeout_releases_process(
     assert response.json()["error"] == "title_harness_timeout"
     [process_key] = process_manager.released
     assert uuid.UUID(process_key).hex == process_key
+
+
+# ── Smart Routing host judge (POST /routing-judge) ──────────────────
+
+
+def _judge_app(
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    generator: Any,  # type: ignore[explicit-any]
+):
+    async def resolve_harness_config(**kwargs: Any) -> tuple[str, None]:
+        # claude-native resolves its env through claude-sdk (resolver_harness).
+        return kwargs["harness_override"] or harness, None
+
+    monkeypatch.setattr("omnigent.runner.app._resolve_harness_config", resolve_harness_config)
+    monkeypatch.setattr(
+        "omnigent.runner.background_titles.claude_native.generate_background_title", generator
+    )
+    return create_runner_app(
+        process_manager=_FakeProcessManager(_FakeHarnessClient()),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.asyncio
+async def test_routing_judge_answers_the_rubric_with_the_sessions_own_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[BackgroundTitleContext] = []
+
+    async def generate(context: BackgroundTitleContext) -> str:
+        seen.append(context)
+        return '{"harness": "claude-native", "model": "claude-haiku-4-5", "rationale": "r"}'
+
+    app = _judge_app(monkeypatch, "claude-native", generate)
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions/conv_test/routing-judge",
+            json={"message": "what does git stash pop do?", "instructions": "RUBRIC"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "judged",
+        "text": '{"harness": "claude-native", "model": "claude-haiku-4-5", "rationale": "r"}',
+    }
+    [context] = seen
+    assert (context.prompt, context.instructions) == ("what does git stash pop do?", "RUBRIC")
+    # The economy model is pinned by the shared dispatch, not the caller.
+    assert context.title_model == background_title_model("claude-native")
+    assert context.economy_only
+
+
+@pytest.mark.asyncio
+async def test_routing_judge_reports_an_unsupported_harness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def generate(context: BackgroundTitleContext) -> str:
+        raise AssertionError("no CLI should run for an unsupported harness")
+
+    app = _judge_app(monkeypatch, "pi", generate)
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions/conv_test/routing-judge",
+            json={"message": "task", "instructions": "RUBRIC"},
+        )
+    assert response.status_code == 200
+    assert response.json() == {"status": "unsupported", "text": None}
+
+
+@pytest.mark.asyncio
+async def test_routing_judge_fails_when_the_cli_gives_no_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLI missing or not logged in: the generator returns ``None`` (stderr stays in the log)."""
+
+    async def generate(context: BackgroundTitleContext) -> None:
+        del context
+
+    app = _judge_app(monkeypatch, "claude-native", generate)
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions/conv_test/routing-judge",
+            json={"message": "task", "instructions": "RUBRIC"},
+        )
+    assert response.status_code == 502
+    assert response.json()["error"] == "routing_judge_failed"
+
+
+@pytest.mark.asyncio
+async def test_routing_judge_cancels_the_cli_at_its_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancelled = asyncio.Event()
+
+    async def generate(context: BackgroundTitleContext) -> str:
+        del context
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return "{}"
+
+    app = _judge_app(monkeypatch, "claude-native", generate)
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions/conv_test/routing-judge",
+            json={"message": "task", "instructions": "RUBRIC", "timeout_s": 0.1},
+        )
+    assert response.status_code == 504
+    assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_generator_sends_override_instructions_as_system_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b'{"model": "m"}', b""
+
+    async def create_subprocess_exec(command: str, *args: str, **kwargs: Any) -> FakeProcess:
+        captured.update(args=args)
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_native_claude_config",
+        lambda spec=None: None,
+    )
+    monkeypatch.setattr(
+        "omnigent.claude_launcher.resolve_claude_launch", lambda command, args: (command, args)
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
+
+    text = await claude_native_titles.generate_background_title(
+        BackgroundTitleContext(
+            prompt="task",
+            harness="claude-native",
+            spawn_env={},
+            process_manager=None,
+            title_model="haiku",
+            instructions="RUBRIC",
+        )
+    )
+
+    assert text == '{"model": "m"}'
+    args = list(captured["args"])
+    assert args[args.index("--system-prompt") + 1] == "RUBRIC"
+    assert args[args.index("--model") + 1] == "haiku"
