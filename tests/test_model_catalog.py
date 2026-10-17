@@ -258,7 +258,21 @@ def test_managed_claude_settings_require_gateway_and_credential(
                 "name": "ollama",
                 "host": "localhost:11434",
             },
-            id="local",
+            id="local-ollama",
+        ),
+        pytest.param(
+            ResolvedModelProvider(
+                kind="local",
+                detail="provider 'llama-server'",
+                base_url="http://localhost:8080/v1",
+            ),
+            {
+                "kind": "local",
+                "label": "Local",
+                "name": "llama-server",
+                "host": "localhost:8080",
+            },
+            id="local-llama-server",
         ),
         pytest.param(
             ResolvedModelProvider(

@@ -2,7 +2,8 @@
 
 For open-source users who route coding agents through a non-Databricks
 endpoint (a vendor API key, a subscription CLI login, a gateway like
-OpenRouter, a local Ollama, or a Databricks profile), the ``providers:``
+OpenRouter, a local Ollama or llama-server, or a Databricks profile), the
+``providers:``
 block in ``~/.omnigent/config.yaml`` is the source of truth for the
 active model selection. Defaults are **per family**: a provider marked
 **``default: true``** is the default for the family/families it serves,
@@ -115,7 +116,8 @@ _VALID_WIRE_API = (RESPONSES_WIRE_API, CHAT_WIRE_API)
 # - ``subscription``: a logged-in CLI (``claude`` / ``codex``) — no families,
 #   no base_url; the CLI carries its own auth.
 # - ``gateway``: an OpenAI/Anthropic-compatible proxy (OpenRouter, LiteLLM).
-# - ``local``: a self-hosted endpoint (Ollama, vLLM) reached via families.
+# - ``local``: a self-hosted endpoint (Ollama, llama-server, vLLM)
+#   reached via families.
 # - ``databricks``: a Databricks profile from ``~/.databrickscfg``.
 # - ``cli-config``: a custom model provider the harness CLI's own config
 #   file defines and authenticates (today: a ``[model_providers.X]`` table
@@ -295,8 +297,10 @@ class FamilyConfig:
     active harness does not consume never forces its secret to exist.
 
     :param base_url: Endpoint base URL the harness talks to, e.g.
-        ``"https://openrouter.ai/api/v1"`` (a gateway) or
-        ``"http://localhost:11434/v1"`` (a local Ollama). Required. As
+        ``"https://openrouter.ai/api/v1"`` (a gateway),
+        ``"http://localhost:11434/v1"`` (a local Ollama), or
+        ``"http://localhost:8080/v1"`` (a local llama-server).
+        Required. As
         stored on :attr:`Provider.families` this may still contain a raw
         ``$VAR`` reference; it is expanded by :meth:`Provider.family`.
     :param api_key: Inline static API key, possibly a ``$VAR`` reference
@@ -319,7 +323,8 @@ class FamilyConfig:
         ``default`` key consulted when the spec declares no model, e.g.
         ``{"default": "gpt-4o", "opus": "claude-opus-4"}``.
     :param pricing: Optional custom per-million-token pricing for
-        self-hosted models and gateways (e.g., Ollama, vLLM, custom endpoints).
+        self-hosted models and gateways (e.g., Ollama, llama-server, vLLM,
+        custom endpoints).
         When configured, this pricing takes precedence over catalog lookup,
         allowing self-hosted providers serving catalog-known model IDs to use
         their own rates. ``None`` (the default) means no custom pricing — falls

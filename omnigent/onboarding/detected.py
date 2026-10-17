@@ -201,9 +201,10 @@ def _synthesize_entry(det: DetectedProvider) -> dict[str, object] | None:
         )
 
     if det.kind == "local":
-        # A self-hosted OpenAI-compatible server (Ollama). ``det.source`` is
-        # the base host (e.g. ``http://localhost:11434``); append the
-        # OpenAI-compatible ``/v1`` path. The key is a placeholder the
+        # A self-hosted OpenAI-compatible server (Ollama, llama-server, …).
+        # ``det.source`` is the base host (e.g.
+        # ``http://localhost:11434`` or ``http://localhost:8080``); append
+        # the OpenAI-compatible ``/v1`` path. The key is a placeholder the
         # server ignores but the family block requires a credential source.
         base_url = det.source.rstrip("/") + "/v1"
         return {
