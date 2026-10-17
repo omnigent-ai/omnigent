@@ -121,6 +121,11 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/e2e_ui/chat/test_hidden_terminal_scrollbar.py::test_hidden_terminal_scrollbar_never_paints_over_foreground`
 - **`dialog-routing`:**
   `tests/e2e_ui/chat/test_blocked_dialog_terminal_routing.py::test_chat_blocked_on_terminal_dialog_routes_user_to_terminal`
+  (a dialog opened mid-turn, driven by an injected `blocked_on` status edge).
+  `tests/e2e_ui/messages/test_claude_native_startup_dialog_without_message.py::test_startup_dialog_is_reported_without_a_message`
+  (a startup dialog with no message sent: real Claude Code parks on "Settings
+  Error" for an invalid user settings file, and Chat shows a notice naming the
+  dialog while it stays in the terminal; needs `claude` and `tmux`).
 
 ## Gotchas
 

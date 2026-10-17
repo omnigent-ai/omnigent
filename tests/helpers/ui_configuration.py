@@ -80,6 +80,25 @@ def _validate_ui_base_url(base_url: str) -> None:
     )
 
 
+def claude_mock_provider_config(mock_llm_server_url: str) -> str:
+    """Return a ``config.yaml`` routing Claude Code's Anthropic traffic to the mock server.
+
+    :param mock_llm_server_url: The mock LLM server base URL.
+    :returns: The YAML text for a global or per-runner ``OMNIGENT_CONFIG_HOME``.
+    """
+    return textwrap.dedent(f"""\
+        providers:
+          mock-claude:
+            kind: key
+            default: [anthropic]
+            anthropic:
+              base_url: "{mock_llm_server_url}"
+              api_key: "mock-key"
+              models:
+                default: {_CLAUDE_MOCK_MODEL}
+        """)
+
+
 @contextlib.contextmanager
 def temp_omnigent_mock_config(
     mock_llm_server_url: str, harness: str, *, workflow_owned: bool = False
@@ -114,17 +133,7 @@ def temp_omnigent_mock_config(
     original = config_path.read_bytes() if config_path.exists() else None
 
     if harness == "claude":
-        mock_config = textwrap.dedent(f"""\
-            providers:
-              mock-claude:
-                kind: key
-                default: [anthropic]
-                anthropic:
-                  base_url: "{mock_llm_server_url}"
-                  api_key: "mock-key"
-                  models:
-                    default: {_CLAUDE_MOCK_MODEL}
-            """)
+        mock_config = claude_mock_provider_config(mock_llm_server_url)
     else:  # codex
         # The mock model is not in the pricing catalog; configured rates let
         # the server price codex-native sessions (Session cost, per-model cost).
