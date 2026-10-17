@@ -78,6 +78,14 @@ _CLAUDE_MODEL_CONFIRM_POLL_S = 0.25
 _CLAUDE_MODEL_LATE_DIALOG_BUDGET_S = 1200.0
 
 
+# How long a Claude model or effort switch refused by an open question or
+# permission prompt waits for the person's answer, and how often it looks.
+_CLAUDE_SETTINGS_AFTER_PROMPT_BUDGET_S = 600.0
+
+
+_CLAUDE_SETTINGS_AFTER_PROMPT_POLL_S = 1.0
+
+
 _CLAUDE_MODEL_LATE_DIALOG_POLL_S = 2.0
 
 
@@ -1119,12 +1127,77 @@ def build_native_controls(
             extra={"session_id": conv_id},
         )
 
+    # One switch per session and kind waits for a pending prompt; a newer pick replaces it.
+    _settings_after_prompt: dict[tuple[str, str], asyncio.Task[None]] = {}
+
+    def _cancel_settings_after_prompt(conv_id: str, kind: str) -> None:
+        queued = _settings_after_prompt.pop((conv_id, kind), None)
+        if queued is not None:
+            queued.cancel()
+
+    def _queue_settings_after_prompt(
+        conv_id: str,
+        kind: str,
+        bridge_dir: Path,
+        apply: Callable[[], Coroutine[Any, Any, None]],
+    ) -> None:
+        """Run ``apply`` once the question or permission prompt that refused it is answered."""
+        from omnigent.harnesses.claude_native.bridge import has_pending_user_prompt
+
+        async def _wait_then_apply() -> None:
+            deadline = time.monotonic() + _CLAUDE_SETTINGS_AFTER_PROMPT_BUDGET_S
+            try:
+                while await asyncio.to_thread(has_pending_user_prompt, bridge_dir):
+                    if time.monotonic() >= deadline:
+                        _logger.warning(
+                            "claude-native %s change for session=%s dropped: the pending "
+                            "prompt was not answered within %.0fs",
+                            kind,
+                            conv_id,
+                            _CLAUDE_SETTINGS_AFTER_PROMPT_BUDGET_S,
+                            extra={"session_id": conv_id},
+                        )
+                        return
+                    await asyncio.sleep(_CLAUDE_SETTINGS_AFTER_PROMPT_POLL_S)
+                # From here a newer pick no longer cancels this switch mid-typing.
+                _forget(asyncio.current_task())
+                await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
+                await apply()
+            except Exception:  # noqa: BLE001 — best-effort; the forwarder's report reconciles
+                _logger.warning(
+                    "claude-native %s change for session=%s failed after the prompt was answered",
+                    kind,
+                    conv_id,
+                    exc_info=True,
+                    extra={"session_id": conv_id},
+                )
+
+        def _forget(task: asyncio.Task[Any] | None) -> None:
+            if task is not None and _settings_after_prompt.get((conv_id, kind)) is task:
+                del _settings_after_prompt[(conv_id, kind)]
+
+        _cancel_settings_after_prompt(conv_id, kind)
+        task = asyncio.create_task(
+            _wait_then_apply(), name=f"claude-{kind}-after-prompt-{conv_id}"
+        )
+        _settings_after_prompt[(conv_id, kind)] = task
+        _model_dialog_watchers.add(task)
+        task.add_done_callback(_model_dialog_watchers.discard)
+        task.add_done_callback(_forget)
+        _logger.info(
+            "claude-native %s change for session=%s waits for the pending prompt to be answered",
+            kind,
+            conv_id,
+            extra={"session_id": conv_id},
+        )
+
     async def _handle_claude_native_effort_change(
         conv_id: str,
         effort: str | None,
     ) -> Response:
         from omnigent.harnesses.claude_native.bridge import (
             EFFORT_DIALOG_HINT,
+            ClaudeUserPromptPending,
             bridge_dir_for_bridge_id,
             inject_slash_command,
         )
@@ -1137,9 +1210,11 @@ def build_native_controls(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        _cancel_settings_after_prompt(conv_id, "effort")
         await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
         command = f"/effort {effort}"
-        try:
+
+        async def _switch() -> None:
             # An effort switch invalidates the prompt cache on a session with
             # history, so Claude Code asks to confirm; the chat UI cannot render
             # that TUI dialog, so answer it by its own title.
@@ -1151,6 +1226,12 @@ def build_native_controls(
                 auto_confirm=True,
                 confirm_hint=EFFORT_DIALOG_HINT,
             )
+
+        try:
+            await _switch()
+        except ClaudeUserPromptPending:
+            _queue_settings_after_prompt(conv_id, "effort", bridge_dir, _switch)
+            return Response(status_code=204)
         except (RuntimeError, ValueError) as exc:
             return JSONResponse(
                 status_code=503,
@@ -1215,6 +1296,7 @@ def build_native_controls(
     ) -> Response:
         from omnigent.harnesses.claude_native.bridge import (
             SWITCH_MODEL_DIALOG_HINT,
+            ClaudeUserPromptPending,
             bridge_dir_for_bridge_id,
             confirm_dialog_if_open,
             inject_slash_command,
@@ -1244,6 +1326,7 @@ def build_native_controls(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+        _cancel_settings_after_prompt(conv_id, "model")
         await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
         selected_model = model.strip()
         claude_config = await _resolve_session_claude_launch_config(conv_id)
@@ -1293,8 +1376,22 @@ def build_native_controls(
                 },
             )
         command = f"/model {model_arg}"
+        # Expected spellings come from this session's own catalog rows (every
+        # row's ``model`` is the harness's own resolution), plus the typed arg
+        # and its selection mapping.
+        expected = {value for value in (resolved_model, model_arg) if value}
+        cached_rows = _claude_model_options_rows.get(conv_id)
+        for row in cached_rows[1] if cached_rows is not None else []:
+            if row.get("id") in (selected_model, resolved_model) or row.get("model") in (
+                selected_model,
+                resolved_model,
+            ):
+                row_model = row.get("model")
+                if isinstance(row_model, str) and row_model:
+                    expected.add(row_model)
         baseline = await asyncio.to_thread(read_claude_status_model, bridge_dir)
-        try:
+
+        async def _type_switch() -> None:
             # Accepted trade-off: ``/model <id>`` also saves the pick as the
             # person's global default in ``~/.claude/settings.json``. Driving
             # the interactive picker instead avoided that write but needed
@@ -1307,6 +1404,17 @@ def build_native_controls(
                 auto_confirm=True,
                 confirm_hint=SWITCH_MODEL_DIALOG_HINT,
             )
+
+        async def _switch_after_prompt() -> None:
+            await _type_switch()
+            await _watch_late_model_dialog(conv_id, bridge_dir, expected)
+
+        try:
+            await _type_switch()
+        except ClaudeUserPromptPending:
+            # The pane is waiting on the person's answer; switch once they give it.
+            _queue_settings_after_prompt(conv_id, "model", bridge_dir, _switch_after_prompt)
+            return Response(status_code=204)
         except (RuntimeError, ValueError) as exc:
             return JSONResponse(
                 status_code=503,
@@ -1317,21 +1425,9 @@ def build_native_controls(
             )
         # Verify against the statusLine snapshot the forwarder already polls:
         # Claude rewrites it on every render, including right after ``/model``.
-        # Expected spellings come from this session's own catalog rows (every
-        # row's ``model`` is the harness's own resolution), plus the typed arg
-        # and its selection mapping. Success replies only after the pane
-        # actually switched; the swallowed-dialog case answers non-2xx so the
-        # server surfaces it instead of the row silently claiming the pick.
-        expected = {value for value in (resolved_model, model_arg) if value}
-        cached_rows = _claude_model_options_rows.get(conv_id)
-        for row in cached_rows[1] if cached_rows is not None else []:
-            if row.get("id") in (selected_model, resolved_model) or row.get("model") in (
-                selected_model,
-                resolved_model,
-            ):
-                row_model = row.get("model")
-                if isinstance(row_model, str) and row_model:
-                    expected.add(row_model)
+        # Success replies only after the pane actually switched; the
+        # swallowed-dialog case answers non-2xx so the server surfaces it
+        # instead of the row silently claiming the pick.
         # A switch typed into a busy pane is queued; its turn may settle before the deadline.
         was_busy = _native_pane_status.get(conv_id) in ("running", "waiting")
         deadline = time.monotonic() + _CLAUDE_MODEL_CONFIRM_TIMEOUT_S

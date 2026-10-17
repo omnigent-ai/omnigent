@@ -2164,6 +2164,171 @@ async def test_events_model_change_mid_turn_defers_instead_of_failing(
     assert resp.status_code == 204, resp.text
 
 
+_PROMPT_SESSION_ID = "68c7c1acc5eeec3978c5e62043da51a5"
+
+
+def _patch_settings_behind_prompt(
+    monkeypatch: pytest.MonkeyPatch, prompt_open: list[bool]
+) -> list[str]:
+    """Script a Claude pane whose question or permission prompt is open while ``prompt_open[0]``.
+
+    :returns: Every command the runner typed, refused ones included.
+    """
+    commands: list[str] = []
+
+    def _fake_inject(
+        bridge_dir: Any,
+        *,
+        command: str,
+        timeout_s: float,
+        auto_confirm: bool = False,
+        confirm_hint: str | None = None,
+    ) -> None:
+        del bridge_dir, timeout_s, auto_confirm, confirm_hint
+        commands.append(command)
+        if prompt_open[0]:
+            raise claude_native_bridge.ClaudeUserPromptPending(
+                "Answer the pending Claude question before changing settings."
+            )
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    monkeypatch.setattr(
+        claude_native_bridge, "has_pending_user_prompt", lambda _bridge_dir: prompt_open[0]
+    )
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "read_model_env",
+        lambda _bridge_dir: {"ANTHROPIC_CUSTOM_MODEL_OPTION": "claude-opus-4-7"},
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_native_claude_config",
+        lambda *, spec: None,
+    )
+    monkeypatch.setattr(claude_native_bridge, "read_model_picker_values", lambda _: [])
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.stored_claude_picker_values",
+        lambda _config, _rows=None: [],
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.stored_claude_catalog_rows", lambda _config: None
+    )
+    monkeypatch.setattr(
+        claude_native_bridge, "read_claude_status_model", lambda _bridge_dir: "claude-opus-4-6"
+    )
+    monkeypatch.setattr(claude_native_bridge, "confirm_dialog_if_open", lambda _b, *, hint: False)
+    monkeypatch.setattr(native_controls, "_CLAUDE_SETTINGS_AFTER_PROMPT_POLL_S", 0.01)
+    monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_LATE_DIALOG_BUDGET_S", 0.05)
+    monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_LATE_DIALOG_POLL_S", 0.01)
+    return commands
+
+
+async def _wait_for_commands(commands: list[str], count: int) -> None:
+    for _ in range(300):
+        if len(commands) >= count:
+            return
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event", "command"),
+    [
+        ({"type": "model_change", "model": "claude-opus-4-7"}, "/model claude-opus-4-7"),
+        ({"type": "effort_change", "effort": "high"}, "/effort high"),
+    ],
+    ids=["model", "effort"],
+)
+async def test_events_settings_change_waits_for_a_pending_prompt_then_applies(
+    monkeypatch: pytest.MonkeyPatch, event: dict[str, str], command: str
+) -> None:
+    """A switch refused by an open question or permission prompt applies once it is answered."""
+    prompt_open = [True]
+    commands = _patch_settings_behind_prompt(monkeypatch, prompt_open)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": _PROMPT_SESSION_ID,
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(f"/v1/sessions/{_PROMPT_SESSION_ID}/events", json=event)
+        # Not a failure: the person is answering Claude, and the switch follows.
+        assert resp.status_code == 204, resp.text
+        await asyncio.sleep(0.05)
+        assert commands == [command]
+        prompt_open[0] = False
+        await _wait_for_commands(commands, 2)
+    assert commands == [command, command]
+
+
+@pytest.mark.asyncio
+async def test_events_settings_change_behind_an_unanswered_prompt_is_dropped(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A prompt left open past the budget drops the queued switch instead of typing later."""
+    commands = _patch_settings_behind_prompt(monkeypatch, [True])
+    monkeypatch.setattr(native_controls, "_CLAUDE_SETTINGS_AFTER_PROMPT_BUDGET_S", 0.05)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    with caplog.at_level(logging.WARNING):
+        async with _runner_client(app) as client:
+            create_resp = await client.post(
+                "/v1/sessions",
+                json={
+                    "session_id": _PROMPT_SESSION_ID,
+                    "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+                },
+            )
+            assert create_resp.status_code == 201, create_resp.text
+            resp = await client.post(
+                f"/v1/sessions/{_PROMPT_SESSION_ID}/events",
+                json={"type": "model_change", "model": "claude-opus-4-7"},
+            )
+            assert resp.status_code == 204, resp.text
+            await asyncio.sleep(0.3)
+    assert commands == ["/model claude-opus-4-7"]
+    assert any("dropped" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_events_newer_model_pick_replaces_one_waiting_for_a_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the latest pick applies after the prompt is answered."""
+    prompt_open = [True]
+    commands = _patch_settings_behind_prompt(monkeypatch, prompt_open)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "read_model_env",
+        lambda _bridge_dir: {
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-7",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6",
+        },
+    )
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": _PROMPT_SESSION_ID,
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        for model in ("opus", "sonnet"):
+            resp = await client.post(
+                f"/v1/sessions/{_PROMPT_SESSION_ID}/events",
+                json={"type": "model_change", "model": model},
+            )
+            assert resp.status_code == 204, resp.text
+        prompt_open[0] = False
+        await _wait_for_commands(commands, 3)
+        await asyncio.sleep(0.05)
+    assert commands == ["/model opus", "/model sonnet", "/model sonnet"]
+
+
 @pytest.mark.asyncio
 async def test_events_model_change_stays_queued_when_the_turn_settles_mid_wait(
     monkeypatch: pytest.MonkeyPatch,

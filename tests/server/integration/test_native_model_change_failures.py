@@ -376,7 +376,7 @@ async def test_claude_model_confirmation_controls_public_patch_and_rollback(
 
 
 @pytest.mark.parametrize("screen", [_QUESTION, _PERMISSION], ids=["question", "permission"])
-async def test_claude_pending_prompt_blocks_model_pick_without_answering_it(
+async def test_claude_pending_prompt_holds_model_pick_without_answering_it(
     client: httpx.AsyncClient,
     native_session: _NativeSession,
     monkeypatch: pytest.MonkeyPatch,
@@ -387,16 +387,29 @@ async def test_claude_pending_prompt_blocks_model_pick_without_answering_it(
     sent: list[tuple[str, ...]] = []
     monkeypatch.setattr(claude_bridge, "_capture_pane", lambda *_args: screen)
     monkeypatch.setattr(claude_bridge, "_run_tmux", lambda *args: sent.append(args))
+    monkeypatch.setattr(native_controls, "_CLAUDE_SETTINGS_AFTER_PROMPT_BUDGET_S", 0.2)
+    monkeypatch.setattr(native_controls, "_CLAUDE_SETTINGS_AFTER_PROMPT_POLL_S", 0.01)
 
     response = await _pick_model(client, session)
 
-    session.assert_refused(response)
-    assert session.runner_replies[0].json()["error"] == "claude_native_model_failed"
-    assert any(
-        record.exc_info and isinstance(record.exc_info[1], claude_bridge.ClaudeUserPromptPending)
-        for record in caplog.records
+    # The pick waits for the person's answer instead of failing.
+    assert response.status_code == 200, response.text
+    assert session.runner_replies[0].status_code == 204
+    assert session.store.get_conversation(session.session_id).model_override == (
+        session.requested_model
     )
+    assert session.errors == []
+    for _ in range(100):
+        if any("dropped" in record.getMessage() for record in caplog.records):
+            break
+        await asyncio.sleep(0.01)
+    assert any("dropped" in record.getMessage() for record in caplog.records)
+    # Nothing was ever typed into the open question or permission prompt.
     assert sent == []
+    assert session.claude is not None
+    assert claude_bridge.read_claude_status_model(session.claude.bridge_dir) == (
+        session.previous_model
+    )
     assert session.tunnel.dispatch_errors == []
 
 
