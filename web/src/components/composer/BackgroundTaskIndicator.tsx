@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState } from "react";
-import { ChevronRightIcon, SquareTerminalIcon } from "lucide-react";
+import { ChevronRightIcon, Loader2Icon, SquareTerminalIcon } from "lucide-react";
 
+import { useAgentTurnActive } from "@/components/chat/chatBubbleParts";
 import { Button } from "@/components/ui/button";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import type { BackgroundTaskInfo } from "@/lib/types";
@@ -72,11 +73,16 @@ function TaskCommand({ command, label }: { command: string; label: string }) {
   );
 }
 
-/** Running shells and monitors, independent of foreground work; the count is authoritative. */
+/**
+ * Running shells and monitors; the count is authoritative. While the agent's
+ * turn is active the badge doubles as the working cue (spinner + accessible
+ * name) — on a phone the end-of-thread shimmer scrolls off screen.
+ */
 export function BackgroundTaskIndicator() {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
   const bgTasks = useChatStore((s) => s.backgroundTasks);
   const conversationId = useChatStore((s) => s.conversationId);
+  const agentWorking = useAgentTurnActive();
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   // Escape returns to the trigger; session switches must never move focus.
@@ -105,6 +111,9 @@ export function BackgroundTaskIndicator() {
   if (bgCount <= 0) return null;
 
   const countLabel = `${bgCount} background task${bgCount === 1 ? "" : "s"}`;
+  const statusLabel = agentWorking
+    ? `Agent working — ${countLabel} still running`
+    : `${countLabel} still running`;
   // The count is authoritative in both directions: an over-long detail list
   // is clamped, a short one is acknowledged as partially unavailable.
   const displayedTasks = bgTasks.slice(0, bgCount);
@@ -112,8 +121,9 @@ export function BackgroundTaskIndicator() {
 
   return (
     <>
-      {/* Polite tally so count changes are announced with the popover
-          closed, replacing the old pill's role="status". */}
+      {/* Polite tally so count changes are announced with the popover closed.
+          The working state stays out of this live region — the shimmer is the
+          sole working-state announcer; the badge's accessible name carries it. */}
       <span role="status" className="sr-only">
         {countLabel} still running
       </span>
@@ -125,10 +135,18 @@ export function BackgroundTaskIndicator() {
             variant="ghost"
             size="xs"
             data-testid="background-task-pill"
-            aria-label={`${countLabel} still running`}
+            aria-label={statusLabel}
             className="shrink-0 gap-1 px-1 font-normal tabular-nums text-muted-foreground md:px-2"
           >
-            <SquareTerminalIcon className="size-3.5" strokeWidth={1.5} aria-hidden="true" />
+            {agentWorking ? (
+              <Loader2Icon
+                data-testid="background-task-working"
+                className="size-3.5 animate-spin motion-reduce:animate-none"
+                aria-hidden="true"
+              />
+            ) : (
+              <SquareTerminalIcon className="size-3.5" strokeWidth={1.5} aria-hidden="true" />
+            )}
             {bgCount}
           </Button>
         </PopoverTrigger>
