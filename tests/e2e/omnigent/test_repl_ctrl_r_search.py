@@ -33,13 +33,14 @@ from typing import Any
 
 from tests.e2e.conftest import get_mock_requests
 from tests.e2e.omnigent._pexpect_harness import (
+    ReplScreen,
     await_turn_complete,
     clean_exit,
     spawn_omnigent_run,
     strip_ansi,
     submit_prompt,
+    wait_for_screen,
 )
-from tests.e2e.omnigent._repl_test_helpers import drain_for
 from tests.e2e.omnigent._snapshot import compare_snapshot
 from tests.e2e.omnigent.conftest import configure_mock_llm
 
@@ -66,11 +67,8 @@ _RUNNING_TIMEOUT = 20.0
 _COMPLETION_TIMEOUT = 60.0
 _EXIT_TIMEOUT = 15.0
 
-# How long to wait for the Ctrl+R + substring render cycle. The
-# keystrokes are local; the delay is purely for prompt-toolkit's
-# min_redraw_interval + render tick.
-_SEARCH_DRAIN_TIMEOUT = 3.0
-_ACCEPT_DRAIN_TIMEOUT = 3.0
+# Keystrokes are local, but a loaded CI runner can take seconds to repaint.
+_SEARCH_RENDER_TIMEOUT = 30.0
 
 
 def test_repl_ctrl_r_reverse_search(
@@ -104,6 +102,25 @@ def test_repl_ctrl_r_reverse_search(
         key=_MODEL,
     )
     yaml_path = omnigent_repo_root / "tests" / "resources" / "examples" / "hello_world.yaml"
+    search_line = f"{_SEARCH_PROMPT_MARKER}: {_NEEDLE}"
+
+    def _search_shows_match(screen: ReplScreen) -> bool:
+        # The toolbar echoes the typed needle and the input row above it
+        # shows the matched history entry.
+        lines = screen.lines()
+        return any(
+            line == search_line and _PROMPT in lines[i - 1] for i, line in enumerate(lines) if i
+        )
+
+    def _match_accepted(screen: ReplScreen) -> bool:
+        # Search mode closed and the bottom-most input row holds the match.
+        lines = screen.lines()
+        prompt_rows = [line for line in lines if line.startswith(" ❯")]
+        return (
+            not any(line.startswith(_SEARCH_PROMPT_MARKER) for line in lines)
+            and bool(prompt_rows)
+            and _PROMPT in prompt_rows[-1]
+        )
 
     child = spawn_omnigent_run(
         omnigent_python=omnigent_python,
@@ -121,59 +138,56 @@ def test_repl_ctrl_r_reverse_search(
         # REPL is ready.
         child.expect(r"❯ ", timeout=_BOOT_TIMEOUT)
         submit_prompt(child, _PROMPT)
-        # The prompt can redraw during a turn; consume its unique response
-        # before treating the following prompt as ready for history search.
         await_turn_complete(
             child,
             running_timeout=_RUNNING_TIMEOUT,
             completion_timeout=_COMPLETION_TIMEOUT,
-            running_marker=_INITIAL_RESPONSE,
-            completion_pattern=r"❯ ",
+            reply_marker=_INITIAL_RESPONSE,
         )
+        screen = child.logfile_read
+        assert isinstance(screen, ReplScreen)
         # Enter reverse-search mode. prompt-toolkit swaps the
         # input area focus to the search toolbar and redraws
         # with the "I-search backward: " prompt.
+        search_mark = screen.mark()
         child.sendcontrol("r")
         # Type the unique substring. Each character narrows the
         # search; prompt-toolkit's default match behavior is to
         # surface the most recent history entry containing the
         # typed text.
         child.send(_NEEDLE)
-        # Collect the post-Ctrl+R + post-substring render
-        # frames. drain_for handles the case where prompt-
-        # toolkit splits the search-toolbar paint and the
-        # match-surfacing paint into separate frames.
-        search_drain = drain_for(child, _SEARCH_DRAIN_TIMEOUT)
+        needle_surfaced = wait_for_screen(
+            child, _search_shows_match, timeout=_SEARCH_RENDER_TIMEOUT
+        )
+        search_drain = screen.raw_since(search_mark)
 
         # Enter should accept the current reverse-search match, leave
         # search mode, and keep the matched command in the normal input
         # buffer for editing/submission. This regressed when the custom
         # REPL key map started Ctrl+R search but did not explicitly wire
         # search-mode Enter to prompt-toolkit's accept_search handler.
+        accept_mark = screen.mark()
         child.send("\r")
-        accept_drain = drain_for(child, _ACCEPT_DRAIN_TIMEOUT)
+        wait_for_screen(child, _match_accepted, timeout=_SEARCH_RENDER_TIMEOUT)
+        accept_drain = screen.raw_since(accept_mark)
         # Press Ctrl+G to cancel any still-active search mode, then submit.
         # If Enter worked, Ctrl+G is a no-op against the normal input buffer
         # and the recalled prompt is submitted. If Enter did not work, Ctrl+G
         # exits search mode without accepting the match, leaving no prompt to
         # submit; the wait below times out before observing a turn.
         child.sendcontrol("g")
-        drain_for(child, _ACCEPT_DRAIN_TIMEOUT)
         child.send("\r")
-        # The turn waiter must own output from submission onward; a fast
-        # mock response can finish before a separate render drain returns.
         submit_drain = ""
         try:
             submitted_turn = await_turn_complete(
                 child,
                 running_timeout=_RUNNING_TIMEOUT,
                 completion_timeout=_COMPLETION_TIMEOUT,
-                running_marker=_RECALLED_RESPONSE,
-                completion_pattern=r"❯ ",
+                reply_marker=_RECALLED_RESPONSE,
             )
             submit_drain = submitted_turn.raw
             accepted_search_submits = True
-        except Exception:
+        except AssertionError:
             accepted_search_submits = False
         clean_exit(child, timeout=_EXIT_TIMEOUT)
         exit_code = child.exitstatus
@@ -196,9 +210,9 @@ def test_repl_ctrl_r_reverse_search(
         # an incremental search is active.
         "search_toolbar_visible": _SEARCH_PROMPT_MARKER in combined_stripped,
         # The matched history entry should surface in the input
-        # area. Searching for the unique token confirms the
-        # entry was found — not just that search was started.
-        "needle_surfaced": _NEEDLE in search_stripped,
+        # area while the toolbar shows the typed needle — proof the
+        # entry was found, not just that search was started.
+        "needle_surfaced": needle_surfaced,
         # After pressing Enter, the SearchToolbar should disappear,
         # and the matched entry should still be present in the normal
         # input area. This is the actual "select result" behavior
