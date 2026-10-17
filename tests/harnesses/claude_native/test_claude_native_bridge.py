@@ -5785,6 +5785,37 @@ def test_inject_slash_command_rejects_invalid_commands(
         claude_native_bridge.inject_slash_command(bridge_dir, command=bad_command)
 
 
+@pytest.mark.parametrize(
+    ("before", "written", "after"),
+    [
+        # No key before the switch: the saved one is removed again.
+        ({"theme": "dark"}, "sonnet", {"theme": "dark"}),
+        # Someone else changed the default in the meantime: left alone.
+        ({"model": "opus"}, "haiku", {"model": "haiku"}),
+    ],
+)
+def test_inject_model_command_restores_only_its_own_save(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolate_claude_user_settings: Path,
+    before: dict[str, str],
+    written: str,
+    after: dict[str, str],
+) -> None:
+    """``inject_model_command`` undoes Claude's default-model save and nothing else."""
+    settings = _isolate_claude_user_settings
+    settings.write_text(json.dumps(before), encoding="utf-8")
+
+    def _claude_pane(_bridge_dir: Path, *, command: str, **_kwargs: object) -> None:
+        settings.write_text(json.dumps({**before, "model": written}), encoding="utf-8")
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _claude_pane)
+
+    claude_native_bridge.inject_model_command(tmp_path / "bridge", model_arg="sonnet")
+
+    assert json.loads(settings.read_text(encoding="utf-8")) == after
+
+
 def test_cycleable_permission_modes_match_the_server_patch_vocabulary() -> None:
     """
     The bridge and the Sessions API accept the same set of modes.

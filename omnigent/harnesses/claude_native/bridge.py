@@ -4763,6 +4763,137 @@ def inject_slash_command(
         _confirm_tui_dialog(socket_path, tmux_target, hint=dialog_hint, bridge_dir=bridge_dir)
 
 
+# Claude awaits its own default-model save for at most 3s after ``/model``.
+_DEFAULT_MODEL_SAVE_WAIT_S = 3.0
+_MISSING = object()
+
+
+def inject_model_command(
+    bridge_dir: Path,
+    *,
+    model_arg: str,
+    timeout_s: float = _TMUX_READY_TIMEOUT_S,
+) -> None:
+    """
+    Switch the pane to *model_arg* for this session only.
+
+    Claude Code 2.1.x has no session-only form of ``/model <name>``: in an
+    interactive session it also saves the pick as the user's default model in
+    ``settings.json``, so every switch Omnigent typed rewrote the default of
+    every future Claude Code session. This types the command, waits for
+    Claude's save, and puts the previous value of the ``model`` key back.
+    The running session keeps the switched model: Claude holds it in memory
+    and does not re-read the key for the live session.
+
+    :param bridge_dir: Bridge directory path.
+    :param model_arg: ``/model`` argument, e.g. ``"claude-sonnet-5-5"``.
+    :param timeout_s: Seconds to wait for ``tmux.json``, e.g. ``30.0``.
+    :raises ValueError: See :func:`inject_slash_command`.
+    :raises RuntimeError: See :func:`inject_slash_command`.
+    """
+    path = claude_user_settings_path()
+    before = _read_settings_model(path)
+    inject_slash_command(
+        bridge_dir,
+        command=f"/model {model_arg}",
+        timeout_s=timeout_s,
+        auto_confirm=True,
+        confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+    )
+    if isinstance(before, str) and before.strip().lower() == model_arg.strip().lower():
+        return  # Claude's save would not change the file.
+    try:
+        _restore_settings_model(path, before, model_arg)
+    except (OSError, ValueError):
+        _logger.warning(
+            "claude-native: could not restore the default model in %s", path, exc_info=True
+        )
+
+
+def claude_user_settings_path() -> Path:
+    """
+    Return the user ``settings.json`` Claude Code saves its default model to.
+
+    :returns: ``$CLAUDE_CONFIG_DIR/settings.json``, else ``~/.claude/settings.json``.
+    """
+    # ponytail: the runner's env, as status_file.sessions_dir; a CLAUDE_CONFIG_DIR set
+    # only in the terminal's launch command is missed, and then nothing is restored.
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    home = Path(configured).expanduser() if configured else Path.home() / ".claude"
+    return home / "settings.json"
+
+
+def _read_settings_model(path: Path) -> object:
+    """
+    Read the ``model`` key of a Claude settings file.
+
+    :param path: Settings file.
+    :returns: The value, or ``_MISSING`` when the file or key is absent or
+        the file is not a readable JSON object.
+    """
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return _MISSING
+    return payload.get("model", _MISSING) if isinstance(payload, dict) else _MISSING
+
+
+def _restore_settings_model(path: Path, before: object, model_arg: str) -> None:
+    """
+    Undo Claude's default-model save, touching only the ``model`` key.
+
+    Waits for the save to land, then restores *before* only while the key
+    still holds what Claude wrote for *model_arg*, so a value someone else
+    wrote in the meantime is left alone.
+
+    :param path: Settings file.
+    :param before: The key's value before ``/model``, or ``_MISSING``.
+    :param model_arg: The typed ``/model`` argument.
+    :returns: None.
+    :raises OSError: If the file cannot be rewritten.
+    :raises ValueError: If the file stops being valid JSON mid-restore.
+    """
+    deadline = time.monotonic() + _DEFAULT_MODEL_SAVE_WAIT_S
+    current = _read_settings_model(path)
+    while current == before and time.monotonic() < deadline:
+        time.sleep(0.05)
+        current = _read_settings_model(path)
+    if current == before:
+        return  # No save landed (non-interactive session, or the switch did not take).
+    if not isinstance(current, str) or current.strip().lower() != model_arg.strip().lower():
+        _logger.info(
+            "claude-native: default model in %s changed to %r, not the typed %r; left as is",
+            path,
+            current,
+            model_arg,
+        )
+        return
+    target = path.resolve()
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"{target} is not a JSON object")
+    if before is _MISSING:
+        payload.pop("model", None)
+    else:
+        payload["model"] = before
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=target.parent, prefix=f".{target.name}.", delete=False
+        ) as handle:
+            tmp_path = Path(handle.name)
+            # Claude's own layout: two-space indent, raw UTF-8, trailing newline.
+            handle.write(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+        os.chmod(tmp_path, stat.S_IMODE(target.stat().st_mode))
+        os.replace(tmp_path, target)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            with contextlib.suppress(FileNotFoundError):
+                tmp_path.unlink()
+    _logger.info("claude-native: kept %s default model as %r", path, before)
+
+
 def _confirm_tui_dialog(
     socket_path: str,
     tmux_target: str,
