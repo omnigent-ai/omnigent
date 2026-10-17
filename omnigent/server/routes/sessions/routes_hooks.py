@@ -88,6 +88,7 @@ from omnigent.server.routes._sessions.helpers import (
     _structured_ask_user_question,
 )
 from omnigent.server.routes._sessions.orchestration import (
+    _ask_gate_resolver_reason,
     _hold_native_ask_gate,
     _publish_and_wait_for_harness_elicitation,
     _spawn_gateway_backed,
@@ -987,7 +988,14 @@ def register_hooks_routes(
                             if approved
                             else {
                                 "result": "POLICY_ACTION_DENY",
-                                "reason": result.reason or "Approval was not granted.",
+                                # Resolver's rationale (a cancel carrying
+                                # "not like that") wins over the policy's
+                                # reason — #7315.
+                                "reason": (
+                                    _ask_gate_resolver_reason.get()
+                                    or result.reason
+                                    or "Approval was not granted."
+                                ),
                             }
                         )
                         add_audit_attrs(
