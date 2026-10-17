@@ -369,15 +369,21 @@ def test_no_change_emits_no_changed_frame(app: FastAPI, stores, fast_rescan: Non
             )
 
 
-def test_delete_pushes_removed_frame(app: FastAPI, stores, fast_rescan: None) -> None:
-    """Deleting a watched session makes the server push a ``removed``
-    frame for its id (the row no longer resolves)."""
+@pytest.mark.parametrize(
+    "template", [pytest.param("{hex}", id="bare"), pytest.param("conv_{hex}", id="prefixed")]
+)
+def test_delete_pushes_removed_frame(
+    app: FastAPI, stores, fast_rescan: None, template: str
+) -> None:
+    """Deleting a watched session makes the server push a ``removed`` frame
+    naming its bare id (the row no longer resolves), whichever spelling the
+    client watched it by."""
     permission_store = stores[2]
     s1 = _seed_session(stores, owner=ALICE, title="doomed")
     with TestClient(app).websocket_connect(
         "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
     ) as ws:
-        ws.send_text(json.dumps({"type": "watch", "session_ids": [s1]}))
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [template.format(hex=s1)]}))
         _recv_until(ws, {"snapshot"})
         # Drop access so the next rescan can no longer resolve the id for
         # this user — the list-stream's definition of "removed".
@@ -886,3 +892,39 @@ def test_projects_changed_event_forwards_to_client(
         sessions_routes.user_session_stream.publish(ALICE, {"type": "projects_changed"})
         frame = _recv_until(ws, {"projects_changed"})
         assert frame["type"] == "projects_changed"
+
+
+@pytest.mark.parametrize(
+    ("templates", "owner", "admin"),
+    [
+        pytest.param(["conv_{hex}"], ALICE, False, id="prefixed"),
+        pytest.param(["{hex}", "conv_{hex}"], ALICE, False, id="bare_then_prefixed"),
+        pytest.param(["conv_{hex}", "{hex}"], BOB, True, id="admin_prefixed_then_bare"),
+        pytest.param(["{hex}", "conv_{hex}"], BOB, True, id="admin_bare_then_prefixed"),
+    ],
+)
+def test_conv_prefixed_watch_streams_grant_fields(
+    app: FastAPI, stores, templates: list[str], owner: str, admin: bool
+) -> None:
+    """A ``conv_``-prefixed watch, alone or alongside the bare id (the sidebar
+    sends both when the opened session is on its loaded page), streams one
+    item with the ``permission_level`` / ``owner`` a bare-hex watch does.
+    Grants are keyed by the watched spellings while items carry bare ids, so
+    a mismatched lookup presented an owned session as ownerless. An admin
+    watching another user's session must still see that user as its owner.
+    """
+    _, _, permission_store = stores
+    s1 = _seed_session(stores, owner=owner, title="prefixed")
+    if admin:
+        permission_store.ensure_user(ALICE)
+        permission_store.set_admin(ALICE, True)
+    watched = [template.format(hex=s1) for template in templates]
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": watched}))
+        snapshot = _recv_until(ws, {"snapshot"})
+        items = snapshot["items"]
+        assert [item["id"] for item in items] == [s1]  # type: ignore[index]
+        assert items[0]["permission_level"] == LEVEL_OWNER  # type: ignore[index]
+        assert items[0]["owner"] == owner  # type: ignore[index]

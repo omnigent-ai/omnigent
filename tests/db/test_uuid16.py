@@ -13,6 +13,7 @@ from omnigent.db.db_models import (
     InvalidUuidError,
     Uuid16,
     normalize_uuid,
+    spellings_by_normalized_uuid,
     uuid_to_bytes,
 )
 
@@ -84,6 +85,21 @@ class TestNormalizeUuid:
 
     def test_none_passes_through(self) -> None:
         assert normalize_uuid(None) is None
+
+
+class TestSpellingsByNormalizedUuid:
+    def test_groups_distinct_spellings_under_bare_hex_in_input_order(self) -> None:
+        dashed = f"{_HEX[:8]}-{_HEX[8:12]}-{_HEX[12:16]}-{_HEX[16:20]}-{_HEX[20:]}"
+        other = "0" * 31 + "1"
+        assert spellings_by_normalized_uuid(["conv_" + _HEX, other, _HEX, dashed, _HEX]) == {
+            _HEX: ["conv_" + _HEX, _HEX, dashed],
+            other: [other],
+        }
+
+    def test_malformed_maps_to_itself(self) -> None:
+        assert spellings_by_normalized_uuid(["nonexistent-id"]) == {
+            "nonexistent-id": ["nonexistent-id"]
+        }
 
 
 class TestUuid16ResultDecoding:

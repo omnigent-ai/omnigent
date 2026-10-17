@@ -10,6 +10,8 @@ SQLite file and tears it down automatically.
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from sqlalchemy import event
 
@@ -1346,3 +1348,38 @@ def test_resolve_access_cache_evicts_least_recently_used_over_cap(
     finally:
         detach()
     assert count[0] == 1, f"only the LRU-evicted entry should re-read, got {count[0]}"
+
+
+@pytest.mark.parametrize(
+    "templates",
+    [
+        pytest.param(["{dashed}"], id="dashed"),
+        pytest.param(["conv_{hex}"], id="legacy_prefix"),
+        pytest.param(["{hex}", "conv_{hex}"], id="bare_then_prefixed"),
+        pytest.param(["conv_{hex}", "{hex}"], id="prefixed_then_bare"),
+        pytest.param(["{dashed}", "conv_{hex}"], id="dashed_then_prefixed"),
+    ],
+)
+def test_list_for_sessions_keys_by_caller_spelling(
+    store: SqlAlchemyPermissionStore, db_uri: str, templates: list[str]
+) -> None:
+    """Grants come back under every id spelling the caller passed: ``Uuid16``
+    reads back bare hex, so grouping by the stored value raised ``KeyError``
+    for non-bare callers, and keying one spelling per session left the other
+    alias empty when a watch-set carried both.
+    """
+    _ensure_user(store, "alice")
+    _ensure_user(store, "bob")
+    conv = _create_conversation(db_uri)
+    other = _create_conversation(db_uri)
+    store.grant("alice", conv, level=2)
+    store.grant("bob", other, level=1)
+    dashed = str(uuid.UUID(conv))
+    asked = [template.format(hex=conv, dashed=dashed) for template in templates]
+
+    result = store.list_for_sessions([*asked, other])
+
+    assert list(result) == [*asked, other]
+    for key in asked:
+        assert [g.user_id for g in result[key]] == ["alice"], key
+    assert [g.user_id for g in result[other]] == ["bob"]

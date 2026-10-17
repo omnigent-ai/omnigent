@@ -48,6 +48,7 @@ from omnigent.db.db_models import (
     SqlUser,
     SqlUserDailyCost,
     current_workspace_id,
+    spellings_by_normalized_uuid,
     uuid_to_bytes,
 )
 from omnigent.db.enum_codecs import (
@@ -1368,7 +1369,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
         if not conversation_ids:
             return {}
-        unique_ids = list(set(conversation_ids))
+        unique_ids = list(dict.fromkeys(conversation_ids))
         with self._conv_session("get_conversations") as session:
             rows = list(
                 session.execute(
@@ -1401,14 +1402,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .all()
                 )
         meta_by_id = {m.id: m for m in meta_rows}
-        return {
-            row.id: _to_conversation(
-                row,
-                meta_by_id.get(row.id),
-                labels_by_conv.get(row.id, {}),
+        # Return each row under every caller spelling of its id.
+        spellings = spellings_by_normalized_uuid(unique_ids)
+        result: dict[str, Conversation] = {}
+        for row in rows:
+            conversation = _to_conversation(
+                row, meta_by_id.get(row.id), labels_by_conv.get(row.id, {})
             )
-            for row in rows
-        }
+            for conversation_id in spellings[row.id]:
+                result[conversation_id] = conversation
+        return result
 
     def list_child_conversation_ids_by_parent(
         self,
@@ -1448,9 +1451,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                     desc(self._tiebreaker_col),
                 )
             ).all()
+        # Key children under every caller spelling of the parent.
+        spellings = spellings_by_normalized_uuid(unique_ids)
         for parent_id, child_id in rows:
             if parent_id is not None:
-                result[parent_id].append(child_id)
+                for requested_parent_id in spellings[parent_id]:
+                    result[requested_parent_id].append(child_id)
         return result
 
     def list_child_conversation_ids_page(
@@ -2345,8 +2351,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .order_by(ranked.c.conversation_id, ranked.c.position.desc())
             ).all()
             decoded = self._decode_item_data_batch([row.data for row in rows])
+            # Key items under every caller spelling of the conversation.
+            spellings = spellings_by_normalized_uuid(unique_ids)
             for row, data_json in zip(rows, decoded, strict=True):
-                result[row.conversation_id].append(_to_item(row, data_json))  # type: ignore[arg-type]
+                item = _to_item(row, data_json)  # type: ignore[arg-type]
+                for conversation_id in spellings[row.conversation_id]:
+                    result[conversation_id].append(item)
         return result
 
     def _encode_item_data(self, data_json: str) -> str:
