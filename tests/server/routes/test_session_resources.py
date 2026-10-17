@@ -42,6 +42,7 @@ from omnigent.server.auth import (
 )
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
+from omnigent.server.routes.sessions.routes_resources import _RunnerStreamResponse
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
@@ -4635,6 +4636,64 @@ async def test_filesystem_download_cancelled_prefetch_shields_stream_cleanup(
         await started.wait()
         task_group.cancel_scope.cancel()
 
+    assert cleaned.is_set()
+    assert len(cancelled) == 1
+    assert isinstance(cancelled[0], asyncio.CancelledError)
+
+
+@pytest.mark.asyncio
+async def test_runner_stream_response_disconnect_shields_upstream_cleanup() -> None:
+    sent_chunk = asyncio.Event()
+    cleaned = asyncio.Event()
+
+    class UpstreamStream(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield b"first chunk"
+
+        async def aclose(self) -> None:
+            await asyncio.sleep(0)
+            cleaned.set()
+
+    upstream = httpx.Response(200, stream=UpstreamStream())
+
+    async def content() -> AsyncIterator[bytes]:
+        yield b"first chunk"
+        await asyncio.Event().wait()
+
+    response = _RunnerStreamResponse(upstream, headers={}, content=content())
+    sent_messages: list[dict[str, Any]] = []
+    cancelled: list[BaseException] = []
+
+    async def receive() -> dict[str, Any]:
+        await sent_chunk.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent_messages.append(message)
+        if message["type"] == "http.response.body" and message.get("body"):
+            sent_chunk.set()
+
+    async def run_response() -> None:
+        try:
+            await response(
+                {
+                    "type": "http",
+                    "asgi": {"version": "3.0"},
+                    "method": "GET",
+                    "path": "/",
+                },
+                receive,
+                send,
+            )
+        except BaseException as exc:
+            cancelled.append(exc)
+
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(run_response)
+        await sent_chunk.wait()
+        task_group.cancel_scope.cancel()
+
+    assert any(message.get("body") == b"first chunk" for message in sent_messages)
     assert cleaned.is_set()
     assert len(cancelled) == 1
     assert isinstance(cancelled[0], asyncio.CancelledError)
@@ -10646,6 +10705,28 @@ async def test_binary_file_read_is_not_gzipped(client: httpx.AsyncClient) -> Non
     assert resp.status_code == 200
     assert "content-encoding" not in resp.headers
     assert resp.json() == payload
+
+
+@pytest.mark.asyncio
+async def test_binary_file_read_with_http_middleware_skips_gzip(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+) -> None:
+    payload = _fs_binary_read_payload()
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=payload)))  # type: ignore[arg-type]
+
+    @app.middleware("http")
+    async def pass_through(request: Request, call_next: Callable[..., Any]) -> Any:
+        return await call_next(request)
+
+    resp = await client.get(
+        f"{_FS_BASE}/filesystem/docs/logo.png",
+        headers={"Accept-Encoding": "gzip, deflate, br"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == payload
+    assert "content-encoding" not in resp.headers
 
 
 @pytest.mark.asyncio

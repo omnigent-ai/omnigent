@@ -188,7 +188,8 @@ class _RunnerStreamResponse(StreamingResponse):
         try:
             await super().__call__(scope, receive, send)
         finally:
-            await self._upstream.aclose()
+            with anyio.CancelScope(shield=True):
+                await self._upstream.aclose()
 
 
 # Runner wait for a PR label, reviewer, or merge request, above the runner's 15-second
