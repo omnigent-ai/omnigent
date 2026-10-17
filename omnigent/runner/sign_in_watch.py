@@ -32,7 +32,8 @@ def build_sign_in_watch(
     *,
     _background_tasks: set[asyncio.Task[Any]],
     _session_harness_name: Callable[[str], str | None],
-    _release_sign_in_hold: Callable[[str], bool],
+    _message_held_for_sign_in: Callable[[str], bool],
+    _release_sign_in_hold: Callable[[str], None],
     _sign_in_watchers: dict[str, asyncio.Task[None]],
     resource_registry: SessionResourceRegistry,
     server_client: httpx.AsyncClient,
@@ -77,35 +78,46 @@ def build_sign_in_watch(
         prompt. This reads the session's running panes until no prompt is on
         screen and the agent can take a message, then posts the notice. It ends
         silently when no pane is running any more: the launcher exited, which
-        the next send reports on its own. Either way it releases a message held
-        for the sign-in, so the session's queue sends it.
+        the next send reports on its own. However it ends, it then releases a
+        message held for the sign-in, so the session's queue sends it.
 
         :param conv_id: Session whose turn failed with ``databricks_sign_in_pending``.
         """
         from omnigent.harnesses.diagnostics import detect_sign_in_prompt
 
-        harness = _session_harness_name(conv_id)
-        pane_names = _native_pane_names(conv_id)
-        while True:
-            await asyncio.sleep(_SIGN_IN_WATCH_INTERVAL_S)
-            registry = resource_registry.terminal_registry
-            entries = registry.list_for_conversation(conv_id) if registry is not None else []
-            screens: list[str] = []
-            for entry in entries:
-                if entry.terminal_name not in pane_names or not entry.instance.running:
+        try:
+            harness = _session_harness_name(conv_id)
+            pane_names = _native_pane_names(conv_id)
+            while True:
+                await asyncio.sleep(_SIGN_IN_WATCH_INTERVAL_S)
+                registry = resource_registry.terminal_registry
+                entries = registry.list_for_conversation(conv_id) if registry is not None else []
+                screens: list[str] = []
+                for entry in entries:
+                    if entry.terminal_name not in pane_names or not entry.instance.running:
+                        continue
+                    try:
+                        result = await entry.instance.read(join_wrapped=True)
+                    except Exception:  # noqa: BLE001 — an unreadable pane shows nothing this poll
+                        _logger.debug(
+                            "Failed to read the sign-in pane for %s", conv_id, exc_info=True
+                        )
+                        result = None
+                    screen = result.get("screen") if isinstance(result, dict) else None
+                    screens.append(screen if isinstance(screen, str) else "")
+                if not screens:
+                    return
+                if any(detect_sign_in_prompt(screen) is not None for screen in screens):
                     continue
-                result = await entry.instance.read(join_wrapped=True)
-                screen = result.get("screen") if isinstance(result, dict) else None
-                screens.append(screen if isinstance(screen, str) else "")
-            if not screens:
-                _release_sign_in_hold(conv_id)
-                return
-            if any(detect_sign_in_prompt(screen) is not None for screen in screens):
-                continue
-            if _sign_in_agent_ready(conv_id, harness, screens):
-                held = _release_sign_in_hold(conv_id)
-                await _post_sign_in_completed_notice(conv_id, harness, held=held)
-                return
+                if _sign_in_agent_ready(conv_id, harness, screens):
+                    # Post before the release on exit, so a resend refused again can rewatch.
+                    await _post_sign_in_completed_notice(
+                        conv_id, harness, held=_message_held_for_sign_in(conv_id)
+                    )
+                    return
+        finally:
+            # Any exit resumes a held message; teardown paths drop the queue themselves.
+            _release_sign_in_hold(conv_id)
 
     def _sign_in_agent_ready(conv_id: str, harness: str | None, screens: list[str]) -> bool:
         """Return whether the agent can take a message now that no sign-in prompt is on screen."""
@@ -161,8 +173,10 @@ def build_sign_in_watch(
 
         :param conv_id: Session whose message is held.
         :param error: The harness refusal, carrying the sign-in ``title`` and the
-            link to open as ``remediation``.
+            next step as ``remediation``.
         """
+        from omnigent.harnesses.diagnostics import SIGN_IN_RESEND_STEP
+
         agent = _agent_name(_session_harness_name(conv_id))
         item: dict[str, Any] = {
             "code": "databricks_sign_in_pending",
@@ -172,8 +186,10 @@ def build_sign_in_watch(
                 "Your message will be sent once you sign in."
             ),
         }
-        if isinstance(error.get("remediation"), str):
-            item["remediation"] = error["remediation"]
+        remediation = error.get("remediation")
+        if isinstance(remediation, str):
+            # Keep the sign-in step; the held message is sent without the person resending it.
+            item["remediation"] = remediation.replace(SIGN_IN_RESEND_STEP, ".")
         try:
             await _post_sign_in_item(conv_id, item)
         except (httpx.HTTPError, RuntimeError):
