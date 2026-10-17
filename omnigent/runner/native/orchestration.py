@@ -5119,6 +5119,14 @@ async def _auto_create_codex_terminal(
                     outcome,
                     extra={"session_id": session_id},
                 )
+            elif (
+                not _codex_catalog_was_stale
+                and native_codex_launch_pins_model_provider(_codex_launch)
+                and codex_session_meta_model_provider(_codex_launch) == "openai"
+            ):
+                # Codex's account backend accepts its catalog spelling. Keep the
+                # persisted pick while launching the same model by the confirmed id.
+                _codex_launch = dataclasses.replace(_codex_launch, model=reachable)
         if _codex_launch.model is None and _codex_launch.profile is None and _codex_catalog:
             # Same staleness rule as the claude branch: never convert a stale
             # entry's default into an explicit model pin.

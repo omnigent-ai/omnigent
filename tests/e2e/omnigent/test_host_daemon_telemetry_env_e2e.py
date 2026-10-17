@@ -34,12 +34,14 @@ import signal
 import subprocess
 import sys
 import threading
+import uuid
 from pathlib import Path
 
 import httpx
 import pytest
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, RUNNER_PARENT_PID_ENV_VAR
+from tests.e2e.conftest import lookup_agent_id, register_inline_agent
 from tests.e2e.omnigent.test_host_ctrl_c_stop_server import (
     _connect_env,
     _read_local_server_record,
@@ -56,6 +58,28 @@ _RUNNER_APPEAR_TIMEOUT = 60.0
 _POLL_PAUSE = threading.Event()
 
 
+def test_telemetry_daemons_keep_distinct_identities_with_a_shared_mock_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Isolating HOME must also keep daemon identities distinct under mock config."""
+    from omnigent.host.identity import load_or_create_host_identity
+
+    shared_config = tmp_path / "mock-config"
+    shared_config.mkdir()
+    (shared_config / "config.yaml").write_text("auth:\n  type: api_key\n")
+    identities = []
+    for name in ("first", "second"):
+        env = _telemetry_env({"OMNIGENT_CONFIG_HOME": str(shared_config)}, tmp_path / name)
+        with monkeypatch.context() as child_env:
+            for key in ("OMNIGENT_CONFIG_HOME", "OMNIGENT_HOST_ID", "OMNIGENT_HOST_NAME"):
+                if key in env:
+                    child_env.setenv(key, env[key])
+                else:
+                    child_env.delenv(key, raising=False)
+            identities.append(load_or_create_host_identity())
+    assert identities[0].host_id != identities[1].host_id
+
+
 def _telemetry_env(base_env: dict[str, str], home: Path) -> dict[str, str]:
     """The user's telemetry environment for the ``host --background`` spawn.
 
@@ -64,6 +88,9 @@ def _telemetry_env(base_env: dict[str, str], home: Path) -> dict[str, str]:
     :returns: Environment dict for the CLI subprocess.
     """
     env = _connect_env(base_env, home)
+    # Other test daemons can reconnect when the local server port is reused.
+    env["OMNIGENT_HOST_ID"] = uuid.uuid4().hex
+    env["OMNIGENT_HOST_NAME"] = "telemetry-env-e2e"
     env["CLAUDE_CODE_ENABLE_TELEMETRY"] = "1"
     env["OTEL_METRICS_EXPORTER"] = "otlp"
     env["OMNIGENT_TELEMETRY_ENABLED"] = "1"
@@ -236,15 +263,23 @@ def test_daemon_spawned_runner_receives_claude_telemetry_flag(
             timeout=30.0,
             headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
         ) as client:
-            host_id = _online_host_id(client, timeout=_BOOT_TIMEOUT)
-            agents = client.get("/v1/agents")
-            agents.raise_for_status()
-            rows = agents.json()["data"]
-            assert rows, "server registered no agents"
+            host_id = _online_host_id(
+                client, host_id=env["OMNIGENT_HOST_ID"], timeout=_BOOT_TIMEOUT
+            )
+            # The flag is observed on the runner, independent of its harness CLI.
+            agent_name = register_inline_agent(
+                client,
+                name="telemetry-env-e2e",
+                harness="openai-agents",
+                model="gpt-4o",
+                profile="",
+                prompt="Reply briefly.",
+                mock_llm_base_url=env["OPENAI_BASE_URL"],
+            )
             create = client.post(
                 "/v1/sessions",
                 json={
-                    "agent_id": rows[0]["id"],
+                    "agent_id": lookup_agent_id(client, agent_name),
                     "host_id": host_id,
                     "workspace": str(workspace),
                 },
@@ -265,10 +300,11 @@ def test_daemon_spawned_runner_receives_claude_telemetry_flag(
             _sigterm(server_pid)
 
 
-def _online_host_id(client: httpx.Client, timeout: float) -> str:
+def _online_host_id(client: httpx.Client, *, host_id: str, timeout: float) -> str:
     """Poll ``GET /v1/hosts`` until a host is online; return its id.
 
     :param client: HTTP client pointed at the detached local server.
+    :param host_id: This test's daemon identity.
     :param timeout: Max seconds to wait for the daemon's host registration.
     :returns: The online host's ``host_id``.
     :raises AssertionError: If no host comes online within *timeout*.
@@ -277,7 +313,11 @@ def _online_host_id(client: httpx.Client, timeout: float) -> str:
     while elapsed < timeout:
         resp = client.get("/v1/hosts")
         if resp.status_code == 200:
-            online = [h for h in resp.json().get("hosts", []) if h.get("status") == "online"]
+            online = [
+                h
+                for h in resp.json().get("hosts", [])
+                if h.get("host_id") == host_id and h.get("status") == "online"
+            ]
             if online:
                 return str(online[0]["host_id"])
         _POLL_PAUSE.wait(0.5)

@@ -127,6 +127,7 @@ CodexRequestFn = Callable[[str, CodexParams], Awaitable[CodexMessage]]
 
 _CONNECT_RETRY_DELAY_SECONDS = 0.05
 _EFFORT_CATALOG_TIMEOUT_SECONDS = 2.0
+_ACCOUNT_MODEL_LOOKUP_TIMEOUT_SECONDS = 2.0
 _EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS = 2.0
 _EFFORT_CONNECT_TIMEOUT_SECONDS = 2.0
 _EFFORT_SETTINGS_UPDATE_TIMEOUT_SECONDS = 2.0
@@ -1337,6 +1338,63 @@ async def list_codex_model_options(
         if not isinstance(next_cursor, str) or not next_cursor:
             raise ValueError("Codex model/list nextCursor must be a string or null")
         cursor = next_cursor
+
+
+async def resolve_codex_account_model(
+    client: CodexAppServerClient,
+    thread_id: str,
+    model: str,
+    *,
+    deadline: float | None = None,
+) -> str:
+    """Use a live account catalog's spelling for an equivalent gateway model.
+
+    Both the loaded thread and the catalog's config must explicitly select
+    OpenAI. Unknown providers, opaque ids, unavailable metadata, and models
+    absent from the catalog retain the requested identifier.
+    """
+    from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug
+    from omnigent.models.model_override import canonical_model_spelling
+
+    if canonical_model_spelling(model) == model:
+        return model
+    loop = asyncio.get_running_loop()
+    if deadline is None:
+        deadline = loop.time() + _ACCOUNT_MODEL_LOOKUP_TIMEOUT_SECONDS
+    remaining = deadline - loop.time()
+    if remaining <= 0:
+        return model
+
+    async def resolve() -> str:
+        try:
+            response = await client.request("config/read", {"includeLayers": False})
+        except CodexAppServerResponseError as exc:
+            if not _codex_rejects_request_field(exc, "includeLayers"):
+                raise
+            response = await client.request("config/read", {})
+        result = response.get("result")
+        config = result.get("config") if isinstance(result, dict) else None
+        if not isinstance(config, dict) or config.get("model_provider") != "openai":
+            return model
+        response = await client.request(
+            "thread/read", {"threadId": thread_id, "includeTurns": False}
+        )
+        result = response.get("result")
+        thread = result.get("thread") if isinstance(result, dict) else None
+        if not isinstance(thread, dict) or thread.get("modelProvider") != "openai":
+            return model
+        rows = await list_codex_model_options(client, include_hidden=True)
+        return codex_reachable_model_slug(model, rows) or model
+
+    try:
+        return await asyncio.wait_for(resolve(), timeout=remaining)
+    except Exception:  # noqa: BLE001 — metadata must not replace a requested model
+        log_once(
+            _logger,
+            logging.INFO,
+            "Could not confirm Codex account model spelling; retaining the requested id",
+        )
+        return model
 
 
 _model_discovery_cache: TTLCache[str, tuple[_JsonObject, ...]] = TTLCache(

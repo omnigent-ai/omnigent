@@ -132,12 +132,15 @@ class _FakeCodexNativeClient:
         yield {}
 
 
-def _collect_turn_events(executor: CodexNativeExecutor, text: str) -> list[Any]:
+def _collect_turn_events(
+    executor: CodexNativeExecutor, text: str, config: ExecutorConfig | None = None
+) -> list[Any]:
     """
     Run one native executor turn and collect its events.
 
     :param executor: Native Codex executor under test.
     :param text: User text to send, e.g. ``"hello"``.
+    :param config: Optional per-request model and effort settings.
     :returns: Events yielded by :meth:`CodexNativeExecutor.run_turn`.
     """
 
@@ -152,6 +155,7 @@ def _collect_turn_events(executor: CodexNativeExecutor, text: str) -> list[Any]:
             [{"role": "user", "content": [{"type": "input_text", "text": text}]}],
             [],
             "",
+            config,
         ):
             events.append(event)
         return events
@@ -1897,7 +1901,9 @@ def test_model_settings_update_mirrors_model_into_config_toml(
     assert read_codex_config_model(tmp_path) == "gpt-5.6-luna"
 
 
-def _catalog_client(supported: list[str]) -> type[_FakeCodexNativeClient]:
+def _catalog_client(
+    supported: list[str], *, provider: str | None = None, thread_provider: str | None = None
+) -> type[_FakeCodexNativeClient]:
     """Return a fresh fake whose catalog lists ``gpt-5.6-sol`` with *supported* efforts."""
 
     class CatalogClient(_FakeCodexNativeClient):
@@ -1906,6 +1912,12 @@ def _catalog_client(supported: list[str]) -> type[_FakeCodexNativeClient]:
         next_turn = 1
 
         async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "config/read":
+                type(self).requests.append((method, params))
+                return {"result": {"config": {"model_provider": provider}}}
+            if method == "thread/read":
+                type(self).requests.append((method, params))
+                return {"result": {"thread": {"modelProvider": thread_provider}}}
             if method == "model/list":
                 type(self).requests.append((method, params))
                 return {
@@ -1924,6 +1936,139 @@ def _catalog_client(supported: list[str]) -> type[_FakeCodexNativeClient]:
             return await super().request(method, params)
 
     return CatalogClient
+
+
+@pytest.mark.parametrize(
+    ("pick", "provider", "thread_provider", "expected"),
+    [
+        ("system.ai.gpt-5-6-sol", "openai", "openai", "gpt-5.6-sol"),
+        ("databricks-gpt-5-6-sol", "openai", "openai", "gpt-5.6-sol"),
+        ("system.ai.gpt-5-6-sol", "gateway", "gateway", "system.ai.gpt-5-6-sol"),
+        ("system.ai.gpt-5-6-sol", "openai", "gateway", "system.ai.gpt-5-6-sol"),
+        ("system.ai.gpt-5-6-sol", "gateway", "openai", "system.ai.gpt-5-6-sol"),
+        ("system.ai.gpt-5-6-sol", None, "openai", "system.ai.gpt-5-6-sol"),
+        ("openai/example-model", "openai", "openai", "openai/example-model"),
+        ("system.ai.custom-model", "openai", "openai", "system.ai.custom-model"),
+    ],
+)
+@pytest.mark.parametrize("steering", [False, True])
+def test_saved_pick_replay_uses_the_connected_account_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    pick: str,
+    provider: str | None,
+    thread_provider: str | None,
+    expected: str,
+    steering: bool,
+) -> None:
+    """A saved override cannot undo a confirmed account model at first delivery."""
+    client = _catalog_client(
+        ["low", "medium", "high"], provider=provider, thread_provider=thread_provider
+    )
+    monkeypatch.setattr("omnigent.harnesses.codex_native.app_server.CodexAppServerClient", client)
+    _start_state(tmp_path)
+    if steering:
+        state = read_bridge_state(tmp_path)
+        assert state is not None
+        write_bridge_state(tmp_path, replace(state, active_turn_id="existing-turn"))
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    (home / "config.toml").write_text('model = "gpt-5.6-sol"\n')
+    config = ExecutorConfig(model=pick)
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello", config)
+
+    updates = [params for method, params in client.requests if method == "thread/settings/update"]
+    if steering:
+        assert updates == []
+        assert [method for method, _params in client.requests] == ["turn/steer"]
+        assert read_codex_config_model(tmp_path) == "gpt-5.6-sol"
+    else:
+        assert updates == [{"threadId": "thread_123", "model": expected}]
+        assert read_codex_config_model(tmp_path) == expected
+    assert config.model == pick
+    assert isinstance(events[-1], TurnComplete)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "config-unavailable",
+        "thread-unsupported",
+        "catalog-unavailable",
+        "budget",
+        "cancel",
+        "unlisted",
+        "settings-failed",
+    ],
+)
+def test_account_model_resolution_preserves_refusals_and_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    """Unavailable proof preserves the pick; genuine settings failures still fail."""
+    from omnigent.harnesses.codex_native import app_server
+
+    pick = "system.ai.gpt-9-absent" if failure == "unlisted" else "system.ai.gpt-5-6-sol"
+    base = _catalog_client(["low", "medium", "high"], provider="openai", thread_provider="openai")
+    monkeypatch.setattr(app_server, "_ACCOUNT_MODEL_LOOKUP_TIMEOUT_SECONDS", 0.03)
+
+    class Client(base):
+        closes = 0
+
+        async def close(self) -> None:
+            type(self).closes += 1
+            await super().close()
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            unavailable = {
+                "config-unavailable": "config/read",
+                "thread-unsupported": "thread/read",
+                "catalog-unavailable": "model/list",
+            }
+            if failure == "budget" and method in {"config/read", "thread/read"}:
+                await asyncio.sleep(0.02)
+            if failure == "cancel" and method == "thread/read":
+                raise asyncio.CancelledError
+            if method == unavailable.get(failure):
+                type(self).requests.append((method, params))
+                raise CodexAppServerResponseError(
+                    {"code": -32601, "message": "unsupported metadata"}
+                )
+            if method == "thread/settings/update":
+                type(self).requests.append((method, params))
+                if failure == "settings-failed":
+                    raise OSError("settings transport failed")
+                raise CodexAppServerResponseError({"code": -32602, "message": "model unavailable"})
+            return await super().request(method, params)
+
+    monkeypatch.setattr(app_server, "CodexAppServerClient", Client)
+    _start_state(tmp_path)
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    (home / "config.toml").write_text('model = "gpt-5.6-sol"\n')
+    config = ExecutorConfig(model=pick)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    if failure == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            _collect_turn_events(executor, "hello", config)
+        assert not any(method == "thread/settings/update" for method, _params in Client.requests)
+        assert Client.closes == len(Client.created) == 1
+    else:
+        events = _collect_turn_events(executor, "hello", config)
+        assert isinstance(events[-1], ExecutorError)
+        expected = "gpt-5.6-sol" if failure == "settings-failed" else pick
+        updates = [
+            params for method, params in Client.requests if method == "thread/settings/update"
+        ]
+        assert updates == [{"threadId": "thread_123", "model": expected}]
+    assert not any(method == "turn/start" for method, _params in Client.requests)
+    if failure == "budget":
+        assert not any(method == "model/list" for method, _params in Client.requests)
+    assert read_codex_config_model(tmp_path) == "gpt-5.6-sol"
+    assert config.model == pick
 
 
 @pytest.mark.parametrize(

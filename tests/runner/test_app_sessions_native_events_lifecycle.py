@@ -84,6 +84,8 @@ class _RecordingCodexAppServerClient:
         self.closed = False
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self.model_list_responses: list[dict[str, Any]] = []
+        self.metadata_responses: dict[str, dict[str, Any]] = {}
+        self.thread_loaded = True
 
     async def connect(self) -> None:
         """
@@ -103,6 +105,16 @@ class _RecordingCodexAppServerClient:
         :returns: Empty successful JSON-RPC result.
         """
         self.requests.append((method, params))
+        if method in {"thread/read", "thread/settings/update"} and not self.thread_loaded:
+            from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
+
+            raise CodexAppServerResponseError(
+                {"code": -32600, "message": f"thread not found: {params['threadId']}"}
+            )
+        if method == "thread/resume":
+            self.thread_loaded = True
+        if method in self.metadata_responses:
+            return self.metadata_responses[method]
         if method == "model/list" and self.model_list_responses:
             return self.model_list_responses.pop(0)
         return {"result": {}}
@@ -125,6 +137,14 @@ class _RecordingCodexAppServerClient:
             {"threadId": "thread_codex", "model": "gpt-5.4"},
         ),
         (
+            {"type": "model_change", "model": "system.ai.gpt-5-6-sol"},
+            {"threadId": "thread_codex", "model": "gpt-5.6-sol"},
+        ),
+        (
+            {"type": "model_change", "model": "databricks-gpt-5-6-sol"},
+            {"threadId": "thread_codex", "model": "gpt-5.6-sol"},
+        ),
+        (
             {"type": "effort_change", "effort": "xhigh"},
             {"threadId": "thread_codex", "effort": "xhigh"},
         ),
@@ -143,14 +163,22 @@ class _RecordingCodexAppServerClient:
             },
         ),
     ],
-    ids=["model_change", "effort_change", "plan_mode_change"],
+    ids=[
+        "model_change",
+        "account-route-id",
+        "account-serving-id",
+        "effort_change",
+        "plan_mode_change",
+    ],
 )
+@pytest.mark.parametrize("initially_loaded", [True, False])
 async def test_events_codex_native_settings_change_uses_thread_settings_update(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     event_payload: dict[str, Any],
     expected_params: dict[str, Any],
+    initially_loaded: bool,
 ) -> None:
     """
     Codex-native model / effort updates call ``thread/settings/update``.
@@ -181,6 +209,23 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
         transport="ws://127.0.0.1:43210",
         client_name="omnigent-codex-native-runner",
     )
+    fake_client.thread_loaded = initially_loaded
+    account_pick = event_payload["type"] == "model_change" and event_payload.get(
+        "model"
+    ) != expected_params.get("model")
+    if account_pick:
+        fake_client.metadata_responses = {
+            "config/read": {"result": {"config": {"model_provider": "openai"}}},
+            "thread/read": {"result": {"thread": {"modelProvider": "openai"}}},
+        }
+        fake_client.model_list_responses = [
+            {
+                "result": {
+                    "data": [{"id": "gpt-5.6-sol", "model": "gpt-5.6-sol"}],
+                    "nextCursor": None,
+                }
+            }
+        ]
 
     def _fake_client_for_transport(
         transport: str,
@@ -230,12 +275,22 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
     assert fake_client.closed
     if event_payload["type"] == "effort_change":
         assert "effort change without a known model skips validation" in caplog.text
-    assert fake_client.requests == [
-        ("thread/settings/update", expected_params),
-    ], (
-        f"codex-native {event_payload['type']} must call thread/settings/update "
-        f"with next-turn settings; got {fake_client.requests!r}."
-    )
+    updates = [call for call in fake_client.requests if call[0] == "thread/settings/update"]
+    initial_params = dict(expected_params)
+    if account_pick and not initially_loaded:
+        initial_params["model"] = event_payload["model"]
+    expected_updates = [("thread/settings/update", expected_params)]
+    if not initially_loaded:
+        expected_updates.insert(0, ("thread/settings/update", initial_params))
+    assert updates == expected_updates
+    if not account_pick and initially_loaded:
+        assert fake_client.requests == updates
+    if account_pick:
+        assert event_payload["model"] != expected_params["model"]
+        assert (
+            codex_native_bridge.read_codex_home_config_model(tmp_path / "codex-home")
+            == expected_params["model"]
+        )
 
 
 @pytest.mark.asyncio

@@ -60,6 +60,8 @@ class _LoopbackCodex:
     applied_updates: list[dict[str, Any]] = field(default_factory=list)
     rpc_errors: list[dict[str, Any]] = field(default_factory=list)
     response_errors: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    model_provider: str | None = None
+    thread_model_provider: str | None = None
     refuse_handshake: bool = False
     proc: SimpleNamespace | None = None
 
@@ -141,7 +143,17 @@ class _LoopbackCodex:
                 await websocket.send(json.dumps({"id": message["id"], "error": error}))
                 continue
             result: dict[str, Any] = {}
-            if method == "model/list":
+            if method == "config/read":
+                result = {"config": {"model_provider": self.model_provider}}
+            elif method == "thread/read":
+                thread_id = params["threadId"]
+                if thread_id not in self.loaded_threads:
+                    error = {"code": -32600, "message": f"thread not found: {thread_id}"}
+                    self.rpc_errors.append(error)
+                    await websocket.send(json.dumps({"id": message["id"], "error": error}))
+                    continue
+                result = {"thread": {"id": thread_id, "modelProvider": self.thread_model_provider}}
+            elif method == "model/list":
                 result = {
                     "data": [
                         {
@@ -215,25 +227,34 @@ class _NativeSession:
         )
         assert response.status_code == 200, response.text
 
-    def assert_settings(self, model: str, effort: str = "high") -> None:
+    def assert_settings(
+        self, model: str, effort: str = "high", *, applied_model: str | None = None
+    ) -> None:
+        applied_model = applied_model or model
         saved = self.store.get_conversation(self.session_id)
         assert saved.model_override == model
         assert saved.reasoning_effort == effort
-        assert bridge.read_codex_config_model(self.codex.bridge_dir) == model
+        assert bridge.read_codex_config_model(self.codex.bridge_dir) == applied_model
         assert bridge.read_codex_config_effort(self.codex.bridge_dir) == effort
         assert self.codex.loaded_threads[self.codex.thread_id] == {
-            "model": model,
+            "model": applied_model,
             "effort": effort,
         }
 
     def assert_applied(
-        self, response: httpx.Response, *, model: str = _REQUESTED_MODEL, effort: str = "high"
+        self,
+        response: httpx.Response,
+        *,
+        model: str = _REQUESTED_MODEL,
+        effort: str = "high",
+        applied_model: str | None = None,
     ) -> None:
+        applied_model = applied_model or model
         assert response.status_code == 200, response.text
         assert response.json()["model_override"] == model
-        self.assert_settings(model, effort)
+        self.assert_settings(model, effort, applied_model=applied_model)
         assert self.codex.applied_updates == [
-            {"threadId": self.codex.thread_id, "model": model, "effort": effort}
+            {"threadId": self.codex.thread_id, "model": applied_model, "effort": effort}
         ]
         assert not any(event.get("type") == "response.error" for event in self.events)
 
@@ -365,6 +386,30 @@ async def test_connected_codex_model_change_before_idle_reap(
     )
     native_session.assert_applied(response)
     assert native_session.codex.launches == 1
+
+
+@pytest.mark.parametrize("pick", ["system.ai.gpt-6-sol", "databricks-gpt-6-sol"])
+@pytest.mark.parametrize("unloaded", [False, True])
+async def test_account_model_pick_confirms_the_applied_native_identifier(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    pick: str,
+    unloaded: bool,
+) -> None:
+    """Retain the selected id while applying its confirmed account spelling."""
+    session = native_session
+    session.codex.model_provider = "openai"
+    session.codex.thread_model_provider = "openai"
+    if unloaded:
+        session.codex.loaded_threads.clear()
+    selection = {"model_override": pick}
+
+    response = await client.patch(f"/v1/sessions/{session.session_id}", json=selection)
+
+    session.assert_applied(response, model=pick, applied_model=_REQUESTED_MODEL)
+    assert selection["model_override"] == pick
+    assert response.json()["model_override"] == pick
+    assert session.store.get_conversation(session.session_id).model_override == pick
 
 
 @pytest.mark.parametrize("combined", [False, True], ids=["model", "model-and-effort"])

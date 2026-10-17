@@ -224,20 +224,37 @@ async def codex_launch_harness(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("pick", ["databricks-gpt-5-6-sol", "system.ai.gpt-5-6-sol"])
+@pytest.mark.parametrize("provider", ["profile", "openai", "stale-openai"])
 async def test_equivalent_gateway_pick_launches_without_reset(
-    pick: str, codex_launch_harness: _LaunchHarness
+    pick: str,
+    provider: str,
+    codex_launch_harness: _LaunchHarness,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Gateway prefixes and endpoint punctuation do not make a pick unavailable."""
     harness = codex_launch_harness
+    if provider.endswith("openai"):
+        monkeypatch.setattr(
+            codex_app,
+            "resolve_native_codex_launch",
+            lambda *, model, spec=None, terminal_launch_args=(): codex_app.NativeCodexLaunch(
+                config_overrides=['model_provider="openai"'], model=model, profile=None
+            ),
+        )
     harness.snapshot["model_override"] = pick
-    harness.seed_catalog([{"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "isDefault": True}])
+    harness.seed_catalog(
+        [{"id": "gpt-5.6-sol", "model": "gpt-5.6-sol", "isDefault": True}],
+        stale=provider == "stale-openai",
+    )
 
     await harness.launch()
 
-    assert harness.builds[0]["model"] == pick
+    assert harness.builds[0]["model"] == ("gpt-5.6-sol" if provider == "openai" else pick)
     assert harness.builds[0]["session_id"] == _SESSION_ID
+    assert harness.snapshot["model_override"] == pick
     assert harness.resets == []
-    harness.probe.assert_not_awaited()
+    if provider != "stale-openai":
+        harness.probe.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -26,6 +26,7 @@ from omnigent.harnesses.codex_native.app_server import (
     client_for_transport,
     is_server_draining_error,
     is_stale_active_turn_error,
+    resolve_codex_account_model,
     resolve_codex_effort_for_model,
 )
 from omnigent.harnesses.codex_native.bridge import (
@@ -331,6 +332,11 @@ async def _start_codex_turn(
 ) -> None:
     """Apply optional settings and start one Codex turn on an idle thread."""
     settings_overrides = dict(settings_overrides)
+    requested_model = settings_overrides.get("model")
+    if isinstance(requested_model, str):
+        settings_overrides["model"] = await resolve_codex_account_model(
+            client, state.thread_id, requested_model
+        )
     # Settings applied while their config write failed are recorded beside the config.
     unmirrored = await asyncio.to_thread(read_unmirrored_codex_settings, bridge_dir)
     model = (
