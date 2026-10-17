@@ -180,6 +180,15 @@ Cross-harness journeys:
   `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_codex_picker_offers_the_clis_catalog_and_default`
   (real host API and Codex CLI, with custom/bundled catalogs and a hidden default; desktop and mobile);
   see also [composer](./composer.md) for effort.
+- **`model-and-effort`, Claude controls during terminal startup:**
+  `tests/harnesses/claude_native/test_claude_native_slow_ready.py::test_slash_command_waits_for_a_silently_booting_terminal`
+  drives a real private tmux pane; model/effort/compact recreation and bounded
+  startup failures run through the runner in
+  `tests/runner/test_app_sessions_native_session_change_heal.py`.
+  These prove terminal delivery and control responses without vendor inference.
+  `tests/server/integration/test_native_model_change_failures.py` covers the public
+  settings response and rollback; `tests/runner/test_claude_control_deadline.py`
+  verifies a cancelled caller stops its original worker and queued injection.
 - **`model-and-effort`, managed sandbox before a host exists:**
   `tests/e2e_ui/start_session/test_sandbox_gateway_models_without_binding.py::test_sandbox_codex_picker_offers_gateway_models_before_a_host_exists`,
   `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_optional_gateway_preview_without_a_host`.
