@@ -645,14 +645,8 @@ class TestConstructor(unittest.TestCase):
         # separately passes --host for its own workspace guard (identity is
         # still pinned by --profile), so assert on the mint, not the whole helper.
         self.assertNotIn("databricks auth token --host", helper)
-        # `--force-refresh` only exists in Databricks CLI >= v0.296.0, so it
-        # stays behind a `--help` capability probe — an older CLI rejects the
-        # unknown flag and yields an empty token → silent 401.
-        self.assertIn("databricks auth token --help", helper)
-        # And even where it exists it is only ATTEMPTED: it fails outright on a
-        # stale refresh token, so an empty result must fall back to the cached
-        # token rather than turning a usable credential into an auth failure.
-        self.assertIn("--force-refresh", helper)
+        # Concurrent forced refreshes race the shared refresh token into revocation.
+        self.assertNotIn("--force-refresh", helper)
         self.assertIn('if [ -z "$token" ]; then', helper)
 
     def test_databricks_flag_no_creds_raises(self):

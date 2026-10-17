@@ -293,16 +293,12 @@ def databricks_bearer_token_command(
     authenticating as *different* profiles for the same workspace, one of them
     re-authed and the other not.
 
-    **Refresh.** ``--force-refresh`` is attempted first: it renews a still-valid
-    cached token, which is what keeps a long gateway session from hitting a
-    mid-session 401. But it *fails* when the refresh token itself has gone
-    stale, and unconditionally forcing turned a perfectly usable cached access
-    token into a hard auth failure. So the forced attempt is speculative — its
-    output is captured and its stderr dropped — and an empty result falls back
-    to plain ``auth token``, which serves the cached token and renews it only
-    when it is near expiry. The fallback keeps its stderr so a genuine auth
-    failure is still visible. ``--force-refresh`` only exists in Databricks CLI
-    >= v0.296.0, so it stays behind the ``--help`` capability probe.
+    **Refresh.** Plain ``auth token`` serves the cached access token and renews
+    it only near expiry; a harness re-runs the helper on a 401. Never pass
+    ``--force-refresh``: every concurrent session runs this helper, and each
+    forced call rotates the profile's single-use refresh token in the shared
+    token cache. Racing rotations replay a spent refresh token, the IdP revokes
+    the grant, and every session 401s until the user re-runs ``auth login``.
 
     **Fallbacks.** After the CLI mint, empty-token fallbacks run in order. A
     caller-supplied command (the one ucode recorded, pinned to the named
@@ -373,14 +369,8 @@ def databricks_bearer_token_command(
         "| jq -r '.access_token // empty'); "
         'if [ -z "$token" ]; then token="$DATABRICKS_BEARER"; fi; '
         'printf "%s\\n" "$token"; '
-        "else token=''; "
-        "if databricks auth token --help 2>&1 | grep -q force-refresh; then "
-        f"token=$({mint} --force-refresh --output json 2>/dev/null "
-        "| jq -r '.access_token // empty'); "
-        "fi; "
-        'if [ -z "$token" ]; then '
+        "else "
         f"token=$({mint} --output json | jq -r '.access_token // empty'); "
-        "fi; "
         f"{fallback}"
         'printf "%s\\n" "$token"; fi'
     )
