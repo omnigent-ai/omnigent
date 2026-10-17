@@ -1076,6 +1076,17 @@ class HarnessInstallResult(NamedTuple):
     reason: str | None
 
 
+_INSTALL_LOCKS: dict[str, threading.Lock] = {}
+_INSTALL_LOCKS_GUARD = threading.Lock()
+
+
+def _install_lock(spec: HarnessInstallSpec) -> threading.Lock:
+    """One lock per installed artifact: concurrent callers (host boot preparation,
+    a UI install request) must never run two installers of one package at once."""
+    with _INSTALL_LOCKS_GUARD:
+        return _INSTALL_LOCKS.setdefault(spec.package or spec.binary, threading.Lock())
+
+
 def try_install_harness_cli(key: str) -> HarnessInstallResult:
     """Install the harness CLI, returning whether it landed and why not.
 
@@ -1100,15 +1111,31 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
     cmd = harness_install_command(key)
     if shutil.which(cmd[0]) is None:
         return HarnessInstallResult(False, f"{cmd[0]!r} is not available on the host")
+    # harness_install_command would have raised for a spec-less key, so spec is
+    # non-None past this point.
+    assert spec is not None
+    lock = _install_lock(spec)
+    waited = not lock.acquire(blocking=False)
+    if waited:
+        lock.acquire()
+    try:
+        # Another caller just installed this package: skip the redundant run
+        # unless the CLI still misses its version range (an upgrade is wanted).
+        if waited and harness_cli_installed(key):
+            return HarnessInstallResult(True, None)
+        return _run_installer(spec, cmd)
+    finally:
+        lock.release()
+
+
+def _run_installer(spec: HarnessInstallSpec, cmd: list[str]) -> HarnessInstallResult:
+    """Run *cmd* and report whether ``spec.binary`` resolves afterwards."""
     try:
         result = subprocess.run(cmd, check=False, timeout=300)
     except subprocess.TimeoutExpired:
         return HarnessInstallResult(False, "install timed out after 300s")
     except OSError as exc:
         return HarnessInstallResult(False, f"install command failed to run: {exc}")
-    # harness_install_command would have raised for a spec-less key, so spec is
-    # non-None past this point.
-    assert spec is not None
     # Resolve the freshly-installed binary via the SAME ladder readiness uses
     # (:func:`resolve_cli_binary` — ``PATH`` plus the nvm/npm-global/homebrew
     # fallback dirs), so the install verdict and the readiness badge can never

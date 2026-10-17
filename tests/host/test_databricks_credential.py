@@ -194,6 +194,21 @@ def test_broker_token_command_none_for_a_different_workspace(
     assert dc.broker_token_command("https://other.example") is None
 
 
+def test_managed_connect_workspace_host_after_configure(monkeypatch: pytest.MonkeyPatch) -> None:
+    _connected(monkeypatch)
+    assert dc.configure_host_databricks("https://omni.example/", "host-1") is True
+    assert dc.managed_connect_workspace_host() == "https://ws.example"
+
+
+def test_managed_connect_workspace_host_none_without_sidecar(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A profile alone (e.g. an operator's own [omnigent] section) is not a
+    # managed-connect host; the broker sidecar is what makes it one.
+    assert dc._write_profile(tmp_path / ".databrickscfg", "https://ws.example")
+    assert dc.managed_connect_workspace_host() is None
+
+
 def test_main_prints_broker_bearer(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -154,3 +154,37 @@ print('stdout-after-logger-marker', flush=True)
     assert handles[0].proc.poll() is not None
     if exit_early:
         assert handles[0].proc.returncode == 23
+
+
+def test_isolated_host_writes_caller_config_beside_its_identity(tmp_path: Path):
+    import sys
+
+    import yaml
+
+    from tests._helpers.host import isolated_host
+
+    with pytest.raises(ValueError, match="identity section"):
+        with isolated_host(tmp_path, "http://127.0.0.1:1", config={"host": {"name": "mine"}}):
+            pytest.fail("a caller-owned host section must be rejected before starting a host")
+    assert not (tmp_path / "home").exists()
+
+    written: list[dict] = []
+
+    def ready(host):
+        written.append(yaml.safe_load((host.home / ".omnigent" / "config.yaml").read_text()))
+
+    with isolated_host(
+        tmp_path,
+        "http://127.0.0.1:1",
+        base_env={"PATH": os.environ["PATH"]},
+        host_id="cafe" * 8,
+        name="merged-host",
+        command=[sys.executable, "-c", "import time; time.sleep(60)"],
+        cwd=tmp_path,
+        config={"providers": {"mock": {"kind": "key"}}},
+        ready=ready,
+    ):
+        pass
+    (config,) = written
+    assert config["host"] == {"host_id": "cafe" * 8, "name": "merged-host"}
+    assert config["providers"] == {"mock": {"kind": "key"}}

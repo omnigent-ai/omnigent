@@ -373,6 +373,81 @@ def test_claude_ready_via_configured_provider_without_cli_login(
     assert configured_harness_map()["claude-native"] is True
 
 
+def _managed_connect_host(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, sidecar: bool
+) -> None:
+    """Model a managed-connect sandbox: host-only ``[omnigent]`` profile, plus the
+    broker sidecar ``configure_host_databricks`` writes beside it when *sidecar*."""
+    import omnigent.harnesses.codex_native.main as codex_main
+    from omnigent.host import databricks_credential as dc
+
+    # Codex readiness probes the [omnigent] profile live (model discovery), which
+    # can block for minutes without a reachable workspace; these tests are about Pi.
+    monkeypatch.setattr(codex_main, "_codex_auth_unavailable_reason", lambda: None)
+    cfg = tmp_path / ".databrickscfg"
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    assert dc._write_profile(cfg, "https://ws.example")
+    if sidecar:
+        assert dc._write_sidecar(
+            cfg, "https://omni.example", "host-1", "tok", "https://ws.example"
+        )
+
+
+def test_pi_ready_via_managed_connect_broker_without_provider_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Installed Pi with no ``providers:`` entry reads ready on a managed-connect
+    host: launch routes it through the owner's Databricks broker, so the picker
+    must not block it as needs-auth."""
+    _all_clis_installed(monkeypatch)
+    _managed_connect_host(monkeypatch, tmp_path, sidecar=True)
+    result = configured_harness_map()
+    for harness in ("pi", "pi-native", "native-pi"):
+        assert result[harness] is True
+
+
+def test_pi_needs_auth_with_profile_but_no_broker_sidecar(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _all_clis_installed(monkeypatch)
+    _managed_connect_host(monkeypatch, tmp_path, sidecar=False)
+    assert configured_harness_map()["pi-native"] == "needs-auth"
+
+
+def test_pi_managed_connect_broker_yields_to_global_api_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A global ``auth: api_key`` keeps launch off the broker, so readiness does too."""
+    _all_clis_installed(monkeypatch)
+    _managed_connect_host(monkeypatch, tmp_path, sidecar=True)
+    (tmp_path / "config.yaml").write_text(
+        "auth:\n  type: api_key\n  api_key: sk-test\n", encoding="utf-8"
+    )
+    assert configured_harness_map()["pi-native"] == "needs-auth"
+
+
+def test_pi_managed_connect_check_failure_logs_only_the_exception_class(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failing lookup is logged without its message: a ``.databrickscfg`` parse
+    error can quote the offending line, including a malformed credential."""
+    import logging
+
+    from omnigent.host import databricks_credential as dc
+
+    _all_clis_installed(monkeypatch)
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / ".databrickscfg"))
+
+    def broken_lookup() -> str | None:
+        raise ValueError("Source contains parsing errors: token = sk-SYNTHETIC-SECRET")
+
+    monkeypatch.setattr(dc, "managed_connect_workspace_host", broken_lookup)
+    with caplog.at_level(logging.DEBUG, logger="omnigent.onboarding.harness_readiness"):
+        assert configured_harness_map()["pi-native"] == "needs-auth"
+    assert "SYNTHETIC-SECRET" not in caplog.text
+    assert "managed-connect check failed (ValueError)" in caplog.text
+
+
 def test_family_provider_configured_excludes_subscription(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -727,16 +727,14 @@ def _connect_broker_pi_provider(*, model: str | None) -> PiProviderConfig | None
     """
     from omnigent.host.databricks_credential import (
         HOST_DATABRICKS_PROFILE,
-        broker_token_command,
+        managed_connect_workspace_host,
     )
-    from omnigent.inner.databricks_executor import _read_databrickscfg_host
     from omnigent.onboarding.provider_config import ProviderEntry
     from omnigent.onboarding.ucode_state import read_ucode_state
 
-    host = _read_databrickscfg_host(HOST_DATABRICKS_PROFILE)
-    if not host or not broker_token_command(host.rstrip("/")):
+    host = managed_connect_workspace_host()
+    if host is None:
         return None  # not a managed connect host
-    host = host.rstrip("/")
     served_model = model
     if served_model is None:
         workspace_state = read_ucode_state(host)
