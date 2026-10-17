@@ -237,6 +237,7 @@ def test_routing_available_from_a_legacy_single_client() -> None:
             routing_client=None,
             policy_llm_connection_factory=None,
         ),
+        SimpleNamespace(remote_routing_available=False),
     ],
 )
 def test_routing_unavailable_when_nothing_is_configured(caps: Any) -> None:
@@ -399,3 +400,24 @@ async def test_route_with_fallback_uses_the_judge_off_the_gateway() -> None:
 
 async def test_route_with_fallback_reports_an_unconfigured_deployment() -> None:
     assert await route_with_fallback(RoutingBackends(), "hi", _MENU, gateway_backed=True) is None
+
+
+def test_routing_available_trusts_a_runners_remote_server() -> None:
+    """A runner has no backends of its own; the server's answer is the truth.
+
+    Without this, every runner reads routing as off — the backends are built in
+    the server process — and hides the advisor from sessions the server routes.
+    """
+    assert routing_available(SimpleNamespace(remote_routing_available=True)) is True
+
+
+def test_routing_available_keeps_its_own_answer_when_it_owns_backends() -> None:
+    """A process with backends answers for itself; a remote flag cannot mask a tripped router."""
+    caps = _caps(
+        routing_backends=RoutingBackends(external=_Tripped()),
+        routing_client=None,
+        policy_llm_connection_factory=None,
+        remote_routing_available=True,
+    )
+    assert routing_sources(caps) == {"external": False, "oss": False}
+    assert routing_available(caps) is False

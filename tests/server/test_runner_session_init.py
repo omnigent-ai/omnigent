@@ -70,7 +70,12 @@ def _conversation() -> Conversation:
 
 
 @pytest.mark.asyncio
-async def test_initializer_shares_result_for_one_tunnel_generation() -> None:
+async def test_initializer_shares_result_for_one_tunnel_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.server.runner_session_init.routing_available", lambda _caps: True
+    )
     registry = _Registry()
     client = _Client()
     initializer = RunnerSessionInitializer(  # type: ignore[arg-type]
@@ -92,6 +97,7 @@ async def test_initializer_shares_result_for_one_tunnel_generation() -> None:
     assert initializer.is_initialized(conversation, client)  # type: ignore[arg-type]
     assert len(client.calls) == 1
     assert client.calls[0]["session_init"]["snapshot"]["workspace"] == "/tmp/workspace"
+    assert client.calls[0]["session_init"]["smart_routing_available"] is True
 
     cached = await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
     assert cached is first_response
