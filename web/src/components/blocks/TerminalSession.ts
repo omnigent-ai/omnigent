@@ -421,6 +421,31 @@ export function parseTerminalClipboardMessage(message: string): string | null {
   return decodeTerminalClipboardBase64((value as { data: string }).data);
 }
 
+/** Largest pasted block forwarded through the server's tmux paste pipeline. */
+export const TERMINAL_PASTE_MAX_BYTES = 1024 * 1024;
+
+/**
+ * Build the browser→server ``paste`` control frame for pasted text, or
+ * ``null`` when the paste should stay on xterm's native path.
+ *
+ * Let tmux apply bracketed paste even when xterm missed the mode before attach.
+ * Single-line and oversized pastes retain xterm's native path.
+ *
+ * :param text: The ``text/plain`` clipboard payload of the paste event.
+ * :returns: The JSON text frame to send, or ``null`` to fall through.
+ */
+export function terminalPasteMessage(text: string): string | null {
+  if (!/[\r\n]/.test(text)) return null;
+  const bytes = new TextEncoder().encode(text);
+  if (bytes.length === 0 || bytes.length > TERMINAL_PASTE_MAX_BYTES) return null;
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return JSON.stringify({ type: "paste", encoding: "base64", data: btoa(binary) });
+}
+
 /** Whether a clipboard event is attributable to recent input on this attach. */
 export function hadRecentTerminalInput(lastInputAt: number, now: number): boolean {
   return (
@@ -776,6 +801,22 @@ export class TerminalSession {
         event.preventDefault();
         event.stopImmediatePropagation();
         this.onClipboardRequest?.(selection, event);
+      },
+      { capture: true, signal },
+    );
+
+    // Capture before xterm so tmux can apply bracketed paste for multiline text.
+    container.addEventListener(
+      "paste",
+      (e) => {
+        const message = terminalPasteMessage(e.clipboardData?.getData("text/plain") ?? "");
+        if (message === null) return;
+        e.preventDefault();
+        e.stopPropagation();
+        onInput?.();
+        this.lastUserInputAt = performance.now();
+        if (this.ws.readyState !== WebSocket.OPEN) return;
+        this.ws.send(message);
       },
       { capture: true, signal },
     );
