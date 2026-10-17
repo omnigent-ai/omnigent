@@ -49,6 +49,7 @@ from ._events import (
     ToolCall,
     ToolResult,
 )
+from ._http import session_url
 from ._sse import parse_sse_stream
 from ._timeouts import _SSE_TIMEOUT
 from ._tool_handler import (
@@ -965,7 +966,7 @@ async def _post_elicitation_result(
     body = {"action": "accept" if accepted else "decline"}
     try:
         resp = await http.post(
-            f"{base_url}/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+            session_url(base_url, session_id, "elicitations", elicitation_id, "resolve"),
             json=body,
             timeout=60.0,
         )
