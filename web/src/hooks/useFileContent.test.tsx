@@ -28,6 +28,7 @@ import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { useChatStore } from "@/store/chatStore";
 import {
   downloadWorkspaceFile,
+  fetchWorkspaceFileBytes,
   fileContentToBlob,
   triggerBrowserDownload,
   useFileContent,
@@ -308,6 +309,66 @@ describe("downloadWorkspaceFile", () => {
     } as Response);
 
     await expect(downloadWorkspaceFile("sess_x", "missing.txt")).rejects.toThrow("404");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fetchWorkspaceFileBytes
+// ---------------------------------------------------------------------------
+
+describe("fetchWorkspaceFileBytes", () => {
+  it("reads attachment responses inline without triggering a browser download", async () => {
+    const bytes = new Uint8Array([0x67, 0x6c, 0x54, 0x46]);
+    fetchMock.mockResolvedValueOnce(
+      new Response(bytes, {
+        headers: { "Content-Disposition": 'attachment; filename="scene.glb"' },
+      }),
+    );
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click");
+
+    await expect(fetchWorkspaceFileBytes("sess_123", "src/main.py")).resolves.toEqual(bytes.buffer);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      DOWNLOAD_URL,
+      expect.objectContaining({ cache: "no-store" }),
+    );
+    expect(click).not.toHaveBeenCalled();
+  });
+
+  it("propagates download-route errors", async () => {
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 404, statusText: "Not Found" }));
+
+    await expect(fetchWorkspaceFileBytes("sess_x", "missing.glb")).rejects.toThrow("404 Not Found");
+  });
+
+  it("rejects a Content-Length above the 256 MiB preview limit before reading", async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(new Uint8Array([1]), {
+        headers: { "Content-Length": String(256 * 1024 * 1024 + 1) },
+      }),
+    );
+
+    await expect(fetchWorkspaceFileBytes("sess_123", "huge.glb")).rejects.toThrow("256 MiB");
+
+    const signal = fetchMock.mock.calls.at(-1)?.[1]?.signal as AbortSignal | undefined;
+    expect(signal?.aborted).toBe(true);
+  });
+
+  it("cancels a chunked response as soon as the bounded read crosses the limit", async () => {
+    const cancel = vi.fn();
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array([1, 2, 3]));
+        controller.enqueue(new Uint8Array([4, 5, 6]));
+      },
+      cancel,
+    });
+    fetchMock.mockResolvedValueOnce(new Response(body));
+
+    await expect(
+      fetchWorkspaceFileBytes("sess_123", "chunked.glb", { maxBytes: 4 }),
+    ).rejects.toThrow("4 bytes");
+    expect(cancel).toHaveBeenCalledOnce();
   });
 });
 
