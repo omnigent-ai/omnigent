@@ -263,6 +263,37 @@ def test_kimi_native_bypass_permission_mode_translates_to_never_ask() -> None:
     assert _derive_terminal_launch_args_from_spec(spec) == ["--auto"]
 
 
+def test_kimi_native_bypass_permission_mode_precedes_yolo_false() -> None:
+    """An explicit Kimi bypass mode takes precedence over the yolo opt-out."""
+    spec = _spec_with_config(
+        {
+            "harness": "kimi-native",
+            "permission_mode": "bypassPermissions",
+            "yolo": False,
+        }
+    )
+    assert _derive_terminal_launch_args_from_spec(spec) == ["--auto"]
+
+
+def test_kimi_native_non_bypass_permission_mode_without_yolo_returns_none() -> None:
+    """Kimi ignores non-bypass modes when no yolo opt-in is present."""
+    spec = _spec_with_config({"harness": "kimi-native", "permission_mode": "plan"})
+    assert _derive_terminal_launch_args_from_spec(spec) is None
+
+
+def test_kimi_native_non_string_permission_mode_is_fail_closed() -> None:
+    """Non-string permission modes must never enable Kimi Never Ask."""
+
+    class _EqAnything:
+        def __eq__(self, other: object) -> bool:
+            return True
+
+        __hash__ = object.__hash__
+
+    spec = _spec_with_config({"harness": "kimi-native", "permission_mode": _EqAnything()})
+    assert _derive_terminal_launch_args_from_spec(spec) is None
+
+
 @pytest.mark.parametrize(
     ("mode", "expected"),
     [
