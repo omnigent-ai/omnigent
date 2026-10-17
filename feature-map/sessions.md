@@ -15,6 +15,9 @@ the header menu), and each place is a separate entry point.
 - `pin-reorder`: drag a pinned row onto another pinned row to change the Pinned
   order, which persists across reloads; dropping an unpinned row onto a pinned
   row pins it into that slot.
+- `touch-gestures`: on touch devices a row swipes to archive or delete
+  (configurable in Settings) and press-and-hold opens its menu in place of the
+  hover controls; the sidebar and Workspace dividers follow a finger drag.
 - `rename`: from the row, the header menu, or the header title; long titles are
   limited.
 - `archive`: archived sessions leave the main list and appear in the archived
@@ -135,7 +138,11 @@ returns to the Settings menu.
 
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
 offer pin, fork, rename, mark as unread or read, add to project (or move
-session), archive or unarchive, and delete.
+session), archive or unarchive, and delete. Touch devices of any width
+paint no hover controls on the row: press and hold it to open the same menu
+(Pin included), or swipe it. By default swipe right archives and swipe left
+deletes after a confirmation; both directions are configurable under Settings ›
+Appearance › Touch & mobile.
 
 **Project folder:** right-click its header or open its three-dot menu, then
 choose Rename project. Start typing as soon as the dialog opens.
@@ -235,7 +242,9 @@ Canvas conversation or side chat, and forks that displayed conversation rather
 than the main session.
 
 **Mobile:** the header menu and the sidebar drawer offer the same actions; touch
-devices fold some row controls into the menu.
+devices fold the row controls into the press-and-hold menu and add the row
+swipes described above. The sidebar and Workspace dividers also follow a finger
+drag, not only the mouse.
 
 **Databricks Sandbox and Arclet sessions:** Fork is disabled in the header,
 sidebar menus, and message actions. The composer's host menu shows a disabled
@@ -315,6 +324,15 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`pin-reorder`:**
   `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_drag_reorders_pinned_sessions`.
   Dropping an unpinned row onto a pinned row has web unit coverage only.
+- **`touch-gestures`:**
+  `tests/e2e_ui/sessions/test_touch_input_gestures.py::test_session_row_swipe_tracks_finger`,
+  `tests/e2e_ui/sessions/test_touch_input_gestures.py::test_session_row_left_swipe_opens_default_delete_confirmation`,
+  `tests/e2e_ui/sessions/test_touch_input_gestures.py::test_session_row_long_press_opens_actions_menu`,
+  `tests/e2e_ui/sessions/test_touch_input_gestures.py::test_row_actions_use_long_press_on_unfolded_foldable`,
+  `tests/e2e_ui/mobile/test_session_row_touch_gestures.py::test_session_row_long_press_with_wobble_opens_menu`,
+  `tests/e2e_ui/sessions/test_sidebar_touch_divider_and_row_controls.py::test_sidebar_divider_touch_drag_resizes`,
+  `tests/e2e_ui/sessions/test_inline_panel_resize.py::test_touch_resize_keeps_drag_range_on_tablet_width`.
+  Swipe-action defaults and the Touch & mobile settings have web unit coverage only.
 - **`rename`:**
   `tests/e2e_ui/sessions/test_sidebar_rename.py::test_rename_session_enforces_user_title_limit`,
   `tests/e2e_ui/sessions/test_header_session_menu.py::test_header_session_menu_renames_owner_and_hides_for_subagent`.

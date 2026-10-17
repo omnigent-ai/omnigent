@@ -636,7 +636,7 @@ interface WorkspacePanelProps {
   /** Suppress motion while the resize handle is actively dragging. */
   resizing?: boolean;
   /**
-   * Props for the left-edge resize handle (onMouseDown/onKeyDown + ARIA),
+   * Props for the left-edge resize handle (pointer handlers/onKeyDown + ARIA),
    * from ``useResizableInlinePanel().handleProps``.
    */
   handleProps: React.HTMLAttributes<HTMLDivElement> & { tabIndex: number };
@@ -1003,7 +1003,11 @@ function WorkspacePanelImpl({
   const effectiveHandleProps = pending
     ? {
         ...handleProps,
-        onMouseDown: undefined,
+        onPointerDown: undefined,
+        onPointerMove: undefined,
+        onPointerUp: undefined,
+        onPointerCancel: undefined,
+        onLostPointerCapture: undefined,
         onKeyDown: undefined,
         "aria-disabled": true,
         tabIndex: -1,
@@ -1195,372 +1199,376 @@ function WorkspacePanelImpl({
       </WorkspaceTabTooltip>
     ),
   };
-  const rail = (
-    <aside
-      aria-label="Workspace"
-      aria-hidden={!open}
-      inert={inert}
-      // The resize hook can starve the rail to width 0 while it stays mounted;
-      // marking it collapsed keeps index.css's safe-area padding off it so a
-      // zero-width rail can't paint a ghost bg-card strip on native shells.
-      data-collapsed={width === 0 || undefined}
-      // Full-height desktop surface flush to the window edge, separated from
-      // the main content by a left divider — no outer margin, rounding, or
-      // shadow (mirrors the left sidebar). AppShell reserves the panel width
-      // from ChatHeader, so the pane extends to the top without sitting under
-      // the existing session action cluster.
-      // ``@container/rail`` makes the rail a named container-query context so
-      // the tab strip can switch scroll behavior on the rail's own width
-      // (see the strip below) without a JS width listener.
-      //
-      // Maximized: break out of the flex row and stretch across the content
-      // region (absolute inset-0) so the rail owns the full width, keeping the
-      // same flush/bordered styling — only the width changes. The resize
-      // handle is suppressed in that state — there's no neighbor to resize
-      // against.
-      data-maximized={maximized || undefined}
-      data-state={open ? "open" : "closed"}
-      data-animate-visibility={animateVisibility || undefined}
-      data-resizing={resizing || undefined}
-      className={cn(
-        "workspace-panel-motion @container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-l md:border-border md:bg-card",
-        maximized ? "md:absolute md:inset-0" : "md:shrink-0",
-      )}
-      // Width is fixed by the resize handle normally; maximized ignores it and
-      // stretches to the absolute inset instead. The width doubles as the
-      // reservation index.css caps the rail's lateral safe-area insets to.
-      style={
-        maximized
-          ? undefined
-          : ({
-              width: open ? width : 0,
-              "--omnigent-reserved-width": `${width}px`,
-            } as CSSProperties)
-      }
-    >
-      <div
-        data-workspace-panel-inner
-        className="relative flex h-full min-h-0 shrink-0 flex-col"
-        style={{ width: maximized ? "100%" : width }}
-      >
-        {/* Left-edge horizontal resize handle — suppressed while maximized. */}
-        {!maximized && (
-          <div
-            {...effectiveHandleProps}
-            className={cn(
-              "absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors",
-              pending && "cursor-default hover:bg-transparent active:bg-transparent",
-            )}
-          />
-        )}
-        {/* The default nav tab comes first; the remaining tabs keep their relative order. */}
-        {/* Narrow rails use the picker for fixed panels, leaving room for open tabs. */}
+  return (
+    <>
+      {/* The resize target is a real flex gutter. Its bounded slivers stay
+          outside both scroll containers. */}
+      {!maximized && handleProps.hidden !== true && (
         <div
-          ref={tabListRef}
-          role="toolbar"
-          aria-label="Workspace tabs"
-          tabIndex={-1}
-          onKeyDown={handlePermanentTabNumber}
-          className="workspace-tab-strip shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-3"
+          {...effectiveHandleProps}
+          data-workspace-panel-resize-gutter
+          className={cn(
+            "relative z-50 hidden w-1 shrink-0 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50 data-dragging:bg-primary/50 md:block",
+            pending && "cursor-default hover:bg-transparent active:bg-transparent",
+          )}
+        />
+      )}
+      <aside
+        aria-label="Workspace"
+        aria-hidden={!open}
+        inert={inert}
+        // The resize hook can starve the rail to width 0 while it stays mounted;
+        // marking it collapsed keeps index.css's safe-area padding off it so a
+        // zero-width rail can't paint a ghost bg-card strip on native shells.
+        data-collapsed={width === 0 || undefined}
+        // Full-height desktop surface flush to the window edge, separated from
+        // the main content by a left divider — no outer margin, rounding, or
+        // shadow (mirrors the left sidebar). AppShell reserves the panel width
+        // from ChatHeader, so the pane extends to the top without sitting under
+        // the existing session action cluster.
+        // ``@container/rail`` makes the rail a named container-query context so
+        // the tab strip can switch scroll behavior on the rail's own width
+        // (see the strip below) without a JS width listener.
+        //
+        // Maximized: break out of the flex row and stretch across the content
+        // region (absolute inset-0) so the rail owns the full width, keeping the
+        // same flush/bordered styling — only the width changes. The resize
+        // handle is suppressed in that state — there's no neighbor to resize
+        // against.
+        data-maximized={maximized || undefined}
+        data-state={open ? "open" : "closed"}
+        data-animate-visibility={animateVisibility || undefined}
+        data-resizing={resizing || undefined}
+        className={cn(
+          "workspace-panel-motion @container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-l md:border-border md:bg-card",
+          maximized ? "md:absolute md:inset-0" : "md:shrink-0",
+        )}
+        // Width is fixed by the resize handle normally; maximized ignores it and
+        // stretches to the absolute inset instead. The width doubles as the
+        // reservation index.css caps the rail's lateral safe-area insets to.
+        style={
+          maximized
+            ? undefined
+            : ({
+                width: open ? width : 0,
+                "--omnigent-reserved-width": `${width}px`,
+              } as CSSProperties)
+        }
+      >
+        <div
+          data-workspace-panel-inner
+          className="relative flex h-full min-h-0 shrink-0 flex-col"
+          style={{ width: maximized ? "100%" : width }}
         >
-          <Tabs
-            className={cn("shrink-0", showOpenTabs && "@max-[400px]/rail:hidden")}
-            // When a file or shell tab is active no fixed trigger should
-            // highlight, so feed the radix group a sentinel that matches none of
-            // them. The active file/shell tab carries its own highlight. Gate the
-            // shell case on the terminal actually being present (same gate as the
-            // content slot below): a sticky selection whose terminal is gone shows
-            // the fallback nav view, so its nav tab must highlight, not "__tab__".
-            value={
-              pending
-                ? "__pending__"
-                : selectedFilePath !== null ||
-                    browserSelected ||
-                    sideChatSelected ||
-                    (selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey))
-                  ? "__tab__"
-                  : rightRailTab
-            }
-            onValueChange={(value) => selectPermanentTab(value as RightRailTab)}
-            componentId="chat.right_rail.tabs"
-          >
-            <TabsList variant="pill" className="gap-1">
-              {tabOrder.map((tab) => tabTriggers[tab])}
-            </TabsList>
-          </Tabs>
-          {/* The divider follows the fixed panel icons' visibility. */}
+          {/* The default nav tab comes first; the remaining tabs keep their relative order. */}
+          {/* Narrow rails use the picker for fixed panels, leaving room for open tabs. */}
           <div
-            aria-hidden
-            className={cn(
-              "mx-2 h-[14px] w-px shrink-0 self-center bg-border-strong",
-              showOpenTabs && "@max-[400px]/rail:hidden",
+            ref={tabListRef}
+            role="toolbar"
+            aria-label="Workspace tabs"
+            tabIndex={-1}
+            onKeyDown={handlePermanentTabNumber}
+            className="workspace-tab-strip shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-3"
+          >
+            <Tabs
+              className={cn("shrink-0", showOpenTabs && "@max-[400px]/rail:hidden")}
+              // When a file or shell tab is active no fixed trigger should
+              // highlight, so feed the radix group a sentinel that matches none of
+              // them. The active file/shell tab carries its own highlight. Gate the
+              // shell case on the terminal actually being present (same gate as the
+              // content slot below): a sticky selection whose terminal is gone shows
+              // the fallback nav view, so its nav tab must highlight, not "__tab__".
+              value={
+                pending
+                  ? "__pending__"
+                  : selectedFilePath !== null ||
+                      browserSelected ||
+                      sideChatSelected ||
+                      (selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey))
+                    ? "__tab__"
+                    : rightRailTab
+              }
+              onValueChange={(value) => selectPermanentTab(value as RightRailTab)}
+              componentId="chat.right_rail.tabs"
+            >
+              <TabsList variant="pill" className="gap-1">
+                {tabOrder.map((tab) => tabTriggers[tab])}
+              </TabsList>
+            </Tabs>
+            {/* The divider follows the fixed panel icons' visibility. */}
+            <div
+              aria-hidden
+              className={cn(
+                "mx-2 h-[14px] w-px shrink-0 self-center bg-border-strong",
+                showOpenTabs && "@max-[400px]/rail:hidden",
+              )}
+            />
+            {showOpenTabs && (
+              <>
+                {/* Open tabs fill the space before the pinned trailing controls. */}
+                <WorkspaceTabsScroller>
+                  <FileTabsStrip
+                    openFiles={openFiles}
+                    activeFilePath={selectedFilePath}
+                    onFileSelect={openFileViewer}
+                    onCloseFile={onCloseFile}
+                  />
+                  <TerminalTabsStrip
+                    openTerminals={openTerminals}
+                    activeTerminalKey={selectedTerminalKey}
+                    closingKey={closingTerminalKey ?? null}
+                    canClose={isEditorLevel(permissionLevel)}
+                    labelFor={terminalLabelFor}
+                    onSelect={openTerminalTab}
+                    onClose={onCloseTerminal}
+                  />
+                  {showBrowserTab &&
+                    browsers.tabs.map((tabId, index) => (
+                      <div
+                        key={tabId}
+                        ref={
+                          browserSelected && browsers.selected === tabId ? activeBrowserRef : null
+                        }
+                        className={cn(
+                          "flex h-[24px] shrink-0 items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
+                          browserSelected && browsers.selected === tabId
+                            ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
+                            : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
+                        )}
+                      >
+                        <button
+                          type="button"
+                          role="tab"
+                          aria-selected={browserSelected && browsers.selected === tabId}
+                          className="flex items-center gap-1"
+                          onAuxClick={(event) => {
+                            if (event.button === 1) {
+                              event.preventDefault();
+                              void closeBrowserTab(tabId);
+                            }
+                          }}
+                          onClick={() => {
+                            browsers.select(tabId);
+                            onRightRailTabChange("browser");
+                          }}
+                        >
+                          <GlobeIcon className="size-4" />
+                          Browser {index + 1}
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`Close Browser ${index + 1}`}
+                          className="flex size-4 items-center justify-center rounded hover:bg-muted"
+                          onClick={() => void closeBrowserTab(tabId)}
+                        >
+                          <XIcon className="size-3" />
+                        </button>
+                      </div>
+                    ))}
+                  {sideChats.tabs.map((childId, index) => {
+                    const active = sideChatSelected && sideChats.selected === childId;
+                    const label = `Side chat ${index + 1}`;
+                    return (
+                      <div
+                        key={childId}
+                        ref={active ? activeSideChatRef : null}
+                        className={cn(
+                          "flex h-[24px] shrink-0 items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
+                          active
+                            ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
+                            : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
+                        )}
+                      >
+                        <button
+                          type="button"
+                          role="tab"
+                          aria-selected={active}
+                          className="flex items-center gap-1"
+                          onAuxClick={(event) => {
+                            if (event.button === 1) {
+                              event.preventDefault();
+                              closeSideChat(childId);
+                            }
+                          }}
+                          onClick={() => {
+                            sideChats.select(childId);
+                            onRightRailTabChange("sidechat");
+                          }}
+                        >
+                          <MessagesSquareIcon className="size-4" />
+                          {label}
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`Close ${label}`}
+                          className="flex size-4 items-center justify-center rounded hover:bg-muted"
+                          onClick={() => closeSideChat(childId)}
+                        >
+                          <XIcon className="size-3" />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </WorkspaceTabsScroller>
+                {/* Keep new-panel actions outside the scrolling viewport. */}
+                <NewTabMenu
+                  conversationId={conversationId}
+                  onOpenBrowser={showBrowserTab ? addBrowser : undefined}
+                  onOpenSideChat={onNewSideChat}
+                  onCreateError={onShellCreateFailed}
+                  onOpenTerminal={openTerminalTab}
+                  onCreateStart={onShellCreateStart}
+                  triggerClassName="ml-1"
+                  liveness={liveness}
+                />
+              </>
             )}
-          />
-          {showOpenTabs && (
-            <>
-              {/* Open tabs fill the space before the pinned trailing controls. */}
-              <WorkspaceTabsScroller>
-                <FileTabsStrip
-                  openFiles={openFiles}
-                  activeFilePath={selectedFilePath}
-                  onFileSelect={openFileViewer}
-                  onCloseFile={onCloseFile}
-                />
-                <TerminalTabsStrip
-                  openTerminals={openTerminals}
-                  activeTerminalKey={selectedTerminalKey}
-                  closingKey={closingTerminalKey ?? null}
-                  canClose={isEditorLevel(permissionLevel)}
-                  labelFor={terminalLabelFor}
-                  onSelect={openTerminalTab}
-                  onClose={onCloseTerminal}
-                />
-                {showBrowserTab &&
-                  browsers.tabs.map((tabId, index) => (
-                    <div
-                      key={tabId}
-                      ref={browserSelected && browsers.selected === tabId ? activeBrowserRef : null}
-                      className={cn(
-                        "flex h-[24px] shrink-0 items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
-                        browserSelected && browsers.selected === tabId
-                          ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
-                          : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
-                      )}
-                    >
-                      <button
-                        type="button"
-                        role="tab"
-                        aria-selected={browserSelected && browsers.selected === tabId}
-                        className="flex items-center gap-1"
-                        onAuxClick={(event) => {
-                          if (event.button === 1) {
-                            event.preventDefault();
-                            void closeBrowserTab(tabId);
-                          }
-                        }}
-                        onClick={() => {
-                          browsers.select(tabId);
-                          onRightRailTabChange("browser");
-                        }}
-                      >
-                        <GlobeIcon className="size-4" />
-                        Browser {index + 1}
-                      </button>
-                      <button
-                        type="button"
-                        aria-label={`Close Browser ${index + 1}`}
-                        className="flex size-4 items-center justify-center rounded hover:bg-muted"
-                        onClick={() => void closeBrowserTab(tabId)}
-                      >
-                        <XIcon className="size-3" />
-                      </button>
-                    </div>
-                  ))}
-                {sideChats.tabs.map((childId, index) => {
-                  const active = sideChatSelected && sideChats.selected === childId;
-                  const label = `Side chat ${index + 1}`;
-                  return (
-                    <div
-                      key={childId}
-                      ref={active ? activeSideChatRef : null}
-                      className={cn(
-                        "flex h-[24px] shrink-0 items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
-                        active
-                          ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
-                          : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
-                      )}
-                    >
-                      <button
-                        type="button"
-                        role="tab"
-                        aria-selected={active}
-                        className="flex items-center gap-1"
-                        onAuxClick={(event) => {
-                          if (event.button === 1) {
-                            event.preventDefault();
-                            closeSideChat(childId);
-                          }
-                        }}
-                        onClick={() => {
-                          sideChats.select(childId);
-                          onRightRailTabChange("sidechat");
-                        }}
-                      >
-                        <MessagesSquareIcon className="size-4" />
-                        {label}
-                      </button>
-                      <button
-                        type="button"
-                        aria-label={`Close ${label}`}
-                        className="flex size-4 items-center justify-center rounded hover:bg-muted"
-                        onClick={() => closeSideChat(childId)}
-                      >
-                        <XIcon className="size-3" />
-                      </button>
-                    </div>
-                  );
-                })}
-              </WorkspaceTabsScroller>
-              {/* Keep new-panel actions outside the scrolling viewport. */}
+            {/* "+" — open a new Shell tab. With no open tabs it sits here, right
+            after the nav tabs (next to Shells); once tabs exist it moves into
+            the open-tabs region to trail the last tab (see above). Self-gates
+            to nothing when the agent has no terminal access. */}
+            {showEmptyNewTab && (
               <NewTabMenu
                 conversationId={conversationId}
                 onOpenBrowser={showBrowserTab ? addBrowser : undefined}
                 onOpenSideChat={onNewSideChat}
-                onCreateError={onShellCreateFailed}
                 onOpenTerminal={openTerminalTab}
                 onCreateStart={onShellCreateStart}
-                triggerClassName="ml-1"
+                onCreateError={onShellCreateFailed}
                 liveness={liveness}
               />
-            </>
-          )}
-          {/* "+" — open a new Shell tab. With no open tabs it sits here, right
-            after the nav tabs (next to Shells); once tabs exist it moves into
-            the open-tabs region to trail the last tab (see above). Self-gates
-            to nothing when the agent has no terminal access. */}
-          {showEmptyNewTab && (
-            <NewTabMenu
-              conversationId={conversationId}
-              onOpenBrowser={showBrowserTab ? addBrowser : undefined}
-              onOpenSideChat={onNewSideChat}
-              onOpenTerminal={openTerminalTab}
-              onCreateStart={onShellCreateStart}
-              onCreateError={onShellCreateFailed}
-              liveness={liveness}
-            />
-          )}
-          {/* The picker and fullscreen toggle form the trailing control group. */}
-          <DropdownMenu>
-            <WorkspaceTabTooltip label="Select panel" className="ml-auto pl-1">
-              <DropdownMenuTrigger asChild>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-xs"
-                  className="size-6 shrink-0"
-                  aria-label="Select panel"
-                  disabled={pending}
-                >
-                  <ChevronDownIcon className="size-4" />
-                </Button>
-              </DropdownMenuTrigger>
-            </WorkspaceTabTooltip>
-            <DropdownMenuContent align="end" className="max-w-[min(32rem,calc(100vw-2rem))]">
-              <SuppressBrowserView />
-              <DropdownMenuLabel>Panels</DropdownMenuLabel>
-              {panelOptions.map((option) => (
-                <DropdownMenuItem
-                  key={option.key}
-                  onSelect={option.select}
-                  disabled={option.disabled}
-                  title={option.label}
-                  aria-current={option.active ? "true" : undefined}
-                >
-                  <span className="min-w-0 flex-1 truncate">{option.label}</span>
-                  {option.active && <CheckIcon className="size-4" aria-hidden />}
-                </DropdownMenuItem>
-              ))}
-            </DropdownMenuContent>
-          </DropdownMenu>
-          <WorkspaceTabTooltip
-            label={maximized ? "Exit full screen" : "Full screen"}
-            className="ml-1"
-          >
-            <Button
-              type="button"
-              variant="ghost"
-              aria-label={maximized ? "Exit full screen" : "Full screen"}
-              aria-pressed={maximized}
-              onClick={onToggleMaximized}
-              disabled={pending}
-              size="icon-xs"
-              className="flex size-6 text-muted-foreground hover:text-foreground"
+            )}
+            {/* The picker and fullscreen toggle form the trailing control group. */}
+            <DropdownMenu>
+              <WorkspaceTabTooltip label="Select panel" className="ml-auto pl-1">
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    className="size-6 shrink-0"
+                    aria-label="Select panel"
+                    disabled={pending}
+                  >
+                    <ChevronDownIcon className="size-4" />
+                  </Button>
+                </DropdownMenuTrigger>
+              </WorkspaceTabTooltip>
+              <DropdownMenuContent align="end" className="max-w-[min(32rem,calc(100vw-2rem))]">
+                <SuppressBrowserView />
+                <DropdownMenuLabel>Panels</DropdownMenuLabel>
+                {panelOptions.map((option) => (
+                  <DropdownMenuItem
+                    key={option.key}
+                    onSelect={option.select}
+                    disabled={option.disabled}
+                    title={option.label}
+                    aria-current={option.active ? "true" : undefined}
+                  >
+                    <span className="min-w-0 flex-1 truncate">{option.label}</span>
+                    {option.active && <CheckIcon className="size-4" aria-hidden />}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+            <WorkspaceTabTooltip
+              label={maximized ? "Exit full screen" : "Full screen"}
+              className="ml-1"
             >
-              {maximized ? (
-                <MinimizeIcon className="size-4" />
-              ) : (
-                <MaximizeIcon className="size-4" />
-              )}
-            </Button>
-          </WorkspaceTabTooltip>
-        </div>
-        {/* Tab content — single slot. An open shell tab holds its xterm; a
+              <Button
+                type="button"
+                variant="ghost"
+                aria-label={maximized ? "Exit full screen" : "Full screen"}
+                aria-pressed={maximized}
+                onClick={onToggleMaximized}
+                disabled={pending}
+                size="icon-xs"
+                className="flex size-6 text-muted-foreground hover:text-foreground"
+              >
+                {maximized ? (
+                  <MinimizeIcon className="size-4" />
+                ) : (
+                  <MaximizeIcon className="size-4" />
+                )}
+              </Button>
+            </WorkspaceTabTooltip>
+          </div>
+          {/* Tab content — single slot. An open shell tab holds its xterm; a
           file tab holds FileViewer; the Files/Changes tabs show FilesPanel
           (tree vs changed-only list); Subagents lists the root's children +
           a "main" link back to the parent. */}
-        <div data-workspace-panel-content className="flex min-h-0 flex-1 flex-col overflow-hidden">
-          {pending ? (
-            <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
-              <Spinner />
-              <span className="text-ui">Starting workspace…</span>
-            </div>
-          ) : selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey) ? (
-            // Show the selected shell's xterm only while its terminal is actually
-            // present. The selection is sticky (AppShell never prunes it off the
-            // list), so during a transient terminals-list churn this falls back to
-            // the default view and the xterm reappears when the terminal returns.
-            <RailTerminalView
-              conversationId={conversationId}
-              terminalKey={selectedTerminalKey}
-              readOnly={!isOwnerLevel(permissionLevel)}
-              autoFocus={autoFocusSelectedTerminal}
-            />
-          ) : selectedFilePath !== null ? (
-            <FileViewer
-              viewport="desktop"
-              frameless
-              open
-              conversationId={conversationId}
-              path={selectedFilePath}
-              position={filePosition}
-              onClose={onShowScopeView}
-              onCloseTab={handleCloseTab}
-              onNavigateTo={openFileViewer}
-              permissionLevel={permissionLevel}
-              onCommentsOpenChange={onCommentsOpenChange}
-              sort={filesPanelSort}
-            />
-          ) : sideChatSelected && !isMobile ? (
-            // A side chat: a forked child conversation streamed here in its own
-            // scoped surface, beside the still-active main chat. Phones show it
-            // in the side-chats drawer instead, so it never mounts twice.
-            selectedSideChatPane
-          ) : browserSelected && showBrowserTab ? (
-            // Browser soft tab — BrowserPane self-gates and measures this rail
-            // slot to position the native view over it.
-            <BrowserPane
-              key={browsers.viewId}
-              conversationId={browsers.viewId!}
-              agentBrowser={browsers.agentBrowser}
-              active={open}
-              className="min-h-0 flex-1"
-            />
-          ) : rightRailTab === "github" && showGithubTab ? (
-            <PullRequestPanel conversationId={conversationId} />
-          ) : rightRailTab === "subagents" && rootSessionId ? (
-            <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
-          ) : (
-            showFilesPanel && (
-              <FilesPanel
-                frameless
-                onFileSelect={openFileViewer}
-                flatView={rightRailTab === "changes"}
-                showHidden={filesPanelShowHidden}
-                onShowHiddenChange={onShowHiddenChange}
-                sort={filesPanelSort}
-                onSortChange={onSortChange}
+          <div
+            data-workspace-panel-content
+            className="flex min-h-0 flex-1 flex-col overflow-hidden"
+          >
+            {pending ? (
+              <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
+                <Spinner />
+                <span className="text-ui">Starting workspace…</span>
+              </div>
+            ) : selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey) ? (
+              // Show the selected shell's xterm only while its terminal is actually
+              // present. The selection is sticky (AppShell never prunes it off the
+              // list), so during a transient terminals-list churn this falls back to
+              // the default view and the xterm reappears when the terminal returns.
+              <RailTerminalView
+                conversationId={conversationId}
+                terminalKey={selectedTerminalKey}
+                readOnly={!isOwnerLevel(permissionLevel)}
+                autoFocus={autoFocusSelectedTerminal}
               />
-            )
-          )}
+            ) : selectedFilePath !== null ? (
+              <FileViewer
+                viewport="desktop"
+                frameless
+                open
+                conversationId={conversationId}
+                path={selectedFilePath}
+                position={filePosition}
+                onClose={onShowScopeView}
+                onCloseTab={handleCloseTab}
+                onNavigateTo={openFileViewer}
+                permissionLevel={permissionLevel}
+                onCommentsOpenChange={onCommentsOpenChange}
+                sort={filesPanelSort}
+              />
+            ) : sideChatSelected && !isMobile ? (
+              // A side chat: a forked child conversation streamed here in its own
+              // scoped surface, beside the still-active main chat. Phones show it
+              // in the side-chats drawer instead, so it never mounts twice.
+              selectedSideChatPane
+            ) : browserSelected && showBrowserTab ? (
+              // Browser soft tab — BrowserPane self-gates and measures this rail
+              // slot to position the native view over it.
+              <BrowserPane
+                key={browsers.viewId}
+                conversationId={browsers.viewId!}
+                agentBrowser={browsers.agentBrowser}
+                active={open}
+                className="min-h-0 flex-1"
+              />
+            ) : rightRailTab === "github" && showGithubTab ? (
+              <PullRequestPanel conversationId={conversationId} />
+            ) : rightRailTab === "subagents" && rootSessionId ? (
+              <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+            ) : (
+              showFilesPanel && (
+                <FilesPanel
+                  frameless
+                  onFileSelect={openFileViewer}
+                  flatView={rightRailTab === "changes"}
+                  showHidden={filesPanelShowHidden}
+                  onShowHiddenChange={onShowHiddenChange}
+                  sort={filesPanelSort}
+                  onSortChange={onSortChange}
+                />
+              )
+            )}
+          </div>
         </div>
-      </div>
-    </aside>
-  );
-  return (
-    <>
-      {rail}
+      </aside>
       {/* The rail is `hidden` on phones, so the drawer renders beside it. A
-        portal to the body would escape the embed's scoped styles. */}
+          portal to the body would escape the embed's scoped styles. */}
       {isMobile && (
         <MobilePanelDrawer
           open={mobileSideChatsOpen}
