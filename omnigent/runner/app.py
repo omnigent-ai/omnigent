@@ -7741,6 +7741,9 @@ def create_runner_app(
         and hasattr(_pane_reaper_registry, "native_panes")
     ):
         from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
+        from omnigent.native._native_forwarder_health import (
+            session_posted_within as native_forwarder_session_posted_within,
+        )
         from omnigent.native.native_cost_popup import (
             _tmux_last_client_input_at,
             _tmux_window_activity_at,
@@ -7774,6 +7777,10 @@ def create_runner_app(
             # active turn, so every signal above reads idle. Reaping it kills the
             # prompt and strands its approval card unanswerable.
             if approval_wait_is_fresh(conv_id):
+                return True
+            # A codex sub-agent streams through the parent's forwarder while the
+            # parent pane sits idle; reaping it tears down the child's app-server.
+            if native_forwarder_session_posted_within(conv_id, PANE_OUTPUT_BUSY_WINDOW_S):
                 return True
             # An attached viewer alone does not spare the pane (a tab left open
             # overnight kept idle native stacks resident). Count it only when a

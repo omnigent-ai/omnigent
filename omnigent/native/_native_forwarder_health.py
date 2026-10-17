@@ -22,6 +22,7 @@ unrelated stall.
 
 from __future__ import annotations
 
+import contextvars
 import time
 
 # Single-slot holder rather than a module global + ``global`` statement: one
@@ -34,6 +35,13 @@ _state: dict[str, tuple[float, str] | None] = {"last_post_failure": None}
 # idle watchdog reads it, so a sub-agent still streaming while its parent is idle
 # counts as activity; once posts stop, the idle window bounds the hold.
 _last_post_at: dict[str, float | None] = {"value": None}
+
+# Session whose forwarder task is posting. A codex forwarder also posts for its
+# sub-agent mirrors, so a parent pane with streaming children reads as active.
+_forwarder_session: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "native_forwarder_session", default=None
+)
+_last_post_at_by_session: dict[str, float] = {}
 
 
 def record_post_failure(event_type: str, error: BaseException) -> None:
@@ -79,12 +87,42 @@ def note_post_success() -> None:
     populated; once it recovers, the next success empties it and the watchdog
     won't blame a long-resolved failure for an unrelated later stall.
 
-    Also stamps :func:`last_post_at` for the runner idle watchdog.
+    Also stamps :func:`last_post_at` for the runner idle watchdog, and the
+    bound forwarder session's clock for the native-pane reaper.
 
     :returns: None.
     """
     _state["last_post_failure"] = None
-    _last_post_at["value"] = time.monotonic()
+    now = time.monotonic()
+    _last_post_at["value"] = now
+    session_id = _forwarder_session.get()
+    if session_id is not None:
+        _last_post_at_by_session[session_id] = now
+
+
+def bind_forwarder_session(session_id: str) -> None:
+    """
+    Attribute the current task's later forwarder POSTs to *session_id*.
+
+    Call once at the top of a forwarder task; tasks it spawns inherit the
+    binding, so posts for its sub-agent mirrors count toward this session too.
+
+    :param session_id: Session that owns the forwarder, e.g. ``"conv_abc123"``.
+    :returns: None.
+    """
+    _forwarder_session.set(session_id)
+
+
+def session_posted_within(session_id: str, within_s: float) -> bool:
+    """
+    Return whether *session_id*'s forwarder got a POST response recently.
+
+    :param session_id: Session bound by :func:`bind_forwarder_session`.
+    :param within_s: Recency window in seconds, e.g. ``120.0``.
+    :returns: ``True`` when its last POST round-trip is under *within_s* old.
+    """
+    posted_at = _last_post_at_by_session.get(session_id)
+    return posted_at is not None and time.monotonic() - posted_at < within_s
 
 
 def last_post_at() -> float | None:
@@ -128,3 +166,4 @@ def clear() -> None:
     """
     _state["last_post_failure"] = None
     _last_post_at["value"] = None
+    _last_post_at_by_session.clear()
