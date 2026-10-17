@@ -89,6 +89,25 @@ describe("sandboxProviderOptions", () => {
   });
 });
 
+describe("sandboxOptionLabel", () => {
+  it("uses the friendly agent-sandbox provider name", () => {
+    expect(sandboxOptionLabel("agent_sandbox")).toBe("Agent Sandbox");
+  });
+
+  it("humanizes underscores in unknown provider ids", () => {
+    expect(sandboxOptionLabel("foo_bar")).toBe("Foo Bar Sandbox");
+  });
+
+  it.each([
+    ["_foo", "Foo Sandbox"],
+    ["foo__bar", "Foo Bar Sandbox"],
+    ["foo_", "Foo Sandbox"],
+    ["foo__", "Foo Sandbox"],
+  ])("avoids stray spaces when humanizing %s", (provider, expected) => {
+    expect(sandboxOptionLabel(provider)).toBe(expected);
+  });
+});
+
 describe("resolveServerInfo sandbox_providers", () => {
   it.each([undefined, null, "", "manage", 2, true])(
     "defaults an absent or invalid public ceiling %s to Read",
