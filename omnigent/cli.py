@@ -2187,6 +2187,16 @@ REQUIRE_WRAPPER_ENV = "OMNIGENT_REQUIRE_WRAPPER"
 WRAPPER_BYPASS_ENV = "OMNIGENT_WRAPPER_BYPASS"
 
 
+def _wrapper_managed_deployment(env: Mapping[str, str] | None = None) -> bool:
+    """Return whether wrapper use is required (``OMNIGENT_REQUIRE_WRAPPER``).
+
+    A configured ``OMNIGENT_WRAPPER_COMMAND`` alone only affects hint spelling.
+    """
+    if env is None:
+        env = os.environ
+    return env_truthy(env.get(REQUIRE_WRAPPER_ENV))
+
+
 def _wrapper_guard_error(env: Mapping[str, str], prog: str) -> str | None:
     """Return the block message when a naked ``omni`` call is refused, else ``None``.
 
@@ -9450,10 +9460,16 @@ def _selected_daemon_records(
     :param all_targets: Whether ``--all`` was passed.
     :param default_all: Whether no selector should mean all records.
     :returns: Matching daemon records.
-    :raises click.ClickException: If ``--server`` and ``--all`` conflict.
+    :raises click.ClickException: If ``--server`` and ``--all`` conflict
+        outside a wrapper-managed deployment.
     """
     if all_targets and server is not None:
-        raise click.ClickException("Use either --server or --all, not both.")
+        # In a wrapper-managed deployment (e.g. `isaac omni` injects its managed
+        # --server) an explicit --all overrides --server; say so on stderr.
+        if not _wrapper_managed_deployment():
+            raise click.ClickException("Use either --server or --all, not both.")
+        # The URL is omitted on purpose: it may carry basic-auth credentials.
+        click.echo("Ignoring --server: --all selects every known target.", err=True)
     if all_targets or (server is None and default_all):
         return _list_daemon_records()
     resolved = _resolve_host_server(server)
