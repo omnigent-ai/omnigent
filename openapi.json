@@ -6291,11 +6291,6 @@
             "title": "Public Sharing Max Level",
             "type": "string"
           },
-          "request_managed_sandbox_host_id": {
-            "default": true,
-            "title": "Request Managed Sandbox Host Id",
-            "type": "boolean"
-          },
           "push": {
             "anyOf": [
               {
@@ -6305,6 +6300,11 @@
                 "type": "null"
               }
             ]
+          },
+          "request_managed_sandbox_host_id": {
+            "default": true,
+            "title": "Request Managed Sandbox Host Id",
+            "type": "boolean"
           },
           "sandbox_provider": {
             "anyOf": [
