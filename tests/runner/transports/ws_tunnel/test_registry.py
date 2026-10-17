@@ -15,16 +15,23 @@ import math
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import replace
 
 import pytest
 
 from omnigent.runner.transports.ws_tunnel.frames import (
+    TUNNEL_RENEWAL_CAPABILITY,
     HelloFrame,
     ResponseBodyFrame,
     ResponseEndFrame,
     ResponseHeadFrame,
+    WSFrame,
 )
-from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+from omnigent.runner.transports.ws_tunnel.registry import (
+    InvalidRenewalPermit,
+    RunnerSession,
+    TunnelRegistry,
+)
 from tests.budgets import budget
 
 
@@ -57,6 +64,201 @@ class _ClosingWS(_NoopWS):
 
 def _hello() -> HelloFrame:
     return HelloFrame(runner_version="0.1.0", frame_protocol_version=1, harnesses=[], envs=[])
+
+
+def _renewal_hello(
+    predecessor: RunnerSession | None = None, *, continuity: str | None = None
+) -> HelloFrame:
+    return replace(
+        _hello(),
+        capabilities=[TUNNEL_RENEWAL_CAPABILITY],
+        renewal_permit=predecessor.renewal_permit if predecessor else None,
+        continuity_token=predecessor.continuity_token if predecessor else continuity,
+    )
+
+
+@pytest.mark.asyncio
+async def test_planned_replacement_retains_old_reply_and_routes_new_requests() -> None:
+    reg = TunnelRegistry()
+    old = reg.register("r1", _ClosingWS(), _renewal_hello(), owner="alice")
+    pending = reg.open_request("r1", "accepted", method="POST", path="/command")
+    new = reg.register("r1", _ClosingWS(), _renewal_hello(old), owner="alice")
+    assert reg.get("r1") is new
+    assert not pending.head_future.done()
+    assert new.renewal_permit is None
+    current = reg.open_request("r1", "next", method="POST", path="/command")
+    assert current.session is new
+    assert not reg.route_response_frame("r1", ResponseHeadFrame("next", 201), old)
+    assert reg.route_response_frame("r1", ResponseHeadFrame("accepted", 200), old)
+    assert (await pending.head_future).status == 200
+    reg.close_request("r1", "accepted", old)
+    await asyncio.sleep(0)
+    assert new.renewal_permit is not None
+    assert reg.deregister("r1", old) is None
+    assert reg.get("r1") is new
+    current.head_future.cancel()
+    reg.close_request("r1", "next", new)
+    reg.deregister("r1", new)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ["permit", "continuity", "owner"])
+async def test_invalid_planned_replacement_leaves_current_requests_alone(mismatch: str) -> None:
+    reg = TunnelRegistry()
+    old = reg.register("r1", _NoopWS(), _renewal_hello(), owner="alice")
+    pending = reg.open_request("r1", "accepted")
+    hello = _renewal_hello(old)
+    if mismatch == "permit":
+        hello.renewal_permit = "unproved"
+    if mismatch == "continuity":
+        hello.continuity_token = "unproved"
+    with pytest.raises(InvalidRenewalPermit):
+        reg.register("r1", _NoopWS(), hello, owner="bob" if mismatch == "owner" else "alice")
+    assert reg.get("r1") is old
+    assert not pending.head_future.done()
+    pending.head_future.cancel()
+    reg.close_request("r1", "accepted", old)
+    reg.deregister("r1", old)
+
+
+@pytest.mark.asyncio
+async def test_independent_process_replacement_aborts_current_and_predecessor() -> None:
+    reg = TunnelRegistry()
+    old = reg.register("r1", _NoopWS(), _renewal_hello(), owner="alice")
+    first = reg.open_request("r1", "first")
+    current = reg.register("r1", _NoopWS(), _renewal_hello(old), owner="alice")
+    second = reg.open_request("r1", "second")
+    replacement = reg.register("r1", _NoopWS(), _renewal_hello(), owner="alice")
+    for state in (first, second):
+        with pytest.raises(ConnectionError, match="replaced"):
+            await state.head_future
+    assert reg.get("r1") is replacement
+    assert replacement.continuity_token != current.continuity_token
+    assert replacement.renewal_permit is not None
+    reg.deregister("r1", replacement)
+
+
+@pytest.mark.asyncio
+async def test_same_process_reconnect_preserves_the_one_pending_predecessor() -> None:
+    reg = TunnelRegistry()
+    old = reg.register("r1", _NoopWS(), _renewal_hello(), owner="alice")
+    pending = reg.open_request("r1", "accepted")
+    current = reg.register("r1", _NoopWS(), _renewal_hello(old), owner="alice")
+    token = current.continuity_token
+    reg.deregister("r1", current)
+    replacement = reg.register("r1", _NoopWS(), _renewal_hello(continuity=token), owner="alice")
+    assert not pending.head_future.done()
+    assert replacement.renewal_permit is None
+    assert reg.route_response_frame("r1", ResponseHeadFrame("accepted", 200), old)
+    assert (await pending.head_future).status == 200
+    reg.close_request("r1", "accepted", old)
+    await asyncio.sleep(0)
+    assert replacement.renewal_permit is not None
+    reg.deregister("r1", replacement)
+
+
+@pytest.mark.asyncio
+async def test_genuine_predecessor_loss_fails_its_request_only() -> None:
+    reg = TunnelRegistry()
+    old = reg.register("r1", _NoopWS(), _renewal_hello(), owner="alice")
+    pending = reg.open_request("r1", "accepted")
+    current = reg.register("r1", _NoopWS(), _renewal_hello(old), owner="alice")
+    reg.deregister("r1", old)
+    with pytest.raises(ConnectionError, match="draining tunnel closed"):
+        await pending.head_future
+    assert reg.get("r1") is current
+    assert current.renewal_permit is not None
+    reg.deregister("r1", current)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method,path,reopenable",
+    [
+        ("GET", "/v1/sessions/session-id/stream", True),
+        ("POST", "/v1/sessions/session-id/stream", False),
+        ("GET", "/v1/sessions/session-id/stream/extra", False),
+        ("GET", "/work", False),
+        (None, None, False),
+    ],
+)
+async def test_only_exact_passive_session_get_is_reopened_during_renewal(
+    method, path, reopenable
+) -> None:
+    reg = TunnelRegistry()
+    old = reg.register("r1", _NoopWS(), _renewal_hello())
+    pending = reg.open_request("r1", "request", method=method, path=path)
+    current = reg.register("r1", _NoopWS(), _renewal_hello(old))
+    if reopenable:
+        with pytest.raises(ConnectionError, match="session stream moved"):
+            await pending.head_future
+    else:
+        assert not pending.head_future.done()
+        pending.head_future.cancel()
+        reg.close_request("r1", "request", old)
+    reg.deregister("r1", current)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protected_work", ["request", "websocket"])
+async def test_passive_stream_waits_for_protected_work_and_a_current_tunnel(
+    protected_work: str,
+) -> None:
+    reg = TunnelRegistry()
+    old = reg.register("r1", _ClosingWS(), _renewal_hello(), owner="alice")
+    stream = reg.open_request("r1", "stream", method="GET", path="/v1/sessions/s1/stream")
+    request = None
+    if protected_work == "request":
+        request = reg.open_request("r1", "accepted", method="POST", path="/command")
+    else:
+        reg.open_ws_channel("r1", "terminal", session=old)
+    current = reg.register("r1", _ClosingWS(), _renewal_hello(old), owner="alice")
+    await asyncio.sleep(0)
+    assert not stream.head_future.done()
+    assert reg.accepts_frames(old)
+    assert current.renewal_permit is None
+
+    reg.deregister("r1", current)
+    if request is not None:
+        request.head_future.cancel()
+        reg.close_request("r1", "accepted", old)
+    else:
+        reg.close_ws_channel("r1", "terminal", old)
+    await asyncio.sleep(0)
+    assert reg.get("r1") is None
+    assert reg.has_live_predecessor("r1")
+    assert reg.accepts_frames(old)
+    assert not stream.head_future.done()
+    with pytest.raises(KeyError):
+        reg.open_request("r1", "new-command", method="POST", path="/command")
+
+    replacement = reg.register(
+        "r1",
+        _ClosingWS(),
+        _renewal_hello(continuity=current.continuity_token),
+        owner="alice",
+    )
+    with pytest.raises(ConnectionError, match="session stream moved"):
+        await stream.head_future
+    assert not reg.has_live_predecessor("r1")
+    assert not reg.accepts_frames(old)
+    assert replacement.renewal_permit is not None
+    reg.deregister("r1", replacement)
+
+
+@pytest.mark.asyncio
+async def test_planned_renewal_retains_tunneled_websocket_ownership() -> None:
+    reg = TunnelRegistry()
+    old = reg.register("r1", _NoopWS(), _renewal_hello())
+    channel = reg.open_ws_channel("r1", "terminal", session=old)
+    current = reg.register("r1", _NoopWS(), _renewal_hello(old))
+    assert current.renewal_permit is None
+    assert reg.route_ws_inbound("r1", WSFrame("terminal", "accepted-output"), old)
+    assert await channel.inbound_queue.get() == ("text", "accepted-output")
+    assert not reg.route_ws_inbound("r1", WSFrame("terminal", "stale-output"), current)
+    reg.close_ws_channel("r1", "terminal", old)
+    assert current.renewal_permit is not None
+    reg.deregister("r1", current)
 
 
 async def _wait_until(predicate: Callable[[], object], *, timeout_s: float = 1.0) -> None:

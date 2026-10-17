@@ -33,6 +33,8 @@ import binascii
 import concurrent.futures
 import contextlib
 import logging
+import re
+import secrets
 import threading
 import time
 from collections.abc import Callable
@@ -46,17 +48,30 @@ import httpx
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
+    TUNNEL_RENEWAL_CAPABILITY,
     Frame,
     HelloFrame,
+    RequestCancelFrame,
     ResponseBodyFrame,
     ResponseEndFrame,
     ResponseHeadFrame,
     WSCloseFrame,
     WSFrame,
+    encode_frame,
 )
 
 _logger = logging.getLogger(__name__)
 _connection_generations = count(1)
+
+
+class InvalidRenewalPermit(ValueError):
+    """The replacement cannot prove it owns the current connection."""
+
+
+def _token_matches(expected: str | None, supplied: str | None) -> bool:
+    return bool(
+        expected and supplied and supplied.isascii() and secrets.compare_digest(expected, supplied)
+    )
 
 
 class WebSocketLike(Protocol):
@@ -129,6 +144,9 @@ class RunnerSession:
     close_reason: str | None = None
     peer_close_reason: str | None = None
     diagnostics: TunnelDiagnostics = field(default_factory=TunnelDiagnostics)
+    renewal_permit: str | None = field(default=None, repr=False)
+    continuity_token: str | None = field(default=None, repr=False)
+    renewal_ready: asyncio.Future[str] | None = field(default=None, repr=False)
 
 
 @dataclass
@@ -161,6 +179,8 @@ class RequestState:
     body_queue: asyncio.Queue[ResponseBodyFrame | None]
     end_event: asyncio.Event = field(default_factory=asyncio.Event)
     aborted_with: BaseException | None = None
+    method: str | None = None
+    path: str | None = None
 
 
 # Inbound channel-queue item shape:
@@ -256,6 +276,7 @@ class TunnelRegistry:
         if max_connect_waiters_total < 1:
             raise ValueError("max_connect_waiters_total must be at least 1")
         self._sessions: dict[str, RunnerSession] = {}
+        self._draining: dict[str, RunnerSession] = {}
         self._connect_waits: dict[str, RunnerConnectWaitState] = {}
         self._max_connect_waiters_per_runner = max_connect_waiters_per_runner
         self._max_connect_waiters_total = max_connect_waiters_total
@@ -279,8 +300,9 @@ class TunnelRegistry:
         for the same runner_id (from a previous tunnel that lagged
         on cleanup), the OLD one is discarded and the new one
         replaces it. Any in-flight requests on the old session are
-        aborted with a ConnectionError so awaiters get a clean
-        failure rather than hanging.
+        aborted with a ConnectionError so awaiters get a clean failure.
+        An authenticated planned renewal instead retains one predecessor's
+        existing requests/channels until they finish; new work uses the new session.
 
         :param runner_id: Runner id to register.
         :param ws: Live WebSocket connection.
@@ -302,27 +324,145 @@ class TunnelRegistry:
             last_frame_at=now,
             owner=owner,
             last_frame_monotonic=time.monotonic(),
+            renewal_ready=(
+                loop.create_future() if TUNNEL_RENEWAL_CAPABILITY in hello.capabilities else None
+            ),
         )
         with self._lock:
-            old = self._sessions.pop(runner_id, None)
-            if old is not None:
-                self.record_close(old, code=4000, reason="tunnel replaced")
-                self._abort_session_inflight(
-                    old,
-                    ConnectionError(
-                        "tunnel replaced by newer connection (newest-wins, RUNNER.md §2)"
-                    ),
+            old = self._sessions.get(runner_id)
+            predecessor = self._draining.get(runner_id)
+            planned = hello.renewal_permit is not None
+            if planned and (
+                old is None
+                or predecessor is not None
+                or old.owner != owner
+                or session.renewal_ready is None
+                or not _token_matches(old.renewal_permit, hello.renewal_permit)
+                or not _token_matches(old.continuity_token, hello.continuity_token)
+            ):
+                raise InvalidRenewalPermit("renewal predecessor is not current on this replica")
+            continuity = (
+                predecessor is not None
+                and predecessor.owner == owner
+                and session.renewal_ready is not None
+                and _token_matches(predecessor.continuity_token, hello.continuity_token)
+            )
+            if session.renewal_ready is not None:
+                session.continuity_token = (
+                    old.continuity_token
+                    if planned and old is not None
+                    else predecessor.continuity_token
+                    if continuity and predecessor is not None
+                    else secrets.token_urlsafe(32)
                 )
+            if old is not None:
+                old.renewal_permit = None
+                if planned:
+                    self._draining[runner_id] = old
+                else:
+                    self.record_close(old, code=4000, reason="tunnel replaced")
+                    self._abort_session_inflight(
+                        old,
+                        ConnectionError(
+                            "tunnel replaced by newer connection (newest-wins, RUNNER.md §2)"
+                        ),
+                    )
+            if predecessor is not None and not continuity:
+                self._draining.pop(runner_id)
+                self.record_close(predecessor, code=4000, reason="tunnel replaced")
+                self._abort_session_inflight(
+                    predecessor, ConnectionError("tunnel replaced by newer process")
+                )
+                _retire_session_writer(predecessor, code=4000, reason="tunnel replaced")
             self._sessions[runner_id] = session
+            if planned and old is not None:
+                self._finish_draining(old)
+            elif continuity and predecessor is not None:
+                self._finish_draining(predecessor)
+            self._offer_renewal(session)
             wait_state = self._connect_waits.pop(runner_id, None)
             if wait_state is not None:
                 self._connect_waiter_total -= len(wait_state.waiters)
-        if old is not None:
+        if old is not None and not planned:
             _retire_session_writer(old, code=4000, reason="tunnel replaced")
         if wait_state is not None:
             for waiter in list(wait_state.waiters):
                 _resolve_connect_waiter(waiter, session)
         return session
+
+    def _accepted(self, session: RunnerSession) -> bool:
+        return (
+            self._sessions.get(session.runner_id) is session
+            or self._draining.get(session.runner_id) is session
+        )
+
+    def accepts_frames(self, session: RunnerSession) -> bool:
+        """Accept replies/events from the current or owned draining generation."""
+        with self._lock:
+            return self._accepted(session)
+
+    def has_live_predecessor(self, runner_id: str) -> bool:
+        """Report retained work/streams without advertising new-command readiness."""
+        with self._lock:
+            return runner_id in self._draining
+
+    def _offer_renewal(self, session: RunnerSession) -> None:
+        if (
+            session.renewal_ready is None
+            or session.renewal_permit is not None
+            or session.runner_id in self._draining
+        ):
+            return
+        permit = secrets.token_urlsafe(32)
+        session.renewal_permit = permit
+
+        def ready() -> None:
+            if session.renewal_ready is not None and not session.renewal_ready.done():
+                session.renewal_ready.set_result(permit)
+
+        _call_session_soon_threadsafe(session, ready)
+
+    def _finish_draining(self, session: RunnerSession) -> None:
+        if (
+            self._draining.get(session.runner_id) is not session
+            or session.ws_channels
+            or any(not self._passive_stream(state) for state in session.in_flight.values())
+        ):
+            return
+        current = self._sessions.get(session.runner_id)
+        if current is None:
+            return
+        self._abort_passive_streams(session)
+        self._draining.pop(session.runner_id)
+        self.record_close(session, code=4000, reason="tunnel renewal drained")
+        _retire_session_writer(session, code=4000, reason="tunnel renewal drained")
+        self._offer_renewal(current)
+
+    @staticmethod
+    def _passive_stream(state: RequestState) -> bool:
+        return (
+            state.method == "GET"
+            and re.fullmatch(r"/v1/sessions/[^/]+/stream", state.path or "") is not None
+        )
+
+    @staticmethod
+    def _abort_passive_streams(session: RunnerSession) -> None:
+        for req_id, state in list(session.in_flight.items()):
+            if not TunnelRegistry._passive_stream(state):
+                continue
+            session.in_flight.pop(req_id)
+            error = ConnectionError("session stream moved to renewed tunnel")
+            _call_soon_threadsafe(state, partial(_abort_request_state, state, error))
+
+            def cancel(request_id: str = req_id) -> None:
+                session.outbound_queue.put_nowait(
+                    OutboundFrame(
+                        encode_frame(RequestCancelFrame(request_id, "tunnel renewal")),
+                        queued_at=session.diagnostics.timestamp(),
+                    )
+                )
+
+            _call_session_soon_threadsafe(session, cancel)
 
     def deregister(
         self,
@@ -344,8 +484,8 @@ class TunnelRegistry:
             ``"runner_0123456789abcdef"``.
         :param session: Optional generation guard. When provided,
             deregistration only removes the registry entry if the
-            current entry is this exact session object. This prevents
-            stale route handlers from deleting a newer tunnel.
+            current or draining entry is this exact session object. A
+            draining connection's loss aborts only its own requests.
         :param retire: ``True`` when this server retires a live tunnel on
             purpose and expects the runner to reconnect, which the
             ``on_retire`` callback reports. The tunnel route passes
@@ -355,6 +495,15 @@ class TunnelRegistry:
         """
         with self._lock:
             current = self._sessions.get(runner_id)
+            if session is not None and self._draining.get(runner_id) is session:
+                self._draining.pop(runner_id)
+                self._abort_session_inflight(
+                    session, ConnectionError("draining tunnel closed before request completed")
+                )
+                _retire_session_writer(session, code=1001, reason="draining tunnel closed")
+                if current is not None:
+                    self._offer_renewal(current)
+                return session
             if current is None or (session is not None and current is not session):
                 return None
             removed = self._sessions.pop(runner_id)
@@ -564,7 +713,7 @@ class TunnelRegistry:
             ``False`` if it has been replaced or deregistered.
         """
         with self._lock:
-            if self._sessions.get(session.runner_id) is not session:
+            if not self._accepted(session):
                 return False
             session.last_frame_at = time.time()
             session.last_frame_monotonic = time.monotonic()
@@ -578,14 +727,20 @@ class TunnelRegistry:
             when ``session`` is stale.
         """
         with self._lock:
-            if self._sessions.get(session.runner_id) is not session:
+            if not self._accepted(session):
                 return None
             return time.monotonic() - session.last_frame_monotonic
 
     # ── Per-request lifecycle ────────────────────────────
 
     def open_request(
-        self, runner_id: str, req_id: str, *, generation: int | None = None
+        self,
+        runner_id: str,
+        req_id: str,
+        *,
+        generation: int | None = None,
+        method: str | None = None,
+        path: str | None = None,
     ) -> RequestState:
         """Allocate reassembly state for a new outgoing request.
 
@@ -609,6 +764,8 @@ class TunnelRegistry:
                 session=session,
                 head_future=loop.create_future(),
                 body_queue=asyncio.Queue(),
+                method=method,
+                path=path,
             )
             session.in_flight[req_id] = state
             return state
@@ -635,6 +792,7 @@ class TunnelRegistry:
             if target is None:
                 return
             target.in_flight.pop(req_id, None)
+            self._finish_draining(target)
 
     def request_is_open(self, session: RunnerSession, req_id: str) -> bool:
         """Return whether a request is still in flight on ``session``.
@@ -698,6 +856,7 @@ class TunnelRegistry:
             if target is None:
                 return
             target.ws_channels.pop(ch_id, None)
+            self._finish_draining(target)
 
     def route_ws_inbound(
         self,
@@ -711,8 +870,8 @@ class TunnelRegistry:
             was delivered; ``False`` for orphans (logged by caller).
         """
         with self._lock:
-            current = self._sessions.get(runner_id)
-            if current is None or (session is not None and current is not session):
+            current = session or self._sessions.get(runner_id)
+            if current is None or current.runner_id != runner_id or not self._accepted(current):
                 return False
             self.mark_frame_seen(current)
             if not isinstance(frame, (WSFrame, WSCloseFrame)):
@@ -756,14 +915,13 @@ class TunnelRegistry:
     ) -> None:
         """Enqueue one outbound WebSocket frame on the session's owner loop.
 
-        :param session: Current session generation that should send
-            the frame.
+        :param session: Current or draining generation that owns the frame.
         :param data: Encoded tunnel frame JSON.
         :param app_ping_ts: Application ping token, only for heartbeat diagnostics.
         :returns: None after the frame has been accepted into the
             route-loop outbound queue.
         :raises ConnectionError: If ``session`` is no longer the
-            registry's current generation for its runner id.
+            registry's current or draining generation for its runner id.
         :raises Exception: Preparation or queue failures before frame acceptance
             are forwarded from the owner loop.
         """
@@ -774,7 +932,7 @@ class TunnelRegistry:
             """Run on ``session.loop`` and enqueue the outbound frame."""
             try:
                 with self._lock:
-                    if self._sessions.get(session.runner_id) is not session:
+                    if not self._accepted(session):
                         raise ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
                     frame = OutboundFrame(
                         data, queued_at=session.diagnostics.timestamp(), app_ping_ts=app_ping_ts
@@ -824,8 +982,8 @@ class TunnelRegistry:
             request that was already cancelled).
         """
         with self._lock:
-            current = self._sessions.get(runner_id)
-            if current is None or (session is not None and current is not session):
+            current = session or self._sessions.get(runner_id)
+            if current is None or current.runner_id != runner_id or not self._accepted(current):
                 return False
             self.mark_frame_seen(current)
             if not isinstance(frame, ResponseHeadFrame | ResponseBodyFrame | ResponseEndFrame):

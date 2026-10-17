@@ -3575,7 +3575,9 @@ def create_app(
             conversation_store.list_conversations_by_runner_id, runner_id
         )
         # The runner may reconnect while the store returns an older snapshot.
-        if tunnel_registry.get(runner_id) is not None:
+        if tunnel_registry.get(runner_id) is not None or tunnel_registry.has_live_predecessor(
+            runner_id
+        ):
             _logger.info(
                 "Runner %s reconnected during offline lookup; skipping offline-marking",
                 runner_id,
@@ -3659,7 +3661,9 @@ def create_app(
         # If a live tunnel is registered for this runner, the runner is
         # NOT offline, so skip. Mirrors the registry's own
         # generation-guarded ``deregister``.
-        if tunnel_registry.get(runner_id) is not None:
+        if tunnel_registry.get(runner_id) is not None or tunnel_registry.has_live_predecessor(
+            runner_id
+        ):
             _logger.info(
                 "Runner %s disconnect superseded by a live tunnel; skipping offline-marking",
                 runner_id,
