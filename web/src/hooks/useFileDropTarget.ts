@@ -1,7 +1,20 @@
-// File drag-and-drop scoped to one element: files dropped anywhere inside it
-// attach to the composer, while the shell around it keeps its own behavior.
+// File drops belong to the surface under the pointer; the shell keeps its own behavior.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useSyncExternalStore } from "react";
+
+let activeTarget: HTMLElement | null = null;
+const listeners = new Set<() => void>();
+function setActiveTarget(target: HTMLElement | null) {
+  activeTarget = target;
+  for (const listener of listeners) listener();
+}
+function subscribe(listener: () => void) {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
+export const ignoreWorkspaceUploadDrag = (event: DragEvent): boolean =>
+  event.target instanceof Element && event.target.closest("[data-upload-drop-root]") !== null;
 
 /** Files are only readable on drop, so `types` is the only mid-drag signal. */
 function carriesFiles(transfer: DataTransfer | null | undefined): boolean {
@@ -16,20 +29,38 @@ function carriesFiles(transfer: DataTransfer | null | undefined): boolean {
  */
 export function useFileDropTarget(
   target: HTMLElement | null,
-  onFiles: (files: File[]) => void,
+  onFiles: (files: File[], event: DragEvent) => void,
+  options: { ignore?: (event: DragEvent) => boolean } = {},
 ): boolean {
-  const [isDragActive, setIsDragActive] = useState(false);
+  const owner = useSyncExternalStore(
+    subscribe,
+    () => activeTarget,
+    () => null,
+  );
   // A rebind between dragenter and drop would lose the depth count.
   const onFilesRef = useRef(onFiles);
   onFilesRef.current = onFiles;
+  const ignoreRef = useRef(options.ignore);
+  ignoreRef.current = options.ignore;
 
   useEffect(() => {
     if (!target) return;
     // Enter/leave fire in pairs as the pointer crosses child elements.
     let depth = 0;
+    const setIsDragActive = (active: boolean) => {
+      if (active) setActiveTarget(target);
+      else if (activeTarget === target) setActiveTarget(null);
+    };
+    const ignored = (event: DragEvent) => {
+      if (!ignoreRef.current?.(event)) return false;
+      depth = 0;
+      setIsDragActive(false);
+      return true;
+    };
 
     const enter = (e: DragEvent): void => {
       if (!carriesFiles(e.dataTransfer)) return;
+      if (ignored(e)) return;
       depth += 1;
       setIsDragActive(true);
     };
@@ -42,6 +73,7 @@ export function useFileDropTarget(
 
     const over = (e: DragEvent): void => {
       if (!carriesFiles(e.dataTransfer)) return;
+      if (ignored(e)) return;
       // Without this no drop event fires, and the browser opens the file.
       e.preventDefault();
       // A drag entering from another window can arrive without a dragenter.
@@ -50,11 +82,12 @@ export function useFileDropTarget(
 
     const drop = (e: DragEvent): void => {
       if (!carriesFiles(e.dataTransfer)) return;
+      if (ignored(e)) return;
       e.preventDefault();
       depth = 0;
       setIsDragActive(false);
       const files = Array.from(e.dataTransfer?.files ?? []);
-      if (files.length > 0) onFilesRef.current(files);
+      if (files.length > 0) onFilesRef.current(files, e);
     };
 
     // Cancelled drag: Esc, or a drop outside the target.
@@ -68,15 +101,29 @@ export function useFileDropTarget(
     target.addEventListener("dragover", over);
     target.addEventListener("drop", drop);
     target.addEventListener("dragend", end);
+    const outside = (event: DragEvent) => {
+      if (
+        carriesFiles(event.dataTransfer) &&
+        event.target instanceof Node &&
+        !target.contains(event.target)
+      )
+        end();
+    };
+    document.addEventListener("dragover", outside);
+    document.addEventListener("drop", end);
+    document.addEventListener("dragend", end);
     return () => {
       target.removeEventListener("dragenter", enter);
       target.removeEventListener("dragleave", leave);
       target.removeEventListener("dragover", over);
       target.removeEventListener("drop", drop);
       target.removeEventListener("dragend", end);
+      document.removeEventListener("dragover", outside);
+      document.removeEventListener("drop", end);
+      document.removeEventListener("dragend", end);
       setIsDragActive(false);
     };
   }, [target]);
 
-  return isDragActive;
+  return target !== null && owner === target;
 }

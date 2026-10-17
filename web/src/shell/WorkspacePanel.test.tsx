@@ -14,6 +14,15 @@ import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
 import { writeDefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
 import { WorkspacePanel } from "./WorkspacePanel";
+import type { ReactNode } from "react";
+
+vi.mock("./WorkspaceUploads", () => ({
+  WorkspaceUploadProvider: ({ children }: { children: ReactNode }) => children,
+  WorkspaceUploadDropRoot: ({ children }: { children: ReactNode }) => (
+    <div data-testid="upload-root-stub">{children}</div>
+  ),
+  UploadsTray: () => <div data-testid="uploads-tray-stub" />,
+}));
 
 // The rail's content children are exercised by their own suites; stub them so
 // these tests focus on WorkspacePanel's own logic (the open-file/shell tab
@@ -186,6 +195,18 @@ function renderWorkspace(
 }
 
 describe("WorkspacePanel surface presentation", () => {
+  it("keeps the upload tray outside the Files and viewer content slot", () => {
+    const { view } = renderWorkspace();
+    const tray = screen.getByTestId("uploads-tray-stub");
+    expect(tray.closest("[data-workspace-panel-content]")).toBeNull();
+    expect(
+      screen.getByTestId("files-panel-stub").closest('[data-testid="upload-root-stub"]'),
+    ).toBeTruthy();
+    view.unmount();
+    renderWorkspace({ selectedFilePath: "a.txt", openFiles: ["a.txt"] });
+    expect(screen.getByTestId("uploads-tray-stub")).toBeTruthy();
+    expect(screen.queryByTestId("upload-root-stub")).toBeNull();
+  });
   it("sits flush to the window edge with a left divider, no floating card frame", () => {
     renderWorkspace();
 
