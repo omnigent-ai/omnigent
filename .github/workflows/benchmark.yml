@@ -82,7 +82,9 @@ jobs:
       # to its own backend and ignores the others. postgres:16 mirrors
       # Lakebase's major version; mysql:8.0 matches the stores-mysql CI lane.
       postgres:
-        image: postgres:16
+        # ECR Public mirrors Docker Hub's official images (same digests) without
+        # Docker Hub's anonymous pull rate limit, which fails shared CI runners.
+        image: public.ecr.aws/docker/library/postgres:16
         env:
           POSTGRES_PASSWORD: bench
           POSTGRES_DB: benchdb
@@ -94,7 +96,8 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       mysql:
-        image: mysql:8.0
+        # Same image as Docker Hub's mysql:8.0, without its anonymous pull rate limit.
+        image: public.ecr.aws/docker/library/mysql:8.0
         env:
           MYSQL_ROOT_PASSWORD: bench
           MYSQL_DATABASE: benchdb
