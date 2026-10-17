@@ -22,6 +22,82 @@ Which bridge should we use?
   4. Chat about this
 Enter to select · ↑/↓ to navigate · Esc to cancel
 """
+# The plan-approval dialog has no "Enter to …" footer.
+_PLAN_APPROVAL = """\
+   - Read the new field in the parser
+   - Add a regression test
+  ──────────────────────────────────────────────────────────────────────────────
+   Claude has written up a plan and is ready to execute. Would you like to proceed?
+   ❯ 1. Yes, and use auto mode
+     2. Yes, manually approve edits
+     3. Tell Claude what to change
+        shift+tab to approve with this feedback
+   ctrl+g to edit in Vim · ~/.claude/plans/example-plan.md
+"""
+# The plan dialog as Claude Code 2.1.283 draws it: a new headline, still no footer.
+_PLAN_APPROVAL_EXIT_PLAN_MODE = """\
+ ▐▛███▛█   Claude Code v2.1.283
+▝▜██████▀  Sonnet 4 · API Usage Billing
+ ▝▝   ▝▝   ~/…/omnigent-src-worktrees/plan-session
+
+⚠ Claude Sonnet 4 retired June 15, 2026 · /model to switch
+  ⎿  SessionStart:startup says: Open this session in Omnigent:
+     http://127.0.0.1:40417/c/<session>
+
+❯ Add a maintained-by footer to README.md
+
+▔▔▔ ⚠ Claude Sonnet 4 was retired on June 15, 2026. Consider switching to a newer model. ▔
+
+  ──────────────────────────────────────────────────────────────────────────────────────
+   Exit plan mode?
+
+    Claude wants to exit plan mode
+
+    ❯ 1. Yes, and switch to default (ask each time) for this session
+      2. No
+"""
+# An AskUserQuestion on a 47-column pane: the banner and the footer
+# ("Esc to" / "cancel") both wrap.
+_QUESTION_NARROW_PANE = """\
+ ▐▛███▛█   Claude Code v2.1.283
+▝▜██████▀  Sonnet 4 · API Usage Billing
+ ▝▝   ▝▝   ~/…/plan-session
+
+⚠ Claude Sonnet 4 retired June 15, 2026 ·
+  /model to switch
+  ⎿  SessionStart:startup says: Open this
+     session in Omnigent: http://127.0.0.1:4041
+     7/c/<session>
+
+❯ Pick a deployment target
+───────────────────────────────────────────────
+ ☐ Target
+
+Which deployment target should I use for this
+change?
+
+❯ 1. Staging
+     Deploy to the staging environment first.
+  2. Production
+     Deploy straight to production.
+  3. Type something.
+───────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to
+cancel
+"""
+# Transcript text that borrows a plan dialog's words but is not a live dialog:
+# no rule above the echoed option list; a rule with no numbered row below it;
+# or a rule and a numbered row, but the headline only wraps across two rows.
+_PLAN_WORDS_IN_TRANSCRIPT = (
+    "❯ 1. try the parser first\n● I drafted both steps. Would you like to proceed?\n",
+    "──────────────────────────────\n"
+    "● Exit plan mode? Not yet. Would you like to proceed with the parser first?\n",
+    "──────────────────────────────\n"
+    "● I drafted the plan. Would you like to\nproceed?\n"
+    "❯ 1. keep the overlay\n",
+)
 _PERMISSION = """\
 ╭──────────────────────────────────────────────────────────╮
 │ Bash command                                             │
@@ -69,7 +145,10 @@ def test_live_hook_protects_a_prompt_even_during_a_torn_capture(
     [
         _QUESTION,
         _QUESTION.replace("Enter to select", "Space to select · Enter to submit"),
+        _QUESTION_NARROW_PANE,
         _PERMISSION,
+        _PLAN_APPROVAL,
+        _PLAN_APPROVAL_EXIT_PLAN_MODE,
     ],
 )
 @pytest.mark.parametrize("operation", ["message", "settings"])
@@ -78,7 +157,9 @@ def test_terminal_fallback_prompt_receives_no_injected_keystrokes(
 ) -> None:
     """A hook may have timed out; its still-visible native prompt remains protected."""
     sent = []
-    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: pane)
+    # Accept keyword arguments so a recognition regression that reaches a
+    # join_wrapped capture fails on the refusal assertion, not a stub TypeError.
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_a, **_k: pane)
     monkeypatch.setattr(bridge, "_run_tmux", lambda *args: sent.append(args))
     assert bridge.has_pending_user_prompt(native_bridge)
     with pytest.raises(bridge.ClaudeUserPromptPending):
@@ -91,11 +172,67 @@ def test_terminal_fallback_prompt_receives_no_injected_keystrokes(
     assert sent == []
 
 
-@pytest.mark.parametrize("pane", [_QUESTION, _PERMISSION])
+@pytest.mark.parametrize(
+    "pane", [_QUESTION, _PERMISSION, _PLAN_APPROVAL, _PLAN_APPROVAL_EXIT_PLAN_MODE]
+)
 def test_decision_text_above_a_ready_composer_does_not_block_delivery(
     native_bridge: Path, monkeypatch: pytest.MonkeyPatch, pane: str
 ) -> None:
     monkeypatch.setattr(bridge, "_capture_pane", lambda *_: pane + _COMPOSER)
+    assert not bridge.has_pending_user_prompt(native_bridge)
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    _PLAN_WORDS_IN_TRANSCRIPT,
+    ids=["no-rule", "no-selector", "wrapped-headline"],
+)
+def test_plan_dialog_words_in_the_transcript_are_not_a_plan_dialog(
+    native_bridge: Path, monkeypatch: pytest.MonkeyPatch, transcript: str
+) -> None:
+    """Only a selected numbered row under a rule makes the words a live dialog."""
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: transcript)
+    assert not bridge.has_pending_user_prompt(native_bridge)
+
+
+# Unframed transcript where a decision phrase or footer only wraps across rows.
+# Collapsing whole-pane whitespace would cross-match it as a live prompt.
+_DECISION_PHRASE_WRAPPED_IN_TRANSCRIPT = (
+    "● I can set that up. Do you want\nto configure the deploy target now?\n",
+    "● The picker that opens next uses Enter to\nselect an option and Esc to\ncancel.\n",
+)
+
+
+@pytest.mark.parametrize(
+    "transcript",
+    _DECISION_PHRASE_WRAPPED_IN_TRANSCRIPT,
+    ids=["do-you-want-to", "enter-to-select-esc-to-cancel"],
+)
+def test_decision_phrase_wrapping_in_the_transcript_is_not_a_prompt(
+    native_bridge: Path, monkeypatch: pytest.MonkeyPatch, transcript: str
+) -> None:
+    """Without a dialog frame, a phrase that only wraps across rows is not a prompt."""
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: transcript)
+    assert not bridge.has_pending_user_prompt(native_bridge)
+
+
+# A finished tool-output box (two rules) with assistant text wrapping a decision
+# phrase below it. The phrase sits past the closing rule, so framing rules above
+# must not let it read as a live dialog.
+_WRAPPED_DECISION_BELOW_TOOL_BOX = (
+    "╭──────────────────────────────╮\n"
+    "│ Running pytest -q             │\n"
+    "╰──────────────────────────────╯\n"
+    "● Next I will set things up. Do you want\n"
+    "to configure the deploy target now?\n"
+)
+
+
+def test_wrapped_decision_phrase_below_a_tool_box_is_not_a_prompt(
+    native_bridge: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A phrase wrapping below a framed tool box is transcript, not a dialog."""
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: _WRAPPED_DECISION_BELOW_TOOL_BOX)
     assert not bridge.has_pending_user_prompt(native_bridge)
 
 
@@ -134,10 +271,26 @@ def test_question_appearing_after_readiness_prevents_paste(
     assert sent == []
 
 
+@pytest.mark.parametrize(
+    "pane",
+    [
+        _QUESTION,
+        _QUESTION_NARROW_PANE,
+        _PLAN_APPROVAL,
+        _PLAN_APPROVAL_EXIT_PLAN_MODE,
+    ],
+)
 def test_question_appearing_during_readiness_does_not_become_a_terminal_timeout(
-    native_bridge: Path, monkeypatch: pytest.MonkeyPatch
+    native_bridge: Path, monkeypatch: pytest.MonkeyPatch, pane: str
 ) -> None:
-    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: _QUESTION)
+    """Refused at once, so the executor keeps the pane instead of reaping it at the cap."""
+    # The URL-bearing panes reach _capture_pane(..., join_wrapped=True) on a
+    # regression, so the stub must accept that keyword to surface the timeout.
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_a, **_k: pane)
+    # A recognition regression would otherwise poll to the slow-boot hard cap; bound
+    # it so the regression fails in one poll instead of the 180-second wait.
+    monkeypatch.setattr(bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(bridge, "_claude_pane_state", lambda *_: bridge._ClaudePaneState(True))
     with pytest.raises(bridge.ClaudeUserPromptPending):
         bridge._wait_for_claude_prompt_ready(
             "/tmp/example.sock", "main", timeout_s=0, bridge_dir=native_bridge

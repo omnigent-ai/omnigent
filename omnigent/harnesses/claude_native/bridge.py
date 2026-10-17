@@ -53,7 +53,7 @@ import threading
 import time
 import unicodedata
 import urllib.parse
-from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
@@ -303,6 +303,12 @@ _DIALOG_FOOTER_RE = re.compile(
     r"enter to (confirm|continue)|press enter to continue|esc to (cancel|exit|reject)",
     re.IGNORECASE,
 )
+# The selected row of a numbered option list, e.g. "❯ 1. Yes".
+_NUMBERED_SELECTOR_ROW_RE = re.compile(r"❯\s*\d+\.")
+# Headlines of the plan-approval dialog across Claude Code releases: the current
+# "Exit plan mode?" and the older "Claude has written up a plan and is ready to
+# execute. Would you like to proceed?".
+_PLAN_APPROVAL_HINTS = ("Exit plan mode?", "Would you like to proceed?")
 # Lines scanned for a dialog when no box rule anchors the region.
 _DIALOG_SCAN_TAIL_LINES = 15
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
@@ -5606,15 +5612,56 @@ def _user_prompt_visible(pane: str) -> bool:
         return False
     lines = [line for line in pane.splitlines() if line.strip()]
     rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
-    region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
+    # The body stays newline-joined so transcript below the box cannot cross-
+    # match a dialog phrase; only the footer tail below the last rule is
+    # collapsed, since a narrow pane wraps "Enter to … · Esc to …" across rows.
+    if len(rules) >= 2:
+        body = "\n".join(lines[rules[-2] + 1 : rules[-1]])
+        footer = _collapse_whitespace(lines[rules[-1] + 1 :])
+    else:
+        body = "\n".join(lines)
+        footer = ""
     return (
         _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_CONSENT)
-        or "Do you want to " in region
-        or "Yes, and don't ask again" in region
+        or "Do you want to " in body
+        or "Yes, and don't ask again" in body
         or (
-            any(hint in region for hint in ("Enter to select", "Enter to submit"))
-            and "Esc to cancel" in region
+            any(hint in footer for hint in ("Enter to select", "Enter to submit"))
+            and "Esc to cancel" in footer
         )
+        or _plan_approval_dialog_visible(lines, rules)
+    )
+
+
+def _plan_approval_dialog_visible(lines: list[str], rules: list[int]) -> bool:
+    """Recognize the plan-approval dialog, which has no "Enter to …" footer.
+
+    It is drawn below the last rule: one of the :data:`_PLAN_APPROVAL_HINTS`
+    headlines on its own line, then a numbered option list led by ``❯``.
+
+    :param lines: The pane's non-blank lines.
+    :param rules: Indices into *lines* of the box rules.
+    :returns: Whether the dialog is holding the terminal.
+    """
+    if not rules:
+        return False
+    region = lines[rules[-1] + 1 :]
+    # Match the headline within one pane line and require the numbered options
+    # below it; collapsing the whole region would let a wrapped transcript
+    # phrase above a stray numbered row look like the dialog.
+    headline = next(
+        (
+            index
+            for index, line in enumerate(region)
+            if any(hint in _collapse_whitespace([line]) for hint in _PLAN_APPROVAL_HINTS)
+        ),
+        None,
+    )
+    if headline is None:
+        return False
+    return any(
+        _NUMBERED_SELECTOR_ROW_RE.match(line.strip().lstrip("│ "))
+        for line in region[headline + 1 :]
     )
 
 
@@ -5982,6 +6029,19 @@ def _history_search_footer_shown(pane: str) -> bool:
     return " ".join(fragments).lower().startswith(_HISTORY_SEARCH_FOOTER_PREFIXES)
 
 
+def _collapse_whitespace(lines: Iterable[str]) -> str:
+    """
+    Join pane lines into one string with every whitespace run collapsed.
+
+    A narrow pane wraps dialog text across rows, so a phrase matched against
+    the joined text is found whether or not a row break fell inside it.
+
+    :param lines: Pane lines, e.g. ``["Enter to select · Esc to", "cancel"]``.
+    :returns: The single-spaced text, e.g. ``"Enter to select · Esc to cancel"``.
+    """
+    return " ".join(" ".join(lines).split())
+
+
 def _is_box_rule(line: str) -> bool:
     """
     Return whether a line is a TUI box-drawing horizontal rule.
@@ -6138,8 +6198,19 @@ def _terminal_dialog_headline(pane: str) -> str | None:
         return None
     lines = [line for line in pane.splitlines() if line.strip()]
     last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
-    region = lines[last_rule + 1 :] if last_rule is not None else lines[-_DIALOG_SCAN_TAIL_LINES:]
-    footer = next((line for line in reversed(region) if _DIALOG_FOOTER_RE.search(line)), None)
+    if last_rule is not None:
+        # A narrow pane wraps the footer below the last rule, so collapse line
+        # breaks and keep only the matched footer phrase: a trailing "press
+        # enter" elsewhere in the region must not loosen the check below.
+        region = lines[last_rule + 1 :]
+        footer_match = _DIALOG_FOOTER_RE.search(_collapse_whitespace(region))
+        footer = footer_match.group(0) if footer_match is not None else None
+    else:
+        # No framing rule: this is the bare transcript tail. Match the footer
+        # within a single line, or wrapped output quoting a footer phrase could
+        # masquerade as a dialog and raise a spurious ClaudeTerminalDialog.
+        region = lines[-_DIALOG_SCAN_TAIL_LINES:]
+        footer = next((line for line in reversed(region) if _DIALOG_FOOTER_RE.search(line)), None)
     if footer is None:
         return None
     has_selector = any(
