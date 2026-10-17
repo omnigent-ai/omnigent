@@ -35,6 +35,7 @@ from pathlib import Path
 import httpx
 
 from omnigent.inner import _proc
+from omnigent.util.socket_teardown_guard import install_socket_teardown_guard
 
 
 def _is_socket_listening(socket_path: str) -> bool:
@@ -169,5 +170,6 @@ def create_uds_client(socket_path: str, *, base_url: str = "http://runner") -> h
         UDS; httpx requires a well-formed URL prefix).
     :returns: An ``httpx.AsyncClient`` pointed at the UDS.
     """
+    install_socket_teardown_guard()
     transport = httpx.AsyncHTTPTransport(uds=socket_path)
     return httpx.AsyncClient(transport=transport, base_url=base_url)
