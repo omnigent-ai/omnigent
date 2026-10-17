@@ -48,12 +48,12 @@ from cachetools import TTLCache
 from omnigent._platform import default_shell_argv
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.llms.anthropic_model_metadata import parse_anthropic_model_metadata
+from omnigent.models.databricks_model_discovery import model_service_wire_apis
 from omnigent.models.model_metadata import (
     ModelCapability,
     ModelCostTier,
     ModelIntent,
     ModelMetadata,
-    ModelWireAPI,
 )
 from omnigent.models.model_override import is_codex_compatible_model, model_family_mismatch
 from omnigent.models.model_resolver import (
@@ -1703,28 +1703,14 @@ def fetch_databricks_model_service_entries(
         )
         if not name:
             continue
-        api_types = service.get("supported_api_types")
-        normalized_api_types = {
-            api_type.lower()
-            for api_type in (api_types if isinstance(api_types, list) else [])
-            if isinstance(api_type, str)
-        }
-        wire_apis: set[ModelWireAPI] = set()
-        if any("chat/completions" in api_type for api_type in normalized_api_types):
-            wire_apis.add(ModelWireAPI.OPENAI_CHAT)
-        if "openai/v1/responses" in normalized_api_types:
-            wire_apis.add(ModelWireAPI.OPENAI_RESPONSES)
-        if any(
-            "anthropic" in api_type and "messages" in api_type for api_type in normalized_api_types
-        ):
-            wire_apis.add(ModelWireAPI.ANTHROPIC_MESSAGES)
+        wire_apis = model_service_wire_apis(service)
         if not wire_apis:
             continue
         models.append(
             ModelEntry(
                 id=name,
                 family=model_family_token(name),
-                metadata=ModelMetadata(wire_apis=frozenset(wire_apis)),
+                metadata=ModelMetadata(wire_apis=wire_apis),
             )
         )
     return tuple(models)

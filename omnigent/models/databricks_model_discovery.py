@@ -5,10 +5,12 @@ from __future__ import annotations
 import logging
 import re
 import warnings
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 import httpx
+
+from omnigent.models.model_metadata import ModelWireAPI
 
 _logger = logging.getLogger(__name__)
 
@@ -23,6 +25,11 @@ _MODEL_SERVICES_PARENT = "schemas/system.ai"
 _PAGE_SIZE = 100
 _MAX_PAGES = 100
 _HTTP_TIMEOUT_S = 10.0
+
+#: Generic Responses and Codex Responses are separate advertised routes.
+#: The MLflow gateway's own ``mlflow/v1/responses`` is a different surface.
+_RESPONSES_API_TYPE = "openai/v1/responses"
+_CODEX_RESPONSES_API_TYPE = "codex/v1/responses"
 
 
 #: Catalog spellings the same endpoint can be served under. Ordered by
@@ -150,15 +157,72 @@ def preferred_served_claude_model(
     return _models_by_claude_family(claude_ids, marker="claude-").get(preferred_family)
 
 
-def _list_model_service_ids(
+def _model_service_api_types(service: Mapping[str, object]) -> frozenset[str] | None:
+    api_types = service.get("supported_api_types")
+    if not isinstance(api_types, list):
+        return None
+    normalized = frozenset(api_type.lower() for api_type in api_types if isinstance(api_type, str))
+    return None if api_types and not normalized else normalized
+
+
+def model_service_wire_apis(service: Mapping[str, object]) -> frozenset[ModelWireAPI] | None:
+    """Normalize a model service's advertised ``supported_api_types``.
+
+    Codex-only routes do not establish support for the generic Responses API.
+
+    :param service: One ``model_services`` entry, e.g.
+        ``{"name": "model-services/system.ai.gpt-5-5",
+        "supported_api_types": ["openai/v1/responses"]}``.
+    :returns: The recognized wire protocols (empty when routes are advertised
+        but none is recognized), or ``None`` when the entry carries no usable
+        route metadata: the field is missing, not a list, or has no string entry.
+    """
+    normalized = _model_service_api_types(service)
+    if normalized is None:
+        return None
+    wire_apis: set[ModelWireAPI] = set()
+    if any("chat/completions" in api_type for api_type in normalized):
+        wire_apis.add(ModelWireAPI.OPENAI_CHAT)
+    if _RESPONSES_API_TYPE in normalized:
+        wire_apis.add(ModelWireAPI.OPENAI_RESPONSES)
+    if any("anthropic" in api_type and "messages" in api_type for api_type in normalized):
+        wire_apis.add(ModelWireAPI.ANTHROPIC_MESSAGES)
+    return frozenset(wire_apis)
+
+
+@dataclass(frozen=True)
+class _ModelService:
+    """One ``system.ai`` model service from the Unity Catalog listing.
+
+    ``api_types`` is ``None`` when the entry carries no usable route metadata.
+    """
+
+    model_id: str
+    api_types: frozenset[str] | None
+
+
+@dataclass(frozen=True)
+class _ModelServiceListing:
+    """The ``system.ai`` model services a workspace lists.
+
+    ``complete`` is false when the page budget ran out with a next-page token
+    pending, so a model that is absent may just be on an unread page.
+    """
+
+    services: list[_ModelService]
+    complete: bool
+
+
+def _list_model_services(
     client: httpx.Client,
     workspace_url: str,
     headers: dict[str, str],
-) -> list[str]:
-    """List Databricks-managed ``system.ai`` model-service identifiers."""
-    model_ids: list[str] = []
+) -> _ModelServiceListing:
+    """List Databricks-managed ``system.ai`` model services with their routes."""
+    services: list[_ModelService] = []
     page_token: str | None = None
     seen_tokens: set[str] = set()
+    complete = True
     for _ in range(_MAX_PAGES):
         params: dict[str, str] = {
             "max_results": str(_MODEL_SERVICES_MAX_RESULTS),
@@ -175,17 +239,20 @@ def _list_model_service_ids(
         payload: object = response.json()
         if not isinstance(payload, dict):
             raise ValueError("Databricks model-services response must be an object")
-        services = payload.get("model_services")
-        if isinstance(services, list):
-            for service in services:
-                raw_name = service.get("name") if isinstance(service, dict) else None
-                if not isinstance(raw_name, str):
-                    continue
-                model_id = raw_name.strip()
-                if model_id.startswith(_MODEL_SERVICE_PREFIX):
-                    model_id = model_id[len(_MODEL_SERVICE_PREFIX) :]
-                if model_id.startswith(_SYSTEM_MODEL_PREFIX):
-                    model_ids.append(model_id)
+        page = payload.get("model_services")
+        if page is not None and not isinstance(page, list):
+            raise ValueError("Databricks model-services response 'model_services' must be a list")
+        for service in page or []:
+            if not isinstance(service, dict):
+                continue
+            raw_name = service.get("name")
+            if not isinstance(raw_name, str):
+                continue
+            model_id = raw_name.strip()
+            if model_id.startswith(_MODEL_SERVICE_PREFIX):
+                model_id = model_id[len(_MODEL_SERVICE_PREFIX) :]
+            if model_id.startswith(_SYSTEM_MODEL_PREFIX):
+                services.append(_ModelService(model_id, _model_service_api_types(service)))
         raw_next = payload.get("next_page_token")
         if not isinstance(raw_next, str) or not raw_next:
             break
@@ -196,12 +263,23 @@ def _list_model_service_ids(
     else:
         # Exhausted the page budget with a next-page token still pending: the
         # listing is partial, so the newest model of a family could be missed.
+        complete = False
         _logger.warning(
             "Databricks model-services listing truncated after %d pages; "
             "discovery may miss newer models",
             _MAX_PAGES,
         )
-    return sorted(set(model_ids))
+    return _ModelServiceListing(services, complete)
+
+
+def _list_model_service_ids(
+    client: httpx.Client,
+    workspace_url: str,
+    headers: dict[str, str],
+) -> list[str]:
+    """List Databricks-managed ``system.ai`` model-service identifiers."""
+    listing = _list_model_services(client, workspace_url, headers)
+    return sorted({service.model_id for service in listing.services})
 
 
 def _list_anthropic_gateway_ids(
@@ -363,24 +441,45 @@ def discover_databricks_codex_models(
     Unity Catalog model services is the only listing that reports what the
     codex Responses route will serve, so ids are ``system.ai.`` by
     construction — unlike the Claude catalog above, which also has a legacy
-    gateway listing to merge in.
+    gateway listing to merge in. A service counts only when its name is a
+    codex family *and* its advertised routes include the Responses API: a
+    GPT-named service that advertises only chat-completions cannot be served
+    on the codex route whatever it is called. A service without route
+    metadata keeps the name-based rule.
 
     :param workspace_url: Workspace origin, e.g. ``"https://example.com"``.
     :param token: Workspace bearer token.
     :param transport: Optional HTTP transport used by tests.
     :returns: Codex-servable model ids, best default first, e.g.
         ``("system.ai.gpt-5-6-sol", "system.ai.gpt-5-5")``. An empty tuple is
-        authoritative: the listing answered and exposes no codex model.
+        authoritative: the complete listing answered and exposes no codex model.
     :raises httpx.HTTPError: When the listing cannot be read.
-    :raises ValueError: When the listing is malformed.
+    :raises ValueError: When the listing is malformed, or was truncated before
+        naming any codex model, so absence cannot be established.
     """
     from omnigent.models.model_override import is_codex_compatible_model
 
     headers = {"Authorization": f"Bearer {token}"}
     with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
-        model_ids = _list_model_service_ids(client, workspace_url, headers)
-    codex_ids = [model_id for model_id in model_ids if is_codex_compatible_model(model_id)]
+        listing = _list_model_services(client, workspace_url, headers)
+    codex_ids = {
+        service.model_id
+        for service in listing.services
+        if is_codex_compatible_model(service.model_id) and _serves_codex_route(service)
+    }
+    if not codex_ids and not listing.complete:
+        raise ValueError(
+            "Databricks model-services listing was truncated before naming a codex "
+            "model; cannot tell whether the workspace serves none"
+        )
     return tuple(sorted(codex_ids, key=_codex_preference_rank, reverse=True))
+
+
+def _serves_codex_route(service: _ModelService) -> bool:
+    """Whether the codex Responses route can serve *service*."""
+    return service.api_types is None or not service.api_types.isdisjoint(
+        {_RESPONSES_API_TYPE, _CODEX_RESPONSES_API_TYPE}
+    )
 
 
 def _codex_preference_rank(model_id: str) -> tuple[int, int, int, int, str]:

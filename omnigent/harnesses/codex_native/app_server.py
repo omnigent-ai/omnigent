@@ -1672,7 +1672,8 @@ async def probe_codex_model_options(
         omitted, resolve the host's default shape.
     :returns: The probe rows with a single default marked.
     :raises ImportError: When the Codex CLI is unavailable.
-    :raises OSError: When a Databricks profile resolves no workspace host.
+    :raises OSError: When a Databricks profile resolves no workspace host or
+        serves no model on the codex route.
     :raises RuntimeError: When the probe app-server exits before connecting.
     :raises TimeoutError: When the probe app-server does not become ready.
     """
@@ -3228,6 +3229,27 @@ class CodexDatabricksProfileMissingError(OmnigentError, OSError):
         )
 
 
+class CodexDatabricksNoCodexModelsError(OmnigentError, OSError):
+    """The workspace listing answered but serves nothing on the codex route.
+
+    Coded ``HARNESS_NOT_CONFIGURED`` like the missing-profile error above, so a
+    terminal start failure shows the remedy verbatim. Subclasses
+    :class:`OSError`, the documented error of this launch step.
+    """
+
+    def __init__(self, profile: str) -> None:
+        """
+        :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``.
+        """
+        super().__init__(
+            f"Databricks profile {profile!r} exposes no model service on the Codex "
+            "Responses route, so native Codex has no model to launch on. Ask a "
+            "workspace admin to enable a Codex-compatible model service that "
+            "advertises the Responses route, or choose an explicit model for this agent.",
+            code=ErrorCode.HARNESS_NOT_CONFIGURED,
+        )
+
+
 def _databricks_launch_materialization(
     *, model: str | None, profile: str, codex_path: str | None = None
 ) -> _DatabricksLaunchMaterialization:
@@ -3245,6 +3267,8 @@ def _databricks_launch_materialization(
     :returns: The materialized overrides, pinned model, and host.
     :raises CodexDatabricksProfileMissingError: When the profile resolves no
         workspace host.
+    :raises CodexDatabricksNoCodexModelsError: When no model is requested and
+        the workspace serves none on the codex route.
     """
     host = _databricks_gateway_host(profile)
     if not host:
@@ -3273,9 +3297,11 @@ def _resolve_databricks_codex_model(
     ``databricks-`` spelling the gateway now answers with ``501
     NOT_IMPLEMENTED ... Use Unity Catalog model services (v3)`` — so a launch
     could pin a model the workspace will not serve. Resolve from the workspace
-    instead, as claude-native already does: the live Unity Catalog listing,
-    then ucode's cached copy of it, then the bundled catalog as the documented
-    last resort.
+    instead, as claude-native already does: the live Unity Catalog listing;
+    when that listing cannot be read, ucode's cached copy of it, then the
+    bundled catalog as the last resort. A listing that answers with no
+    codex-servable model is authoritative and stops an implicit launch, since
+    the bundled catalog could only pin a model the gateway will not serve.
 
     An explicit model first reuses its fresh shared Codex catalog row's model
     for the same profile, workspace and executable. A miss keeps discovery.
@@ -3290,6 +3316,8 @@ def _resolve_databricks_codex_model(
         servable one.
     :param codex_path: Executable whose shared catalog may resolve the model.
     :returns: The model id to pin on the codex launch.
+    :raises CodexDatabricksNoCodexModelsError: When no model is requested and
+        the workspace listing exposes no codex model.
     """
     from omnigent.models import model_catalog_store
     from omnigent.models.databricks_model_discovery import (
@@ -3311,6 +3339,7 @@ def _resolve_databricks_codex_model(
                     return model.strip()
 
     servable: tuple[str, ...] = ()
+    listing_answered = False
     try:
         from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
@@ -3323,6 +3352,7 @@ def _resolve_databricks_codex_model(
         # simply fails the listing and drops to the ucode-state fallback below,
         # which is already keyed by ``host``.
         servable = discover_databricks_codex_models(host, creds.token)
+        listing_answered = True
     except Exception as exc:  # noqa: BLE001 — cached ucode state is the launch fallback
         # Recoverable fallback; frames are debug-only so a TTY-mirrored
         # host console stays concise.
@@ -3348,6 +3378,8 @@ def _resolve_databricks_codex_model(
         return select_servable_model(requested, servable) or requested
     if servable:
         return servable[0]
+    if listing_answered:
+        raise CodexDatabricksNoCodexModelsError(profile)
     return model_catalog.resolve_catalog_model("databricks", family="openai").model_id
 
 
