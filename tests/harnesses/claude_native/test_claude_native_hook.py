@@ -1119,6 +1119,10 @@ def test_build_hook_settings_registers_policy_hooks_when_omnigent_server_url_set
     # The last entry is the catch-all policy evaluation hook.
     policy_entry_cmd = post_tool_use_entries[-1]["hooks"][0]["command"]
     assert "evaluate-policy" in policy_entry_cmd
+    # The tool observer posts to the relay; Python is only its fallback.
+    observer_cmd = post_tool_use_entries[-2]["hooks"][0]["command"]
+    assert '"$OMNIGENT_RELAY_URL/hook/observe-tool"' in observer_cmd
+    assert observer_cmd.index("curl") < observer_cmd.index("claude_native.hook observe-tool")
     # UserPromptSubmit carries the forwarder's status hook PLUS the policy
     # hook appended as a catch-all. For native sessions this is the sole
     # REQUEST-phase gate (the server-level _evaluate_input_policy skips

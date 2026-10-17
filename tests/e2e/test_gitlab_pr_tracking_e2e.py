@@ -76,9 +76,20 @@ async def test_native_hook_tracks_gitlab_mr_without_observer_io(
     )
     command = shlex.split(
         str(
-            hook_settings(bridge_dir, sys.executable, f"omnigent.harnesses.{harness}.hook")[
-                "command"
-            ]
+            hook_settings(
+                bridge_dir,
+                shlex.join(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-m",
+                        f"omnigent.harnesses.{harness}.hook",
+                        "observe-tool",
+                        "--bridge-dir",
+                        str(bridge_dir),
+                    ]
+                ),
+            )["command"]
         )
     )
     if operation.startswith("push-stderr"):

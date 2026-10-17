@@ -81,6 +81,7 @@ from omnigent.harnesses.kiro_native import bridge as kiro_bridge
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import FailureContext
+from omnigent.native.relay_hook import TOOL_RELAY_ENV_FILE, relay_hook_command
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -214,10 +215,6 @@ _RECENT_LOCAL_COMMAND_LINE_LIMIT = 200
 _RECENT_LOCAL_COMMAND_WINDOW_S = 10.0
 _FORKED_FROM_LINE_LIMIT = 200
 _TOOL_RELAY_FILE = "tool_relay.json"
-# Shell-sourceable sibling of tool_relay.json so the curl-based hook
-# commands can discover the live relay without a JSON parser. Re-written
-# on every relay start, so hooks survive runner restarts (new port).
-_TOOL_RELAY_ENV_FILE = "tool_relay.env"
 _TMUX_FILE = "tmux.json"
 _PERMISSION_HOOK_FILE = "permission_hook.json"
 _CONTEXT_FILE = "context.json"
@@ -2442,8 +2439,20 @@ def build_hook_settings(
     }
     from omnigent.native.tool_observer_hook import hook_settings
 
-    observer_hook = hook_settings(bridge_dir, python, "omnigent.harnesses.claude_native.hook")
-    observer_hook["command"] = _pin_runner_tmpdir(cast(str, observer_hook["command"]))
+    observer_hook = hook_settings(
+        bridge_dir,
+        _python_hook_command(
+            [
+                python,
+                "-I",
+                "-m",
+                "omnigent.harnesses.claude_native.hook",
+                "observe-tool",
+                "--bridge-dir",
+                str(bridge_dir),
+            ]
+        ),
+    )
     hooks["PostToolUse"].append({"hooks": [observer_hook]})
     if turn_routing:
         hooks["UserPromptSubmit"].append({"hooks": [_claude_route_turn_hook(bridge_dir, python)]})
@@ -2488,41 +2497,27 @@ def build_hook_settings(
         hooks["PermissionRequest"] = [{"hooks": [permission_hook]}]
 
         # Policy-gate native Claude Code tools, not just relay/MCP tools.
-        # The hook is a bare curl against the relay's evaluate-policy
-        # endpoint (which owns all transformation and verdict logic), so
-        # Claude's blocking tool-call path pays no interpreter spawn. The
-        # relay's coordinates are re-read from tool_relay.env on every
-        # event, so hooks survive runner restarts. Before the relay exists
-        # (it starts in the background at session create — a very early
-        # hook can beat it) or when curl fails, the same stdin is
-        # replayed into the Python hook, which owns the direct-server
-        # path and the phase-aware fail-closed contract — exactly the
-        # pre-curl behavior.
-        relay_env_quoted = shlex.quote(str(bridge_dir / _TOOL_RELAY_ENV_FILE))
-        evaluate_policy_python = _python_hook_command(
-            [
-                python,
-                "-I",
-                "-m",
-                "omnigent.harnesses.claude_native.hook",
-                "evaluate-policy",
-                "--bridge-dir",
-                str(bridge_dir),
-            ]
-        )
-        evaluate_policy_command = (
-            "p=$(cat); "
-            f"if [ -r {relay_env_quoted} ]; then . {relay_env_quoted}; "
-            "out=$(printf '%s' \"$p\" | curl -sf --max-time 86400 "
-            '-H "Authorization: Bearer $OMNIGENT_RELAY_TOKEN" '
-            "-H 'Content-Type: application/json' --data-binary @- "
-            '"$OMNIGENT_RELAY_URL/hook/claude/evaluate-policy" 2>/dev/null) '
-            "&& { printf '%s' \"$out\"; exit 0; }; fi; "
-            f"printf '%s' \"$p\" | {evaluate_policy_python}"
-        )
+        # The relay's evaluate-policy endpoint owns all transformation and
+        # verdict logic, so Claude's blocking tool-call path pays no
+        # interpreter spawn; the Python hook is only the relay-less fallback.
         evaluate_policy_hook: _JsonObject = {
             "type": "command",
-            "command": evaluate_policy_command,
+            "command": relay_hook_command(
+                bridge_dir,
+                "/hook/claude/evaluate-policy",
+                _python_hook_command(
+                    [
+                        python,
+                        "-I",
+                        "-m",
+                        "omnigent.harnesses.claude_native.hook",
+                        "evaluate-policy",
+                        "--bridge-dir",
+                        str(bridge_dir),
+                    ]
+                ),
+                max_time_s=86400,
+            ),
         }
 
         # AskUserQuestion needs no PreToolUse forwarder: Claude Code raises its
@@ -6451,7 +6446,7 @@ def start_tool_relay(
         relay_info["session_id"] = session_id
     _write_json_file(bridge_dir / _TOOL_RELAY_FILE, relay_info)
     # token_urlsafe's alphabet is [A-Za-z0-9_-], safe inside single quotes.
-    env_path = bridge_dir / _TOOL_RELAY_ENV_FILE
+    env_path = bridge_dir / TOOL_RELAY_ENV_FILE
     env_path.write_text(
         f"OMNIGENT_RELAY_URL='{advertised_url}'\nOMNIGENT_RELAY_TOKEN='{token}'\n",
         encoding="utf-8",
@@ -6722,11 +6717,12 @@ def _handler_factory(
 # never cut mid-reason by the truncation.
 _POLICY_PROXY_ERROR_DETAIL_MAX = 400
 
-# How long /hook/observe-tool waits for the file-change observer before
-# answering. Generous enough for a first-call registry resolution (one server
-# round trip); each request runs on its own ThreadingHTTPServer thread, so
-# waiting never stalls other relay traffic.
-_FILE_CHANGE_OBSERVER_TIMEOUT_S = 10.0
+# Policy hook routes served end to end by the relay, keyed to the harness
+# stamped on the evaluation context.
+_HOOK_EVALUATE_ROUTES = {
+    "/hook/claude/evaluate-policy": "claude-native",
+    "/hook/codex/evaluate-policy": "codex-native",
+}
 
 
 def _tool_relay_handler_factory(
@@ -6755,6 +6751,14 @@ def _tool_relay_handler_factory(
         registry.
     :returns: A concrete :class:`BaseHTTPRequestHandler` subclass.
     """
+    observer_lock = asyncio.Lock()
+
+    async def _observe_in_order(
+        observer: Callable[[_JsonObject], Awaitable[None]], payload: _JsonObject
+    ) -> None:
+        # Serialized, so a Write and the Edit after it never record swapped.
+        async with observer_lock:
+            await observer(payload)
 
     class _ToolRelayHandler(BaseHTTPRequestHandler):
         """HTTP handler for active Omnigent tool relay calls."""
@@ -6779,8 +6783,8 @@ def _tool_relay_handler_factory(
             if self.path not in (
                 "/tool",
                 "/policies/evaluate",
-                "/hook/claude/evaluate-policy",
                 "/hook/observe-tool",
+                *_HOOK_EVALUATE_ROUTES,
             ):
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
@@ -6797,19 +6801,16 @@ def _tool_relay_handler_factory(
                 if session_id is not None:
                     observe_hook(session_id, payload)
                     if file_change_observer is not None:
-                        # Wait so the record lands before the hook returns and
-                        # the panel's next fetch can see it; the observer owns
-                        # its own error handling, so a timeout only means the
-                        # recording finishes in the background.
-                        future = asyncio.run_coroutine_threadsafe(
-                            _await_tool_result(file_change_observer(payload)), loop
+                        # Not awaited: the harness holds the tool result until
+                        # the hook exits. The observer publishes its own
+                        # refetch signal once the record lands.
+                        asyncio.run_coroutine_threadsafe(
+                            _observe_in_order(file_change_observer, payload), loop
                         )
-                        with contextlib.suppress(Exception):
-                            future.result(timeout=_FILE_CHANGE_OBSERVER_TIMEOUT_S)
-                self._send_json({})
+                self._respond_hook_output(None)
                 return
-            if self.path == "/hook/claude/evaluate-policy":
-                self._handle_hook_evaluate(payload)
+            if self.path in _HOOK_EVALUATE_ROUTES:
+                self._handle_hook_evaluate(payload, _HOOK_EVALUATE_ROUTES[self.path])
                 return
             if self.path == "/policies/evaluate":
                 self._handle_policy_evaluate(payload)
@@ -6837,15 +6838,18 @@ def _tool_relay_handler_factory(
             if raw:
                 self.wfile.write(raw)
 
-        def _handle_hook_evaluate(self, payload: _JsonObject) -> None:
-            """Serve one Claude policy hook event end to end.
+        def _handle_hook_evaluate(self, payload: _JsonObject, harness: str) -> None:
+            """Serve one native policy hook event end to end.
 
             The hook subprocess is a bare curl: this endpoint does the
             payload→EvaluationRequest transform, the upstream evaluate
             call, and the EvaluationResponse→hook-output transform, so the
             blocking hook path pays no interpreter spawn. Responses are
             always 200; enforcement failures are expressed as fail-closed
-            hook output.
+            hook output. Claude Code and Codex share the hook output shape.
+
+            :param payload: Hook stdin payload.
+            :param harness: ``"claude-native"`` or ``"codex-native"``.
             """
             # Heavy policy imports stay off this module's import path (hook
             # subprocesses import it); the relay runs inside the runner
@@ -6871,11 +6875,16 @@ def _tool_relay_handler_factory(
                 self._respond_hook_output(None)
                 return
             context = eval_request["event"]["context"]
-            context["harness"] = "claude-native"
+            context["harness"] = harness
             if bridge_dir is not None:
-                status_model = read_claude_status_model(bridge_dir)
-                if status_model:
-                    context["model"] = status_model
+                if harness == "codex-native":
+                    from omnigent.harnesses.codex_native.bridge import read_codex_config_model
+
+                    model = read_codex_config_model(bridge_dir)
+                else:
+                    model = read_claude_status_model(bridge_dir)
+                if model:
+                    context["model"] = model
             # Stable re-attach id: a retried long-poll reattaches to the
             # same parked ASK instead of raising a second approval card.
             request_body = {

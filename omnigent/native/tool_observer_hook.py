@@ -4,19 +4,28 @@ from __future__ import annotations
 
 import argparse
 import json
-import shlex
 import sys
 import urllib.request
 from pathlib import Path
 
+from omnigent.native.relay_hook import relay_hook_command
 
-def hook_settings(bridge_dir: Path, python: str, module: str) -> dict[str, object]:
-    """Use each harness's existing owned hook module and trust registration."""
+
+def hook_settings(bridge_dir: Path, fallback: str) -> dict[str, object]:
+    """
+    Build the PostToolUse observer hook, answered by the relay without Python.
+
+    The relay acknowledges before it records, so the tool result never waits
+    on the observer.
+
+    :param bridge_dir: Bridge directory holding the relay coordinates.
+    :param fallback: The harness's own ``observe-tool`` Python hook command
+        (its trust-registered module), run when no relay answers.
+    :returns: One command-hook entry.
+    """
     return {
         "type": "command",
-        "command": shlex.join(
-            [python, "-I", "-m", module, "observe-tool", "--bridge-dir", str(bridge_dir)]
-        ),
+        "command": relay_hook_command(bridge_dir, "/hook/observe-tool", fallback, max_time_s=1),
         "timeout": 3,
     }
 
