@@ -3572,7 +3572,13 @@ def create_runner_app(
             "hermes-native",
         }:
             return
-        if status == "idle" and harness in {"codex-native", "antigravity-native"}:
+        # These forwarders own the idle edge: a web turn only injects a prompt,
+        # so its completion must not mark a still-busy native session idle.
+        if status == "idle" and harness in {
+            "codex-native",
+            "antigravity-native",
+            "opencode-native",
+        }:
             return
         event: _JsonObject = {"type": "session.status", "status": status}
         if error is not None:

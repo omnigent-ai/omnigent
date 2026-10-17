@@ -195,6 +195,8 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
     {
         "omnigent.claude_native.bridge_id",
         "omnigent.codex_native.bridge_id",
+        # The fork has its own OpenCode data dir, so the source's session is absent there.
+        "omnigent.opencode_native.active_session_id",
         "omnigent.last_context_tokens",
         "omnigent.last_context_window",
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,

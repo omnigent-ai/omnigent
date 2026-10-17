@@ -7,6 +7,7 @@ opencode-native HTTP/SSE wire surface stays covered without a live server.
 
 from __future__ import annotations
 
+import re
 from types import SimpleNamespace
 from typing import Any
 
@@ -148,7 +149,11 @@ async def test_send_prompt_builds_payload_and_closes() -> None:
     client = _FakeClient()
     out = await _transport(client).send_prompt("ses_1", NativePrompt(text="hi"))
     assert out == {"ok": True}
-    assert ("prompt_async", ("ses_1", {"parts": [{"type": "text", "text": "hi"}]})) in client.calls
+    [(name, (session_id, payload))] = [c for c in client.calls if c[0] == "prompt_async"]
+    assert (name, session_id) == ("prompt_async", "ses_1")
+    assert payload["parts"] == [{"type": "text", "text": "hi"}]
+    # A fresh id in OpenCode's ascending format names the injected user message.
+    assert re.fullmatch(r"msg_[0-9a-f]{12}[0-9A-Za-z]{14}", payload["messageID"])
     assert client.closed
 
 

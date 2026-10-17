@@ -2496,6 +2496,22 @@ _SSE_RESPONSE_COMPLETED = (
             ["running", "idle"],
             id="failure-superseded-by-completion",
         ),
+        pytest.param(
+            "opencode-native",
+            [_SSE_RESPONSE_CREATED, _SSE_RESPONSE_FAILED],
+            "failed",
+            ["running", "failed"],
+            id="opencode-native-failed-stream",
+        ),
+        # The injected web turn completes as soon as OpenCode accepts the
+        # prompt; its forwarder posts idle when the native session goes idle.
+        pytest.param(
+            "opencode-native",
+            [_SSE_RESPONSE_CREATED, _SSE_RESPONSE_COMPLETED],
+            "idle",
+            ["running"],
+            id="opencode-native-completion-leaves-idle-to-forwarder",
+        ),
     ],
 )
 async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
@@ -2538,6 +2554,13 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
     # out of the real ``~/.omnigent/codex-native`` tree. The module documents
     # this monkeypatch as the supported test isolation point.
     monkeypatch.setattr("omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT", tmp_path)
+
+    async def _no_terminal_boot(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    # The opencode-native turn path cold-boots its terminal first; this test
+    # covers only the status edges of the injected turn stream.
+    monkeypatch.setattr("omnigent.runner.app._launch_native_terminal", _no_terminal_boot)
 
     async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """

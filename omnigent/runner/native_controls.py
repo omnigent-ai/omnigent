@@ -1754,13 +1754,20 @@ def build_native_controls(
         return Response(status_code=200 if updated else 204)
 
     async def _handle_opencode_native_clear(conv_id: str) -> Response:
+        from omnigent.harnesses.opencode_native.bridge import (
+            OPENCODE_NATIVE_ACTIVE_SESSION_LABEL_KEY,
+        )
+
         if _session_harness_name(conv_id) != "opencode-native":
             return Response(status_code=204)
         if server_client is not None:
             with contextlib.suppress(httpx.HTTPError):
                 await server_client.patch(
                     f"/v1/sessions/{urllib.parse.quote(conv_id, safe='')}",
-                    json={"external_session_id": None},
+                    json={
+                        "external_session_id": None,
+                        "labels": {OPENCODE_NATIVE_ACTIVE_SESSION_LABEL_KEY: ""},
+                    },
                     params={"include_usage": "false"},
                     timeout=10.0,
                 )

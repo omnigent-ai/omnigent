@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 import omnigent.harnesses.opencode_native.forwarder as fwd_mod
-from omnigent.harnesses.opencode_native.client import OpenCodeEvent
+from omnigent.harnesses.opencode_native.bridge import OPENCODE_NATIVE_ACTIVE_SESSION_LABEL_KEY
+from omnigent.harnesses.opencode_native.client import (
+    OpenCodeEvent,
+    OpenCodeSession,
+)
 
 _SESSION = "ses_1"
 
@@ -20,6 +25,14 @@ class _RecordingServerClient:
     def __init__(self) -> None:
         self.posts: list[tuple[str, dict[str, Any]]] = []
         self.hook_response: dict[str, Any] | None = None
+        self.patches: list[tuple[str, dict[str, Any]]] = []
+        # Status codes for the next PATCHes; 200 once exhausted.
+        self.patch_statuses: list[int] = []
+
+    async def patch(self, url: str, *, json: dict[str, Any], **_kw: Any) -> httpx.Response:
+        self.patches.append((url, json))
+        status = self.patch_statuses.pop(0) if self.patch_statuses else 200
+        return httpx.Response(status, request=httpx.Request("PATCH", url))
 
     async def post(self, url: str, *, json: dict[str, Any]) -> httpx.Response:
         self.posts.append((url, json))
@@ -37,6 +50,10 @@ class _FakeOpenCodeClient:
         self.messages: list[dict[str, Any]] = []
         self.question_replies: list[tuple[str, list[Any]]] = []
         self.question_rejects: list[str] = []
+        self.sessions: dict[str, OpenCodeSession] = {}
+
+    async def get_session(self, session_id: str) -> OpenCodeSession | None:
+        return self.sessions.get(session_id)
 
     async def list_messages(self, session_id: str) -> list[dict[str, Any]]:
         return self.messages
@@ -168,6 +185,338 @@ async def test_user_text_part_is_mirrored_before_the_assistant() -> None:
     user_item = next(it for it in items if it["item_data"]["role"] == "user")
     assert user_item["item_data"]["content"][0]["text"] == "my prompt"
     assert user_item["response_id"] == "msg_u"
+
+
+def _message_texts(server: _RecordingServerClient) -> list[tuple[str, str]]:
+    items = [b["data"] for _u, b in server.posts if b["type"] == "external_conversation_item"]
+    return [
+        (it["item_data"]["role"], it["item_data"]["content"][0]["text"])
+        for it in items
+        if it["item_type"] == "message"
+    ]
+
+
+def _text_part(part_id: str, message_id: str, text: str) -> OpenCodeEvent:
+    return _event(
+        "message.part.updated",
+        part={"id": part_id, "messageID": message_id, "type": "text", "text": text},
+    )
+
+
+async def test_prompt_queued_mid_reply_lands_after_that_reply() -> None:
+    """A prompt sent while a reply streams follows that reply, as OpenCode orders it.
+
+    OpenCode creates the queued user message at submit time, so its id sorts
+    after the in-flight assistant message, whose text only flushes at step end.
+    """
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_01", "role": "user"}))
+    await fwd.handle_event(_text_part("prt_01", "msg_01", "first prompt"))
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_02", "role": "assistant"}))
+    await fwd.handle_event(_text_part("prt_02", "msg_02", "first"))
+    # The queued prompt arrives while msg_02 is still streaming.
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_03", "role": "user"}))
+    await fwd.handle_event(_text_part("prt_03", "msg_03", "queued prompt"))
+    await fwd.handle_event(_text_part("prt_02", "msg_02", "first reply"))
+    await fwd.handle_event(
+        _event(
+            "message.part.updated",
+            part={"id": "prt_s", "messageID": "msg_02", "type": "step-finish"},
+        )
+    )
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_04", "role": "assistant"}))
+    await fwd.handle_event(_text_part("prt_04", "msg_04", "second reply"))
+    await fwd.handle_event(_event("session.idle"))
+
+    assert _message_texts(server) == [
+        ("user", "first prompt"),
+        ("assistant", "first reply"),
+        ("user", "queued prompt"),
+        ("assistant", "second reply"),
+    ]
+
+
+async def test_prompt_queued_mid_reply_follows_it_when_its_completion_is_missed() -> None:
+    """A newer reply starting without the earlier one's step-finish keeps native order."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_02", "role": "assistant"}))
+    await fwd.handle_event(_text_part("prt_02", "msg_02", "first reply"))
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_03", "role": "user"}))
+    await fwd.handle_event(_text_part("prt_03", "msg_03", "queued prompt"))
+    # The step-finish for msg_02 fell in a reconnect gap.
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_04", "role": "assistant"}))
+    await fwd.handle_event(_text_part("prt_04", "msg_04", "second reply"))
+    await fwd.handle_event(_event("session.idle"))
+
+    assert _message_texts(server) == [
+        ("assistant", "first reply"),
+        ("user", "queued prompt"),
+        ("assistant", "second reply"),
+    ]
+
+
+async def test_prompt_queued_mid_reply_is_posted_when_the_turn_aborts() -> None:
+    """An interrupted reply (no step-finish) still releases the queued prompt."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_02", "role": "assistant"}))
+    await fwd.handle_event(_text_part("prt_02", "msg_02", "partial"))
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_03", "role": "user"}))
+    await fwd.handle_event(_text_part("prt_03", "msg_03", "queued prompt"))
+    assert _message_texts(server) == []
+    await fwd.handle_event(_event("session.error", error={"name": "MessageAbortedError"}))
+
+    assert _message_texts(server) == [("assistant", "partial"), ("user", "queued prompt")]
+
+
+def _user_turn(session_id: str, message_id: str, text: str) -> list[OpenCodeEvent]:
+    return [
+        _event(
+            "message.updated",
+            sessionID=session_id,
+            info={"id": message_id, "role": "user", "sessionID": session_id},
+        ),
+        _event(
+            "message.part.updated",
+            sessionID=session_id,
+            part={
+                "id": f"prt_{message_id}",
+                "messageID": message_id,
+                "type": "text",
+                "text": text,
+            },
+        ),
+    ]
+
+
+async def test_tui_new_session_is_followed_for_mirroring_injection_and_resume(
+    tmp_path: Path,
+) -> None:
+    """``/new`` in the TUI moves mirroring, web injection and resume to the new session."""
+    from omnigent.harnesses.opencode_native.bridge import (
+        OpenCodeNativeBridgeState,
+        read_bridge_state,
+        write_bridge_state,
+    )
+
+    write_bridge_state(
+        tmp_path,
+        OpenCodeNativeBridgeState(
+            session_id="conv_1", server_base_url="http://127.0.0.1:1", opencode_session_id=_SESSION
+        ),
+    )
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    # The first resume-label write fails transiently.
+    server.patch_statuses = [503]
+    fwd = _forwarder(server, opencode, bridge_dir=tmp_path)
+    # OpenCode creates the TUI's new session lazily, with the first prompt.
+    await fwd.handle_event(
+        _event("session.created", sessionID="ses_new", info={"id": "ses_new", "title": "New"})
+    )
+    for event in _user_turn("ses_new", "msg_n1", "after new"):
+        await fwd.handle_event(event)
+
+    assert _message_texts(server) == [("user", "after new")]
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.opencode_session_id == "ses_new"
+    resume_write = (
+        "/v1/sessions/conv_1",
+        {"labels": {OPENCODE_NATIVE_ACTIVE_SESSION_LABEL_KEY: "ses_new"}},
+    )
+    assert server.patches == [resume_write]
+
+    # The turn end retries the failed write; once stored, it is not rewritten.
+    await fwd.handle_event(_event("session.idle", sessionID="ses_new"))
+    await fwd.handle_event(_event("session.idle", sessionID="ses_new"))
+    assert server.patches == [resume_write, resume_write]
+
+
+def _idempotent_transcript(server: _RecordingServerClient) -> list[tuple[str, str]]:
+    """Transcript items as the server stores them, dropping reposted ``source_id`` s."""
+    seen: set[str] = set()
+    out: list[tuple[str, str]] = []
+    for _url, body in server.posts:
+        data = body["data"]
+        if body["type"] != "external_conversation_item" or data["item_type"] == "error":
+            continue
+        source_id = data.get("source_id")
+        if source_id is not None:
+            if source_id in seen:
+                continue
+            seen.add(source_id)
+        item = data["item_data"]
+        if data["item_type"] == "message":
+            out.append((item["role"], item["content"][0]["text"]))
+        else:
+            out.append((data["item_type"], item["call_id"]))
+    return out
+
+
+async def test_returning_to_a_session_mirrored_before_a_restart_shows_it_once() -> None:
+    """Catch-up after a restart reposts old history under its original source ids."""
+    tool_part = {
+        "id": "prt_t",
+        "messageID": "msg_a2",
+        "type": "tool",
+        "callID": "call_1",
+        "tool": "bash",
+        "state": {"status": "completed", "input": {"command": "ls"}, "output": "ok"},
+    }
+    server = _RecordingServerClient()
+    first = _forwarder(server, _FakeOpenCodeClient())
+    for event in _user_turn(_SESSION, "msg_a1", "hi in A"):
+        await first.handle_event(event)
+    await first.handle_event(_event("message.updated", info={"id": "msg_a2", "role": "assistant"}))
+    await first.handle_event(_event("message.part.updated", part=tool_part))
+    await first.handle_event(_text_part("prt_a2", "msg_a2", "reply in A"))
+    await first.handle_event(_event("session.idle"))
+    await first.handle_event(
+        _event("session.created", sessionID="ses_B", info={"id": "ses_B", "title": "B"})
+    )
+
+    # The runner restarts on ses_B; the user then picks A in the TUI and prompts.
+    opencode = _FakeOpenCodeClient()
+    opencode.sessions[_SESSION] = OpenCodeSession(id=_SESSION)
+    opencode.messages = [
+        {
+            "info": {"id": "msg_a1", "role": "user"},
+            "parts": [
+                {"id": "prt_msg_a1", "messageID": "msg_a1", "type": "text", "text": "hi in A"}
+            ],
+        },
+        {
+            "info": {
+                "id": "msg_a2",
+                "role": "assistant",
+                "finish": "stop",
+                "time": {"completed": 1},
+            },
+            "parts": [
+                tool_part,
+                {"id": "prt_a2", "messageID": "msg_a2", "type": "text", "text": "reply in A"},
+            ],
+        },
+    ]
+    second = fwd_mod.OpenCodeNativeForwarder(
+        session_id="conv_1",
+        opencode_session_id="ses_B",
+        opencode_client=opencode,  # type: ignore[arg-type]
+        server_client=server,  # type: ignore[arg-type]
+    )
+    for event in _user_turn(_SESSION, "msg_a3", "back in A"):
+        await second.handle_event(event)
+
+    assert _idempotent_transcript(server) == [
+        ("user", "hi in A"),
+        ("function_call", "call_1"),
+        ("function_call_output", "call_1"),
+        ("assistant", "reply in A"),
+        ("user", "back in A"),
+    ]
+
+
+async def test_tui_switch_ends_web_prompt_pending_before_sse(tmp_path: Path) -> None:
+    """A switch before a web prompt's first event still settles that prompt."""
+    from omnigent.harnesses.opencode_native.bridge import (
+        OpenCodeNativeBridgeState,
+        mark_web_prompt_pending,
+        read_bridge_state,
+        web_prompt_pending,
+        write_bridge_state,
+    )
+
+    write_bridge_state(
+        tmp_path,
+        OpenCodeNativeBridgeState(
+            session_id="conv_1", server_base_url="http://127.0.0.1:1", opencode_session_id=_SESSION
+        ),
+    )
+    mark_web_prompt_pending(tmp_path)
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode, bridge_dir=tmp_path)
+    await fwd.handle_event(
+        _event("session.created", sessionID="ses_new", info={"id": "ses_new", "title": "New"})
+    )
+    for event in _user_turn("ses_new", "msg_n1", "after new"):
+        await fwd.handle_event(event)
+
+    assert [e["status"] for e in _status_edges(server.posts)] == ["idle"]
+    assert not web_prompt_pending(tmp_path)
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.opencode_session_id == "ses_new"
+
+
+async def test_prompt_in_a_session_picked_from_the_tui_list_switches_to_it() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    # A lookup that finds nothing yet must not mark the session a child for good.
+    await fwd.handle_event(_user_turn("ses_old", "msg_o0", "too early")[0])
+    assert server.patches == []
+
+    opencode.sessions["ses_old"] = OpenCodeSession(id="ses_old")
+    for event in _user_turn("ses_old", "msg_o1", "back in the old one"):
+        await fwd.handle_event(event)
+
+    assert _message_texts(server) == [("user", "back in the old one")]
+    assert server.patches == [
+        ("/v1/sessions/conv_1", {"labels": {OPENCODE_NATIVE_ACTIVE_SESSION_LABEL_KEY: "ses_old"}})
+    ]
+
+
+async def test_switch_to_a_finished_session_does_not_post_a_stale_idle_edge() -> None:
+    """Catching up a picked session's old history is neither a turn start nor end."""
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    opencode.sessions["ses_old"] = OpenCodeSession(id="ses_old")
+    tool_part = {
+        "id": "prt_o1",
+        "messageID": "msg_o1",
+        "type": "tool",
+        "callID": "call_o1",
+        "tool": "bash",
+        "state": {"status": "completed", "input": {"command": "ls"}, "output": "ok"},
+    }
+    opencode.messages = [
+        {"info": {"id": "msg_o0", "role": "user"}, "parts": []},
+        {
+            "info": {
+                "id": "msg_o1",
+                "role": "assistant",
+                "finish": "stop",
+                "time": {"completed": 1},
+            },
+            "parts": [tool_part],
+        },
+    ]
+    fwd = _forwarder(server, opencode)
+    for event in _user_turn("ses_old", "msg_o2", "back in the old one"):
+        await fwd.handle_event(event)
+
+    assert ("function_call", "call_o1") in _idempotent_transcript(server)
+    assert not fwd.state.turn_active
+    await fwd.fail_turn_after_server_exit(1)
+    assert _status_edges(server.posts) == []
+    assert fwd._active_message_id is None
+
+
+async def test_task_subagent_session_never_takes_over_the_main_session() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.handle_event(
+        _event(
+            "session.created",
+            sessionID="ses_child",
+            info={"id": "ses_child", "parentID": _SESSION},
+        )
+    )
+    for event in _user_turn("ses_child", "msg_c1", "subagent task"):
+        await fwd.handle_event(event)
+    for event in _user_turn(_SESSION, "msg_m1", "main prompt"):
+        await fwd.handle_event(event)
+
+    assert _message_texts(server) == [("user", "main prompt")]
+    assert server.patches == []
 
 
 async def test_tool_part_posts_function_call_and_output() -> None:
@@ -477,6 +826,83 @@ async def test_permission_asked_allows_only_on_explicit_policy_allow() -> None:
 
     fwd = _forwarder(server, opencode, policy_evaluator=allow)
     await fwd.handle_event(_event("permission.v2.asked", id="per_a", action="bash"))
+    assert opencode.replies[0][1]["reply"] == "once"
+
+
+async def test_server_exit_fails_only_an_open_turn() -> None:
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode)
+    await fwd.fail_turn_after_server_exit(-9)
+    assert _status_edges(server.posts) == []
+
+    await fwd.handle_event(_event("message.updated", info={"id": "msg_a", "role": "assistant"}))
+    await fwd.fail_turn_after_server_exit(-9)
+    edges = _status_edges(server.posts)
+    assert [e["status"] for e in edges] == ["running", "failed"]
+    assert "exit code -9" in edges[-1]["output"]
+    assert edges[-1]["response_id"] == "msg_a"
+
+
+class _PromptAcceptingClient:
+    async def prompt_async(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return {}
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def test_server_exit_fails_an_accepted_web_prompt_before_its_events(
+    tmp_path: Path,
+) -> None:
+    """The runner leaves idle to the forwarder, so a crash before the turn's SSE must fail it."""
+    from omnigent.harnesses.opencode_native.bridge import (
+        OpenCodeNativeBridgeState,
+        write_bridge_state,
+    )
+    from omnigent.harnesses.opencode_native.http_transport import OpenCodeHttpTransport
+    from omnigent.native.native_server_transport import NativePrompt
+
+    write_bridge_state(
+        tmp_path,
+        OpenCodeNativeBridgeState(
+            session_id="conv_1", server_base_url="http://127.0.0.1:1", opencode_session_id=_SESSION
+        ),
+    )
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    fwd = _forwarder(server, opencode, bridge_dir=tmp_path)
+    transport = OpenCodeHttpTransport(
+        bridge_dir=tmp_path,
+        client_factory=lambda: _PromptAcceptingClient(),  # type: ignore[arg-type,return-value]
+    )
+
+    await fwd.fail_turn_after_server_exit(1)
+    assert _status_edges(server.posts) == []
+
+    await transport.send_prompt(_SESSION, NativePrompt(text="hi"))
+    await fwd.fail_turn_after_server_exit(1)
+    edges = _status_edges(server.posts)
+    assert [e["status"] for e in edges] == ["failed"]
+    assert "exit code 1" in edges[0]["output"]
+
+
+async def test_subagent_permission_goes_through_the_policy_gate() -> None:
+    """A ``task`` sub-agent's approval is answered like the main session's.
+
+    Dropping it left the session parked on a native-only prompt the web never showed.
+    """
+    server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    evaluated: list[Any] = []
+
+    async def allow(normalized: Any) -> dict[str, Any]:
+        evaluated.append(normalized)
+        return {"decision": "allow"}
+
+    fwd = _forwarder(server, opencode, policy_evaluator=allow)
+    await fwd.handle_event(
+        _event("permission.v2.asked", sessionID="ses_child", id="per_c", action="bash")
+    )
+    assert len(evaluated) == 1
+    assert opencode.replies == [("per_c", opencode.replies[0][1])]
     assert opencode.replies[0][1]["reply"] == "once"
 
 
