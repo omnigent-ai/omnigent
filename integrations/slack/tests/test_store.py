@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import aiosqlite
+import pytest
 from omnigent_slack.models import ThreadKey, UserConfig
 from omnigent_slack.store import SQLiteStore
 
@@ -25,10 +26,13 @@ async def test_store_persists_thread_session(tmp_path: Path) -> None:
     assert record.owner_user_id == "U1"
     assert record.host_id == "host_a"
 
-    await store.upsert_session(key, "conv_2", "title", owner_user_id="U1")
+    with pytest.raises(aiosqlite.IntegrityError, match="already bound"):
+        await store.upsert_session(key, "conv_2", "title", owner_user_id="U2")
     record = await store.get_session(key)
     assert record is not None
-    assert record.session_id == "conv_2"
+    assert (record.session_id, record.owner_user_id, record.host_id) == ("conv_1", "U1", "host_a")
+    await store.upsert_session(key, "conv_1", "updated", owner_user_id="U1", host_id="host_b")
+    assert (await store.get_session(key)).host_id == "host_b"
 
 
 async def test_store_user_config_round_trip(tmp_path: Path) -> None:

@@ -142,7 +142,7 @@ async def run() -> None:
     )
 
     app = AsyncApp(token=settings.slack_bot_token)
-    setup.register(app)
+    setup.register(app, service.handle_resume_command)
     register_handlers(app, service)
     _register_error_handler(app, logger)
 
