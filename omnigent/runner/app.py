@@ -7800,6 +7800,8 @@ def create_runner_app(
             )
 
         async def _reap_native_pane(pane: PaneRef) -> None:
+            # Captured before the close: a relaunch during it binds its own relay.
+            relay_binding = _session_comment_relays.get(pane.conversation_id)
             try:
                 await resource_registry.close_terminal(pane.conversation_id, pane.terminal_id)
             finally:
@@ -7809,6 +7811,12 @@ def create_runner_app(
                 # a ``codex app-server`` for the runner's lifetime even when the
                 # pane close above partially fails (the very leak this guards).
                 await _native_runtime.teardown_codex_native_app_server(pane.conversation_id)
+                # The pane was the relay's only client; the next launch starts a new one.
+                if relay_binding is not None and (
+                    _pane_reaper_registry.get(pane.conversation_id, pane.terminal_name, "main")
+                    is None
+                ):
+                    _discard_comment_relay(pane.conversation_id, relay_binding.relay)
                 _publish_terminal_deleted_event(
                     conversation_id=pane.conversation_id,
                     terminal_name=pane.terminal_name,

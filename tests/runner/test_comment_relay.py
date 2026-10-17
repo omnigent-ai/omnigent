@@ -470,6 +470,70 @@ async def test_repeated_terminal_launch_keeps_single_relay(relay_env: _RelayEnv)
     )
 
 
+class _ReapableStubResourceRegistry(_StubResourceRegistry):
+    """Stub with a terminal registry, so the runner wires its idle pane reaper."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        super().__init__(tmp_path)
+        from omnigent.terminals.registry import TerminalRegistry
+
+        self.terminal_registry = TerminalRegistry()  # type: ignore[assignment]
+
+    async def close_terminal(self, session_id: str, terminal_id: str) -> bool:
+        """The stub launched no pane, so there is nothing to close."""
+        del session_id, terminal_id
+        return True
+
+
+@pytest.mark.asyncio
+async def test_idle_pane_reap_closes_comment_relay(tmp_path: Path) -> None:
+    """Reaping an idle native pane closes its relay; the next launch starts a fresh one."""
+    from omnigent.entities.session_resources import terminal_resource_id
+    from omnigent.terminals.pane_reaper import PaneRef
+
+    app = create_runner_app(
+        resource_registry=_ReapableStubResourceRegistry(tmp_path),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reaper = app.state.native_pane_reaper
+    assert reaper is not None
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = bridge_dir_for_bridge_id(session_id)
+    prepare_bridge_dir(session_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        try:
+            resp = await _launch_terminal(client, session_id, bridge_inject_dir=True)
+            assert resp.status_code == 200, resp.text
+            relay_url = json.loads(relay_file.read_text())["url"]
+
+            pane = PaneRef(
+                session_id,
+                terminal_resource_id("claude", "main"),
+                "claude",
+                tmp_path / "tmux.sock",
+            )
+            await reaper._reap(pane)
+
+            # A surviving relay keeps a listening socket per reaped session
+            # until the session is deleted, exhausting the runner's descriptors.
+            assert not relay_file.exists(), "tool_relay.json survived the idle reap"
+            with pytest.raises(httpx.ConnectError):
+                async with httpx.AsyncClient() as probe:
+                    await probe.get(relay_url, timeout=2.0)
+
+            resp = await _launch_terminal(client, session_id, bridge_inject_dir=True)
+            assert resp.status_code == 200, resp.text
+            # The relay binds from a fixed port range, so the new one may reuse the port.
+            async with httpx.AsyncClient() as probe:
+                await probe.get(json.loads(relay_file.read_text())["url"], timeout=2.0)
+        finally:
+            with contextlib.suppress(httpx.HTTPError):
+                await client.delete(f"/v1/sessions/{session_id}")
+            shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
 @pytest.mark.asyncio
 async def test_relay_executor_routes_through_omnigent_in_omnigent_mode(
     tmp_path: Path,
