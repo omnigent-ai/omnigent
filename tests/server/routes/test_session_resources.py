@@ -7850,16 +7850,13 @@ async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
 
 
 @pytest.mark.asyncio
-async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirror(
-    tmp_path: Path,
+@pytest.mark.parametrize("refusal_kind", ["auth", "stale_session"])
+async def test_claude_pre_delivery_refusal_is_not_reclassified_as_missing_by_later_mirror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal_kind: str
 ) -> None:
-    """A pre-delivery refusal must not be reported again as a missing message.
-
-    Claude refuses web ``/login`` before touching the terminal. If that failure
-    is not marked undelivered, the input stays pending. The next successful
-    message's transcript mirror skips it and persists a second error with code
-    ``native_prompt_not_recorded``.
-    """
+    """An auth or stale-session refusal settles its input before a later accepted mirror."""
+    from omnigent.harnesses.claude_native.bridge import REQUEST_SESSION_ID_ENV_VAR
+    from omnigent.inner import claude_native_executor
     from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
     from omnigent.runtime import pending_inputs
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
@@ -7877,8 +7874,18 @@ async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirro
     assert conversation is not None
     first_stable_id = "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"
     later_stable_id = "2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b"
-    auth_content = [{"type": "input_text", "text": "/login"}]
+    auth_content = [
+        {"type": "input_text", "text": "/login" if refusal_kind == "auth" else "held input"}
+    ]
     later_content = [{"type": "input_text", "text": "continue after login"}]
+    if refusal_kind == "stale_session":
+        monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, session_id)
+        (tmp_path / "bridge.json").write_text('{"active_session_id": "replacement"}')
+
+    def unexpected_paste(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("refused input reached the native paste")
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", unexpected_paste)
     first_pending = pending_inputs.record(
         session_id,
         auth_content,
@@ -7954,6 +7961,10 @@ async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirro
             f"settled {later_pending}; persisted={missing_errors}"
         )
         assert refusal.get("undelivered") is True
+        assert [item.data.content for item in store.appended_items if item.type == "message"] == [
+            auth_content,
+            later_content,
+        ]
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == []
         assert later_pending not in pending_inputs.pending_ids(session_id)
     finally:

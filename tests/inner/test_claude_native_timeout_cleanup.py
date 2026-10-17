@@ -78,11 +78,13 @@ async def _until(predicate: Callable[[], bool]) -> None:
         ("missing_owner", "timeout"),
         ("logical_transfer", "timeout"),
         ("logical_return", "timeout"),
+        ("logical_rotation", "timeout"),
         ("cross_process_transfer", "timeout"),
         ("owned", "cancel"),
         ("replacement", "cancel"),
         ("logical_transfer", "cancel"),
         ("logical_return", "cancel"),
+        ("logical_rotation", "cancel"),
         ("cross_process_transfer", "cancel"),
         ("owned", "exit"),
         ("replacement", "exit"),
@@ -209,7 +211,12 @@ async def test_stale_cleanup_preserves_a_same_owner_native_terminal(
                 old_socket, "display-message", "-p", "-t", "main", "#{pane_id}"
             ).stdout.strip()
             if has_replacement:
-                if scenario in {"logical_transfer", "logical_return", "cross_process_transfer"}:
+                if scenario in {
+                    "logical_transfer",
+                    "logical_return",
+                    "logical_rotation",
+                    "cross_process_transfer",
+                }:
                     replacement_socket = old_socket
                     original_terminal = bridge.capture_tmux_terminal(str(old_socket), "main")
                     assert original_terminal is not None
@@ -239,6 +246,8 @@ async def test_stale_cleanup_preserves_a_same_owner_native_terminal(
                             timeout=5,
                         )
                         assert result.returncode == 0, result.stderr
+                    elif scenario == "logical_rotation":
+                        bridge.begin_active_session_rotation(bridge_dir)
                     else:
                         bridge.write_active_session_id(bridge_dir, "replacement-conversation")
                         if scenario == "logical_return":

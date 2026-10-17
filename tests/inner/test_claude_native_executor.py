@@ -85,6 +85,8 @@ async def test_run_turn_injects_user_message_without_streaming_transcript(
         *,
         content: str,
         timeout_s: float = 30.0,
+        expected_session_id: str | None = None,
+        framework_notices: list[str] | None = None,
     ) -> None:
         """
         Capture the injected message and write a transcript line.
@@ -96,6 +98,8 @@ async def test_run_turn_injects_user_message_without_streaming_transcript(
         :returns: None.
         """
         del timeout_s
+        assert expected_session_id is None
+        assert framework_notices == []
         sent_messages.append({"bridge_dir": bridge_dir_arg, "content": content})
         transcript_path.write_text("terminal-owned output\n", encoding="utf-8")
 
@@ -150,6 +154,8 @@ async def test_run_turn_does_not_advertise_active_omnigent_tools(
         *,
         content: str,
         timeout_s: float = 30.0,
+        expected_session_id: str | None = None,
+        framework_notices: list[str] | None = None,
     ) -> None:
         """
         Capture a web-message injection.
@@ -208,6 +214,8 @@ async def test_run_turn_rejects_stale_session_after_clear(
         *,
         content: str,
         timeout_s: float = 30.0,
+        expected_session_id: str | None = None,
+        framework_notices: list[str] | None = None,
     ) -> None:
         """
         Fail if stale-session protection reaches tmux injection.
@@ -239,6 +247,270 @@ async def test_run_turn_rejects_stale_session_after_clear(
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
     assert "no longer active after /clear" in events[0].message
+    assert events[0].undelivered is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["turn", "steering"])
+async def test_queued_input_rechecks_the_active_native_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, delivery: str
+) -> None:
+    """An old conversation's queued writer cannot type into a replacement pane."""
+    (tmp_path / "bridge.json").write_text('{"active_session_id": "conv_old"}')
+    monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "conv_old")
+    checked = asyncio.Event()
+    original_check = claude_native_executor._session_is_active
+
+    def check(bridge_dir: Path, request_session_id: str | None) -> bool:
+        active = original_check(bridge_dir, request_session_id)
+        checked.set()
+        return active
+
+    sent: list[str] = []
+    monkeypatch.setattr(claude_native_executor, "_session_is_active", check)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_user_message",
+        lambda *args, **kwargs: sent.append(kwargs["content"]),
+    )
+    executor = ClaudeNativeExecutor(tmp_path)
+
+    async def deliver() -> bool | list[Any]:
+        if delivery == "steering":
+            return await executor.enqueue_session_message("main", "held input")
+        return [
+            event
+            async for event in executor.run_turn(
+                messages=[{"role": "user", "content": "held input"}], tools=[], system_prompt=""
+            )
+        ]
+
+    async with executor._inject_lock:
+        task = asyncio.create_task(deliver())
+        await asyncio.wait_for(checked.wait(), 2)
+        assert not task.done()
+        (tmp_path / "bridge.json").write_text('{"active_session_id": "conv_new"}')
+        context_path = tmp_path / claude_bridge.CLAUDE_FRAMEWORK_CONTEXT_FILE
+        context_path.write_text("replacement context")
+    result = await asyncio.wait_for(task, 2)
+
+    assert sent == []
+    assert context_path.read_text() == "replacement context"
+    if delivery == "steering":
+        assert result is False
+    else:
+        assert isinstance(result, list) and len(result) == 1
+        assert isinstance(result[0], ExecutorError) and result[0].undelivered is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["turn", "steering"])
+async def test_input_is_refused_while_a_clear_rotation_is_pending(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, delivery: str
+) -> None:
+    """The hook marks the pane as rotating before the replacement conversation exists."""
+    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path.parent)
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path)
+    (tmp_path / "bridge.json").write_text('{"active_session_id": "conv_old"}')
+    monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "conv_old")
+    sent: list[str] = []
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_user_message",
+        lambda *args, **kwargs: sent.append(kwargs["content"]),
+    )
+    executor = ClaudeNativeExecutor(tmp_path)
+    claude_bridge.begin_active_session_rotation(tmp_path)
+
+    if delivery == "steering":
+        assert await executor.enqueue_session_message("main", "held input") is False
+    else:
+        events = [
+            event
+            async for event in executor.run_turn(
+                messages=[{"role": "user", "content": "held input"}], tools=[], system_prompt=""
+            )
+        ]
+        assert len(events) == 1
+        assert isinstance(events[0], ExecutorError) and events[0].undelivered is True
+        assert "no longer active after /clear" in events[0].message
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_model_switch_cannot_deliver_input_after_native_session_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A completed control command does not authorize a user paste into a new owner."""
+    (tmp_path / "bridge.json").write_text('{"active_session_id": "conv_old"}')
+    monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "conv_old")
+    calls: list[str] = []
+    context_path = tmp_path / claude_bridge.CLAUDE_FRAMEWORK_CONTEXT_FILE
+
+    def switch(*args: Any, **kwargs: Any) -> None:
+        calls.append(kwargs["command"])
+        (tmp_path / "bridge.json").write_text('{"active_session_id": "conv_new"}')
+        context_path.write_text("replacement context")
+
+    monkeypatch.setattr(claude_native_executor, "inject_slash_command", switch)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_user_message",
+        lambda *args, **kwargs: calls.append(kwargs["content"]),
+    )
+    executor = ClaudeNativeExecutor(tmp_path)
+    monkeypatch.setattr(executor, "_model_command_arg", lambda model: "sonnet")
+    events = [
+        event
+        async for event in executor.run_turn(
+            messages=[{"role": "user", "content": "held input"}], tools=[], system_prompt=""
+        )
+    ]
+
+    assert calls == ["/model sonnet"]
+    assert context_path.read_text() == "replacement context"
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError) and events[0].undelivered is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["turn", "steering"])
+async def test_accepted_input_is_not_reclassified_when_native_session_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, delivery: str
+) -> None:
+    """A paste already accepted by the native process must not become replayable."""
+    (tmp_path / "bridge.json").write_text('{"active_session_id": "conv_old"}')
+    monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "conv_old")
+    sent: list[str] = []
+
+    def inject(*args: Any, **kwargs: Any) -> None:
+        assert kwargs["expected_session_id"] == "conv_old"
+        assert kwargs["framework_notices"] == []
+        sent.append(kwargs["content"])
+        (tmp_path / "bridge.json").write_text('{"active_session_id": "conv_new"}')
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", inject)
+    executor = ClaudeNativeExecutor(tmp_path)
+    if delivery == "steering":
+        assert await executor.enqueue_session_message("main", "accepted input") is True
+    else:
+        events = [
+            event
+            async for event in executor.run_turn(
+                messages=[{"role": "user", "content": "accepted input"}],
+                tools=[],
+                system_prompt="",
+            )
+        ]
+        assert events == [TurnComplete(response=None)]
+    assert sent == ["accepted input"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "boundary", ["bridge_lock", "prompt_ready", "buffer_loaded", "after_paste", "command_fallback"]
+)
+async def test_native_owner_change_preserves_paste_acceptance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, boundary: str
+) -> None:
+    """Exercise the real bridge after readiness and immediately before its paste."""
+    (tmp_path / "bridge.json").write_text('{"active_session_id": "conv_old"}')
+    monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "conv_old")
+    context_path = tmp_path / claude_bridge.CLAUDE_FRAMEWORK_CONTEXT_FILE
+    commands: list[tuple[str, ...]] = []
+    pasted = False
+    content = "/unknown" if boundary == "command_fallback" else "held input"
+
+    def replace_owner() -> None:
+        (tmp_path / "bridge.json").write_text('{"active_session_id": "conv_new"}')
+        context_path.write_text("replacement context")
+
+    def ready(*args: Any, **kwargs: Any) -> None:
+        if boundary == "prompt_ready":
+            replace_owner()
+
+    def run_tmux(socket: str, *args: str) -> None:
+        nonlocal pasted
+        commands.append(args)
+        if args[0] == "load-buffer" and boundary == "buffer_loaded":
+            replace_owner()
+        elif args[0] == "paste-buffer":
+            pasted = True
+            if boundary == "after_paste":
+                replace_owner()
+        elif args[-1] == "Enter":
+            pasted = False
+
+    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path.parent)
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setattr(
+        claude_bridge,
+        "_wait_for_tmux_info",
+        lambda *args, **kwargs: {"socket_path": "/tmp/mock.sock", "tmux_target": "main"},
+    )
+    monkeypatch.setattr(claude_bridge, "_restore_occupied_input", lambda *args, **kwargs: None)
+    monkeypatch.setattr(claude_bridge, "_wait_for_claude_prompt_ready", ready)
+    monkeypatch.setattr(claude_bridge, "_run_tmux", run_tmux)
+    monkeypatch.setattr(
+        claude_bridge,
+        "_capture_pane",
+        lambda *args, **kwargs: (
+            "──────────────\n❯ " + (content if pasted else "") + "\n──────────────\n"
+        ),
+    )
+    if boundary == "command_fallback":
+
+        def reject_command(*args: Any, **kwargs: Any) -> bool:
+            replace_owner()
+            return True
+
+        monkeypatch.setattr(claude_bridge, "_unknown_command_rejection_appeared", reject_command)
+    monkeypatch.setattr(claude_bridge, "_PASTE_SETTLE_S", 0)
+    monkeypatch.setattr(claude_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.001)
+    executor = ClaudeNativeExecutor(tmp_path)
+
+    async def deliver() -> list[Any]:
+        return [
+            event
+            async for event in executor.run_turn(
+                messages=[{"role": "user", "content": content}], tools=[], system_prompt=""
+            )
+        ]
+
+    if boundary == "bridge_lock":
+        file_lock = claude_bridge._bridge_injection_file_lock(tmp_path)
+        original_lock = claude_bridge._bridge_injection_file_lock
+        blocked = threading.Event()
+
+        def injection_lock(path: Path) -> Any:
+            blocked.set()
+            return original_lock(path)
+
+        file_lock.acquire(timeout=2)
+        monkeypatch.setattr(claude_bridge, "_bridge_injection_file_lock", injection_lock)
+        task = asyncio.create_task(deliver())
+        try:
+            assert await asyncio.to_thread(blocked.wait, 2)
+            replace_owner()
+        finally:
+            file_lock.release()
+        events = await asyncio.wait_for(task, 2)
+    else:
+        events = await deliver()
+
+    assert context_path.read_text() == "replacement context"
+    if boundary == "after_paste":
+        assert sum(command[0] == "paste-buffer" for command in commands) == 1
+        assert events == [TurnComplete(response=None)]
+        return
+    if boundary == "command_fallback":
+        assert sum(command[0] == "paste-buffer" for command in commands) == 1
+        assert len(events) == 1
+        assert isinstance(events[0], ExecutorError) and events[0].undelivered is False
+        return
+    assert not any(command[0] == "paste-buffer" for command in commands)
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError) and events[0].undelivered is True
 
 
 @pytest.mark.asyncio
@@ -264,6 +536,8 @@ async def test_run_turn_points_auth_commands_at_omni_setup(
         *,
         content: str,
         timeout_s: float = 30.0,
+        expected_session_id: str | None = None,
+        framework_notices: list[str] | None = None,
     ) -> None:
         """
         Fail if an auth command reaches tmux injection.
@@ -321,6 +595,8 @@ async def test_enqueue_session_message_refuses_auth_commands(
         *,
         content: str,
         timeout_s: float = 30.0,
+        expected_session_id: str | None = None,
+        framework_notices: list[str] | None = None,
     ) -> None:
         """
         Fail if an auth command reaches tmux injection.
@@ -364,6 +640,8 @@ async def test_enqueue_session_message_rejects_stale_session_after_clear(
         *,
         content: str,
         timeout_s: float = 30.0,
+        expected_session_id: str | None = None,
+        framework_notices: list[str] | None = None,
     ) -> None:
         """
         Fail if stale-session steering reaches tmux injection.
@@ -409,6 +687,8 @@ async def test_enqueue_session_message_injects_steering_into_terminal(
         *,
         content: str,
         timeout_s: float = 30.0,
+        expected_session_id: str | None = None,
+        framework_notices: list[str] | None = None,
     ) -> None:
         """
         Capture a steering injection.
@@ -476,6 +756,8 @@ async def test_concurrent_injections_do_not_overlap_in_terminal(
         *,
         content: str,
         timeout_s: float = 30.0,
+        expected_session_id: str | None = None,
+        framework_notices: list[str] | None = None,
     ) -> None:
         """Record peak concurrency, then hold the call open until released.
 
@@ -563,9 +845,18 @@ def _stub_inject(
         *,
         content: str,
         timeout_s: float = 30.0,
+        expected_session_id: str | None = None,
+        framework_notices: list[str] | None = None,
     ) -> None:
         del timeout_s
-        sent.append({"bridge_dir": bridge_dir_arg, "content": content})
+        assert expected_session_id is None
+        sent.append(
+            {
+                "bridge_dir": bridge_dir_arg,
+                "content": content,
+                "framework_notices": framework_notices,
+            }
+        )
 
     return _fake
 
@@ -672,7 +963,8 @@ async def test_resize_notice_uses_hidden_hook_context(
         pass
 
     assert sent[0]["content"] == "inspect this"
-    assert (tmp_path / "pending_framework_context.txt").read_text() == resize_notice(dimensions)
+    assert sent[0]["framework_notices"] == [resize_notice(dimensions)]
+    assert not (tmp_path / "pending_framework_context.txt").exists()
 
 
 @pytest.mark.asyncio
@@ -685,7 +977,8 @@ async def test_failed_injection_clears_framework_context(
     from omnigent.inner.native_attachments import framework_notice_block
 
     def fail_inject(*args: Any, **kwargs: Any) -> None:
-        assert (tmp_path / "pending_framework_context.txt").exists()
+        assert kwargs["framework_notices"]
+        assert not (tmp_path / "pending_framework_context.txt").exists()
         raise error
 
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
@@ -1033,12 +1326,14 @@ async def test_enqueue_session_message_materializes_image(
     assert "steering_img.png" in injected
     assert "look at this" in injected
     assert "downscaled" not in injected
-    assert (tmp_path / CLAUDE_FRAMEWORK_CONTEXT_FILE).read_text() == resize_notice(dimensions)
+    assert sent[0]["framework_notices"] == [resize_notice(dimensions)]
+    assert not (tmp_path / CLAUDE_FRAMEWORK_CONTEXT_FILE).exists()
     # File was written to the bridge directory.
     written = list((attachment_cache_dir(tmp_path)).iterdir())
     assert len(written) == 1
     assert written[0].name == "steering_img.png"
     assert await executor.enqueue_session_message("session-key", "follow-up")
+    assert sent[-1]["framework_notices"] == []
     assert not (tmp_path / CLAUDE_FRAMEWORK_CONTEXT_FILE).exists()
 
 
@@ -1171,6 +1466,8 @@ async def test_run_turn_applies_routed_model_before_message_under_one_lock(
         *,
         content: str,
         timeout_s: float = 30.0,
+        expected_session_id: str | None = None,
+        framework_notices: list[str] | None = None,
     ) -> None:
         """Record the message inject."""
         del bridge_dir_arg, timeout_s
@@ -1240,7 +1537,7 @@ async def test_run_turn_uses_the_custom_model_slot_id_verbatim(
     monkeypatch.setattr(
         claude_native_executor,
         "inject_user_message",
-        lambda bridge_dir_arg, *, content, timeout_s=30.0: None,
+        _stub_inject([]),
     )
 
     executor = ClaudeNativeExecutor(tmp_path / "bridge")
@@ -1301,7 +1598,7 @@ async def test_run_turn_types_a_managed_picker_row_verbatim(
     monkeypatch.setattr(
         claude_native_executor,
         "inject_user_message",
-        lambda bridge_dir_arg, *, content, timeout_s=30.0: None,
+        _stub_inject([]),
     )
 
     executor = ClaudeNativeExecutor(tmp_path / "bridge")
@@ -1346,7 +1643,12 @@ async def test_run_turn_skips_switch_for_untranslatable_model(
         slash_calls.append(command)
 
     def fake_inject_user_message(
-        bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+        expected_session_id: str | None = None,
+        framework_notices: list[str] | None = None,
     ) -> None:
         del bridge_dir_arg, timeout_s
         msg_calls.append(content)
@@ -1391,7 +1693,7 @@ async def test_run_turn_skips_switch_when_the_family_pin_drifted(
     """
     monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
     slash_calls: list[str] = []
-    msg_calls: list[str] = []
+    msg_calls: list[dict[str, Any]] = []
 
     monkeypatch.setattr(claude_native_executor, "read_launch_model", lambda _bridge: None)
     monkeypatch.setattr(
@@ -1409,7 +1711,7 @@ async def test_run_turn_skips_switch_when_the_family_pin_drifted(
     monkeypatch.setattr(
         claude_native_executor,
         "inject_user_message",
-        lambda bridge_dir_arg, *, content, timeout_s=30.0: msg_calls.append(content),
+        _stub_inject(msg_calls),
     )
 
     executor = ClaudeNativeExecutor(tmp_path / "bridge")
@@ -1424,7 +1726,7 @@ async def test_run_turn_skips_switch_when_the_family_pin_drifted(
     ]
 
     assert slash_calls == []
-    assert msg_calls == ["hello"]
+    assert [call["content"] for call in msg_calls] == ["hello"]
     assert events == [TurnComplete(response=None)]
 
 
@@ -1456,7 +1758,12 @@ async def test_run_turn_without_model_override_injects_message_only(
         slash_calls.append(command)
 
     def fake_inject_user_message(
-        bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+        expected_session_id: str | None = None,
+        framework_notices: list[str] | None = None,
     ) -> None:
         del bridge_dir_arg, timeout_s
         msg_calls.append(content)
@@ -1510,7 +1817,12 @@ async def test_run_turn_skips_model_switch_when_already_on_that_model(
         slash_calls.append(command)
 
     def fake_inject_user_message(
-        bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+        expected_session_id: str | None = None,
+        framework_notices: list[str] | None = None,
     ) -> None:
         del bridge_dir_arg, timeout_s
         msg_calls.append(content)
@@ -1563,7 +1875,12 @@ async def test_a_routed_first_message_switches_the_model_exactly_once(
         slash_calls.append(command)
 
     def fake_inject_user_message(
-        bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+        expected_session_id: str | None = None,
+        framework_notices: list[str] | None = None,
     ) -> None:
         del bridge_dir_arg, timeout_s
         msg_calls.append(content)
@@ -1611,7 +1928,14 @@ async def test_run_turn_reaps_tmux_before_reporting_prompt_timeout(
     bridge_dir = tmp_path / "bridge"
     killed: list[NativeTmuxTerminal] = []
 
-    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+    def fail_inject(
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+        expected_session_id: str | None = None,
+        framework_notices: list[str] | None = None,
+    ) -> None:
         del bridge_dir_arg, content, timeout_s
         _pin_terminal()
         raise ClaudePromptTimeout("terminal did not become ready")
@@ -1654,7 +1978,14 @@ async def test_run_turn_keeps_the_pane_when_a_terminal_dialog_blocks_delivery(
     """
     bridge_dir = tmp_path / "bridge"
 
-    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+    def fail_inject(
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+        expected_session_id: str | None = None,
+        framework_notices: list[str] | None = None,
+    ) -> None:
         del bridge_dir_arg, content, timeout_s
         raise ClaudeTerminalDialog(
             "Claude Code is waiting for an answer in its terminal "
@@ -1709,7 +2040,14 @@ async def test_run_turn_reports_a_refused_routed_model_switch_as_undelivered(
             f"not sent ({command})."
         )
 
-    def record_message(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+    def record_message(
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+        expected_session_id: str | None = None,
+        framework_notices: list[str] | None = None,
+    ) -> None:
         """Record a message inject that must never happen."""
         del bridge_dir_arg, timeout_s
         messages.append(content)
@@ -1847,7 +2185,14 @@ async def test_run_turn_keeps_the_pane_when_a_sign_in_prompt_blocks_delivery(
     """
     bridge_dir = tmp_path / "bridge"
 
-    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+    def fail_inject(
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+        expected_session_id: str | None = None,
+        framework_notices: list[str] | None = None,
+    ) -> None:
         del bridge_dir_arg, content, timeout_s
         raise ClaudeSignInPending(
             "Claude Code is waiting for a sign-in in this session's terminal, "
@@ -1903,7 +2248,14 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
     """
     bridge_dir = tmp_path / "bridge"
 
-    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+    def fail_inject(
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+        expected_session_id: str | None = None,
+        framework_notices: list[str] | None = None,
+    ) -> None:
         del bridge_dir_arg, content, timeout_s
         raise ClaudeTerminalExited(
             "The Claude Code terminal has exited, so the message was not delivered.",
@@ -2035,7 +2387,14 @@ async def test_run_turn_does_not_reap_unrelated_runtime_error(
 ) -> None:
     """Only the readiness failure that terminalizes the turn triggers cleanup."""
 
-    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+    def fail_inject(
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+        expected_session_id: str | None = None,
+        framework_notices: list[str] | None = None,
+    ) -> None:
         del bridge_dir_arg, content, timeout_s
         raise RuntimeError("tmux send-keys failed")
 
@@ -2067,7 +2426,14 @@ async def test_run_turn_reports_reap_failure_with_prompt_timeout(
 ) -> None:
     """A failed hard-stop remains visible beside the delivery error."""
 
-    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+    def fail_inject(
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+        expected_session_id: str | None = None,
+        framework_notices: list[str] | None = None,
+    ) -> None:
         del bridge_dir_arg, content, timeout_s
         _pin_terminal()
         raise failure("terminal did not become ready")
@@ -2102,7 +2468,14 @@ async def test_run_turn_does_not_reap_without_native_terminal_identity(
 ) -> None:
     """Missing native ownership must not turn into an unfenced cleanup."""
 
-    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+    def fail_inject(
+        bridge_dir_arg: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+        expected_session_id: str | None = None,
+        framework_notices: list[str] | None = None,
+    ) -> None:
         del bridge_dir_arg, content, timeout_s
         raise ClaudePromptTimeout("terminal did not become ready")
 

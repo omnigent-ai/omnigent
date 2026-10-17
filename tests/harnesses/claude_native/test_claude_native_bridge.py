@@ -4639,6 +4639,7 @@ def _run_unknown_command_injection(
 def test_unknown_command_rejection_redelivers_escaped(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A message rejected as "Unknown command" is re-delivered escaped.
@@ -4649,18 +4650,22 @@ def test_unknown_command_rejection_redelivers_escaped(
     the message again with the space escape so it reaches the model
     as plain user text.
     """
-    payloads = _run_unknown_command_injection(
-        tmp_path,
-        monkeypatch,
-        content="/not-a-real-skill hello world",
-        reject_name="not-a-real-skill",
-    )
+    with caplog.at_level("INFO", logger="omnigent.harnesses.claude_native.bridge"):
+        payloads = _run_unknown_command_injection(
+            tmp_path,
+            monkeypatch,
+            content="/not-a-real-skill hello world",
+            reject_name="not-a-real-skill",
+        )
     assert len(payloads) == 2, (
         f"Expected the rejected message to be pasted twice (raw, then escaped); "
         f"got {len(payloads)} paste(s)."
     )
     assert payloads[0].startswith(b"/not-a-real-skill")
     assert payloads[1].startswith(b" /not-a-real-skill hello world")
+    assert "re-delivering the message escaped as plain text" in caplog.text
+    assert "not-a-real-skill" not in caplog.text
+    assert "hello world" not in caplog.text
 
 
 def test_unknown_name_accepted_as_skill_is_not_redelivered(
@@ -10798,6 +10803,227 @@ def _fake_tmux(
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", _fake_capture)
     monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     return sends
+
+
+@pytest.mark.parametrize("failure", ["none", "owned", "replacement", "rewritten", "fallback"])
+def test_framework_context_is_staged_and_cleaned_by_its_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    (bridge_dir / "bridge.json").write_text('{"active_session_id": "conv_old"}')
+    path = bridge_dir / claude_native_bridge.CLAUDE_FRAMEWORK_CONTEXT_FILE
+    content = "/unknown" if failure == "fallback" else "hello"
+    panes = [_composer_pane(content), _composer_pane()]
+    if failure == "fallback":
+        panes.insert(0, _composer_pane())
+        monkeypatch.setattr(
+            claude_native_bridge, "_unknown_command_rejection_appeared", lambda *a, **k: True
+        )
+    sends = _fake_tmux(monkeypatch, panes)
+    run_tmux = claude_native_bridge._run_tmux
+    loads = 0
+    monkeypatch.setattr(claude_native_bridge, "_restore_occupied_input", lambda *a, **k: None)
+    monkeypatch.setattr(
+        claude_native_bridge, "_wait_for_claude_prompt_ready", lambda *a, **k: None
+    )
+
+    def run(socket_path: str, *args: str) -> None:
+        nonlocal loads
+        if args[0] == "load-buffer":
+            loads += 1
+            assert path.read_text() == "framework note"
+            if failure == "replacement":
+                replacement = bridge_dir / "replacement.txt"
+                replacement.write_text("replacement context")
+                replacement.replace(path)
+            elif failure == "rewritten":
+                path.write_text("replacement context")
+            if failure not in {"none", "fallback"} or (failure == "fallback" and loads == 2):
+                raise RuntimeError("paste transport refused")
+        run_tmux(socket_path, *args)
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", run)
+    if failure == "none":
+        inject_user_message(
+            bridge_dir,
+            content="hello",
+            expected_session_id="conv_old",
+            framework_notices=["framework note"],
+        )
+        assert path.read_text() == "framework note"
+        assert sum(command[0] == "paste-buffer" for command in sends) == 1
+    else:
+        with pytest.raises(RuntimeError, match="paste transport refused"):
+            inject_user_message(
+                bridge_dir,
+                content=content,
+                expected_session_id="conv_old",
+                framework_notices=["framework note"],
+            )
+        assert sum(command[0] == "paste-buffer" for command in sends) == int(failure == "fallback")
+        if failure in {"owned", "fallback"}:
+            assert not path.exists()
+        else:
+            assert path.read_text() == "replacement context"
+
+
+@pytest.mark.parametrize("kind", ["json", "text"])
+def test_atomic_bridge_writes_close_before_replacing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    files: list[Any] = []
+    temporary_file = tempfile.NamedTemporaryFile
+    replace = os.replace
+
+    def create(*args: Any, **kwargs: Any) -> Any:
+        handle = temporary_file(*args, **kwargs)
+        files.append(handle)
+        return handle
+
+    def replace_closed(source: Any, destination: Any) -> None:
+        assert files[-1].closed
+        replace(source, destination)
+
+    monkeypatch.setattr(claude_native_bridge.tempfile, "NamedTemporaryFile", create)
+    monkeypatch.setattr(claude_native_bridge.os, "replace", replace_closed)
+    path = tmp_path / "bridge" / "value.txt"
+    if kind == "json":
+        claude_native_bridge._write_json_file(path, {"value": "kept"})
+        assert json.loads(path.read_text()) == {"value": "kept"}
+    else:
+        assert claude_native_bridge._write_text_file(path, "kept") is not None
+        assert path.read_text() == "kept"
+
+
+def test_framework_context_does_not_replace_a_new_owner_before_atomic_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    (bridge_dir / "bridge.json").write_text('{"active_session_id": "conv_old"}')
+    path = bridge_dir / claude_native_bridge.CLAUDE_FRAMEWORK_CONTEXT_FILE
+    sends = _fake_tmux(monkeypatch, [_composer_pane()])
+    monkeypatch.setattr(claude_native_bridge, "_restore_occupied_input", lambda *a, **k: None)
+    monkeypatch.setattr(
+        claude_native_bridge, "_wait_for_claude_prompt_ready", lambda *a, **k: None
+    )
+    fsync = os.fsync
+
+    def rotate(fd: int) -> None:
+        fsync(fd)
+        (bridge_dir / "bridge.json").write_text('{"active_session_id": "conv_new"}')
+        path.write_text("replacement context")
+
+    monkeypatch.setattr(claude_native_bridge.os, "fsync", rotate)
+    with pytest.raises(claude_native_bridge.ClaudeSessionInactive):
+        inject_user_message(
+            bridge_dir,
+            content="hello",
+            expected_session_id="conv_old",
+            framework_notices=["old context"],
+        )
+    assert sends == []
+    assert path.read_text() == "replacement context"
+
+
+@pytest.mark.parametrize("generation", [None, "owner-before-clear"])
+def test_a_pending_clear_rotation_refuses_input_until_the_replacement_owner_is_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, generation: str | None
+) -> None:
+    """
+    The hook marks the pane as rotating before the replacement conversation exists.
+
+    Claude has already discarded the conversation at that point, so a message
+    for the old owner must be refused before its first paste; the replacement
+    owner is accepted as soon as ``write_active_session_id`` names it.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    config: dict[str, Any] = {"active_session_id": "conv_old"}
+    if generation is not None:
+        config["active_session_generation"] = generation
+    (bridge_dir / "bridge.json").write_text(json.dumps(config))
+    sends = _fake_tmux(monkeypatch, [_composer_pane()])
+    monkeypatch.setattr(claude_native_bridge, "_restore_occupied_input", lambda *a, **k: None)
+    monkeypatch.setattr(
+        claude_native_bridge, "_wait_for_claude_prompt_ready", lambda *a, **k: None
+    )
+    assert claude_native_bridge.active_session_accepts_input(bridge_dir, "conv_old")
+
+    claude_native_bridge.begin_active_session_rotation(bridge_dir)
+
+    rotating = json.loads((bridge_dir / "bridge.json").read_text())
+    assert rotating["active_session_id"] == "conv_old"
+    assert isinstance(rotating["active_session_generation"], str)
+    assert rotating["active_session_generation"] != generation
+    assert not claude_native_bridge.active_session_accepts_input(bridge_dir, "conv_old")
+    assert claude_native_bridge.active_session_accepts_input(bridge_dir, None)
+    with pytest.raises(claude_native_bridge.ClaudeSessionInactive):
+        inject_user_message(bridge_dir, content="hello", expected_session_id="conv_old")
+    assert sends == []
+
+    claude_native_bridge.write_active_session_id(bridge_dir, "conv_new")
+
+    assert claude_native_bridge.active_session_accepts_input(bridge_dir, "conv_new")
+    assert not claude_native_bridge.active_session_accepts_input(bridge_dir, "conv_old")
+    assert "active_session_rotation_started_at" not in (bridge_dir / "bridge.json").read_text()
+
+
+def test_concurrent_owner_and_marker_writers_keep_each_other_s_update(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hook's marker write and the owner rotation run in different processes."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    (bridge_dir / "bridge.json").write_text(
+        json.dumps({"active_session_id": "conv_old", "model_picker_values": ["sonnet"]})
+    )
+    owner_read = threading.Event()
+    release_owner = threading.Event()
+    real_read = claude_native_bridge._read_json_file
+    owner_thread = threading.Thread(
+        target=claude_native_bridge.write_active_session_id, args=(bridge_dir, "conv_new")
+    )
+
+    def paused_read(path: Path) -> Any:
+        config = real_read(path)
+        if threading.current_thread() is owner_thread and path.name == "bridge.json":
+            owner_read.set()
+            assert release_owner.wait(5.0)
+        return config
+
+    monkeypatch.setattr(claude_native_bridge, "_read_json_file", paused_read)
+    owner_thread.start()
+    assert owner_read.wait(5.0)
+    marker_thread = threading.Thread(
+        target=claude_native_bridge.begin_active_session_rotation, args=(bridge_dir,)
+    )
+    marker_thread.start()
+    # Without the shared lock the marker writer would finish here, and the owner
+    # write still in flight would then drop its update.
+    marker_thread.join(0.3)
+    assert marker_thread.is_alive()
+    release_owner.set()
+    owner_thread.join(5.0)
+    marker_thread.join(5.0)
+    assert not owner_thread.is_alive() and not marker_thread.is_alive()
+
+    config = json.loads((bridge_dir / "bridge.json").read_text())
+    assert config["active_session_id"] == "conv_new"
+    assert config["model_picker_values"] == ["sonnet"]
+    assert "active_session_rotation_started_at" in config
+
+
+def test_a_stale_clear_rotation_marker_expires(tmp_path: Path) -> None:
+    """A marker left by a rotation that never finished must not refuse the pane for good."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    (bridge_dir / "bridge.json").write_text('{"active_session_id": "conv_old"}')
+    claude_native_bridge.begin_active_session_rotation(bridge_dir)
+    assert not claude_native_bridge.active_session_accepts_input(bridge_dir, "conv_old")
+
+    config = json.loads((bridge_dir / "bridge.json").read_text())
+    config["active_session_rotation_started_at"] = (
+        time.time() - claude_native_bridge.ACTIVE_SESSION_ROTATION_MAX_AGE_S - 1
+    )
+    (bridge_dir / "bridge.json").write_text(json.dumps(config))
+    assert claude_native_bridge.active_session_accepts_input(bridge_dir, "conv_old")
 
 
 def test_a_model_switch_types_the_argument_form_and_confirms(
