@@ -215,6 +215,81 @@ async def test_wait_for_runner_global_cap_bounds_waiter_growth() -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caps",
+    [
+        pytest.param({"max_connect_waiters_per_runner": 1}, id="per-runner-cap"),
+        pytest.param({"max_connect_waiters_total": 1}, id="global-cap"),
+    ],
+)
+async def test_wait_for_runner_overflow_caller_sees_early_registration(
+    caps: dict[str, int],
+) -> None:
+    """A caller past the waiter cap must notice a runner that registers early."""
+    reg = TunnelRegistry(**caps)
+    timeout_s = 8.0
+    register_after_s = 0.3
+    loop = asyncio.get_running_loop()
+    admitted = asyncio.create_task(reg.wait_for_runner("r1", timeout_s=timeout_s))
+    tasks = [admitted]
+    try:
+        await _wait_until(lambda: reg.connect_waiter_count() == 1, timeout_s=budget(1.0))
+        overflow = asyncio.create_task(reg.wait_for_runner("r1", timeout_s=timeout_s))
+        tasks.append(overflow)
+        await asyncio.sleep(0)
+        assert reg.connect_waiter_count() == 1
+
+        await asyncio.sleep(register_after_s)
+        registered_at = loop.time()
+        session = reg.register("r1", _NoopWS(), _hello())
+        assert await asyncio.wait_for(admitted, timeout=budget(1.0)) is session
+        resolved = await asyncio.wait_for(overflow, timeout=timeout_s + budget(1.0))
+        overflow_latency = loop.time() - registered_at
+        assert resolved is session
+        # Half the window separates a 0.5s re-check from waiting out the deadline,
+        # even when a loaded CI loop stalls for seconds.
+        assert overflow_latency < timeout_s / 2, (
+            f"overflow caller observed the runner {overflow_latency:.2f}s after it registered; "
+            f"it waited out its whole {timeout_s:.1f}s timeout instead of re-checking"
+        )
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "caps",
+    [
+        pytest.param({"max_connect_waiters_per_runner": 1}, id="per-runner-cap"),
+        pytest.param({"max_connect_waiters_total": 1}, id="global-cap"),
+    ],
+)
+async def test_wait_for_runner_overflow_caller_without_runner_waits_out_timeout(
+    caps: dict[str, int],
+) -> None:
+    """Re-checking across several polls must neither end an overflow wait early nor overrun it."""
+    reg = TunnelRegistry(**caps)
+    # Longer than two 0.5s polls, so the deadline loop re-sleeps before it expires.
+    timeout_s = 1.2
+    loop = asyncio.get_running_loop()
+    admitted = asyncio.create_task(reg.wait_for_runner("r1", timeout_s=math.inf))
+    try:
+        await _wait_until(lambda: reg.connect_waiter_count() == 1, timeout_s=budget(1.0))
+        started = loop.time()
+        assert await reg.wait_for_runner("r1", timeout_s=timeout_s) is None
+        elapsed = loop.time() - started
+        assert timeout_s - 0.05 <= elapsed < timeout_s + budget(1.0), (
+            f"overflow caller returned after {elapsed:.2f}s for a {timeout_s:.1f}s timeout"
+        )
+        assert reg.connect_waiter_count() == 1
+    finally:
+        admitted.cancel()
+        await asyncio.gather(admitted, return_exceptions=True)
+
+
 def test_wait_for_runner_rejects_invalid_waiter_caps() -> None:
     """Waiter caps must be positive finite counters."""
     with pytest.raises(ValueError, match="per_runner"):
