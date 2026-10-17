@@ -179,6 +179,10 @@ def _builtin_contribution() -> SandboxProviderContribution:
                 name="e2b",
                 launcher_class="omnigent.onboarding.sandboxes.e2b:E2BSandboxLauncher",
             ),
+            "opensandbox": SandboxProviderMetadata(
+                name="opensandbox",
+                launcher_class="omnigent.onboarding.sandboxes.opensandbox:OpenSandboxLauncher",
+            ),
             "gensee": SandboxProviderMetadata(
                 name="gensee",
                 launcher_class="omnigent.onboarding.sandboxes.gensee:GenseeSandboxLauncher",
