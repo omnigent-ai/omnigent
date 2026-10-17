@@ -2478,6 +2478,17 @@ async def _create_thread_replacement_session(
         json={
             "agent_id": agent_id,
             "labels": labels,
+            # A native thread reset keeps its workspace and launch settings.
+            **{
+                key: old[key]
+                for key in (
+                    "workspace",
+                    "terminal_launch_args",
+                    "model_override",
+                    "reasoning_effort",
+                )
+                if old.get(key) is not None
+            },
         },
     )
     create_resp.raise_for_status()

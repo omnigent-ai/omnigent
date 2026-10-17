@@ -195,7 +195,15 @@ class _Session:
 
 
 @contextmanager
-def _session(rig: _Rig, model: str, effort: str, *, inherited: bool = False) -> Iterator[_Session]:
+def _session(
+    rig: _Rig,
+    model: str,
+    effort: str,
+    *,
+    inherited: bool = False,
+    model_override: str | None = None,
+    terminal_launch_args: list[str] | None = None,
+) -> Iterator[_Session]:
     source_effort = effort if inherited else "medium"
     source_config = f'model = "{model}"\nmodel_reasoning_effort = "{source_effort}"\n'
     # Record the user's choice to keep the model instead of accepting an upgrade.
@@ -211,6 +219,8 @@ def _session(rig: _Rig, model: str, effort: str, *, inherited: bool = False) -> 
     metadata: dict[str, Any] = {"workspace": str(rig.stack.workspace)}
     if not inherited:
         metadata["reasoning_effort"] = effort
+    if terminal_launch_args is not None:
+        metadata["terminal_launch_args"] = terminal_launch_args
     created = create_native_session(
         rig.api, rig.stack.base_url, harness="codex", model=model, metadata=metadata
     )
@@ -218,7 +228,10 @@ def _session(rig: _Rig, model: str, effort: str, *, inherited: bool = False) -> 
     bridge_id = hashlib.sha256(session_id.encode()).hexdigest()[:32]
     bridge = rig.stack.runner_home / ".omnigent" / "codex-native" / bridge_id
     try:
-        _json(rig.api.patch(f"/v1/sessions/{session_id}", json={"runner_id": rig.stack.runner_id}))
+        binding = {"runner_id": rig.stack.runner_id}
+        if model_override is not None:
+            binding["model_override"] = model_override
+        _json(rig.api.patch(f"/v1/sessions/{session_id}", json=binding))
         session = _Session(session_id, bridge, {})
         session.ensure_terminal(rig)
         yield session
@@ -503,6 +516,61 @@ def test_codex_combined_model_and_reset_uses_target_default(codex_effort_rig: _R
         )
         _assert_turn(rig, session, _SWITCH_MODEL, default, terminal=True)
         _assert_turn(rig, session, _SWITCH_MODEL, default)
+
+
+def test_codex_new_preserves_session_settings(codex_effort_rig: _Rig) -> None:
+    """A native /new retains the launch settings saved on the replacement session."""
+    rig = codex_effort_rig
+    assert "high" in rig.capabilities(_STANDARD_MODEL)
+    launch_args = ["-s", "read-only", "-a", "never"]
+    settings = {
+        "terminal_launch_args": launch_args,
+        "model_override": _STANDARD_MODEL,
+        "reasoning_effort": "high",
+    }
+    with _session(
+        rig,
+        _STANDARD_MODEL,
+        "high",
+        model_override=_STANDARD_MODEL,
+        terminal_launch_args=launch_args,
+    ) as session:
+        try:
+            before = _json(rig.api.get(f"/v1/sessions/{session.id}"))
+            assert {key: before.get(key) for key in settings} == settings
+            _assert_turn(rig, session, _STANDARD_MODEL, "high", terminal=True)
+            original = read_bridge_state(session.bridge)
+            assert original is not None
+            session.tmux("send-keys", "-l", "--", "/new")
+            time.sleep(0.3)
+            session.tmux("send-keys", "Enter")
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                rotated = read_bridge_state(session.bridge)
+                if rotated is not None and rotated.session_id != session.id:
+                    break
+                # A slow TUI can drop the first Enter while absorbing the paste.
+                session.tmux("send-keys", "Enter")
+                time.sleep(0.2)
+            else:
+                pytest.fail(
+                    f"Native /new did not rotate the session.\n"
+                    f"{session.tmux('capture-pane', '-p')}\n{rig.stack.log_tail()}"
+                )
+            assert rotated.thread_id != original.thread_id
+            after = _json(rig.api.get(f"/v1/sessions/{rotated.session_id}"))
+            evidence = {"before": before, "after": after, "settings": settings}
+            (rig.stack.root / "rotation-settings.json").write_text(json.dumps(evidence, indent=2))
+            (rig.stack.root / "rotation-terminal.txt").write_text(
+                session.tmux("capture-pane", "-p")
+            )
+            assert {key: after[key] for key in settings} == settings
+            assert after["runner_id"] == rig.stack.runner_id
+            assert after["workspace"] == before["workspace"]
+        finally:
+            current = read_bridge_state(session.bridge)
+            if current is not None and current.session_id != session.id:
+                rig.api.delete(f"/v1/sessions/{current.session_id}")
 
 
 def test_codex_resume_clamps_persisted_effort(codex_effort_rig: _Rig) -> None:
