@@ -920,7 +920,8 @@ class OpenCodeNativeForwarder:
         ``{name, data}`` error. Post ``external_session_status: failed`` with the
         error message (and a re-auth hint for provider-auth errors) so the web UI
         shows the failure instead of a silent idle. A ``MessageAbortedError`` is a
-        user interrupt, not a failure, so it takes the normal idle path.
+        user interrupt, not a failure, so it ends the turn with a cancelled
+        outcome rather than a bare idle the runner would read as a completion.
         """
         error = event.properties.get("error")
         _logger.warning("OpenCode session error for session=%s: %s", self._session_id, error)
@@ -928,7 +929,9 @@ class OpenCodeNativeForwarder:
         name = error.get("name") if isinstance(error, Mapping) else None
         data = error.get("data") if isinstance(error, Mapping) else None
         if name == "MessageAbortedError":
-            await self._end_turn()
+            # Stamp the terminal edge so the server settles an interrupted
+            # sub-agent dispatch as cancelled instead of a normal completion.
+            await self._end_turn(extra={"turn_outcome": "cancelled"})
             return
         message = data.get("message") if isinstance(data, Mapping) else None
         if not isinstance(message, str) or not message.strip():
