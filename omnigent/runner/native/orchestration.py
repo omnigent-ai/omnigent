@@ -3170,6 +3170,17 @@ async def _auto_create_cursor_terminal(
     # snapshot that would expire mid-session), matching the runner's server_client.
     _runner_auth = _RunnerDatabricksAuth(_make_auth_token_factory())
 
+    # The server gates the /clear rotation event on runner-tunnel authority, so
+    # the forwarder must present the binding token; harmless additive header on
+    # bearer-authenticated servers.
+    from omnigent.runner._entry import _runner_tunnel_binding_token_from_env
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+
+    _binding_token = _runner_tunnel_binding_token_from_env()
+    _forwarder_headers: dict[str, str] = (
+        {RUNNER_TUNNEL_TOKEN_HEADER: _binding_token} if _binding_token else {}
+    )
+
     from omnigent.harnesses.cursor_native.forwarder import supervise_cursor_forwarder
     from omnigent.harnesses.cursor_native.permissions import (
         cursor_launch_args_enable_yolo,
@@ -3203,7 +3214,7 @@ async def _auto_create_cursor_terminal(
         await asyncio.gather(
             supervise_cursor_forwarder(
                 base_url=server_url,
-                headers={},
+                headers=_forwarder_headers,
                 session_id=session_id,
                 bridge_dir=bridge_dir,
                 agent_name="cursor-native-ui",
