@@ -177,6 +177,8 @@ RUN test -f ./omnigent/server/static/web-ui/index.html \
 # Optional managed-sandbox provider extras for the SERVER. Build with
 # `--build-arg OMNIGENT_EXTRAS=kubernetes` (comma-separate for several).
 ARG OMNIGENT_EXTRAS=
+COPY integrations/slack/README.md integrations/slack/pyproject.toml ./integrations/slack/
+COPY integrations/slack/src/ ./integrations/slack/src/
 RUN set -f; \
     extras="${OMNIGENT_EXTRAS},"; \
     set --; \
