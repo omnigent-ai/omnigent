@@ -5830,3 +5830,21 @@ async def test_registration_database_failure_still_attempts_provider_cleanup(db_
         await launch_managed_host(config=_injected_config(fake), owner=_OWNER, host_store=hosts)
     assert len(fake.terminated) == 1
     assert fake.host_starts == []
+
+
+def test_parse_valid_boat_config() -> None:
+    """The boat YAML shape parses with the 7-day policy token TTL."""
+    from omnigent.onboarding.sandboxes.boat import BoatSandboxLauncher
+    from omnigent.server.managed_hosts import BOAT_MANAGED_TOKEN_TTL_S
+
+    cfg = parse_sandbox_config({"provider": "boat", "server_url": "https://srv.example.com/"})
+    assert cfg is not None
+    assert isinstance(cfg.default.launcher_factory(), BoatSandboxLauncher)
+    assert cfg.default.token_ttl_s == BOAT_MANAGED_TOKEN_TTL_S == 7 * 24 * 3600
+
+
+def test_parse_boat_config_rejects_unknown_key() -> None:
+    with pytest.raises(ValueError, match=r"sandbox\.boat"):
+        parse_sandbox_config(
+            {"provider": "boat", "server_url": "https://srv.example.com/", "boat": {"image": "x"}}
+        )

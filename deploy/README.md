@@ -84,6 +84,9 @@ deploy/
 ├── blaxel/            ← Blaxel sandbox-provider guide + managed-host config;
 │   └── README.md         NOT a server deploy target.
 │
+├── boat/              ← Boat.dev managed sandbox-provider guide (persistent
+│   └── README.md         resume, HTTP API, no SDK); NOT a server deploy target.
+│
 ├── islo/              ← Islo sandbox-provider guide (gateway credential
 │   └── README.md         injection); NOT a server deploy target.
 │
@@ -336,7 +339,7 @@ omnigent sandbox connect --provider modal --sandbox-id <id> --server https://you
 > rather than a registry image — build it once first; see
 > [`e2b/README.md`](e2b/README.md).
 
-**Server-managed (Modal, Daytona, Blaxel, Islo, E2B, or Gensee).** With
+**Server-managed (Modal, Daytona, Boat, Blaxel, Islo, E2B, or Gensee).** With
 *managed hosts*, creating a session with `"host_type": "managed"` (e.g.
 `POST /v1/sessions {"agent_id": ..., "host_type": "managed"}`) makes the
 server provision a sandbox, start a host in it, and run the session there.
@@ -358,6 +361,8 @@ Modal credentials come from the server's environment (`MODAL_TOKEN_ID` /
 `MODAL_TOKEN_SECRET`, or a mounted `~/.modal.toml`), not the config file.
 Daytona reads `DAYTONA_API_KEY`. Blaxel reads `BL_WORKSPACE` and `BL_API_KEY`.
 Islo reads `ISLO_API_KEY` and optional `ISLO_BASE_URL`. E2B reads `E2B_API_KEY`.
+Boat reads `BOAT_API_KEY` and optional `BOAT_API_URL`; see
+[`boat/README.md`](boat/README.md).
 Gensee reads `GENSEE_CONTROLLER_API_TOKEN`; see
 [`gensee/README.md`](gensee/README.md) for its managed-only configuration.
 All credentials come from the server environment.
