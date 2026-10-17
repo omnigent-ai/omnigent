@@ -7,27 +7,26 @@ adds native niceties:
 - **OS-native desktop notifications** (via the main-process `Notification`
   API) when an agent finishes a turn (`running` → `idle`/`failed`), raises a
   new elicitation (asks for input), or a runner disconnects (`online` →
-  `offline`). A notification fires for any such event **except** the one
-  conversation you're actively viewing (window focused _and_ that chat
-  open). Sessions already settled at launch don't fire; only fresh
+  `offline`). By default, a notification fires for any such event **except**
+  the conversation you're actively viewing. On macOS, choose
+  **Settings → Notifications → Always** to notify for that active
+  conversation too. Sessions already settled at launch don't fire; only fresh
   transitions this client observes do. On a turn-end the notification body
   shows the **first few lines of the agent's final message** when they can be
   fetched (one best-effort `GET /items` call), falling back to a generic
   "Agent finished and is ready for your input." On macOS each notification can
-  also **play a sound** — a system sound you pick in the **Notifications** menu
+  also **play a sound** — a system sound you pick in the **Settings → Notifications** page
   (see below). It's **off by default (opt-in)**: a fresh install stays silent
   until you turn it on, so the sound never surprises you.
-- **A foreground attention cue.** macOS (and Windows) suppress the notification
-  _banner_ for the **frontmost** app — and macOS suppresses its **sound** too —
-  so the notification still lands in Notification Center, but no toast pops (and
-  on macOS no sound plays), which reads as "notifications only work when the app
-  is in the background." Because the web layer already only notifies for
-  sessions you are _not_ actively viewing, the shell adds OS-level cues the
-  frontmost app _can_ produce: it **bounces the macOS dock icon** (or flashes
-  the taskbar frame on Windows/Linux), and on macOS it **plays the chosen sound
-  itself** (via `afplay`) instead of the suppressed notification sound. Because
-  the shell plays it, the alert is audible **whether Omnigent is backgrounded or
-  in front** — and the toast's own sound is muted so the cue never doubles.
+  **Compatibility:** These controls require an updated macOS desktop app and
+  connected server web bundle. Older server bundles retain their existing
+  focused-conversation suppression. Existing notification preferences are preserved.
+- **A foreground attention cue.** Electron requests foreground presentation on
+  macOS, so a native banner can appear while Omnigent is frontmost. The shell
+  supplements notifications by **bouncing the macOS dock icon** (or flashing
+  the taskbar frame on Windows/Linux). On macOS it also **plays the chosen sound
+  itself** via `afplay`, keeping the alert audible whether Omnigent is in front
+  or backgrounded; the toast's own sound is muted so the cue never doubles.
 - **Multiple windows** (**Server → New Window**, `Cmd/Ctrl+N`). Each window is
   an independent view, opening on the current window's URL so you can then
   navigate it to a different conversation and watch two side by side. A
@@ -60,11 +59,12 @@ adds native niceties:
   `Assets.car`/Liquid Glass appearance rather than the development PNG. Our other custom actions
   — **New Window**, **New Window on Different Server…**, and
   **Change Server…** — live in a dedicated **Server** submenu. On macOS a
-  **Notifications** submenu turns the notification sound on/off (**Play
-  Notification Sound**, **off by default** — the user opts in) and picks which
-  macOS system sound to play (**Sound ▸** — Glass, Ping, Hero, …); choosing one
-  previews it, and the choice persists in `settings.json` and applies to the
-  next notification.
+  **Settings → Notifications** page controls when to notify, enables sound
+  (off by default), and selects a macOS system sound. **Preview sound** plays
+  the selection even when sounds are disabled. **Send test notification** checks
+  native delivery, and **Open macOS notification settings** opens the system
+  settings for choosing banners or alerts. Preferences persist on this Mac and
+  apply to all its windows.
 - **Browser-style file drag-and-drop** works out of the box: Electron does
   not intercept file drops the way Tauri does by default, so dropping an
   image onto a text field reaches the web app's HTML5 drop handler with no

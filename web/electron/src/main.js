@@ -3204,13 +3204,12 @@ async function confirmHostEnrollment(win) {
 }
 
 /**
- * OS-level attention cue for a notification fired while the app is frontmost,
- * where the banner is suppressed by the OS. On macOS we bounce the dock icon
- * (`informational` = a single gentle bounce); on Windows/Linux we flash the
- * window frame. No-op when the window is the foreground, actively-focused
- * surface AND nothing is queued — but we always cue here because the web layer
- * only calls notify for sessions the user is NOT actively viewing, so a cue is
- * always warranted. Wrapped in try/catch: a cue must never break notifying.
+ * Supplemental OS-level attention cue for a notification. On macOS we bounce
+ * the dock icon (`informational` = a single gentle bounce); on Windows/Linux we
+ * flash the window frame when it is not focused. Electron presents foreground
+ * macOS notifications too, including for the active conversation in Always
+ * mode, so this cue complements rather than replaces the banner. Wrapped in
+ * try/catch: a cue must never break notifying.
  */
 function signalForeground() {
   try {
@@ -3232,7 +3231,7 @@ function signalForeground() {
 // suppressed by macOS, so to make the alert audible in BOTH the foreground and
 // the background we play a system sound ourselves with `afplay` and mute the
 // toast's built-in sound (see the notify handler). The chosen sound and the
-// on/off switch live in the native Notifications menu, persisted in settings
+// on/off switch live in Settings → Notifications, persisted in settings
 // (`notification_sound_enabled`, `notification_sound_name`).
 // ---------------------------------------------------------------------------
 
@@ -3279,11 +3278,31 @@ function systemSoundNames() {
 
 /**
  * Whether the notification sound is enabled. Opt-in: OFF unless the user has
- * explicitly turned it on via the Notifications menu, so a fresh install stays
+ * explicitly turned it on in Settings → Notifications, so a fresh install stays
  * silent until the user asks for sound.
  */
 function notificationSoundEnabled() {
   return loadSettings().notification_sound_enabled === true;
+}
+
+function currentNotificationMode() {
+  return loadSettings().notification_mode === "always" ? "always" : "when-away";
+}
+
+function setNotificationMode(mode) {
+  const normalized = mode === "always" ? "always" : "when-away";
+  const settings = loadSettings();
+  settings.notification_mode = normalized;
+  saveSettings(settings);
+  for (const [win, state] of windows) {
+    if (state.origin && !win.isDestroyed()) {
+      try {
+        win.webContents.send("omnigent:notification-mode-changed", normalized);
+      } catch {
+        // Window torn down between the check and the send.
+      }
+    }
+  }
 }
 
 /**
@@ -3304,7 +3323,7 @@ function currentNotificationSoundName() {
 /**
  * Play a macOS system sound by name via `afplay`, fire-and-forget. No-op off
  * macOS (afplay is macOS-only). Used both for live notifications and for the
- * menu's pick-to-preview.
+ * explicit sound preview.
  *
  * @param {string} name A name from `systemSoundNames()`, e.g. `"Glass"`.
  */
@@ -3553,6 +3572,7 @@ function buildMenu() {
       { role: "togglefullscreen" },
     ],
   });
+  // Keep app-specific menus before the platform Window menu.
   template.push({ role: "windowMenu" });
   if (!isMac) {
     template.push({ label: "Help", submenu: [aboutItem] });
@@ -3587,43 +3607,6 @@ function buildMenu() {
         ],
       },
     ];
-
-    // macOS notification-sound settings: an on/off switch plus a picker of
-    // system sounds. Selections persist in settings.json and are read live by
-    // the notify handler, so a change applies to the next notification without
-    // a relaunch. macOS-only because playback uses `afplay`.
-    if (isMac) {
-      /** @type {Electron.MenuItemConstructorOptions[]} */
-      const soundChoices = systemSoundNames().map((name) => ({
-        id: `notification_sound_${name}`,
-        label: name,
-        type: "radio",
-        checked: currentNotificationSoundName() === name,
-        click: () => {
-          const settings = loadSettings();
-          settings.notification_sound_name = name;
-          saveSettings(settings);
-          // Pick-to-preview: play the choice immediately so the user hears it,
-          // even when the sound is currently toggled off.
-          playSystemSound(name);
-        },
-      }));
-      debugSubmenu.push(
-        { type: "separator" },
-        {
-          id: "notification_sound_enabled",
-          label: "Play Notification Sound",
-          type: "checkbox",
-          checked: notificationSoundEnabled(),
-          click: (item) => {
-            const settings = loadSettings();
-            settings.notification_sound_enabled = item.checked;
-            saveSettings(settings);
-          },
-        },
-        { label: "Sound", submenu: soundChoices },
-      );
-    }
 
     debugSubmenu.push({ type: "separator" }, { role: "toggleDevTools" });
 
@@ -3993,6 +3976,56 @@ function registerIpc() {
     setWindowServerUrl(win, null);
     win.webContents.stop();
     return true;
+  });
+  ipcMain.handle("omnigent:get-notification-mode", (event) => {
+    if (!isPinnedOriginSender(event)) return "when-away";
+    return currentNotificationMode();
+  });
+  const notificationSettings = () => ({
+    mode: currentNotificationMode(),
+    soundEnabled: notificationSoundEnabled(),
+    soundName: currentNotificationSoundName(),
+    sounds: systemSoundNames(),
+  });
+  const requireNotificationSettingsSender = (event) => {
+    if (!isPinnedOriginSender(event) || process.platform !== "darwin") {
+      throw new Error("Notification settings require a connected macOS window");
+    }
+  };
+  ipcMain.handle("omnigent:get-notification-settings", (event) => {
+    if (!isPinnedOriginSender(event) || process.platform !== "darwin") return null;
+    return notificationSettings();
+  });
+  ipcMain.handle("omnigent:set-notification-settings", (event, patch) => {
+    requireNotificationSettingsSender(event);
+    if (
+      !patch ||
+      typeof patch !== "object" ||
+      (patch.mode !== undefined && !["always", "when-away"].includes(patch.mode)) ||
+      (patch.soundEnabled !== undefined && typeof patch.soundEnabled !== "boolean") ||
+      (patch.soundName !== undefined && !systemSoundNames().includes(patch.soundName))
+    ) {
+      throw new Error("Invalid notification settings");
+    }
+    const settings = loadSettings();
+    if (patch.soundEnabled !== undefined) settings.notification_sound_enabled = patch.soundEnabled;
+    if (patch.soundName !== undefined) settings.notification_sound_name = patch.soundName;
+    saveSettings(settings);
+    // Broadcast after all fields are saved so other windows can refresh together.
+    setNotificationMode(patch.mode ?? currentNotificationMode());
+    return notificationSettings();
+  });
+  ipcMain.handle("omnigent:preview-notification-sound", (event, name) => {
+    requireNotificationSettingsSender(event);
+    if (!systemSoundNames().includes(name)) throw new Error("Unknown notification sound");
+    // An explicit preview works even when notification sounds are disabled.
+    playSystemSound(name);
+  });
+  ipcMain.handle("omnigent:open-notification-settings", (event) => {
+    requireNotificationSettingsSender(event);
+    return shell.openExternal(
+      "x-apple.systempreferences:com.apple.Notifications-Settings.extension",
+    );
   });
   // Setup page → persist URL and navigate the SENDING window to it. We target
   // the window that owns the setup page (via its webContents) rather than a
@@ -4424,14 +4457,9 @@ function registerIpc() {
   // OS notification via the main-process Notification API. Clicking focuses
   // the app window (the useful default). Resolves true when shown.
   //
-  // Foreground caveat (esp. macOS): the OS suppresses the BANNER for a
-  // notification posted by the frontmost app — it still lands in Notification
-  // Center, but no toast appears, which reads as "notifications only work when
-  // backgrounded." The web layer already decides WHETHER to notify (it fires
-  // for any session except the one you're actively viewing), so when the
-  // window is focused we add an OS-level attention cue the frontmost app CAN
-  // show: bounce the macOS dock icon / flash the taskbar frame. That makes a
-  // non-open session's turn-end noticeable even with the app in front.
+  // Electron requests foreground presentation on macOS, so native banners can
+  // appear while the app is frontmost (including the active conversation in
+  // Always mode). The dock bounce/taskbar flash below is a supplemental cue.
   ipcMain.handle("omnigent:notify", (event, params) => {
     if (!isPinnedOriginSender(event)) {
       // The contract is "resolves false when not shown" — a foreign page

@@ -75,6 +75,9 @@ jobs:
           web/electron/test/browserIpc.test.js
           web/electron/test/preload_update.test.js
 
+      - name: Run Electron main-process unit regressions
+        run: node --test web/electron/test/update-main.test.js
+
       - name: Check formatting
         run: pnpm --filter web run format:check
 

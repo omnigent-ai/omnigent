@@ -65,6 +65,18 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
       body: params?.body,
       navigatePath: params?.navigatePath,
     }),
+  getNotificationMode: () => ipcRenderer.invoke("omnigent:get-notification-mode"),
+  getNotificationSettings: () => ipcRenderer.invoke("omnigent:get-notification-settings"),
+  setNotificationSettings: (settings) =>
+    ipcRenderer.invoke("omnigent:set-notification-settings", settings),
+  previewNotificationSound: (name) =>
+    ipcRenderer.invoke("omnigent:preview-notification-sound", name),
+  openNotificationSettings: () => ipcRenderer.invoke("omnigent:open-notification-settings"),
+  onNotificationModeChanged: (callback) => {
+    const listener = (_event, mode) => callback(mode === "always" ? "always" : "when-away");
+    ipcRenderer.on("omnigent:notification-mode-changed", listener);
+    return () => ipcRenderer.removeListener("omnigent:notification-mode-changed", listener);
+  },
   /**
    * Subscribe to OS-notification clicks. The main process sends the in-app
    * path the clicked notification carried, which we forward to the SPA so it

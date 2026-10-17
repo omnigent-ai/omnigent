@@ -203,6 +203,22 @@ function loadMainHarness({
         return true;
       },
     },
+    // Keep this plain-Node main-process harness independent of an installed
+    // Electron binary. OIDC credential behavior has its own focused tests.
+    "./oidc-credentials": {
+      signInWithBrowser: async () => ({ token: "test", expiresIn: null }),
+      refreshSession: async () => ({ token: "test", expiresIn: null }),
+      signOut: async () => {},
+      hasStoredGrant: () => false,
+      removeStoredGrant: () => false,
+    },
+    "./oidc-auth": {
+      createOidcAuth: () => ({
+        attach: async () => {},
+        detach: () => {},
+        isAttached: () => false,
+      }),
+    },
     "./omnigent_cli": {
       isExecutableFile: () => false,
       resolveCliPath: () => null,
@@ -313,6 +329,107 @@ function findMenuItem(menu, id) {
   }
   return null;
 }
+
+function findTopLevelMenu(menu, label) {
+  return menu.template.find((item) => item.label === label) ?? null;
+}
+
+describe("macOS notification settings", () => {
+  it("uses Settings instead of a top-level Notifications menu", (t) => {
+    const harness = loadMainHarness({ isPackaged: true, platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.buildMenu();
+    assert.equal(findTopLevelMenu(harness.calls.setApplicationMenu.at(-1), "Notifications"), null);
+  });
+
+  it("persists mode and sound, broadcasts, and preserves unrelated preferences", (t) => {
+    const harness = loadMainHarness({ platform: "darwin", settings: { unrelated: 42 } });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    const saved = harness.ipcHandlers.get("omnigent:set-notification-settings")(
+      harness.events.pinned,
+      { mode: "always", soundEnabled: true, soundName: "Ping" },
+    );
+    assert.equal(saved.mode, "always");
+    assert.equal(saved.soundEnabled, true);
+    assert.equal(saved.soundName, "Ping");
+    assert.equal(harness.readSettings().unrelated, 42);
+    assert.equal(harness.readSettings().notification_mode, "always");
+    assert.equal(harness.readSettings().notification_sound_name, "Ping");
+    assert.deepEqual(harness.calls.sent.at(-1), {
+      channel: "omnigent:notification-mode-changed",
+      payload: "always",
+    });
+  });
+
+  it("restores persisted preferences only for pinned senders", (t) => {
+    const harness = loadMainHarness({
+      platform: "darwin",
+      settings: {
+        notification_mode: "always",
+        notification_sound_enabled: true,
+        notification_sound_name: "Ping",
+      },
+    });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    const handler = harness.ipcHandlers.get("omnigent:get-notification-settings");
+    const value = handler(harness.events.pinned);
+    assert.equal(value.mode, "always");
+    assert.equal(value.soundEnabled, true);
+    assert.equal(value.soundName, "Ping");
+    assert.ok(value.sounds.includes("Glass"));
+    assert.equal(handler(harness.events.unpinned), null);
+    const mode = harness.ipcHandlers.get("omnigent:get-notification-mode");
+    assert.equal(mode(harness.events.pinned), "always");
+    assert.equal(mode(harness.events.unpinned), "when-away");
+  });
+
+  it("rejects invalid settings and untrusted mutation or preview requests", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    const save = harness.ipcHandlers.get("omnigent:set-notification-settings");
+    for (const patch of [
+      null,
+      { mode: "invalid" },
+      { soundEnabled: "true" },
+      { soundName: "missing" },
+    ]) {
+      assert.throws(() => save(harness.events.pinned, patch), /Invalid notification settings/);
+    }
+    for (const channel of [
+      "set-notification-settings",
+      "preview-notification-sound",
+      "open-notification-settings",
+    ]) {
+      assert.throws(
+        () => harness.ipcHandlers.get(`omnigent:${channel}`)(harness.events.unpinned, {}),
+        /connected macOS window/,
+      );
+    }
+    assert.deepEqual(harness.readSettings(), {});
+  });
+
+  it("continues broadcasting when a window closes during send", (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    const first = harness.api.windows.keys().next().value;
+    first.webContents.send = () => {
+      throw new Error("Window closed");
+    };
+    const received = [];
+    harness.api.windows.set(
+      { isDestroyed: () => false, webContents: { send: (...args) => received.push(args) } },
+      { origin: "https://server.example" },
+    );
+    harness.ipcHandlers.get("omnigent:set-notification-settings")(harness.events.pinned, {
+      mode: "always",
+    });
+    assert.deepEqual(received, [["omnigent:notification-mode-changed", "always"]]);
+  });
+});
 
 function hasDebugMenu(menu) {
   return menu.template.some((item) => item.label === "Debug");
