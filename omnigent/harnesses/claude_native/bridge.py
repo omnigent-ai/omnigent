@@ -411,6 +411,14 @@ _OVERLAY_SURFACE = "an overlay"
 # e.g. a launch wrapper's output before Claude Code has drawn its input box —
 # and an Escape cannot clear it.
 _ESCAPE_DISMISS_HINT = re.compile(r"\b(?:\w+/)*Esc(?:/\w+)* to \w", re.IGNORECASE)
+# Headlines of startup dialogs whose "Esc to cancel" quits Claude Code rather
+# than closing the dialog (2.1.299: the settings error exits 1, the folder-trust
+# question exits 0). Only the person may answer them.
+_ESCAPE_QUITS_DIALOG_HEADLINES = (
+    "Settings Error",
+    "Accessing workspace",
+    "Do you trust the files in this folder",
+)
 # Titles of the confirmation dialog Claude Code pops when a switch invalidates
 # the prompt cache — one component, titled for what is being switched. It only
 # appears on a session with history, and it took ~1.9s to render on a warm
@@ -5769,7 +5777,9 @@ def _restore_occupied_input(
     the web-UI message wins the pane.
 
     Questions and permission prompts are protected by their hook wait markers
-    and visible decision controls; they require an explicit answer.
+    and visible decision controls; they require an explicit answer. So are the
+    startup dialogs whose Escape quits Claude Code instead of closing them
+    (:func:`_escape_quits_claude`): they are left for the person to answer.
 
     Escape is only sent while the surface is verifiably on screen —
     never blind, because on the bare composer Escape interrupts an
@@ -5825,8 +5835,10 @@ def _restore_occupied_input(
             )
             return surface
         # Nothing an Escape can clear: launcher output before the input box
-        # mounts, or a dialog that offers no dismissal.
-        unclearable = surface == _OVERLAY_SURFACE and not _ESCAPE_DISMISS_HINT.search(pane)
+        # mounts, a dialog that offers no dismissal, or one Escape would quit.
+        unclearable = surface == _OVERLAY_SURFACE and (
+            not _ESCAPE_DISMISS_HINT.search(pane) or _escape_quits_claude(pane)
+        )
         if not confirmed:
             # One sighting is not enough to spend an Escape on: on a bare
             # composer Escape interrupts the running turn, and a single frame
@@ -5845,6 +5857,18 @@ def _restore_occupied_input(
             last_escape = now
         unclearable_seen = unclearable
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+
+
+def _escape_quits_claude(pane: str) -> bool:
+    """
+    Return whether the dialog on screen quits Claude Code on Escape.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` for a startup dialog named in
+        :data:`_ESCAPE_QUITS_DIALOG_HEADLINES`.
+    """
+    headline = _terminal_dialog_headline(pane)
+    return headline is not None and headline.startswith(_ESCAPE_QUITS_DIALOG_HEADLINES)
 
 
 def _occupying_surface(pane: str) -> str | None:
