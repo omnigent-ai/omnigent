@@ -190,6 +190,7 @@ def store_token(
     user_id: str,
     expires_at: float,
     refresh_token: str | None = None,
+    refresh_expires_at: float | None = None,
 ) -> None:
     """Persist a session token for a server.
 
@@ -203,6 +204,9 @@ def store_token(
         server handed one out. Lets :func:`refresh_stored_token` renew
         the access token past expiry without a human re-running
         ``omnigent login``.
+    :param refresh_expires_at: Absolute epoch seconds when the refresh
+        grant itself lapses, when the server reported it. Stored only
+        when present so a server that omits it never blanks the field.
     """
     entry: dict[str, str | float] = {
         "token": token,
@@ -214,6 +218,8 @@ def store_token(
     existing_org_id = load_databricks_org_id(server_url)
     if existing_org_id is not None:
         entry["org_id"] = existing_org_id
+    if refresh_expires_at is not None:
+        entry["refresh_expires_at"] = refresh_expires_at
     _store_entry(server_url, entry)
 
 
@@ -553,6 +559,13 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
         new_refresh = refresh_token
     expires_in = _coerce_expires_in(payload.get("expires_in"))
 
+    # A refresh must never blank a known refresh expiry: take the server's
+    # value when it reports one, else preserve what the entry already held.
+    refresh_expires_at = payload.get("refresh_expires_at")
+    if not isinstance(refresh_expires_at, (int, float)):
+        stored_expiry = entry.get("refresh_expires_at")
+        refresh_expires_at = stored_expiry if isinstance(stored_expiry, (int, float)) else None
+
     user_id = entry.get("user_id")
     store_token(
         server_url,
@@ -560,6 +573,7 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
         user_id=user_id if isinstance(user_id, str) else "",
         expires_at=time.time() + expires_in,
         refresh_token=new_refresh,
+        refresh_expires_at=refresh_expires_at,
     )
     # A fresh token means any earlier expiry warning is stale; allow
     # a new one if this credential ever lapses again.

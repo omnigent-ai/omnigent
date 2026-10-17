@@ -55,6 +55,7 @@ import os
 import secrets
 import time
 from collections.abc import Callable
+from typing import NamedTuple
 
 import jwt
 from fastapi import APIRouter, HTTPException, Request
@@ -330,12 +331,27 @@ def _make_client_secret_gate() -> Callable[[Request], bool]:
     return _client_secret_ok
 
 
+class LoginGrant(NamedTuple):
+    """The client-facing result of issuing a login refresh grant.
+
+    :param refresh_token: The raw refresh token to hand to the client
+        (stored hashed server-side).
+    :param refresh_expires_at: Absolute epoch seconds when the refresh
+        grant can no longer be renewed — the grant's ``approved_at``
+        anchor plus the absolute lifetime. Lets the client persist a
+        true expiry rather than re-deriving it.
+    """
+
+    refresh_token: str
+    refresh_expires_at: int
+
+
 def issue_login_grant(
     device_grant_store: DeviceGrantStore,
     *,
     user_id: str,
     cookie_secret: bytes,
-) -> str:
+) -> LoginGrant:
     """Create a redeemed refresh grant for an interactive login.
 
     Called by the login flows (OIDC cli-ticket fulfillment, accounts
@@ -349,17 +365,21 @@ def issue_login_grant(
     :param device_grant_store: Grant persistence.
     :param user_id: The just-authenticated identity.
     :param cookie_secret: HMAC key for hashing the refresh token.
-    :returns: The raw refresh token to hand to the client (stored hashed).
+    :returns: The raw refresh token and its absolute refresh expiry.
     """
     refresh_token = _mint_refresh_token()
+    created_at = int(time.time())
     device_grant_store.create_redeemed_grant(
         secrets.token_urlsafe(24),
         user_id=user_id,
         client_id=LOGIN_GRANT_CLIENT_ID,
         refresh_token_hash=hash_secret(refresh_token, cookie_secret),
-        created_at=int(time.time()),
+        created_at=created_at,
     )
-    return refresh_token
+    return LoginGrant(
+        refresh_token=refresh_token,
+        refresh_expires_at=created_at + _grant_max_lifetime_seconds(),
+    )
 
 
 def create_oauth_token_router(
@@ -430,6 +450,16 @@ def create_oauth_token_router(
             )
         except Exception:  # noqa: BLE001 — housekeeping must never fail a refresh
             _logger.debug("oauth/token: opportunistic grant purge failed", exc_info=True)
+
+    def _add_refresh_expiry(content: dict[str, object], approved_at: int | None) -> None:
+        """Attach the grant's absolute refresh expiry to a token response.
+
+        Anchored at ``approved_at`` (the grant's lifetime start) plus the
+        absolute lifetime, so the client can persist a true expiry. Skipped
+        when the grant carries no anchor — never emit a bogus expiry.
+        """
+        if approved_at is not None:
+            content["refresh_expires_at"] = approved_at + _grant_max_lifetime
 
     def _issue_access_token(grant_id: str, user_id: str, client_id: str) -> str:
         grant = device_grant_store.authorize_access(grant_id)
@@ -535,14 +565,16 @@ def create_oauth_token_router(
             # access token is renewed. Revocation + the absolute lifetime cap
             # bound the exposure.
             access_token = _issue_access_token(grant.id, grant.user_id, grant.client_id or "")
+            content: dict[str, object] = {
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "token_type": "Bearer",
+                "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
+            }
+            _add_refresh_expiry(content, grant.approved_at)
             return JSONResponse(
                 status_code=200,
-                content={
-                    "access_token": access_token,
-                    "refresh_token": refresh_token,
-                    "token_type": "Bearer",
-                    "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
-                },
+                content=content,
                 headers=NO_STORE_HEADERS,
             )
 
@@ -566,14 +598,16 @@ def create_oauth_token_router(
             rotated.user_id,
             rotated.client_id or "",
         )
+        content = {
+            "access_token": access_token,
+            "refresh_token": new_refresh,
+            "token_type": "Bearer",
+            "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
+        }
+        _add_refresh_expiry(content, rotated.approved_at)
         return JSONResponse(
             status_code=200,
-            content={
-                "access_token": access_token,
-                "refresh_token": new_refresh,
-                "token_type": "Bearer",
-                "expires_in": _ACCESS_TOKEN_TTL_SECONDS,
-            },
+            content=content,
             headers=NO_STORE_HEADERS,
         )
 
