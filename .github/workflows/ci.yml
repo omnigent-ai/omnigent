@@ -273,7 +273,9 @@ jobs:
     timeout-minutes: 30
     services:
       postgres:
-        image: postgres:16
+        # ECR Public mirrors Docker Hub's official images (same digests) without
+        # Docker Hub's anonymous pull rate limit, which fails shared CI runners.
+        image: public.ecr.aws/docker/library/postgres:16
         env:
           POSTGRES_PASSWORD: omnigent
           POSTGRES_DB: omnigent_root
@@ -319,6 +321,10 @@ jobs:
     if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # Cockroach Labs' own registry for every compose call: Docker Hub's
+      # anonymous pull rate limit fails shared CI runners.
+      CRDB_IMAGE_REPO: us-docker.pkg.dev/cockroach-cloud-images/cockroachdb/cockroach
     strategy:
       fail-fast: false
       matrix:
@@ -370,7 +376,8 @@ jobs:
     timeout-minutes: 30
     services:
       mysql:
-        image: mysql:8.0
+        # Same image as Docker Hub's mysql:8.0, without its anonymous pull rate limit.
+        image: public.ecr.aws/docker/library/mysql:8.0
         env:
           MYSQL_ROOT_PASSWORD: omnigent
           MYSQL_DATABASE: omnigent_root
