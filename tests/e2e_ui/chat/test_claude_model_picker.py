@@ -475,12 +475,7 @@ def test_claude_native_picker_saves_model_while_host_asleep(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """An asleep session keeps the config gear live and Save PATCHes the model.
-
-    A model/effort change persists server-side and applies when the next
-    message wakes the session, so wherever the composer stays open (here:
-    ``host_asleep``) the gear must stay enabled with the catalog-backed
-    dropdown — not inert behind a live-runner requirement.
+    """Only choosing a model wakes an asleep session before its model PATCH.
 
     :param page: Playwright page fixture.
     :param seeded_session: ``(base_url, session_id)`` for a real server-backed
@@ -490,6 +485,24 @@ def test_claude_native_picker_saves_model_while_host_asleep(
     base_url, session_id = seeded_session
     _force_asleep_liveness(page, session_id)
     patch_bodies = _patch_session_as_claude_native(page, session_id, host_asleep=True)
+    _install_catalog_stream(page, session_id)
+    page.route(
+        f"**/v1/sessions/{session_id}/resources/terminals*",
+        lambda route: route.fulfill(json={"object": "list", "data": [], "has_more": False}),
+    )
+    retry_bodies: list[dict] = []
+
+    def _resume(route: Route) -> None:
+        body = route.request.post_data_json or {}
+        retry_bodies.append(body)
+        if body.get("type") != "retry_session":
+            route.fulfill(status=400, json={"error": "Unexpected session input"})
+            return
+        route.fulfill(
+            json={"queued": False, "recovered": True, "recovery": "runner_relaunched"},
+        )
+
+    page.route(f"**/v1/sessions/{session_id}/events", _resume)
 
     # Wait for the /health poll that resolves liveness to host_asleep to land
     # before the gear assertions, so they exercise the settled asleep state and
@@ -506,10 +519,12 @@ def test_claude_native_picker_saves_model_while_host_asleep(
     gear.click()
     page.get_by_test_id("composer-agent-edit").click()
     expect(page.get_by_test_id("composer-agent-config-menu")).to_be_visible()
-    # The catalog still populates the dropdown while the session sleeps.
+    # Reading the cached catalog does not need a live terminal.
     expect(page.locator('[role="menuitemcheckbox"][data-model-id]')).to_have_count(
         len(_EXPECTED_ROWS)
     )
+    assert retry_bodies == []
+    assert patch_bodies == []
     _screenshot(page, "asleep-config-gear")
 
     with page.expect_response(
@@ -521,6 +536,7 @@ def test_claude_native_picker_saves_model_while_host_asleep(
     ):
         page.locator('[role="menuitemcheckbox"][data-model-id="opus"]').click()
 
+    assert retry_bodies == [{"type": "retry_session", "data": {}}]
     assert patch_bodies[-1] == {"model_override": "opus"}
 
 

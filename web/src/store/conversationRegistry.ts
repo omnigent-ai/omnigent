@@ -274,16 +274,20 @@ export class ConversationRegistry {
    * tab reclaims one of ITS OWN background streams before it either gives up
    * (leaving the new conversation cold) or opens over budget.
    *
-   * Never evicts: the conversation on screen, `exemptId` (the one being bound —
-   * disposing it would hand back a dead entry), or an entry holding work the
-   * server has no record of yet (`hasUnsentWork` — evicting that loses the
-   * user's message). When nothing is evictable, returns `null` and the caller
-   * decides what to do with a saturated origin.
+   * Never evicts the active/binding entry or one holding unsent work or an
+   * in-flight configuration change. When nothing is evictable, returns `null`
+   * and the caller decides what to do with a saturated origin.
    */
   evictLruEvictable(exemptId?: string): string | null {
     for (const [id, entry] of this.entries) {
       if (id === this.activeId || id === exemptId) continue;
-      if (hasUnsentWork(entry.getState())) continue;
+      const state = entry.getState();
+      if (
+        hasUnsentWork(state) ||
+        state.sessionConfigPhase !== null ||
+        state.pendingModelChange !== null
+      )
+        continue;
       this.entries.delete(id);
       entry.dispose();
       return id;

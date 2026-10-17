@@ -195,6 +195,56 @@ describe("ConversationRegistry", () => {
     expect(a.disposed).toBe(true);
   });
 
+  it.each(["starting", "applying"] as const)(
+    "protects a %s configuration change until it settles",
+    (phase) => {
+      const a = registry.acquire("conv_a");
+      a.setState({ sessionConfigPhase: phase });
+      registry.acquire("conv_b");
+
+      expect(registry.evictLruEvictable()).toBe("conv_b");
+      expect(a.disposed).toBe(false);
+      expect(registry.evictLruEvictable()).toBeNull();
+
+      a.setState({ sessionConfigPhase: null });
+      expect(registry.evictLruEvictable()).toBe("conv_a");
+      expect(a.disposed).toBe(true);
+    },
+  );
+
+  it("keeps a completed configuration change pinned until its model is confirmed", () => {
+    const a = registry.acquire("conv_a");
+    a.setState({ sessionConfigPhase: "applying", pendingModelChange: "sonnet" });
+    a.setState({ sessionConfigPhase: null });
+    registry.acquire("conv_b");
+
+    expect(registry.evictLruEvictable()).toBe("conv_b");
+    expect(a.disposed).toBe(false);
+    expect(registry.evictLruEvictable()).toBeNull();
+
+    a.setState({ pendingModelChange: null });
+    expect(registry.evictLruEvictable()).toBe("conv_a");
+    expect(a.disposed).toBe(true);
+  });
+
+  it("returns null when every background entry holds an in-flight configuration", () => {
+    registry.acquire("conv_a").setState({ sessionConfigPhase: "starting" });
+    registry.acquire("conv_b").setState({ sessionConfigPhase: "applying" });
+    registry.acquire("conv_c").setState({ pendingModelChange: "sonnet" });
+
+    expect(registry.evictLruEvictable()).toBeNull();
+    expect(registry.ids()).toEqual(["conv_a", "conv_b", "conv_c"]);
+  });
+
+  it("does not keep a failed configuration change pinned after cleanup", () => {
+    const a = registry.acquire("conv_a");
+    a.setState({ sessionConfigPhase: "starting" });
+    a.setState({ sessionConfigPhase: null, sessionConfigError: "Host is offline" });
+
+    expect(registry.evictLruEvictable()).toBe("conv_a");
+    expect(a.disposed).toBe(true);
+  });
+
   it("does evict an entry whose sends have all settled", () => {
     // Once the POST returns, the server can account for the message — the
     // navigate-back snapshot re-seeds it, so reclaiming its slot is safe.
