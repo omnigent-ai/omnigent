@@ -56,6 +56,7 @@ from omnigent.cli_invocation import WRAPPER_COMMAND_ENV, cli_invocation
 from omnigent.cli_native import register_native_commands as _register_native_commands
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
 from omnigent.cli_sandbox import sandbox as _sandbox_group
+from omnigent.cli_speculate import speculate_command as _speculate_command
 from omnigent.config import (
     _merge_effective_config,
     global_config_path,
@@ -2121,6 +2122,7 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "sandbox",
         "server",
         "setup",
+        "speculate",
         "start",
         "stop",
         "uninstall",
@@ -11574,6 +11576,9 @@ if _sandbox_providers():
     cli.add_command(_sandbox_group)
     if "lakebox" in _sandbox_providers():
         cli.add_command(_lakebox_alias_group)
+
+# ─── speculate ────────────────────────────────────────────────────
+cli.add_command(_speculate_command)
 
 # ─── debug group ──────────────────────────────────────────────────
 #
