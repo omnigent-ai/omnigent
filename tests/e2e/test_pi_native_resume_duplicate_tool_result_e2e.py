@@ -146,9 +146,9 @@ def _written_pi_session_file(runner_home: Path, session_id: str) -> Path | None:
     return None
 
 
-def _tool_result_call_ids(session_file: Path) -> list[str]:
-    """Return the ``toolCallId`` of every ``toolResult`` record, in file order."""
-    call_ids: list[str] = []
+def _tool_result_messages(session_file: Path) -> list[dict]:
+    """Return every ``toolResult`` message, in file order."""
+    messages: list[dict] = []
     for line in session_file.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
@@ -156,8 +156,13 @@ def _tool_result_call_ids(session_file: Path) -> list[str]:
         record = json.loads(line)
         message = record.get("message")
         if isinstance(message, dict) and message.get("role") == "toolResult":
-            call_ids.append(message.get("toolCallId"))
-    return call_ids
+            messages.append(message)
+    return messages
+
+
+def _tool_result_call_ids(session_file: Path) -> list[str | None]:
+    """Return the ``toolCallId`` of every ``toolResult`` record, in file order."""
+    return [message.get("toolCallId") for message in _tool_result_messages(session_file)]
 
 
 def test_cold_resume_does_not_replay_duplicate_tool_result(tmp_path: Path) -> None:
@@ -239,4 +244,17 @@ def test_cold_resume_does_not_replay_duplicate_tool_result(tmp_path: Path) -> No
             f"for one call_id ({_CALL_ID}); the resumed session is unrecoverable "
             f"(Anthropic rejects multiple tool_result blocks for one tool_use id). "
             f"toolResult ids in rebuilt session: {call_ids}"
+        )
+        # Cold resume must also keep the tool's name on the rebuilt result; an
+        # empty toolName makes Gemini reject the next turn with
+        # "function_response.name: Name cannot be empty".
+        names = {
+            message.get("toolName")
+            for message in _tool_result_messages(session_file)
+            if message.get("toolCallId") == _CALL_ID
+        }
+        assert names == {"get_time"}, (
+            f"cold resume rebuilt the toolResult for {_CALL_ID} with name(s) {names}; "
+            f"expected the committed tool name 'get_time' so the rebuilt "
+            f"functionResponse.name is non-empty. file: {session_file.read_text()[:2000]}"
         )
