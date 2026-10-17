@@ -8131,6 +8131,9 @@ def _note_runner_idle_shutdown(runner_id: str, convs: Sequence[Conversation] = (
     return marked
 
 
+_FAILING_DISCONNECT_DECISIONS = frozenset({"failed_mid_turn", "failed_before_start"})
+
+
 async def _runner_disconnect_requires_failure(
     session_id: str,
     conversation_store: ConversationStore,
@@ -8140,11 +8143,35 @@ async def _runner_disconnect_requires_failure(
     fail_idle_top_level: bool = False,
     error_code: str = "runner_disconnected",
 ) -> bool:
+    """Return whether :func:`_runner_disconnect_decision` found an interrupted turn."""
+    decision = await _runner_disconnect_decision(
+        session_id,
+        conversation_store,
+        origin=origin,
+        snapshot=snapshot,
+        fail_idle_top_level=fail_idle_top_level,
+        error_code=error_code,
+    )
+    return decision in _FAILING_DISCONNECT_DECISIONS
+
+
+async def _runner_disconnect_decision(
+    session_id: str,
+    conversation_store: ConversationStore,
+    *,
+    origin: str,
+    snapshot: Conversation | None = None,
+    fail_idle_top_level: bool = False,
+    error_code: str = "runner_disconnected",
+) -> str:
     """Decide whether runner loss interrupted work, recording the state used.
 
     Local turn edges are newer than asynchronous persistence. A cold cache
     needs a fresh row: an offline sweep's snapshot may predate a child's idle
     observation. Recheck the cache after the read, even when the read fails.
+    A mid-turn status resting on the cache alone, with no row from the caller,
+    needs the row as well: another replica may have deleted the session while
+    this one held its relay, and a deleted session has no turn left to fail.
 
     If the read is unavailable, use the sweep or relay's adoption snapshot.
     Without any known state, preserve the session: a failed read does not
@@ -8156,11 +8183,17 @@ async def _runner_disconnect_requires_failure(
     cache: its saved status can still read mid-turn after its last idle edge.
     The parent's native runtime drives that turn and reports its outcome, so
     the saved status alone is no evidence of an interruption.
+
+    :returns: The decision logged in the ``runner_disconnect_decision`` row,
+        for example ``"failed_mid_turn"``, ``"idle_no_failure"`` or ``"deleted"``.
     """
     cached = _session_status_cache.get(session_id)
     persisted: Conversation | None = None
     lookup = "not_needed"
-    if cached is None:
+    # A warm mid-turn cache without a caller-supplied row still needs the row:
+    # another replica may have deleted the session while this one kept its relay.
+    confirming_row = cached in _MID_TURN_STATUSES and snapshot is None
+    if cached is None or confirming_row:
         try:
             persisted = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             lookup = "found" if persisted is not None else "missing"
@@ -8204,6 +8237,8 @@ async def _runner_disconnect_requires_failure(
         decision = "handed_off"
     elif live in _MID_TURN_STATUSES and source != "cache" and _owned_by_parent_runtime(conv):
         decision = "subagent_unobserved"
+    elif live in _MID_TURN_STATUSES and confirming_row and lookup == "missing":
+        decision = "deleted"
     elif live in _MID_TURN_STATUSES:
         decision = "failed_mid_turn"
     elif source == "unknown":
@@ -8281,7 +8316,7 @@ async def _runner_disconnect_requires_failure(
             **shutdown_state.disconnect_attributes(runner_id),
         ),
     )
-    return decision in ("failed_mid_turn", "failed_before_start")
+    return decision
 
 
 async def _relay_runner_live_elsewhere(
@@ -8345,7 +8380,7 @@ async def _relay_runner_stream(
     one shutting down (:func:`omnigent.server.shutdown_state.server_shutting_down`):
     it closed the tunnel itself, so the loss says nothing about the runner
     and no session is failed. Otherwise only a session it caught mid-turn
-    (:func:`_runner_disconnect_requires_failure`) gets the
+    (:func:`_runner_disconnect_decision`) gets the
     ``failed`` status and durable ``runner_disconnected`` labels — the same
     rule :func:`_mark_runner_sessions_offline_impl` applies to the runner's
     other sessions. An idle session had no work to interrupt, so it stays
@@ -8468,16 +8503,16 @@ async def _relay_runner_stream(
             elif shutdown_state.server_shutting_down():
                 decision = "server_shutdown"
             elif shutdown_state.runner_handoff_reason(outage_runner_id) is not None:
-                # See _runner_disconnect_requires_failure.
+                # See _runner_disconnect_decision.
                 decision = "handed_off"
             elif await _relay_runner_live_elsewhere(session_id, conversation_store):
                 decision = "live_elsewhere"
-            elif await _runner_disconnect_requires_failure(
-                session_id, conversation_store, origin="runner_disconnected_mid_turn"
-            ):
-                decision = "failed_mid_turn"
             else:
-                decision = "idle_no_failure"
+                decision = await _runner_disconnect_decision(
+                    session_id, conversation_store, origin="runner_disconnected_mid_turn"
+                )
+                if decision not in ("failed_mid_turn", "deleted"):
+                    decision = "idle_no_failure"
             # One row per outage outcome: which branch below fired, how long the
             # runner was gone against the grace, and how many retries it got.
             _logger.warning(
@@ -8529,6 +8564,16 @@ async def _relay_runner_stream(
                 _relinquish_session_live_state(session_id)
                 _logger.info(
                     "Relay: runner live on another replica for session=%s; no failure to report",
+                    session_id,
+                    extra={"session_id": session_id},
+                )
+            elif decision == "deleted":
+                # Another replica deleted the session during the grace. Its row
+                # is gone, so there is no turn to fail and nothing to label.
+                _relinquish_session_live_state(session_id)
+                _logger.info(
+                    "Relay: session=%s was deleted during the runner's grace; "
+                    "no failure to report",
                     session_id,
                     extra={"session_id": session_id},
                 )

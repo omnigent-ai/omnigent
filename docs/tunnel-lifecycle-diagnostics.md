@@ -130,7 +130,7 @@ session impact or changes KPI eligibility.
   the previous one.
 - `runner_stream_disconnected`: the relay's give-up row, with `decision`
   (`intentional_stop`, `server_shutdown`, `handed_off`, `live_elsewhere`,
-  `idle_no_failure` or `failed_mid_turn`), the matching `outage_id`, loss-time
+  `deleted`, `idle_no_failure` or `failed_mid_turn`), the matching `outage_id`, loss-time
   `runner_id`/`turn_id`, `grace_s`, `outage_s`, `retries`, and the schema
   marker. `server_shutting_down` and `runner_handoff_reason` say whether this
   replica's own shutdown mark or a per-runner handoff mark was fresh at the
@@ -145,7 +145,7 @@ session impact or changes KPI eligibility.
   relay (`origin = runner_disconnected_mid_turn`) or offline sweep
   (`origin = runner_offline_sweep`). `decision` is `idle_no_failure`,
   `failed_mid_turn`, `failed_before_start`, `already_failed`, `intentional_stop`,
-  `handed_off`, or `subagent_unobserved`, alongside `server_shutting_down` and
+  `handed_off`, `subagent_unobserved`, or `deleted`, alongside `server_shutting_down` and
   `runner_handoff_reason` as above. A `runner_tunnel_handed_off` info row marks
   the start of each per-runner handoff window, and the first
   `server_shutdown_marked` row the start of each shutdown window.
@@ -160,6 +160,11 @@ session impact or changes KPI eligibility.
   it and emits no new `session_turn_failed` (`already_failed`); only a stale
   cause left by a prior runner yields to this runner's startup failure.
   `fail_idle_top_level` applies only to top-level startup failures.
+  A mid-turn status taken from this replica's cache alone is checked against
+  the row before the turn fails: `deleted` (`status_lookup = missing`) means
+  another replica removed the session during the grace, so no
+  `session_turn_failed` event or error labels are recorded and the relay drops
+  its local live state for the session.
 
   `status_source` is `cache`, `persisted`, `snapshot`, `relay_snapshot`, or
   `unknown`, alongside `cached_session_status`, `persisted_session_status`,

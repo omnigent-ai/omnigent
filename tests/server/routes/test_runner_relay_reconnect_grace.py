@@ -12,6 +12,7 @@ import pytest
 from omnigent.runtime import session_stream
 from omnigent.server.routes._sessions import orchestration
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from tests._helpers.conversation_rows import conversation_rows
 from tests.server.helpers import start_session_stream_collector
 
 
@@ -340,3 +341,91 @@ async def test_an_unrecovered_stream_still_exhausts_its_grace(
         orchestration._session_status_cache.pop(session_id, None)
         orchestration._session_active_response_cache.pop(session_id, None)
         session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+async def test_relay_does_not_fail_a_session_deleted_during_its_grace(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session and its sub-agent deleted mid-grace must not get a failed turn.
+
+    Another replica serves the delete and removes both rows from the shared
+    database; this process keeps their relays and a ``running`` status cache.
+    """
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 2.0)
+    monkeypatch.setattr(orchestration, "_RELAY_RETRY_INTERVAL_S", 0.05)
+    store = SqlAlchemyConversationStore(db_uri)
+    parent_id = store.create_conversation().id
+    child_id = store.create_conversation(kind="sub_agent", parent_conversation_id=parent_id).id
+    session_ids = (parent_id, child_id)
+    attempts = dict.fromkeys(session_ids, 0)
+    retrying = asyncio.Event()
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        session_id = request.url.path.split("/")[3]
+        attempts[session_id] += 1
+        if attempts[session_id] == 1:
+            # The runner reported a live turn, then its tunnel closed.
+            return httpx.Response(
+                200,
+                stream=_NaturalEofStream(
+                    b'data: {"type":"session.status","status":"running"}\n\n'
+                ),
+            )
+        if all(count >= 2 for count in attempts.values()):
+            retrying.set()
+        return httpx.Response(200, stream=_NaturalEofStream())
+
+    collectors = {}
+    tasks: list[asyncio.Task[None]] = []
+    try:
+        for session_id in session_ids:
+            collectors[session_id] = await start_session_stream_collector(session_id)
+        async with httpx.AsyncClient(
+            base_url="http://runner", transport=httpx.MockTransport(respond)
+        ) as client:
+            tasks = [
+                asyncio.create_task(
+                    orchestration._relay_runner_stream(
+                        session_id, client, store, runner_id="runner-on-this-replica"
+                    )
+                )
+                for session_id in session_ids
+            ]
+            await asyncio.wait_for(retrying.wait(), timeout=10.0)
+            assert all(
+                orchestration._session_status_cache.get(session_id) == "running"
+                for session_id in session_ids
+            )
+            assert await store.delete_conversation(parent_id) is True
+            assert all(store.get_conversation(session_id) is None for session_id in session_ids)
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=10.0)
+
+        outcomes = {}
+        for session_id in session_ids:
+            failed_events = []
+            while not collectors[session_id].queue.empty():
+                event = collectors[session_id].queue.get_nowait()
+                if event.get("type") == "session.status" and event.get("status") == "failed":
+                    failed_events.append(event)
+            outcomes[session_id] = {
+                "cached_status": orchestration._session_status_cache.get(session_id),
+                "failed_events": failed_events,
+                **conversation_rows(db_uri, session_id),
+            }
+        assert all(
+            outcome["cached_status"] != "failed"
+            and not outcome["failed_events"]
+            and not outcome["labels"]
+            for outcome in outcomes.values()
+        ), f"deleted sessions were failed by the relay give-up: {outcomes}"
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for session_id in session_ids:
+            if session_id in collectors:
+                await collectors[session_id].stop()
+            orchestration._session_status_cache.pop(session_id, None)
+            orchestration._session_active_response_cache.pop(session_id, None)
+            session_stream.close(session_id)

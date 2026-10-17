@@ -2015,6 +2015,10 @@ async def test_relay_fails_mid_turn_session_from_the_row_when_the_cache_is_cold(
         ("default", None, "missing", None, "unknown_no_failure", "unknown"),
         ("default", None, "error", "running", "failed_mid_turn", "cache"),
         ("default", None, "error", "waiting", "failed_mid_turn", "cache"),
+        # A mid-turn status from the cache alone is checked against the row: a
+        # session another replica deleted during the grace is not failed.
+        ("default", None, "missing", "running", "deleted", "cache"),
+        ("sub_agent", None, "missing", "waiting", "deleted", "cache"),
     ],
 )
 async def test_relay_disconnect_status_after_adoption(
@@ -2104,6 +2108,8 @@ async def test_relay_disconnect_status_after_adoption(
             assert not any(row["event_name"] == "session_turn_failed" for row in rows)
             if decision == "subagent_unobserved":
                 assert refreshed.live_status in {"running", "waiting"}
+            if decision == "deleted":
+                assert sessions_module._session_status_cache.get(child.id) is None
         logged = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
         assert logged["attributes"]["status_source"] == status_source
         assert logged["attributes"]["decision"] == decision
