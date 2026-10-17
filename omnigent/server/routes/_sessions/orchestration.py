@@ -105,6 +105,7 @@ from omnigent.runner.subagent_routing import (
 )
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import (
+    disconnect_outcome,
     get_policy_store,
     inflight_text,
     pending_elicitations,
@@ -3826,6 +3827,11 @@ async def _publish_runner_recovered_status_impl(
         error=None,
     )
     session_stream.publish(session_id, event.model_dump())
+    if require_disconnect_code:
+        # Only a passive reconnect can show the same turn resuming on its own.
+        disconnect_outcome.note_disconnect_failure_cleared(
+            session_id, failure_code="runner_disconnected"
+        )
     await _persist_session_status_error_labels(session_id, None, conversation_store)
 
 
@@ -7655,6 +7661,8 @@ async def _dispatch_session_event_to_runner_impl(
     """
     if runner_router is not None:
         await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
+    if body.type == "message":
+        disconnect_outcome.note_user_turn(conv.id)
     if body.type == "message" and conv.kind == "sub_agent" and _is_codex_native_subagent(conv):
         # Codex /side follow-up: drive the child on its own Codex thread via the
         # parent's runner/bridge; do not persist AP-side (the forwarder mirrors
