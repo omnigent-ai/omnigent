@@ -181,6 +181,8 @@ jobs:
       # so the image runs natively on Apple Silicon / arm64 clusters. Amd64-only
       # consumers (Modal, Daytona, CoreWeave) keep pulling the amd64 variant —
       # the list is a superset, so nothing changes for them.
+      # Keep Docker layers out of the Actions cache pool used by test jobs.
+      # Each existing public image package owns its own buildcache tag.
       - name: Build and push
         id: build-server
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
@@ -190,16 +192,16 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.tags.outputs.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=registry,ref=ghcr.io/omnigent-ai/omnigent-server:buildcache
+          cache-to: type=registry,ref=ghcr.io/omnigent-ai/omnigent-server:buildcache,mode=max
           provenance: false
           sbom: true
 
       # Host image: same Dockerfile, `host` target, also multi-arch (amd64 +
       # arm64). The harness CLIs it bakes in all ship arm64 — claude-code and
       # codex publish linux-arm64 npm binaries, pi is pure-JS. Runs after the
-      # server build so it reuses the shared builder-stage layers from the gha
-      # cache (cached per platform).
+      # server build so it can import the shared builder-stage layers from
+      # the server cache as well as its own host-specific layers.
       - name: Build and push host image
         id: build-host
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
@@ -210,15 +212,17 @@ jobs:
           push: true
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.tags.outputs.host_tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: |
+            type=registry,ref=ghcr.io/omnigent-ai/omnigent-host:buildcache
+            type=registry,ref=ghcr.io/omnigent-ai/omnigent-server:buildcache
+          cache-to: type=registry,ref=ghcr.io/omnigent-ai/omnigent-host:buildcache,mode=max
           provenance: false
           sbom: true
 
       # OpenShell server variant: the default server image plus the
       # openshell SDK extra (OMNIGENT_EXTRAS=openshell). Used by the
       # deploy/kubernetes/overlays/openshell kustomize overlay. Reuses
-      # the shared builder-stage layers from the gha cache.
+      # the shared builder-stage layers from the server registry cache.
       - name: Build and push openshell server image
         id: build-openshell
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
@@ -230,8 +234,10 @@ jobs:
           tags: ${{ steps.tags.outputs.openshell_tags }}
           build-args: |
             OMNIGENT_EXTRAS=openshell
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: |
+            type=registry,ref=ghcr.io/omnigent-ai/omnigent-server-openshell:buildcache
+            type=registry,ref=ghcr.io/omnigent-ai/omnigent-server:buildcache
+          cache-to: type=registry,ref=ghcr.io/omnigent-ai/omnigent-server-openshell:buildcache,mode=max
           provenance: false
           sbom: true
 
@@ -239,7 +245,7 @@ jobs:
       # client extra (OMNIGENT_EXTRAS=kubernetes), so `sandbox.provider:
       # kubernetes` works without a self-built image. Used by the
       # deploy/kubernetes/overlays/sandbox-runners kustomize overlay. Reuses
-      # the shared builder-stage layers from the gha cache.
+      # the shared builder-stage layers from the server registry cache.
       - name: Build and push kubernetes server image
         id: build-kubernetes
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
@@ -251,15 +257,17 @@ jobs:
           tags: ${{ steps.tags.outputs.kubernetes_tags }}
           build-args: |
             OMNIGENT_EXTRAS=kubernetes
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: |
+            type=registry,ref=ghcr.io/omnigent-ai/omnigent-server-kubernetes:buildcache
+            type=registry,ref=ghcr.io/omnigent-ai/omnigent-server:buildcache
+          cache-to: type=registry,ref=ghcr.io/omnigent-ai/omnigent-server-kubernetes:buildcache,mode=max
           provenance: false
           sbom: true
 
       # Modal server variant: the default server image plus the modal SDK
       # extra (OMNIGENT_EXTRAS=modal), so a server running outside Modal can
       # provision managed Modal sandboxes. Reuses the shared builder-stage
-      # layers from the gha cache.
+      # layers from the server registry cache.
       - name: Build and push modal server image
         id: build-modal
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
@@ -271,8 +279,10 @@ jobs:
           tags: ${{ steps.tags.outputs.modal_tags }}
           build-args: |
             OMNIGENT_EXTRAS=modal
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: |
+            type=registry,ref=ghcr.io/omnigent-ai/omnigent-server-modal:buildcache
+            type=registry,ref=ghcr.io/omnigent-ai/omnigent-server:buildcache
+          cache-to: type=registry,ref=ghcr.io/omnigent-ai/omnigent-server-modal:buildcache,mode=max
           provenance: false
           sbom: true
     outputs:
