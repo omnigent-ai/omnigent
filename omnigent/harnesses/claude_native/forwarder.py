@@ -33,6 +33,7 @@ from omnigent.harnesses.claude_native.bridge import (
     _display_text,
     _transcript_items_from_entry,
     compute_transcript_cumulative_cost,
+    inject_user_message,
     read_active_session_id,
     read_bridge_id,
     read_claude_context_state,
@@ -907,6 +908,9 @@ class _ForwardDedupeState:
     # ``[System: scheduled prompt fired]`` marker (see the bridge parser).
     pending_settled_response_id: str | None = None
     settled_response_id: str | None = None
+    # Set when a turn cut mid-response was continued in the pane; cleared by
+    # the next ``Stop``. A second cut before then fails as usual.
+    stream_cut_continued: bool = False
     # Failed cost posts are retried by this long-running poll loop. Without a
     # retry gate, an edge 429 turns the poll interval into a request storm and
     # prevents the limiter from recovering.
@@ -3618,6 +3622,54 @@ async def _create_fork_replacement_session(
     return new_session_id
 
 
+# Claude Code's StopFailure text when the model stream drops after output began.
+# It never retries such a turn; asking it to continue usually completes it.
+_STREAM_CUT_FRAGMENT = "connection lost mid-response"
+STREAM_CUT_CONTINUE_TEXT = "Please continue from where you left off."
+# Set to "0" to fail a cut turn as before instead of continuing it once.
+STREAM_CUT_CONTINUE_ENV_VAR = "OMNIGENT_CLAUDE_CONTINUE_AFTER_STREAM_CUT"
+_STREAM_CUT_CONTINUE_TIMEOUT_S = 15.0
+
+
+def _is_stream_cut(failure_detail: str | None) -> bool:
+    """Report whether a ``StopFailure`` is Claude's mid-response connection loss."""
+    if os.environ.get(STREAM_CUT_CONTINUE_ENV_VAR, "1") == "0":
+        return False
+    return failure_detail is not None and _STREAM_CUT_FRAGMENT in failure_detail.lower()
+
+
+async def _continue_after_stream_cut(bridge_dir: Path, *, session_id: str) -> bool:
+    """
+    Ask Claude to continue a turn its model stream dropped mid-response.
+
+    :param bridge_dir: Native Claude bridge directory.
+    :param session_id: Omnigent session id, for logs.
+    :returns: ``True`` when the continuation was submitted; ``False`` leaves
+        the turn to fail as usual.
+    """
+    try:
+        await asyncio.to_thread(
+            inject_user_message,
+            bridge_dir,
+            content=STREAM_CUT_CONTINUE_TEXT,
+            timeout_s=_STREAM_CUT_CONTINUE_TIMEOUT_S,
+        )
+    except Exception:  # noqa: BLE001 - any delivery failure keeps today's failed turn
+        _logger.warning(
+            "Could not continue a Claude turn cut mid-response; session=%s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return False
+    _logger.info(
+        "Continued a Claude turn cut mid-response; session=%s",
+        session_id,
+        extra=debug_event("claude_native_stream_cut_continued", session_id=session_id),
+    )
+    return True
+
+
 def _stop_failure_detail(
     record: ClaudeHookRecord,
     *,
@@ -4426,6 +4478,26 @@ async def _forward_available_status_events(
                 )
             except Exception as exc:  # noqa: BLE001 - telemetry must not prevent status delivery
                 _logger.debug("Claude hook failure telemetry failed: %s", type(exc).__name__)
+        failure_detail = (
+            _stop_failure_detail(
+                record, session_id=session_id, transcript_context=transcript_context
+            )
+            if status == "failed"
+            else None
+        )
+        if status == "idle":
+            dedupe.stream_cut_continued = False
+        elif (
+            status == "failed"
+            and not dedupe.stream_cut_continued
+            and _is_stream_cut(failure_detail)
+            and await _continue_after_stream_cut(bridge_dir, session_id=session_id)
+        ):
+            # The turn keeps running on the continuation; no failed edge.
+            dedupe.stream_cut_continued = True
+            durable = next_durable
+            await _write_hook_state_async(bridge_dir, durable)
+            continue
         try:
             await post_external_session_status(
                 client,
@@ -4449,11 +4521,7 @@ async def _forward_available_status_events(
                 # the UI can name the shells. Dropped on ``failed`` for the same
                 # reason as the count (the server clears the tally there).
                 background_tasks=(None if status == "failed" else record.background_tasks),
-                failure_detail=_stop_failure_detail(
-                    record, session_id=session_id, transcript_context=transcript_context
-                )
-                if status == "failed"
-                else None,
+                failure_detail=failure_detail,
                 failure_context=failure_context,
             )
         except httpx.HTTPError as exc:
