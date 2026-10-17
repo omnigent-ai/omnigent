@@ -67,6 +67,8 @@ from omnigent.terminals.ws_common import (
 _logger = logging.getLogger(__name__)
 
 __all__ = [
+    "MIN_FORWARDED_COLS",
+    "MIN_FORWARDED_ROWS",
     "bridge_tmux_control_to_websocket",
     "unescape_control_output",
 ]
@@ -104,6 +106,12 @@ _CONTROL_STDOUT_BUFFER_LIMIT: Final[int] = 16 * 1024 * 1024
 # pane TUI (e.g. Codex) trusts that over its own $TERM; without pinning it the
 # client inherits the runner's TERM, which can be a non-interactive ``dumb``.
 _WEB_TERMINAL_TERM: Final[str] = "xterm-256color"
+
+# Resize floor, mirrored by MIN_FORWARDED_COLS/ROWS in web/.../TerminalSession.ts.
+# A hidden (display:none) terminal fits to a few bogus columns; forwarding that
+# would shrink the shared pane under a TUI mid-boot, so sub-floor sizes are dropped.
+MIN_FORWARDED_COLS: Final[int] = 20
+MIN_FORWARDED_ROWS: Final[int] = 5
 
 # Closing the socket is best-effort: the browser may already be gone. Starlette
 # raises ``RuntimeError`` once a close frame has been sent and
@@ -765,6 +773,14 @@ async def bridge_tmux_control_to_websocket(
                             cols = int(ctl["cols"])
                             rows = int(ctl["rows"])
                         except (KeyError, TypeError, ValueError):
+                            continue
+                        if cols < MIN_FORWARDED_COLS or rows < MIN_FORWARDED_ROWS:
+                            _logger.debug(
+                                "ignoring %dx%d resize below the usable floor target=%s",
+                                cols,
+                                rows,
+                                tmux_target,
+                            )
                             continue
                         await _send_command(f"refresh-client -C {cols}x{rows}\n".encode())
                 elif data is not None and not read_only:

@@ -27,6 +27,10 @@ import { TerminalLinkProvider } from "./TerminalLinkProvider";
 const CARD_LIGHT = "#ffffff";
 const CARD_DARK = "#131517";
 const TERMINAL_BOLD_WEIGHT_OFFSET = 300;
+// Smallest grid the tmux bridge forwards (control_bridge.MIN_FORWARDED_COLS/ROWS).
+// The rendered grid is kept at least this large so it cannot diverge from the pane.
+const MIN_FORWARDED_COLS = 20;
+const MIN_FORWARDED_ROWS = 5;
 
 function terminalFontOptions({ sizePx, family, weight }: CodeFont) {
   return {
@@ -636,6 +640,7 @@ export function touchScrollPayload(
  * close the WS, dispose the terminal.
  */
 export class TerminalSession {
+  private readonly container: HTMLElement;
   private readonly term: Terminal;
   private readonly fit: FitAddon;
   /** WebGL renderer addon, or ``null`` when WebGL is unavailable. */
@@ -710,6 +715,7 @@ export class TerminalSession {
     adaptCodexPalette = false,
     onFileLink?: TerminalFileLinkListener,
   ) {
+    this.container = container;
     this.codexPalette = adaptCodexPalette ? new CodexTerminalPalette() : null;
     this.clipboardEnabled = clipboardEnabled;
     this.focusOnConnect = focusOnConnect;
@@ -1072,14 +1078,31 @@ export class TerminalSession {
     };
   }
 
+  /**
+   * Whether the container is laid out. Under a `display:none` ancestor it has no
+   * box and the fit addon measures its `100%` width as 100px — a few bogus columns.
+   * Browsers without `checkVisibility` fall back to the element's client rects.
+   */
+  private hasLayoutBox(): boolean {
+    if (typeof this.container.checkVisibility === "function") {
+      return this.container.checkVisibility();
+    }
+    return this.container.getClientRects().length > 0;
+  }
+
   private sendResize(): void {
     if (this.ws.readyState !== WebSocket.OPEN) return;
+    // Keep the last real size while hidden; the ResizeObserver re-fits once
+    // the surface is laid out again.
+    if (!this.hasLayoutBox()) return;
     try {
       this.fit.fit();
     } catch {
       return;
     }
-    const { cols, rows } = this.term;
+    const cols = Math.max(this.term.cols, MIN_FORWARDED_COLS);
+    const rows = Math.max(this.term.rows, MIN_FORWARDED_ROWS);
+    if (cols !== this.term.cols || rows !== this.term.rows) this.term.resize(cols, rows);
     // Skip a no-op resize: the WS-open handler and the ResizeObserver both
     // call this on mount, and a transient re-fit can land the same size. On
     // the control transport an unchanged size is a wasted round-trip (tmux
