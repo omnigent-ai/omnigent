@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import type { RoutingScope } from "@/lib/routingDecision";
@@ -1457,6 +1460,23 @@ describe("buildSlashCommandMap", () => {
       slashCommandMatches(name, "using-superpowers"),
     );
     expect(matches).toEqual(["/superpowers:using-superpowers"]);
+  });
+});
+
+// ── /btw Quick Answer overlay ─────────────────────────────────────────
+
+describe("btw Quick Answer panel", () => {
+  it("bounds the answer container so long answers scroll instead of overflowing the viewport", () => {
+    // jsdom cannot measure overflow; guard the answer container's scroll classes in source.
+    const chatPagePath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "ChatPage.tsx");
+    const source = readFileSync(chatPagePath, "utf8");
+    const panelStart = source.indexOf("{btwSidechat && (");
+    expect(panelStart).toBeGreaterThan(-1);
+    // First <div className> after the "Answer:" label is the answer container.
+    const answerDiv = source.slice(panelStart).match(/Answer:[\s\S]*?<div className="([^"]+)"/);
+    expect(answerDiv?.[1]).toContain("overflow-y-auto");
+    expect(answerDiv?.[1]).toContain("max-h-[50vh]");
+    expect(answerDiv?.[1]).toContain("overscroll-contain");
   });
 });
 
