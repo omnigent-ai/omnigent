@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor, wait
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
@@ -87,22 +89,43 @@ class PausedBridgeWriter:
     process: subprocess.Popen[str]
     read_done: Path
     resume: Path
+    stderr: str = ""
+    _reaped: bool = field(default=False, init=False, repr=False)
+
+    def __enter__(self) -> PausedBridgeWriter:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def close(self) -> str:
+        """Kill the child if it is still running, reap it, and return its stderr."""
+        if not self._reaped:
+            if self.process.poll() is None:
+                self.process.kill()
+            _, self.stderr = self.process.communicate()
+            self._reaped = True
+        return self.stderr
 
     def wait_until_read(self) -> None:
         deadline = time.monotonic() + _WRITER_TIMEOUT_S
         while not self.read_done.exists():
             if self.process.poll() is not None:
-                _, stderr = self.process.communicate()
-                raise AssertionError(f"paused writer exited before reading: {stderr}")
+                raise AssertionError(f"paused writer exited before reading: {self.close()}")
             if time.monotonic() > deadline:
-                self.process.kill()
-                raise AssertionError("paused writer never reported its read")
+                raise AssertionError(f"paused writer never reported its read: {self.close()}")
             time.sleep(0.01)
 
     def resume_and_wait(self) -> None:
         self.resume.touch()
-        _, stderr = self.process.communicate(timeout=_WRITER_TIMEOUT_S)
-        assert self.process.returncode == 0, stderr
+        try:
+            _, self.stderr = self.process.communicate(timeout=_WRITER_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            raise AssertionError(
+                f"paused writer never exited after resuming: {self.close()}"
+            ) from None
+        self._reaped = True
+        assert self.process.returncode == 0, self.stderr
 
 
 def start_paused_bridge_writer(
@@ -115,6 +138,8 @@ def start_paused_bridge_writer(
 ) -> PausedBridgeWriter:
     """
     Start a bridge writer in a child process that pauses after reading *pause_on*.
+
+    Use the result as a context manager so the child is always reaped.
 
     :param bridge_root: Bridge root the child trusts, e.g. the test's ``tmp_path``.
     :param bridge_dir: Bridge directory the writer targets.
@@ -148,6 +173,34 @@ def start_paused_bridge_writer(
     return PausedBridgeWriter(process=process, read_done=read_done, resume=resume)
 
 
+def start_competing_writer(
+    pool: ThreadPoolExecutor, writer: Callable[..., None], /, *args: object, **kwargs: object
+) -> Future[None]:
+    """
+    Run *writer* in *pool* and check that the paused process still excludes it.
+
+    :param pool: Executor that runs the competing writer.
+    :param writer: Bridge writer to run, e.g. :func:`record_hook_event`.
+    :param args: Positional arguments for *writer*.
+    :param kwargs: Keyword arguments for *writer*.
+    :returns: The writer's future, still pending while the paused process holds the lock.
+    """
+    started = threading.Event()
+
+    def run() -> None:
+        started.set()
+        writer(*args, **kwargs)
+
+    future = pool.submit(run)
+    assert started.wait(timeout=_WRITER_TIMEOUT_S), "competing writer never started"
+    wait([future], timeout=_COMPETING_WRITER_WAIT_S)
+    assert not future.done(), (
+        "competing writer finished while the paused writer still held its stale read; "
+        "the bridge lock is not excluding writers"
+    )
+    return future
+
+
 def test_stop_hook_state_update_keeps_a_concurrent_session_start_identity(
     tmp_path: Path,
 ) -> None:
@@ -172,20 +225,23 @@ def test_stop_hook_state_update_keeps_a_concurrent_session_start_identity(
     )
     assert read_claude_session_id(bridge_dir) == "claude-old"
 
-    stop_hook = start_paused_bridge_writer(
-        tmp_path,
-        bridge_dir,
-        pause_on="state.json",
-        writer="record_hook_event",
-        payload={
-            "hook_event_name": "Stop",
-            "session_id": "claude-old",
-            "transcript_path": str(old_transcript),
-        },
-    )
-    stop_hook.wait_until_read()
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        session_start = pool.submit(
+    with (
+        ThreadPoolExecutor(max_workers=1) as pool,
+        start_paused_bridge_writer(
+            tmp_path,
+            bridge_dir,
+            pause_on="state.json",
+            writer="record_hook_event",
+            payload={
+                "hook_event_name": "Stop",
+                "session_id": "claude-old",
+                "transcript_path": str(old_transcript),
+            },
+        ) as stop_hook,
+    ):
+        stop_hook.wait_until_read()
+        session_start = start_competing_writer(
+            pool,
             record_hook_event,
             bridge_dir,
             {
@@ -194,7 +250,6 @@ def test_stop_hook_state_update_keeps_a_concurrent_session_start_identity(
                 "transcript_path": str(new_transcript),
             },
         )
-        wait([session_start], timeout=_COMPETING_WRITER_WAIT_S)
         stop_hook.resume_and_wait()
         session_start.result(timeout=_WRITER_TIMEOUT_S)
 
@@ -222,28 +277,30 @@ def test_session_rotation_keeps_a_concurrent_model_vocabulary_record(tmp_path: P
     )
     assert read_model_picker_values(bridge_dir) == ["databricks-claude-opus-4-7"]
 
-    rotation = start_paused_bridge_writer(
-        tmp_path,
-        bridge_dir,
-        pause_on="bridge.json",
-        writer="write_active_session_id",
-        session_id="conv_new",
-    )
-    rotation.wait_until_read()
     fresh_env = {
         "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8",
         "ANTHROPIC_CUSTOM_MODEL_OPTION": "system.ai.glm-5-3",
     }
     fresh_picker = ["databricks-claude-opus-4-8", "system.ai.glm-5-3"]
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        vocabulary = pool.submit(
+    with (
+        ThreadPoolExecutor(max_workers=1) as pool,
+        start_paused_bridge_writer(
+            tmp_path,
+            bridge_dir,
+            pause_on="bridge.json",
+            writer="write_active_session_id",
+            session_id="conv_new",
+        ) as rotation,
+    ):
+        rotation.wait_until_read()
+        vocabulary = start_competing_writer(
+            pool,
             record_model_vocabulary,
             bridge_dir,
             launch_env=fresh_env,
             launch_model="databricks-claude-opus-4-8",
             picker_values=fresh_picker,
         )
-        wait([vocabulary], timeout=_COMPETING_WRITER_WAIT_S)
         rotation.resume_and_wait()
         vocabulary.result(timeout=_WRITER_TIMEOUT_S)
 
