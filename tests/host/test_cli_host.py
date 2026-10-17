@@ -12,12 +12,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
 
+import click
 import psutil
 import pytest
 from click.testing import CliRunner
 
 from omnigent import cli as cli_module
 from omnigent.cli import _add_daemon_host_status, _ensure_host_daemon, _host_daemon_alive, cli
+from omnigent.cli_diagnostics import suppresses_recovery_hint
 from omnigent.host.local_server import LocalServerStartup
 
 
@@ -1275,6 +1277,161 @@ def test_host_background_signs_in_before_spawning(
     # configured target instead.
     assert "server: https://example.databricksapps.com" in result.output
     assert "omnigent host stop --server https://example.databricksapps.com" in result.output
+
+
+_VANITY_API = "https://vanity.databricks.com/api/2.0/omnigent"
+_WORKSPACE_API = "https://dbc-1.cloud.databricks.com/api/2.0/omnigent"
+_SAME_WORKSPACE_PID = 5150
+
+
+def _seed_same_workspace_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    vanity_org_id: str = "1",
+) -> None:
+    """
+    Record a live daemon on the workspace host and log both URLs in.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Test-scoped directory holding the token file.
+    :param vanity_org_id: Workspace id the vanity URL's login records, e.g.
+        ``"1"`` for the daemon's own workspace.
+    """
+    from omnigent.cli_auth import store_databricks_auth
+
+    monkeypatch.setenv("OMNIGENT_HOST_ID", "a" * 32)
+    monkeypatch.setenv("OMNIGENT_HOST_NAME", "test-host")
+    monkeypatch.setattr(
+        "omnigent.cli_auth._token_file_path", lambda: tmp_path / "auth_tokens.json"
+    )
+    store_databricks_auth(_WORKSPACE_API, "https://dbc-1.cloud.databricks.com", org_id="1")
+    store_databricks_auth(_VANITY_API, "https://dbc-1.cloud.databricks.com", org_id=vanity_org_id)
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_databricks_server_auth", lambda *args, **kwargs: None
+    )
+    cli_module._write_daemon_record(
+        cli_module._HostDaemonRecord(
+            pid=_SAME_WORKSPACE_PID,
+            target=_WORKSPACE_API,
+            mode="server",
+            server_url=_WORKSPACE_API,
+            log_path=str(tmp_path / "existing.log"),
+            started_at=int(time.time()),
+            host_id="a" * 32,
+        )
+    )
+
+
+def test_host_background_reuses_daemon_on_another_url_for_the_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A second URL for the same workspace reuses the running daemon.
+
+    A second daemon with the same host id would take over the first one's
+    server connection and back again every few seconds.
+    """
+    spawned_args, _ = _patch_background_host_spawn(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "omnigent.cli._pid_alive", lambda checked: checked in {4242, _SAME_WORKSPACE_PID}
+    )
+    _seed_same_workspace_daemon(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(cli, ["host", "--background", "--server", _VANITY_API])
+
+    assert result.exit_code == 0, result.output
+    assert spawned_args == [], "the workspace's daemon must not get a second one"
+    assert f"already running (pid {_SAME_WORKSPACE_PID})" in result.output
+    assert "same workspace through another URL" in result.output
+    # Reported under the daemon's own URL, not the one requested.
+    server_lines = [line.split() for line in result.output.splitlines() if "server:" in line]
+    assert server_lines == [["server:", "https://dbc-1.cloud.databricks.com/omnigent?o=1"]]
+
+
+def test_host_background_spawns_for_another_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A different workspace id keeps its own daemon."""
+    spawned_args, _ = _patch_background_host_spawn(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "omnigent.cli._pid_alive", lambda checked: checked in {4242, _SAME_WORKSPACE_PID}
+    )
+    _seed_same_workspace_daemon(monkeypatch, tmp_path, vanity_org_id="2")
+
+    result = CliRunner().invoke(cli, ["host", "--background", "--server", _VANITY_API])
+
+    assert result.exit_code == 0, result.output
+    assert spawned_args and _VANITY_API in spawned_args[0]
+    assert "Started the host daemon" in result.output
+
+
+def test_foreground_host_refuses_another_url_for_the_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A foreground host can't reuse a daemon, so it refuses and names it."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(
+        "omnigent.cli._pid_is_recorded_daemon",
+        lambda record: record.pid in {os.getpid(), _SAME_WORKSPACE_PID},
+    )
+    _seed_same_workspace_daemon(monkeypatch, tmp_path)
+    runs: list[str] = []
+
+    with patch(
+        "omnigent.host.connect.run_host_process",
+        lambda server_url, **kwargs: runs.append(server_url),
+    ):
+        result = CliRunner().invoke(
+            cli, ["host", "--server", _VANITY_API, "--no-open"], standalone_mode=False
+        )
+
+    assert isinstance(result.exception, click.ClickException)
+    message = result.exception.format_message()
+    assert "already running for this workspace under another URL" in message
+    assert f"target={_WORKSPACE_API}" in message
+    assert "nothing more to do" in message
+    # The running daemon is the right one, so neither the message nor the
+    # stale-host hint suggests stopping it.
+    assert "stop" not in message
+    assert suppresses_recovery_hint(result.exception)
+    assert runs == []
+    assert cli_module._find_daemon_record(_VANITY_API) is None
+
+
+def test_host_status_selects_daemon_on_another_url_for_the_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``host status --server`` reports the workspace's daemon and names the request.
+
+    The desktop app's Arca connect reads this JSON and needs to know the
+    daemon serves the URL it asked for.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr(
+        "omnigent.cli._pid_is_recorded_daemon",
+        lambda record: record.pid == _SAME_WORKSPACE_PID,
+    )
+    monkeypatch.setattr(
+        "omnigent.cli._daemon_status_payload",
+        lambda record, **kwargs: cli_module._base_daemon_status_payload(record),
+    )
+    _seed_same_workspace_daemon(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(cli, ["host", "status", "--server", _VANITY_API, "--json"])
+
+    assert result.exit_code == 0, result.output
+    (daemon,) = json.loads(result.output)["daemons"]
+    assert daemon["pid"] == _SAME_WORKSPACE_PID
+    assert daemon["target"] == _WORKSPACE_API
+    assert daemon["same_workspace_as"] == _VANITY_API
 
 
 # ── omnigent start ────────────────────────────────────────────────

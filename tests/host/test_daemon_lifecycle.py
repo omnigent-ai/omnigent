@@ -16,6 +16,7 @@ from omnigent.host.daemon_lifecycle import (
     DaemonLifecycleLock,
     HostDaemonRecord,
     daemon_record_path,
+    find_same_workspace_daemon,
     normalize_daemon_target,
     record_flock_is_held,
 )
@@ -420,3 +421,117 @@ async def test_monitor_startup_grace_before_first_ownership(
         monitor.cancel()
         with pytest.raises(asyncio.CancelledError):
             await monitor
+
+
+_VANITY = "https://vanity.databricks.com/api/2.0/omnigent"
+_WORKSPACE_HOST = "https://dbc-1.cloud.databricks.com/api/2.0/omnigent"
+_HOST_ID = "a" * 32
+
+
+def _server_record(
+    server_url: str, *, pid: int = 4242, host_id: str = _HOST_ID
+) -> HostDaemonRecord:
+    """Build a live-looking server-mode daemon record for *server_url*."""
+    target = normalize_daemon_target(server_url)
+    return HostDaemonRecord(
+        pid=pid,
+        target=target,
+        mode="server",
+        server_url=target,
+        log_path=None,
+        started_at=1,
+        host_id=host_id,
+    )
+
+
+@pytest.mark.parametrize(
+    ("requested", "record", "logins", "live", "matches"),
+    [
+        # Two URLs for one workspace collide on (workspace, host id).
+        (
+            _VANITY,
+            _server_record(_WORKSPACE_HOST),
+            {_VANITY: "1", _WORKSPACE_HOST: "1"},
+            True,
+            True,
+        ),
+        # The URL's own ?o= selector identifies the workspace without a login record.
+        (f"{_VANITY}?o=1", _server_record(_WORKSPACE_HOST), {_WORKSPACE_HOST: "1"}, True, True),
+        # The same URL is the per-target record's job, not this lookup's.
+        (_VANITY, _server_record(_VANITY), {_VANITY: "1"}, True, False),
+        (
+            _VANITY,
+            _server_record(_WORKSPACE_HOST),
+            {_VANITY: "1", _WORKSPACE_HOST: "2"},
+            True,
+            False,
+        ),
+        # An unknown workspace id never matches: non-Databricks servers keep per-URL daemons.
+        (_VANITY, _server_record(_WORKSPACE_HOST), {_WORKSPACE_HOST: "1"}, True, False),
+        (_VANITY, _server_record(_WORKSPACE_HOST), {_VANITY: "1"}, True, False),
+        # A different host id is a different host, which the server keeps separately.
+        (
+            _VANITY,
+            _server_record(_WORKSPACE_HOST, host_id="b" * 32),
+            {_VANITY: "1", _WORKSPACE_HOST: "1"},
+            True,
+            False,
+        ),
+        (
+            _VANITY,
+            _server_record(_WORKSPACE_HOST),
+            {_VANITY: "1", _WORKSPACE_HOST: "1"},
+            False,
+            False,
+        ),
+    ],
+)
+def test_find_same_workspace_daemon(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    requested: str,
+    record: HostDaemonRecord,
+    logins: dict[str, str],
+    live: bool,
+    matches: bool,
+) -> None:
+    from omnigent.cli_auth import store_databricks_auth
+
+    monkeypatch.setattr(
+        "omnigent.cli_auth._token_file_path", lambda: tmp_path / "auth_tokens.json"
+    )
+    for server_url, org_id in logins.items():
+        store_databricks_auth(server_url, "https://dbc-1.cloud.databricks.com", org_id=org_id)
+
+    found = find_same_workspace_daemon(
+        [record], server_url=requested, host_id=_HOST_ID, is_live=lambda _record: live
+    )
+
+    assert (found == record) is matches
+
+
+def test_find_same_workspace_daemon_skips_local_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.cli_auth import store_databricks_auth
+
+    monkeypatch.setattr(
+        "omnigent.cli_auth._token_file_path", lambda: tmp_path / "auth_tokens.json"
+    )
+    store_databricks_auth(_VANITY, "https://dbc-1.cloud.databricks.com", org_id="1")
+    local = HostDaemonRecord(
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+        log_path=None,
+        started_at=1,
+        host_id=_HOST_ID,
+    )
+
+    assert (
+        find_same_workspace_daemon(
+            [local], server_url=_VANITY, host_id=_HOST_ID, is_live=lambda _record: True
+        )
+        is None
+    )

@@ -23,6 +23,7 @@ import hashlib
 import json
 import logging
 import os
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -99,6 +100,68 @@ def normalize_daemon_target(server_url: str | None) -> str:
     netloc = f"{userinfo}{hostname}{port_suffix}"
     path = parsed.path.rstrip("/")
     return urlunsplit((scheme, netloc, path, parsed.query, parsed.fragment))
+
+
+def daemon_workspace_id(server_url: str) -> str | None:
+    """Return the Databricks workspace id a server-mode target connects to.
+
+    Two different URLs can front one workspace (a vanity host and the
+    ``dbc-…`` workspace host, say). The server keys host connections by
+    workspace and host id, so the workspace id, not the URL, decides whether
+    two daemons collide.
+
+    :param server_url: Server URL, e.g.
+        ``"https://example.databricks.com/api/2.0/omnigent?o=123"``.
+    :returns: The ``?o=`` selector when the URL carries one, else the org id
+        stored by ``omnigent login`` for the URL, e.g. ``"123"``. ``None``
+        when neither is known (non-Databricks servers, no login yet).
+    """
+    from omnigent.util.server_url import ServerUrl
+
+    return ServerUrl.from_api_base(server_url).org_id
+
+
+def find_same_workspace_daemon(
+    records: Iterable[HostDaemonRecord],
+    *,
+    server_url: str,
+    host_id: str | None,
+    is_live: Callable[[HostDaemonRecord], bool],
+) -> HostDaemonRecord | None:
+    """Find a live daemon serving *server_url*'s workspace under another URL.
+
+    A second daemon with the same host id on another URL for the same
+    workspace doesn't fail: the server keeps the newest tunnel per
+    ``(workspace, host id)``, so the two daemons keep evicting each other.
+    Callers reuse or refuse instead of starting one. URLs whose workspace id
+    is unknown never match, so non-Databricks servers keep per-URL daemons.
+
+    :param records: Daemon registry records to search.
+    :param server_url: Server URL the caller wants a daemon for, e.g.
+        ``"https://example.databricks.com/api/2.0/omnigent"``.
+    :param host_id: Host id the caller would advertise, e.g.
+        ``"9eb97e60d38b43919d996b4918f63493"``. ``None`` never matches.
+    :param is_live: Liveness check for a record's owner.
+    :returns: The live record, or ``None``.
+    """
+    if host_id is None:
+        return None
+    target = normalize_daemon_target(server_url)
+    workspace_id: str | None = None
+    for record in records:
+        if record.mode != "server" or record.server_url is None or record.host_id != host_id:
+            continue
+        if normalize_daemon_target(record.target) == target:
+            continue
+        if workspace_id is None:
+            workspace_id = daemon_workspace_id(server_url)
+            if workspace_id is None:
+                return None
+        if daemon_workspace_id(record.server_url) != workspace_id:
+            continue
+        if is_live(record):
+            return record
+    return None
 
 
 def _target_digest(target: str) -> str:

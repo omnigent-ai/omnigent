@@ -25,7 +25,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from importlib import import_module, resources
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, BinaryIO, Literal, TypeAlias, cast, get_args
+from typing import TYPE_CHECKING, Any, BinaryIO, Literal, NoReturn, TypeAlias, cast, get_args
 
 import click
 import psutil
@@ -74,6 +74,9 @@ from omnigent.host.daemon_lifecycle import (
 )
 from omnigent.host.daemon_lifecycle import (
     daemon_registry_dir as _daemon_registry_dir_for,
+)
+from omnigent.host.daemon_lifecycle import (
+    find_same_workspace_daemon as _find_same_workspace_daemon,
 )
 from omnigent.host.daemon_lifecycle import (
     normalize_daemon_target as _normalize_daemon_target_impl,
@@ -3114,6 +3117,32 @@ def _reuse_existing_daemon_record(target: str) -> _DaemonReuseDecision:
     return _DaemonReuseDecision(reuse=True, config_changed=False)
 
 
+def _same_workspace_daemon(
+    server_url: str | None, *, host_id: str | None = None
+) -> _HostDaemonRecord | None:
+    """
+    Find the live daemon that already hosts this machine on *server_url*'s workspace.
+
+    Another URL for the same workspace counts as the same server: a second
+    daemon with this host id would evict the first one's tunnel and back.
+
+    :param server_url: Requested server URL, e.g.
+        ``"https://example.databricks.com/api/2.0/omnigent"``. ``None`` or
+        empty (local mode) never matches.
+    :param host_id: Host id the caller would advertise; defaults to the local
+        host identity.
+    :returns: The live daemon's record, or ``None``.
+    """
+    if not server_url:
+        return None
+    return _find_same_workspace_daemon(
+        _list_daemon_records(),
+        server_url=server_url,
+        host_id=host_id if host_id is not None else _load_existing_host_id(),
+        is_live=_daemon_owner_is_live,
+    )
+
+
 def _local_daemon_serves_target(target: str, server_url: str | None) -> bool:
     """
     Check whether the local daemon already serves a requested URL target.
@@ -3358,6 +3387,9 @@ def _live_daemon_conflict(record: _HostDaemonRecord) -> _HostDaemonRecord | None
             and not _daemon_owner_is_live(local_record)
         ):
             _delete_daemon_record(local_record)
+        sibling = _same_workspace_daemon(record.server_url, host_id=record.host_id)
+        if sibling is not None and sibling.pid != record.pid:
+            return sibling
     return None
 
 
@@ -3375,28 +3407,7 @@ def _claim_foreground_daemon_record(
     """
     conflict = _live_daemon_conflict(record)
     if conflict is not None:
-        # server_url is None in local mode; "" makes the hint say --server "".
-        stop_command = _host_stop_command(conflict.server_url or "")
-        detail = (
-            "A host daemon is already running for this server "
-            f"({_describe_pid(conflict.pid)}, target={conflict.target}). "
-        )
-        if _pid_is_foreign(conflict.pid):
-            # Another user owns the daemon: `host stop` on this account can only
-            # clear the shared registry record, not signal the process — and a
-            # service-managed daemon respawns. Point at remedies that work
-            # instead of a stop that cannot.
-            raise click.ClickException(
-                detail + "It is owned by another user, so it cannot be stopped from this "
-                f"account: `{stop_command}` only clears the shared registry record "
-                "(and a service-managed daemon respawns). Ask that user to stop it, "
-                "or set OMNIGENT_DATA_DIR to a directory only you use to run your "
-                "own host."
-            )
-        raise click.ClickException(
-            detail + f"Run `{cli_invocation()} host status` to inspect it or `{stop_command}` "
-            "to stop it first."
-        )
+        _raise_live_daemon_conflict(record, conflict)
     previous = _find_daemon_record(record.target)
     if (
         previous is not None
@@ -3412,6 +3423,64 @@ def _claim_foreground_daemon_record(
         previous = None
     _write_daemon_record(record)
     return previous
+
+
+def _raise_live_daemon_conflict(
+    record: _HostDaemonRecord, conflict: _HostDaemonRecord
+) -> NoReturn:
+    """
+    Refuse to start a foreground host next to a live daemon for the same server.
+
+    :param record: Foreground daemon record this process wanted to claim.
+    :param conflict: Live daemon record found by :func:`_live_daemon_conflict`
+        or :func:`_same_workspace_daemon`.
+    :raises click.ClickException: Always.
+    """
+    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+
+    # server_url is None in local mode; "" makes the hint say --server "".
+    stop_command = _host_stop_command(conflict.server_url or "")
+    same_workspace = (
+        conflict.mode == "server"
+        and record.mode == "server"
+        and _normalize_daemon_target(conflict.target) != record.target
+    )
+    if same_workspace:
+        detail = (
+            "A host daemon is already running for this workspace under another URL "
+            f"({_describe_pid(conflict.pid)}, target={conflict.target}). A second one "
+            "would take over its connection and back again. "
+        )
+    else:
+        detail = (
+            "A host daemon is already running for this server "
+            f"({_describe_pid(conflict.pid)}, target={conflict.target}). "
+        )
+    if same_workspace and not _pid_is_foreign(conflict.pid):
+        exc = click.ClickException(
+            detail + "It already connects this machine to the workspace, so there is "
+            f"nothing more to do. Run `{cli_invocation()} host status` to see it."
+        )
+        # Nothing is wrong with the running daemon, so the stale-host
+        # `stop` hint would point at the wrong fix.
+        setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
+        raise exc
+    if _pid_is_foreign(conflict.pid):
+        # Another user owns the daemon: `host stop` on this account can only
+        # clear the shared registry record, not signal the process — and a
+        # service-managed daemon respawns. Point at remedies that work
+        # instead of a stop that cannot.
+        raise click.ClickException(
+            detail + "It is owned by another user, so it cannot be stopped from this "
+            f"account: `{stop_command}` only clears the shared registry record "
+            "(and a service-managed daemon respawns). Ask that user to stop it, "
+            "or set OMNIGENT_DATA_DIR to a directory only you use to run your "
+            "own host."
+        )
+    raise click.ClickException(
+        detail + f"Run `{cli_invocation()} host status` to inspect it or `{stop_command}` "
+        "to stop it first."
+    )
 
 
 def _restore_replaced_daemon_record(
@@ -3494,6 +3563,9 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
         return False
     if not decision.config_changed and _local_daemon_serves_target(target, server_url):
         _record_host_state("reused_local_daemon", running_before=True)
+        return False
+    if _same_workspace_daemon(server_url) is not None:
+        _record_host_state("reused_same_workspace_daemon", running_before=True)
         return False
 
     _HOST_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -9129,6 +9201,9 @@ def _run_background_host(
     previous = _find_daemon_record(target)
     _ensure_host_daemon(server or None)
     record = _find_daemon_record(target)
+    same_workspace = None if record is not None else _same_workspace_daemon(server or None)
+    if same_workspace is not None:
+        record = same_workspace
     if record is None:
         # A local daemon may already own the requested URL under its local
         # registry key. It is reusable only after its host is online too.
@@ -9144,7 +9219,7 @@ def _run_background_host(
             "Could not spawn the background host daemon. "
             f"See {process_log_dir_reference('host')} for details."
         )
-    reused = previous is not None and previous.pid == record.pid
+    reused = same_workspace is not None or (previous is not None and previous.pid == record.pid)
     try:
         if not reused:
             _confirm_background_host_alive(record)
@@ -9154,7 +9229,7 @@ def _run_background_host(
             _update_daemon_resolved_server_url(target, server_url)
             record = _find_daemon_record(target) or record
         else:
-            server_url = target
+            server_url = _normalize_daemon_target(record.target)
         _confirm_background_host_registered(record)
     except click.ClickException:
         if not reused:
@@ -9167,6 +9242,8 @@ def _run_background_host(
         bold=True,
     )
     click.echo(f"{headline} (pid {record.pid}).")
+    if same_workspace is not None:
+        click.echo("It already connects this machine to the same workspace through another URL.")
     # User-facing: the display form (workspace /omnigent URL with ?o= when
     # known) — the API mount is an implementation detail.
     from omnigent.util.server_url import display_server_url
@@ -9348,6 +9425,10 @@ def host(
         # (or a headless invocation) fails loud with the command to run.
         if remote_mode:
             _ensure_databricks_server_auth(server, non_interactive=non_interactive)
+            # A first sign-in is what records the workspace id, so check again.
+            sibling = _same_workspace_daemon(server, host_id=record.host_id)
+            if sibling is not None:
+                _raise_live_daemon_conflict(record, sibling)
         _maybe_open_host_web_ui(server, non_interactive=non_interactive, no_open=no_open, cfg=cfg)
         run_host_process(server_url=server, daemon_target=target)
         stopped_cleanly = True
@@ -9469,6 +9550,11 @@ def _selected_daemon_records(
         local = _local_daemon_serving_remote(resolved)
         if local is not None:
             return [local]
+        # `host --server <url>` also reuses a daemon on another URL for the
+        # same workspace, so stop/status must find that daemon too.
+        same_workspace = _same_workspace_daemon(resolved)
+        if same_workspace is not None:
+            return [same_workspace]
     return []
 
 
@@ -10454,17 +10540,27 @@ def host_status(
     if server is None:
         server = _host_group_option(ctx, "server")
     records = _selected_daemon_records(server=server, all_targets=all_targets, default_all=True)
+    resolved = _resolve_host_server(server) if server is not None and not all_targets else None
+    requested_target = _normalize_daemon_target(resolved) if resolved else None
 
     # Build payloads in parallel so HTTP calls to independent servers overlap.
     # Dead-process records skip the network entirely (see _add_daemon_host_status),
     # but live ones each take a full auth-resolution + round-trip — parallelising
     # them saves wall time proportional to the number of live daemons.
     def _build(record: _HostDaemonRecord) -> _HostPayload:
-        return _daemon_status_payload(
+        payload = _daemon_status_payload(
             record,
             include_sessions=sessions,
             connected_sessions_only=True,
         )
+        if (
+            requested_target is not None
+            and record.mode == "server"
+            and _normalize_daemon_target(record.target) != requested_target
+        ):
+            # Selected by workspace: the daemon serves --server's workspace via another URL.
+            payload["same_workspace_as"] = requested_target
+        return payload
 
     with concurrent.futures.ThreadPoolExecutor() as pool:
         payloads = list(pool.map(_build, records))
