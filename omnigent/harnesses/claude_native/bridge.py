@@ -202,6 +202,11 @@ APPROVAL_WAIT_MARKER_REFRESH_S = 60.0
 # reads stale; a hook killed mid-wait leaves a marker that expires on its own.
 APPROVAL_WAIT_MARKER_TTL_S = 420.0
 _CONFIG_FILE = "bridge.json"
+# ``bridge.json`` key: epoch time of the ``/clear`` rotation's latest step. Pane
+# input is refused while it is set; the hook refreshes it after each server round
+# trip, so only a rotation that never completes lets it age out and reopen the pane.
+_ACTIVE_SESSION_ROTATION_KEY = "active_session_rotation_started_at"
+ACTIVE_SESSION_ROTATION_MAX_AGE_S = 300.0
 _SERVER_FILE = "server.json"
 # Control socket of one ``serve-mcp`` process under the harness socket root,
 # named by owner pid so a socket left behind by a dead process can be reaped.
@@ -634,6 +639,52 @@ class ClaudeUserPromptPending(RuntimeError):
 
 class ClaudeMessageNotAccepted(RuntimeError):
     """The submitted draft remained in Claude's input box until the deadline."""
+
+
+class ClaudeSessionInactive(RuntimeError):
+    """A native reset changed the pane's owner before user-input handoff."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Claude native session is no longer active after /clear; "
+            "open the latest conversation and retry."
+        )
+
+
+def _require_input_session(bridge_dir: Path, expected_session_id: str | None) -> None:
+    if not active_session_accepts_input(bridge_dir, expected_session_id):
+        raise ClaudeSessionInactive()
+
+
+@contextlib.contextmanager
+def _pending_framework_context(
+    bridge_dir: Path, notices: list[str] | None, expected_session_id: str | None
+) -> Iterator[None]:
+    """Stage context at handoff and remove only this delivery's file on failure."""
+    _require_input_session(bridge_dir, expected_session_id)
+    path = bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
+    identity: tuple[int, int, int, int] | None = None
+    if notices:
+        identity = _write_text_file(
+            path, "\n\n".join(notices), expected_session_id=expected_session_id
+        )
+    elif notices is not None:
+        path.unlink(missing_ok=True)
+    try:
+        yield
+    except BaseException:
+        if identity is not None:
+            # Any OS error here must not replace the delivery failure being raised.
+            with contextlib.suppress(OSError):
+                current = path.lstat()
+                if (
+                    current.st_dev,
+                    current.st_ino,
+                    current.st_mtime_ns,
+                    current.st_ctime_ns,
+                ) == identity:
+                    path.unlink()
+        raise
 
 
 @contextlib.contextmanager
@@ -2023,14 +2074,41 @@ def read_active_session_id(bridge_dir: Path) -> str | None:
     :returns: Active Omnigent session id, e.g. ``"conv_abc123"``, or
         ``None`` when the bridge config is absent or malformed.
     """
-    config = _read_json_file(bridge_dir / _CONFIG_FILE)
-    if not isinstance(config, dict):
-        return None
+    return _active_session_id(_read_json_file(bridge_dir / _CONFIG_FILE))
+
+
+def _active_session_id(config: _JsonObject) -> str | None:
     active = config.get("active_session_id")
     if isinstance(active, str) and active:
         return active
     legacy = config.get("conversation_id")
     return legacy if isinstance(legacy, str) and legacy else None
+
+
+def active_session_accepts_input(bridge_dir: Path, request_session_id: str | None) -> bool:
+    """
+    Return whether input sent from *request_session_id* may reach the shared pane.
+
+    Input is refused while a ``/clear`` rotation is in flight (see
+    :func:`begin_active_session_rotation`) and once another conversation owns
+    the pane. ``None`` preserves harness spawns that predate the owner guard.
+
+    :param bridge_dir: Bridge directory path.
+    :param request_session_id: Omnigent session the input was sent to, e.g.
+        ``"conv_abc123"``.
+    :returns: ``True`` when the pane may receive the input.
+    """
+    if request_session_id is None:
+        return True
+    config = _read_json_file(bridge_dir / _CONFIG_FILE)
+    started_at = config.get(_ACTIVE_SESSION_ROTATION_KEY)
+    if (
+        isinstance(started_at, int | float)
+        and time.time() - started_at < ACTIVE_SESSION_ROTATION_MAX_AGE_S
+    ):
+        return False
+    active = _active_session_id(config)
+    return active is None or active == request_session_id
 
 
 def read_launch_model(bridge_dir: Path) -> str | None:
@@ -2186,7 +2264,30 @@ def write_active_session_id(bridge_dir: Path, session_id: str) -> None:
             raise RuntimeError(f"bridge config missing: {bridge_dir / _CONFIG_FILE}")
         config["active_session_id"] = session_id
         config["conversation_id"] = session_id
+        config.pop(_ACTIVE_SESSION_ROTATION_KEY, None)
         config["updated_at"] = time.time()
+        _write_json_file(bridge_dir / _CONFIG_FILE, config)
+
+
+def begin_active_session_rotation(bridge_dir: Path) -> None:
+    """
+    Refuse pane input until :func:`write_active_session_id` names the replacement owner.
+
+    Claude has already discarded the conversation when its ``/clear`` hooks run,
+    but the Omnigent rotation takes several server round trips; without this
+    marker a message sent meanwhile passes the owner check and is pasted into
+    the replacement conversation. Calling it again refreshes the marker's age.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: None.
+    :raises RuntimeError: If the bridge config does not exist.
+    """
+    with _bridge_metadata_write_lock(bridge_dir):
+        config = _read_json_file(bridge_dir / _CONFIG_FILE)
+        if not config:
+            raise RuntimeError(f"bridge config missing: {bridge_dir / _CONFIG_FILE}")
+        config[_ACTIVE_SESSION_ROTATION_KEY] = time.time()
+        config["active_session_generation"] = secrets.token_hex(16)
         _write_json_file(bridge_dir / _CONFIG_FILE, config)
 
 
@@ -4134,6 +4235,8 @@ def inject_user_message(
     *,
     content: str,
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
+    expected_session_id: str | None = None,
+    framework_notices: list[str] | None = None,
 ) -> None:
     r"""
     Deliver a user message into the Claude terminal via tmux send-keys.
@@ -4187,6 +4290,9 @@ def inject_user_message(
         terminal's process is verifiably alive but still booting (see
         :func:`_wait_for_claude_prompt_ready`), so a slow host connect
         delivers the message late instead of dropping it.
+    :param expected_session_id: Refuse stale conversation input before its first paste.
+    :param framework_notices: One-shot hook context staged with this input; ``None``
+        leaves legacy callers' context unchanged.
     :returns: None.
     :raises RuntimeError: If the tmux target is not advertised in time,
         if Claude's input prompt never renders, if a ``tmux send-keys``
@@ -4195,6 +4301,7 @@ def inject_user_message(
     :raises ClaudeTerminalDialog: If the input box stays in shell mode or the
         prompt-history search after the reclaim; nothing was typed.
     """
+    _require_input_session(bridge_dir, expected_session_id)
     delivery_diagnostics.set_stage("waiting_for_tmux")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     delivery_diagnostics.set_stage("restoring_input")
@@ -4245,32 +4352,46 @@ def inject_user_message(
         rejection_baseline = _count_unknown_command_rejections(
             _capture_pane(socket_path, tmux_target), rejection_needle
         )
-    _paste_and_submit(bridge_dir, socket_path, tmux_target, text=injected_text, needle=needle)
-    if rejection_needle is None:
-        return
-    if not _unknown_command_rejection_appeared(
-        socket_path,
-        tmux_target,
-        needle=rejection_needle,
-        baseline=rejection_baseline,
-    ):
-        # No rejection: Claude Code accepted the command (a real skill or
-        # custom command) and the turn is underway.
-        return
-    # Claude Code dropped the message. Re-deliver it escaped so the text
-    # reaches the model as a regular user message instead of vanishing.
-    _logger.info(
-        "claude-native: Claude Code rejected unknown command /%s; "
-        "re-delivering the message escaped as plain text",
-        unknown_name,
-    )
-    _paste_and_submit(
-        bridge_dir,
-        socket_path,
-        tmux_target,
-        text=_escape_slash_command_text(content),
-        needle=needle,
-    )
+    with _pending_framework_context(bridge_dir, framework_notices, expected_session_id):
+        _paste_and_submit(
+            bridge_dir,
+            socket_path,
+            tmux_target,
+            text=injected_text,
+            needle=needle,
+            expected_session_id=expected_session_id,
+        )
+        if rejection_needle is None:
+            return
+        if not _unknown_command_rejection_appeared(
+            socket_path,
+            tmux_target,
+            needle=rejection_needle,
+            baseline=rejection_baseline,
+        ):
+            # No rejection: Claude Code accepted the command (a real skill or
+            # custom command) and the turn is underway.
+            return
+        # Claude Code dropped the message. Re-deliver it escaped so the text
+        # reaches the model as a regular user message instead of vanishing.
+        _logger.info(
+            "claude-native: Claude Code rejected an unknown command; "
+            "re-delivering the message escaped as plain text"
+        )
+        try:
+            _paste_and_submit(
+                bridge_dir,
+                socket_path,
+                tmux_target,
+                text=_escape_slash_command_text(content),
+                needle=needle,
+                expected_session_id=expected_session_id,
+            )
+        except ClaudeSessionInactive as exc:
+            raise RuntimeError(
+                "The native session changed after the initial submit; "
+                "the command fallback was not sent. Open the latest conversation."
+            ) from exc
 
 
 def _paste_and_submit(
@@ -4280,6 +4401,7 @@ def _paste_and_submit(
     *,
     text: str,
     needle: str,
+    expected_session_id: str | None = None,
 ) -> None:
     r"""
     Deliver *text* into Claude's input box as one paste plus a verified Enter.
@@ -4303,6 +4425,7 @@ def _paste_and_submit(
         never leaves the input box after repeated submit Enters, or if a
         prompt appears after the submit Enter.
     """
+    _require_input_session(bridge_dir, expected_session_id)
     delivery_diagnostics.start_attempt()
     delivery_diagnostics.set_stage("checking_pending_prompt")
     if has_pending_user_prompt(bridge_dir):
@@ -4332,6 +4455,7 @@ def _paste_and_submit(
         paste_path = paste_file.name
     try:
         _run_tmux(socket_path, "load-buffer", "-b", "omnigent-paste", paste_path)
+        _require_input_session(bridge_dir, expected_session_id)
         _run_tmux(
             socket_path,
             "paste-buffer",
@@ -9589,6 +9713,13 @@ def _write_json_file(path: Path, payload: _JsonObject) -> None:
     :param payload: JSON-compatible object.
     :returns: None.
     """
+    _write_text_file(path, json.dumps(payload, separators=(",", ":")))
+
+
+def _write_text_file(
+    path: Path, text: str, *, expected_session_id: str | None = None
+) -> tuple[int, int, int, int] | None:
+    """Atomically write owner-only bridge text and return the file's identity."""
     _ensure_secure_dir(path.parent)
     tmp_path: Path | None = None
     try:
@@ -9601,11 +9732,22 @@ def _write_json_file(path: Path, payload: _JsonObject) -> None:
             delete=False,
         ) as handle:
             tmp_path = Path(handle.name)
-            handle.write(json.dumps(payload, separators=(",", ":")))
+            handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
+            before = os.fstat(handle.fileno())
         os.chmod(tmp_path, 0o600)
+        _require_input_session(path.parent, expected_session_id)
         os.replace(tmp_path, path)
+        with contextlib.suppress(OSError):
+            after = path.lstat()
+            if (after.st_dev, after.st_ino, after.st_mtime_ns) == (
+                before.st_dev,
+                before.st_ino,
+                before.st_mtime_ns,
+            ):
+                return after.st_dev, after.st_ino, after.st_mtime_ns, after.st_ctime_ns
+        return None
     finally:
         if tmp_path is not None:
             with contextlib.suppress(FileNotFoundError):
