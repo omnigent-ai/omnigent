@@ -13,27 +13,22 @@ with ``modelProvider: "gemini"`` in its settings.
       {"access_token": "ya29.…", "refresh_token": "1//0g…",
        "expiry_date": …, "id_token": "eyJ…", "scope": "…", "token_type": "Bearer"}
 
-- Linux writes ``~/.gemini/antigravity-cli/antigravity-oauth-token`` — the OAuth
-  object **nested under** ``token`` (verified live against agy 1.0.10)::
+- Linux on agy 1.0.10 writes ``~/.gemini/antigravity-cli/antigravity-oauth-token``
+  — the OAuth object **nested under** ``token`` (verified live)::
 
       {"auth_method": "oauth",
        "token": {"access_token": "ya29.…", "refresh_token": "1//0g…",
                  "token_type": "Bearer", "expiry": "…"}}
 
-- macOS on agy 1.1.7+ writes **no token file at all** — the OAuth credential
-  goes into the **Keychain**. A signed-in Mac therefore has neither file above,
-  and a file-only check locks the user out of a harness they can actually run.
+- Google documents OS keyring storage (macOS Keychain, Linux Secret
+  Service/dbus, or Windows Credential Manager) at
+  https://antigravity.google/docs/cli/install/. Keyring-only storage was
+  observed with agy 1.2.8 on Linux.
 
-Detection is file-first with a macOS-only CLI fallback, mirroring
-:func:`omnigent.onboarding.ambient._claude_login_detected` (Claude Code has the
-same Keychain split). A non-empty ``access_token`` / ``refresh_token`` string —
-flat (macOS) or nested under ``token`` (Linux) — counts as a completed login.
-When no file carries one, macOS asks the CLI itself via
-:func:`omnigent.onboarding.harness_install.harness_cli_logged_in`, which runs
-``agy models`` (exit 0 only when signed in) and so reads the credential wherever
-agy stored it, Keychain included. Linux stays purely file-based and
-subprocess-free: the token file is accurate there, so the fallback would add
-cost while weakening a signal that already works.
+Detection accepts the API key first, then legacy token files, then asks the CLI
+via :func:`omnigent.onboarding.harness_install.harness_cli_logged_in`. Its
+bounded, non-interactive ``agy models`` probe reads credentials wherever agy
+stored them and exits 0 only when signed in.
 
 The fallback asks the CLI rather than inspecting
 ``~/.gemini/antigravity-cli/settings.json`` because omnigent's own CLI launch
@@ -61,7 +56,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 from omnigent.onboarding import harness_install
@@ -69,7 +63,7 @@ from omnigent.onboarding.provider_config import GEMINI_FAMILY
 
 _GEMINI_DIR: Path = Path(os.path.expanduser("~")) / ".gemini"
 
-# Where ``agy`` writes its OAuth token after the first interactive sign-in. The
+# Where older ``agy`` versions write their OAuth token after sign-in. The
 # location is platform-specific (verified against agy 1.0.10), so detection
 # checks both: macOS uses ``oauth_creds.json``; Linux uses
 # ``antigravity-cli/antigravity-oauth-token``.
@@ -128,26 +122,25 @@ def gemini_auth_has_credential(creds_path: Path | None = None) -> bool:
     (:data:`GEMINI_OAUTH_CRED_PATHS`) and returns ``True`` if any carries a
     usable token — so a logged-in user is recognized on both macOS
     (``oauth_creds.json``) and Linux
-    (``antigravity-cli/antigravity-oauth-token``). When no file carries a token
-    and the host is macOS, falls back to asking the CLI itself
-    (:func:`omnigent.onboarding.harness_install.harness_cli_logged_in`, which
-    runs ``agy models``), because agy 1.1.7+ keeps the credential in the
-    Keychain and writes no token file. With *creds_path* set, checks only that
-    file — the caller named the signal it wants, so no CLI fallback runs.
+    (``antigravity-cli/antigravity-oauth-token``). When no file carries a token,
+    falls back to asking the CLI itself via a bounded, non-interactive
+    ``agy models`` probe, which also detects credentials in the OS keyring.
+    With *creds_path* set, checks only that file — the caller named the signal
+    it wants, so no CLI fallback runs.
 
     A file counts as a completed login when it parses as a JSON object with a
     non-empty ``access_token`` / ``refresh_token`` string, flat or nested under
-    ``token``. The file check cannot detect server-side revocation; the macOS
+    ``token``. The file check cannot detect server-side revocation; the
     CLI fallback can.
 
     Never raises — an unreadable file or home directory, a missing ``agy``
     binary, and a hung or failing ``agy models`` all read as ``False``.
 
     :param creds_path: A specific credential file to check; ``None`` checks all
-        of :data:`GEMINI_OAUTH_CRED_PATHS`, then the macOS CLI fallback.
+        of :data:`GEMINI_OAUTH_CRED_PATHS`, then the CLI fallback.
     :returns: ``True`` when a usable Gemini credential is present — an ambient
-        API key, a token file on any platform, or a Keychain credential seen
-        through the macOS CLI fallback. ``False`` when none is available.
+        API key, a token file on any platform, or a keyring credential seen
+        through the CLI fallback. ``False`` when none is available.
     """
     api_key = os.environ.get(_GEMINI_API_KEY_ENV)
     if api_key is not None and api_key.strip():
@@ -155,13 +148,14 @@ def gemini_auth_has_credential(creds_path: Path | None = None) -> bool:
     paths = (creds_path,) if creds_path is not None else GEMINI_OAUTH_CRED_PATHS
     if any(_file_carries_token(path) for path in paths):
         return True
-    if creds_path is not None or sys.platform != "darwin":
+    if creds_path is not None:
         return False
-    # agy 1.1.7+ on macOS keeps OAuth in the Keychain and writes no token file,
-    # so only the CLI can see the login. Resolved through the module so a test
-    # can monkeypatch it without this call site caching the old function.
+    # Modern agy can keep OAuth solely in the OS keyring on any platform.
+    # Ask its status command rather than inferring login from settings files.
     try:
-        return harness_install.harness_cli_logged_in(GEMINI_FAMILY)
+        return harness_install.harness_cli_logged_in(
+            GEMINI_FAMILY, timeout=harness_install.READINESS_CLI_PROBE_TIMEOUT_S
+        )
     except (OSError, ValueError, subprocess.SubprocessError):
         # Readiness must never raise: a probe that cannot run is "no credential".
         return False
@@ -180,8 +174,7 @@ def gemini_login_detected() -> bool:
     :returns: ``True`` when ``GEMINI_API_KEY`` is non-empty, a token file
         (macOS ``~/.gemini/oauth_creds.json``, Linux
         ``~/.gemini/antigravity-cli/antigravity-oauth-token``) carries a
-        usable credential, or — on macOS only, where agy 1.1.7+ stores OAuth in
-        the Keychain — ``agy models`` reports a signed-in CLI; ``False``
-        otherwise.
+        usable credential, or ``agy models`` reports a signed-in CLI (including
+        OS keyring credentials); ``False`` otherwise.
     """
     return gemini_auth_has_credential()
