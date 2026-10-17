@@ -33,6 +33,7 @@ from omnigent.harnesses.claude_native.bridge import (
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import TurnComplete
 from omnigent.runner.app import _resolve_forwarded_message_content
+from tests._helpers.fake_claude_composer import FAKE_CLAUDE_COMPOSER_SOURCE
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -71,7 +72,10 @@ main()
 """
 
 # Render the composer expected by the bridge and record text submitted to it.
-_FAKE_CLAUDE_TUI = """\
+_FAKE_CLAUDE_TUI = (
+    FAKE_CLAUDE_COMPOSER_SOURCE
+    + "\n"
+    + """\
 import os, sys, termios, tty
 
 PROMPT_GLYPH = "\\u276f"
@@ -92,7 +96,7 @@ def main():
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     tty.setraw(fd)
-    chars = []
+    composer = FakeClaudeComposer()
     transcript = []
     render("", transcript)
     try:
@@ -103,24 +107,17 @@ def main():
             byte = data[0]
             if byte == 3:  # Ctrl-C tears the pane down on teardown
                 break
-            if byte == 13:  # Enter submits a non-empty draft
-                if chars:
-                    transcript.append("sent: " + "".join(chars))
-                    chars = []
-                    render("", transcript)
-                continue
-            if byte < 0x20:
-                # Swallow control bytes (Escape, the ESC of bracketed-paste
-                # markers); the visible message content is printable.
-                continue
-            chars.append(chr(byte))
-            render("".join(chars), transcript)
+            submitted = composer.feed(data)
+            if submitted is not None:
+                transcript.append("sent: " + submitted)
+            render(composer.draft, transcript)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 main()
 """
+)
 
 _FILENAME = "protocol.md"
 _FILE_BYTES = b"# Zebra Protocol\nThe passphrase is MARSCRATE-7.\n"

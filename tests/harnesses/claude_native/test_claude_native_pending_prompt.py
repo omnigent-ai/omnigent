@@ -167,7 +167,7 @@ def test_prompt_appearing_after_slash_paste_receives_no_submit_enter(
     def send(*args: str) -> None:
         nonlocal pasted
         sent.append(args)
-        if "-l" in args:
+        if args[-1] == "/model different":
             pasted = True
             if prompt is None:
                 _park_hook(native_bridge)
@@ -181,7 +181,11 @@ def test_prompt_appearing_after_slash_paste_receives_no_submit_enter(
     with pytest.raises(bridge.ClaudeUserPromptPending):
         bridge.inject_slash_command(native_bridge, command="/model different")
     assert pasted
-    assert [args[-1] for args in sent] == ["Space", "C-u", "/model different"]
+    assert [args[-1] for args in sent] == [
+        "Space",
+        "\x1b[107;5u" * 2 + "\x1b[117;5u" * 2,
+        "/model different",
+    ]
 
 
 @pytest.mark.parametrize(

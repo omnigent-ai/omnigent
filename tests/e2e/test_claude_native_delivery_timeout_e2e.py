@@ -52,6 +52,7 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import ExecutorError, TurnComplete
+from tests._helpers.fake_claude_composer import FAKE_CLAUDE_COMPOSER_SOURCE
 
 pytestmark = pytest.mark.skipif(shutil.which("tmux") is None, reason="requires tmux on PATH")
 
@@ -76,7 +77,10 @@ _DELIVERY_BOUND_S = _SUBMIT_VERIFY_TIMEOUT_S + 5.0
 # argv[2] seconds -- stdin queues in the pty, exactly like a CPU-starved TUI
 # at submit time -- then recovers and processes the queued submit Enter, which
 # moves the draft into the transcript and clears the input box.
-_FAKE_CLAUDE_TUI = """\
+_FAKE_CLAUDE_TUI = (
+    FAKE_CLAUDE_COMPOSER_SOURCE
+    + "\n"
+    + """\
 import os, sys, termios, time, tty
 
 PROMPT_GLYPH = "\\u276f"
@@ -99,7 +103,7 @@ def main():
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     tty.setraw(fd)
-    chars = []
+    composer = FakeClaudeComposer()
     transcript = []
     stalled = False
     render("", transcript)
@@ -111,19 +115,11 @@ def main():
             byte = data[0]
             if byte == 3:  # Ctrl-C tears the pane down cleanly on teardown
                 break
-            if byte == 13:  # Enter submits a non-empty draft
-                if chars:
-                    transcript.append("sent: " + "".join(chars))
-                    chars = []
-                    render("", transcript)
-                continue
-            if byte < 0x20:
-                # Other control bytes (Escape, Ctrl-A/Ctrl-K, the ESC of
-                # bracketed-paste markers) are swallowed.
-                continue
-            chars.append(chr(byte))
-            render("".join(chars), transcript)
-            if not stalled and STALL_TRIGGER in "".join(chars):
+            submitted = composer.feed(data)
+            if submitted is not None:
+                transcript.append("sent: " + submitted)
+            render(composer.draft, transcript)
+            if not stalled and STALL_TRIGGER in composer.draft:
                 # The draft has visibly committed; go unresponsive past the
                 # legacy fixed submit window while input queues in the pty.
                 stalled = True
@@ -134,6 +130,7 @@ def main():
 
 main()
 """
+)
 
 
 @pytest.fixture

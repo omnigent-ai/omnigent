@@ -11,7 +11,8 @@ import pytest
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native.bridge import inject_user_message, write_tmux_target
 
-_CLEAR_LINE_KEYS = ("\x1b[97;5u", "\x1b[107;5u")
+_CLEAR_LINE_KEYS = ("\x1b[97;5u", "\x1b[107;5u", "\x1b[117;5u")
+_CLEAR_COMPOSER = "\x1b[107;5u" * 2 + "\x1b[117;5u" * 2
 _AGENTS = ("main", "general-purpose", "general-purpose")
 _RULE = "─" * 60
 
@@ -73,7 +74,12 @@ class _FakeClaudeFooter:
             return
         if key == "Space":
             self.draft += " "
-        elif key in _CLEAR_LINE_KEYS or key == "C-u":
+        elif key == "C-u" or (
+            key
+            and not key.replace(_CLEAR_LINE_KEYS[0], "")
+            .replace(_CLEAR_LINE_KEYS[1], "")
+            .replace(_CLEAR_LINE_KEYS[2], "")
+        ):
             self.draft = ""
         elif key == "Enter":
             if self.draft.strip():
@@ -167,7 +173,7 @@ def test_the_refocus_space_never_reaches_the_message(
     inject_user_message(bridge_dir, content="hello")
 
     assert tui.submitted == ["hello"]
-    assert tui.keys[:3] == ["Space", *_CLEAR_LINE_KEYS]
+    assert tui.keys[:2] == ["Space", _CLEAR_COMPOSER]
 
 
 def test_a_slash_command_reaches_claude_while_the_footer_holds_focus(
@@ -180,4 +186,4 @@ def test_a_slash_command_reaches_claude_while_the_footer_holds_focus(
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
     assert tui.submitted == ["/effort high"]
-    assert tui.keys[:2] == ["Space", "C-u"]
+    assert tui.keys[:2] == ["Space", _CLEAR_COMPOSER]

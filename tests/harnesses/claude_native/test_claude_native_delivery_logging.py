@@ -14,6 +14,8 @@ from omnigent.debug_logging import current_session_id_scope, record_to_row
 from omnigent.harnesses.claude_native import bridge, delivery_diagnostics
 from omnigent.native.input_diagnostics import input_delivery_scope
 
+_EMPTY_BOX = "──────\n❯ \n──────\n"
+
 
 @pytest.mark.parametrize(
     ("scenario", "verification", "outcome"),
@@ -48,6 +50,7 @@ def test_delivery_diagnostics(
     content = "\n" + secret if scenario == "blank_line" else secret
     elapsed = 0.0
     pane = "❯ "
+    clearing = False
     enters = 0
     pending_checks = 0
 
@@ -71,12 +74,15 @@ def test_delivery_diagnostics(
             raise bridge.ClaudeInjectionCancelled(secret)
 
     def run_tmux(socket: str, *args: str) -> None:
-        nonlocal pane, enters
+        nonlocal pane, enters, clearing
         assert not any(
             getattr(record, "event_name", "").startswith("claude_native_")
             for record in caplog.records
         )
+        if args[-1] == "Space":
+            clearing = True
         if args[0] == "paste-buffer":
+            clearing = False
             if scenario == "transport_error":
                 raise RuntimeError(secret)
             pane = "❯ " + content
@@ -100,7 +106,9 @@ def test_delivery_diagnostics(
     monkeypatch.setattr(bridge, "_restore_occupied_input", lambda *_a, **_k: None)
     monkeypatch.setattr(bridge, "_wait_for_claude_prompt_ready", ready)
     monkeypatch.setattr(bridge, "_run_tmux", run_tmux)
-    monkeypatch.setattr(bridge, "_capture_pane", lambda *_a, **_k: pane)
+    monkeypatch.setattr(
+        bridge, "_capture_pane", lambda *_a, **_k: _EMPTY_BOX if clearing else pane
+    )
     if scenario == "observation_error":
         monkeypatch.setattr(delivery_diagnostics, "_draft_observation", broken_observation)
     if scenario.startswith("pending_"):
@@ -193,7 +201,7 @@ def test_delivery_diagnostics(
         assert attrs["submit_pane_max_columns"] == (0 if scenario == "empty_capture" else 2)
         assert attrs["submit_capture_empty"] == (scenario == "empty_capture")
         assert attrs["stage_verifying_submit_ms"] == 10
-        assert attrs["elapsed_ms"] == 30
+        assert attrs["elapsed_ms"] == 40
 
     if scenario == "blank_line":
         assert attrs["draft_seen"] is False

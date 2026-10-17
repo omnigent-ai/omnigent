@@ -4302,6 +4302,7 @@ def test_write_tmux_target_persists_socket_and_target(tmp_path: Path) -> None:
 # Each send-keys first leaves copy mode in the same tmux call; without it,
 # a pane the reader scrolled back hands the keys to tmux instead of Claude.
 _LEAVE_COPY_MODE = ["copy-mode", "-q", "-t", "claude:0.0", ";"]
+_CLEAR_ONE_ROW_COMPOSER = "\x1b[107;5u" * 2 + "\x1b[117;5u" * 2
 
 
 @pytest.mark.parametrize(
@@ -4395,15 +4396,14 @@ def test_inject_user_message_pastes_content_then_submits(
 
     # Space (refocus), CSI-u Ctrl+A, Ctrl+K (clear), load-buffer, paste-buffer,
     # Enter — fewer than 6 means a delivery step was dropped.
-    assert len(captured) == 6, (
-        f"Expected 6 tmux calls (Space, CSI-u Ctrl+A, Ctrl+K, load-buffer, "
+    assert len(captured) == 5, (
+        f"Expected 5 tmux calls (Space, clear composer, load-buffer, "
         f"paste-buffer, Enter), got {len(captured)}."
     )
-    refocus, clear_home, clear_kill, load, paste, submit = captured
+    refocus, clear, load, paste, submit = captured
     assert refocus[-4:] == ["send-keys", "-t", "claude:0.0", "Space"]
-    assert clear_home[3:8] == _LEAVE_COPY_MODE
-    assert clear_home[-4:] == ["-l", "-t", "claude:0.0", "\x1b[97;5u"]
-    assert clear_kill[-4:] == ["-l", "-t", "claude:0.0", "\x1b[107;5u"]
+    assert clear[3:8] == _LEAVE_COPY_MODE
+    assert clear[-4:] == ["-l", "-t", "claude:0.0", _CLEAR_ONE_ROW_COMPOSER]
     # The buffer file carried the normalized content + trailing CR. A
     # missing trailing CR is the trailing-CR regression; a newline that stayed
     # \n (not CR) is the anthropics/claude-code#52126 multi-line collapse.
@@ -4909,14 +4909,13 @@ def test_inject_user_message_waits_for_claude_prompt_before_typing(
     assert capture_calls["n"] >= 3, (
         f"Expected >=3 capture-pane polls before the prompt rendered, got {capture_calls['n']}."
     )
-    assert len(send_keys) == 6, (
-        f"Expected 6 tmux calls (Space, CSI-u Ctrl+A, Ctrl+K, load-buffer, "
+    assert len(send_keys) == 5, (
+        f"Expected 5 tmux calls (Space, clear composer, load-buffer, "
         f"paste-buffer, Enter), got {len(send_keys)}."
     )
-    refocus, clear_home, clear_kill, load, paste, submit = send_keys
+    refocus, clear, load, paste, submit = send_keys
     assert refocus[-1] == "Space"
-    assert clear_home[-4:] == ["-l", "-t", "claude:0.0", "\x1b[97;5u"]
-    assert clear_kill[-4:] == ["-l", "-t", "claude:0.0", "\x1b[107;5u"]
+    assert clear[-4:] == ["-l", "-t", "claude:0.0", _CLEAR_ONE_ROW_COMPOSER]
     # The paste fires after the gate via the buffer path. The exact
     # payload/flag assertions live in the dedicated paste test; here the
     # gate ordering is the claim.
@@ -5589,13 +5588,11 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Slash commands flow via C-u + literal paste + Enter.
+    Slash commands flow via whole-draft clearing, literal paste, and Enter.
 
-    C-u kills any draft the user is mid-typing — otherwise the paste
-    concatenates and Enter submits ``<draft>/effort high``. ``-l`` is
-    required so tmux pastes ``/`` and spaces literally; Enter submits.
-    Every capture here is blank, so this also pins the fail-soft path:
-    a never-identifiable draft still gets the single blind submit.
+    Clearing removes the draft before the command is pasted literally.
+    Captures show an empty framed composer, confirming the clear; the command
+    never renders, so its unidentifiable draft gets one blind submit.
     """
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
@@ -5606,29 +5603,24 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
 
     captured: list[list[str]] = []
 
-    class _FakeCompleted:
-        """Fake CompletedProcess returned by the patched subprocess.run."""
-
-        returncode = 0
-        stdout = ""
-        stderr = ""
-
-    def _fake_run(cmd: list[str], **kwargs: object) -> _FakeCompleted:
-        """Record one tmux invocation; return rc=0."""
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """Record keystrokes while captures expose an empty framed composer."""
         del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=_composer_pane(), stderr="")
         captured.append(cmd)
-        return _FakeCompleted()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
     monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
-    # Four keystroke calls in order: Space (refocus), C-u (clear), literal
-    # paste, Enter. A missing C-u lets the draft concatenate; 5+ = duplicated send.
+    # Four keystroke calls in order: Space (refocus), whole-draft clear, literal
+    # paste, Enter. A missing clear lets the draft concatenate; 5+ = duplicated send.
     # capture-pane calls (the delivery-verification polls) are not keystrokes.
     keystrokes = [cmd for cmd in captured if "send-keys" in cmd]
     assert len(keystrokes) == 4, (
-        f"Expected 4 tmux send-keys calls (Space + C-u + paste + Enter), got {len(keystrokes)}."
+        f"Expected 4 tmux send-keys calls (Space + clear + paste + Enter), got {len(keystrokes)}."
     )
     refocus, clear, paste, submit = keystrokes
     assert refocus[-1] == "Space"
@@ -5638,9 +5630,10 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
         "/tmp/example/tmux.sock",
         *_LEAVE_COPY_MODE,
         "send-keys",
+        "-l",
         "-t",
         "claude:0.0",
-        "C-u",
+        _CLEAR_ONE_ROW_COMPOSER,
     ]
     assert paste == [
         "tmux",
@@ -5715,6 +5708,7 @@ def test_tmux_injections_are_serialized_per_bridge(
         claude_native_bridge, "_wait_for_claude_prompt_ready", lambda *_a, **_k: None
     )
     monkeypatch.setattr(claude_native_bridge, "_paste_and_submit", lambda *_a, **_k: None)
+    monkeypatch.setattr(claude_native_bridge, "_clear_composer", lambda *_a, **_k: None)
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda *_args: None)
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_args: "")
     monkeypatch.setattr(claude_native_bridge, "_PASTE_COMMIT_TIMEOUT_S", 0.0)
@@ -10836,7 +10830,7 @@ def test_a_model_switch_types_the_argument_form_and_confirms(
 
     assert [args[-1] for args in sends] == [
         "Space",
-        "C-u",
+        _CLEAR_ONE_ROW_COMPOSER,
         "/model databricks-claude-sonnet-5",
         "Enter",
         # The "Switch model?" confirmation, once it actually rendered.
@@ -11200,7 +11194,7 @@ def test_a_swallowed_slash_submit_enter_is_retried_while_the_draft_persists(
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
-    assert tails == ["Space", "C-u", "/effort high", "Enter", "Enter"], (
+    assert tails == ["Space", _CLEAR_ONE_ROW_COMPOSER, "/effort high", "Enter", "Enter"], (
         f"Expected the swallowed submit Enter to be retried once; got {tails}."
     )
 
@@ -11215,7 +11209,7 @@ def test_a_slash_command_stuck_in_the_composer_fails_loud(
     the authoritative fallback — an honest failure, not a silent divergence.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    _fake_tmux(monkeypatch, [_composer_pane("/effort high")])
+    _fake_tmux(monkeypatch, [_IDLE_PANE] * 5 + [_composer_pane("/effort high")])
 
     with pytest.raises(RuntimeError, match="was not delivered"):
         claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
@@ -11241,7 +11235,7 @@ def test_a_slash_command_draft_that_never_renders_submits_blind(
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
     tails = [args[-1] for args in sends]
-    assert tails == ["Space", "C-u", "/effort high", "Enter"], (
+    assert tails == ["Space", _CLEAR_ONE_ROW_COMPOSER, "/effort high", "Enter"], (
         f"An unverifiable draft must submit blind exactly once; got {tails}."
     )
 
@@ -11263,7 +11257,7 @@ def test_an_effort_switch_with_a_swallowed_confirm_leaves_the_pane_usable(
 
     def _fake_run_tmux(socket_path: str, *args: str) -> None:
         del socket_path
-        if "-l" in args:
+        if args[-1] == "/effort high":
             tui["pane"] = _composer_pane("/effort high")
         elif args[-1] == "Enter":
             if claude_native_bridge.EFFORT_DIALOG_HINT in tui["pane"]:
@@ -11321,7 +11315,13 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         confirm_hint=claude_native_bridge.EFFORT_DIALOG_HINT,
     )
 
-    assert [args[-1] for args in sends] == ["Space", "C-u", "/effort high", "Enter", "Enter"]
+    assert [args[-1] for args in sends] == [
+        "Space",
+        _CLEAR_ONE_ROW_COMPOSER,
+        "/effort high",
+        "Enter",
+        "Enter",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -11404,7 +11404,7 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
 
     tails = [cmd[-1] for cmd in captured]
     # Escape (dismiss the surface) must precede every delivery keystroke.
-    assert tails[:4] == ["Escape", "Space", "\x1b[97;5u", "\x1b[107;5u"], (
+    assert tails[:3] == ["Escape", "Space", _CLEAR_ONE_ROW_COMPOSER], (
         f"Expected the occupying surface to be Escaped before the clear; got {tails}."
     )
     assert tails.count("Escape") == 1, f"One sighting, one Escape — got {tails.count('Escape')}."
@@ -11919,7 +11919,13 @@ def test_inject_slash_command_restores_an_occupied_input_box_first(
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
-    assert [args[-1] for args in sends] == ["Escape", "Space", "C-u", "/effort high", "Enter"]
+    assert [args[-1] for args in sends] == [
+        "Escape",
+        "Space",
+        _CLEAR_ONE_ROW_COMPOSER,
+        "/effort high",
+        "Enter",
+    ]
 
 
 def test_inject_slash_command_fails_loud_at_a_surface_escape_cannot_clear(
@@ -11994,7 +12000,12 @@ def test_a_torn_frame_after_a_hinted_surface_does_not_refuse_the_slash_command(
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
-    assert [args[-1] for args in sends] == ["Space", "C-u", "/effort high", "Enter"]
+    assert [args[-1] for args in sends] == [
+        "Space",
+        _CLEAR_ONE_ROW_COMPOSER,
+        "/effort high",
+        "Enter",
+    ]
 
 
 def test_a_lowercase_escape_hint_still_marks_a_surface_dismissible(
@@ -12016,7 +12027,13 @@ def test_a_lowercase_escape_hint_still_marks_a_surface_dismissible(
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
 
-    assert [args[-1] for args in sends] == ["Escape", "Space", "C-u", "/compact", "Enter"]
+    assert [args[-1] for args in sends] == [
+        "Escape",
+        "Space",
+        _CLEAR_ONE_ROW_COMPOSER,
+        "/compact",
+        "Enter",
+    ]
 
 
 def test_a_single_frame_without_a_composer_does_not_draw_an_escape(
@@ -12043,7 +12060,7 @@ def test_a_single_frame_without_a_composer_does_not_draw_an_escape(
 
     tails = [args[-1] for args in sends]
     assert "Escape" not in tails, f"A one-frame sighting must not draw an Escape; got {tails}."
-    assert tails == ["Space", "C-u", "/effort high", "Enter"]
+    assert tails == ["Space", _CLEAR_ONE_ROW_COMPOSER, "/effort high", "Enter"]
 
 
 def test_the_shortcuts_panel_is_not_treated_as_an_occupied_input(
@@ -12066,7 +12083,12 @@ def test_the_shortcuts_panel_is_not_treated_as_an_occupied_input(
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
-    assert [args[-1] for args in sends] == ["Space", "C-u", "/effort high", "Enter"]
+    assert [args[-1] for args in sends] == [
+        "Space",
+        _CLEAR_ONE_ROW_COMPOSER,
+        "/effort high",
+        "Enter",
+    ]
 
 
 def test_claude_pane_ready_is_true_only_at_an_idle_input_box(
