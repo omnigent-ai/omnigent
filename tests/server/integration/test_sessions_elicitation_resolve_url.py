@@ -1037,7 +1037,7 @@ async def test_child_mcp_input_required_bubbles_to_parent_stream(
 
     runner_stub = _InputRequiredRunnerClient()
 
-    async def _fake_get_runner_client(session_id: str, runner_router: Any) -> Any:
+    async def _fake_get_runner_client(session_id: str, runner_router: Any, **_kwargs: Any) -> Any:
         """
         Hand the route the stub in place of a WS-tunnel runner client.
 
