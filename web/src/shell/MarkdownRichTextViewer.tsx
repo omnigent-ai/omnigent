@@ -21,8 +21,8 @@ import { AlertTriangleIcon, Check, Copy, MessageSquareOffIcon } from "lucide-rea
 import { useEditor, EditorContent } from "@tiptap/react";
 import type { Transaction } from "@tiptap/pm/state";
 import { StarterKit } from "@tiptap/starter-kit";
-import { Table, TableRow, TableCell, TableHeader } from "@tiptap/extension-table";
-import { ListItem, TaskItem, TaskList } from "@tiptap/extension-list";
+import { TableRow, TableCell, TableHeader } from "@tiptap/extension-table";
+import { ListItem, TaskItem } from "@tiptap/extension-list";
 import { Markdown } from "@tiptap/markdown";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
@@ -51,6 +51,7 @@ import { isUserEditUpdate } from "./codeBlockLanguageEdit";
 import { GitHubAlertBlockquote } from "./TipTapGitHubAlert";
 import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
 import { SoftBreak } from "./TipTapSoftBreak";
+import { BoundedOrderedList, BoundedTable, BoundedTaskList } from "./tiptapBoundedTokenizers";
 import {
   installMarkdownParserPatch,
   installMarkdownSerializerPatch,
@@ -347,12 +348,17 @@ function MarkdownRichTextViewerInner({
       // schema-invalid doc that crashes the panel. See SafeListItem above.
       // codeBlock: false — replaced by CodeBlockWithLanguage, which adds a
       // language picker and a live mermaid preview via a React node view.
+      // orderedList: false — replaced by BoundedOrderedList. It, BoundedTaskList
+      // and BoundedTable stop the upstream markdown tokenizers from re-splitting
+      // the whole file at every block (see tiptapBoundedTokenizers.ts).
       StarterKit.configure({
         link: false,
         blockquote: false,
         listItem: false,
         codeBlock: false,
+        orderedList: false,
       }),
+      BoundedOrderedList,
       SafeListItem,
       CodeBlockWithLanguage,
       // Task lists (GitHub `- [ ]` / `- [x]`). StarterKit ships
@@ -362,9 +368,9 @@ function MarkdownRichTextViewerInner({
       // built-in `- [ ]` marked tokenizer so the syntax parses into checkbox
       // items, and (b) round-trips back to identical markdown via their
       // built-in renderMarkdown. nested:true lets Tab indent sub-checklists.
-      TaskList,
+      BoundedTaskList,
       TaskItem.configure({ nested: true }),
-      Table.configure({ resizable: true }),
+      BoundedTable.configure({ resizable: true }),
       TableRow,
       TableCell,
       TableHeader,

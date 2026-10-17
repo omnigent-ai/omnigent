@@ -5,20 +5,27 @@
  * an unknown fence language stays selectable, and the picker is disabled when
  * the editor is read-only.
  *
- * @tiptap/react's NodeViewWrapper/NodeViewContent need the editor's node-view
- * context to render, and MermaidPreview pulls in Streamdown; both are mocked so
- * this stays a fast unit test of our own branching.
+ * @tiptap/react's NodeViewWrapper and node-view context need a live editor, and
+ * MermaidPreview pulls in Streamdown; both are mocked so this stays a fast unit
+ * test of our own branching, including how the fence body adopts the editor's
+ * content element.
  */
 
 import { render, screen, fireEvent } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { createPortal } from "react-dom";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { NodeViewProps } from "@tiptap/react";
 import { TipTapCodeBlockView } from "./TipTapCodeBlockView";
 import { CODE_BLOCK_LANGUAGE_EDIT_META } from "./codeBlockLanguageEdit";
 
+// The context ref @tiptap/react uses to place the content element itself.
+const reactNodeView = vi.hoisted(() => ({ nodeViewContentRef: vi.fn() }));
+
 vi.mock("@tiptap/react", () => ({
-  NodeViewWrapper: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
-  NodeViewContent: () => <pre data-testid="node-content" />,
+  NodeViewWrapper: ({ children }: { children: React.ReactNode }) => (
+    <div data-node-view-wrapper="">{children}</div>
+  ),
+  useReactNodeView: () => reactNodeView,
 }));
 
 vi.mock("./MermaidPreview", () => ({
@@ -30,7 +37,13 @@ vi.mock("./MermaidPreview", () => ({
 afterEach(() => vi.clearAllMocks());
 
 function renderView(
-  overrides: { language?: string | null; textContent?: string; editable?: boolean } = {},
+  overrides: {
+    language?: string | null;
+    textContent?: string;
+    editable?: boolean;
+    focused?: boolean;
+  } = {},
+  host?: HTMLElement,
 ) {
   // A chainable transaction stub that records the setNodeAttribute/setMeta calls.
   const tr = { setNodeAttribute: vi.fn(() => tr), setMeta: vi.fn(() => tr) };
@@ -43,11 +56,40 @@ function renderView(
     getPos: () => 0,
     editor: {
       isEditable: overrides.editable ?? true,
+      isFocused: overrides.focused ?? false,
       view: { state: { tr }, dispatch },
     },
   } as unknown as NodeViewProps;
-  render(<TipTapCodeBlockView {...props} />);
-  return { tr, dispatch };
+  // @tiptap/react renders a node view through a portal into its host element.
+  const view = <TipTapCodeBlockView {...props} />;
+  const { unmount } = render(host ? createPortal(view, host) : view);
+  return { tr, dispatch, unmount };
+}
+
+/**
+ * The host @tiptap/react renders a node view into: the editor's content element
+ * sits beside the React tree until the fence body adopts it.
+ */
+function renderInHost(focused: boolean) {
+  const host = document.createElement("div");
+  host.className = "react-renderer";
+  const content = document.createElement("div");
+  content.setAttribute("data-node-view-content-react", "");
+  content.setAttribute("data-node-view-wrapper", "");
+  host.appendChild(content);
+  document.body.appendChild(host);
+  const { unmount } = renderView({ language: "python", focused }, host);
+  const body = host.querySelector("code[data-node-view-content]");
+  return {
+    content,
+    body,
+    host,
+    // Unmount the portal before its host leaves the document.
+    cleanup: () => {
+      unmount();
+      host.remove();
+    },
+  };
 }
 
 describe("TipTapCodeBlockView", () => {
@@ -102,5 +144,39 @@ describe("TipTapCodeBlockView", () => {
   it("disables the language picker when the editor is read-only", () => {
     renderView({ language: "mermaid", textContent: "graph TD", editable: false });
     expect(screen.getByRole("combobox")).toBeDisabled();
+  });
+});
+
+describe("fence body", () => {
+  // Unmounting the previous test's view forwards a null ref after mocks were cleared.
+  beforeEach(() => reactNodeView.nodeViewContentRef.mockClear());
+
+  it("adopts the content element itself while the editor is unfocused", () => {
+    // @tiptap/react's ref would first read the DOM selection, which lays out
+    // the whole document; unfocused there is no caret to preserve.
+    const { content, body, cleanup } = renderInHost(false);
+    try {
+      expect(body?.firstChild).toBe(content);
+      expect(content.hasAttribute("data-node-view-wrapper")).toBe(false);
+      expect(reactNodeView.nodeViewContentRef).not.toHaveBeenCalled();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("lets @tiptap/react place the content while the editor has focus", () => {
+    const { host, content, body, cleanup } = renderInHost(true);
+    try {
+      expect(reactNodeView.nodeViewContentRef).toHaveBeenCalledWith(body);
+      expect(content.parentElement).toBe(host);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("falls back to @tiptap/react when the host markup is not recognised", () => {
+    renderView({ language: "python" });
+    const body = document.querySelector("code[data-node-view-content]");
+    expect(reactNodeView.nodeViewContentRef).toHaveBeenCalledWith(body);
   });
 });
