@@ -14,7 +14,8 @@ moves away the peek dismisses and the sidebar is collapsed again.
 The failing test drives that exact journey with real pointer events and
 asserts the user-level contract: a click on the toggle's location pins the
 sidebar open and keeps the user on their session. The companion test guards
-the already-working genuinely-fast click (before the 400ms timer fires).
+the already-working genuinely-fast click (before the 400ms timer fires), and a
+third test covers the click that lands once the card is fully visible.
 
 Pure client-side interaction on the seeded session page — no LLM turn.
 """
@@ -33,6 +34,8 @@ _PARK = (900, 500)
 # describes as "before any preview shows up".
 _JUST_PAST_PEEK_DELAY_MS = 460
 _WELL_BEFORE_PEEK_DELAY_MS = 120
+# By 600ms the card's entry animation has ended and it takes pointer events.
+_AFTER_PEEK_VISIBLE_MS = 800
 
 
 def _collapse_sidebar(page: Page) -> None:
@@ -145,4 +148,26 @@ def test_click_before_peek_delay_opens_sidebar(
         page,
         session_id,
         f"clicked {_WELL_BEFORE_PEEK_DELAY_MS}ms after hover",
+    )
+
+
+def test_click_after_peek_card_appears_opens_sidebar(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Clicking the toggle's spot once the hover-preview is fully visible still pins the sidebar.
+
+    The card floats below the chat header, so the click must reach the toggle, not the card."""
+    base_url, session_id = seeded_session
+    page.set_viewport_size({"width": 1280, "height": 800})
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_role("complementary", name="Workspace")).to_be_visible(timeout=30_000)
+
+    _collapse_sidebar(page)
+    peek_mounted = _hover_toggle_then_click(page, _AFTER_PEEK_VISIBLE_MS)
+    _assert_sidebar_pinned_open(
+        page,
+        session_id,
+        f"clicked {_AFTER_PEEK_VISIBLE_MS}ms after hover; "
+        f"peek card mounted at click time: {peek_mounted}",
     )
