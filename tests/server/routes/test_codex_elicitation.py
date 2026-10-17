@@ -9,7 +9,9 @@ import pytest
 
 from omnigent.errors import OmnigentError
 from omnigent.server.routes._codex_elicitation import (
+    _codex_apply_patch_approval_response,
     _codex_command_preview,
+    _codex_file_change_approval_response,
     _codex_mcp_elicitation_response,
     _codex_mcp_persist_modes,
     _execpolicy_amendment,
@@ -128,6 +130,75 @@ class TestCodexMcpApprovalPersistence:
         }
 
         assert _codex_mcp_persist_modes(params) == {"session"}
+
+
+# ── Codex file-change approval persistence ─────────────────────────────
+
+
+_FILE_CHANGE_METHOD = "item/fileChange/requestApproval"
+_APPLY_PATCH_METHOD = "applyPatchApproval"
+
+
+class TestCodexFileChangeApprovalPersistence:
+    """Tests for Codex's session-scoped file-change approval choice."""
+
+    @pytest.mark.parametrize("method", [_FILE_CHANGE_METHOD, _APPLY_PATCH_METHOD])
+    def test_params_advertise_session_scope(self, method: str) -> None:
+        req = parse_codex_elicitation_request(
+            {
+                "id": 21,
+                "method": method,
+                "params": {"threadId": "thread_1", "turnId": "turn_1", "itemId": "item_1"},
+            }
+        )
+
+        assert req.params.model_dump()["codex_persist_modes"] == ["session"]
+
+    def test_session_accept_returns_accept_for_session(self) -> None:
+        result = ElicitationResult.model_validate(
+            {"action": "accept", "_meta": {"persist": "session"}}
+        )
+
+        response = _codex_file_change_approval_response(result, _FILE_CHANGE_METHOD, {})
+
+        assert response == {"decision": "acceptForSession"}
+
+    def test_legacy_session_accept_returns_approved_for_session(self) -> None:
+        result = ElicitationResult.model_validate(
+            {"action": "accept", "_meta": {"persist": "session"}}
+        )
+
+        response = _codex_apply_patch_approval_response(result, _APPLY_PATCH_METHOD, {})
+
+        assert response == {"decision": "approved_for_session"}
+
+    @pytest.mark.parametrize(
+        ("action", "decision"),
+        [("accept", "accept"), ("decline", "decline"), ("cancel", "cancel")],
+    )
+    def test_one_time_verdicts_keep_plain_decisions(self, action: str, decision: str) -> None:
+        result = ElicitationResult.model_validate({"action": action})
+
+        response = _codex_file_change_approval_response(result, _FILE_CHANGE_METHOD, {})
+
+        assert response == {"decision": decision}
+
+    def test_decline_ignores_persistence_meta(self) -> None:
+        result = ElicitationResult.model_validate(
+            {"action": "decline", "_meta": {"persist": "session"}}
+        )
+
+        response = _codex_file_change_approval_response(result, _FILE_CHANGE_METHOD, {})
+
+        assert response == {"decision": "decline"}
+
+    def test_rejects_unadvertised_persistence_mode(self) -> None:
+        result = ElicitationResult.model_validate(
+            {"action": "accept", "_meta": {"persist": "always"}}
+        )
+
+        with pytest.raises(OmnigentError, match="was not advertised"):
+            _codex_file_change_approval_response(result, _FILE_CHANGE_METHOD, {})
 
 
 # ── _string_list_answer ──────────────────────────────────────────────
