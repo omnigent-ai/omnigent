@@ -629,7 +629,17 @@ class ClaudeInjectionCancelled(RuntimeError):
 
 
 class ClaudeUserPromptPending(RuntimeError):
-    """A native question or permission prompt must be answered before injection."""
+    """
+    A native question or permission prompt must be answered before injection.
+
+    :param message: Human-readable refusal.
+    :param nothing_typed: Whether the refusal came before any keystroke reached
+        the pane, so the same delivery can run again once the prompt is answered.
+    """
+
+    def __init__(self, message: str, *, nothing_typed: bool = False) -> None:
+        super().__init__(message)
+        self.nothing_typed = nothing_typed
 
 
 class ClaudeMessageNotAccepted(RuntimeError):
@@ -4307,7 +4317,8 @@ def _paste_and_submit(
     delivery_diagnostics.set_stage("checking_pending_prompt")
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
-            "Answer the pending Claude question or permission request before sending a message."
+            "Answer the pending Claude question or permission request before sending a message.",
+            nothing_typed=True,
         )
     delivery_diagnostics.set_stage("pasting")
     # Space returns focus to the input box if the footer (shells item or agent
@@ -5628,16 +5639,23 @@ def _raise_if_user_prompt_pending(
     pane: str,
     *,
     message: str = "Claude is waiting for an explicit answer; input not sent.",
+    nothing_typed: bool = False,
 ) -> None:
-    """Protect live hook waits even when a captured pane is torn or stale."""
+    """
+    Protect live hook waits even when a captured pane is torn or stale.
+
+    :param nothing_typed: Whether no keystroke has reached the pane yet (see
+        :class:`ClaudeUserPromptPending`).
+    """
     if _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_CONSENT):
         raise ClaudeUserPromptPending(
             "Claude Code is waiting for your auto-mode classifier billing choice. "
             "The message was not delivered. Open the terminal, answer the prompt, "
-            "then resend your message."
+            "then resend your message.",
+            nothing_typed=nothing_typed,
         )
     if (bridge_dir is not None and _has_approval_wait(bridge_dir)) or _user_prompt_visible(pane):
-        raise ClaudeUserPromptPending(message)
+        raise ClaudeUserPromptPending(message, nothing_typed=nothing_typed)
 
 
 def has_pending_user_prompt(bridge_dir: Path) -> bool:
@@ -5809,6 +5827,7 @@ def _restore_occupied_input(
                 "Answer the pending Claude question or permission request "
                 "before sending a message."
             ),
+            nothing_typed=True,
         )
         if auto_mode_billing_notice_visible(pane):
             _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
@@ -6231,6 +6250,7 @@ def _wait_for_claude_prompt_ready(
             bridge_dir,
             pane,
             message="Claude is waiting for an explicit answer; message not sent.",
+            nothing_typed=True,
         )
         polls += 1
         if pane.strip():
