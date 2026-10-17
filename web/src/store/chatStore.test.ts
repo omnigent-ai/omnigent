@@ -71,6 +71,7 @@ import {
   beginLocalConversation,
   committedItemProvesDelivery,
   consumePendingInitialPrompt,
+  ensureConversationStreamed,
   handleSessionEvent,
   hydrateLocalConversation,
   isStaleCompletedResponse,
@@ -1101,6 +1102,41 @@ describe("chatStore — lazy subtree usage", () => {
       expect(readUsage).not.toHaveBeenCalled();
     },
   );
+});
+
+describe("chatStore — ensureConversationStreamed", () => {
+  it("resolves true and settles the entry when it initiates a bind", async () => {
+    seedSession("conv_stream_new", [userMessage("resp_1", "hello")]);
+
+    const initiated = await ensureConversationStreamed("conv_stream_new");
+
+    expect(initiated).toBe(true);
+    const state = conversationRegistry.peek("conv_stream_new")!.getState();
+    expect(state.loadingConversation).toBe(false);
+    expect(state.conversationLoadError).toBeNull();
+    expect(state.boundAgentId).toBe("agent_xyz");
+    expect(state.blocks).toHaveLength(1);
+  });
+
+  it("resolves false for a no-op once the conversation is already streamed", async () => {
+    seedSession("conv_stream_reuse", [userMessage("resp_1", "hello")]);
+
+    expect(await ensureConversationStreamed("conv_stream_reuse")).toBe(true);
+    // The live pump stays open, so a second call reuses it rather than rebinding.
+    expect(await ensureConversationStreamed("conv_stream_reuse")).toBe(false);
+  });
+
+  it("resolves false while a bind is already in flight", async () => {
+    conversationRegistry.acquire("conv_stream_loading").setState({ loadingConversation: true });
+
+    expect(await ensureConversationStreamed("conv_stream_loading")).toBe(false);
+  });
+
+  it("resolves false for a placeholder id without binding", async () => {
+    expect(await ensureConversationStreamed("")).toBe(false);
+    expect(await ensureConversationStreamed("temp:00001111")).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });
 
 describe("chatStore — switchTo", () => {
