@@ -695,3 +695,94 @@ def test_malloc_tuning_env_honors_overrides(monkeypatch: pytest.MonkeyPatch) -> 
         "MALLOC_ARENA_MAX": "1",
         "MALLOC_TRIM_THRESHOLD_": "65536",
     }
+
+
+# --------------------------------------------------------------------------
+# posix_shell_path
+# --------------------------------------------------------------------------
+
+
+# Spelled as Windows stores them: ``os.environ`` keys are uppercased there.
+_GIT_INSTALL_ENV_VARS = ("PROGRAMFILES", "PROGRAMW6432", "PROGRAMFILES(X86)", "LOCALAPPDATA")
+
+
+def _fake_shell(path: Path) -> Path:
+    """Create an executable stand-in at *path* and its ``.exe`` twin.
+
+    ``shutil.which`` matches the bare name on POSIX and the ``PATHEXT`` name on
+    Windows, so both spellings exist for the lookup to work on either host.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for candidate in (path, path.with_name(f"{path.name}.exe")):
+        candidate.write_text("#!/bin/sh\n")
+        candidate.chmod(0o755)
+    return path
+
+
+def _shell_lookup_env(
+    monkeypatch: pytest.MonkeyPatch, *path_dirs: Path, is_windows: bool = True
+) -> None:
+    """Pin ``PATH`` to *path_dirs*, hide every Git install location, set the OS flag."""
+    monkeypatch.setattr(_platform, "IS_WINDOWS", is_windows)
+    monkeypatch.setenv("PATH", os.pathsep.join(str(d) for d in path_dirs))
+    for var in _GIT_INSTALL_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_posix_shell_path_prefers_git_bash_over_wsl_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PowerShell PATH (System32 first, only Git's ``cmd`` dir) yields Git's bash."""
+    system32 = tmp_path / "Windows" / "System32"
+    _fake_shell(system32 / "bash")
+    _fake_shell(tmp_path / "Git" / "cmd" / "git")
+    _fake_shell(tmp_path / "Git" / "bin" / "bash")
+    _shell_lookup_env(monkeypatch, system32, tmp_path / "Git" / "cmd")
+
+    assert _platform.posix_shell_path() == str(tmp_path / "Git" / "bin" / "bash.exe")
+
+
+@pytest.mark.parametrize("is_windows", [True, False])
+def test_posix_shell_path_keeps_non_launcher_bash_later_on_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, is_windows: bool
+) -> None:
+    """A bash behind the launcher on PATH wins on either OS: the launcher is known by location."""
+    system32 = tmp_path / "Windows" / "System32"
+    msys_bin = tmp_path / "msys64" / "usr" / "bin"
+    _fake_shell(system32 / "bash")
+    _fake_shell(msys_bin / "bash")
+    _shell_lookup_env(monkeypatch, system32, msys_bin, is_windows=is_windows)
+
+    resolved = _platform.posix_shell_path()
+
+    assert resolved is not None
+    assert Path(resolved).parent == msys_bin
+
+
+def test_posix_shell_path_falls_back_to_program_files_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no ``git`` on PATH, the per-machine Git install is still found."""
+    system32 = tmp_path / "Windows" / "System32"
+    program_files = tmp_path / "Program Files"
+    _fake_shell(system32 / "bash")
+    _fake_shell(program_files / "Git" / "bin" / "bash")
+    _shell_lookup_env(monkeypatch, system32)
+    monkeypatch.setenv("PROGRAMFILES", str(program_files))
+
+    assert _platform.posix_shell_path() == str(program_files / "Git" / "bin" / "bash.exe")
+
+
+@pytest.mark.parametrize(
+    "launcher_dir",
+    ["Windows/System32", "Windows/Sysnative", "AppData/Local/Microsoft/WindowsApps"],
+)
+def test_posix_shell_path_none_when_only_wsl_launcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launcher_dir: str
+) -> None:
+    """Every WSL launcher location is skipped, and nothing else is guessed."""
+    launcher = tmp_path.joinpath(*launcher_dir.split("/"))
+    _fake_shell(launcher / "bash")
+    _shell_lookup_env(monkeypatch, launcher)
+
+    assert _platform.posix_shell_path() is None
