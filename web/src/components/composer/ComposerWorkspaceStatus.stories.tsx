@@ -10,6 +10,7 @@ const meta = {
   tags: ["visual-snapshot"],
   args: {
     workspacePath: "/Users/dev/projects/omnigent",
+    sandboxRepos: [],
     worktreePath: null,
     isWorktree: null,
     branch: null,
