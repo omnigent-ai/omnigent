@@ -406,11 +406,14 @@ def _iter_embedded_json_objects(raw: bytes) -> list[dict[str, object]]:
 
     A pending tool call lives inside cursor's binary protobuf checkpoint frame
     with the JSON message embedded (and binary protobuf before/after it), so a
-    whole-row ``json.loads`` fails. Decode as latin-1 (1 byte → 1 char, keeping
-    indices aligned; JSON is ASCII regardless) and brace-match each ``{`` while
-    tracking string state + escapes so braces inside strings don't miscount. A
-    candidate ``{`` in surrounding binary that fails to balance or parse is
-    skipped without abandoning the rest of the row.
+    whole-row ``json.loads`` fails. Scan a latin-1 view (1 byte → 1 char keeps
+    indices byte-aligned, and JSON's structural characters are ASCII) and
+    brace-match each ``{`` while tracking string state + escapes so braces
+    inside strings don't miscount. Each balanced span is then decoded from the
+    original bytes as UTF-8, since cursor writes non-ASCII string content as
+    raw UTF-8 that the latin-1 view would mangle. A candidate ``{`` in
+    surrounding binary that fails to balance, decode, or parse is skipped
+    without abandoning the rest of the row.
 
     :param raw: The raw ``blobs.data`` bytes.
     :returns: Every successfully parsed JSON object (dicts only), in order.
@@ -454,8 +457,8 @@ def _iter_embedded_json_objects(raw: bytes) -> list[dict[str, object]]:
                 depth -= 1
                 if depth == 0:
                     try:
-                        obj = json.loads(text[i : j + 1])
-                    except ValueError:
+                        obj = json.loads(raw[i : j + 1].decode("utf-8"))
+                    except ValueError:  # includes UnicodeDecodeError on binary noise
                         obj = None
                     if isinstance(obj, dict):
                         objects.append(obj)
