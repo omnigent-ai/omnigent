@@ -70,6 +70,7 @@ import {
   getSelectionOffsets,
   indexToLine,
   isBinaryPath,
+  isMarkdownTooLargeForRichView,
   isImageFile,
   isModelFile,
   isNotebookPath,
@@ -592,14 +593,19 @@ export function CodeViewer({
   // must drop to read-only when this is set.
   const truncated = fileQuery.data?.truncated ?? false;
   const lang = detectLang(path);
+  // Oversized markdown bypasses the rich editor/preview — the markdown lexer
+  // overflows the call stack on multi-MiB buffers, killing the viewer — and
+  // renders as Monaco source like every other large file.
+  const markdownTooLarge = isMarkdownTooLargeForRichView(lang, content.length);
   // Non-markdown files render in Monaco (read-only or editable by permission);
-  // markdown keeps TipTap (editor) / Shiki (source) and HTML keeps its preview.
-  const showMonaco = lang !== "markdown" && viewMode !== "preview";
+  // markdown keeps TipTap (editor) / Shiki (source) and HTML keeps its preview
+  // — unless the markdown is too large for those rich surfaces.
+  const showMonaco = lang === "markdown" ? markdownTooLarge : viewMode !== "preview";
   // HTML, markdown, and notebook previews render through their own surfaces and
   // never read the Shiki tokens, so skipping them avoids a wasted full-file pass.
   const isHtmlPreview = viewMode === "preview" && lang === "html";
   const isMarkdownOrNotebookPreview =
-    viewMode === "preview" && (lang === "markdown" || isNotebookPath(path));
+    viewMode === "preview" && ((lang === "markdown" && !markdownTooLarge) || isNotebookPath(path));
   const isRenderedPreview = isHtmlPreview || isMarkdownOrNotebookPreview;
   // Only the Shiki DOM path needs the per-line split; skip it for Monaco and
   // rendered previews, which never render these lines.
@@ -683,7 +689,9 @@ export function CodeViewer({
     matchLineRefs.current.get(idx)?.scrollIntoView({ block: "center", behavior: "smooth" });
   }, [searchQuery, currentMatchIdx]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const isMarkdownEditor = viewMode === "editor" && lang === "markdown";
+  // Oversized markdown renders in Monaco (which owns find), so it never
+  // counts as the TipTap editor surface even in "editor" mode.
+  const isMarkdownEditor = viewMode === "editor" && lang === "markdown" && !markdownTooLarge;
 
   // Markdown editor mode has its own find bar (MarkdownSearchBar), driven by the
   // shared `searchOpen` toggle. Cmd+F opens it and Escape closes it; the bar
@@ -915,7 +923,7 @@ export function CodeViewer({
     );
   }
 
-  if (viewMode === "editor" && lang === "markdown") {
+  if (viewMode === "editor" && lang === "markdown" && !markdownTooLarge) {
     return (
       <MarkdownRichTextViewer
         content={content}
