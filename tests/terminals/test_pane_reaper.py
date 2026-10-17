@@ -14,17 +14,19 @@ from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.native import native_cost_popup
 from omnigent.runner.app import create_runner_app
+from omnigent.runner.native import orchestration as native_runtime
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.terminals.pane_reaper import (
     _DEFAULT_IDLE_TIMEOUT_S,
     _IDLE_TIMEOUT_ENV,
+    NATIVE_PANE_TERMINAL_NAMES,
     PANE_OUTPUT_BUSY_WINDOW_S,
     NativePaneReaper,
     PaneRef,
     resolve_native_pane_idle_timeout_s,
 )
 from omnigent.terminals.registry import TerminalRegistry
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
 
 def _pane(conv: str, name: str = "claude") -> PaneRef:
@@ -201,10 +203,20 @@ async def test_loop_disabled_when_timeout_non_positive() -> None:
 def test_kimi_is_exempt_from_pane_reaping() -> None:
     # kimi records no resumable chat id, so a reaped pane cannot be re-created
     # with its context; the name filter must never offer kimi panes to the reaper.
-    from omnigent.terminals.pane_reaper import NATIVE_PANE_TERMINAL_NAMES
-
     assert "kimi" not in NATIVE_PANE_TERMINAL_NAMES
     assert "claude" in NATIVE_PANE_TERMINAL_NAMES
+
+
+def test_every_native_harness_pane_is_offered_to_the_reaper() -> None:
+    # A native harness missing from the hand-kept name filter leaks every one of
+    # its finished panes; only kimi may be absent (see the exemption test above).
+    from omnigent.harness_aliases import NATIVE_HARNESSES, native_terminal_name
+
+    pane_names = {native_terminal_name(harness) for harness in NATIVE_HARNESSES}
+    uncovered = pane_names - NATIVE_PANE_TERMINAL_NAMES
+    assert uncovered <= {"kimi"}, f"native panes invisible to the reaper: {sorted(uncovered)}"
+    stale = NATIVE_PANE_TERMINAL_NAMES - pane_names
+    assert not stale, f"reaper names with no native harness: {sorted(stale)}"
 
 
 async def test_runner_busy_check_spares_a_pane_parked_on_an_approval(
@@ -295,3 +307,171 @@ async def test_runner_busy_check_counts_a_viewer_only_on_recent_input(
     assert await reaper._is_busy(pane)
     instance._last_client_interaction_at = time.monotonic() - PANE_OUTPUT_BUSY_WINDOW_S - 1.0
     assert not await reaper._is_busy(pane)
+
+
+class _FakeSidecarServer:
+    """Stands in for a per-session codex app-server / opencode server."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.parametrize(
+    ("terminal_name", "server_registry"),
+    [
+        ("codex", native_runtime._AUTO_CODEX_APP_SERVERS),
+        ("opencode", native_runtime._AUTO_OPENCODE_SERVERS),
+        ("claude", None),
+    ],
+)
+async def test_runner_reap_releases_the_sessions_sidecars(
+    tmp_path: Path,
+    terminal_name: str,
+    server_registry: dict[str, object] | None,
+) -> None:
+    """Reaping a pane must also release its forwarder and helper server, which
+    otherwise outlive the pane for the runner's lifetime."""
+    conv = f"conv_reap_{terminal_name}"
+    registry = TerminalRegistry()
+    instance = make_test_terminal_instance(terminal_name, "main", tmp_path)
+    registry._by_conversation[conv] = {(terminal_name, "main"): instance}
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=SessionResourceRegistry(terminal_registry=registry),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reaper = app.state.native_pane_reaper
+    assert reaper is not None
+    forwarder = asyncio.create_task(
+        asyncio.Event().wait(), name=f"{terminal_name}-forwarder-{conv}"
+    )
+    native_runtime._register_auto_forwarder_task(conv, forwarder)
+    if server_registry is not None:
+        server = _FakeSidecarServer()
+        server_registry[conv] = server  # type: ignore[index]
+    pane = PaneRef(
+        conv, terminal_resource_id(terminal_name, "main"), terminal_name, instance.socket_path
+    )
+    try:
+        await reaper._reap(pane)
+
+        assert registry.get(conv, terminal_name, "main") is None
+        assert forwarder.done(), "transcript forwarder still running after the pane was reaped"
+        assert conv not in native_runtime._AUTO_FORWARDER_TASKS
+        if server_registry is not None:
+            assert server.closed, f"{terminal_name} server not closed by the reap"
+            assert conv not in server_registry
+    finally:
+        forwarder.cancel()
+        await asyncio.gather(forwarder, return_exceptions=True)
+        native_runtime._AUTO_FORWARDER_TASKS.pop(conv, None)
+        if server_registry is not None:
+            server_registry.pop(conv, None)
+
+
+async def test_runner_reap_leaves_a_recreated_sessions_sidecars_untouched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session recreated while the reap's close is in flight keeps its new
+    forwarder and OpenCode server: the reap releases only the generation it
+    captured, so a message arriving before cleanup is not stripped of its stack."""
+    conv = "conv_reap_recreated"
+    registry = TerminalRegistry()
+    instance = make_test_terminal_instance("opencode", "main", tmp_path)
+    registry._by_conversation[conv] = {("opencode", "main"): instance}
+    resource_registry = SessionResourceRegistry(terminal_registry=registry)
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=resource_registry,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reaper = app.state.native_pane_reaper
+    assert reaper is not None
+
+    old_forwarder = asyncio.create_task(asyncio.Event().wait(), name=f"old-{conv}")
+    native_runtime._register_auto_forwarder_task(conv, old_forwarder)
+    old_server = _FakeSidecarServer()
+    native_runtime._AUTO_OPENCODE_SERVERS[conv] = old_server
+
+    new_forwarder = asyncio.create_task(asyncio.Event().wait(), name=f"new-{conv}")
+    new_server = _FakeSidecarServer()
+    original_close_terminal = resource_registry.close_terminal
+
+    async def recreate_before_cleanup(*args: object, **kwargs: object) -> bool:
+        # close() drops the pane before the reap's cleanup runs; an incoming
+        # message recreates the session with a fresh forwarder and server here.
+        result = await original_close_terminal(*args, **kwargs)  # type: ignore[arg-type]
+        native_runtime._register_auto_forwarder_task(conv, new_forwarder)
+        native_runtime._AUTO_OPENCODE_SERVERS[conv] = new_server
+        return result
+
+    monkeypatch.setattr(resource_registry, "close_terminal", recreate_before_cleanup)
+    pane = PaneRef(
+        conv, terminal_resource_id("opencode", "main"), "opencode", instance.socket_path
+    )
+    try:
+        await reaper._reap(pane)
+
+        assert native_runtime._AUTO_FORWARDER_TASKS.get(conv) is new_forwarder
+        assert not new_forwarder.done(), "replacement forwarder cancelled by the reap"
+        assert native_runtime._AUTO_OPENCODE_SERVERS.get(conv) is new_server
+        assert not new_server.closed, "replacement OpenCode server closed by the reap"
+    finally:
+        for task in (old_forwarder, new_forwarder):
+            task.cancel()
+        await asyncio.gather(old_forwarder, new_forwarder, return_exceptions=True)
+        native_runtime._AUTO_FORWARDER_TASKS.pop(conv, None)
+        native_runtime._AUTO_OPENCODE_SERVERS.pop(conv, None)
+
+
+async def test_runner_reap_releases_sidecars_even_when_the_close_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed terminal close must still release the pane's forwarder and server
+    (the ``finally`` guards the leak) and must not swallow the close error."""
+    conv = "conv_reap_close_fails"
+    registry = TerminalRegistry()
+    instance = make_test_terminal_instance("opencode", "main", tmp_path)
+    registry._by_conversation[conv] = {("opencode", "main"): instance}
+    resource_registry = SessionResourceRegistry(terminal_registry=registry)
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=resource_registry,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reaper = app.state.native_pane_reaper
+    assert reaper is not None
+
+    forwarder = asyncio.create_task(asyncio.Event().wait(), name=f"forwarder-{conv}")
+    native_runtime._register_auto_forwarder_task(conv, forwarder)
+    server = _FakeSidecarServer()
+    native_runtime._AUTO_OPENCODE_SERVERS[conv] = server
+
+    class _CloseFailed(RuntimeError):
+        pass
+
+    async def close_raises(*args: object, **kwargs: object) -> bool:
+        raise _CloseFailed("pane close failed")
+
+    monkeypatch.setattr(resource_registry, "close_terminal", close_raises)
+    pane = PaneRef(
+        conv, terminal_resource_id("opencode", "main"), "opencode", instance.socket_path
+    )
+    try:
+        with pytest.raises(_CloseFailed):
+            await reaper._reap(pane)
+
+        assert forwarder.done(), "forwarder not released when the pane close failed"
+        assert conv not in native_runtime._AUTO_FORWARDER_TASKS
+        assert server.closed, "server not released when the pane close failed"
+        assert conv not in native_runtime._AUTO_OPENCODE_SERVERS
+    finally:
+        forwarder.cancel()
+        await asyncio.gather(forwarder, return_exceptions=True)
+        native_runtime._AUTO_FORWARDER_TASKS.pop(conv, None)
+        native_runtime._AUTO_OPENCODE_SERVERS.pop(conv, None)

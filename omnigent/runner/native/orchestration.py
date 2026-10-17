@@ -301,6 +301,72 @@ async def teardown_all_opencode_native_servers() -> None:
             await teardown_opencode_native_server(session_id)
 
 
+@dataclasses.dataclass(frozen=True)
+class ReapedNativeSidecars:
+    """The forwarder and helper servers a native pane owned when reaped.
+
+    Captured before the pane is closed so a session recreated during the close
+    await is recognised as a newer generation and left running.
+    """
+
+    forwarder: asyncio.Task[object] | None
+    codex_app_server: CodexNativeAppServer | None
+    opencode_server: OpenCodeNativeServer | None
+
+
+def capture_native_sidecars(session_id: str) -> ReapedNativeSidecars:
+    """Snapshot a session's live forwarder and helper servers before reaping.
+
+    :param session_id: Session/conversation id, e.g. ``\"conv_abc123\"``.
+    :returns: The sidecars currently registered for the session.
+    """
+    return ReapedNativeSidecars(
+        forwarder=_AUTO_FORWARDER_TASKS.get(session_id),
+        codex_app_server=_AUTO_CODEX_APP_SERVERS.get(session_id),
+        opencode_server=_AUTO_OPENCODE_SERVERS.get(session_id),
+    )
+
+
+async def release_reaped_native_sidecars(session_id: str, captured: ReapedNativeSidecars) -> None:
+    """Release only the sidecar generation the reaped pane owned.
+
+    ``TerminalRegistry.close`` drops the pane before awaiting its shutdown, so an
+    incoming message can recreate the session and register a replacement
+    forwarder and server during that await. Each slot is compared against the
+    captured object (the ``is``-identity guard ``close(expected=...)`` uses), so
+    a replacement generation is left running rather than cancelled or closed.
+
+    Object identity defines a generation, so a codex recreate that reuses the
+    still-live app-server and forwarder is not a new generation and stays
+    eligible for cleanup.
+
+    :param session_id: Session/conversation id, e.g. ``\"conv_abc123\"``.
+    :param captured: The pane's sidecars from :func:`capture_native_sidecars`.
+    :returns: None.
+    """
+    if (
+        captured.forwarder is not None
+        and _AUTO_FORWARDER_TASKS.get(session_id) is captured.forwarder
+    ):
+        # Cancelling the forwarder also closes an adopted codex app-server via
+        # its own ``finally``; the explicit close below is the no-forwarder path.
+        await _cancel_auto_forwarder_task(session_id)
+    if (
+        captured.codex_app_server is not None
+        and _AUTO_CODEX_APP_SERVERS.get(session_id) is captured.codex_app_server
+    ):
+        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+        with contextlib.suppress(Exception):
+            await captured.codex_app_server.close()
+    if (
+        captured.opencode_server is not None
+        and _AUTO_OPENCODE_SERVERS.get(session_id) is captured.opencode_server
+    ):
+        _AUTO_OPENCODE_SERVERS.pop(session_id, None)
+        with contextlib.suppress(Exception):
+            await captured.opencode_server.close()
+
+
 def _register_auto_forwarder_task(session_id: str, task: asyncio.Task[object]) -> None:
     """
     Register a session's transcript-forwarder task in the keyed registry.
