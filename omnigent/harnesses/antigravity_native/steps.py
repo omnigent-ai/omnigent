@@ -42,7 +42,13 @@ Key differences from the retired transcript-based ``step_to_events`` mapper:
    ``toolCalls`` is never mirrored, so a stream→poll fallback cannot re-key a
    pair mid-conversation.
 
-:func:`map_step_to_events` is the public API; all other symbols are private.
+:func:`map_step_to_events` is the item-mapping public API. Alongside it the
+module publishes the pure **turn-state classification** helpers
+(:func:`find_turn_start_index`, :func:`classify_turn_outcome`,
+:func:`is_turn_close_step`, :func:`cascade_is_idle`, …) that answer "has agy
+finished this turn, and how did it end?" — shared by the read driver's status
+edges and the write path's completion gate so the two can never disagree. Other
+symbols are private.
 """
 
 from __future__ import annotations
@@ -1045,29 +1051,18 @@ def map_step_to_events(
         idx = _step_index(step)
         step_idx = idx if idx is not None else 0
         events: list[OutboundEvent] = []
-        planner = step.get("plannerResponse")
-        if isinstance(planner, dict):
-            response_text = planner.get("response")
-            # modifiedResponse is the post-moderation text; prefer it over
-            # response when present.  Both fields appear in live fixtures and
-            # are equal when no moderation has occurred.
-            modified = planner.get("modifiedResponse")
-            planner_text = (
-                modified
-                if isinstance(modified, str) and modified
-                else response_text
-                if isinstance(response_text, str)
-                else None
-            )
-            if planner_text:
-                # ONE message event — NO delta (the double-render fix).
-                events.append(
-                    _message_event(
-                        conversation_id=conversation_id,
-                        step_idx=step_idx,
-                        text=planner_text,
-                    )
+        # Reuse the shared selector so the committed message text is byte-identical
+        # to the text the completion gate reports (:func:`planner_response_text`).
+        planner_text = planner_response_text(step)
+        if planner_text and planner_text.strip():
+            # ONE message event — NO delta (the double-render fix).
+            events.append(
+                _message_event(
+                    conversation_id=conversation_id,
+                    step_idx=step_idx,
+                    text=planner_text,
                 )
+            )
         return events
 
     # Tool steps. BOTH items are emitted here, from this one step: the reader is
@@ -1116,3 +1111,315 @@ def map_step_to_events(
 
     # CHECKPOINT / CONVERSATION_HISTORY / unrecognized system steps → skip.
     return []
+
+
+# ---------------------------------------------------------------------------
+# Turn-state classification: pure, I/O-free predicates answering "has agy
+# finished the turn, and how?" Shared by the reader's status edges and the
+# write path's completion gate so the two can never disagree.
+# ---------------------------------------------------------------------------
+
+# agy's own per-cascade run status. Live-verified on agy 1.1.8: RUNNING persists
+# through parked permission gates, so IDLE never means "waiting for the human".
+CASCADE_RUN_STATUS_IDLE = "CASCADE_RUN_STATUS_IDLE"
+
+# Terminal-state vocabulary for one agy turn, as reported by :class:`TurnOutcome`.
+TurnState = Literal["running", "done", "error"]
+
+
+@dataclass(frozen=True)
+class TurnOutcome:
+    """
+    How one agy turn currently stands, derived from its trajectory steps.
+
+    :param state: ``"running"`` while agy is still working the turn, ``"done"``
+        once it answered and stopped, ``"error"`` when its planner step ended in
+        ``CORTEX_STEP_STATUS_ERROR``.
+    :param text: The turn's assistant text — the closing planner's text at
+        ``"done"``, the newest partial/intermediate planner text while
+        ``"running"``, ``None`` when the turn has produced no text yet.
+    :param error: agy's own error detail for an ``"error"`` state, or ``None``
+        when agy reported the failure without a message.
+    :param waiting_on_user: ``True`` when a step in this turn is currently
+        ``CORTEX_STEP_STATUS_WAITING`` — agy is parked on an ask-question /
+        permission gate. Only ever set alongside ``"running"``; a caller that
+        gives up on a turn uses it to say WHY it never finished.
+    :param model_started: ``True`` once agy has recorded a planner or tool step
+        FOR THIS TURN, i.e. positive evidence the model actually began working on
+        it. A bare recorded USER_INPUT does NOT set this: agy publishes the user
+        step before it starts generating, and during that window its cascade
+        still reports idle. Any caller inferring completion from an idle cascade
+        must require this first, or the pre-start gap reads as a finished turn.
+    """
+
+    state: TurnState
+    text: str | None = None
+    error: str | None = None
+    waiting_on_user: bool = False
+    model_started: bool = False
+
+
+def is_user_turn_step(step: dict[str, object]) -> bool:
+    """
+    Return whether a step OPENS a turn (a USER_INPUT step).
+
+    :param step: One RPC step dict.
+    :returns: ``True`` for a ``CORTEX_STEP_TYPE_USER_INPUT`` step.
+    """
+    return step.get("type") == _TYPE_USER_INPUT
+
+
+def planner_response_text(step: dict[str, object]) -> str | None:
+    """
+    Return a planner step's assistant text verbatim, or ``None`` when it has none.
+
+    The single text selector shared by :func:`map_step_to_events`, the completion
+    gate and the reader's closing delta, so all three agree byte-for-byte:
+    ``modifiedResponse`` (the post-moderation text) is preferred over ``response``.
+    Whether a whitespace-only reply counts as "no visible text" is left to each
+    caller because they differ: the mapper and gate reject it (no empty bubble,
+    no false completion), while the reader keeps it to retire its streamed block.
+
+    :param step: One RPC step dict.
+    :returns: The assistant text, or ``None`` for a non-planner step or an
+        intermediate planner that only dispatched tools.
+    """
+    if step.get("type") != _TYPE_PLANNER_RESPONSE:
+        return None
+    planner = step.get("plannerResponse")
+    if not isinstance(planner, dict):
+        return None
+    for key in ("modifiedResponse", "response"):
+        text = planner.get(key)
+        if isinstance(text, str) and text:
+            return text
+    return None
+
+
+def planner_error_detail(step: dict[str, object]) -> str | None:
+    """
+    Return agy's own error detail from an ERROR planner step.
+
+    :param step: One RPC step dict.
+    :returns: The trimmed ``plannerResponse.error`` / ``.errorMessage`` string,
+        or ``None`` when agy reported the failure without a message.
+    """
+    planner = step.get("plannerResponse")
+    if not isinstance(planner, dict):
+        return None
+    for key in ("error", "errorMessage"):
+        detail = planner.get(key)
+        if isinstance(detail, str) and detail.strip():
+            return detail.strip()
+    return None
+
+
+def is_planner_error_step(step: dict[str, object]) -> bool:
+    """
+    Return whether a step is a PLANNER_RESPONSE that ended in ERROR.
+
+    A model / safety-policy / rate-limit / provider-overload failure lands here.
+    It closes the turn as FAILED, never as a clean empty reply.
+
+    :param step: One RPC step dict.
+    :returns: ``True`` for an ERROR-status planner step.
+    """
+    return step.get("type") == _TYPE_PLANNER_RESPONSE and step.get("status") == _STATUS_ERROR
+
+
+def is_assistant_text_close_step(step: dict[str, object]) -> bool:
+    """
+    Return whether a step closes a turn (assistant text, no further tool calls).
+
+    A DONE ``PLANNER_RESPONSE`` carrying assistant text is the closing edge of a
+    turn — agy answered and stopped. A planner step that only invokes a tool does
+    not close the turn (the tool result, and possibly more planner steps, follow).
+
+    The TEXT is what separates the two: a dispatching planner carries none, in
+    either RPC shape. The ``toolCalls`` test is a poll-shape-only belt-and-braces
+    guard for a planner that somehow carried both; it cannot fire on the stream,
+    where the field is stripped (see :func:`is_turn_close_step`).
+
+    :param step: One RPC step dict.
+    :returns: ``True`` when the step is a DONE PLANNER_RESPONSE with non-empty
+        text and an empty/absent ``toolCalls`` list.
+    """
+    # Fire only on the DONE closing step: a GENERATING frame already carries
+    # growing text with no toolCalls, and would close the turn mid-response.
+    if step.get("status") != _STATUS_DONE:
+        return False
+    text = planner_response_text(step)
+    if text is None or not text.strip():
+        return False
+    planner = step.get("plannerResponse")
+    tool_calls = planner.get("toolCalls") if isinstance(planner, dict) else None
+    return not (isinstance(tool_calls, list) and tool_calls)
+
+
+def is_turn_close_step(step: dict[str, object]) -> bool:
+    """
+    Return whether a step ends the current turn.
+
+    A turn opens on USER_INPUT and stays open until agy stops working. Exactly
+    two steps close it:
+
+    * a DONE PLANNER_RESPONSE carrying assistant text
+      (:func:`is_assistant_text_close_step`) — agy answered and stopped; and
+    * a terminal-ERROR PLANNER_RESPONSE (:func:`is_planner_error_step`) — agy's
+      model step failed, so no tool result or recovery planner follows.
+
+    **Assistant text is the close signal, not the absence of ``toolCalls``.**
+    Text is the one discriminator that holds in BOTH RPC shapes: a planner that
+    dispatches a tool carries no text on the poll shape *or* the stream shape,
+    while an answering planner carries text on both. ``toolCalls`` exists only on
+    the poll shape (the stream strips it, as does ``metadata.toolCall``), so a
+    "closes unless it dispatched" rule read a STREAMED dispatch — DONE, no
+    toolCalls, no text — as a degenerate close and fired IDLE the moment agy
+    called a tool, clearing the spinner for the rest of the turn.
+
+    A DONE planner with neither text nor a dispatch is therefore NOT treated as a
+    close: that shape is indistinguishable from a streamed dispatch, and guessing
+    wrong strands every streamed tool turn. The genuinely degenerate turn is
+    reconciled against agy's own cascade status (:func:`cascade_is_idle`) by both
+    callers — the reader's idle backstop and the executor's completion gate.
+
+    Non-planner steps never close a turn here (a tool result is followed by a
+    recovery/answer planner; closing on it would pre-empt that planner).
+
+    :param step: One RPC step dict.
+    :returns: ``True`` when this step ends the turn.
+    """
+    return is_assistant_text_close_step(step) or is_planner_error_step(step)
+
+
+def cascade_is_idle(summaries: dict[str, object], cascade_id: str) -> bool:
+    """
+    Whether agy itself reports a cascade as no longer running.
+
+    Reads :data:`CASCADE_RUN_STATUS_IDLE` from the cascade's own summary rather
+    than inferring the turn's end from step types. Missing or malformed entries
+    are NOT idle: concluding "finished" on incomplete information is exactly the
+    false success both callers exist to prevent.
+
+    :param summaries: ``trajectorySummaries`` from
+        :func:`~omnigent.harnesses.antigravity_native.rpc.get_all_cascade_trajectories`.
+    :param cascade_id: The cascade to read.
+    :returns: ``True`` only on an explicit idle status for that cascade.
+    """
+    summary = summaries.get(cascade_id)
+    if not isinstance(summary, dict):
+        return False
+    return summary.get("status") == CASCADE_RUN_STATUS_IDLE
+
+
+def find_turn_start_index(
+    steps: list[dict[str, object]],
+    *,
+    baseline_step_count: int,
+) -> int | None:
+    """
+    Locate the USER_INPUT step that opened the turn a caller just delivered.
+
+    **Position is the only signal, deliberately.** The caller snapshots the step
+    count BEFORE delivering, so a USER_INPUT at or after that index necessarily
+    appeared afterwards and is therefore the caller's own turn. Only the NEWEST
+    USER_INPUT is ever tested — deliveries are serialized and agy appends — so an
+    older turn, whose closing planner is already sitting in the same trajectory,
+    can never be adopted.
+
+    There is deliberately no text fallback when the snapshot fails. Matching the
+    delivered TEXT is unsound: when the identical text was sent in the previous
+    turn and the new USER_INPUT step has not yet appeared, the OLD turn matches
+    and its DONE planner is accepted as this turn's completion — the exact false
+    success this gate exists to prevent. No text-only rule separates two
+    identical turns, so a caller that cannot snapshot has no way to identify its
+    turn and must report that rather than guess (see
+    :meth:`omnigent.inner.antigravity_native_executor.AntigravityNativeExecutor._snapshot_step_count`,
+    which retries before giving up).
+
+    :param steps: The full ordered trajectory from
+        :func:`~omnigent.harnesses.antigravity_native.rpc.get_trajectory_steps`.
+    :param baseline_step_count: ``len(steps)`` observed before delivery; ``0``
+        for a conversation agy has not minted yet (nothing earlier exists to be
+        confused with).
+    :returns: Index of this turn's USER_INPUT step, or ``None`` when agy has not
+        recorded it yet.
+    """
+    for index in range(len(steps) - 1, -1, -1):
+        step = steps[index]
+        if not isinstance(step, dict) or not is_user_turn_step(step):
+            continue
+        return index if index >= baseline_step_count else None
+    return None
+
+
+def classify_turn_outcome(steps: list[dict[str, object]], *, start_index: int) -> TurnOutcome:
+    """
+    Classify how the turn opened at ``start_index`` currently stands.
+
+    Scans only the steps AFTER the turn's own USER_INPUT step, so nothing from a
+    previous turn can satisfy it. An :func:`is_planner_error_step` ends the scan
+    immediately as ``"error"``. A DONE close (:func:`is_assistant_text_close_step`)
+    marks the turn ``"done"`` ONLY if no later step reopens it: a mid-turn
+    steering USER_INPUT delivered after a close supersedes it, because the gate
+    must keep waiting for that steered work instead of reporting the pre-steer
+    close as the turn's end. The done determination therefore uses the LAST
+    un-superseded close, not the first one seen. Everything else (tool steps,
+    dispatching planners, a WAITING interaction gate, the steering USER_INPUT
+    itself) leaves the turn ``"running"`` — a tool step that ERRORs does NOT end
+    the turn, because agy routinely recovers from one and keeps working.
+
+    It also reports ``model_started``: whether agy has recorded a planner or tool
+    step for this turn. A recorded USER_INPUT alone does NOT count. agy publishes
+    the user step before it begins generating, and its cascade still reports idle
+    in that window, so a caller that closes a turn on an idle cascade must wait
+    for this evidence — otherwise the pre-start gap reads as a finished turn. A
+    mid-turn steering USER_INPUT is likewise not evidence: it is another
+    delivery, not the model working.
+
+    :param steps: The full ordered trajectory.
+    :param start_index: Index of this turn's USER_INPUT step, from
+        :func:`find_turn_start_index`.
+    :returns: The turn's current :class:`TurnOutcome`.
+    """
+    latest_text: str | None = None
+    waiting = False
+    model_started = False
+    closed = False
+    close_text: str | None = None
+    for step in steps[start_index + 1 :]:
+        if not isinstance(step, dict):
+            continue
+        if is_user_turn_step(step):
+            # A mid-turn steering delivery reopens the turn: a close recorded
+            # before it is no longer this turn's end, and the steer itself is
+            # another delivery, not the model working.
+            closed = False
+            close_text = None
+            continue
+        if step.get("type") == _TYPE_PLANNER_RESPONSE or _is_tool_step(step):
+            model_started = True
+        if is_planner_error_step(step):
+            return TurnOutcome(
+                state="error",
+                text=latest_text,
+                error=planner_error_detail(step),
+                model_started=True,
+            )
+        text = planner_response_text(step)
+        if text and text.strip():
+            latest_text = text
+        if is_assistant_text_close_step(step):
+            closed = True
+            close_text = text
+            continue
+        if step.get("status") == _STATUS_WAITING:
+            waiting = True
+    if closed:
+        return TurnOutcome(state="done", text=close_text, model_started=True)
+    return TurnOutcome(
+        state="running",
+        text=latest_text,
+        waiting_on_user=waiting,
+        model_started=model_started,
+    )
