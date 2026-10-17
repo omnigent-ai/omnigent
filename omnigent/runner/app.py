@@ -8263,13 +8263,49 @@ def _build_spawn_env_from_spec(
                 codex_extended_catalog_env(session_routing_class(session_id).routing_enabled)
             )
 
+    # A Unity Gateway model provider service (Amazon Bedrock, Azure OpenAI, ...)
+    # that the SDK harnesses name in every model request; the spec model is then
+    # the provider's own id, e.g. ``us.anthropic.claude-sonnet-5``.
+    provider_service = spec.executor.config.get("model_provider_service")
+    if provider_service:
+        from omnigent.databricks_ai_gateway import (
+            MODEL_PROVIDER_SERVICE_ENV_VAR,
+            MODEL_PROVIDER_SERVICE_HARNESSES,
+            validate_model_provider_service,
+        )
+
+        if harness not in MODEL_PROVIDER_SERVICE_HARNESSES or env is None:
+            raise ValueError(
+                f"executor.config.model_provider_service is not supported by the "
+                f"{harness!r} harness; use one of {sorted(MODEL_PROVIDER_SERVICE_HARNESSES)}"
+            )
+        env[MODEL_PROVIDER_SERVICE_ENV_VAR] = validate_model_provider_service(
+            str(provider_service)
+        )
+
     # Per-session ``/model`` override wins over everything the builder baked
     # into HARNESS_<H>_MODEL. Without this, `/model` is recorded in the
     # readout but the turn still uses the provider/catalog default.
     if model_override and env is not None:
         model_key = _HARNESS_MODEL_ENV_KEY.get(harness)
         if model_key is not None:
-            env[model_key] = model_override
+            if provider_service:
+                from omnigent.databricks_ai_gateway import is_databricks_catalog_model
+
+                if is_databricks_catalog_model(model_override):
+                    # An agent pinned to a provider service keeps its own provider
+                    # model: the provider cannot serve a Databricks-hosted id, and
+                    # sending one with its header fails the turn (``NOT_FOUND``).
+                    _logger.warning(
+                        "ignoring model override %s: agent is pinned to model provider "
+                        "service %s, which does not serve Databricks-hosted models",
+                        model_override,
+                        provider_service,
+                        extra={"session_id": session_id},
+                    )
+                    model_override = None
+            if model_override:
+                env[model_key] = model_override
 
     # Routing visibility: log the resolved gateway target so operators can
     # confirm which provider a turn actually hits (api.anthropic.com /

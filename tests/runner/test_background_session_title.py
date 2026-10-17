@@ -1399,3 +1399,29 @@ async def test_background_title_timeout_releases_process(
     assert response.json()["error"] == "title_harness_timeout"
     [process_key] = process_manager.released
     assert uuid.UUID(process_key).hex == process_key
+
+
+@pytest.mark.asyncio
+async def test_background_title_skips_economy_model_on_a_provider_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider service never serves the economy alias, so titles use the session model."""
+    from omnigent.databricks_ai_gateway import MODEL_PROVIDER_SERVICE_ENV_VAR
+
+    attempted_models: list[str | None] = []
+
+    async def generate_title(context: BackgroundTitleContext) -> str:
+        attempted_models.append(context.title_model)
+        return "Debug authentication timeout"
+
+    _register_fake_title_generator(monkeypatch, "claude-sdk", generate_title)
+
+    title = await title_service.generate_background_title(
+        _title_context(
+            "claude-sdk",
+            spawn_env={MODEL_PROVIDER_SERVICE_ENV_VAR: "main.ai.bedrock_prod"},
+        )
+    )
+
+    assert title == "Debug authentication timeout"
+    assert attempted_models == [None]
