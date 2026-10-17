@@ -28,12 +28,14 @@ import atexit
 import contextlib
 import re
 import shutil
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import mkdtemp
 
 import pexpect
+import pyte
 from omnigent_ui_sdk import UserConfig, save_user_config
 
 # Default PTY geometry. Large enough that the REPL's layout fits
@@ -64,6 +66,154 @@ STATE_RUNNING = r"state: running"
 # input prompt itself is ready. Several REPL e2e tests already use
 # this as the visible readiness signal.
 PROMPT_READY = r"❯ "
+
+
+# prompt-toolkit ends every render with "show cursor"; screen state is only
+# judged at these boundaries so a half-painted frame never counts.
+_FRAME_END = "\x1b[?25h"
+# Status segment at the left of the bottom toolbar, e.g.
+# ``── hello world · ready  /help ...`` or ``── streaming… 3s  /help ...``.
+_TOOLBAR_STATUS_RE = re.compile(r"^── (?:.* · )?(ready|streaming…)")
+
+
+class ReplScreen:
+    """
+    Terminal emulator fed with every byte pexpect reads from the REPL.
+
+    prompt-toolkit repaints only the cells that changed, so raw-stream
+    regexes such as ``state: sleeping`` can miss a toolbar that is visibly
+    idle, and ``❯ `` matches the input prompt that is also drawn mid-turn.
+    Emulating the screen lets tests wait on what a user would actually see.
+    Installed as ``child.logfile_read`` by :func:`spawn_omnigent_run`.
+
+    :param rows: Terminal height, e.g. ``40``.
+    :param cols: Terminal width, e.g. ``120``.
+    """
+
+    def __init__(self, rows: int, cols: int) -> None:
+        self._screen = pyte.Screen(cols, rows)
+        self._stream = pyte.Stream(self._screen)
+        self._raw: list[str] = []
+        self._raw_len = 0
+        self._tail = ""
+        # One entry per completed frame: (raw offset, toolbar status or None).
+        self.frames: list[tuple[int, str | None]] = []
+
+    def write(self, data: str) -> None:
+        """
+        Feed PTY output to the emulator (pexpect ``logfile_read`` hook).
+
+        :param data: Decoded PTY output chunk.
+        """
+        # Search from the previous chunk's tail so a frame-end sequence
+        # split across two reads is still detected.
+        tail = self._tail
+        base = self._raw_len - len(tail)
+        self._raw.append(data)
+        self._raw_len += len(data)
+        window = tail + data
+        self._tail = window[-(len(_FRAME_END) - 1) :]
+        start = len(tail)
+        search_from = 0
+        while (end := window.find(_FRAME_END, search_from)) != -1:
+            end += len(_FRAME_END)
+            self._stream.feed(window[start:end])
+            self.frames.append((base + end, self.toolbar_status()))
+            start = search_from = end
+        self._stream.feed(window[start:])
+
+    def flush(self) -> None:
+        """No-op; required by pexpect's logfile protocol."""
+
+    def lines(self) -> list[str]:
+        """
+        :returns: The visible screen rows, right-stripped.
+        """
+        return [line.rstrip() for line in self._screen.display]
+
+    def text(self) -> str:
+        """
+        :returns: The visible screen as newline-joined text.
+        """
+        return "\n".join(self.lines())
+
+    def toolbar_status(self) -> str | None:
+        """
+        :returns: ``"ready"`` or ``"streaming…"`` from the bottom-most
+            toolbar row, or ``None`` when no toolbar is visible.
+        """
+        for line in reversed(self.lines()):
+            match = _TOOLBAR_STATUS_RE.match(line)
+            if match:
+                return match.group(1)
+        return None
+
+    def mark(self) -> int:
+        """
+        :returns: Frame index to pass to :meth:`turn_finished_since`.
+        """
+        return len(self.frames)
+
+    def raw_since(self, mark: int) -> str:
+        """
+        :param mark: Value returned by :meth:`mark`.
+        :returns: Raw PTY output read after the frame at *mark*.
+        """
+        offset = self.frames[mark - 1][0] if mark > 0 else 0
+        return "".join(self._raw)[offset:]
+
+    def turn_finished_since(self, mark: int) -> bool:
+        """
+        Whether a busy frame was painted after *mark* and the newest frame
+        shows the toolbar back at ``ready``.
+
+        :param mark: Value returned by :meth:`mark` before the prompt was
+            submitted.
+        :returns: ``True`` once the submitted turn is fully idle.
+        """
+        statuses = [status for _, status in self.frames[mark:] if status is not None]
+        return "streaming…" in statuses and statuses[-1] == "ready"
+
+    def turn_started_since(self, mark: int) -> bool:
+        """
+        :param mark: Value returned by :meth:`mark`.
+        :returns: ``True`` once a busy toolbar frame was painted after *mark*.
+        """
+        return any(status == "streaming…" for _, status in self.frames[mark:])
+
+
+def wait_for_screen(
+    child: pexpect.spawn,
+    predicate: Callable[[ReplScreen], bool],
+    *,
+    timeout: float,
+) -> bool:
+    """
+    Read REPL output until *predicate* holds for its emulated screen.
+
+    :param child: Child from :func:`spawn_omnigent_run`.
+    :param predicate: Called after each read with the child's
+        :class:`ReplScreen`.
+    :param timeout: Max seconds to wait, e.g. ``30.0``.
+    :returns: ``True`` when the predicate held, ``False`` on timeout or EOF.
+    """
+    screen = child.logfile_read
+    assert isinstance(screen, ReplScreen), "child was not spawned by spawn_omnigent_run"
+    # Output already buffered by an earlier expect() was fed to the screen
+    # when it was read; drop it so a later expect() cannot match stale frames.
+    child.buffer = ""
+    deadline = time.monotonic() + timeout
+    while not predicate(screen):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            child.read_nonblocking(size=65536, timeout=min(0.2, remaining))
+        except pexpect.TIMEOUT:
+            continue
+        except pexpect.EOF:
+            return predicate(screen)
+    return True
 
 
 @dataclass(frozen=True)
@@ -251,7 +401,7 @@ def spawn_omnigent_run(
     # routing for spawned CLIs comes from the ``auth:`` block written into
     # the isolated ``OMNIGENT_CONFIG_HOME`` by ``omnigent_credentials_env``.
     spawn_env = ensure_repl_test_theme_env(env)
-    return pexpect.spawn(
+    child = pexpect.spawn(
         command,
         args,
         env={
@@ -265,6 +415,8 @@ def spawn_omnigent_run(
         timeout=timeout,
         dimensions=(_DEFAULT_ROWS, _DEFAULT_COLS),
     )
+    child.logfile_read = ReplScreen(_DEFAULT_ROWS, _DEFAULT_COLS)
+    return child
 
 
 def wait_for_ready(child: pexpect.spawn, *, timeout: float) -> None:
@@ -313,46 +465,61 @@ def await_turn_complete(
     completion_timeout: float,
     running_marker: str = STATE_RUNNING,
     completion_pattern: str = STATE_SLEEPING,
+    reply_marker: str | None = None,
 ) -> PexpectTurn:
     """
-    Wait for the REPL to enter ``running`` and then reach a
-    completion signal; return everything it printed from the
-    ``running`` transition forward.
+    Wait for the submitted turn to start and then to be fully idle; return
+    everything the REPL printed meanwhile.
 
-    The ``running`` transition is used as a handshake only — its
-    appearance proves the prompt submission was accepted by the
-    Session — so we concatenate the pre-running and post-running
-    frame buffers. By default completion is the next
-    ``state: sleeping`` toolbar render; tests whose terminal setup
-    suppresses the toolbar can pass a visible response marker as
-    *completion_pattern* instead.
+    For children from :func:`spawn_omnigent_run` this watches the emulated
+    screen: the bottom toolbar must show ``streaming…`` and then ``ready``
+    again (plus *reply_marker*, when given). The input prompt ``❯ `` is
+    painted mid-turn too, so it cannot signal completion. Other children
+    fall back to raw-stream ``expect`` on *running_marker* then
+    *completion_pattern*.
+
+    Call this right after :func:`submit_prompt`, before reading any more
+    output, so frames from the new turn are all observed.
 
     :param child: Live ``pexpect.spawn`` child.
-    :param running_timeout: Max seconds to wait for the
-        ``running`` transition after a prompt was submitted.
-        Short — if this elapses the REPL almost certainly
-        failed to register the prompt.
-    :param completion_timeout: Max seconds to wait for the
-        turn to finish. Long — real LLM latency sits here.
-    :param running_marker: Regex marker that proves the submitted
-        prompt was accepted and the turn started. Defaults to the
-        bottom-toolbar ``state: running`` text; tests may pass a
-        visible prompt marker when CPR suppresses toolbar output.
-    :param completion_pattern: Regex/string expected after the
-        turn starts. Defaults to ``state: sleeping``.
+    :param running_timeout: Max seconds to wait for the turn to start.
+        Short — if this elapses the REPL almost certainly failed to
+        register the prompt.
+    :param completion_timeout: Max seconds to wait for the turn to
+        finish. Long — LLM latency sits here.
+    :param running_marker: Raw-stream fallback start marker, e.g.
+        ``"working"``.
+    :param completion_pattern: Raw-stream fallback completion marker.
+    :param reply_marker: Text the turn must print after submission, e.g.
+        the mock reply ``"Hi there!"``. Guards against an earlier turn's
+        trailing frames being mistaken for this turn finishing.
     :returns: Captured :class:`PexpectTurn` with raw and
         stripped forms of all output spanning the full turn.
+    :raises AssertionError: If the screen never reaches the expected state.
     """
-    child.expect(running_marker, timeout=running_timeout)
-    # ``child.before`` here is everything rendered between the
-    # previous expect (startup's ready signal) and the ``running``
-    # transition — includes the echoed prompt text and the ``You>``
-    # banner. We must snapshot it before the next expect overwrites
-    # ``before``.
-    pre_running = child.before or ""
-    child.expect(completion_pattern, timeout=completion_timeout)
-    post_running = child.before or ""
-    raw = pre_running + post_running
+    screen = child.logfile_read
+    if not isinstance(screen, ReplScreen):
+        child.expect(running_marker, timeout=running_timeout)
+        # Snapshot ``before`` ahead of the next expect overwriting it.
+        pre_running = child.before or ""
+        child.expect(completion_pattern, timeout=completion_timeout)
+        raw = pre_running + (child.before or "")
+        return PexpectTurn(raw=raw, stripped=strip_ansi(raw))
+
+    mark = screen.mark()
+    if not wait_for_screen(child, lambda s: s.turn_started_since(mark), timeout=running_timeout):
+        raise AssertionError(f"REPL turn never started. Screen:\n{screen.text()}")
+    if not wait_for_screen(
+        child,
+        lambda s: (
+            s.turn_finished_since(mark) and (reply_marker or "") in strip_ansi(s.raw_since(mark))
+        ),
+        timeout=completion_timeout,
+    ):
+        raise AssertionError(
+            f"REPL turn did not finish (reply {reply_marker!r}). Screen:\n{screen.text()}"
+        )
+    raw = screen.raw_since(mark)
     return PexpectTurn(raw=raw, stripped=strip_ansi(raw))
 
 

@@ -74,6 +74,7 @@ _LONG_PROMPT = (
     "explaining what the number could mean. Take your time."
 )
 _FOLLOW_UP_PROMPT = "say hi"
+_FOLLOW_UP_REPLY = "Hi there! How can I help you today?"
 
 # Cancellation acknowledgement rendered by the REPL's run loop
 # when the in-flight turn is cancelled: the muted ``cancelled``
@@ -135,16 +136,12 @@ def test_repl_cancel_re_arms_for_next_turn(
     :param mock_llm_server_url: Mock server URL for configuring
         response queues.
     """
-    # First response delivers instantly (mock LLM), so the cancel
-    # may land after the turn finishes. Either way, the follow-up
-    # turn exercises the re-arm path. Second response is the
-    # follow-up turn.
+    # Escape can land before or after the first turn's model request
+    # consumes a queued response, so the follow-up may get either entry;
+    # queue the same reply twice so the follow-up text is deterministic.
     configure_mock_llm(
         mock_llm_server_url,
-        [
-            {"text": "1. One is the loneliest number. 2. Two is company. 3. Three is a crowd."},
-            {"text": "Hi there! How can I help you today?"},
-        ],
+        [{"text": _FOLLOW_UP_REPLY}, {"text": _FOLLOW_UP_REPLY}],
     )
 
     yaml_path = omnigent_repo_root / "tests" / "resources" / "examples" / "hello_world.yaml"
@@ -177,8 +174,7 @@ def test_repl_cancel_re_arms_for_next_turn(
             child,
             running_timeout=_FOLLOWUP_RUNNING_TIMEOUT,
             completion_timeout=_FOLLOWUP_COMPLETION_TIMEOUT,
-            running_marker=_RUNNING_MARKER,
-            completion_pattern=_COMPLETION_MARKER,
+            reply_marker=_FOLLOW_UP_REPLY,
         )
         clean_exit(child, timeout=_EXIT_TIMEOUT)
         exit_code = child.exitstatus
