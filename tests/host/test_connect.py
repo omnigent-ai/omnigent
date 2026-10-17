@@ -1018,6 +1018,55 @@ async def test_handle_launch_attributes_spawn_failure_to_host(
     assert failure.attributes["error_category"] == "host"
     assert failure.attributes["error_impact"] == "blocking"
     assert failure.attributes["error_phase"] == "runner_launch"
+    # The interpreter still exists, so this is an ordinary spawn failure.
+    assert not host._runtime_gone
+
+
+@pytest.mark.parametrize("live_runner", [False, True])
+async def test_handle_launch_retires_host_when_its_runtime_was_deleted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    live_runner: bool,
+) -> None:
+    """A deleted interpreter fails the launch clearly and retires the host once idle.
+
+    Every later spawn would fail the same way, so the host exits for a restart
+    on a fresh runtime, but only once no live runner would be torn down.
+    """
+    import omnigent.host.connect as connect_module
+
+    host = _make_host_process()
+    missing = tmp_path / "deleted-venv" / "bin" / "python"
+
+    def _interpreter_gone(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
+        raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(missing))
+
+    monkeypatch.setattr(sys, "executable", str(missing))
+    monkeypatch.setattr(connect_module, "_RUNTIME_GONE_RETIRE_DELAY_S", 0.0)
+    monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
+    monkeypatch.setattr(host, "_spawn_runner_proc", _interpreter_gone)
+    if live_runner:
+        host._runners["runner_live"] = Mock()
+    frame = HostLaunchRunnerFrame(
+        request_id="req_runtime_gone",
+        binding_token="token_runtime_gone",
+        workspace=str(tmp_path),
+        session_id="session_runtime_gone",
+    )
+
+    result = await host._handle_launch(frame)
+    await asyncio.sleep(0.01)
+
+    assert isinstance(result, HostLaunchRunnerResultFrame)
+    assert result.status == "failed"
+    assert str(missing) in (result.error or "")
+    assert "was deleted" in (result.error or "")
+    assert host.runtime_gone is not live_runner
+    if live_runner:
+        # The last runner leaving is what retires the host.
+        host._runners.clear()
+        host._retire_if_runtime_gone()
+        assert host.runtime_gone
 
 
 @pytest.mark.parametrize("binding_token", ["token_abc", "", "   "])

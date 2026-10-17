@@ -58,7 +58,7 @@ from omnigent.errors import (
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
-from omnigent.host import HOST_FATAL_EXIT_CODE
+from omnigent.host import HOST_FATAL_EXIT_CODE, HOST_RUNTIME_GONE_EXIT_CODE
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
@@ -460,6 +460,9 @@ except ValueError:
     _LIFECYCLE_POLL_INTERVAL_S = 60.0
 # Keep first startup tolerant of a cold server, but do not spend the library's
 # full default timeout on each reconnect after an established tunnel drops.
+# Delay between noticing a deleted runtime and retiring, so the launch's
+# failure reply reaches the server before the tunnel closes.
+_RUNTIME_GONE_RETIRE_DELAY_S = 2.0
 _INITIAL_CONNECT_OPEN_TIMEOUT_S = 10.0
 _RECONNECT_OPEN_TIMEOUT_S = 3.0
 # Consecutive handshake recycle failures before the prompt cadence gives way
@@ -1341,6 +1344,9 @@ class HostProcess:
         self._lifecycle_lock = lifecycle_lock
         self._lifecycle_task: asyncio.Task[None] | None = None
         self._lifecycle_lost = asyncio.Event()
+        # Set when this host's own interpreter was deleted under it, so no new
+        # runner can start; the host retires once its live runners are gone.
+        self._runtime_gone = False
 
     def _tracked_runner_pids(self) -> set[int]:
         """Return child PIDs whose exit status still belongs to a process handle.
@@ -2013,6 +2019,15 @@ class HostProcess:
                 task.add_done_callback(self._runner_stop_tasks.discard)
                 raise
             except OSError as exc:
+                if not os.path.exists(sys.executable):
+                    self._note_runtime_gone()
+                    return self._launch_failed(
+                        frame,
+                        "failed to spawn runner: this host's Python runtime "
+                        f"({sys.executable}) was deleted while the host was running. "
+                        "The host restarts on a fresh runtime once its other runners "
+                        f"have exited; retry after it reconnects. ({exc})",
+                    )
                 return self._launch_failed(
                     frame,
                     f"failed to spawn runner: {exc}",
@@ -2462,6 +2477,7 @@ class HostProcess:
             # an intentional termination, not a crash to report.
             return
         self._runners.pop(runner_id)
+        self._retire_if_runtime_gone()
         self._trigger_maintenance("runner_exited")
         had_connected = None
         if handle.connect_marker is not None:
@@ -4018,6 +4034,54 @@ class HostProcess:
             self._abort_live_tunnel()
             return
 
+    def _note_runtime_gone(self) -> None:
+        """Record that this host's interpreter was deleted, then retire if idle.
+
+        Runners already running keep working (their interpreter stays mapped),
+        but every new spawn fails, so the host can't serve a relaunch until it
+        is restarted on a fresh runtime.
+
+        :returns: None.
+        """
+        if not self._runtime_gone:
+            self._runtime_gone = True
+            _logger.error(
+                "Host runtime %s was deleted; no runner can start. The host exits "
+                "once its %d live runner(s) have exited so it can be restarted.",
+                sys.executable,
+                len(self._runners),
+                extra=debug_event(
+                    "host_runtime_gone",
+                    stage="runner_spawn",
+                    error_category=ErrorCategory.HOST.value,
+                    error_impact=ErrorImpact.BLOCKING.value,
+                    error_phase=ErrorPhase.RUNNER_LAUNCH.value,
+                ),
+            )
+        asyncio.get_running_loop().call_later(
+            _RUNTIME_GONE_RETIRE_DELAY_S, self._retire_if_runtime_gone
+        )
+
+    def _retire_if_runtime_gone(self) -> None:
+        """Retire the host once its runtime is gone and no runner is left.
+
+        Uses the lifecycle monitor's exit path, so :meth:`run` breaks out of
+        its serve loop and tears down cleanly; the entry point then exits with
+        :data:`HOST_RUNTIME_GONE_EXIT_CODE`.
+
+        :returns: None.
+        """
+        if not self._runtime_gone or self._runners or self._lifecycle_lost.is_set():
+            return
+        _logger.warning("Host runtime is gone and no runner is live; exiting for a restart.")
+        self._lifecycle_lost.set()
+        self._abort_live_tunnel()
+
+    @property
+    def runtime_gone(self) -> bool:
+        """Whether this host exited because its own interpreter was deleted."""
+        return self._runtime_gone and self._lifecycle_lost.is_set()
+
     def _abort_live_tunnel(self) -> None:
         """Abort the live tunnel transport, if any, to break the serve loop.
 
@@ -5372,4 +5436,13 @@ def _serve_host_until_exit(
             flush=True,
         )
         raise SystemExit(HOST_FATAL_EXIT_CODE) from exc
+    if host.runtime_gone:
+        crash_reporting.report_host_exit("runtime_gone", exit_code=HOST_RUNTIME_GONE_EXIT_CODE)
+        print(
+            f"\n✗ This host's Python runtime ({sys.executable}) was deleted. "
+            "Restart the host to run it on a fresh runtime.",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(HOST_RUNTIME_GONE_EXIT_CODE)
     return host.lifecycle_lost
