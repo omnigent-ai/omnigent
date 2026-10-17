@@ -189,12 +189,13 @@ class ProxyMcpManager:
     async def schemas_for(self, spec: AgentSpec) -> McpSchemasResult:
         """Expose selected services using per-service discovery and runner namespaces."""
         self._registry_services = {c.name for c in spec.mcp_servers if c.transport == "registry"}
+        non_registry_services = {c.name for c in spec.mcp_servers if c.transport != "registry"}
         schemas: list[_JsonObject] = []
         names: set[str] = set()
         failures: dict[str, str] = {}
         routes: list[str | None] = []
         routes.extend(sorted(self._registry_services))
-        if any(c.transport != "registry" for c in spec.mcp_servers):
+        if non_registry_services:
             routes.insert(0, None)
         for service in routes:
             result = await self._schemas_at(service)
@@ -202,7 +203,10 @@ class ProxyMcpManager:
                 name = schema.get("name")
                 if not isinstance(name, str):
                     continue
-                if service is None and name.split("__", 1)[0] in self._registry_services:
+                # The session proxy catalog also lists runner-local tools; from that
+                # route keep only names namespaced under a configured non-registry
+                # server so local tools are not re-injected as external MCP tools.
+                if service is None and name.split("__", 1)[0] not in non_registry_services:
                     continue
                 schemas.append(schema)
                 names.add(name)
@@ -449,10 +453,10 @@ class ProxyMcpManager:
                     request_id += 1
                     payload = cast("_JsonObject", {**payload, "id": request_id})
                     continue
-                # -32000 is the MCP convention for server-defined errors (tool
-                # denials, tool errors).  Return as a JSON error string so the
-                # harness feeds the refusal back to the LLM rather than raising.
-                if code == -32000:
+                # -32000 (tool denial/error) and -32602 (a bare name outside the
+                # granted surface) are refusals: return the message as a JSON
+                # error string so the harness feeds it to the LLM, not raise.
+                if code in (-32000, -32602):
                     return json.dumps({"error": msg})
                 raise RuntimeError(
                     f"MCP proxy protocol error {code} for tool {tool_name!r}: {msg}"

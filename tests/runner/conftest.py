@@ -166,7 +166,7 @@ class _FakeMcpManager:
 
     handles_tool_dispatch = True
 
-    def __init__(self, *, tool_name: str = "jira_search_issues") -> None:
+    def __init__(self, *, tool_name: str = "jira__search_issues") -> None:
         """Schema set is a single-tool jira fixture."""
         self._tool_name = tool_name
         self.call_tool_invocations: list[tuple[str, dict[str, Any]]] = []
@@ -428,7 +428,8 @@ class _McpToolsListServerClient(NullServerClient):
     def __init__(self, tool_name: str) -> None:
         """Configure the tool name returned by tools/list.
 
-        :param tool_name: MCP tool name to advertise, e.g. ``"jira_search_issues"``.
+        :param tool_name: Namespaced MCP tool name to advertise, e.g.
+            ``"jira__search_issues"``.
         """
         self._tool_name = tool_name
         self.call_tool_invocations: list[tuple[str, dict[str, Any]]] = []
@@ -488,12 +489,12 @@ class _McpToolsListServerClient(NullServerClient):
 
 
 def _build_app_with_mcp_tool(
-    tool_name: str = "jira_search_issues",
+    tool_name: str = "jira__search_issues",
 ) -> tuple[FastAPI, _FakeMcpManager, _ScriptedHarnessClient, _McpToolsListServerClient]:
     """Wire a runner app with the fakes and one mcp tool name.
 
-    :param tool_name: MCP tool name to advertise and dispatch, e.g.
-        ``"jira_search_issues"``.
+    :param tool_name: Namespaced MCP tool name to advertise and dispatch, e.g.
+        ``"jira__search_issues"``.
     :returns: ``(app, mcp_manager, harness_client, server_client)`` tuple.
         ``mcp_manager`` is the :class:`_FakeMcpManager` used for the runner's
         ``/mcp/execute`` endpoint (not inline turn dispatch).
