@@ -5112,6 +5112,69 @@ async def test_post_external_session_status_carries_response_id(
     assert event["response_id"] == "codex_turn_123"
 
 
+async def test_remote_native_receipt_requires_bound_runner_and_durable_turn(
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.remote_child_protocol import REMOTE_CHILD_STATE, remote_child_state
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+    from omnigent.server.remote_children import claim_remote_dispatch
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    parent = await _create_session(client, agent["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    token = "remote-child-runner-token"
+    child = store.create_conversation(
+        agent_id=agent["id"],
+        kind="sub_agent",
+        parent_conversation_id=parent["id"],
+        host_id="a" * 32,
+        workspace="/work/repo",
+        runner_id=token_bound_runner_id(token),
+    )
+    claim_remote_dispatch(store, child.id, "dispatch_a")
+    url = f"/v1/sessions/{child.id}/events"
+    running = {
+        "type": "external_session_status",
+        "data": {"status": "running", "response_id": "turn_a"},
+    }
+    rejected = await client.post(url, json=running)
+    assert rejected.status_code == 403, rejected.text
+    assert published == []
+    headers = {RUNNER_TUNNEL_TOKEN_HEADER: token}
+    accepted = await client.post(url, json=running, headers=headers)
+    assert accepted.status_code == 202, accepted.text
+    terminal = {
+        "type": "external_session_status",
+        "data": {"status": "idle", "response_id": "turn_a", "turn_completed": True},
+    }
+    pending = await client.post(url, json=terminal, headers=headers)
+    assert pending.status_code == 503, pending.text
+    item = store.append(
+        child.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="turn_a",
+                data=MessageData(
+                    role="assistant",
+                    agent="worker",
+                    content=[{"type": "output_text", "text": "REMOTE_NATIVE_RESULT"}],
+                ),
+            )
+        ],
+    )[0]
+    done = await client.post(url, json=terminal, headers=headers)
+    assert done.status_code == 202, done.text
+    labels = store.get_conversation(child.id).labels
+    assert remote_child_state(labels)["result_item_id"] == item.id
+    forged = await client.patch(
+        f"/v1/sessions/{child.id}", json={"labels": {REMOTE_CHILD_STATE: "{}"}}
+    )
+    assert forged.status_code == 400, forged.text
+
+
 async def test_publish_status_keeps_failed_sticky_against_trailing_idle(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

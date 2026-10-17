@@ -1453,6 +1453,30 @@ class SqlAlchemyConversationStore(ConversationStore):
                 result[parent_id].append(child_id)
         return result
 
+    def compare_and_set_labels(
+        self, conversation_id: str, expected: dict[str, str | None], updates: dict[str, str]
+    ) -> bool:
+        """Serialize conditional label writers on the owning conversation row."""
+
+        def write(session: Session) -> bool:
+            row = session.execute(
+                select(SqlConversation.id)
+                .where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == conversation_id,
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None:
+                raise ConversationNotFoundError(conversation_id)
+            labels = _fetch_labels(session, conversation_id)
+            if any(labels.get(key) != value for key, value in expected.items()):
+                return False
+            _upsert_labels(session, conversation_id, updates, now_epoch())
+            return True
+
+        return run_write_transaction(self._conv_session_immediate, "compare_and_set_labels", write)
+
     def list_child_conversation_ids_page(
         self,
         parent_conversation_id: str,
@@ -4265,6 +4289,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         agent_name: str,
         agent_bundle_location: str,
         agent_description: str | None,
+        conversation_id: str | None = None,
         title: str | None = None,
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
@@ -4335,7 +4360,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             conversation exists.
         """
         return self._create_session_with_agent_with_id(
-            generate_conversation_id(),
+            conversation_id or generate_conversation_id(),
             agent_id=agent_id,
             agent_name=agent_name,
             agent_bundle_location=agent_bundle_location,

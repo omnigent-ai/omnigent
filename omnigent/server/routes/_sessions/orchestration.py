@@ -3598,6 +3598,11 @@ async def _heal_subagent_runner_binding_via_parent(
     :returns: The live ``httpx.AsyncClient`` for the nearest live ancestor runner
         after healing, or ``None`` when no live ancestor could be found.
     """
+    # A host-bound child owns an independent execution environment. A parent
+    # reconnect must not move its tools or workspace onto another machine.
+    if child_conv.host_id is not None:
+        return None
+
     # Walk the ancestor chain (immediate parent first, then root) to find a
     # live runner.  A single hop covers the common case; two hops cover nested
     # sub-agents where the immediate parent's runner is also stale but the root
@@ -5824,6 +5829,22 @@ async def _persist_native_terminal_failure(
     :param failure_context: Normalized cause metadata from the runner's ensure response.
     :returns: Store-assigned id of the consumed user message item.
     """
+    remote_dispatch_id = body.data.get("remote_dispatch_id")
+    if conv.host_id and conv.parent_conversation_id and isinstance(remote_dispatch_id, str):
+        from omnigent.remote_child_protocol import remote_child_state
+        from omnigent.server.remote_children import claim_remote_dispatch
+
+        fresh = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        receipt = remote_child_state(fresh.labels) if fresh else None
+        if (
+            receipt is None
+            or receipt["dispatch_id"] != remote_dispatch_id
+            or receipt["status"] != "pending"
+        ):
+            # An unavailable runner fails before the normal dispatch admission point.
+            await asyncio.to_thread(
+                claim_remote_dispatch, conversation_store, session_id, remote_dispatch_id
+            )
     turn_id = generate_task_id()
     user_item = _build_new_item(body, turn_id, created_by=created_by)
     persisted_items = await asyncio.to_thread(
@@ -5857,6 +5878,16 @@ async def _persist_native_terminal_failure(
         failure_origin="native_terminal_boot_failed",
         failure_context=failure_context,
     )
+    if conv.host_id and conv.parent_conversation_id and isinstance(remote_dispatch_id, str):
+        from omnigent.server.remote_children import fail_remote_dispatch
+
+        if not await asyncio.to_thread(
+            fail_remote_dispatch, conversation_store, session_id, remote_dispatch_id, turn_id
+        ):
+            raise OmnigentError(
+                "remote boot failure receipt could not be committed", code=ErrorCode.CONFLICT
+            )
+        return consumed.id
     # A boot failure on a native sub-agent must wake the parent — mirror
     # the normal terminal-status path (publish + forward), gated on
     # ``kind == "sub_agent"`` so top-level native sessions are unaffected.
@@ -8885,6 +8916,15 @@ async def _relay_runner_stream_once(
                         _rid = resp_obj.get("id")
                         if isinstance(_rid, str) and _rid:
                             current_response_id = _rid
+                            from omnigent.server.remote_children import record_remote_turn
+
+                            await asyncio.to_thread(
+                                record_remote_turn,
+                                conversation_store,
+                                session_id,
+                                response_id=_rid,
+                                status="running",
+                            )
                             # Keep the turn identity across transport retries until final status.
                             _session_active_response_cache[session_id] = _rid
                         _model = resp_obj.get("model")
@@ -9303,6 +9343,18 @@ async def _relay_runner_stream_once(
                     # terminal event so it doesn't leak to the
                     # next turn.
                     if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES:
+                        from omnigent.server.remote_children import record_remote_turn
+
+                        await asyncio.to_thread(
+                            record_remote_turn,
+                            conversation_store,
+                            session_id,
+                            response_id=current_response_id,
+                            status="failed"
+                            if evt_type == "response.incomplete"
+                            else evt_type.split(".", 1)[1],
+                            allow_empty=True,
+                        )
                         current_response_id = None
 
                     # Patch the live event's response_id for
@@ -11221,10 +11273,16 @@ async def _create_session_from_existing_agent(
                 _validate_acp_spec_models, selection_spec, model_override, harness_override
             )
 
-    # Inherit runner affinity from the parent session so the child
-    # is assigned to the same runner (sub-agent co-location).
+    if (
+        body.child_session_id is not None
+        and await asyncio.to_thread(conversation_store.get_conversation, body.child_session_id)
+        is not None
+    ):
+        raise OmnigentError("child session identity already exists", code=ErrorCode.CONFLICT)
+
+    # Co-locate by default; an explicit host selects an independent runner.
     inherited_runner_id: str | None = None
-    if body.parent_session_id is not None:
+    if body.parent_session_id is not None and body.host_id is None:
         parent_conv = _parent_for_routing
         if parent_conv is not None:
             inherited_runner_id = parent_conv.runner_id
@@ -11479,8 +11537,13 @@ async def _create_session_from_existing_agent(
     # that user can never change code running here. A child reusing its parent's
     # agent stays on it: collaborators act in the owner's session. A failed create
     # below keeps the copy: it is listed to its owner from the start, so another of
-    # their requests may already be using it.
-    if _parent_for_routing is None or _parent_for_routing.agent_id != agent.id:
+    # their requests may already be using it. Independent host placement must
+    # keep this copy boundary even when the agent matches the shared parent.
+    if (
+        body.host_id is not None
+        or _parent_for_routing is None
+        or _parent_for_routing.agent_id != agent.id
+    ):
         agent = await asyncio.to_thread(
             agent_for_user, agent_store, artifact_store, agent, user_id
         )
@@ -11499,6 +11562,7 @@ async def _create_session_from_existing_agent(
         with creation_stage("create_persistence_ms"):
             conv = conversation_store.create_conversation(
                 agent_id=agent.id,
+                **({"conversation_id": body.child_session_id} if body.child_session_id else {}),
                 title=body.title,
                 parent_conversation_id=body.parent_session_id,
                 runner_id=inherited_runner_id,

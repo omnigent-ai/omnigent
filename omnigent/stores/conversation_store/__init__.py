@@ -1116,6 +1116,12 @@ class ConversationStore(ABC):
         """
         ...
 
+    def compare_and_set_labels(
+        self, conversation_id: str, expected: dict[str, str | None], updates: dict[str, str]
+    ) -> bool:
+        """Atomically update labels only while every expected value still matches."""
+        raise NotImplementedError("this store does not support conditional label updates")
+
     @abstractmethod
     def set_labels(
         self,
@@ -1787,6 +1793,7 @@ class ConversationStore(ABC):
         agent_name: str,
         agent_bundle_location: str,
         agent_description: str | None,
+        conversation_id: str | None = None,
         title: str | None = None,
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,

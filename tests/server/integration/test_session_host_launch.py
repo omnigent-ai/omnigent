@@ -422,10 +422,12 @@ async def _answer_runner_status_then_wait_for_launch(
     return None
 
 
+@pytest.mark.parametrize("as_child", [False, True])
 async def test_inline_launch_binds_runner_and_returns_host(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
+    as_child: bool,
 ) -> None:
     """Happy path: ``POST /v1/sessions`` with ``host_id`` + ``workspace``
     validates the workspace, binds a runner, launches it, and returns
@@ -436,11 +438,18 @@ async def test_inline_launch_binds_runner_and_returns_host(
     """
     comm = await _connect_host(app)
     agent = await create_test_agent(client)
+    payload = {"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE}
+    if as_child:
+        parent = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+        assert parent.status_code == 201, parent.text
+        payload["parent_session_id"] = parent.json()["id"]
+        payload["child_session_id"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        SqlAlchemyConversationStore(db_uri).set_runner_id(parent.json()["id"], "runner_parent")
 
     responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
     resp = await client.post(
         "/v1/sessions",
-        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+        json=payload,
     )
     await responder
 
@@ -465,6 +474,13 @@ async def test_inline_launch_binds_runner_and_returns_host(
     assert conv.runner_id == body["runner_id"]
     assert conv.host_id == _HOST_ID
     assert conv.workspace == _WORKSPACE
+    if as_child:
+        assert conv.id == payload["child_session_id"]
+        assert conv.parent_conversation_id == payload["parent_session_id"]
+        assert conv.kind == "sub_agent"
+        assert conv.runner_id != "runner_parent"
+        duplicate = await client.post("/v1/sessions", json=payload)
+        assert duplicate.status_code == 409, duplicate.text
 
 
 async def test_inline_launch_stamps_terminal_view_label_at_creation(

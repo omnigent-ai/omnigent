@@ -1631,6 +1631,10 @@ def register_events_routes(
                             "Couldn't confirm the session's runner stopped. Please try again.",
                             code=ErrorCode.RUNNER_UNAVAILABLE,
                         )
+                if stop_conv.parent_conversation_id:
+                    from omnigent.server.remote_children import confirm_remote_stop
+
+                    await asyncio.to_thread(confirm_remote_stop, conversation_store, session_id)
             if not stop_delivered:
                 # False-success backstop. The stop reached NO live runner
                 # (``_stop_session_via_runner`` returned False, so there was
@@ -1911,6 +1915,15 @@ def register_events_routes(
             _signal_harness_elicitation_resolved_by_id(session_id, elicitation_id)
             return {"queued": False}
         if body.type in (_EXTERNAL_SESSION_STATUS_TYPE, _SUBAGENT_STATUS_TYPE):
+            from omnigent.remote_child_protocol import REMOTE_CHILD_STATE
+
+            remote_receipt = (
+                conv.host_id and conv.parent_conversation_id and REMOTE_CHILD_STATE in conv.labels
+            )
+            if remote_receipt and not _has_runner_created_by_authority(request, conv):
+                raise OmnigentError(
+                    "remote turn receipts require the bound runner", code=ErrorCode.FORBIDDEN
+                )
             status = body.data.get("status")
             if body.type == _SUBAGENT_STATUS_TYPE:
                 if body.data.get("idle") is not True:
@@ -2115,6 +2128,38 @@ def register_events_routes(
                 )
             forward_body = body.model_dump()
             forward_body["data"] = data
+            if remote_receipt:
+                from omnigent.server.remote_children import record_remote_turn
+
+                if body.type == _EXTERNAL_SESSION_STATUS_TYPE:
+                    confirmed = data.get("turn_outcome")
+                    edge = (
+                        "running"
+                        if status == "running"
+                        else (
+                            confirmed
+                            if confirmed in {"completed", "failed", "cancelled"}
+                            else "completed"
+                            if status == "idle" and data.get("turn_completed") is True
+                            else "failed"
+                            if status == "failed"
+                            else "unconfirmed"
+                        )
+                    )
+                    recorded = await asyncio.to_thread(
+                        record_remote_turn,
+                        conversation_store,
+                        session_id,
+                        response_id=response_id,
+                        status=edge,
+                        allow_empty=body.data.get("output") == "",
+                    )
+                    if not recorded:
+                        raise OmnigentError(
+                            "remote result transcript is not yet durable",
+                            code=ErrorCode.RUNNER_UNAVAILABLE,
+                        )
+                    return {"queued": False}
             runner_result = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
@@ -3032,6 +3077,20 @@ def register_events_routes(
             if pending_background_title is not None:
                 pending_background_title.schedule(expected_seed_title=conv.title)
             return {"queued": True, "item_id": item_id}
+        if body.type == "message" and conv.host_id and conv.parent_conversation_id:
+            from omnigent.remote_child_protocol import REMOTE_CHILD_STATE
+            from omnigent.server.remote_children import claim_remote_dispatch
+
+            dispatch_id = body.data.get("remote_dispatch_id")
+            if isinstance(dispatch_id, str):
+                await asyncio.to_thread(
+                    claim_remote_dispatch, conversation_store, session_id, dispatch_id
+                )
+            elif REMOTE_CHILD_STATE in conv.labels:
+                raise OmnigentError(
+                    "use sys_session_send for a remotely dispatched child",
+                    code=ErrorCode.CONFLICT,
+                )
         dispatch = await _dispatch_session_event_to_runner(
             session_id,
             conv,

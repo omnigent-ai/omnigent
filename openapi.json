@@ -12755,6 +12755,32 @@
         ]
       }
     },
+    "/v1/session-create-capabilities": {
+      "get": {
+        "description": "Allow newer runners to refuse remote placement on older servers.",
+        "operationId": "session_create_capabilities_v1_session_create_capabilities_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "title": "Response Session Create Capabilities V1 Session Create Capabilities Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Session Create Capabilities",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions": {
       "get": {
         "description": "List sessions with cursor-based pagination.\n\nSessions are conversations with a non-`None` `agent_id`\n\u2014 i.e. those created via `POST /v1/sessions`.\nConversations without an agent binding are excluded.\n\n**Returns:** A `PaginatedList` of `SessionListItem`.",
