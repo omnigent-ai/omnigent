@@ -273,6 +273,9 @@ export function KeyboardShortcutsDialog() {
       // trigger, so require the platform command modifier and no Shift/Alt to
       // avoid clashing (only ⌘/ on macOS, only Ctrl+/ on Win/Linux).
       if (hasCommandModifier(e) && !e.altKey && !e.shiftKey && e.key === "/") {
+        // A focused terminal claims Ctrl+/ for its PTY (Codex's side-conversation
+        // toggle); yield like the other global hotkeys when the chord is taken.
+        if (e.defaultPrevented) return;
         e.preventDefault();
         setOpen((prev) => !prev);
       }
