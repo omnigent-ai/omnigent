@@ -122,7 +122,7 @@ WORKDIR /build
 
 # Manifests + SDK path-deps first so the install layer caches across
 # pure source edits.
-COPY pyproject.toml setup.py ./
+COPY pyproject.toml setup.py uv.lock ./
 # License + third-party attribution travel into the published images (the host
 # and runtime targets COPY /build below), since the image redistributes the
 # dependency bytes baked in by the install step.
@@ -143,11 +143,11 @@ RUN python -m venv /opt/venv
 ENV VIRTUAL_ENV=/opt/venv \
     PATH="/opt/venv/bin:${PATH}"
 
-# Install omnigent. Editable install (-e) is required because
-# pyproject.toml declares the sibling SDKs as editable path deps via
-# [tool.uv.sources]. The runtime stages preserve /build/ so the venv's
-# .pth references stay valid.
-RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} -e .
+# Sync installs the locked dependencies and sibling SDK path sources. Install
+# the root project editable without dependencies so pip cannot re-resolve them.
+RUN uv sync --active --locked --no-dev --no-install-project \
+      --index-url ${PYPI_INDEX_URL} \
+ && uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} --no-deps -e .
 
 # ── Server builder ──────────────────────────────────────
 # Server-only additions on top of the shared builder: the SPA bundle
@@ -163,18 +163,24 @@ COPY --from=web-builder /web/omnigent/server/static/web-ui ./omnigent/server/sta
 RUN test -f ./omnigent/server/static/web-ui/index.html \
     || (echo "ERROR: SPA bundle missing after web-builder stage — check the web build." && exit 1)
 
-# psycopg[binary] is not a baseline dep — pulled in by the
-# [databricks] extra in pyproject — so add it explicitly here.
-RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'psycopg[binary]>=3.1,<4'
-
 # Optional managed-sandbox provider extras for the SERVER (the launcher imports
 # the provider SDK — e.g. the kubernetes client for `sandbox.provider:
 # kubernetes`). Off by default; the runner host image needs none of these. Build
 # with `--build-arg OMNIGENT_EXTRAS=kubernetes` (comma-separate for several).
 ARG OMNIGENT_EXTRAS=
 RUN if [ -n "${OMNIGENT_EXTRAS}" ]; then \
-        uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} -e ".[${OMNIGENT_EXTRAS}]"; \
-    fi
+        extras="$(printf '%s' "${OMNIGENT_EXTRAS}" | sed 's/,/ --extra /g')"; \
+        uv sync --active --locked --no-dev --no-install-project \
+            --index-url ${PYPI_INDEX_URL} --extra postgres --extra ${extras}; \
+    else \
+        uv sync --active --locked --no-dev --no-install-project \
+            --index-url ${PYPI_INDEX_URL} --extra postgres; \
+    fi \
+ && uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} --no-deps -e .
+
+# Keep the explicit server driver install; the locked postgres extra above
+# means this remains a no-op unless the server driver needs repairing.
+RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'psycopg[binary]>=3.1,<4'
 
 # ── Node alias stage ─────────────────────────────────────
 # Pure alias so the host stage can COPY node out of a version-pinned
