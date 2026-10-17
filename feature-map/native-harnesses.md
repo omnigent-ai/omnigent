@@ -313,11 +313,15 @@ Cross-harness journeys:
   covers the real CLI and transcript forwarder through the repro environment.
   It requires Claude Code and tmux; machine-managed Claude settings need an
   isolated container for the scripted model endpoint.
-  If shell mode or the prompt-history search still occupies Claude Code's input
-  box after Omnigent tries to dismiss it with Escape, the web message is refused
-  with a notice to open the terminal, dismiss it, and resend. No message text is
-  typed into the pane.
-  `tests/harnesses/claude_native/test_claude_native_bridge.py::test_inject_user_message_refuses_a_shell_mode_draft_escape_cannot_clear`
+  Before typing, Omnigent dismisses shell mode and the prompt-history search
+  with Escape. A typed shell command keeps the box in shell mode through
+  Escape, so it is cleared with Ctrl+U instead and never runs;
+  `tests/harnesses/claude_native/test_claude_native_shell_mode_draft.py` covers
+  it with a fake input box (plain `uv run pytest`). If either surface still
+  occupies Claude Code's input box afterwards, the web message is refused with a
+  notice to open the terminal, dismiss it, and resend. No message text is typed
+  into the pane.
+  `tests/harnesses/claude_native/test_claude_native_bridge.py::test_inject_user_message_refuses_a_shell_mode_draft_it_cannot_clear`
   covers the refusal with a fake tmux (plain `uv run pytest`);
   `tests/e2e_ui/messages/test_claude_native_refused_delivery_persistence.py::test_claude_refused_message_survives_reload`
   (own environment; a scripted stand-in for the Claude TUI and real tmux) checks
