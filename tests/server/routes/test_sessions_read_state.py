@@ -95,9 +95,13 @@ def _reset_read_state() -> Iterator[None]:
     """Clear the module-level read-state caches around each test."""
     sessions_mod._read_last_seen.clear()
     sessions_mod._read_explicit_unread.clear()
+    sessions_mod._session_status_cache.clear()
+    sessions_mod._session_finished_at_cache.clear()
     yield
     sessions_mod._read_last_seen.clear()
     sessions_mod._read_explicit_unread.clear()
+    sessions_mod._session_status_cache.clear()
+    sessions_mod._session_finished_at_cache.clear()
 
 
 def test_put_mark_unread_returns_204_and_updates_cache() -> None:
@@ -188,6 +192,72 @@ def test_read_state_is_scoped_per_user() -> None:
     del client, app
 
 
+def test_publish_status_stamps_turn_finish() -> None:
+    """A running -> idle edge stamps the session's turn-finish time."""
+    sessions_mod._publish_status("conv_a", "running")
+    assert "conv_a" not in sessions_mod._session_finished_at_cache
+
+    sessions_mod._publish_status("conv_a", "idle")
+    assert sessions_mod._session_finished_at_cache["conv_a"] > 0
+
+
+def test_publish_status_stamps_waiting_to_failed_finish() -> None:
+    """A waiting -> failed edge is a turn finish too (a stop worth surfacing)."""
+    sessions_mod._publish_status("conv_a", "waiting")
+    sessions_mod._publish_status("conv_a", "failed")
+    assert sessions_mod._session_finished_at_cache["conv_a"] > 0
+
+
+def test_publish_status_does_not_stamp_without_an_in_flight_previous() -> None:
+    """An idle publish with no known in-flight status is not a finish.
+
+    Covers the restart/hydration case: clients treat a missing stamp as
+    not-watched and still notify, so a conservative no-stamp is safe.
+    """
+    sessions_mod._publish_status("conv_a", "idle")
+    assert "conv_a" not in sessions_mod._session_finished_at_cache
+
+    sessions_mod._publish_status("conv_a", "idle")
+    assert "conv_a" not in sessions_mod._session_finished_at_cache
+
+
+def test_list_item_embeds_last_finished_at() -> None:
+    """``_build_session_list_item`` reflects the turn-finish stamp."""
+    item_before = _build_item(None, _make_conversation("conv_a"))
+    assert item_before.last_finished_at is None  # type: ignore[attr-defined]
+
+    sessions_mod._publish_status("conv_a", "running")
+    sessions_mod._publish_status("conv_a", "idle")
+
+    item_after = _build_item(None, _make_conversation("conv_a"))
+    assert (  # type: ignore[attr-defined]
+        item_after.last_finished_at == sessions_mod._session_finished_at_cache["conv_a"]
+    )
+
+
+def test_relinquish_clears_last_finished_at() -> None:
+    """Handing the relay to another replica drops the local finish stamp.
+
+    The non-owner must then serve ``last_finished_at = None`` (fail open)
+    rather than a stale earlier-turn stamp that could suppress a notification
+    for a newer finish observed on the owning replica.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    sessions_mod._publish_status("conv_a", "running")
+    sessions_mod._publish_status("conv_a", "idle")
+    assert (  # type: ignore[attr-defined]
+        _build_item(None, _make_conversation("conv_a")).last_finished_at is not None
+    )
+
+    orchestration._relinquish_session_live_state("conv_a")
+
+    assert "conv_a" not in sessions_mod._session_finished_at_cache
+    assert (  # type: ignore[attr-defined]
+        _build_item(None, _make_conversation("conv_a")).last_finished_at is None
+    )
+
+
 def test_prune_clears_read_state_across_all_users() -> None:
     """Pruning a session drops its read-state from every user's caches."""
     sessions_mod._set_read_state("alice@example.com", "conv_a", 4_999, True)
@@ -201,3 +271,14 @@ def test_prune_clears_read_state_across_all_users() -> None:
     assert sessions_mod._read_state_entry("bob@example.com", "conv_a") == (None, False)
     # ...but other sessions are untouched.
     assert sessions_mod._read_state_entry("alice@example.com", "conv_b") == (200, True)
+
+
+def test_prune_clears_last_finished_at() -> None:
+    """Pruning a deleted/archived session drops its turn-finish stamp."""
+    sessions_mod._publish_status("conv_a", "running")
+    sessions_mod._publish_status("conv_a", "idle")
+    assert "conv_a" in sessions_mod._session_finished_at_cache
+
+    sessions_mod._prune_session_read_state("conv_a")
+
+    assert "conv_a" not in sessions_mod._session_finished_at_cache
