@@ -241,6 +241,7 @@ def _to_conversation(
         cost_control_mode_override=overrides["cost_control_mode_override"],
         subagent_routing_override=overrides["subagent_routing_override"],
         harness_override=overrides["harness_override"],
+        env_passthrough_values=overrides["env_passthrough_values"],
         # Stored as ``"on"`` / absent; surfaced as a plain bool on the entity.
         share_workspace_files=overrides["share_workspace_files"] == "on",
         sub_agent_name=meta.sub_agent_name if meta else None,
@@ -3334,6 +3335,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         _unset_subagent_routing_override: bool = False,
         harness_override: str | None = None,
         _unset_harness_override: bool = False,
+        env_passthrough_values: dict[str, str] | None = None,
         share_workspace_files: bool | None = None,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
@@ -3372,6 +3374,11 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param _unset_harness_override: When ``True``, clear
             ``harness_override`` to ``None`` (used to replace the
             ``"auto"`` sentinel after first-message routing resolves).
+        :param env_passthrough_values: Per-session values for spec-declared
+            env-var names, e.g. ``{"OTEL_RESOURCE_ATTRIBUTES": "run.id=42"}``.
+            ``None`` leaves unchanged; a non-empty mapping replaces the stored
+            value wholesale. Write-once in practice — the create route is the
+            only caller, because the harness bakes these into its process env.
         :param share_workspace_files: Whether view-level collaborators may
             browse the workspace. ``True`` stores the share flag, ``False``
             clears it (back to edit-only), ``None`` leaves it unchanged.
@@ -3451,6 +3458,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 overrides_changed = True
             elif harness_override is not None:
                 overrides["harness_override"] = harness_override
+                overrides_changed = True
+            if env_passthrough_values:
+                overrides["env_passthrough_values"] = dict(env_passthrough_values)
                 overrides_changed = True
             # Two-state flag: True stores ``"on"``, False clears it (edit-only
             # again), None leaves it untouched.
@@ -3547,6 +3557,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         _unset_subagent_routing_override: bool = False,
         harness_override: str | None = None,
         _unset_harness_override: bool = False,
+        env_passthrough_values: dict[str, str] | None = None,
         share_workspace_files: bool | None = None,
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
@@ -3566,6 +3577,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             _unset_subagent_routing_override=_unset_subagent_routing_override,
             harness_override=harness_override,
             _unset_harness_override=_unset_harness_override,
+            env_passthrough_values=env_passthrough_values,
             share_workspace_files=share_workspace_files,
             terminal_launch_args=terminal_launch_args,
             archived=archived,

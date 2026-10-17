@@ -239,6 +239,47 @@ async def test_create_session_rejects_malformed_model_override(
     )
 
 
+async def test_create_session_rejects_undeclared_env_passthrough_value(
+    client: httpx.AsyncClient,
+) -> None:
+    """A per-session env value the spec never declared 400s at create.
+
+    The value lands on the harness subprocess environment, so the spec's
+    ``os_env.sandbox.env_passthrough`` is the trust boundary, not the client's
+    request. Rejecting beats dropping: a silently ignored value looks identical
+    to a working one from the dispatcher's side.
+    """
+    agent = await create_test_agent(client)
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "initial_items": [],
+            "env_passthrough_values": {"OTEL_RESOURCE_ATTRIBUTES": "myapp.run.id=42"},
+        },
+    )
+    assert resp.status_code == 400, (
+        f"undeclared env_passthrough_values should 400, got {resp.status_code}: {resp.text}"
+    )
+    assert "OTEL_RESOURCE_ATTRIBUTES" in resp.text
+
+
+async def test_create_session_rejects_a_dangerous_env_name(
+    client: httpx.AsyncClient,
+) -> None:
+    """``PATH`` is refused for the same reason: the spec does not declare it."""
+    agent = await create_test_agent(client)
+    resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "initial_items": [],
+            "env_passthrough_values": {"PATH": "/tmp/evil"},
+        },
+    )
+    assert resp.status_code == 400, f"PATH should 400, got {resp.status_code}: {resp.text}"
+
+
 async def test_create_session_with_reasoning_effort_persists(
     client: httpx.AsyncClient,
 ) -> None:
