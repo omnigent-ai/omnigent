@@ -4455,6 +4455,53 @@ def test_codex_terminal_reuse_requires_a_live_backend_after_a_startup_failure(
         _AUTO_CODEX_BRIDGE_DIRS.pop(session_id, None)
 
 
+@pytest.mark.parametrize(
+    ("startup_code", "expected"),
+    [
+        # A healthy registered app-server keeps its pane.
+        (None, True),
+        # Other causes recorded against a live backend keep it too.
+        ("databricks_sign_in_pending", True),
+        ("codex_thread_not_started", True),
+        # The executor found the live app-server silent: the next ensure replaces it.
+        ("codex_app_server_stopped", False),
+    ],
+)
+def test_registered_codex_app_server_is_replaced_only_when_recorded_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    startup_code: str | None,
+    expected: bool,
+) -> None:
+    """
+    A registered, still-running app-server that stopped answering requests keeps
+    failing every send until it is replaced, so only the executor's stop record
+    makes its pane non-reusable.
+    """
+    from omnigent.runner.app import _AUTO_CODEX_APP_SERVERS
+    from omnigent.runner.native.orchestration import _is_runner_owned_codex_terminal
+
+    session_id = "8c3d2e1f0a9b4c7d8e6f5a4b3c2d1e0f"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    bridge_dir = codex_native_bridge.prepare_bridge_dir(session_id)
+    if startup_code == codex_native_bridge.CODEX_APP_SERVER_STOPPED.code:
+        codex_native_bridge.record_app_server_stopped(bridge_dir)
+    elif startup_code is not None:
+        codex_native_bridge.write_bridge_startup_error(
+            bridge_dir, "Codex is still starting.", code=startup_code
+        )
+    view = SessionResourceView(
+        id="terminal_codex_main", type="terminal", session_id=session_id, name="Codex"
+    )
+    _AUTO_CODEX_APP_SERVERS[session_id] = object()  # type: ignore[assignment]
+    try:
+        reusable = _is_runner_owned_codex_terminal(_CodexPaneRegistry(), view)  # type: ignore[arg-type]
+    finally:
+        _AUTO_CODEX_APP_SERVERS.pop(session_id, None)
+
+    assert reusable is expected
+
+
 @pytest.mark.asyncio
 async def test_codex_app_server_teardown_forgets_the_launch_bridge_dir(tmp_path: Path) -> None:
     """Tearing a session down drops its remembered bridge dir, so the map stays bounded."""

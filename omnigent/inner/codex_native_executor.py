@@ -117,7 +117,7 @@ class _CodexAppServerUnresponsive(RuntimeError):
 def _record_unresponsive_app_server(
     bridge_dir: Path, state: CodexNativeBridgeState, method: str
 ) -> None:
-    """Log the unanswered stage and leave the app-server's stop record in the bridge."""
+    """Log the unanswered stage and record the app-server stopped, so the runner replaces it."""
     _logger.warning(
         "Codex native app-server stopped responding during %s; recording it as stopped",
         method,
@@ -130,7 +130,10 @@ def _record_unresponsive_app_server(
             )
         ),
     )
-    record_app_server_stopped(bridge_dir)
+    current = read_bridge_state(bridge_dir)
+    # Once a relaunch publishes a new transport, this record would condemn the new app-server.
+    if current is not None and current.socket_path == state.socket_path:
+        record_app_server_stopped(bridge_dir)
 
 
 async def _bounded_request(

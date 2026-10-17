@@ -2531,7 +2531,11 @@ async def test_cancel_during_connect_closes_the_half_open_client(
 
 @contextlib.asynccontextmanager
 async def _silent_app_server(
-    tmp_path: Path, silent_method: str, *, active_turn_id: str | None = None
+    tmp_path: Path,
+    silent_method: str,
+    *,
+    active_turn_id: str | None = None,
+    on_silent: Callable[[], None] | None = None,
 ) -> AsyncIterator[list[str]]:
     """
     Serve a real app-server peer that stays connected but never answers one method.
@@ -2539,6 +2543,7 @@ async def _silent_app_server(
     :param tmp_path: Bridge directory, seeded to point at the peer.
     :param silent_method: Method left unanswered, e.g. ``"initialize"``.
     :param active_turn_id: Active turn id to seed, or ``None``.
+    :param on_silent: Called when the unanswered request arrives, or ``None``.
     :returns: The request methods the peer received, in order.
     """
     methods: list[str] = []
@@ -2557,6 +2562,8 @@ async def _silent_app_server(
             if request["method"] != silent_method:
                 result = results.get(request["method"], {})
                 await websocket.send(json.dumps({"id": request["id"], "result": result}))
+            elif on_silent is not None:
+                on_silent()
 
     async with serve(handle, "127.0.0.1", 0) as server:
         port = server.sockets[0].getsockname()[1]
@@ -2714,6 +2721,33 @@ async def test_unanswered_turn_rpc_fails_fast_but_stays_ambiguous(
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id == active_turn_id
+
+
+@pytest.mark.parametrize("method", ["initialize", "turn/start"])
+async def test_unanswered_rpc_after_a_relaunch_does_not_mark_the_new_app_server(
+    method: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    The runner replaces an app-server recorded as stopped, so a request to an old
+    one that times out after a relaunch republished the bridge must not leave a
+    stop record that would make the runner replace the healthy new app-server.
+    """
+    monkeypatch.setattr(codex_native_executor, "_APP_SERVER_RPC_TIMEOUT_SECONDS", 0.2)
+
+    def relaunch() -> None:
+        state = read_bridge_state(tmp_path)
+        assert state is not None
+        write_bridge_state(tmp_path, replace(state, socket_path="ws://127.0.0.1:9"))
+
+    async with _silent_app_server(tmp_path, method, on_silent=relaunch) as methods:
+        [failure] = await _run_turn_within_deadline(
+            CodexNativeExecutor(bridge_dir=tmp_path), "synthetic input"
+        )
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is (method == "initialize")
+    assert methods[-1] == method
+    assert _recorded_stop_code(tmp_path) is None
 
 
 def test_bridge_state_wait_preserves_legacy_and_configured_command_contracts(
