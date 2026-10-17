@@ -2178,17 +2178,19 @@ def test_provider_qualified_override_split_to_configured_provider() -> None:
     # Prefix split; the gateway-kind provider keeps the id verbatim.
     assert provider.model == "databricks-claude-fable-5-1"
     assert provider.credential_warning is None
+    assert provider.model_notice is None
     cfg = provider.to_models_config()
     ids = [m["id"] for prov in cfg["providers"].values() for m in prov["models"]]
     assert not [mid for mid in ids if "/" in mid]
 
 
-def test_override_qualified_by_other_configured_provider_warns() -> None:
-    """Naming a configured provider other than the serving one warns.
+def test_override_qualified_by_other_configured_provider_notifies() -> None:
+    """Naming a configured provider other than the serving one leaves a notice.
 
     The session is served by the pi-default provider, so a model picked from
     another configured provider is requested from the default instead — say
-    so rather than silently reinterpreting the value.
+    so rather than silently reinterpreting the value. The session still works,
+    so this is a neutral model notice, never a credential warning.
     """
     config = _rpw_fable_anthropic_gateway()
     config["providers"]["other-gw"] = {
@@ -2204,9 +2206,10 @@ def test_override_qualified_by_other_configured_provider_warns() -> None:
     )
     assert provider is not None
     assert provider.model == "databricks-claude-fable-5-1"
-    assert provider.credential_warning is not None
-    assert "other-gw" in provider.credential_warning
-    assert "rpw-fable" in provider.credential_warning
+    assert provider.credential_warning is None
+    assert provider.model_notice is not None
+    assert "other-gw" in provider.model_notice
+    assert "rpw-fable" in provider.model_notice
 
 
 @pytest.mark.parametrize(
