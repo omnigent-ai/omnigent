@@ -117,3 +117,46 @@ def test_tools_repair_broken_checkout_with_normal_shell_imports(
         asyncio.run(exercise())
     finally:
         env.close()
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("bwrap") is None,
+    reason="requires Linux and bwrap",
+)
+def test_bwrap_helper_outlives_the_worker_thread_that_started_it(tmp_path: Path) -> None:
+    """A bwrap helper must not die with the per-call thread that spawned it.
+
+    ``--die-with-parent`` fires when the forking *thread* exits. Each tool call
+    runs on a fresh thread, so a helper forked there was killed between calls
+    and in-flight requests were replayed on a replacement helper.
+    """
+    env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(
+                type="linux_bwrap",
+                read_paths=[str(_project_root() / "omnigent")],
+                write_paths=["."],
+            ),
+        )
+    )
+    assert isinstance(env, CallerProcessOSEnvironment)
+
+    async def exercise() -> None:
+        first = await env.shell("echo one")
+        assert first.get("exit_code") == 0, first
+        proc = env._helper._proc
+        assert proc is not None
+        # The spawning worker thread has exited by now; give a parent-death
+        # signal ample time to land if the helper were still bound to it.
+        await asyncio.sleep(0.5)
+        assert proc.poll() is None, f"helper died with its spawning thread: {proc.returncode}"
+        second = await env.shell("echo two")
+        assert second.get("exit_code") == 0, second
+        assert env._helper._proc is proc
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        env.close()

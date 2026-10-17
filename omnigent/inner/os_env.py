@@ -5,11 +5,13 @@ from __future__ import annotations
 import atexit
 import base64
 import codecs
+import concurrent.futures
 import contextlib
 import errno
 import json
 import logging
 import os
+import queue
 import shutil
 import stat
 import subprocess
@@ -17,7 +19,7 @@ import sys
 import tempfile
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict, cast
@@ -383,6 +385,73 @@ class OSEnvironment(ABC):
         """
 
 
+_SpawnJob: TypeAlias = tuple[
+    Callable[[], "subprocess.Popen[str]"],
+    "concurrent.futures.Future[subprocess.Popen[str]]",
+]
+
+
+class _HelperSpawner:
+    """Start helper processes from one long-lived daemon thread.
+
+    ``linux_bwrap`` launches the helper with ``--die-with-parent``
+    (``PR_SET_PDEATHSIG``), and Linux treats the *thread* that forked a child
+    as its parent. Every :func:`run_sync_on_thread` call runs on a fresh
+    thread, so a helper forked there was SIGKILLed as soon as that thread
+    exited, often while serving the next request, which
+    :meth:`_HelperProcessClient._request_locked` then replayed on a new helper
+    (running a non-idempotent edit or shell command twice). Forking from a
+    thread that lives as long as the process keeps ``--die-with-parent``
+    meaning "the runner died".
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._jobs: queue.SimpleQueue[_SpawnJob] | None = None
+
+    def start(self, spawn: Callable[[], subprocess.Popen[str]]) -> subprocess.Popen[str]:
+        """Run *spawn* on the spawner thread and return the started process.
+
+        :param spawn: Zero-argument callable that starts the helper, e.g. a
+            ``subprocess.Popen`` call bound with its arguments.
+        :returns: The process *spawn* started.
+        """
+        future: concurrent.futures.Future[subprocess.Popen[str]] = concurrent.futures.Future()
+        self._queue().put((spawn, future))
+        return future.result()
+
+    def _queue(self) -> queue.SimpleQueue[_SpawnJob]:
+        with self._lock:
+            if self._jobs is None:
+                self._jobs = queue.SimpleQueue()
+                threading.Thread(
+                    target=self._serve,
+                    args=(self._jobs,),
+                    name="omnigent-os-helper-spawner",
+                    daemon=True,
+                ).start()
+            return self._jobs
+
+    @staticmethod
+    def _serve(jobs: queue.SimpleQueue[_SpawnJob]) -> None:
+        while True:
+            spawn, future = jobs.get()
+            try:
+                future.set_result(spawn())
+            except BaseException as exc:  # noqa: BLE001 — forwarded to the requesting thread
+                future.set_exception(exc)
+
+    def _reset_after_fork(self) -> None:
+        # The spawner thread does not survive fork; the child starts its own.
+        self._lock = threading.Lock()
+        self._jobs = None
+
+
+_HELPER_SPAWNER = _HelperSpawner()
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_HELPER_SPAWNER._reset_after_fork)
+
+
 class _HelperProcessClient:
     """JSON-line RPC client for the sandboxed OS helper process."""
 
@@ -649,16 +718,20 @@ class _HelperProcessClient:
         if r_fd is not None:
             popen_kwargs["pass_fds"] = (r_fd,)
         try:
-            self._proc = subprocess.Popen(
-                spawn_argv,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                cwd="/" if sandbox.copy_on_write_namespace else str(self.cwd),
-                env=env,
-                **popen_kwargs,
+            # Fork from the long-lived spawner thread, not this (often
+            # short-lived) worker thread; see :class:`_HelperSpawner`.
+            self._proc = _HELPER_SPAWNER.start(
+                lambda: subprocess.Popen(
+                    spawn_argv,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    cwd="/" if sandbox.copy_on_write_namespace else str(self.cwd),
+                    env=env,
+                    **popen_kwargs,
+                )
             )
         except Exception:
             self._stop_locked()
