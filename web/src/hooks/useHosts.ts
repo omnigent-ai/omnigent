@@ -4,10 +4,11 @@ import {
   useQuery,
   useQueryClient,
   type QueryClient,
+  type UseQueryResult,
 } from "@tanstack/react-query";
-import { useEffect, useLayoutEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { authenticatedFetch } from "@/lib/identity";
-import { ApiError } from "@/lib/sessionsApi";
+import { ApiError, apiErrorFromResponse } from "@/lib/sessionsApi";
 import type { NativeModelOption } from "@/lib/types";
 
 export interface Host {
@@ -93,28 +94,76 @@ export function useHosts(options: UseHostsOptions = {}) {
   });
 }
 
-async function fetchHostModelOptions(
+// Client deadline for one model-options request. The server gives the host 15 s
+// and replies 504 after that, so this only fires when the request itself is stuck.
+export const MODEL_OPTIONS_TIMEOUT_MS = 30_000;
+/** Refresh cadence of the selected harness's catalog, and its stale window. */
+export const MODEL_OPTIONS_POLL_INTERVAL_MS = 15_000;
+
+/** The query result fields consumers read. `error`, `isError` and `status` stay
+ *  settled while a data-less refetch is in flight, where React Query reports pending. */
+export interface HostModelOptionsResult {
+  data: NativeModelOption[] | undefined;
+  error: Error | null;
+  status: "pending" | "error" | "success";
+  fetchStatus: "fetching" | "paused" | "idle";
+  failureCount: number;
+  isPending: boolean;
+  isError: boolean;
+  isSuccess: boolean;
+  isLoading: boolean;
+  isFetching: boolean;
+  refetch: UseQueryResult<NativeModelOption[], Error>["refetch"];
+}
+
+/** The host did not answer: either the client deadline or the server's 504. */
+function isHostTimeout(error: unknown): boolean {
+  return (
+    (error instanceof DOMException && error.name === "TimeoutError") ||
+    (error instanceof ApiError && error.status === 504)
+  );
+}
+
+async function readHostModelOptions(
   hostId: string,
   harness: string,
+  signal: AbortSignal,
 ): Promise<NativeModelOption[]> {
   const res = await authenticatedFetch(
     `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/model-options`,
+    { signal },
   );
-  if (!res.ok) {
-    let detail = `${res.status} ${res.statusText}`;
-    try {
-      const body = (await res.json()) as { detail?: unknown };
-      if (typeof body.detail === "string" && body.detail) detail = body.detail;
-    } catch {
-      // Non-JSON error body — keep the status-line detail.
-    }
-    throw new Error(detail);
-  }
+  if (!res.ok) throw await apiErrorFromResponse(res);
   const body = (await res.json()) as { models?: NativeModelOption[]; error?: string };
   const models = body.models ?? [];
   // Backward compatibility with servers that encoded probe failure in a 200.
   if (models.length === 0 && body.error) throw new Error(body.error);
   return models;
+}
+
+async function fetchHostModelOptions(
+  hostId: string,
+  harness: string,
+): Promise<NativeModelOption[]> {
+  // Race the whole request, body included, against the deadline so the query
+  // settles even when the transport never answers or ignores the abort.
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const reason = new DOMException(
+        `host '${hostId}' did not return model options within ${MODEL_OPTIONS_TIMEOUT_MS / 1000}s`,
+        "TimeoutError",
+      );
+      controller.abort(reason);
+      reject(reason);
+    }, MODEL_OPTIONS_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([readHostModelOptions(hostId, harness, controller.signal), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // A shared request may start from an inactive observer while another needs retries.
@@ -126,7 +175,7 @@ export function useHostModelOptions(
   harness: string,
   enabled = true,
   { poll = true }: { poll?: boolean } = {},
-) {
+): HostModelOptionsResult {
   const queryClient = useQueryClient();
   const canRefresh = enabled && hostId !== null && poll;
   const pollerKey = JSON.stringify([hostId, harness]);
@@ -152,24 +201,57 @@ export function useHostModelOptions(
     enabled: enabled && hostId !== null,
     // Poll the active picker for provider changes; inactive harnesses can
     // fetch eagerly without periodic refreshes or background retries.
-    staleTime: 15_000,
-    refetchInterval: canRefresh ? 15_000 : false,
+    staleTime: MODEL_OPTIONS_POLL_INTERVAL_MS,
+    refetchInterval: canRefresh ? MODEL_OPTIONS_POLL_INTERVAL_MS : false,
     ...(!poll && { refetchOnWindowFocus: false, refetchOnReconnect: false }),
-    // Retry boot-probe races while any picker uses this catalog. Persistent
-    // failures surface after bounded backoff (~22 s).
-    retry: (failureCount) =>
-      (modelCatalogPollers.get(queryClient)?.get(pollerKey) ?? 0) > 0 && failureCount < 6,
+    // Retry boot-probe races while any picker uses this catalog (bounded, ~22 s).
+    // Host timeouts are not boot races: skip the backoff; the poll retries them.
+    retry: (failureCount, error) =>
+      !isHostTimeout(error) &&
+      (modelCatalogPollers.get(queryClient)?.get(pollerKey) ?? 0) > 0 &&
+      failureCount < 6,
     retryDelay: (attempt) => Math.min(5_000, 1_000 * 2 ** attempt),
   });
   const previouslyRefreshing = useRef(canRefresh);
-  const { isError, isFetching, refetch } = query;
+  const { isError: failed, isFetching, refetch } = query;
   useEffect(() => {
     const becameSelected = canRefresh && !previouslyRefreshing.current;
     previouslyRefreshing.current = canRefresh;
     // Retry failed prefetches on selection without restarting exhausted retries.
-    if (becameSelected && isError && !isFetching) void refetch();
-  }, [canRefresh, isError, isFetching, refetch]);
-  return query;
+    if (becameSelected && failed && !isFetching) void refetch();
+  }, [canRefresh, failed, isFetching, refetch]);
+  // React Query drops a data-less query's error and status while it refetches.
+  // Keep each key's last failure until its catalog arrives (or the cache forgets
+  // the failure), so a settled picker keeps its message while the poll retries.
+  const [failures, setFailures] = useState(() => new Map<string, Error>());
+  useEffect(() => {
+    if (query.isError) {
+      setFailures((previous) => new Map(previous).set(pollerKey, query.error));
+    } else if (query.isSuccess) {
+      setFailures((previous) => {
+        if (!previous.has(pollerKey)) return previous;
+        const next = new Map(previous);
+        next.delete(pollerKey);
+        return next;
+      });
+    }
+  }, [pollerKey, query.isError, query.isSuccess, query.error]);
+  const retained = query.isPending && query.errorUpdateCount > 0 ? failures.get(pollerKey) : null;
+  const error = query.error ?? retained ?? null;
+  const isError = error !== null;
+  return {
+    data: query.data,
+    error,
+    status: isError ? "error" : query.status,
+    fetchStatus: query.fetchStatus,
+    failureCount: query.failureCount,
+    isPending: query.isPending && !isError,
+    isError,
+    isSuccess: query.isSuccess,
+    isLoading: query.isLoading && !isError,
+    isFetching: query.isFetching,
+    refetch: query.refetch,
+  };
 }
 
 interface InstallHarnessResult {
