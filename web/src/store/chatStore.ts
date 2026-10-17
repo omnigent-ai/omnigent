@@ -1193,6 +1193,14 @@ export interface ChatActions {
    */
   clearQueuedMessages: (conversationId: string) => void;
   /**
+   * Drop the named optimistic pending bubbles from a conversation, always
+   * keeping an unsent `initialDraft`. Pass the bubble ids captured when a Stop
+   * began: the server settles only the inputs queued before the stop (no
+   * `session.input.consumed` receipt), so a message sent while the stop was in
+   * flight stays live and keeps its bubble.
+   */
+  dropPendingUserMessages: (conversationId: string, tempIds: readonly string[]) => void;
+  /**
    * Flush the queue head if the session is idle and ready. Level-triggered:
    * safe to call on any state change (idempotent — no-ops when busy, when the
    * queue is empty, or when the head isn't for the bound conversation). POSTing
@@ -2096,6 +2104,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       return {
         queuedMessages: s.queuedMessages.filter((m) => m.conversationId !== conversationId),
       };
+    });
+  },
+
+  dropPendingUserMessages: (conversationId, tempIds) => {
+    const dropping = new Set(tempIds);
+    setterFor(conversationId)((s) => {
+      // A draft awaiting model readiness is unsent, so it is never dropped;
+      // the caller already narrowed tempIds to the bubbles settled by the stop.
+      const kept = s.pendingUserMessages.filter(
+        (p) => p.initialDraft !== undefined || !dropping.has(p.tempId),
+      );
+      return kept.length === s.pendingUserMessages.length ? {} : { pendingUserMessages: kept };
     });
   },
 

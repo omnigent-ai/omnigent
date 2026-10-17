@@ -46,6 +46,8 @@ import {
 import { PINNED_LABEL_KEY, PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "@/shell/sidebarNav";
+import { bindConversationForTest, useChatStore, type PendingUserMessage } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
 
 vi.mock("./useSessionUpdatesConnected", () => ({ useSessionUpdatesConnected: vi.fn() }));
 
@@ -2083,6 +2085,148 @@ describe("useStopSession invalidation", () => {
     // state. Dropping this invalidation reintroduces the bug where the
     // header lagged (Stop lingering).
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["session", "conv_x"] });
+  });
+});
+
+describe("useStopSession pending bubbles", () => {
+  // The server settles web messages queued before a stop with no consumed
+  // receipt, so the stopped session's optimistic bubbles must go with it.
+  const bubble = (tempId: string, posted = true): PendingUserMessage => ({
+    tempId,
+    content: [{ type: "input_text", text: `message ${tempId}` }],
+    posted,
+  });
+  const bubbleIds = (id: string) =>
+    conversationRegistry
+      .peek(id)!
+      .getState()
+      .pendingUserMessages.map((p) => p.tempId);
+
+  function renderStop() {
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    return renderHook(() => useStopSession(), { wrapper });
+  }
+
+  beforeEach(() => {
+    bindConversationForTest("conv_bg", { pendingUserMessages: [bubble("pend_bg")] });
+    bindConversationForTest("conv_fg", { pendingUserMessages: [bubble("pend_fg")] });
+  });
+
+  afterEach(() => {
+    conversationRegistry.clear();
+    bindConversationForTest(null);
+  });
+
+  it.each([
+    {
+      which: "active",
+      target: "conv_fg",
+      other: "conv_bg",
+      otherBubbles: ["pend_bg"],
+      projected: [] as string[],
+    },
+    {
+      which: "background",
+      target: "conv_bg",
+      other: "conv_fg",
+      otherBubbles: ["pend_fg"],
+      projected: ["pend_fg"],
+    },
+  ])(
+    "drops the stopped $which conversation's bubbles and leaves the other's",
+    async ({ target, other, otherBubbles, projected }) => {
+      fetchMock.mockResolvedValueOnce(mockResponse({ queued: false }));
+      const { result } = renderStop();
+
+      result.current.mutate(target);
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+      expect(bubbleIds(target)).toEqual([]);
+      expect(bubbleIds(other)).toEqual(otherBubbles);
+      // The composer reads the root projection of whichever entry is on screen (conv_fg).
+      expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual(projected);
+    },
+  );
+
+  it("keeps the bubbles when the stop fails", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 503 }));
+    const { result } = renderStop();
+
+    result.current.mutate("conv_fg");
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    // A stop that did not land leaves the session, and its queued messages, alive.
+    expect(bubbleIds("conv_fg")).toEqual(["pend_fg"]);
+    expect(bubbleIds("conv_bg")).toEqual(["pend_bg"]);
+  });
+
+  it("keeps a bubble sent while the stop is in flight", async () => {
+    // Defer the stop response so another send can land before onSuccess runs.
+    let settleStop!: (value: Response) => void;
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          settleStop = resolve;
+        }),
+    );
+    const { result } = renderStop();
+
+    const callsBefore = fetchMock.mock.calls.length;
+    result.current.mutate("conv_fg");
+    // Wait until the stop is in flight so onMutate has snapshotted ["pend_fg"].
+    await waitFor(() => expect(fetchMock.mock.calls.length).toBeGreaterThan(callsBefore));
+
+    // A send that lands while the stop is in flight; the server keeps it live.
+    act(() => {
+      conversationRegistry.peek("conv_fg")!.setState((s) => ({
+        pendingUserMessages: [...s.pendingUserMessages, bubble("pend_live")],
+      }));
+    });
+
+    settleStop(mockResponse({ queued: false }));
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    // Only the pre-stop bubble is dropped; the in-flight send keeps its bubble.
+    expect(bubbleIds("conv_fg")).toEqual(["pend_live"]);
+    expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual(["pend_live"]);
+  });
+
+  it("keeps an unposted send that is still in flight when the stop begins", async () => {
+    // A send whose POST is not yet acked (posted: false) can reach the server
+    // after its pre-stop snapshot, so the stop never settles it; its bubble
+    // must survive even though it was present when Stop began.
+    act(() => {
+      conversationRegistry.peek("conv_fg")!.setState((s) => ({
+        pendingUserMessages: [...s.pendingUserMessages, bubble("pend_unposted", false)],
+      }));
+    });
+    fetchMock.mockResolvedValueOnce(mockResponse({ queued: false }));
+    const { result } = renderStop();
+
+    result.current.mutate("conv_fg");
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    // The acked bubble is dropped with the stop; the unposted one stays live.
+    expect(bubbleIds("conv_fg")).toEqual(["pend_unposted"]);
+    expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual([
+      "pend_unposted",
+    ]);
+  });
+
+  it("keeps the bubbles when the stop reached no live runner", async () => {
+    // A 202 that carries stop_delivered: false means the stop never reached a
+    // runner, so nothing was settled server-side and the queued messages stay
+    // live for the relaunch; their bubbles must survive the success handler.
+    fetchMock.mockResolvedValueOnce(mockResponse({ queued: false, stop_delivered: false }));
+    const { result } = renderStop();
+
+    result.current.mutate("conv_fg");
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(bubbleIds("conv_fg")).toEqual(["pend_fg"]);
+    expect(bubbleIds("conv_bg")).toEqual(["pend_bg"]);
   });
 });
 

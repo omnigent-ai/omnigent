@@ -1563,6 +1563,9 @@ def register_events_routes(
         if body.type == _STOP_SESSION_TYPE:
             # Fence the cancelled turn, same as interrupt.
             _interrupt_fenced_sessions.add(session_id)
+            # Read before the stop so a message sent after it stays live; marked
+            # only once the stop lands, else the CLI may still record them.
+            queued_pending_ids = pending_inputs.pending_ids(session_id)
             # Harness-agnostic forward: the runner kills the external
             # process for harnesses that have one (claude-native
             # hard-kills its tmux pane) and 204s otherwise. Unlike the
@@ -1672,6 +1675,9 @@ def register_events_routes(
                         conversation_store,
                         int(time.time()) - RUNNER_LIVENESS_TTL_S,
                     )
+            if stop_delivered:
+                # What the stopped CLI had not yet recorded is cancelled, not undelivered.
+                pending_inputs.mark_interrupted(session_id, queued_pending_ids)
             # Stop is non-sticky: no persistent marker is written. The
             # runner tunnel dropping above flips ``runner_online`` to false
             # honestly, and the next message auto-relaunches the session on
@@ -1689,6 +1695,11 @@ def register_events_routes(
                 )
             except Exception:
                 pass
+            # A stop that reached no live runner leaves the pending inputs
+            # above live for the next relaunch; flag that so the web client
+            # keeps its optimistic bubbles. Delivered stops omit the flag.
+            if not stop_delivered:
+                return {"queued": False, "stop_delivered": False}
             return {"queued": False}
         if body.type == _APPROVAL_TYPE:
             # Deliver the verdict through the shared resolver: it
