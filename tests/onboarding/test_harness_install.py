@@ -1133,7 +1133,7 @@ def test_harness_cli_logged_in_uses_claude_json_verdict(
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object):
-        assert argv == ["claude", "auth", "status"]  # the status subcommand
+        assert argv == ["/usr/bin/claude", "auth", "status"]  # discovered absolute binary
         return subprocess.CompletedProcess(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
@@ -1160,7 +1160,7 @@ def test_harness_cli_logged_in_codex_uses_exit_code(
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object):
-        assert argv == ["codex", "login", "status"]  # the status subcommand
+        assert argv == ["/usr/bin/codex", "login", "status"]  # discovered absolute binary
         return subprocess.CompletedProcess(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
@@ -1191,7 +1191,7 @@ def test_harness_cli_logged_in_uses_cursor_json_verdict(
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object):
-        assert argv == ["cursor-agent", "status", "--format", "json"]
+        assert argv == ["/usr/bin/cursor-agent", "status", "--format", "json"]
         return subprocess.CompletedProcess(
             args=argv, returncode=returncode, stdout=stdout, stderr=""
         )
