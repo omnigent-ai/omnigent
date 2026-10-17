@@ -22,6 +22,7 @@ import {
   terminalTabKey,
   useTerminals,
 } from "@/hooks/useTerminals";
+import type { Session } from "@/lib/types";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { TerminalStatusBadge } from "./terminalStatus";
 import { useTerminalStatuses } from "./useTerminalStatuses";
@@ -60,6 +61,8 @@ interface MainTerminalViewProps {
   readOnly?: boolean;
   /** Known runner-tunnel state for the active session. */
   runnerOnline?: boolean;
+  /** Failed session's last task error; shown on the stopped-terminal state to explain why the harness stopped, mirroring the chat error pill. */
+  lastTaskError?: Session["lastTaskError"];
   /** Relaunch or reconnect the session without replaying user input. */
   onResume?: () => void | Promise<void>;
   /**
@@ -75,6 +78,7 @@ export function MainTerminalView({
   visible = true,
   readOnly = false,
   runnerOnline,
+  lastTaskError,
   onResume,
   onSurfaceElement,
 }: MainTerminalViewProps) {
@@ -103,6 +107,11 @@ export function MainTerminalView({
   // has caught up and explicitly reported the runner offline.
   const resumeAvailable =
     onResume !== undefined && !startingUp && (runnerOffline || terminals.length === 0);
+  // Mirror the chat error pill's actionable cause on the stopped-terminal state.
+  const failureCauseMessage =
+    typeof lastTaskError?.message === "string" && lastTaskError.message.trim().length > 0
+      ? lastTaskError.message
+      : null;
   const handleResume = useCallback(async () => {
     if (!onResume) return;
     setResumeError(null);
@@ -214,6 +223,14 @@ export function MainTerminalView({
             <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
               <div className="space-y-1">
                 <p className="font-medium text-foreground text-ui">The harness is not running.</p>
+                {failureCauseMessage ? (
+                  <p
+                    data-testid="terminal-failure-cause"
+                    className="text-destructive text-sm [overflow-wrap:anywhere]"
+                  >
+                    {failureCauseMessage}
+                  </p>
+                ) : null}
                 <p className="text-muted-foreground text-sm">
                   Resume the session to reconnect the terminal.
                 </p>

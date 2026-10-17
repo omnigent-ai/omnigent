@@ -20,6 +20,7 @@ import {
   computeShowsWorking,
   containsMarkdownTable,
   dispatchInitialPrompt,
+  failedSessionLastError,
   isCostRoutingEligible,
   isSubagentRoutingEligible,
   isUnboundCodingFork,
@@ -204,6 +205,23 @@ describe("Terminal-first surface selection", () => {
       }),
     ).toBe(false);
     expect(shouldMountTerminalSurface(null, null)).toBe(false);
+  });
+});
+
+describe("failedSessionLastError", () => {
+  const error = { code: "runner_failed_to_start", message: "host authentication failed" };
+
+  it("surfaces the error for a failed session", () => {
+    expect(failedSessionLastError({ status: "failed", lastTaskError: error })).toEqual(error);
+  });
+
+  it("hides a stale error on a session that is no longer failed", () => {
+    expect(failedSessionLastError({ status: "running", lastTaskError: error })).toBeNull();
+  });
+
+  it("returns null for a failed session with no error, or no session", () => {
+    expect(failedSessionLastError({ status: "failed" })).toBeNull();
+    expect(failedSessionLastError(null)).toBeNull();
   });
 });
 
