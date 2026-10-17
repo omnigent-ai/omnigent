@@ -965,6 +965,10 @@ class Usage(BaseModel):
         this is absent and ``total_tokens`` serves the same purpose.
         The toolbar context ring and ``/context`` command use this
         field when present, falling back to ``total_tokens``.
+    :param context_window: The context window, in tokens, the harness
+        reports it is serving for this turn's model (Codex's
+        ``modelContextWindow``). Preferred over the model-catalog window
+        for the context ring; ``None`` when the harness reports none.
     :param cache_read_input_tokens: Prompt tokens served from a
         provider prompt cache (cache hit), billed at a reduced rate.
         Reported by Anthropic-style providers as a count *separate*
@@ -995,6 +999,7 @@ class Usage(BaseModel):
     output_tokens_details: UsageDetails = Field(default_factory=UsageDetails)
     total_tokens: int = 0
     context_tokens: int | None = None
+    context_window: int | None = None
     cache_read_input_tokens: int = 0
     cache_creation_input_tokens: int = 0
     model: str | None = None

@@ -9834,6 +9834,20 @@
             "description": "Context-fill estimate for the next turn \u2014 set only by executors that make multiple LLM sub-calls per turn (e.g. `openai-agents`). For single-call executors this is absent and `total_tokens` serves the same purpose. The toolbar context ring and `/context` command use this field when present, falling back to `total_tokens`.",
             "title": "Context Tokens"
           },
+          "context_window": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The context window, in tokens, the harness reports it is serving for this turn's model (Codex's `modelContextWindow`). Preferred over the model-catalog window for the context ring; `None` when the harness reports none.",
+            "title": "Context Window"
+          },
           "cost_usd": {
             "anyOf": [
               {

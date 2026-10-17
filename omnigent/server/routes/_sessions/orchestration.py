@@ -2128,9 +2128,11 @@ def _context_labels_from_turn_usage(
     claude-native ``external_session_usage`` path writes, so the web context
     ring renders identically: the numerator
     (:data:`_LAST_CONTEXT_TOKENS_LABEL_KEY`) from ``context_tokens`` and the
-    denominator (:data:`_LAST_CONTEXT_WINDOW_LABEL_KEY`) from the model's
-    catalog window. This is what lets a model-unpinned claude-sdk session show a
-    context ring at all — it has no spec model to size the window from.
+    denominator (:data:`_LAST_CONTEXT_WINDOW_LABEL_KEY`) from the harness's
+    own ``usage.context_window`` when it reports one (codex forwards
+    ``modelContextWindow``), else the model's catalog window. This is what
+    lets a model-unpinned claude-sdk session show a context ring at all — it
+    has no spec model to size the window from.
 
     Returns an empty dict when the turn reports no ``context_tokens`` (a native
     terminal harness reports its fill via ``external_session_usage`` instead),
@@ -2145,6 +2147,14 @@ def _context_labels_from_turn_usage(
     if not isinstance(context_tokens, int) or context_tokens < 0:
         return {}
     labels: dict[str, str] = {_LAST_CONTEXT_TOKENS_LABEL_KEY: str(context_tokens)}
+    reported_window = resp_usage.get("context_window")
+    if (
+        isinstance(reported_window, int)
+        and not isinstance(reported_window, bool)
+        and reported_window > 0
+    ):
+        labels[_LAST_CONTEXT_WINDOW_LABEL_KEY] = str(reported_window)
+        return labels
     model = resp_usage.get("model")
     if isinstance(model, str) and model:
         from omnigent.llms.context_window import get_model_context_window

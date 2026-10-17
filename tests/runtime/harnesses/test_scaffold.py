@@ -959,7 +959,7 @@ async def test_scaffold_response_completed_preserves_context_tokens(
     use_usage: None,
     manager: HarnessProcessManager,
 ) -> None:
-    """Terminal usage preserves ``context_tokens`` from the inner executor.
+    """Terminal usage preserves ``context_tokens`` and ``context_window``.
 
     Billing totals (``total_tokens`` summed across sub-calls) are
     split from context-fill totals (``context_tokens`` = last
@@ -968,7 +968,9 @@ async def test_scaffold_response_completed_preserves_context_tokens(
     into the wire ``Usage`` model before emitting
     ``response.completed``. If that conversion drops
     ``context_tokens``, the REPL/web context ring falls back to the
-    inflated billing sum and tool-call turns look like they compacted.
+    inflated billing sum and tool-call turns look like they compacted;
+    if it drops the harness-reported ``context_window`` (codex's
+    ``modelContextWindow``), the ring is sized from the model catalog.
     """
     conv_id = "conv_usage"
     client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
@@ -989,6 +991,10 @@ async def test_scaffold_response_completed_preserves_context_tokens(
     assert usage["context_tokens"] == 5_700, (
         "context_tokens must survive scaffold serialization so clients can "
         "render context fill from the last sub-call instead of the billing sum."
+    )
+    assert usage["context_window"] == 258_400, (
+        "context_window must survive scaffold serialization so the server sizes "
+        "the context ring from the harness-reported window, not the catalog."
     )
 
 
