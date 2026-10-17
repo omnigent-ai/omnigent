@@ -299,7 +299,9 @@ def _load_entry(server_url: str) -> dict[str, str | float] | None:
     return entry if isinstance(entry, dict) else None
 
 
-def load_token(server_url: str, *, min_remaining_seconds: float = 0.0) -> str | None:
+def load_token(
+    server_url: str, *, min_remaining_seconds: float = 0.0, warn_expired: bool = True
+) -> str | None:
     """Load a stored session token for a server.
 
     Returns ``None`` if no token is stored, the token has expired,
@@ -314,6 +316,9 @@ def load_token(server_url: str, *, min_remaining_seconds: float = 0.0) -> str | 
         the historical behaviour. A caller that can renew passes
         :data:`REFRESH_MIN_REMAINING_SECONDS` so a token about to lapse
         mid-handshake is refreshed instead of used.
+    :param warn_expired: Log the once-per-process expiry warning. A caller
+        about to renew passes ``False`` so a successful refresh isn't
+        preceded by a stale "expired" warning.
     :returns: The session JWT string, or ``None``.
     """
     entry = _load_entry(server_url)
@@ -330,7 +335,8 @@ def load_token(server_url: str, *, min_remaining_seconds: float = 0.0) -> str | 
 
     expires_at = entry.get("expires_at", 0)
     if isinstance(expires_at, (int, float)) and expires_at < time.time():
-        _warn_expired_once(server_url, expires_at, has_refresh="refresh_token" in entry)
+        if warn_expired:
+            _warn_expired_once(server_url, expires_at, has_refresh="refresh_token" in entry)
         return None
     # Near-expiry but still valid: decline quietly (no expiry warning — it
     # has not expired) so the caller can choose to renew.
@@ -566,6 +572,46 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
     _warned_expired_servers.discard(normalized)
     _logger.info("Refreshed login session for %s", safe)
     return access_token
+
+
+def load_or_refresh_token(server_url: str) -> str | None:
+    """Return a usable session token, renewing it from the refresh grant when it lapsed.
+
+    The access token lives an hour while its login grant lives far longer, so
+    a caller that only read the stored token would go out unauthenticated
+    long before the login actually ended.
+
+    :param server_url: The server URL, e.g. ``"http://localhost:6767"``.
+    :returns: A session JWT, or ``None`` when no login can authenticate.
+    """
+    # Expiry is warned only if renewal below fails, not before it succeeds.
+    token = load_token(
+        server_url, min_remaining_seconds=REFRESH_MIN_REMAINING_SECONDS, warn_expired=False
+    )
+    if token:
+        return token
+    refreshed = refresh_stored_token(server_url)
+    if refreshed:
+        return refreshed
+    # Renewal impossible: a near-expiry token that has not lapsed still works.
+    return load_token(server_url)
+
+
+def has_refreshable_login(server_url: str) -> bool:
+    """Report whether a stored login can authenticate now or be renewed.
+
+    :param server_url: The server URL, e.g. ``"http://localhost:6767"``.
+    :returns: ``True`` for a valid session token or held refresh material;
+        ``False`` for no entry, a lapsed token with nothing to renew it, or
+        a Databricks pointer record.
+    """
+    entry = _load_entry(server_url)
+    if entry is None:
+        return False
+    refresh_token = entry.get("refresh_token")
+    if isinstance(refresh_token, str) and refresh_token:
+        return True
+    return load_token(server_url) is not None
 
 
 def _coerce_expires_in(raw: object) -> float:

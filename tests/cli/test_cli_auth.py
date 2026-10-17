@@ -815,6 +815,184 @@ def test_refresh_stored_token_refused_leaves_entry(token_dir, monkeypatch) -> No
     assert entry["refresh_token"] == "refresh-1"
 
 
+def _fake_refresh_post(status: int, posted: list[str]):
+    """Build an ``httpx.post`` double for ``/oauth/token`` that records each call."""
+    import httpx
+
+    def _post(url, *, data=None, timeout=None):
+        posted.append(url)
+        body = (
+            {"access_token": "fresh", "token_type": "Bearer", "expires_in": 3600}
+            if status == 200
+            else {"error": "invalid_grant"}
+        )
+        return httpx.Response(status, json=body, request=httpx.Request("POST", url))
+
+    return _post
+
+
+def test_load_or_refresh_token_uses_fresh_token_without_refreshing(token_dir, monkeypatch) -> None:
+    """A token with plenty of life left is returned as-is, with no network call."""
+    import httpx
+
+    from omnigent.cli_auth import load_or_refresh_token, store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="jwt",
+        user_id="a@x",
+        expires_at=time.time() + 3600,
+        refresh_token="refresh-1",
+    )
+    posted: list[str] = []
+    monkeypatch.setattr(httpx, "post", _fake_refresh_post(200, posted))
+
+    assert load_or_refresh_token("http://localhost:6767") == "jwt"
+    assert posted == []
+
+
+def test_load_or_refresh_token_renews_expired_token(token_dir, monkeypatch) -> None:
+    """An expired login is renewed from its refresh grant instead of reading as absent."""
+    import httpx
+
+    from omnigent.cli_auth import load_or_refresh_token, load_token, store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+    posted: list[str] = []
+    monkeypatch.setattr(httpx, "post", _fake_refresh_post(200, posted))
+
+    assert load_or_refresh_token("http://localhost:6767") == "fresh"
+    assert posted == ["http://localhost:6767/oauth/token"]
+    assert load_token("http://localhost:6767") == "fresh"
+
+
+def test_load_or_refresh_token_refused_returns_none(token_dir, monkeypatch) -> None:
+    """A refused refresh yields no token and keeps the stored grant for a later retry."""
+    import json
+
+    import httpx
+
+    from omnigent.cli_auth import load_or_refresh_token, store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+    posted: list[str] = []
+    monkeypatch.setattr(httpx, "post", _fake_refresh_post(400, posted))
+
+    assert load_or_refresh_token("http://localhost:6767") is None
+    assert posted == ["http://localhost:6767/oauth/token"]
+    entry = json.loads((token_dir / "auth_tokens.json").read_text())["http://localhost:6767"]
+    assert entry["refresh_token"] == "refresh-1"
+
+
+def test_load_or_refresh_token_refused_uses_still_valid_token(token_dir, monkeypatch) -> None:
+    """A near-expiry token that hasn't lapsed is still returned when renewal is refused."""
+    import httpx
+
+    from omnigent.cli_auth import REFRESH_MIN_REMAINING_SECONDS, load_or_refresh_token, store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="near-expiry",
+        user_id="a@x",
+        expires_at=time.time() + REFRESH_MIN_REMAINING_SECONDS / 2,
+        refresh_token="refresh-1",
+    )
+    posted: list[str] = []
+    monkeypatch.setattr(httpx, "post", _fake_refresh_post(400, posted))
+
+    assert load_or_refresh_token("http://localhost:6767") == "near-expiry"
+    assert posted == ["http://localhost:6767/oauth/token"]
+
+
+def test_load_or_refresh_token_successful_renewal_skips_expiry_warning(
+    token_dir, monkeypatch, caplog
+) -> None:
+    """Renewing in the same command must not first warn that the login expired."""
+    import logging
+
+    import httpx
+
+    from omnigent.cli_auth import load_or_refresh_token, store_token
+
+    monkeypatch.setattr("omnigent.cli_auth._warned_expired_servers", set())
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+    monkeypatch.setattr(httpx, "post", _fake_refresh_post(200, []))
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.cli_auth"):
+        assert load_or_refresh_token("http://localhost:6767") == "fresh"
+
+    assert not [r for r in caplog.records if "expired" in r.getMessage()]
+
+
+def test_load_or_refresh_token_refused_renewal_keeps_expiry_warning(
+    token_dir, monkeypatch, caplog
+) -> None:
+    """When renewal fails, the expiry warning still points the user at re-login."""
+    import logging
+
+    import httpx
+
+    from omnigent.cli_auth import load_or_refresh_token, store_token
+
+    monkeypatch.setattr("omnigent.cli_auth._warned_expired_servers", set())
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+    monkeypatch.setattr(httpx, "post", _fake_refresh_post(400, []))
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.cli_auth"):
+        assert load_or_refresh_token("http://localhost:6767") is None
+
+    assert any("expired" in r.getMessage() for r in caplog.records)
+
+
+def test_has_refreshable_login(token_dir) -> None:
+    """Valid tokens and expired-but-renewable logins count; dead or pointer records don't."""
+    from omnigent.cli_auth import has_refreshable_login, store_databricks_auth, store_token
+
+    assert has_refreshable_login("http://localhost:6767") is False
+
+    store_token("http://localhost:6767", token="jwt", user_id="a@x", expires_at=time.time() + 60)
+    assert has_refreshable_login("http://localhost:6767") is True
+
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+    assert has_refreshable_login("http://localhost:6767") is True
+
+    store_token("http://localhost:6767", token="stale", user_id="a@x", expires_at=time.time() - 10)
+    assert has_refreshable_login("http://localhost:6767") is False
+
+    store_databricks_auth("https://app.databricksapps.com", "https://ws.databricks.com")
+    assert has_refreshable_login("https://app.databricksapps.com") is False
+
+
 def test_refresh_404_on_loopback_is_quiet(token_dir, monkeypatch, caplog) -> None:
     """A loopback server without /oauth/token is expected and must stay quiet.
 
