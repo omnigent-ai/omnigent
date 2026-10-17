@@ -99,6 +99,13 @@ runs:
       with:
         harness: claude
 
+    - name: Install Databricks CLI
+      # claude-sdk Databricks journeys mint their bearer through the CLI's apiKeyHelper.
+      shell: bash
+      run: |
+        curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/2260866f83a41a2df55e1cfe7ffe038b78325bf6/install.sh | sh
+        databricks --version
+
     - name: Install Claude Code billing-notice regression CLI
       shell: bash
       env:
