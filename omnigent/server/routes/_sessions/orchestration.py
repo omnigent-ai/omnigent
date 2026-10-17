@@ -192,6 +192,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
     _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
     _CODEX_NATIVE_MODEL,
+    _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
     _CURSOR_NATIVE_WRAPPER_LABEL_VALUE,
     _EXTERNAL_SESSION_STATUS_TYPE,
     _FENCE_EXEMPT_EVENT_TYPES,
@@ -6313,9 +6314,10 @@ _ROUTING_CATALOG_WAIT_S = 3.0
 async def _refresh_stale_native_model_options(
     session_id: str,
     runner_client: httpx.AsyncClient | None,
+    wrapper: str = _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
 ) -> None:
     """
-    Replace a pre-launch claude catalog with the runner's launch-exact one.
+    Replace a pre-launch or missing catalog with the runner's launch-exact one.
 
     The cache can hold a catalog resolved from the session's *host* before
     the terminal existed (``_load_model_options_from_host``), whose family
@@ -6331,8 +6333,12 @@ async def _refresh_stale_native_model_options(
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
     :param runner_client: HTTP client pointed at the bound runner, or
         ``None`` when no runner is bound.
+    :param wrapper: The session's native wrapper label, which names the
+        harness-specific fallback route.
     """
-    if runner_client is None or session_id not in _model_options_stale:
+    if runner_client is None or (
+        session_id not in _model_options_stale and _model_options_cache.get(session_id)
+    ):
         return
     # This wait was the biggest single term in routing's pre-router latency on
     # a first message, and nothing named it in the logs. Time it, so the ladder
@@ -6340,7 +6346,7 @@ async def _refresh_stale_native_model_options(
     started = time.monotonic()
     inflight = _model_options_inflight.get(session_id)
     if inflight is None:
-        endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER[_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE]
+        endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER[wrapper]
         inflight = asyncio.create_task(
             _load_model_options(
                 runner_client,
@@ -6389,7 +6395,9 @@ async def _native_turn_catalog(
     vocabulary and nothing else — while the gateway behind it serves far
     more, including generations the pane cannot name. Routing a turn onto
     one of those would be dropped by the executor, so the picker rows are
-    the candidate list for this session.
+    the candidate list for this session. A codex-native pane switches onto
+    its app-server ``model/list`` ids, which off the gateway are the only
+    candidates anything knows of.
 
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
     :param conv: Conversation row, read for the wrapper label.
@@ -6400,9 +6408,10 @@ async def _native_turn_catalog(
         terminal with a known vocabulary (the caller keeps its own
         candidate resolution).
     """
-    if conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) != _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
+    wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) or ""
+    if wrapper not in (_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE, _CODEX_NATIVE_WRAPPER_LABEL_VALUE):
         return None
-    await _refresh_stale_native_model_options(session_id, runner_client)
+    await _refresh_stale_native_model_options(session_id, runner_client, wrapper)
     options = _model_options_cache.get(session_id)
     if not options:
         return None
@@ -6416,7 +6425,10 @@ async def _native_turn_catalog(
         raw = option.get("model") or option.get("id")
         if isinstance(raw, str) and raw and raw not in models:
             models.append(raw)
-    return models or None
+    # The rubric reads list position as cost; picker order is not cost order.
+    from omnigent.server.smart_routing import order_by_model_line_cost
+
+    return order_by_model_line_cost(models) or None
 
 
 def _routed_turn_model_spelling(

@@ -1789,6 +1789,51 @@ async def test_turn_catalog_and_verdict_follow_the_panes_vocabulary() -> None:
     )
 
 
+async def test_codex_turn_catalog_is_the_panes_model_list() -> None:
+    """A codex pane's turn candidates are its own ``model/list`` ids, fetched when cold."""
+    from omnigent.harness_plugins import CODEX_NATIVE_CODING_AGENT
+    from omnigent.server.routes._sessions.orchestration import (
+        _model_options_cache,
+        _native_turn_catalog,
+        _routed_turn_model_spelling,
+    )
+
+    session_id = "conv_codex_vocab"
+    conv = SimpleNamespace(
+        id=session_id, labels={"omnigent.wrapper": CODEX_NATIVE_CODING_AGENT.wrapper_label}
+    )
+    requested: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requested.append(request.url.path)
+        return httpx.Response(
+            200,
+            json={
+                "models": [
+                    {"id": "gpt-5.5", "model": "gpt-5.5", "isDefault": True},
+                    {"id": "gpt-5.4-mini", "model": "gpt-5.4-mini"},
+                ]
+            },
+        )
+
+    runner_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner.invalid"
+    )
+    try:
+        # Nothing cached yet (no picker opened, prefetch not landed): the turn
+        # fetches the pane's catalog rather than routing with no candidates.
+        assert await _native_turn_catalog(session_id, conv, runner_client) == [
+            "gpt-5.4-mini",
+            "gpt-5.5",
+        ]
+        assert requested == [f"/v1/sessions/{session_id}/model-options"]
+        # Codex takes its model ids verbatim, so the pick needs no respelling.
+        assert _routed_turn_model_spelling(session_id, conv, "gpt-5.4-mini") == "gpt-5.4-mini"
+    finally:
+        await runner_client.aclose()
+        _model_options_cache.pop(session_id, None)
+
+
 async def test_turn_catalog_spells_managed_models_outside_claude_families() -> None:
     from omnigent.server.routes._sessions.orchestration import (
         _model_options_cache,
@@ -2335,3 +2380,51 @@ def test_routed_spelling_types_a_managed_picker_row_verbatim() -> None:
         )
     finally:
         _orchestration._model_options_cache.pop("conv_managed", None)
+
+
+@pytest.mark.parametrize(
+    ("picker", "cheapest_first"),
+    [
+        # Claude Code's own /model order: its default first, haiku last.
+        (
+            [
+                "claude-sonnet-5-5",
+                "claude-fable-5-1",
+                "claude-opus-5-5",
+                "claude-haiku-4-5-20251001",
+            ],
+            [
+                "claude-haiku-4-5-20251001",
+                "claude-sonnet-5-5",
+                "claude-opus-5-5",
+                "claude-fable-5-1",
+            ],
+        ),
+        # codex model/list mixes generations; lines sort, picker order holds within one.
+        (
+            [
+                "gpt-6.1-sol",
+                "gpt-6-astra",
+                "gpt-6-sol",
+                "gpt-6-luna",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+            ],
+            [
+                "gpt-6-luna",
+                "gpt-5.6-luna",
+                "gpt-5.6-terra",
+                "gpt-6.1-sol",
+                "gpt-6-sol",
+                "gpt-6-astra",
+            ],
+        ),
+    ],
+)
+def test_turn_catalog_orders_picker_rows_cheapest_first(
+    picker: list[str], cheapest_first: list[str]
+) -> None:
+    """The judge rubric reads position as cost, so picker rows reach it cheapest first."""
+    from omnigent.server.smart_routing import order_by_model_line_cost
+
+    assert order_by_model_line_cost(picker) == cheapest_first
