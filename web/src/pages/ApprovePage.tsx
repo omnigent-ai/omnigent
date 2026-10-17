@@ -18,6 +18,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { CheckIcon, MessageCircleQuestionMark, XIcon } from "lucide-react";
+import { ElectronWindowDragStrip } from "@/components/ElectronWindowDragStrip";
 import { ElicitationMessage } from "@/components/blocks/ElicitationMessage";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -104,6 +105,7 @@ export function ApprovePage() {
 
   return (
     <div className="mx-auto flex min-h-screen max-w-xl items-center justify-center p-6">
+      <ElectronWindowDragStrip />
       {state.kind === "loading" && (
         <Alert className="flex flex-col gap-2 py-4 px-5">
           <AlertTitle className="text-ui">Loading elicitation…</AlertTitle>
