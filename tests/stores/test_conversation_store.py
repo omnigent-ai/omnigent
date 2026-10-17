@@ -318,6 +318,88 @@ def test_get_conversations_empty_input_skips_query(
     assert conversation_store.get_conversations([]) == {}
 
 
+_LIST_ROW_WRITES: dict[str, Callable[[SqlAlchemyConversationStore, str], object]] = {
+    "rename": lambda s, cid: s.update_conversation(cid, title="renamed"),
+    "archive": lambda s, cid: s.update_conversation(cid, archived=True),
+    "reasoning effort": lambda s, cid: s.update_conversation(cid, reasoning_effort="high"),
+    "label added": lambda s, cid: s.set_labels(cid, {"team": "core"}),
+    "label value": lambda s, cid: s.set_labels(cid, {"seed": "2"}),
+    "label deleted": lambda s, cid: s.delete_label(cid, "seed"),
+    "live status": lambda s, cid: s.set_session_live_status(cid, "running"),
+    "pending elicitations": lambda s, cid: s.set_pending_elicitation_count(cid, 2),
+    "runner rebind": lambda s, cid: s.replace_runner_id(cid, "rnr_other"),
+    "runner unbind": lambda s, cid: s.clear_runner_id(cid),
+    "host bind": lambda s, cid: s.set_host_id(
+        cid, "0d6a4c1e2f3b4a5c8d9e0f1a2b3c4d5e", workspace="/w", git_branch="main"
+    ),
+    "external session id": lambda s, cid: s.set_external_session_id(cid, "ext-1"),
+    "project": lambda s, cid: s.set_conversation_project(cid, "5f0e1d2c3b4a49588776655443322110"),
+}
+
+# Writes to columns no session-list row reads; they must not force a reload.
+_UNLISTED_WRITES: dict[str, Callable[[SqlAlchemyConversationStore, str], object]] = {
+    "usage": lambda s, cid: s.increment_session_usage(cid, {"total_cost_usd": 1.0}),
+    "session state": lambda s, cid: s.set_session_state(cid, {"phase": "x"}),
+    "runner heartbeat": lambda s, cid: s.touch_runner_liveness(["rnr_0"], now=2_000_000_000),
+}
+
+
+@pytest.mark.parametrize("write", _LIST_ROW_WRITES.values(), ids=_LIST_ROW_WRITES.keys())
+def test_conversation_fingerprint_moves_with_list_row_columns(
+    conversation_store: SqlAlchemyConversationStore,
+    write: Callable[[SqlAlchemyConversationStore, str], object],
+) -> None:
+    """Every write to a column the session list shows changes the fingerprint,
+    including writes that deliberately leave ``updated_at`` alone."""
+    conv = conversation_store.create_conversation(
+        title="row", runner_id="rnr_0", labels={"seed": "1"}
+    )
+    before = conversation_store.get_conversation_fingerprints([conv.id])[conv.id]
+    write(conversation_store, conv.id)
+    assert conversation_store.get_conversation_fingerprints([conv.id])[conv.id] != before
+
+
+@pytest.mark.parametrize("write", _UNLISTED_WRITES.values(), ids=_UNLISTED_WRITES.keys())
+def test_conversation_fingerprint_ignores_unlisted_columns(
+    conversation_store: SqlAlchemyConversationStore,
+    write: Callable[[SqlAlchemyConversationStore, str], object],
+) -> None:
+    """Blob and heartbeat writes leave the fingerprint unchanged, so a busy
+    session isn't reloaded for data its list row never shows."""
+    conv = conversation_store.create_conversation(
+        title="row", runner_id="rnr_0", labels={"seed": "1"}
+    )
+    before = conversation_store.get_conversation_fingerprints([conv.id])
+    write(conversation_store, conv.id)
+    assert conversation_store.get_conversation_fingerprints([conv.id]) == before
+
+
+def test_loaded_fingerprint_matches_fingerprint_read(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A load's fingerprint equals a later fingerprint read of the unchanged
+    row, so a cached row isn't reloaded on every tick."""
+    conv = conversation_store.create_conversation(
+        title="row", runner_id="rnr_0", labels={"seed": "1", "team": "core"}
+    )
+    conversation_store.set_session_live_status(conv.id, "running")
+    fingerprint, loaded = conversation_store.get_conversations_with_fingerprints([conv.id])[
+        conv.id
+    ]
+    assert loaded.title == "row"
+    assert conversation_store.get_conversation_fingerprints([conv.id])[conv.id] == fingerprint
+
+
+def test_conversation_fingerprints_omit_unknown_ids(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Unknown ids are absent, so a deleted row reads as gone."""
+    conv = conversation_store.create_conversation(title="row")
+    unknown = "5eca720dc2bc6cdc3a99028d7bd0f917"
+    assert set(conversation_store.get_conversation_fingerprints([conv.id, unknown])) == {conv.id}
+    assert conversation_store.get_conversation_fingerprints([]) == {}
+
+
 def test_list_latest_message_items_for_conversations(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

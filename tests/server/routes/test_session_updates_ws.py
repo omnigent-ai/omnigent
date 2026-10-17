@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -24,7 +26,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import omnigent.server.routes.sessions as sessions_routes
-from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
+from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
 from omnigent.server.routes.sessions import SessionLiveness, create_sessions_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -409,6 +411,212 @@ def test_other_users_session_is_not_visible(app: FastAPI, stores, fast_rescan: N
             )
 
 
+def test_shared_ticks_keep_each_sockets_frames_independent(
+    app: FastAPI, stores, fast_rescan: None
+) -> None:
+    """Two of Alice's sockets with overlapping watch-sets share tick builds yet
+    each gets exactly its own frames, and Bob's socket on a shared session
+    never receives Alice's rows."""
+    conversation_store, _, permission_store = stores
+    s1 = _seed_session(stores, owner=ALICE, title="one")
+    s2 = _seed_session(stores, owner=ALICE, title="two")
+    s3 = _seed_session(stores, owner=ALICE, title="three")
+    permission_store.ensure_user(BOB)
+    permission_store.grant(BOB, s2, LEVEL_READ)
+    # One client context keeps every socket on the server's single event loop,
+    # as in production.
+    with (
+        TestClient(app) as client,
+        client.websocket_connect(
+            "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+        ) as tab_a,
+        client.websocket_connect(
+            "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+        ) as tab_b,
+        client.websocket_connect(
+            "/v1/sessions/updates", headers={"X-Forwarded-Email": BOB}
+        ) as bob,
+    ):
+        for ws, ids in ((tab_a, [s1, s2]), (tab_b, [s2, s3]), (bob, [s2])):
+            ws.send_text(json.dumps({"type": "watch", "session_ids": ids}))
+            _recv_until(ws, {"snapshot"})
+
+        conversation_store.update_conversation(s3, title="three renamed")
+        changed_b = _recv_until(tab_b, {"changed"})
+        assert [item["id"] for item in changed_b["items"]] == [s3]  # type: ignore[index]
+
+        conversation_store.update_conversation(s2, title="two renamed")
+        # Tab A never watched s3, so its next delta is the s2 rename alone.
+        changed_a = _recv_until(tab_a, {"changed"})
+        assert [item["id"] for item in changed_a["items"]] == [s2]  # type: ignore[index]
+        changed_b = _recv_until(tab_b, {"changed"})
+        assert [item["id"] for item in changed_b["items"]] == [s2]  # type: ignore[index]
+        changed_bob = _recv_until(bob, {"changed"})
+        # Bob's row carries his own access level, not Alice's.
+        assert changed_bob["items"][0]["permission_level"] == LEVEL_READ  # type: ignore[index]
+        assert changed_a["items"][0]["permission_level"] == LEVEL_OWNER  # type: ignore[index]
+
+        # Losing access removes the row for that user alone.
+        permission_store.revoke(BOB, s2)
+        assert _recv_until(bob, {"removed"})["ids"] == [s2]
+        for _ in range(5):
+            assert json.loads(tab_a.receive_text())["type"] == "heartbeat"
+        permission_store.revoke(ALICE, s2)
+        assert _recv_until(tab_a, {"removed"})["ids"] == [s2]
+        assert _recv_until(tab_b, {"removed"})["ids"] == [s2]
+
+
+@pytest.mark.parametrize("change", ["archive", "revoke"])
+def test_tick_never_undoes_a_newer_snapshot(
+    app: FastAPI, stores, fast_rescan: None, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """A tick that began before a snapshot finished must not push that tick's
+    older shared rows over the snapshot, e.g. resurrecting an archived row or
+    re-sending one the user just lost access to."""
+    conversation_store, _, permission_store = stores
+    monkeypatch.setattr(sessions_routes, "_SESSION_UPDATES_RESCAN_INTERVAL_S", 0.3)
+    s1 = _seed_session(stores, owner=ALICE, title="one")
+    s2 = _seed_session(stores, owner=ALICE, title="two")
+    snapshot_entered, release_snapshot = threading.Event(), threading.Event()
+    list_for_sessions = permission_store.list_for_sessions
+
+    def _gated(ids: list[str]) -> object:
+        # Only tab B's new snapshot reads exactly these ids; ticks read others.
+        if sorted(ids) == sorted([s1, s2]):
+            snapshot_entered.set()
+            release_snapshot.wait(5)
+        return list_for_sessions(ids)
+
+    monkeypatch.setattr(permission_store, "list_for_sessions", _gated)
+    headers = {"X-Forwarded-Email": ALICE}
+    with (
+        TestClient(app) as client,
+        client.websocket_connect("/v1/sessions/updates", headers=headers) as tab_a,
+        client.websocket_connect("/v1/sessions/updates", headers=headers) as tab_b,
+    ):
+        for ws in (tab_a, tab_b):
+            ws.send_text(json.dumps({"type": "watch", "session_ids": [s1]}))
+            _recv_until(ws, {"snapshot"})
+        tab_b.send_text(json.dumps({"type": "watch", "session_ids": [s1, s2]}))
+        assert snapshot_entered.wait(5)
+        # Tab A's ticks share pre-change rows while tab B's ticker waits on
+        # the lock its snapshot holds.
+        time.sleep(0.45)
+        if change == "archive":
+            conversation_store.update_conversation(s1, archived=True)
+        else:
+            permission_store.revoke(ALICE, s1)
+        release_snapshot.set()
+
+        snapshot = _recv_until(tab_b, {"snapshot"})
+        rows = {item["id"]: item for item in snapshot["items"]}  # type: ignore[index]
+        if change == "archive":
+            assert rows[s1]["archived"] is True
+        else:
+            assert s1 not in rows
+        # Heartbeats arrive once per tick here, so this spans several ticks.
+        for _ in range(4):
+            frame = json.loads(tab_b.receive_text())
+            for item in frame.get("items", []):
+                assert item["id"] != s1 or item["archived"] is True, frame
+
+
+def test_connect_and_disconnect_log_users_open_socket_count(
+    app: FastAPI, stores, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The connect/disconnect lines report how many update sockets the user
+    has open on this process, so a deploy can confirm sharing applies."""
+
+    def _counts(phase: str) -> list[object]:
+        return [
+            record.args[0]  # type: ignore[index]
+            for record in caplog.records
+            if record.getMessage().startswith(f"session-updates stream {phase}")
+        ]
+
+    with caplog.at_level(logging.INFO, logger="omnigent.server.routes.sessions"):
+        with TestClient(app) as client:
+            headers = {"X-Forwarded-Email": ALICE}
+            with client.websocket_connect("/v1/sessions/updates", headers=headers) as tab_a:
+                tab_a.send_text(json.dumps({"type": "watch", "session_ids": []}))
+                _recv_until(tab_a, {"snapshot"})
+                with client.websocket_connect("/v1/sessions/updates", headers=headers) as tab_b:
+                    tab_b.send_text(json.dumps({"type": "watch", "session_ids": []}))
+                    _recv_until(tab_b, {"snapshot"})
+                    assert _counts("connected") == [1, 2]
+    assert _counts("disconnected") == [1, 0]
+
+
+@pytest.fixture
+def conversation_loads(stores, monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """Record the ids of every full conversation load the stream makes."""
+    conversation_store = stores[0]
+    loads: list[list[str]] = []
+    load = conversation_store.get_conversations_with_fingerprints
+
+    def _recording_load(conversation_ids: list[str]) -> dict[str, object]:
+        loads.append(sorted(conversation_ids))
+        return load(conversation_ids)
+
+    monkeypatch.setattr(conversation_store, "get_conversations_with_fingerprints", _recording_load)
+    return loads
+
+
+def test_ticks_reload_only_changed_conversations(
+    app: FastAPI, stores, fast_rescan: None, conversation_loads: list[list[str]]
+) -> None:
+    """Idle ticks load no conversations, and a change reloads only its row
+    while still pushing the same ``changed`` frame."""
+    conversation_store = stores[0]
+    s1 = _seed_session(stores, owner=ALICE, title="one")
+    s2 = _seed_session(stores, owner=ALICE, title="two")
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [s1, s2]}))
+        _recv_until(ws, {"snapshot"})
+        _recv_until(ws, {"heartbeat"})
+        conversation_loads.clear()
+        # Each heartbeat spans two ticks.
+        for _ in range(5):
+            assert json.loads(ws.receive_text())["type"] == "heartbeat"
+        assert conversation_loads == []
+
+        # A live-status write leaves updated_at alone; the fingerprint still sees it.
+        conversation_store.set_session_live_status(s2, "running")
+        changed = _recv_until(ws, {"changed"})
+        assert [item["id"] for item in changed["items"]] == [s2]  # type: ignore[index]
+        assert changed["items"][0]["status"] == "running"  # type: ignore[index]
+        assert conversation_loads == [[s2]]
+
+
+def test_ticks_reload_unchanged_conversations_on_schedule(
+    app: FastAPI,
+    stores,
+    fast_rescan: None,
+    conversation_loads: list[list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unchanged rows are still reloaded once per full-reload interval, so an
+    input the fingerprint misses is stale for at most that long."""
+    monkeypatch.setattr(sessions_routes, "_SESSION_UPDATES_FULL_RELOAD_INTERVAL_S", 0.25)
+    s1 = _seed_session(stores, owner=ALICE, title="one")
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [s1]}))
+        _recv_until(ws, {"snapshot"})
+        _recv_until(ws, {"heartbeat"})
+        conversation_loads.clear()
+        started = time.monotonic()
+        for _ in range(10):
+            assert json.loads(ws.receive_text())["type"] == "heartbeat"
+        elapsed = time.monotonic() - started
+        # One reload per 0.25 s of age, not one per 0.05 s tick.
+        assert 2 <= len(conversation_loads) <= elapsed / 0.25 + 1
+        assert all(ids == [s1] for ids in conversation_loads)
+
+
 def test_unauthenticated_connection_is_rejected(stores) -> None:
     """With permissions enabled, a socket whose handshake yields no
     identity is closed at the handshake (policy violation) before any
@@ -478,9 +686,10 @@ def test_transient_store_error_does_not_kill_stream(
     skipped — the stream stays open and a later real change still pushes a
     ``changed`` frame. Without the ticker's guard, the raised exception
     would tear the connection down and force a reconnect + re-snapshot."""
-    conversation_store = stores[0]
+    conversation_store, _, permission_store = stores
     s1 = _seed_session(stores, owner=ALICE, title="before")
-    real_get = conversation_store.get_conversations
+    # Snapshot and every tick read grants first.
+    real_get = permission_store.list_for_sessions
     calls = {"n": 0}
 
     def flaky_get(ids: list[str]) -> dict[str, object]:
@@ -493,7 +702,7 @@ def test_transient_store_error_does_not_kill_stream(
             raise RuntimeError("transient store blip")
         return real_get(ids)
 
-    monkeypatch.setattr(conversation_store, "get_conversations", flaky_get)
+    monkeypatch.setattr(permission_store, "list_for_sessions", flaky_get)
     with TestClient(app).websocket_connect(
         "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
     ) as ws:
@@ -511,7 +720,7 @@ def test_transient_store_error_does_not_kill_stream(
     # (call 1 = snapshot, call 2 = failed tick, call 3+ = recovered ticks).
     assert calls["n"] >= 3, (
         f"expected the ticker to keep rescanning after a failed tick, "
-        f"but get_conversations was called only {calls['n']} time(s)"
+        f"but list_for_sessions was called only {calls['n']} time(s)"
     )
 
 

@@ -187,6 +187,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _validate_session_model_selection,
     ensure_runner_connected,
 )
+from omnigent.server.routes._sessions.update_ticks import ConversationCache, SessionUpdateTicks
 from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
     AutomaticSessionRenameResponse,
@@ -1805,6 +1806,7 @@ def register_core_routes(
     async def _fetch_watched_items(
         watched: list[str],
         user_id: str | None,
+        conversations: ConversationStore | ConversationCache = conversation_store,
     ) -> list[dict[str, Any]]:
         """
         Build current list-item payloads for the watched ids.
@@ -1827,6 +1829,9 @@ def register_core_routes(
             deduplicated and length-capped by the caller.
         :param user_id: The authenticated requesting user, or ``None``
             when permissions are disabled, e.g. ``"alice@example.com"``.
+        :param conversations: Source of the conversation rows; the ticker
+            passes the user's :class:`ConversationCache`. Access checks
+            above run against fresh grants either way.
         :returns: One JSON-ready dict per accessible, existing watched
             session, in no particular order.
         """
@@ -1858,7 +1863,7 @@ def register_core_routes(
             """Bulk-load the accessible conversations that are sessions
             (non-null ``agent_id``) in one batched store call, preserving
             the caller's id order for deterministic output."""
-            by_id = conversation_store.get_conversations(ids)
+            by_id = conversations.get_conversations(ids)
             return [
                 conv
                 for cid in ids
@@ -1912,6 +1917,8 @@ def register_core_routes(
         # the cached snippet untouched.
         return [item.model_dump(exclude={"search_snippet"}) for item in items]
 
+    update_ticks = SessionUpdateTicks(_fetch_watched_items, conversation_store)
+
     @router.websocket("/sessions/updates")
     async def session_updates(websocket: WebSocket) -> None:
         """
@@ -1935,12 +1942,13 @@ def register_core_routes(
 
         Watched-row freshness is pull-based — each interval the server
         re-reads the watched ids (the same read ``GET /v1/sessions`` does)
-        and emits only what changed. *Discovery* of sessions the client
-        isn't watching yet (created / forked / shared elsewhere) is instead
-        push-based: a ``session_added`` event on this user's
-        :mod:`user_session_stream` channel makes the server push the new
-        session as a ``changed`` frame, which the client reconciles into the
-        sidebar. Together these mean an idle list makes zero HTTP polls yet a
+        and emits only what changed. A user's sockets tick together and
+        share that read (see :class:`SessionUpdateTicks`). *Discovery* of
+        sessions the client isn't watching yet (created / forked / shared
+        elsewhere) is instead push-based: a ``session_added`` event on this
+        user's :mod:`user_session_stream` channel makes the server push the
+        new session as a ``changed`` frame, which the client reconciles into
+        the sidebar. Together these mean an idle list makes zero HTTP polls yet a
         new session still appears within a tick of being created.
 
         :param websocket: The incoming FastAPI :class:`WebSocket`.
@@ -1955,9 +1963,11 @@ def register_core_routes(
                 reason="authentication required",
             )
         await websocket.accept()
+        user_sockets = update_ticks.attach(user_id)
         _logger.info(
-            "session-updates stream connected",
-            extra=debug_event("session_updates", phase="connected"),
+            "session-updates stream connected (%d open for this user)",
+            user_sockets,
+            extra=debug_event("session_updates", phase="connected", user_sockets=user_sockets),
         )
 
         watched: list[str] = []
@@ -1965,6 +1975,9 @@ def register_core_routes(
         # by currently-watched ids; pruned when the watch-set narrows.
         last_sent: dict[str, dict[str, Any]] = {}
         last_send_monotonic = time.monotonic()
+        # When the last snapshot finished; a tick that began earlier may hold
+        # shared rows older than that baseline.
+        snapshot_monotonic = 0.0
         # Serializes the read-diff-send-update critical section between the
         # reader (snapshot on watch) and the ticker (interval deltas) so
         # they never interleave updates to ``last_sent``.
@@ -1994,19 +2007,25 @@ def register_core_routes(
         async def _emit_snapshot() -> None:
             """Send a full snapshot for the current watch-set and reset the
             diff baseline to it."""
+            nonlocal snapshot_monotonic
             items = await _fetch_watched_items(watched, user_id)
             dumps = {item["id"]: item for item in items}
             last_sent.clear()
             last_sent.update(dumps)
             await _send({"type": "snapshot", "items": list(dumps.values())})
+            snapshot_monotonic = time.monotonic()
 
-        async def _emit_deltas() -> None:
+        async def _emit_deltas(tick: int) -> None:
             """Diff the watched ids against the last frame and send only the
             changes; emit a heartbeat when nothing changed but the link has
-            been idle."""
+            been idle.
+
+            :param tick: The user's shared tick, from
+                :meth:`SessionUpdateTicks.next_tick`.
+            """
             nonlocal last_send_monotonic
             if watched:
-                items = await _fetch_watched_items(watched, user_id)
+                items = await update_ticks.rows(user_id, watched, tick)
                 current = {item["id"]: item for item in items}
                 changed = [dump for cid, dump in current.items() if last_sent.get(cid) != dump]
                 # Removed = a still-watched id that no longer resolves (lost
@@ -2087,10 +2106,17 @@ def register_core_routes(
             while True:
                 from omnigent.server.routes import sessions as _sf
 
-                await asyncio.sleep(_sf._SESSION_UPDATES_RESCAN_INTERVAL_S)
+                tick, tick_started = await update_ticks.next_tick(
+                    user_id, _sf._SESSION_UPDATES_RESCAN_INTERVAL_S
+                )
                 async with emit_lock:
+                    # A snapshot sent while this tick waited for the lock is
+                    # newer than the tick's shared rows, which could undo it
+                    # (including a revoked or deleted row). Wait for the next.
+                    if snapshot_monotonic >= tick_started:
+                        continue
                     try:
-                        await _emit_deltas()
+                        await _emit_deltas(tick)
                     except WebSocketDisconnect:
                         # The client went away mid-send — the normal terminal
                         # condition. Propagate so the stream tears down and the
@@ -2197,9 +2223,16 @@ def register_core_routes(
                         extra=debug_event("session_updates", phase="error"),
                     )
         finally:
+            # Stop the ticker before releasing the user's shared tick state.
+            for task in (reader_task, ticker_task, discovery_task):
+                task.cancel()
+            user_sockets = update_ticks.detach(user_id)
             _logger.info(
-                "session-updates stream disconnected",
-                extra=debug_event("session_updates", phase="disconnected"),
+                "session-updates stream disconnected (%d open for this user)",
+                user_sockets,
+                extra=debug_event(
+                    "session_updates", phase="disconnected", user_sockets=user_sockets
+                ),
             )
             with contextlib.suppress(RuntimeError):
                 await websocket.close()

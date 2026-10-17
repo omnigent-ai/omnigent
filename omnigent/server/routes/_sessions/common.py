@@ -688,6 +688,12 @@ _SESSION_UPDATES_RESCAN_INTERVAL_S: float = 4.0
 _SESSION_UPDATES_HEARTBEAT_INTERVAL_S: float = 30.0
 
 
+# Longest a session-updates tick reuses a conversation whose fingerprint held.
+# Matches the idle heartbeat and stays under the web client's 60 s list
+# reconcile, while reloading unchanged rows on only ~1 tick in 8.
+_SESSION_UPDATES_FULL_RELOAD_INTERVAL_S: float = 30.0
+
+
 _SESSION_UPDATES_MAX_WATCHED: int = 500
 
 
