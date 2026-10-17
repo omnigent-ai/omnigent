@@ -1505,6 +1505,104 @@ describe("Sidebar session list", () => {
       expect(screen.getAllByTestId("session-tooltip-location")[0]).toHaveTextContent(expected);
     });
   });
+
+  describe("runner stats in the session tooltip", () => {
+    const statsHost = {
+      host_id: "host_stats",
+      name: "bryan-mbp",
+      owner: "bryan",
+      status: "online",
+      sandbox_provider: null,
+      stats: {
+        reported_at: Date.now() / 1000 - 8,
+        cpu_percent: 48,
+        memory_total_bytes: 16 * 1024 ** 3,
+        memory_used_bytes: 8 * 1024 ** 3,
+      },
+    };
+    const hostStatsOn = {
+      ...FALLBACK_SERVER_INFO,
+      features: { ...FALLBACK_SERVER_INFO.features, sidebar_grouping_ui: true, host_stats: true },
+    };
+
+    async function hoverStatsTooltip(host: object, info?: ServerInfo, branch?: string) {
+      useHostsMock.mockReturnValue({ data: [host] });
+      mockConversations([
+        conv("conv_stats", "Codex", { host_id: "host_stats", git_branch: branch }),
+      ]);
+      renderSidebar(true, "/", undefined, info);
+      fireEvent.pointerMove(screen.getByRole("link", { name: "conv_stats" }), {
+        pointerType: "mouse",
+      });
+      return screen.findByTestId("session-tooltip-content");
+    }
+
+    it("moves the host line into the runner section when the feature is on", async () => {
+      const tooltip = await hoverStatsTooltip(
+        statsHost,
+        hostStatsOn,
+        "feature/runner-stats-tooltip",
+      );
+
+      const section = within(tooltip).getByTestId("runner-stats-section");
+      expect(within(section).getByTestId("runner-stats-header")).toHaveTextContent("bryan-mbp");
+      expect(within(section).getByRole("meter", { name: "CPU used" })).toBeInTheDocument();
+      expect(within(tooltip).queryByTestId("session-tooltip-location")).toBeNull();
+      const details = within(tooltip).getByTestId("session-tooltip-branch").parentElement!;
+      const dividers = [...tooltip.children].filter((el) => el.classList.contains("border-t"));
+      expect(dividers).toHaveLength(2);
+      expect(dividers[0]).toBe(details);
+      expect(dividers[1]).toBe(section);
+      expect(section).toHaveClass("border-border");
+      // The section closes the card, after the status line.
+      expect(tooltip.lastElementChild).toBe(section);
+    });
+
+    it("keeps the plain location line while the feature is off", async () => {
+      const tooltip = await hoverStatsTooltip(statsHost);
+
+      expect(within(tooltip).getByTestId("session-tooltip-location")).toHaveTextContent(
+        "bryan-mbp",
+      );
+      expect(within(tooltip).queryByTestId("runner-stats-section")).toBeNull();
+    });
+
+    it("keeps the plain location line for a host without stats", async () => {
+      const tooltip = await hoverStatsTooltip({ ...statsHost, stats: null }, hostStatsOn);
+
+      expect(within(tooltip).getByTestId("session-tooltip-location")).toHaveTextContent(
+        "bryan-mbp",
+      );
+      expect(within(tooltip).queryByTestId("runner-stats-section")).toBeNull();
+    });
+
+    it("shows an offline host's last-seen instead of the location line", async () => {
+      // A host that disconnected after reporting: only its last reported_at is left.
+      const offline = {
+        ...statsHost,
+        status: "offline",
+        stats: { reported_at: Date.now() / 1000 - 300 },
+      };
+      const tooltip = await hoverStatsTooltip(offline, hostStatsOn);
+
+      const section = within(tooltip).getByTestId("runner-stats-section");
+      expect(within(section).getByTestId("runner-stats-header")).toHaveTextContent(
+        /bryan-mbp\s*· offline · last seen 5m ago/,
+      );
+      expect(within(section).queryAllByRole("meter")).toHaveLength(0);
+      expect(within(tooltip).queryByTestId("session-tooltip-location")).toBeNull();
+    });
+
+    it("keeps the plain location line for an online host with no readings", async () => {
+      const online = { ...statsHost, stats: { reported_at: Date.now() / 1000 - 5 } };
+      const tooltip = await hoverStatsTooltip(online, hostStatsOn);
+
+      expect(within(tooltip).getByTestId("session-tooltip-location")).toHaveTextContent(
+        "bryan-mbp",
+      );
+      expect(within(tooltip).queryByTestId("runner-stats-section")).toBeNull();
+    });
+  });
 });
 
 describe("Sidebar failed session indicator", () => {

@@ -131,6 +131,7 @@ from omnigent.host.git_worktree import (
 from omnigent.host.identity import HostIdentity, load_or_create_host_identity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
+from omnigent.host.stats import HostStatsSampler
 from omnigent.inner import _proc
 from omnigent.onboarding.harness_auth import (
     adopt_env_credential,
@@ -1230,6 +1231,8 @@ class HostProcess:
         # refresh task keeps it current.
         self._configured_harnesses: dict[str, HarnessAvailability] | None = None
         self._gateway_inference: dict[str, bool] | None = None
+        # Resource snapshot for keepalive pongs whose ping asks for one.
+        self._host_stats = HostStatsSampler()
         self._capabilities_initialized = False
         # Invalidates deferred probe results when an install or credential
         # write has already produced a fresher snapshot. Capability state is
@@ -4945,7 +4948,11 @@ class HostProcess:
                 diagnostics = self._diagnostics_for(ws)
                 if diagnostics is not None:
                     diagnostics.app_ping_received()
-                await self._send_text(ws, encode_frame(PongFrame(ts=runner_frame.ts)))
+                # Sample only when the server's host_stats feature asks for it.
+                stats = self._host_stats.sample() if runner_frame.request_host_stats else None
+                await self._send_text(
+                    ws, encode_frame(PongFrame(ts=runner_frame.ts, host_stats=stats))
+                )
                 if diagnostics is not None:
                     diagnostics.app_pong_sent()
             return

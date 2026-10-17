@@ -28,6 +28,7 @@ def test_unset_or_empty_disables_every_feature(environ: dict[str, str]) -> None:
         "import_review": False,
         "custom_agents_settings_ui": False,
         "sidebar_grouping_ui": False,
+        "host_stats": False,
     }
 
 
@@ -67,6 +68,13 @@ def test_arca_shutdown_warnings_are_frontend_visible() -> None:
 
     assert flags.enabled(Feature.ARCA_SHUTDOWN_WARNINGS)
     assert flags.frontend_dict()["arca_shutdown_warnings"] is True
+
+
+def test_host_stats_is_a_frontend_visible_feature() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "host_stats"})
+
+    assert flags.enabled(Feature.HOST_STATS)
+    assert flags.frontend_dict()["host_stats"] is True
 
 
 def test_unknown_feature_fails_with_known_names() -> None:
