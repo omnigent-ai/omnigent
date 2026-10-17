@@ -24,7 +24,7 @@ export const SCHEDULED_TASK_SUGGESTIONS: ScheduledTaskSuggestion[] = [
     iconClassName: "text-blue-600 dark:text-blue-400",
     title: "Follow-up monitor",
     prefill: {
-      name: "Follow-up monitor",
+      name: "Follow-up monitor - {{ddd, MMM DD}}",
       prompt:
         "Review recent email and calendar activity every weekday morning. Summarize anything that needs my attention and call out follow-ups I should handle today.",
     },
@@ -35,7 +35,7 @@ export const SCHEDULED_TASK_SUGGESTIONS: ScheduledTaskSuggestion[] = [
     iconClassName: "text-emerald-600 dark:text-emerald-500",
     title: "PR sweep",
     prefill: {
-      name: "PR sweep",
+      name: "PR sweep - {{YYYY-MM-DD}}",
       prompt:
         "List open pull requests waiting on review. Highlight stale PRs that need a nudge and summarize the next action for each one.",
     },
@@ -46,7 +46,7 @@ export const SCHEDULED_TASK_SUGGESTIONS: ScheduledTaskSuggestion[] = [
     iconClassName: "text-amber-600 dark:text-amber-500",
     title: "News digest",
     prefill: {
-      name: "News digest",
+      name: "News digest - {{MMM DD}}",
       prompt:
         "Summarize notable news from the last day. Keep it concise, group related items, and flag anything worth reading more closely.",
     },
