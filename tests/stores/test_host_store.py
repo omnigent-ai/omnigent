@@ -1866,3 +1866,81 @@ def test_replace_managed_host_sandbox_refuses_cross_owner(db_uri: str) -> None:
     assert resolved.sandbox_id == "sb-m7"
     # Bob's token never armed Alice's host: it does not match the stored digest.
     assert store.resolve_launch_token("58f80f7592c6a72ba121eb5aedde8a82", "bob-token-7") is None
+
+
+@pytest.mark.parametrize("removal", ["detach", "account"])
+def test_attached_sandbox_ownership_survives_host_lifecycle(host_store, db_uri, removal):
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    accounts.create_user_with_password("alice", "test-password-hash")
+    host = host_store.reserve_sandbox_host(
+        host_id=_RESERVED_HOST_ID,
+        name="devbox",
+        user_id="alice",
+        provider="modal",
+        attached_sandbox_id="existing-box",
+    )
+    assert host is not None and host.sandbox_attached
+    assert HostStore(db_uri).get_host(host.host_id) == host
+    assert host_store.list_current_managed_sandbox_hosts_page(after=None, limit=10) == []
+    assert not host_store.detach_stale_managed_sandbox(
+        host.host_id,
+        sandbox_id=host.sandbox_id,
+        expected_updated_at=host.updated_at,
+    )
+    with pytest.raises(ValueError, match="externally owned"):
+        host_store.replace_managed_host_sandbox(
+            host_id=host.host_id,
+            user_id="alice",
+            token="new",
+            provider="modal",
+            sandbox_id="replacement",
+            token_expires_at=now_epoch() + 100,
+        )
+    # An ordinary reservation cannot claim an externally owned box.
+    assert (
+        host_store.reserve_sandbox_host(
+            host_id=host.host_id,
+            name="devbox",
+            user_id="alice",
+            provider="modal",
+        )
+        is None
+    )
+    assert host_store.delete_host(host.host_id, user_id="bob") is None
+    if removal == "detach":
+        host_store.delete_host(host.host_id)
+    else:
+        SqlAlchemyAccountStore(db_uri).delete_user("alice")
+    assert host_store.get_host(host.host_id) is None
+    assert host_store.list_terminating_managed_sandbox_hosts_page(after=None, limit=10) == []
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_attachment_cannot_claim_a_managed_sandbox_generation(host_store, pending):
+    managed = host_store.register_managed_host(
+        host_id="ef" * 16,
+        name="per-session",
+        user_id="alice",
+        token="launch",
+        provider="modal",
+        sandbox_id="managed-box",
+        token_expires_at=now_epoch() + 100,
+    )
+    if pending:
+        assert host_store.detach_stale_managed_sandbox(
+            managed.host_id,
+            sandbox_id="managed-box",
+            expected_updated_at=managed.updated_at,
+        )
+    assert (
+        host_store.reserve_sandbox_host(
+            host_id=_RESERVED_HOST_ID,
+            name="devbox",
+            user_id="alice",
+            provider="modal",
+            attached_sandbox_id="managed-box",
+        )
+        is None
+    )

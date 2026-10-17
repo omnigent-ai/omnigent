@@ -521,6 +521,37 @@
         "title": "AgentObject",
         "type": "object"
       },
+      "AttachSandboxRequest": {
+        "description": "The provider checks access to this opaque sandbox ID for the caller.",
+        "properties": {
+          "name": {
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^\\S(?:.*\\S)?$",
+            "title": "Name",
+            "type": "string"
+          },
+          "provider": {
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Provider",
+            "type": "string"
+          },
+          "sandbox_id": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Sandbox Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider",
+          "sandbox_id",
+          "name"
+        ],
+        "title": "AttachSandboxRequest",
+        "type": "object"
+      },
       "AutomaticSessionRenameRequest": {
         "additionalProperties": false,
         "description": "Proposed title for a framework or agent-initiated rename.",
@@ -10855,7 +10886,153 @@
         ]
       }
     },
+    "/v1/hosts/attach": {
+      "post": {
+        "description": "Attach a caller-authorized existing sandbox as a reusable host.",
+        "operationId": "attach_host_v1_hosts_attach_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AttachSandboxRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Attach Host V1 Hosts Attach Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Attach Host",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/sandboxes": {
+      "get": {
+        "description": "List the caller's reusable boxes, including those not registered as hosts.",
+        "operationId": "discover_sandboxes_v1_hosts_sandboxes_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "provider",
+            "required": true,
+            "schema": {
+              "maxLength": 32,
+              "minLength": 1,
+              "title": "Provider",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "items": {
+                      "additionalProperties": {
+                        "type": "string"
+                      },
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "title": "Response Discover Sandboxes V1 Hosts Sandboxes Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Discover Sandboxes",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
     "/v1/hosts/{host_id}": {
+      "delete": {
+        "description": "Remove a reusable attachment and its credentials without deleting the box.",
+        "operationId": "detach_host_v1_hosts__host_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Detach Host V1 Hosts  Host Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Detach Host",
+        "tags": [
+          "hosts"
+        ]
+      },
       "get": {
         "description": "Get details for a single host.\n\n**Returns:** Host details dict \u2014 the `list_hosts` fields (including `gateway_inference`, `None` when unreported) plus `runners`.\n\n**Raises**\n\n- `HTTPException` \u2014 404 if the host does not exist.",
         "operationId": "get_host_v1_hosts__host_id__get",
@@ -11761,6 +11938,53 @@
           }
         },
         "summary": "Launch Runner",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/wake": {
+      "post": {
+        "description": "Wake an attached box before browsing its directories or starting sessions.",
+        "operationId": "wake_attached_host_v1_hosts__host_id__wake_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Wake Attached Host V1 Hosts  Host Id  Wake Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Wake Attached Host",
         "tags": [
           "hosts"
         ]

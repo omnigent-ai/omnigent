@@ -5,11 +5,12 @@ to false for existing rows and for inserts from older servers. This migration
 alone enables no behavior and adds no table or index.
 
 Deploy the schema first, then the attachment-aware application to **all** servers
-and cleanup workers. Only then allow attachment requests. Older workers ignore
-the ownership marker and must never process attached hosts.
+and cleanup workers. Only then allow attachment requests or enable a provider's
+`reusable_hosts` capability. Older workers ignore the ownership marker and must
+never process static hosts.
 
-Before rolling back the application, disable attachment requests and remove all
-attached host registrations through the attachment-aware application's host-delete
+Before rolling back the application, disable attachment requests and static
+creation, then remove all static host registrations through the application's host-delete
 API. This revokes Omnigent access without deleting the boxes. Drain outstanding
 attachment/resume requests before checking that no attached rows remain. Then
 roll back the application; the additive column can remain. Downgrading the schema

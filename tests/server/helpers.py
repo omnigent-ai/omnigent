@@ -9,7 +9,7 @@ import re
 import tarfile
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar
 
 import click
@@ -22,6 +22,7 @@ from omnigent.onboarding.sandboxes import (
     RemoteProcess,
     SandboxLauncher,
 )
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
 from omnigent.runtime import session_stream
 from omnigent.server.smart_routing import RoutingResult, RoutingSettings
@@ -175,6 +176,8 @@ class FakeSandboxLauncher(SandboxLauncher):
         can_resume: bool = False,
         fail_on_resume: bool = False,
         provision_gate: threading.Event | None = None,
+        attachments: dict[str, str] | None = None,
+        reusable_hosts: bool = False,
     ) -> None:
         self._on_host_start = on_host_start
         # Public + mutable: relaunch tests flip the failure mode between
@@ -185,6 +188,8 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.can_resume = can_resume
         self.fail_on_resume = fail_on_resume
         self._provision_gate = provision_gate
+        self.attachments = attachments
+        self.reusable_hosts = reusable_hosts
         # Image reference / secret names / env names the production code
         # constructed the launcher with (captured by the
         # ctor-monkeypatch shims).
@@ -235,9 +240,20 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.terminated: list[str] = []
         self.resumed: list[str] = []
 
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return replace(super().capabilities, reusable_hosts=self.reusable_hosts)
+
     def prepare(self) -> None:
         """Record the preflight call (no real SDK/credential check)."""
         self.prepared = True
+
+    def attach_for_user(self, sandbox_id: str, *, owner: str) -> None:
+        """Authorize only the explicit sandbox-to-owner mapping supplied by a test."""
+        if self.attachments is None:
+            super().attach_for_user(sandbox_id, owner=owner)
+        if self.attachments.get(sandbox_id) != owner:
+            raise PermissionError("not your sandbox")
 
     def provision(self, name: str) -> str:
         """Record provisioning and return a per-generation sandbox id.

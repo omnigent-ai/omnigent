@@ -81,16 +81,27 @@ describe("useHosts", () => {
     ]);
   });
 
-  it("hides server-managed sandbox hosts from the host list", async () => {
-    // Every host picker (NewChatDialog, ForkSessionDialog,
-    // ResumeWithDirectoryDialog) consumes this hook, so filtering here
-    // is what keeps sandbox-backed hosts out of all of them. A host
-    // with a non-null sandbox_provider is server-managed (created from
-    // a managed sandbox); one without the field at all comes from an
-    // older server and must be kept.
+  it("keeps explicit attachments while hiding ad hoc sandbox hosts", async () => {
+    // All host pickers share this filter, including old-server compatibility.
     fetchMock.mockResolvedValueOnce(
       mockResponse({
         hosts: [
+          {
+            host_id: "host_static",
+            name: "My devbox",
+            owner: "alice",
+            status: "offline",
+            sandbox_provider: "modal",
+            sandbox_attached: true,
+          },
+          {
+            host_id: "host_ad_hoc",
+            name: "Per-session sandbox",
+            owner: "alice",
+            status: "online",
+            sandbox_provider: "modal",
+            sandbox_attached: false,
+          },
           {
             host_id: "host_sandbox",
             name: "sandbox-abc123",
@@ -118,17 +129,17 @@ describe("useHosts", () => {
     const { result } = renderHook(() => useHosts(), { wrapper });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-    // The modal-backed host is dropped; the explicit-null and
-    // field-absent hosts both survive. If host_sandbox appears, the
-    // sandbox filter regressed; if host_legacy disappears, the filter
-    // broke old-server compatibility.
-    expect(result.current.data?.map((h) => h.host_id)).toEqual(["host_laptop", "host_legacy"]);
+    expect(result.current.data?.map((h) => h.host_id)).toEqual([
+      "host_static",
+      "host_laptop",
+      "host_legacy",
+    ]);
   });
 
   it("retains sandbox hosts when includeSandbox is set", async () => {
     // The chat-header HostBadge needs sandbox-backed hosts so it can
     // label them ("Databricks Sandbox"); the default filtered call must
-    // stay sandbox-free for the pickers.
+    // keep ad hoc sandboxes out of the pickers.
     fetchMock.mockResolvedValueOnce(
       mockResponse({
         hosts: [

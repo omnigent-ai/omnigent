@@ -3060,11 +3060,12 @@ def create_app(
         sandbox_provider = None
         sandbox_providers: list[str] = []
         sandbox_provider_capabilities: dict[str, dict[str, bool]] = {}
-        if sandbox_config is not None and sandbox_config.managed_launch_supported:
-            managed_sandboxes_enabled = True
-            sandbox_provider = sandbox_config.default.provider
-            sandbox_providers = list(sandbox_config.launchable_providers())
+        if sandbox_config is not None:
             sandbox_provider_capabilities = sandbox_config.provider_ui_capabilities()
+            if sandbox_config.managed_launch_supported:
+                managed_sandboxes_enabled = True
+                sandbox_provider = sandbox_config.default.provider
+                sandbox_providers = list(sandbox_config.launchable_providers())
         # enabled_connections lists the connection providers this deploy has
         # wired (config + store present), in a stable order. The web UI shows
         # the Sandbox Integrations nav when the list is non-empty and renders

@@ -9,6 +9,7 @@ import {
   GitBranchIcon,
   InfoIcon,
   MonitorIcon,
+  PlusIcon,
   TriangleAlertIcon,
 } from "lucide-react";
 import {
@@ -22,6 +23,7 @@ import {
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
   SelectSeparator,
   SelectTrigger,
@@ -79,10 +81,15 @@ import { checkHostDirectory, hostDirectoryMissing } from "@/hooks/useHostFilesys
 import { getCliServerUrl } from "@/lib/host";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { randomUUID } from "@/lib/randomUUID";
-import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
+import {
+  sandboxDiscoveryProviders,
+  sandboxOptionLabel,
+  sandboxProviderOptions,
+} from "@/lib/capabilities";
 import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferences";
 import { resolveWorkspacePath, useResolvedHostHome } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
+import { StaticSandboxPicker } from "./StaticSandboxPicker";
 import { WorkspacePathField } from "./WorkspacePathField";
 import {
   ConnectHostInstructions,
@@ -99,6 +106,7 @@ import {
 // non-empty value). When chosen, the fork omits agent_id and the server
 // clones the source's agent.
 const SAME_AS_SOURCE = "__same__";
+const DISCOVER_SANDBOX_PREFIX = "__discover_static:";
 
 // This dialog's pickers use the compact `text-sm` font (matching the Agent
 // field), on both the trigger value and the open dropdown's options. Items set
@@ -807,6 +815,7 @@ function SupportedForkSessionForm({
   const [sandboxSelected, setSandboxSelected] = useState(false);
   // Provider the sandbox pick launches on; null for a server that names none.
   const [sandboxProvider, setSandboxProvider] = useState<string | null>(null);
+  const [discoveryProvider, setDiscoveryProvider] = useState<string | null>(null);
   // Repository cloned into the sandbox, split across two inputs and
   // recomposed into the request's `<url>[#<branch>]` workspace.
   const [sandboxRepoUrl, setSandboxRepoUrl] = useState("");
@@ -844,6 +853,8 @@ function SupportedForkSessionForm({
     () => (info !== "loading" ? sandboxProviderOptions(info) : []),
     [info],
   );
+  const discoveryProviders =
+    !workspaceRecovery && info !== "loading" ? sandboxDiscoveryProviders(info) : [];
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
 
@@ -1461,7 +1472,9 @@ function SupportedForkSessionForm({
               <p className="text-sm text-muted-foreground" data-testid="fork-session-no-hosts">
                 Loading hosts…
               </p>
-            ) : onlineHosts.length === 0 && !managedSandboxesEnabled ? (
+            ) : onlineHosts.length === 0 &&
+              !managedSandboxesEnabled &&
+              discoveryProviders.length === 0 ? (
               // Nothing usable (no hosts, or all offline) and no sandbox to
               // fall back on — show the connect command directly so the user
               // can unblock. The submit button stays greyed until a host is
@@ -1482,6 +1495,10 @@ function SupportedForkSessionForm({
                   }
                   componentId="fork_session.host"
                   onValueChange={(v) => {
+                    if (v.startsWith(DISCOVER_SANDBOX_PREFIX)) {
+                      setDiscoveryProvider(v.slice(DISCOVER_SANDBOX_PREFIX.length));
+                      return;
+                    }
                     const provider = sandboxHostChoiceProvider(v);
                     if (provider !== undefined) {
                       selectSandbox(provider);
@@ -1521,7 +1538,14 @@ function SupportedForkSessionForm({
                         >
                           <span className="flex items-center gap-2">
                             <MonitorCloudIcon className="size-4 text-muted-foreground" />
-                            <span className="text-sm">{sandboxOptionLabel(provider)}</span>
+                            <span className="text-sm">
+                              {sandboxOptionLabel(
+                                provider,
+                                provider !== null &&
+                                  info.sandbox_provider_capabilities?.[provider]?.reusable_hosts ===
+                                    true,
+                              )}
+                            </span>
                           </span>
                         </SelectItem>
                       ))}
@@ -1545,8 +1569,32 @@ function SupportedForkSessionForm({
                         <HostLabel host={host} />
                       </SelectItem>
                     ))}
+                    {discoveryProviders.map((provider) => (
+                      <SelectGroup key={`discover-${provider}`}>
+                        <SelectSeparator />
+                        <SelectItem
+                          value={`${DISCOVER_SANDBOX_PREFIX}${provider}`}
+                          className="text-muted-foreground"
+                        >
+                          <span className="flex items-center gap-2">
+                            <PlusIcon className="size-4" aria-hidden="true" />
+                            <span>
+                              Existing Static Sandbox
+                              {discoveryProviders.length > 1 && ` (${provider})`}
+                            </span>
+                          </span>
+                        </SelectItem>
+                      </SelectGroup>
+                    ))}
                   </SelectContent>
                 </Select>
+                {discoveryProvider !== null && (
+                  <StaticSandboxPicker
+                    provider={discoveryProvider}
+                    onClose={() => setDiscoveryProvider(null)}
+                    onSelect={selectHost}
+                  />
+                )}
                 {/* A sandbox is a usable target, so no dead-end even with no
                     host online: offer connecting one as a collapsed, optional
                     step rather than an alarming "no hosts connected" banner. */}

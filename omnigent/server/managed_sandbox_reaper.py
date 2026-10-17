@@ -147,17 +147,19 @@ class ManagedSandboxReaper:
         now: int,
         current_slot: bool,
     ) -> int:
-        grouped: dict[tuple[int, str], list[Host]] = {}
+        grouped: dict[tuple[int, str, str], list[Host]] = {}
         for workspace_id, host in sorted(page, key=self._page_reap_order):
             if current_slot and host.terminating_sandbox_id is not None:
                 continue
             if not self._is_reap_candidate(host, cutoff=cutoff, now=now):
                 continue
             assert host.sandbox_provider is not None
-            grouped.setdefault((workspace_id, host.sandbox_provider), []).append(host)
+            grouped.setdefault((workspace_id, host.sandbox_provider, host.user_id), []).append(
+                host
+            )
 
         reaped = 0
-        for (workspace_id, provider), candidates in grouped.items():
+        for (workspace_id, provider, _owner), candidates in grouped.items():
             try:
                 reaped += await asyncio.to_thread(
                     self._reap_group,
@@ -251,6 +253,8 @@ class ManagedSandboxReaper:
 
     @staticmethod
     def _is_reap_candidate(host: Host, *, cutoff: int, now: int) -> bool:
+        if host.sandbox_attached:
+            return False
         return host.sandbox_provider is not None and (
             (
                 host.deleted_at is not None

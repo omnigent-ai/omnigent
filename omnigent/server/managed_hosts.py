@@ -182,14 +182,14 @@ from typing import TYPE_CHECKING, Any, cast
 import click
 from fastapi import HTTPException
 
-from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
+from omnigent.db.db_models import LABEL_VALUE_MAX_LEN, current_workspace_id
 from omnigent.db.utils import builtin_agent_id, now_epoch
-from omnigent.onboarding.sandboxes.base import SandboxGoneError
+from omnigent.onboarding.sandboxes.base import SandboxCapabilityError, SandboxGoneError
 
 # RepoWorkspace lives in the launcher's own package so a launcher can accept it
 # without importing omnigent.server; re-exported here (its parser is here) so
 # existing `from omnigent.server.managed_hosts import RepoWorkspace` keeps working.
-from omnigent.onboarding.sandboxes.types import GitCloneOptions, RepoWorkspace
+from omnigent.onboarding.sandboxes.types import GitCloneOptions, RepoWorkspace, SandboxInfo
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
@@ -647,8 +647,8 @@ class ManagedSandboxConfig:
     :param launcher_factory: Zero-argument factory producing the
         :class:`~omnigent.onboarding.sandboxes.base.SandboxLauncher`
         each launch uses, e.g.
-        ``lambda: ModalSandboxLauncher(image=…)``. Called per launch
-        (launchers may cache provider handles internally). May raise
+        ``lambda: ModalSandboxLauncher(image=…)``. Must return a fresh instance
+        because calls bind the host owner's identity; never share it across users. May raise
         ``HTTPException`` to report an unusable backend — the YAML
         path uses this for providers without managed support.
     :param token_ttl_s: Launch-token lifetime in seconds, e.g.
@@ -656,14 +656,15 @@ class ManagedSandboxConfig:
         provider's maximum sandbox lifetime so a live sandbox can
         always re-authenticate its tunnel across reconnects.
     :param managed_launch_supported: Whether ``launcher_factory`` can
-        actually serve a managed launch. The YAML path sets this from
-        :data:`PROVIDERS_WITH_MANAGED_LAUNCH` — staged providers
+        create a sandbox. The YAML path uses contributed providers'
+        ``managed_launch`` capability or :data:`PROVIDERS_WITH_MANAGED_LAUNCH` — staged providers
         (``lakebox``) parse but get ``False``, since their factory
         rejects at launch. Defaults to ``True`` for
         directly-constructed configs (an embedding deployment's
         custom factory IS the support). Drives the unauthenticated
         ``managed_sandboxes_enabled`` capability flag on
-        ``GET /v1/info``, which gates the web UI's sandbox option.
+        ``GET /v1/info``, which gates creation. Set ``False`` for injected
+        discovery-only providers; attachment and resume remain available.
     :param provider: Short provider name surfaced to the web UI so the
         new-session sandbox option can be labeled per provider (e.g.
         ``"modal"`` → "Modal Sandbox", ``"lakebox"`` → "Databricks
@@ -856,23 +857,37 @@ class ManagedSandboxDeployment:
 
     def provider_ui_capabilities(self) -> dict[str, dict[str, bool]]:
         """
-        UI-relevant capability flags per launchable provider, for ``/v1/info``.
+        UI-relevant flags for creation and discovery providers, for ``/v1/info``.
 
         Only the flags the web branches on are exposed (not the full internal
         :class:`SandboxCapabilities`), so the wire contract stays small — add an
-        inner key here to surface another flag. Instantiates each launchable
+        inner key here to surface another flag. Instantiates each configured
         provider's launcher to read its declared capabilities.
 
         ponytail: builds launchers on each call; memoize on the deployment only
         if /v1/info shows up hot (provider count is tiny, __init__ does no I/O).
 
-        :returns: Capability flags for each launchable provider, in configured order.
+        :returns: Capability flags for each usable provider, in configured order.
         """
         caps: dict[str, dict[str, bool]] = {}
         for config in self.configs:
-            if config.managed_launch_supported and config.provider is not None:
-                launcher = config.launcher_factory()
+            if config.provider is not None:
+                try:
+                    launcher = config.launcher_factory()
+                except HTTPException:
+                    if config.managed_launch_supported:
+                        raise
+                    continue  # Staged providers have no usable launcher yet.
+                if (
+                    not config.managed_launch_supported
+                    and not launcher.capabilities.reusable_hosts
+                ):
+                    continue
                 caps[config.provider] = {"multi_repo": launcher.capabilities.multi_repo}
+                if launcher.capabilities.reusable_hosts:
+                    caps[config.provider]["reusable_hosts"] = True
+                if not config.managed_launch_supported:
+                    continue
                 from omnigent.inference_config import parse_inference_config
                 from omnigent.server.inference_catalog import ambient_gateway_providers
 
@@ -1784,7 +1799,9 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         launcher_factory=launcher_factory,
         token_ttl_s=token_ttl_s,
         managed_launch_supported=(
-            provider in PROVIDERS_WITH_MANAGED_LAUNCH or provider in community
+            launcher_factory().capabilities.managed_launch
+            if provider in community
+            else provider in PROVIDERS_WITH_MANAGED_LAUNCH
         ),
         provider=provider,
         host_config=host_config,
@@ -3519,6 +3536,76 @@ def _select_provider_config(
     return selected
 
 
+def _launcher_for_owner(config: ManagedSandboxConfig, owner: str) -> SandboxHostLauncher:
+    """Construct a fresh launcher with the authenticated or persisted host owner."""
+    launcher = config.launcher_factory()
+    launcher.bind_principal(owner)
+    return launcher
+
+
+async def discover_sandbox_hosts(
+    *, config: ManagedSandboxDeployment, owner: str, provider: str
+) -> Sequence[SandboxInfo]:
+    """Read the caller's controller inventory without registering or waking hosts."""
+    entry = _select_provider_config(config, provider)
+    launcher = _launcher_for_owner(entry, owner)
+    if launcher.provider != provider or not launcher.capabilities.reusable_hosts:
+        raise HTTPException(400, "discovery requires a reusable sandbox provider")
+    try:
+        return await asyncio.to_thread(launcher.list_for_user, owner=owner)
+    except PermissionError as exc:
+        raise HTTPException(403, "sandbox discovery not authorized") from exc
+    except click.ClickException as exc:
+        raise HTTPException(502, "sandbox discovery failed") from exc
+
+
+async def attach_sandbox_host(
+    *,
+    config: ManagedSandboxDeployment,
+    owner: str,
+    host_store: HostStore,
+    provider: str,
+    sandbox_id: str,
+    name: str,
+) -> str:
+    """Authorize and attach an existing box using the ordinary host wake path.
+
+    The stable identity makes retries reuse one registration. Ownership is
+    immutable and saved before any wake; startup failures never delete the box.
+    """
+    entry = _select_provider_config(config, provider)
+    launcher = _launcher_for_owner(entry, owner)
+    if launcher.provider != provider or not launcher.capabilities.resume_stopped:
+        raise HTTPException(400, "attachment requires a matching provider with resume support")
+    try:
+        await asyncio.to_thread(launcher.attach_for_user, sandbox_id, owner=owner)
+    except SandboxCapabilityError as exc:
+        raise HTTPException(400, exc.message) from exc
+    except PermissionError as exc:
+        raise HTTPException(403, "sandbox attachment not authorized") from exc
+    except click.ClickException as exc:
+        raise HTTPException(502, "sandbox attachment failed") from exc
+    host_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        repr(("omnigent-attachment", current_workspace_id(), provider, sandbox_id)),
+    ).hex
+    try:
+        host = await asyncio.to_thread(
+            host_store.reserve_sandbox_host,
+            host_id=host_id,
+            name=name,
+            user_id=owner,
+            provider=provider,
+            attached_sandbox_id=sandbox_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(409, "sandbox is already attached to another host owner") from exc
+    if host is None:
+        raise HTTPException(409, "host name or sandbox attachment conflicts with an existing host")
+    await resume_managed_host(host.host_id, host_store, config)
+    return host.host_id
+
+
 async def launch_managed_host(
     *,
     config: ManagedSandboxDeployment,
@@ -3538,8 +3625,8 @@ async def launch_managed_host(
     host dials the tunnel) → clone the requested repositories → start
     ``omnigent host`` inside the sandbox with the token + identity in its
     environment → poll the hosts table until the host is online. Any
-    failure after provisioning terminates the sandbox and deletes the
-    host row (which revokes the token) before re-raising.
+    failure after provisioning an ad hoc sandbox terminates it and deletes
+    its host row. Reusable boxes and their registrations survive failures.
 
     :param config: The deployment's offered providers (YAML-parsed or
         wrapped around a directly-constructed embedding config).
@@ -3580,15 +3667,22 @@ async def launch_managed_host(
         provisioning, cloning, host startup, or registration fails.
     """
     entry = _select_provider_config(config, provider)
-    launcher = entry.launcher_factory()
+    launcher = _launcher_for_owner(entry, owner)
+    reusable = launcher.capabilities.reusable_hosts
+    if not entry.managed_launch_supported or not launcher.capabilities.managed_launch:
+        raise HTTPException(400, "sandbox provider does not support creating new sandboxes")
+    if reusable and not launcher.capabilities.resume_stopped:
+        raise HTTPException(400, "reusable sandbox providers must support resume")
     repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
-    slice_key_enabled = host_id is not None
+    slice_key_enabled = reusable or host_id is not None
     host_id = host_id or uuid.uuid4().hex
     host_name = managed_host_name(host_id)
     try:
         await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
         await asyncio.to_thread(launcher.prepare)
         sandbox_id = await asyncio.to_thread(launcher.provision, host_name)
+    except PermissionError as exc:
+        raise HTTPException(403, "sandbox access not authorized") from exc
     except click.ClickException as exc:
         raise HTTPException(
             status_code=502,
@@ -3602,6 +3696,7 @@ async def launch_managed_host(
         host_name=host_name,
         owner=owner,
         sandbox_id=sandbox_id,
+        sandbox_attached=reusable,
         repos=repos,
         agent_name=agent_name,
         on_stage=on_stage,
@@ -3658,6 +3753,10 @@ async def relaunch_managed_host(
         longer matches the configured launcher; 502 when
         provisioning, cloning, host startup, or registration fails.
     """
+    if host.sandbox_attached:
+        raise HTTPException(
+            409, "externally owned sandbox cannot be replaced; restore it with its provider"
+        )
     launcher = _launcher_for_teardown(host, config)
     if launcher is None:
         raise HTTPException(
@@ -3827,6 +3926,7 @@ async def _register_and_start_host(
     on_stage: Callable[[str], None] | None = None,
     keep_host_on_failure: bool = False,
     slice_key_enabled: bool = False,
+    sandbox_attached: bool = False,
 ) -> str:
     """
     Arm the credential, start the in-sandbox host, and await its
@@ -3864,6 +3964,8 @@ async def _register_and_start_host(
         cleanup terminates the new sandbox and revokes the token but
         keeps the host row. ``False`` (first launch) deletes the row.
     :param slice_key_enabled: Whether the host routes by its own id.
+    :param sandbox_attached: The provider created a reusable box it owns.
+        Startup failure revokes its token but retains the host for a retry.
     :returns: The absolute in-sandbox workspace path.
     :raises HTTPException: 502 when cloning, host startup, or
         registration fails.
@@ -3888,6 +3990,7 @@ async def _register_and_start_host(
                 host_store.register_managed_host,
                 host_id=host_id,
                 name=host_name,
+                sandbox_attached=sandbox_attached,
                 user_id=owner,
                 token=token,
                 provider=launcher.provider,
@@ -3916,7 +4019,10 @@ async def _register_and_start_host(
     except Exception as exc:
         # The provider allocated the sandbox before registration or startup
         # could fail, so both failures must attempt cleanup.
-        if record is None:
+        if sandbox_attached:
+            if record is not None:
+                await asyncio.to_thread(host_store.revoke_launch_token, host_id)
+        elif record is None:
             current = None
             try:
                 current = await asyncio.to_thread(host_store.get_host, host_id)
@@ -4011,7 +4117,7 @@ def _launcher_for_teardown(
         return None
     entry = config.recorded(host.sandbox_provider)
     try:
-        launcher = entry.launcher_factory()
+        launcher = _launcher_for_owner(entry, host.user_id)
     except HTTPException:
         # The YAML path's unsupported-provider factory raises; there is
         # no launcher to terminate with.
@@ -4183,6 +4289,8 @@ async def resume_managed_host(
             )
             if armed is None:
                 current = await asyncio.to_thread(host_store.get_host, host.host_id)
+                if host.sandbox_attached:
+                    raise HTTPException(409, "sandbox attachment changed while waking")
                 if current is None:
                     await _terminate_sandbox_best_effort(
                         launcher,
@@ -4214,13 +4322,17 @@ async def resume_managed_host(
                 server_url=entry.server_url,
                 repos=workspace_repos,
                 host_config=_with_host_slice_key(
-                    entry.host_config, slice_key_enabled, entry.server_url
+                    entry.host_config, slice_key_enabled or host.sandbox_attached, entry.server_url
                 ),
                 on_stage=on_stage,
                 agent_name=agent_name,
             )
             await _wait_for_host_online(host_store, host.host_id)
-        except SandboxGoneError:
+        except SandboxGoneError as exc:
+            if host.sandbox_attached:
+                raise HTTPException(
+                    409, "attached sandbox is gone; restore it with its provider"
+                ) from exc
             raise
         except Exception as exc:
             # An ordinary failed wake must NOT tear the sandbox down (the volume
@@ -4254,8 +4366,11 @@ async def terminate_managed_host(
         the launcher for the provider-side terminate), or ``None``
         when managed hosts are no longer configured.
     """
+    # Session cleanup must leave a reusable host and its other sessions intact.
+    if host.sandbox_attached:
+        return
     tombstone = await asyncio.to_thread(host_store.delete_host, host.host_id)
-    if tombstone is None:
+    if tombstone is None or tombstone.sandbox_attached:
         return
     launcher = _launcher_for_teardown(tombstone, config)
     sandbox_ids = dict.fromkeys((tombstone.sandbox_id, tombstone.terminating_sandbox_id))

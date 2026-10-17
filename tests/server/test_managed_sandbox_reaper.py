@@ -50,6 +50,11 @@ class _RecordingLauncher:
         self.identity_threads: list[int] = []
         self.terminated: list[str] = []
         self.termination_threads: list[int] = []
+        self.principal: str | None = None
+        self.termination_principals: list[tuple[str, str | None]] = []
+
+    def bind_principal(self, principal: str) -> None:
+        self.principal = principal
 
     @contextlib.contextmanager
     def reaper_identity(self, workspace_id: int) -> Iterator[None]:
@@ -61,6 +66,7 @@ class _RecordingLauncher:
 
     def terminate(self, sandbox_id: str) -> None:
         self.termination_threads.append(threading.get_ident())
+        self.termination_principals.append((sandbox_id, self.principal))
         if self.on_terminate is not None:
             self.on_terminate(sandbox_id)
         if self.fail:
@@ -242,7 +248,8 @@ def _deployment(
     )
 
 
-async def test_sweep_reaps_stale_host_rows_without_scanning_sessions() -> None:
+@pytest.mark.parametrize("mixed_owners", [False, True])
+async def test_sweep_reaps_stale_host_rows_without_scanning_sessions(mixed_owners: bool) -> None:
     now = 4_000_000
     modal = _RecordingLauncher("modal")
     e2b = _RecordingLauncher("e2b")
@@ -283,19 +290,25 @@ async def test_sweep_reaps_stale_host_rows_without_scanning_sessions() -> None:
         host_store=hosts,  # type: ignore[arg-type]
         sandbox_config=_deployment([modal, e2b]),
     )
+    second_owner = "bob@example.com" if mixed_owners else "alice@example.com"
+    hosts.hosts[7]["host_modal_2"] = replace(hosts.hosts[7]["host_modal_2"], user_id=second_owner)
 
     assert await reaper.sweep_once(now=now) == 3
 
     assert modal.terminated == ["sb-modal-2", "sb-modal"]
     assert e2b.terminated == ["sb-e2b"]
-    assert hosts.detached == [
-        (7, "host_modal_2", "sb-modal-2"),
+    assert sorted(hosts.detached) == [
         (7, "host_modal", "sb-modal"),
+        (7, "host_modal_2", "sb-modal-2"),
         (9, "host_e2b", "sb-e2b"),
     ]
     assert hosts.cleared == hosts.detached
-    assert modal.factory_calls == 1
-    assert modal.identity_entries == [7]
+    assert modal.factory_calls == (2 if mixed_owners else 1)
+    assert modal.identity_entries == ([7, 7] if mixed_owners else [7])
+    assert modal.termination_principals == [
+        ("sb-modal-2", second_owner),
+        ("sb-modal", "alice@example.com"),
+    ]
     assert e2b.factory_calls == 1
     assert e2b.identity_entries == [9]
     assert hosts.hosts[7]["host_modal"].sandbox_id is None

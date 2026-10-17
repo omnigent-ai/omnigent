@@ -185,7 +185,12 @@ def _keep_alive_for_runner(runner_id: str) -> None:
             host = host_store.get_host(host_id)
             # Only a server-provisioned sandbox has one to extend; a CLI host has
             # no sandbox_id / provider and is left alone.
-            if host is None or not host.sandbox_id or not host.sandbox_provider:
+            if (
+                host is None
+                or host.sandbox_attached
+                or not host.sandbox_id
+                or not host.sandbox_provider
+            ):
                 continue
             # for_provider, NOT recorded: recorded() falls back to the deployment
             # default when the host's provider is no longer offered, which is safe
@@ -207,7 +212,9 @@ def _keep_alive_for_runner(runner_id: str) -> None:
                 host.sandbox_provider
             )
             try:
-                extended = config.launcher_factory().keep_alive(host.sandbox_id)
+                from omnigent.server.managed_hosts import _launcher_for_owner
+
+                extended = _launcher_for_owner(config, host.user_id).keep_alive(host.sandbox_id)
                 # INFO from the server layer so the keepalive is visible in the
                 # server log (onboarding-layer loggers do not surface there); the
                 # provider logs the new deadline at debug. A provider returns

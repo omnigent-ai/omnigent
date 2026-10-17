@@ -16,11 +16,13 @@ export interface Host {
   owner: string;
   status: "online" | "offline";
   /**
-   * Sandbox provider backing a server-managed host (e.g. "modal");
-   * null for user-connected hosts. Optional because older servers
+   * Sandbox provider backing this host (e.g. "modal");
+   * null for ordinary user-connected hosts. Optional because older servers
    * omit the field entirely.
    */
   sandbox_provider?: string | null;
+  /** Reusable, externally owned sandbox, created by a provider or attached later. */
+  sandbox_attached?: boolean;
   /**
    * Per-harness readiness reported by the host's last connect, e.g.
    * `{"claude-sdk": true, "codex": "needs-auth"}`. `null`/absent means the
@@ -46,14 +48,9 @@ export async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
   const res = await authenticatedFetch("/v1/hosts");
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as HostsResponse;
-  // Hide server-managed sandbox hosts from every host picker: they
-  // are launch targets the server creates on demand (and relaunches
-  // at will), not user-connectable machines, so offering them as
-  // manual targets is misleading. Hosts from older servers lack the
-  // field and are kept. `includeSandbox` opts a caller (the chat-header
-  // HostBadge) back into seeing them so it can label sandbox sessions.
+  // Per-session sandboxes stay hidden; explicitly reusable boxes appear as hosts.
   if (includeSandbox) return body.hosts;
-  return body.hosts.filter((h) => !h.sandbox_provider);
+  return body.hosts.filter((h) => !h.sandbox_provider || h.sandbox_attached === true);
 }
 
 interface UseHostsOptions {
