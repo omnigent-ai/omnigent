@@ -30,6 +30,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -799,21 +800,7 @@ def test_wrap_launcher_argv_chdir_none_falls_back_to_cwd(
 def test_wrap_launcher_argv_binds_intermediate_symlink_at_literal_path(
     tmp_path: Path,
 ) -> None:
-    """
-    When ``argv[0]`` resolves through an intermediate directory-symlink
-    (the uv-managed-Python layout: ``cpython-3.12 -> cpython-3.12.13``),
-    the argv builder must emit a bind that mounts the real directory at
-    the *literal* symlink path. Otherwise bwrap's ``execvp`` will fail
-    with ENOENT because the kernel traverses the literal name and the
-    intermediate symlink doesn't exist inside the sandbox.
-
-    Regression for the CI failure: switching to
-    ``python-preference = "only-managed"`` made uv create a venv whose
-    ``.venv/bin/python`` resolves through ``cpython-3.12 -> cpython-3.12.13``,
-    and the previous ``_ensure_executable_visible`` implementation only
-    bound the fully-resolved ``cpython-3.12.13`` path. The kernel had no
-    way to reach it through the literal ``cpython-3.12`` name.
-    """
+    """A version-floating interpreter path must resolve to one mounted install."""
     # Build the uv-style layout:
     #   <tmp>/installs/cpython-3.12.13/bin/python   (real file)
     #   <tmp>/installs/cpython-3.12 -> cpython-3.12.13   (directory symlink)
@@ -840,28 +827,10 @@ def test_wrap_launcher_argv_binds_intermediate_symlink_at_literal_path(
     policy = _make_policy(scratch)
     argv = backend.wrap_launcher_argv([str(venv_python), "-c", "pass"], policy, scratch)
 
-    # Pair up the ``--ro-bind-try src dst`` triples for inspection.
-    def _bind_pairs() -> list[tuple[str, str]]:
-        pairs: list[tuple[str, str]] = []
-        for i, token in enumerate(argv):
-            if token == "--ro-bind-try" and i + 2 < len(argv):
-                pairs.append((argv[i + 1], argv[i + 2]))
-        return pairs
-
-    pairs = _bind_pairs()
-    # The fix: a bind whose DESTINATION is the literal version-floating
-    # path (``cpython-3.12``) and whose SOURCE is the resolved real
-    # directory (``cpython-3.12.13``). Without this, the kernel can't
-    # traverse the floating name inside the sandbox.
-    floating_bin_dst = str(floating / "bin")
-    real_bin_src = str(real_install / "bin")
-    assert (real_bin_src, floating_bin_dst) in pairs, (
-        f"Expected a bind mapping the real Python install bin "
-        f"({real_bin_src!r}) at the floating symlink's literal bin path "
-        f"({floating_bin_dst!r}). Without this, bwrap's execvp on the "
-        f"literal venv path fails with ENOENT because the floating "
-        f"symlink dir is missing inside the sandbox. Pairs: {pairs}"
-    )
+    real_root = str(real_install)
+    assert _index_of_triple(argv, "--ro-bind-try", real_root, real_root) is not None
+    assert _index_of_triple(argv, "--symlink", real_root, str(floating)) is not None
+    assert _index_of_triple(argv, "--ro-bind-try", real_root, str(floating)) is None
 
 
 def test_wrap_launcher_argv_target_binds_non_default_path(
@@ -944,6 +913,22 @@ def test_wrap_launcher_argv_target_none_no_extra_binds(
     )
 
 
+def test_conflicting_helper_and_target_directory_symlinks_are_rejected(tmp_path: Path) -> None:
+    destination = str(tmp_path / "literal-install")
+    with patch.object(
+        bwrap_sandbox,
+        "_ensure_executable_visible",
+        side_effect=[
+            ["--symlink", str(tmp_path / "first-install"), destination],
+            ["--symlink", str(tmp_path / "replacement-install"), destination],
+        ],
+    ):
+        with pytest.raises(ValueError, match="Conflicting executable directory symlink"):
+            _make_backend().wrap_launcher_argv(
+                ["helper"], _make_policy(tmp_path), tmp_path, target="target"
+            )
+
+
 @pytest.mark.parametrize("target", ["/bin/bash", "/sbin/tool", "/workspace/tool"])
 def test_covered_executable_does_not_expose_parent_directories(target: str) -> None:
     assert (
@@ -960,6 +945,25 @@ def test_shallow_executable_never_exposes_the_host_root() -> None:
         "/opt",
         "/opt",
     ]
+
+
+def test_link_resolution_steps_up_from_the_link_target(tmp_path: Path) -> None:
+    real = tmp_path.resolve()
+    (real / "store/lib").mkdir(parents=True)
+    (real / "venv").mkdir()
+    (real / "venv/shortcut").symlink_to("../store/lib")
+    links: dict[Path, str] = {}
+
+    resolved = bwrap_sandbox._resolve_recording_links(real / "venv/shortcut/../bin", links)
+
+    assert resolved == real / "store/bin"
+    assert links == {real / "venv/shortcut": "../store/lib"}
+
+
+def test_link_resolution_stops_at_the_kernel_symlink_limit(tmp_path: Path) -> None:
+    (tmp_path / "loop").symlink_to("loop")
+
+    assert bwrap_sandbox._resolve_recording_links(tmp_path / "loop/bin", {}) is None
 
 
 def test_wrap_launcher_argv_target_already_in_default_mounts(
@@ -1957,6 +1961,412 @@ print(json.dumps(results))
         f" instead of EPERM; the MASKED_EQ rule for CLONE_NEWNET in"
         " _bwrap_extra_seccomp_rules() is missing or incorrect."
     )
+
+
+_PARENT_MOUNT_LAYOUTS = (
+    "venv-symlink",
+    "bin-symlink",
+    "venv-chain-absolute",
+    "venv-chain-relative",
+    "bin-chain-absolute",
+    "bin-chain-relative",
+    "venv-bin-chain-relative",
+    "venv-file-link-relative",
+    "split-version-alias",
+    "aliased-checkout",
+    "dotdot-after-link",
+    "physical",
+)
+
+
+@pytestmark_bwrap
+@pytest.mark.parametrize(
+    ("entry_point", "layout"),
+    [
+        *(("helper", layout) for layout in _PARENT_MOUNT_LAYOUTS),
+        ("target", "venv-chain-relative"),
+        ("helper-and-target", "venv-chain-relative"),
+        ("helper-and-target", "aliased-checkout"),
+    ],
+)
+@pytest.mark.parametrize("exposure", ["unmounted", "read-root", "cwd"])
+def test_interpreter_directory_symlinks_survive_parent_mounts(
+    tmp_path: Path, layout: str, exposure: str, entry_point: str
+) -> None:
+    """Parent grants must preserve both the helper and final target executable."""
+    checkout, interpreter, _ = _directory_symlink_interpreter(tmp_path, layout)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    cwd = checkout if exposure == "cwd" else workspace
+    backend = _make_backend()
+    policy = backend.resolve(
+        OSEnvSpec(
+            type="caller_process",
+            sandbox=OSEnvSandboxSpec(
+                type="linux_bwrap", read_paths=[str(checkout)] if exposure == "read-root" else []
+            ),
+        ),
+        cwd,
+    )
+    command = [str(interpreter), "-I", "-S", "-c", "print('INTERPRETER_READY')"]
+    if entry_point == "target":
+        command = [
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            f"import subprocess; subprocess.run({command!r}, check=True)",
+        ]
+    argv = backend.wrap_launcher_argv(
+        command, policy, cwd, target=str(interpreter) if entry_point != "helper" else None
+    )
+
+    completed = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "INTERPRETER_READY"
+
+
+def _directory_symlink_interpreter(tmp_path: Path, layout: str) -> tuple[Path, Path, Path]:
+    root = tmp_path / "real-root" if layout == "aliased-checkout" else tmp_path
+    checkout = root / "checkout"
+    checkout.mkdir(parents=True)
+    install = root / "install"
+    if layout == "venv-bin-chain-relative":
+        (install / "real-bin").mkdir(parents=True)
+        (install / "real-bin/python").symlink_to(Path(sys.executable).resolve())
+        (tmp_path / "floating-bin").symlink_to("install/real-bin", target_is_directory=True)
+        (install / "bin").symlink_to("../floating-bin", target_is_directory=True)
+        (checkout / ".venv").symlink_to("../install", target_is_directory=True)
+        return checkout, checkout / ".venv/bin/python", install
+    (install / "bin").mkdir(parents=True)
+    (install / "bin/python").symlink_to(Path(sys.executable).resolve())
+    venv = checkout / ".venv"
+    if layout == "venv-file-link-relative":
+        # The relative link climbs from the venv's real directory, not from the checkout.
+        (tmp_path / "floating").symlink_to("install", target_is_directory=True)
+        (tmp_path / "venv-store/bin").mkdir(parents=True)
+        (tmp_path / "venv-store/bin/python").symlink_to("../../floating/bin/python")
+        venv.symlink_to("../venv-store", target_is_directory=True)
+        return checkout, venv / "bin/python", install
+    if layout == "split-version-alias":
+        (checkout / "python").mkdir()
+        (checkout / "python/cpython-3.12").symlink_to("../../install", target_is_directory=True)
+        (venv / "bin").mkdir(parents=True)
+        (venv / "bin/python").symlink_to("../../python/cpython-3.12/bin/python")
+        return checkout, venv / "bin/python", install
+    if layout == "aliased-checkout":
+        venv.symlink_to("../install", target_is_directory=True)
+        (tmp_path / "alias-root").symlink_to(root, target_is_directory=True)
+        alias = tmp_path / "alias-root/checkout"
+        return alias, alias / ".venv/bin/python", install
+    if layout == "dotdot-after-link":
+        # The kernel resolves ``shortcut/..`` from the link target, not lexically.
+        (install / "lib").mkdir()
+        (venv / "bin").mkdir(parents=True)
+        (venv / "shortcut").symlink_to(install / "lib", target_is_directory=True)
+        (venv / "bin/python").symlink_to("../shortcut/../bin/python")
+        return checkout, venv / "bin/python", install
+    target = install
+    if "chain" in layout:
+        target = tmp_path / "floating"
+        target.symlink_to(
+            "install" if layout.endswith("relative") else install, target_is_directory=True
+        )
+    if layout.startswith("venv-"):
+        venv.symlink_to(
+            "../floating" if layout.endswith("relative") else target, target_is_directory=True
+        )
+    elif layout.startswith("bin-"):
+        venv.mkdir()
+        (venv / "bin").symlink_to(
+            "../../floating/bin" if layout.endswith("relative") else target / "bin",
+            target_is_directory=True,
+        )
+    else:
+        (venv / "bin").mkdir(parents=True)
+        (venv / "bin/python").symlink_to(Path(sys.executable).resolve())
+    return checkout, venv / "bin/python", install
+
+
+@pytestmark_bwrap
+@pytest.mark.parametrize("layout", ["venv-symlink", "bin-symlink"])
+def test_interpreter_aliases_preserve_masks_and_write_grants(tmp_path: Path, layout: str) -> None:
+    """Interpreter visibility must preserve existing read, write, and mask limits."""
+    checkout, interpreter, install = _directory_symlink_interpreter(tmp_path, layout)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ordinary = checkout / "readme.txt"
+    ordinary.write_text("ordinary")
+    (checkout / ".env").write_text("MASKED_FILE")
+    (checkout / ".private").mkdir()
+    secret = checkout / ".private/secret"
+    secret.write_text("MASKED_DIRECTORY")
+    writable = checkout / "output"
+    writable.mkdir()
+    writable_file = checkout / "approved.txt"
+    writable_file.write_text("before")
+    outside = tmp_path / "ungranted.txt"
+    outside.write_text("UNGRANTED")
+    backend = _make_backend()
+    policy = backend.resolve(
+        OSEnvSpec(
+            type="caller_process",
+            sandbox=OSEnvSandboxSpec(
+                type="linux_bwrap",
+                read_paths=[str(checkout)],
+                write_paths=[str(writable)],
+                write_files=[str(writable_file)],
+            ),
+        ),
+        workspace,
+    )
+    probe = f"""
+import json
+from pathlib import Path
+def write_errno(name):
+    try:
+        Path(name).write_text('denied')
+    except OSError as exc:
+        return exc.errno
+    return None
+def masked_file(name):
+    try:
+        return Path(name).read_text() == ''
+    except PermissionError:
+        return True
+Path({str(writable / "created.txt")!r}).write_text('allowed-root')
+Path({str(writable_file)!r}).write_text('allowed-file')
+print(json.dumps({{
+    'ordinary': Path({str(ordinary)!r}).read_text(),
+    'masked_file': masked_file({str(checkout / ".env")!r}),
+    'masked_directory_visible': Path({str(secret)!r}).exists(),
+    'ungranted_visible': Path({str(outside)!r}).exists(),
+    'checkout_write_errno': write_errno({str(checkout / "denied.txt")!r}),
+    'interpreter_write_errno': write_errno({str(install / "bin/denied.txt")!r}),
+}}))
+"""
+    argv = backend.wrap_launcher_argv(
+        [str(interpreter), "-I", "-S", "-c", probe], policy, workspace
+    )
+
+    completed = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {
+        "ordinary": "ordinary",
+        "masked_file": True,
+        "masked_directory_visible": False,
+        "ungranted_visible": False,
+        "checkout_write_errno": errno.EROFS,
+        "interpreter_write_errno": errno.EROFS,
+    }
+    assert (writable / "created.txt").read_text() == "allowed-root"
+    assert writable_file.read_text() == "allowed-file"
+    assert not (checkout / "denied.txt").exists()
+    assert not (install / "bin/denied.txt").exists()
+
+
+@pytestmark_bwrap
+@pytest.mark.parametrize(
+    "layout",
+    [
+        "venv-symlink",
+        "bin-symlink",
+        "venv-chain-absolute",
+        "venv-chain-relative",
+        "bin-chain-absolute",
+        "bin-chain-relative",
+    ],
+)
+@pytest.mark.parametrize("exposure", ["unmounted", "read-root", "cwd"])
+@pytest.mark.parametrize("writable", [False, True], ids=["read-only", "write-grant"])
+def test_interpreter_directory_aliases_share_masks_and_write_grants(
+    tmp_path: Path, layout: str, exposure: str, writable: bool
+) -> None:
+    """A resolved interpreter directory must keep the same policy through every name."""
+    checkout, interpreter, install = _directory_symlink_interpreter(tmp_path, layout)
+    real = install if layout.startswith("venv-") else install / "bin"
+    lexical = checkout / ".venv" if layout.startswith("venv-") else checkout / ".venv/bin"
+    raw = tmp_path / "floating" if layout.startswith("venv-") else tmp_path / "floating/bin"
+    if "chain" not in layout:
+        raw = lexical
+    (real / "masked.txt").write_text("MASKED_FILE")
+    (real / "masked-directory").mkdir()
+    (real / "masked-directory/secret").write_text("MASKED_DIRECTORY")
+    (real / "approved.txt").write_text("before")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    cwd = checkout if exposure == "cwd" else workspace
+    backend = _make_backend()
+    policy = backend.resolve(
+        OSEnvSpec(
+            type="caller_process",
+            sandbox=OSEnvSandboxSpec(
+                type="linux_bwrap",
+                read_paths=[str(checkout)] if exposure == "read-root" else [],
+                write_paths=[str(real)] if writable else [],
+                mask_paths=[str(real / "masked.txt"), str(real / "masked-directory")],
+            ),
+        ),
+        cwd,
+    )
+    probe = f"""
+import json
+from pathlib import Path
+def read_masked(name):
+    try:
+        return Path(name).read_text()
+    except PermissionError:
+        return ''
+def write_errno(name):
+    try:
+        Path(name).write_text('approved')
+    except OSError as exc:
+        return exc.errno
+    return None
+print(json.dumps({{
+    'lexical_file': read_masked({str(lexical / "masked.txt")!r}),
+    'real_file': read_masked({str(real / "masked.txt")!r}),
+    'raw_file': read_masked({str(raw / "masked.txt")!r}),
+    'lexical_directory_visible': Path({str(lexical / "masked-directory/secret")!r}).exists(),
+    'real_directory_visible': Path({str(real / "masked-directory/secret")!r}).exists(),
+    'raw_directory_visible': Path({str(raw / "masked-directory/secret")!r}).exists(),
+    'lexical_write_errno': write_errno({str(lexical / "approved.txt")!r}),
+    'real_write_errno': write_errno({str(real / "approved.txt")!r}),
+    'raw_write_errno': write_errno({str(raw / "approved.txt")!r}),
+}}))
+"""
+    argv = backend.wrap_launcher_argv([str(interpreter), "-I", "-S", "-c", probe], policy, cwd)
+
+    completed = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
+
+    assert completed.returncode == 0, completed.stderr
+    write_error = None if writable else errno.EROFS
+    assert json.loads(completed.stdout) == {
+        "lexical_file": "",
+        "real_file": "",
+        "raw_file": "",
+        "lexical_directory_visible": False,
+        "real_directory_visible": False,
+        "raw_directory_visible": False,
+        "lexical_write_errno": write_error,
+        "real_write_errno": write_error,
+        "raw_write_errno": write_error,
+    }
+    assert (real / "approved.txt").read_text() == ("approved" if writable else "before")
+
+
+@pytestmark_bwrap
+@pytest.mark.parametrize("layout", ["venv-symlink", "bin-symlink"])
+def test_interpreter_reexposure_preserves_a_masked_install_root(
+    tmp_path: Path, layout: str
+) -> None:
+    """Only the executable subtree may return through a masked install directory."""
+    checkout, interpreter, install = _directory_symlink_interpreter(tmp_path, layout)
+    (install / "secret.txt").write_text("MASKED_INSTALL_SECRET")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    policy = _make_backend().resolve(
+        OSEnvSpec(
+            type="caller_process",
+            sandbox=OSEnvSandboxSpec(
+                type="linux_bwrap", read_paths=[str(checkout)], mask_paths=[str(install)]
+            ),
+        ),
+        workspace,
+    )
+    lexical = checkout / ".venv" if layout == "venv-symlink" else checkout / ".venv/bin/.."
+    probe = (
+        "import json; from pathlib import Path; "
+        f"print(json.dumps([Path({str(lexical / 'secret.txt')!r}).exists(), "
+        f"Path({str(install / 'secret.txt')!r}).exists()]))"
+    )
+    argv = _make_backend().wrap_launcher_argv(
+        [str(interpreter), "-I", "-S", "-c", probe], policy, workspace
+    )
+
+    completed = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == [False, False]
+
+
+@pytestmark_bwrap
+def test_interpreter_directory_link_returns_inside_a_masked_cwd_root(tmp_path: Path) -> None:
+    """Re-expose a needed directory link without reopening its masked parent."""
+    checkout, interpreter, install = _directory_symlink_interpreter(tmp_path, "bin-symlink")
+    masked = checkout / ".venv"
+    (masked / "secret.txt").write_text("MASKED_PARENT")
+    (install / "ungranted.txt").write_text("UNGRANTED_INSTALL_PARENT")
+    policy = _make_backend().resolve(
+        OSEnvSpec(
+            type="caller_process",
+            sandbox=OSEnvSandboxSpec(type="linux_bwrap", mask_paths=[str(masked)]),
+        ),
+        checkout,
+    )
+    probe = (
+        "import json; from pathlib import Path; "
+        f"print(json.dumps([Path({str(masked / 'secret.txt')!r}).exists(), "
+        f"Path({str(install / 'ungranted.txt')!r}).exists()]))"
+    )
+    argv = _make_backend().wrap_launcher_argv(
+        [str(interpreter), "-I", "-S", "-c", probe], policy, checkout
+    )
+
+    completed = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == [False, False]
+
+
+@pytestmark_bwrap
+@pytest.mark.parametrize("layout", ["venv-symlink", "bin-symlink"])
+def test_denied_control_socket_stays_denied_through_interpreter_names(
+    tmp_path: Path, layout: str
+) -> None:
+    """A writable interpreter directory must not reopen a denied control socket."""
+    checkout, interpreter, install = _directory_symlink_interpreter(tmp_path, layout)
+    real = install if layout == "venv-symlink" else install / "bin"
+    lexical = checkout / ".venv" if layout == "venv-symlink" else checkout / ".venv/bin"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    control_path = real / "control.sock"
+    if len(os.fsencode(control_path)) >= 100:
+        pytest.skip("tmp_path is too long for an AF_UNIX socket path")
+    policy = _make_backend().resolve(
+        OSEnvSpec(
+            type="caller_process",
+            sandbox=OSEnvSandboxSpec(type="linux_bwrap", write_paths=[str(real)]),
+        ),
+        workspace,
+    )
+    policy = with_denied_unix_sockets(policy, [control_path])
+    probe = f"""
+import json, socket
+def can_connect(path):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        try:
+            client.connect(path)
+        except OSError:
+            return False
+        return True
+print(json.dumps([
+    can_connect({str(lexical / "control.sock")!r}),
+    can_connect({str(control_path)!r}),
+]))
+"""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as control:
+        control.bind(str(control_path))
+        control.listen(2)
+        argv = _make_backend().wrap_launcher_argv(
+            [str(interpreter), "-I", "-S", "-c", probe], policy, workspace
+        )
+        completed = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == [False, False]
 
 
 @pytestmark_bwrap
