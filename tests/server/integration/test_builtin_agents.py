@@ -216,6 +216,70 @@ async def test_list_builtin_agents_exposes_declared_terminals_from_spec(
     assert entry["terminals"] == ["shell", "py"]
 
 
+async def test_list_builtin_agents_exposes_short_description_from_spec(
+    agent_store: SqlAlchemyAgentStore,
+    artifact_store: LocalArtifactStore,
+    agents_client: httpx.AsyncClient,
+) -> None:
+    """
+    ``GET /v1/agents`` reports each agent's declared ``short_description:``.
+
+    The Web UI picker prefers this over its hardcoded blurb map so any
+    agent — not just the two entries in that map — can supply its own
+    compact picker-row text.
+    """
+    bundle = build_agent_bundle(
+        name="short-desc-agent",
+        description="A much longer paragraph meant for a hover tooltip.",
+        short_description="One-line picker blurb",
+    )
+    _register_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_id="9a6a0e0f9e6a4c6cbf5f6a0a4a6a6a6a",
+        name="short-desc-agent",
+        bundle=bundle,
+    )
+
+    resp = await agents_client.get("/v1/agents")
+
+    assert resp.status_code == 200, resp.text
+    entry = next(a for a in resp.json()["data"] if a["id"] == "9a6a0e0f9e6a4c6cbf5f6a0a4a6a6a6a")
+    # Proves the spec's short_description traversed the load → AgentObject
+    # path verbatim, independent of the long-form description.
+    assert entry["short_description"] == "One-line picker blurb"
+    assert entry["description"] == "A much longer paragraph meant for a hover tooltip."
+
+
+async def test_list_builtin_agents_short_description_absent_when_undeclared(
+    agent_store: SqlAlchemyAgentStore,
+    artifact_store: LocalArtifactStore,
+    agents_client: httpx.AsyncClient,
+) -> None:
+    """
+    ``short_description`` is ``None`` when the spec declares none —
+    the new field must not change the response for every existing
+    agent that doesn't set it.
+    """
+    bundle = build_agent_bundle(name="no-short-desc-agent")
+    _register_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_id="1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b",
+        name="no-short-desc-agent",
+        bundle=bundle,
+    )
+
+    resp = await agents_client.get("/v1/agents")
+
+    assert resp.status_code == 200, resp.text
+    entry = next(a for a in resp.json()["data"] if a["id"] == "1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b")
+    # Matches the sibling nullable fields on AgentObject (description,
+    # harness, updated_at), which this endpoint also emits as null rather
+    # than omitting — the model deliberately does not use exclude_none.
+    assert entry["short_description"] is None
+
+
 async def test_list_builtin_agents_exposes_bundled_skills_from_spec(
     agent_store: SqlAlchemyAgentStore,
     artifact_store: LocalArtifactStore,
