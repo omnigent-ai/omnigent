@@ -154,6 +154,10 @@ from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 
 _logger = logging.getLogger(__name__)
 _RECONNECT_BINDING_BATCH_SIZE = 128
+# A cached session read can trail a fresh rebind by seconds, so a session the
+# by-runner lookup binds to a connecting runner is rechecked this often, this long.
+_RECONNECT_BINDING_RECHECK_INTERVAL_S = 2.0
+_RECONNECT_BINDING_RECHECK_DEADLINE_S = 30.0
 
 
 class SmartRoutingSourcesInfo(BaseModel):
@@ -3858,7 +3862,56 @@ def create_app(
         convs.sort(key=lambda conv: not is_independent(conv))
         _logger.info("_on_runner_connect: runner=%s, %d bound session(s)", runner_id, len(convs))
         roots: list[tuple[Conversation, httpx.AsyncClient]] = []
+        # Listed as bound here, but the refreshed row is missing or names another runner.
+        unconfirmed: list[str] = []
         store_slots = asyncio.Semaphore(RECOVERY_STORE_CONCURRENCY)
+
+        def attach(conv: Conversation) -> httpx.AsyncClient | None:
+            """Attach a session confirmed on this runner; return its client if it is a root."""
+            with runner_log_scope(conv.id, runner_id):
+                _logger.info("_on_runner_connect: matched %s (agent=%s)", conv.id, conv.agent_id)
+                try:
+                    routed = runner_router.client_for_session_resources(conv.id, conversation=conv)
+                except OmnigentError as exc:
+                    if exc.code in (ErrorCode.RUNNER_UNAVAILABLE, ErrorCode.WRONG_REPLICA):
+                        # The runner dropped again before we reached this session.
+                        _logger.warning(
+                            "Runner %s went offline before session %s was re-attached",
+                            runner_id,
+                            conv.id,
+                            extra=debug_event(
+                                "runner_reconnect_client_offline",
+                                runner_id=runner_id,
+                                error_code=exc.code,
+                            ),
+                        )
+                    else:
+                        _logger.exception(
+                            "Failed to resolve runner client for session %s on reconnect",
+                            conv.id,
+                        )
+                    return None
+                if routed.runner_id != runner_id:
+                    return None
+                _ensure_runner_relay(
+                    conv.id,
+                    runner_id,
+                    routed.client,
+                    conversation_store,
+                    conversation=conv,
+                )
+                if not is_independent(conv):
+                    prefetch_session_routing_catalogs(conv.id, conv, routed.client)
+                # A crash can leave a persisted count absent from the live index.
+                session_live_state.persist_pending_count(
+                    conv.id, pending_elicitations.count_for(conv.id)
+                )
+                cached_sandbox = _session_sandbox_status_cache.get(conv.id)
+                # A reconnect proves readiness only for a launch already marked failed.
+                if cached_sandbox is not None and cached_sandbox.stage == "failed":
+                    _publish_sandbox_status(conv.id, "ready")
+                return routed.client if is_independent(conv) else None
+
         for _, candidates in groupby(convs, key=is_independent):
             # Awaited reads let attachment yield between batches, even for native mirrors.
             for batch in batched(candidates, _RECONNECT_BINDING_BATCH_SIZE):
@@ -3878,113 +3931,78 @@ def create_app(
                 for snapshot in batch:
                     conv = current.get(snapshot.id)
                     if conv is None or conv.runner_id != runner_id:
+                        unconfirmed.append(snapshot.id)
                         continue
-                    with runner_log_scope(conv.id, runner_id):
-                        _logger.info(
-                            "_on_runner_connect: matched %s (agent=%s)", conv.id, conv.agent_id
-                        )
-                        try:
-                            routed = runner_router.client_for_session_resources(
-                                conv.id, conversation=conv
-                            )
-                        except OmnigentError as exc:
-                            if exc.code in (ErrorCode.RUNNER_UNAVAILABLE, ErrorCode.WRONG_REPLICA):
-                                # The runner dropped again before we reached this session.
-                                _logger.warning(
-                                    "Runner %s went offline before session %s was re-attached",
-                                    runner_id,
-                                    conv.id,
-                                    extra=debug_event(
-                                        "runner_reconnect_client_offline",
-                                        runner_id=runner_id,
-                                        error_code=exc.code,
-                                    ),
-                                )
-                            else:
-                                _logger.exception(
-                                    "Failed to resolve runner client for session %s on reconnect",
-                                    conv.id,
-                                )
-                            continue
-                        if routed.runner_id != runner_id:
-                            continue
-                        _ensure_runner_relay(
-                            conv.id,
-                            runner_id,
-                            routed.client,
-                            conversation_store,
-                            conversation=conv,
-                        )
-                        if is_independent(conv):
-                            roots.append((conv, routed.client))
-                        else:
-                            prefetch_session_routing_catalogs(conv.id, conv, routed.client)
-                        # A crash can leave a persisted count absent from the live index.
-                        session_live_state.persist_pending_count(
-                            conv.id, pending_elicitations.count_for(conv.id)
-                        )
-                        cached_sandbox = _session_sandbox_status_cache.get(conv.id)
-                        # A reconnect proves readiness only for a launch already marked failed.
-                        if cached_sandbox is not None and cached_sandbox.stage == "failed":
-                            _publish_sandbox_status(conv.id, "ready")
+                    client = attach(conv)
+                    if client is not None:
+                        roots.append((conv, client))
 
-        # Descendants on an offline runner are absent from the bound-session lookup.
-        # Scan attached idle trees in bounded pages before recovering their roots.
-        frontier = {
-            conv.id: conv.id
-            for conv, _ in roots
-            if conv.agent_id is not None and _restorable(conv) and conv.id not in eager_root_ids
-        }
-        idle_root_ids = set(frontier.values())
-        try:
-            while frontier:
-                next_frontier: dict[str, str] = {}
-                for parent_id, root_id in frontier.items():
-                    if root_id in eager_root_ids:
-                        continue
-                    cursor: tuple[int, str] | None = None
-                    while True:
-                        async with store_slots:
-                            pairs = await asyncio.to_thread(
-                                conversation_store.list_child_conversation_ids_page,
-                                parent_id,
-                                after=cursor,
-                                limit=_RECONNECT_BINDING_BATCH_SIZE,
-                            )
-                        if not pairs:
-                            break
-                        child_id, created_at = pairs[-1]
-                        cursor = (created_at, child_id)
-                        async with store_slots:
-                            rows = await asyncio.to_thread(
-                                conversation_store.get_conversations,
-                                [child_id for child_id, _ in pairs],
-                            )
-                        for child_id, _ in pairs:
-                            row = rows.get(child_id)
-                            if (
-                                row is None
-                                or row.host_id is not None
-                                or row.runner_id is None
-                                or not _restorable(row)
-                                or is_side_chat_child(row.labels)
-                            ):
-                                continue
-                            if row.runner_id != runner_id and runner_router.runner_is_online(
-                                row.runner_id
-                            ):
-                                continue
-                            if row.runner_id != runner_id and _interrupted(row):
-                                eager_root_ids.add(root_id)
+        async def classify_idle_trees(new_roots: list[Conversation]) -> None:
+            """Mark idle roots eager when an interrupted descendant waits on an offline runner."""
+            # Descendants on an offline runner are absent from the bound-session lookup.
+            # Scan attached idle trees in bounded pages before recovering their roots.
+            frontier = {
+                conv.id: conv.id
+                for conv in new_roots
+                if conv.agent_id is not None
+                and _restorable(conv)
+                and conv.id not in eager_root_ids
+            }
+            idle_root_ids = set(frontier.values())
+            try:
+                while frontier:
+                    next_frontier: dict[str, str] = {}
+                    for parent_id, root_id in frontier.items():
+                        if root_id in eager_root_ids:
+                            continue
+                        cursor: tuple[int, str] | None = None
+                        while True:
+                            async with store_slots:
+                                pairs = await asyncio.to_thread(
+                                    conversation_store.list_child_conversation_ids_page,
+                                    parent_id,
+                                    after=cursor,
+                                    limit=_RECONNECT_BINDING_BATCH_SIZE,
+                                )
+                            if not pairs:
                                 break
-                            next_frontier[row.id] = root_id
-                        if root_id in eager_root_ids or len(pairs) < _RECONNECT_BINDING_BATCH_SIZE:
-                            break
-                frontier = next_frontier
-        except Exception:
-            # A failed classification must not prevent eager recovery.
-            _logger.exception("Failed to classify child recovery for runner %s", runner_id)
-            eager_root_ids.update(idle_root_ids)
+                            child_id, created_at = pairs[-1]
+                            cursor = (created_at, child_id)
+                            async with store_slots:
+                                rows = await asyncio.to_thread(
+                                    conversation_store.get_conversations,
+                                    [child_id for child_id, _ in pairs],
+                                )
+                            for child_id, _ in pairs:
+                                row = rows.get(child_id)
+                                if (
+                                    row is None
+                                    or row.host_id is not None
+                                    or row.runner_id is None
+                                    or not _restorable(row)
+                                    or is_side_chat_child(row.labels)
+                                ):
+                                    continue
+                                if row.runner_id != runner_id and runner_router.runner_is_online(
+                                    row.runner_id
+                                ):
+                                    continue
+                                if row.runner_id != runner_id and _interrupted(row):
+                                    eager_root_ids.add(root_id)
+                                    break
+                                next_frontier[row.id] = root_id
+                            if (
+                                root_id in eager_root_ids
+                                or len(pairs) < _RECONNECT_BINDING_BATCH_SIZE
+                            ):
+                                break
+                    frontier = next_frontier
+            except Exception:
+                # A failed classification must not prevent eager recovery.
+                _logger.exception("Failed to classify child recovery for runner %s", runner_id)
+                eager_root_ids.update(idle_root_ids)
+
+        await classify_idle_trees([conv for conv, _ in roots])
 
         async def recover_root(conv: Conversation, client: httpx.AsyncClient) -> None:
             with runner_log_scope(conv.id, runner_id):
@@ -4072,11 +4090,114 @@ def create_app(
                     else:
                         _logger.exception("Failed to re-assign session %s on reconnect", conv.id)
 
+        async def recheck_bindings(ids: list[str], recoveries: asyncio.TaskGroup) -> None:
+            """Recover sessions whose refreshed row trails a fresh bind to this runner."""
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            deadline = started + _RECONNECT_BINDING_RECHECK_DEADLINE_S
+            pending = list(ids)
+            try:
+                # One more consistent lookup drops sessions rebound since the first one.
+                async with store_slots:
+                    listed = await asyncio.to_thread(
+                        conversation_store.list_conversations_by_runner_id, runner_id
+                    )
+                still_bound = {conv.id for conv in listed}
+                pending = [sid for sid in pending if sid in still_bound]
+            except Exception:  # noqa: BLE001 — the per-row rechecks below still run
+                _logger.warning(
+                    "Failed to relist sessions for runner %s on reconnect",
+                    runner_id,
+                    exc_info=True,
+                )
+            while pending and tunnel_registry.get(runner_id) is connection:
+                final_read = loop.time() + _RECONNECT_BINDING_RECHECK_INTERVAL_S >= deadline
+                await asyncio.sleep(
+                    max(0.0, min(_RECONNECT_BINDING_RECHECK_INTERVAL_S, deadline - loop.time()))
+                )
+                try:
+                    # Only the unresolved rows are read, so each round stays bounded.
+                    async with store_slots:
+                        current = await asyncio.to_thread(
+                            conversation_store.get_conversations, pending
+                        )
+                except Exception:  # noqa: BLE001 — a failed read costs one round, not the rest
+                    _logger.warning(
+                        "Failed to recheck session bindings for runner %s on reconnect",
+                        runner_id,
+                        exc_info=True,
+                    )
+                    current = {}
+                if tunnel_registry.get(runner_id) is not connection:
+                    return
+                waiting: list[str] = []
+                for sid in pending:
+                    conv = current.get(sid)
+                    if conv is None or conv.runner_id != runner_id:
+                        # A row naming a runner that is online now has really moved there.
+                        moved = conv is not None and (
+                            conv.runner_id is not None
+                            and runner_router.runner_is_online(conv.runner_id)
+                        )
+                        if not moved:
+                            waiting.append(sid)
+                        continue
+                    with runner_log_scope(sid, runner_id):
+                        _logger.info(
+                            "Session %s binding to runner %s settled after %.1fs",
+                            sid,
+                            runner_id,
+                            loop.time() - started,
+                            extra=debug_event(
+                                "runner_reconnect_binding_settled",
+                                runner_id=runner_id,
+                                waited_s=round(loop.time() - started, 3),
+                            ),
+                        )
+                    client = attach(conv)
+                    if client is not None:
+                        await classify_idle_trees([conv])
+                        recoveries.create_task(
+                            recover_root(conv, client), name=f"recover-root-{conv.id}"
+                        )
+                pending = waiting
+                if final_read:
+                    break
+            for sid in pending:
+                with runner_log_scope(sid, runner_id):
+                    _logger.warning(
+                        "Session %s still reads as bound elsewhere %.1fs after runner %s "
+                        "connected; skipping its recovery",
+                        sid,
+                        loop.time() - started,
+                        runner_id,
+                        extra=debug_event(
+                            "runner_reconnect_binding_unsettled",
+                            runner_id=runner_id,
+                            waited_s=round(loop.time() - started, 3),
+                        ),
+                    )
+
+        async def recheck_unconfirmed(ids: list[str], recoveries: asyncio.TaskGroup) -> None:
+            """Recover sessions whose refreshed row trails a fresh bind to this runner."""
+            try:
+                await recheck_bindings(ids, recoveries)
+            except Exception:
+                # Recovery already running for confirmed sessions must not be cancelled.
+                _logger.exception(
+                    "Failed to recheck session bindings for runner %s on reconnect", runner_id
+                )
+
         # A hung initialization delays only its own tree. All tasks are joined and
         # cancelled with this connection; no detached recovery or shared deadline.
         async with asyncio.TaskGroup() as recoveries:
             for conv, client in roots:
                 recoveries.create_task(recover_root(conv, client), name=f"recover-root-{conv.id}")
+            if unconfirmed:
+                recoveries.create_task(
+                    recheck_unconfirmed(unconfirmed, recoveries),
+                    name=f"recheck-bindings-{runner_id}",
+                )
 
     def _mint_managed_runner_token(runner_id: str, ttl_seconds: int) -> str | None:
         assert runner_account_store is not None and auth_provider is not None
