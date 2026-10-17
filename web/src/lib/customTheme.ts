@@ -133,7 +133,7 @@ function rgbToHex({ r, g, b }: Rgb): string {
   return `#${channel(r)}${channel(g)}${channel(b)}`;
 }
 
-function mix(first: string, second: string, secondWeight: number): string {
+export function mix(first: string, second: string, secondWeight: number): string {
   const firstRgb = hexToRgb(first);
   const secondRgb = hexToRgb(second);
   const weight = clamp(secondWeight, 0, 1);
@@ -247,7 +247,7 @@ function formatCssColor(color: CssColor, template: string): string {
   return `rgba(${Math.round(clamp(color.r, 0, 255))}, ${Math.round(clamp(color.g, 0, 255))}, ${Math.round(clamp(color.b, 0, 255))}, ${Math.round(clamp(color.alpha, 0, 1) * 1000) / 1000})`;
 }
 
-function rebaseColor(base: string, reference: string, current: string): string {
+export function rebaseColor(base: string, reference: string, current: string): string {
   if (current === reference) return base;
   const baseColor = parseCssColor(base);
   const referenceColor = parseCssColor(reference);
@@ -533,4 +533,17 @@ export function applyCustomTheme(theme: CustomTheme): void {
       style.setProperty(`--custom-${mode}-${token}`, variants[mode][key]);
     }
   }
+  for (const listener of customThemeListeners) listener(normalized);
+}
+
+type CustomThemeListener = (theme: CustomTheme) => void;
+
+const customThemeListeners = new Set<CustomThemeListener>();
+
+/** Subscribe to applied custom-theme changes. Returns an unsubscribe function. */
+export function subscribeCustomTheme(listener: CustomThemeListener): () => void {
+  customThemeListeners.add(listener);
+  return () => {
+    customThemeListeners.delete(listener);
+  };
 }

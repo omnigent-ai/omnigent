@@ -751,4 +751,21 @@ export function applyThemePalette(palette: ThemeSelection): void {
       root.setAttribute("data-theme", next);
     }
   }
+  for (const listener of paletteListeners) listener(next);
+}
+
+type ThemePaletteListener = (palette: ThemeSelection) => void;
+
+const paletteListeners = new Set<ThemePaletteListener>();
+
+/**
+ * Subscribe to applied palette changes. Surfaces that can't ride the CSS
+ * tokens (the xterm.js terminal takes a JS `ITheme`) re-theme from this.
+ * Returns an unsubscribe function.
+ */
+export function subscribeThemePalette(listener: ThemePaletteListener): () => void {
+  paletteListeners.add(listener);
+  return () => {
+    paletteListeners.delete(listener);
+  };
 }

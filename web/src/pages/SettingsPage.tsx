@@ -494,7 +494,7 @@ function ModeControl() {
   );
 }
 
-/** Terminal light/dark/match-app theme — its own section. */
+/** Terminal light/dark/match-app variant of the color theme — its own section. */
 function TerminalThemeControl() {
   const [mode, setMode] = useState(() => readTerminalThemeMode());
   const labelId = useId();
@@ -507,7 +507,7 @@ function TerminalThemeControl() {
       <SettingsLabel
         label="Terminal theme"
         labelId={labelId}
-        description="Use a light or dark terminal, or match the app."
+        description="Colors follow your color theme. Use its light or dark variant, or match the app."
         className="flex-1"
       />
       <IconSegmentedControl<TerminalThemeMode>

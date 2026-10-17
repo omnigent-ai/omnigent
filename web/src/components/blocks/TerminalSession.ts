@@ -18,14 +18,14 @@ import { withBasePath } from "@/lib/basePath";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
 import { splitWorkspaceFileCitation } from "@/components/ai-elements/streamdown-security";
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
+import {
+  DEFAULT_TERMINAL_PALETTE,
+  type TerminalColors,
+  type TerminalPalette,
+} from "@/lib/terminalPalettes";
 import { CodexTerminalPalette, codexTerminalTheme } from "./CodexTerminalPalette";
 import { TerminalLinkProvider } from "./TerminalLinkProvider";
 
-// Card background colors derived from the app's CSS palette.
-// Light: --card: oklch(1.000 0 0) = pure white.
-// Dark:  --card: oklch(0.195 0.004 240) ≈ rgb(19, 21, 23) via OKLab → sRGB.
-const CARD_LIGHT = "#ffffff";
-const CARD_DARK = "#131517";
 const TERMINAL_BOLD_WEIGHT_OFFSET = 300;
 
 function terminalFontOptions({ sizePx, family, weight }: CodeFont) {
@@ -44,36 +44,13 @@ function terminalFontOptions({ sizePx, family, weight }: CodeFont) {
 export const WS_CLOSE_WRONG_REPLICA = 4400;
 
 /**
- * Return an xterm `ITheme` object matched to the app's light or dark palette.
+ * Return the xterm `ITheme` for the light or dark variant of a terminal palette.
  */
-export function terminalTheme(isDark: boolean): ITheme {
-  const bg = isDark ? CARD_DARK : CARD_LIGHT;
-  return isDark
-    ? {
-        background: bg,
-        foreground: "#e4e4e7",
-        cursor: "#22d3ee",
-        cursorAccent: bg,
-        selectionBackground: "#22d3ee33",
-        black: "#09090b",
-        brightBlack: "#71717a",
-      }
-    : {
-        background: bg,
-        foreground: "#18181b",
-        cursor: "#0891b2",
-        cursorAccent: bg,
-        selectionBackground: "#0891b233",
-        black: "#18181b",
-        brightBlack: "#e4e4e7",
-        // CLIs that assume a dark terminal paint primary text with ANSI
-        // white / bright-white. On the white card background those slots
-        // must be dark tones, or the text renders white-on-white and
-        // vanishes. brightWhite is the most emphasized text, so it maps to
-        // the strongest (darkest) tone; white is a slightly muted gray.
-        white: "#3f3f46",
-        brightWhite: "#18181b",
-      };
+export function terminalTheme(
+  isDark: boolean,
+  palette: TerminalPalette = DEFAULT_TERMINAL_PALETTE,
+): TerminalColors {
+  return { ...palette[isDark ? "dark" : "light"] };
 }
 
 /**
@@ -646,6 +623,7 @@ export class TerminalSession {
   private readonly dataDispose: { dispose: () => void };
   private readonly osc52Dispose: { dispose: () => void };
   private readonly codexPalette: CodexTerminalPalette | null;
+  private terminalPalette: TerminalPalette;
   private readonly onClipboardRequest?: TerminalClipboardListener;
   /** Whether this visible, interactive attach may write the local clipboard. */
   private clipboardEnabled: boolean;
@@ -696,6 +674,7 @@ export class TerminalSession {
    * :param onClipboardRequest: Authorizes browser selections and validated tmux copies.
    * :param focusOnConnect: Whether to grab keyboard focus on WS-open.
    * :param onFileLink: Handles OSC 8 local-file links inside the app.
+   * :param terminalPalette: Colors for the app's current color theme.
    */
   constructor(
     container: HTMLElement,
@@ -709,8 +688,10 @@ export class TerminalSession {
     focusOnConnect = true,
     adaptCodexPalette = false,
     onFileLink?: TerminalFileLinkListener,
+    terminalPalette: TerminalPalette = DEFAULT_TERMINAL_PALETTE,
   ) {
     this.codexPalette = adaptCodexPalette ? new CodexTerminalPalette() : null;
+    this.terminalPalette = terminalPalette;
     this.clipboardEnabled = clipboardEnabled;
     this.focusOnConnect = focusOnConnect;
     this.onClipboardRequest = onClipboardRequest;
@@ -963,12 +944,13 @@ export class TerminalSession {
    * Update the terminal's color theme without reconnecting the WebSocket.
    * Safe to call at any point after construction.
    */
-  setTheme(isDark: boolean): void {
+  setTheme(isDark: boolean, palette: TerminalPalette = this.terminalPalette): void {
+    this.terminalPalette = palette;
     this.term.options.theme = this.theme(isDark);
   }
 
   private theme(isDark: boolean): ITheme {
-    const theme = terminalTheme(isDark);
+    const theme = terminalTheme(isDark, this.terminalPalette);
     return this.codexPalette ? codexTerminalTheme(theme, isDark) : theme;
   }
 
