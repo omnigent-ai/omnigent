@@ -425,18 +425,29 @@ async def test_host_tunnel_slow_heartbeat_does_not_delay_ping_or_offline_cleanup
     assert not store.is_online(_HOST_ID)
 
 
-@pytest.mark.parametrize("wall_clock_step", [-3600.0, 0.0, 3600.0])
+@pytest.mark.parametrize(
+    ("wall_clock_step", "local_stall"),
+    [(-3600.0, False), (0.0, False), (3600.0, False), (0.0, True)],
+)
 async def test_host_tunnel_failed_heartbeat_still_times_out_silent_host(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     wall_clock_step: float,
+    local_stall: bool,
 ) -> None:
     import omnigent.server.routes.host_tunnel as tunnel_mod
     from omnigent.server import host_registry
 
     monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
     monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 3)
+    if local_stall:
+        real_snapshot = TunnelDiagnostics.snapshot
+        monkeypatch.setattr(
+            TunnelDiagnostics,
+            "snapshot",
+            lambda self: {**real_snapshot(self), "loop_lag_s": 300.0},
+        )
     caplog.set_level(logging.INFO, logger=tunnel_mod.__name__)
     app, registry, store = host_app
 
@@ -469,9 +480,9 @@ async def test_host_tunnel_failed_heartbeat_still_times_out_silent_host(
         ]
         assert timeout["connection_id"] == "host-silent"
         # A sleeping or offline host is expected; only a local stall warns.
-        assert timeout["silence_source"] == "peer"
+        assert timeout["silence_source"] == ("local_event_loop" if local_stall else "peer")
         assert all(
-            r.levelno == logging.INFO
+            r.levelno == (logging.WARNING if local_stall else logging.INFO)
             for r in caplog.records
             if getattr(r, "event_name", None) == "host_ping_timeout"
         )

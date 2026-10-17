@@ -951,7 +951,8 @@ async def test_runner_recovery_clears_persisted_disconnect_error_labels(
     a healthy reconnected-to-idle session keeps reporting
     ``runner_disconnected`` and the Subagents panel keeps the grey dot.
     This asserts recovery clears the labels so the projection returns
-    ``None`` again.
+    ``None`` again, and that the recovery is logged against the failure the
+    disconnect logged, naming the path that cleared it.
     """
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
@@ -970,32 +971,47 @@ async def test_runner_recovery_clears_persisted_disconnect_error_labels(
     sessions_module._session_status_cache[session_id] = "running"
 
     try:
-        # Disconnect first: the relay persists the runner_disconnected
-        # labels and marks the status cache "failed".
-        handle = await sessions_module._ensure_runner_relay_ready(
-            session_id,
-            "runner_recovery_labels",
-            fake_runner,  # type: ignore[arg-type]
-            conversation_store=store,  # type: ignore[arg-type]
-        )
-        assert handle is not None
-        gate.set()
-        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        with capture_debug_rows("server") as rows:
+            # Disconnect first: the relay persists the runner_disconnected
+            # labels and marks the status cache "failed".
+            handle = await sessions_module._ensure_runner_relay_ready(
+                session_id,
+                "runner_recovery_labels",
+                fake_runner,  # type: ignore[arg-type]
+                conversation_store=store,  # type: ignore[arg-type]
+            )
+            assert handle is not None
+            gate.set()
+            await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
 
-        persisted = store.labels.get(session_id)
-        assert persisted is not None
-        assert sessions_module._last_task_error_from_labels(persisted) == {
-            "code": "runner_disconnected",
-            "message": "Runner disconnected unexpectedly.",
-        }
-        assert sessions_module._session_status_cache.get(session_id) == "failed"
+            persisted = store.labels.get(session_id)
+            assert persisted is not None
+            assert sessions_module._last_task_error_from_labels(persisted) == {
+                "code": "runner_disconnected",
+                "message": "Runner disconnected unexpectedly.",
+            }
+            assert sessions_module._session_status_cache.get(session_id) == "failed"
 
-        # Recovery: a successful runner rebind / session-init flips the
-        # cached failed back to idle and must drop the durable labels.
-        await sessions_module._publish_runner_recovered_status(
-            session_id,
-            store,  # type: ignore[arg-type]
-        )
+            # Recovery: a successful runner rebind / session-init flips the
+            # cached failed back to idle and must drop the durable labels.
+            await sessions_module._publish_runner_recovered_status(
+                session_id,
+                store,  # type: ignore[arg-type]
+            )
+
+        failures = [
+            row
+            for row in rows
+            if row["event_name"] == "session_turn_failed" and row["session_id"] == session_id
+        ]
+        assert failures and failures[0]["attributes"]["code"] == "runner_disconnected"
+        [recovered] = [
+            row
+            for row in rows
+            if row["event_name"] == "session_runner_recovered" and row["session_id"] == session_id
+        ]
+        assert recovered["attributes"]["failure_code"] == "runner_disconnected"
+        assert recovered["attributes"]["recovery_path"] == "explicit_rebind"
 
         assert sessions_module._session_status_cache.get(session_id) == "idle"
         cleared = store.labels.get(session_id)

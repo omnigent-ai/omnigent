@@ -96,6 +96,7 @@ from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
 from omnigent.runtime import (
+    disconnect_outcome,
     get_policy_store,
     inflight_text,
     pending_elicitations,
@@ -7723,6 +7724,8 @@ async def _dispatch_skill_slash_command_to_runner(
     if conv.harness_override is not None and conv.harness_override != "auto":
         runner_body["harness_override"] = conv.harness_override
 
+    # A skill command starts a new user turn, the same as a plain message.
+    disconnect_outcome.note_user_turn(session_id)
     try:
         await runner_client.post(
             f"/v1/sessions/{session_id}/events",

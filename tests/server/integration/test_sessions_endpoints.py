@@ -2361,6 +2361,48 @@ async def test_external_subagent_start_rejects_missing_required_keys(
 # ── POST /v1/sessions/{id}/events skill slash_command ─────
 
 
+_GRILL_ME_SKILL = {
+    "name": "grill-me",
+    "description": "Stress-test a plan.",
+    "content": "Ask sharp questions one at a time.",
+}
+
+
+def _fake_skill_runner(
+    forwarded: list[dict[str, Any]] | None = None,
+) -> Callable[[httpx.Request], httpx.Response]:
+    """
+    Emulate the runner: resolve skills and capture event posts.
+
+    Skill content is runner-owned, so the server resolves the ``<skill>``
+    meta text via ``POST /skills/resolve`` before persisting/forwarding.
+    This fake mirrors that endpoint with the real
+    :func:`format_skill_meta_text`, then captures the forwarded turn input
+    on ``/events``.
+
+    :param forwarded: Receives each ``/events`` body when given.
+    :returns: Handler for :class:`httpx.MockTransport`.
+    """
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/skills/resolve"):
+            payload = json.loads(request.content)
+            skill = SkillSpec(**_GRILL_ME_SKILL)
+            return httpx.Response(
+                200,
+                json={"meta_text": format_skill_meta_text(skill, payload.get("arguments", ""))},
+            )
+        if (
+            forwarded is not None
+            and request.method == "POST"
+            and request.url.path.endswith("/events")
+        ):
+            forwarded.append(json.loads(request.content))
+        return httpx.Response(202, json={"queued": True})
+
+    return _handler
+
+
 async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -2378,52 +2420,13 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     forwarded: list[dict[str, Any]] = []
     published: list[tuple[str, dict[str, Any]]] = []
 
-    def _handler(request: httpx.Request) -> httpx.Response:
-        """
-        Emulate the runner: resolve skills and capture event posts.
-
-        Skill content is runner-owned, so the server resolves the
-        ``<skill>`` meta text via ``POST /skills/resolve`` before
-        persisting/forwarding. This fake mirrors that endpoint with the
-        real :func:`format_skill_meta_text`, then captures the forwarded
-        turn input on ``/events``.
-
-        :param request: Request sent to the fake runner.
-        :returns: Resolved meta text (``/skills/resolve``) or an
-            accepted response (``/events``).
-        """
-        if request.method == "POST" and request.url.path.endswith("/skills/resolve"):
-            payload = json.loads(request.content)
-            skill = SkillSpec(
-                name="grill-me",
-                description="Stress-test a plan.",
-                content="Ask sharp questions one at a time.",
-            )
-            return httpx.Response(
-                200,
-                json={"meta_text": format_skill_meta_text(skill, payload.get("arguments", ""))},
-            )
-        if request.method == "POST" and request.url.path.endswith("/events"):
-            forwarded.append(json.loads(request.content))
-        return httpx.Response(202, json={"queued": True})
-
     _capture_published(monkeypatch, published)
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(_handler),
+        transport=httpx.MockTransport(_fake_skill_runner(forwarded)),
         base_url="http://runner",
     ) as fake_runner:
         _route_to_runner(monkeypatch, fake_runner)
-        agent = await create_test_agent(
-            client,
-            name="skill-agent",
-            skills=[
-                {
-                    "name": "grill-me",
-                    "description": "Stress-test a plan.",
-                    "content": "Ask sharp questions one at a time.",
-                }
-            ],
-        )
+        agent = await create_test_agent(client, name="skill-agent", skills=[_GRILL_ME_SKILL])
         session = await _create_session(client, agent["id"])
 
         resp = await client.post(
@@ -2492,6 +2495,51 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     session_resp = await client.get(f"/v1/sessions/{session['id']}")
     assert session_resp.status_code == 200, session_resp.text
     assert session_resp.json()["title"] == "/grill-me review this rollout"
+
+
+async def test_skill_slash_command_supersedes_a_watched_disconnect_failure(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A skill command is a new user turn for disconnect-outcome tracking.
+
+    After a passive reconnect clears a ``runner_disconnected`` failure the
+    session is watched for the old turn to resume. The command's own visible
+    ``response.output_item.done`` reaches the real stream observer here, so
+    the failure must be recorded as superseded by the command, never as the
+    old turn resuming.
+    """
+    from omnigent.runtime import disconnect_outcome
+
+    disconnect_outcome.reset_for_tests()
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_fake_skill_runner()),
+            base_url="http://runner",
+        ) as fake_runner:
+            _route_to_runner(monkeypatch, fake_runner)
+            agent = await create_test_agent(client, name="skill-agent", skills=[_GRILL_ME_SKILL])
+            session = await _create_session(client, agent["id"])
+            disconnect_outcome.watch_for_resume(session["id"], failure_code="runner_disconnected")
+            with capture_debug_rows("server") as rows:
+                resp = await client.post(
+                    f"/v1/sessions/{session['id']}/events",
+                    json={
+                        "type": "slash_command",
+                        "data": {"kind": "skill", "name": "grill-me", "arguments": "review this"},
+                    },
+                )
+        assert resp.status_code == 202, resp.text
+    finally:
+        disconnect_outcome.reset_for_tests()
+
+    outcomes = [
+        row["attributes"]["outcome"]
+        for row in rows
+        if row["event_name"] == "session_turn_failure_outcome" and row["session_id"] == session["id"]
+    ]
+    assert outcomes == ["superseded_by_user_turn"]
 
 
 @pytest.mark.parametrize("in_sub_agent", [False, True])

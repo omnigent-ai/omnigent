@@ -3794,6 +3794,12 @@ async def _publish_runner_recovered_status_impl(
     reconnect, keeping the red "Failed" pill instead of silently flipping
     it back to idle and hiding the error.
 
+    Every clear logs ``session_runner_recovered`` with the cleared failure
+    code and the recovery path, so reliability logs can pair it with the
+    session's ``session_turn_failed`` row. A passive clear also arms the
+    resume watch (:mod:`omnigent.runtime.disconnect_outcome`), which records
+    whether the failed turn went on without a new user message.
+
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
     :param conversation_store: Store used to read the persisted error
@@ -3807,17 +3813,31 @@ async def _publish_runner_recovered_status_impl(
     """
     if _session_status_cache.get(session_id) != "failed":
         return
+    # The passive guard below needs the failure's code and the recovery row
+    # names it. An explicit rebind never depended on this read, so a store
+    # error there only loses the code.
+    conv: Conversation | None = None
+    try:
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    except Exception:  # noqa: BLE001
+        if require_disconnect_code:
+            raise
+        _logger.warning(
+            "Runner recovery: could not read the failure being cleared for session=%s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+    last_error = _last_task_error_from_labels(conv.labels) if conv is not None else None
+    failure_code = last_error.get("code") if last_error is not None else None
     # A passive reconnect must distinguish a benign runner disconnect
     # from a real task failure: both land the cache on "failed", but only
     # the disconnect persists a ``runner_disconnected`` label. The
     # reconnect proves the runner is reachable again, which invalidates a
     # disconnect failure but says nothing about a genuine task error —
     # leave that one alone. Explicit rebinds skip this guard.
-    if require_disconnect_code:
-        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        last_error = _last_task_error_from_labels(conv.labels) if conv is not None else None
-        if last_error is None or last_error.get("code") != "runner_disconnected":
-            return
+    if require_disconnect_code and failure_code != "runner_disconnected":
+        return
     _session_status_cache[session_id] = "idle"
     session_live_state.persist_live_status(session_id, "idle")
     event = SessionStatusEvent(
@@ -3827,11 +3847,26 @@ async def _publish_runner_recovered_status_impl(
         error=None,
     )
     session_stream.publish(session_id, event.model_dump())
+    runner_id = conv.runner_id if conv is not None else None
     if require_disconnect_code:
         # Only a passive reconnect can show the same turn resuming on its own.
-        disconnect_outcome.note_disconnect_failure_cleared(
-            session_id, failure_code="runner_disconnected"
+        disconnect_outcome.watch_for_resume(
+            session_id, failure_code="runner_disconnected", runner_id=runner_id
         )
+    recovery_path = "passive_reconnect" if require_disconnect_code else "explicit_rebind"
+    _logger.info(
+        "Runner recovered for session=%s (%s); cleared %s failure",
+        session_id,
+        recovery_path,
+        failure_code or "unlabelled",
+        extra=debug_event(
+            "session_runner_recovered",
+            session_id=session_id,
+            failure_code=failure_code or "",
+            recovery_path=recovery_path,
+            runner_id=runner_id or "",
+        ),
+    )
     await _persist_session_status_error_labels(session_id, None, conversation_store)
 
 

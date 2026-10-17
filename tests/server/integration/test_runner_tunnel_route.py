@@ -18,7 +18,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.requests import HTTPConnection
 
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorImpact, OmnigentError
 from omnigent.runner import create_runner_app
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
@@ -2123,11 +2123,16 @@ async def test_ping_loop_restamps_runner_liveness(
         session_live_state.configure(None)
 
 
-@pytest.mark.parametrize("retire_during_timeout", [False, True], ids=["timeout", "retire-race"])
+@pytest.mark.parametrize(
+    ("retire_during_timeout", "local_stall"),
+    [(False, False), (True, False), (False, True)],
+    ids=["timeout", "retire-race", "local-stall"],
+)
 async def test_ping_timeout_closes_tunnel_and_names_the_connection(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     retire_during_timeout: bool,
+    local_stall: bool,
 ) -> None:
     """A silent runner is closed by the server and both rows name the socket.
 
@@ -2136,16 +2141,28 @@ async def test_ping_timeout_closes_tunnel_and_names_the_connection(
     the tunnel's end row must carry the hello's connection id, the
     connection's age and the silence, and name the ping task among what ended
     the tunnel. The close code is recorded without waiting for a peer reply.
+    The timeout row records the silence as transient: the disconnect grace,
+    not the ping loop, decides whether a turn was actually lost. A silent
+    peer is expected and logs at INFO; a stall of this server's own event
+    loop is a server fault and warns.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param caplog: Pytest log capture fixture.
     :param retire_during_timeout: Retire after the ping loop observes a timeout.
+    :param local_stall: Report an event-loop stall long enough to explain the silence.
     :returns: None.
     """
     import omnigent.server.routes.runner_tunnel as tunnel_mod
 
     monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
     monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 1)
+    if local_stall:
+        real_snapshot = TunnelDiagnostics.snapshot
+        monkeypatch.setattr(
+            TunnelDiagnostics,
+            "snapshot",
+            lambda self: {**real_snapshot(self), "loop_lag_s": 300.0},
+        )
     caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
     route_app = _tunnel_route_app()
     if retire_during_timeout:
@@ -2200,14 +2217,15 @@ async def test_ping_timeout_closes_tunnel_and_names_the_connection(
     assert timeouts[0]["app_silence_timeout_s"] == 0.02
     assert timeouts[0]["last_received_frame_age_s"] >= 0
     assert timeouts[0]["last_app_pong_received_age_s"] is None
-    # A silent peer is an expected, self-recovering outage, not a warning.
-    assert timeouts[0]["silence_source"] == "peer"
-    assert timeouts[0]["error_category"] == "runner"
-    assert timeouts[0]["error_impact"] == "transient"
+    # A silent peer is an expected, self-recovering outage; only this server's
+    # own stall warns, and neither by itself loses a turn.
+    assert timeouts[0]["silence_source"] == ("local_event_loop" if local_stall else "peer")
+    assert timeouts[0]["error_category"] == ("server" if local_stall else "runner")
+    assert timeouts[0]["error_impact"] == ErrorImpact.TRANSIENT.value
     [timeout_record] = [
         r for r in caplog.records if getattr(r, "event_name", None) == "runner_ping_timeout"
     ]
-    assert timeout_record.levelno == logging.INFO
+    assert timeout_record.levelno == (logging.WARNING if local_stall else logging.INFO)
     ends = _tunnel_end_events(caplog)
     assert len(ends) == 1
     assert ends[0]["phase"] == "disconnected"

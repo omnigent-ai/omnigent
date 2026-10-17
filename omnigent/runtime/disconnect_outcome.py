@@ -56,16 +56,17 @@ class _Watch:
 _watches: dict[str, _Watch] = {}
 
 
-def note_disconnect_failure_cleared(
-    session_id: str, *, failure_code: str, runner_id: str | None = None
-) -> None:
-    """Start watching a session whose disconnect failure a reconnect cleared.
+def watch_for_resume(session_id: str, *, failure_code: str, runner_id: str | None = None) -> None:
+    """Watch a session whose disconnect failure a passive reconnect cleared.
+
+    The caller logs the clear itself (``session_runner_recovered``); this only
+    arms the watch that the next progress event or user turn resolves.
 
     :param session_id: Session whose ``failed`` status was cleared,
         e.g. ``"conv_abc123"``.
     :param failure_code: Code of the cleared failure, e.g.
         ``"runner_disconnected"``.
-    :param runner_id: Runner that reconnected, when known.
+    :param runner_id: Runner bound to the session, when known.
     :returns: None.
     """
     now = time.monotonic()
@@ -74,16 +75,6 @@ def note_disconnect_failure_cleared(
         if len(_watches) >= _MAX_WATCHES:
             _watches.pop(next(iter(_watches)), None)
     _watches[session_id] = _Watch(cleared_at=now, failure_code=failure_code, runner_id=runner_id)
-    _logger.info(
-        "disconnect failure cleared on reconnect for session=%s; watching for the turn to resume",
-        session_id,
-        extra=debug_event(
-            "session_turn_failure_cleared",
-            session_id=session_id,
-            failure_code=failure_code,
-            runner_id=runner_id or "",
-        ),
-    )
 
 
 def note_user_turn(session_id: str) -> None:
@@ -93,8 +84,9 @@ def note_user_turn(session_id: str) -> None:
     :returns: None.
     """
     watch = _watches.pop(session_id, None)
-    if watch is not None:
-        _log_outcome(session_id, watch, "superseded_by_user_turn", signal="user_turn")
+    if watch is None or time.monotonic() - watch.cleared_at > _WATCH_TTL_S:
+        return
+    _log_outcome(session_id, watch, "superseded_by_user_turn", signal="user_turn")
 
 
 def observe_event(session_id: str, event: dict[str, Any]) -> None:

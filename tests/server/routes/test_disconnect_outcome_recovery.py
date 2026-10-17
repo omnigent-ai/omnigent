@@ -57,6 +57,13 @@ async def test_disconnect_failure_outcome_after_reconnect(
             if row["event_name"] == "session_turn_failure_outcome"
         ]
         assert outcomes == expected
+        # Every clear is logged against the failure it cleared, naming its path.
+        [recovered] = [row for row in rows if row["event_name"] == "session_runner_recovered"]
+        assert recovered["session_id"] == session_id
+        assert recovered["attributes"]["failure_code"] == "runner_disconnected"
+        assert recovered["attributes"]["recovery_path"] == (
+            "passive_reconnect" if passive else "explicit_rebind"
+        )
     finally:
         disconnect_outcome.reset_for_tests()
         sessions_module._session_status_cache.pop(session_id, None)
@@ -88,7 +95,7 @@ async def test_passive_reconnect_keeps_genuine_failure_unwatched(db_uri: str) ->
             session_stream.publish(conv.id, {"type": "session.status", "status": "running"})
         assert sessions_module._session_status_cache.get(conv.id) == "failed"
         assert not any(
-            row["event_name"] in ("session_turn_failure_cleared", "session_turn_failure_outcome")
+            row["event_name"] in ("session_runner_recovered", "session_turn_failure_outcome")
             for row in rows
         )
     finally:

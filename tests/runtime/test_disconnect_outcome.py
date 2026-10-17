@@ -35,7 +35,7 @@ def _outcomes(rows: list[dict[str, object]]) -> list[dict[str, object]]:
 )
 def test_progress_before_a_user_turn_records_resumed(event: dict[str, object]) -> None:
     with capture_debug_rows("server") as rows:
-        disconnect_outcome.note_disconnect_failure_cleared(
+        disconnect_outcome.watch_for_resume(
             "conv_a", failure_code="runner_disconnected"
         )
         disconnect_outcome.observe_event("conv_a", event)
@@ -47,7 +47,6 @@ def test_progress_before_a_user_turn_records_resumed(event: dict[str, object]) -
     assert outcome["attributes"]["outcome"] == "turn_resumed"
     assert outcome["attributes"]["failure_code"] == "runner_disconnected"
     assert outcome["attributes"]["signal"] == event["type"]
-    assert any(r["event_name"] == "session_turn_failure_cleared" for r in rows)
 
 
 @pytest.mark.parametrize(
@@ -61,7 +60,7 @@ def test_progress_before_a_user_turn_records_resumed(event: dict[str, object]) -
     ],
 )
 def test_non_progress_events_keep_watching(event: dict[str, object]) -> None:
-    disconnect_outcome.note_disconnect_failure_cleared(
+    disconnect_outcome.watch_for_resume(
         "conv_a", failure_code="runner_disconnected"
     )
     with capture_debug_rows("server") as rows:
@@ -73,7 +72,7 @@ def test_non_progress_events_keep_watching(event: dict[str, object]) -> None:
 
 
 def test_user_turn_first_records_superseded_and_stops_watching() -> None:
-    disconnect_outcome.note_disconnect_failure_cleared(
+    disconnect_outcome.watch_for_resume(
         "conv_a", failure_code="runner_disconnected"
     )
     with capture_debug_rows("server") as rows:
@@ -93,13 +92,20 @@ def test_unwatched_sessions_log_nothing() -> None:
     assert _outcomes(rows) == []
 
 
-def test_resume_after_the_watch_window_is_not_recorded(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("late_signal", ["progress", "user_turn"])
+def test_signals_after_the_watch_window_are_not_recorded(
+    monkeypatch: pytest.MonkeyPatch, late_signal: str
+) -> None:
+    """Neither a resume nor a user turn is attributed to a failure older than the window."""
     now = [1000.0]
     monkeypatch.setattr(disconnect_outcome.time, "monotonic", lambda: now[0])
-    disconnect_outcome.note_disconnect_failure_cleared(
-        "conv_a", failure_code="runner_disconnected"
-    )
+    disconnect_outcome.watch_for_resume("conv_a", failure_code="runner_disconnected")
     now[0] += disconnect_outcome._WATCH_TTL_S + 1
     with capture_debug_rows("server") as rows:
-        disconnect_outcome.observe_event("conv_a", {"type": "session.status", "status": "running"})
+        if late_signal == "user_turn":
+            disconnect_outcome.note_user_turn("conv_a")
+        else:
+            disconnect_outcome.observe_event(
+                "conv_a", {"type": "session.status", "status": "running"}
+            )
     assert _outcomes(rows) == []
