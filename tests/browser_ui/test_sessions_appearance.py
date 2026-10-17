@@ -312,6 +312,66 @@ def test_ui_font_family_reset_restores_system_default(page: Page, appearance_url
     assert _stored_family(page) is None, "reset did not clear the persisted family"
 
 
+def test_ui_font_family_applies_to_sidebar_section_headers(
+    page: Page,
+    sessions_url: tuple[str, str, str],
+    browser_contract: BrowserContract,
+) -> None:
+    """Sidebar section headers render in the custom UI font, like the session rows."""
+    base_url, pinned_id, session_id = sessions_url
+    sessions = [
+        {
+            "id": sid,
+            "object": "conversation",
+            "title": title,
+            "agent_id": "appearance-agent",
+            "agent_name": "appearance-agent",
+            "status": "idle",
+            "created_at": index,
+            "updated_at": index,
+            "labels": labels,
+            "permission_level": None,
+        }
+        for index, (sid, title, labels) in enumerate(
+            [
+                (pinned_id, "Pinned session", {"omnigent.pinned": "1"}),
+                (session_id, "Unpinned session", {}),
+            ]
+        )
+    ]
+    browser_contract.json(
+        "/v1/sessions",
+        {
+            "object": "list",
+            "data": sessions,
+            "first_id": pinned_id,
+            "last_id": session_id,
+            "has_more": False,
+        },
+    )
+
+    page.goto(base_url)
+    page.evaluate("() => window.localStorage.setItem('omnigent:ui-font-family', '\"Georgia\"')")
+    page.goto(f"{base_url}/c/{session_id}")
+    _wait_session_ready(page)
+
+    sidebar = page.locator(".conversations-sidebar")
+    row = sidebar.get_by_role("link", name="Unpinned session")
+    expect(row).to_be_visible()
+    row_family = row.evaluate("el => getComputedStyle(el).fontFamily")
+    assert row_family.startswith("Georgia"), f"session row ignored the UI font: {row_family}"
+
+    for title in ("Pinned", "Projects", "Sessions"):
+        header = sidebar.locator("h2 button").filter(has_text=re.compile(rf"^{title}$"))
+        expect(header).to_be_visible()
+        label_family = header.locator("span", has_text=title).evaluate(
+            "el => getComputedStyle(el).fontFamily"
+        )
+        assert label_family == row_family, (
+            f"{title} header font {label_family!r} differs from session rows {row_family!r}"
+        )
+
+
 def test_ui_font_size_scales_and_persists(page: Page, appearance_url: str) -> None:
     """Stepping the size updates the token + value live and survives a reload.
 
