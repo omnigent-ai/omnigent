@@ -1,3 +1,10 @@
+import {
+  acceptSessionProjection,
+  parseSessionObservation,
+  preserveSessionErrorLabels,
+  type SessionObservation,
+} from "@/lib/sessionObservation";
+
 import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useCallback, useSyncExternalStore } from "react";
 import { authenticatedFetch } from "@/lib/identity";
@@ -28,6 +35,8 @@ export interface ChildSessionError {
 export interface ChildSessionInfo {
   /** Child conversation/session identifier, e.g. ``"conv_child123"``. */
   id: string;
+  session_observation?: SessionObservation | null;
+  runner_offline_episode_id?: string | null;
   /** Full title, ``"{tool}:{session_name}"``, e.g. ``"researcher:auth"``. */
   title: string | null;
   /** Human-readable task-derived label, e.g. ``"Investigate auth flow"``. */
@@ -71,6 +80,8 @@ export interface ChildSessionInfo {
  */
 interface ChildSessionWire {
   id: string;
+  session_observation?: SessionObservation | null;
+  runner_offline_episode_id?: string | null;
   title: string | null;
   task_summary?: string | null;
   tool: string | null;
@@ -215,6 +226,8 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
   for (const row of json.data) setSessionParent(row.id, sessionId);
   return json.data.map((row) => ({
     id: row.id,
+    session_observation: parseSessionObservation(row.session_observation),
+    runner_offline_episode_id: row.runner_offline_episode_id ?? null,
     title: row.title,
     task_summary: row.task_summary ?? null,
     tool: row.tool,
@@ -227,6 +240,42 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
     pending_elicitations_count: row.pending_elicitations_count ?? 0,
     routed_model: row.routed_model ?? null,
   }));
+}
+
+/** Merge a fetched row without rewinding lifecycle learned from its live stream. */
+export function mergeChildSessionSnapshot(
+  previous: ChildSessionInfo | undefined,
+  incoming: ChildSessionInfo,
+): ChildSessionInfo {
+  if (
+    !previous ||
+    acceptSessionProjection(
+      incoming.session_observation,
+      incoming.runner_offline_episode_id,
+      previous.session_observation,
+      previous.runner_offline_episode_id,
+    )
+  )
+    return incoming;
+  return {
+    ...incoming,
+    session_observation: previous.session_observation,
+    runner_offline_episode_id: previous.runner_offline_episode_id,
+    busy: previous.busy,
+    current_task_status: previous.current_task_status,
+    last_task_error: previous.last_task_error,
+    labels: preserveSessionErrorLabels(incoming.labels ?? {}, previous.labels),
+    pending_elicitations_count: previous.pending_elicitations_count,
+    last_message_preview: previous.last_message_preview,
+  };
+}
+
+export function mergeChildSessionSnapshots(
+  previous: ChildSessionInfo[] | undefined,
+  incoming: ChildSessionInfo[],
+): ChildSessionInfo[] {
+  const known = new Map(previous?.map((row) => [row.id, row]));
+  return incoming.map((row) => mergeChildSessionSnapshot(known.get(row.id), row));
 }
 
 /**
@@ -256,6 +305,11 @@ export function useChildSessions(
         ? ["conversation", null, "child_sessions"]
         : childSessionsQueryKey(sessionId),
     queryFn: () => fetchChildSessions(sessionId as string),
+    structuralSharing: (previous, incoming) =>
+      mergeChildSessionSnapshots(
+        previous as ChildSessionInfo[] | undefined,
+        incoming as ChildSessionInfo[],
+      ),
     enabled: sessionId !== null,
     staleTime: 60_000,
     retry: false,

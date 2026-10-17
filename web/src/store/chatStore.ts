@@ -1,3 +1,18 @@
+import {
+  clearSessionSnapshotStatuses,
+  mergeSessionSnapshot,
+  sessionLabelsFromStatus,
+  sessionSnapshotFromStatus,
+  shareSessionSnapshot,
+} from "@/lib/sessionSnapshot";
+import {
+  acceptSessionProjection,
+  isVersionedSessionObservation,
+  parseSessionObservation,
+  preserveSessionErrorLabels,
+  type SessionObservation,
+} from "@/lib/sessionObservation";
+
 // Module-scope Zustand store for the active chat session.
 //
 // The streaming state lives outside the React tree so it survives
@@ -79,6 +94,7 @@ import { isStaleCursorError } from "@/lib/staleCursor";
 import type {
   McpServerStartup,
   SessionInputConsumedEvent,
+  SessionStatusEvent,
   SessionViewer,
   StreamEvent,
 } from "@/lib/events";
@@ -97,7 +113,11 @@ import {
 import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
-import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
+import type {
+  Conversation,
+  ConversationsPage,
+  PinnedConversationsResult,
+} from "@/hooks/useConversations";
 import {
   filtersFromConversationQueryKey,
   insertNewRowsIntoPages,
@@ -145,7 +165,11 @@ import {
   onResponseEnd,
   onResponseStart,
 } from "./interactionTelemetry";
-import { getSessionHost, subscribeSessionHostChanges } from "@/lib/sessionHost";
+import {
+  getSessionHost,
+  observeSessionHostProjection,
+  subscribeSessionHostChanges,
+} from "@/lib/sessionHost";
 import {
   isClaudeAgentMessageContent,
   isSystemUserContent,
@@ -680,6 +704,8 @@ export interface ConversationState {
    * for the rest of the session lifetime.
    */
   sessionStatus: SessionStatus;
+  sessionObservation: SessionObservation | null;
+  runnerOfflineEpisodeId: string | null;
   backgroundTaskCount: number;
   /**
    * Per-shell detail behind `backgroundTaskCount`, kept in lockstep with it,
@@ -1354,6 +1380,11 @@ let queryClient: QueryClient | null = null;
 // Any semantic stream event makes a snapshot already in flight potentially
 // stale. Heartbeats are filtered before this revision is bumped.
 const streamEventRevisions = new Map<string, number>();
+const knownSessionProjections = new Map<
+  string,
+  { observation: SessionObservation; episodeId: string | null }
+>();
+let unsubscribeSessionProjectionCache: (() => void) | null = null;
 conversationRegistry.subscribeDisposed((id) => streamEventRevisions.delete(id));
 
 // Reconnects share a binding; only one usage request may hydrate it at a time.
@@ -1748,6 +1779,9 @@ export function bindConversationForTest(
  * conversation is created.
  */
 export function initChatStore(client: QueryClient): void {
+  unsubscribeSessionProjectionCache?.();
+  clearSessionSnapshotStatuses();
+  knownSessionProjections.clear();
   for (const timer of workspaceInvalidationTimers.values()) {
     clearTimeout(timer);
   }
@@ -1765,6 +1799,60 @@ export function initChatStore(client: QueryClient): void {
   // The send latch is per-conversation state now, cleared with the registry above.
   sendChains.clear();
   queryClient = client;
+  for (const query of client.getQueryCache().getAll()) {
+    rememberCachedSessionProjections(query.queryKey, query.state.data);
+  }
+  unsubscribeSessionProjectionCache = client.getQueryCache().subscribe((event) => {
+    if (event.type === "updated" && event.action.type === "success") {
+      rememberCachedSessionProjections(event.query.queryKey, event.query.state.data);
+    }
+  });
+}
+
+/** Retain accepted cache ownership after its query data is collected. */
+function rememberSessionProjection(
+  sessionId: string,
+  rawObservation: unknown,
+  rawEpisodeId: unknown,
+): void {
+  const observation = parseSessionObservation(rawObservation);
+  if (!isVersionedSessionObservation(observation)) return;
+  if (rawEpisodeId != null && typeof rawEpisodeId !== "string") return;
+  const episodeId = typeof rawEpisodeId === "string" ? rawEpisodeId : null;
+  const previous = knownSessionProjections.get(sessionId);
+  if (
+    !previous ||
+    acceptSessionProjection(observation, episodeId, previous.observation, previous.episodeId)
+  ) {
+    knownSessionProjections.set(sessionId, { observation, episodeId });
+  }
+}
+
+function rememberCachedSessionProjections(key: readonly unknown[], data: unknown): void {
+  if (data === null || typeof data !== "object") return;
+  const record = data as Record<string, unknown>;
+  if (key.length === 2 && key[0] === "session" && typeof key[1] === "string") {
+    rememberSessionProjection(key[1], record.sessionObservation, record.runnerOfflineEpisodeId);
+    return;
+  }
+  const rememberRows = (rows: unknown): void => {
+    if (!Array.isArray(rows)) return;
+    for (const row of rows) {
+      if (row && typeof row === "object" && typeof row.id === "string") {
+        rememberSessionProjection(row.id, row.session_observation, row.runner_offline_episode_id);
+      }
+    }
+  };
+  if (key.length === 3 && key[0] === "conversation" && key[2] === "child_sessions") {
+    rememberRows(data);
+  } else if (key[0] === "pinned-conversations") {
+    rememberRows(record.conversations);
+  } else if (key[0] === "conversations" || key[0] === "project-sessions") {
+    if (!Array.isArray(record.pages)) return;
+    for (const page of record.pages) {
+      if (page && typeof page === "object") rememberRows(page.data);
+    }
+  }
 }
 
 function scheduleWorkspaceFilesystemInvalidation(sessionId: string): void {
@@ -1929,6 +2017,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   interruptedResponseIds: [],
   status: "idle",
   sessionStatus: "idle",
+  sessionObservation: null,
+  runnerOfflineEpisodeId: null,
   backgroundTaskCount: 0,
   backgroundTasks: [],
   blockedOn: null,
@@ -2464,6 +2554,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // target afterward would leak the message into the now-active session.
     // An explicit pin (navigate-first background POST) wins over the visible id.
     const submitConversationId = pinnedId ?? get().conversationId;
+    let failureLifecycle = captureSendFailureLifecycle(
+      submitConversationId === null ? get() : setterForState(submitConversationId),
+    );
 
     // Take our place in THIS conversation's send chain: wait for its prior
     // send's network work, then hand off to the next via `releaseSend` in the
@@ -2532,15 +2625,26 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
       if (initialDraft) {
         // From this point Interrupt belongs to the runner, not the local draft.
-        setterFor(sessionId)((s) => ({
-          pendingUserMessages: s.pendingUserMessages.map((p) =>
-            p.tempId === tempId ? { ...p, initialDraft: undefined } : p,
-          ),
-          status: "streaming",
-          sendLatchedAt: Date.now(),
-        }));
+        setterFor(sessionId)((s) => {
+          const patch = {
+            pendingUserMessages: s.pendingUserMessages.map((p) =>
+              p.tempId === tempId ? { ...p, initialDraft: undefined } : p,
+            ),
+            status: "streaming" as const,
+            sendLatchedAt: Date.now(),
+          };
+          if (failureLifecycle === sendLifecycleFingerprint(s)) {
+            failureLifecycle = sendLifecycleFingerprint({ ...s, ...patch });
+          }
+          return patch;
+        });
         initialDispatched = true;
       }
+      const deniedLifecycle = captureDeniedPostLifecycle(
+        setterForState(sessionId),
+        targetState,
+        !alreadyStreaming && !opensSideChat,
+      );
       const postResult = await postEvent(sessionId, {
         type: "message",
         data: {
@@ -2558,18 +2662,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // Target the session this send posted to: the user may have navigated
         // away while the POST was open, and settling the VISIBLE conversation
         // would clobber an unrelated chat's composer state.
-        setterFor(sessionId)((s) => {
-          const patch: Partial<ChatState> = {
-            pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
-          };
-          if (!alreadyStreaming) {
-            patch.status = "idle";
-            patch.sessionStatus = "idle";
-            patch.backgroundTaskCount = 0;
-            patch.backgroundTasks = [];
-          }
-          return patch;
-        });
+        setterFor(sessionId)((s) => settleDeniedPost(s, tempId, deniedLifecycle));
       } else {
         // POST accepted: the server can now account for this message
         // (native: pending_inputs replay until the round-trip commits it;
@@ -2691,7 +2784,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       failSet((s) => ({
         pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
       }));
-      if (!alreadyStreaming) {
+      if (!alreadyStreaming && ownsSendFailureLifecycle(failGet(), failureLifecycle)) {
         if (failGet().activeResponse !== null) {
           // A response bubble already exists (the turn started, then failed)
           // — mark it failed so the error rides on that bubble.
@@ -2737,6 +2830,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // the just-created session even after the user moved to another chat.
     const pinnedId = opts?.pinnedConversationId ?? null;
     const pinnedSetter: typeof setActive = pinnedId === null ? setActive : setterFor(pinnedId);
+    const previousLifecycle = pinnedId === null ? get() : setterForState(pinnedId);
     // Mirror `send`'s lifecycle scaffolding (streaming flag + send-chain
     // serialization) so a skill invocation behaves like any other turn.
     const alreadyStreaming =
@@ -2774,6 +2868,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Pin the destination at submit time — see `send` above for why a late
     // resolve mis-routes to the session the user has since switched to.
     const submitConversationId = pinnedId ?? get().conversationId;
+    const failureLifecycle = captureSendFailureLifecycle(
+      submitConversationId === null ? get() : setterForState(submitConversationId),
+    );
 
     const { waitForPrior, rekey, releaseSend } = enterSendChain(submitConversationId);
 
@@ -2788,6 +2885,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // Same wire shape the REPL sends (repl/_repl.py). The server resolves
       // the skill, persists a visible receipt + hidden `<skill>` meta
       // message, and forwards the meta to the runner.
+      const deniedLifecycle = captureDeniedPostLifecycle(
+        setterForState(sessionId),
+        previousLifecycle,
+        !alreadyStreaming,
+      );
       const postResult = await postEvent(sessionId, {
         type: "slash_command",
         data: { kind: "skill", name, arguments: args },
@@ -2798,18 +2900,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // Targets the session the command posted to: a backgrounded
         // conversation must still roll its echo back, and settling the VISIBLE
         // one would clobber an unrelated chat.
-        setterFor(sessionId)((s) => {
-          const patch: Partial<ChatState> = {
-            pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
-          };
-          if (!alreadyStreaming) {
-            patch.status = "idle";
-            patch.sessionStatus = "idle";
-            patch.backgroundTaskCount = 0;
-            patch.backgroundTasks = [];
-          }
-          return patch;
-        });
+        setterFor(sessionId)((s) => settleDeniedPost(s, tempId, deniedLifecycle));
       } else {
         // POST accepted: the server persisted the visible receipt, so
         // navigation can rely on the snapshot — mark the echo settled
@@ -2838,7 +2929,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       failSet((s) => ({
         pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
       }));
-      if (!alreadyStreaming) {
+      const failureState = failTarget === null ? get() : setterForState(failTarget);
+      if (!alreadyStreaming && ownsSendFailureLifecycle(failureState, failureLifecycle)) {
         finalizeActive(failSet, "failed", message, null);
         failSet({ status: "idle" });
       } else {
@@ -3168,6 +3260,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       try {
         const session = await queryClient.fetchQuery({
           queryKey: ["session", conversationId],
+          structuralSharing: shareSessionSnapshot,
           queryFn: () => getSessionSlim(conversationId),
           staleTime: Infinity,
           retry: false,
@@ -3408,7 +3501,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       (setterForState(conversationId)?.historyGeneration ?? historyGeneration) !==
         historyGeneration;
     try {
-      const { items, hasMore } = await fetchSessionItemsPage(conversationId, {
+      const { items, hasMore, olderCursor } = await fetchSessionItemsPage(conversationId, {
         olderThan: oldestItemId,
       });
       if (stale()) return;
@@ -3423,7 +3516,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         return {
           blocks: [...unique, ...state.blocks],
           hasMoreHistory: hasMore,
-          oldestItemId: items[0]?.id ?? state.oldestItemId,
+          oldestItemId: olderCursor,
           loadingMoreHistory: false,
         };
       });
@@ -3481,6 +3574,100 @@ function isCompactControl(
     !files?.length &&
     text.trim() === "/compact"
   );
+}
+
+interface DeniedPostLifecycle {
+  fingerprint: string;
+  ownsOptimisticState: boolean;
+  sessionStatus: SessionStatus;
+  activeResponse: ActiveResponse | null;
+}
+
+function projectionFingerprint(state: ConversationState): string {
+  const observation = state.sessionObservation;
+  return JSON.stringify([
+    observation?.runner_id ?? null,
+    observation?.binding_epoch ?? null,
+    observation?.revision ?? null,
+    observation?.observation_id ?? null,
+    observation?.status ?? null,
+    observation?.response_id ?? null,
+    observation?.error_key ?? null,
+    state.runnerOfflineEpisodeId ?? null,
+  ]);
+}
+
+function sendLifecycleFingerprint(state: ConversationState): string {
+  return JSON.stringify([
+    projectionFingerprint(state),
+    state.status,
+    state.sessionStatus,
+    state.sendLatchedAt,
+    state.activeResponse?.responseId ?? null,
+    state.activeResponse?.state ?? null,
+    state.activeResponse?.error ?? null,
+    state.activeResponse?.completedAt ?? null,
+  ]);
+}
+
+function captureSendFailureLifecycle(state: ConversationState | null | undefined): string | null {
+  return state ? sendLifecycleFingerprint(state) : null;
+}
+
+function ownsSendFailureLifecycle(
+  state: ConversationState | null | undefined,
+  captured: string | null,
+): boolean {
+  return (
+    state != null &&
+    captured !== null &&
+    state.pendingUserMessages.length === 0 &&
+    sendLifecycleFingerprint(state) === captured
+  );
+}
+
+function captureDeniedPostLifecycle(
+  state: ConversationState | null | undefined,
+  previous: ConversationState | null | undefined,
+  ownsOptimisticState: boolean,
+): DeniedPostLifecycle | null {
+  if (!state) return null;
+  const sameProjection =
+    previous != null &&
+    previous.sessionStatus === state.sessionStatus &&
+    projectionFingerprint(previous) === projectionFingerprint(state);
+  return {
+    fingerprint: sendLifecycleFingerprint(state),
+    ownsOptimisticState:
+      ownsOptimisticState &&
+      state.status === "streaming" &&
+      state.activeResponse === null &&
+      (state.sessionStatus === "idle" || state.sessionStatus === "failed"),
+    sessionStatus: state.sessionStatus,
+    activeResponse: sameProjection ? previous.activeResponse : state.activeResponse,
+  };
+}
+
+function settleDeniedPost(
+  state: ConversationState,
+  tempId: string,
+  captured: DeniedPostLifecycle | null,
+): Partial<ChatState> {
+  const pending = state.pendingUserMessages.filter((message) => message.tempId !== tempId);
+  if (
+    captured?.ownsOptimisticState &&
+    pending.length === 0 &&
+    sendLifecycleFingerprint(state) === captured.fingerprint
+  ) {
+    return {
+      pendingUserMessages: pending,
+      status: "idle",
+      sessionStatus: captured.sessionStatus,
+      activeResponse: captured.activeResponse,
+      sendLatchedAt: null,
+    };
+  }
+  return { pendingUserMessages: pending };
 }
 
 function rejectBusyCompact(conversationId: string | null): boolean {
@@ -4077,10 +4264,14 @@ function pendingElicitationBlocksFromSnapshot(session: Session): AnyBlock[] {
  */
 async function reconcilePendingElicitations(id: string): Promise<void> {
   if (queryClient === null) return;
+  const pendingBeforeFetch = captureElicitationIdsByStatus(
+    setterForState(id)?.blocks ?? [],
+  ).pending;
   let session: Session;
   try {
     session = await queryClient.fetchQuery({
       queryKey: ["session", id],
+      structuralSharing: shareSessionSnapshot,
       queryFn: () => getSessionSlim(id),
       staleTime: 0,
       retry: false,
@@ -4099,11 +4290,13 @@ async function reconcilePendingElicitations(id: string): Promise<void> {
       .filter((x): x is string => x !== null),
   );
   setterFor(id)((s) => {
+    if (!sessionSnapshotIsCurrent(session, s)) return {};
     let changed = false;
     const blocks = s.blocks.map((b) => {
       if (
         b.type === "elicitation" &&
         b.status === "pending" &&
+        pendingBeforeFetch.has(b.elicitationId) &&
         !stillPending.has(b.elicitationId)
       ) {
         changed = true;
@@ -4168,6 +4361,18 @@ function mcpStartupSnapshotPatch(
   };
 }
 
+function sessionSnapshotIsCurrent(
+  session: Session,
+  state: Pick<ConversationState, "sessionObservation" | "runnerOfflineEpisodeId">,
+): boolean {
+  return acceptSessionProjection(
+    session.sessionObservation,
+    session.runnerOfflineEpisodeId,
+    state.sessionObservation,
+    state.runnerOfflineEpisodeId,
+  );
+}
+
 /**
  * Store fields derived from the session's agent binding, computed from a
  * session snapshot.
@@ -4190,34 +4395,42 @@ function sessionBindingPatch(
   session: Session,
   state: Pick<
     ConversationState,
-    "mcpStartupLaunch" | "sessionModelSeeded" | "llmModel" | "sessionModelOverride"
+    | "mcpStartupLaunch"
+    | "sessionModelSeeded"
+    | "llmModel"
+    | "sessionModelOverride"
+    | "sessionObservation"
+    | "runnerOfflineEpisodeId"
   >,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
-): Pick<
-  ChatState,
-  | "isNativeTerminalSession"
-  | "nativeVendorOwnsModel"
-  | "sessionModelSeeded"
-  | "boundAgentId"
-  | "boundAgentName"
-  | "llmModel"
-  | "pendingModelChange"
-  | "sessionModelOverride"
-  | "sessionHarness"
-  | "subAgentName"
-  | "costControlModeOverride"
-  | "subagentRoutingOverride"
-  | "codexPlanMode"
-  | "claudePermissionMode"
-  | "codexApprovalMode"
-  | "contextWindow"
-  | "gitBranch"
-  | "codexModelOptions"
-  | "terminalPending"
-  | "sandboxStatus"
-  | "mcpStartup"
-  | "mcpStartupLaunch"
+): Partial<
+  Pick<
+    ChatState,
+    | "isNativeTerminalSession"
+    | "nativeVendorOwnsModel"
+    | "sessionModelSeeded"
+    | "boundAgentId"
+    | "boundAgentName"
+    | "llmModel"
+    | "pendingModelChange"
+    | "sessionModelOverride"
+    | "sessionHarness"
+    | "subAgentName"
+    | "costControlModeOverride"
+    | "subagentRoutingOverride"
+    | "codexPlanMode"
+    | "claudePermissionMode"
+    | "codexApprovalMode"
+    | "contextWindow"
+    | "gitBranch"
+    | "codexModelOptions"
+    | "terminalPending"
+    | "sandboxStatus"
+    | "mcpStartup"
+    | "mcpStartupLaunch"
+  >
 > {
+  if (!sessionSnapshotIsCurrent(session, state)) return {};
   const retainModelSeed = state.sessionModelSeeded && session.llmModel == null;
   return {
     isNativeTerminalSession: isNativeTerminalSessionFn(session),
@@ -4274,6 +4487,7 @@ async function refreshSessionBinding(id: string): Promise<void> {
   try {
     session = await queryClient.fetchQuery({
       queryKey: ["session", id],
+      structuralSharing: shareSessionSnapshot,
       queryFn: () => getSessionSlim(id),
       staleTime: 0,
       retry: false,
@@ -4399,6 +4613,7 @@ async function bindStream(
     const [session, page] = await Promise.all([
       queryClient.fetchQuery({
         queryKey: ["session", id],
+        structuralSharing: shareSessionSnapshot,
         queryFn: () => getSessionSlim(id, { refreshState: true }),
         staleTime: 0,
         retry: false,
@@ -4424,13 +4639,21 @@ async function bindStream(
     // The live SSE stream has no buffer, so a prompt that fired
     // before this chat was opened wouldn't render otherwise.
     const pendingElicitationBlocks = pendingElicitationBlocksFromSnapshot(session);
-    const oldestItemId = items[0]?.id ?? null;
+    const oldestItemId = page.olderCursor;
     set((state) => {
+      const acceptLifecycle = acceptSessionProjection(
+        session.sessionObservation,
+        session.runnerOfflineEpisodeId,
+        state.sessionObservation,
+        state.runnerOfflineEpisodeId,
+      );
       const currentBlocks = withoutNativePreviews(state.blocks, snapshotNativeMessageIds);
       const bindingPatch = sessionBindingPatch(session, state, launchBeforeFetch);
       const racedOptions = racedNativeModelOptions.get(id);
       const catalogWonBindRace =
-        bindingPatch.codexModelOptions.length === 0 && (racedOptions?.length ?? 0) > 0;
+        acceptLifecycle &&
+        (bindingPatch.codexModelOptions?.length ?? 0) === 0 &&
+        (racedOptions?.length ?? 0) > 0;
       const effectiveBindingPatch = catalogWonBindRace
         ? { ...bindingPatch, codexModelOptions: racedOptions! }
         : bindingPatch;
@@ -4446,9 +4669,11 @@ async function bindStream(
           .filter((b): b is typeof b & { type: "elicitation" } => b.type === "elicitation")
           .map((b) => b.elicitationId),
       );
-      const uniquePendingElicitations = pendingElicitationBlocks.filter(
-        (b) => b.type !== "elicitation" || !seenElicitationIds.has(b.elicitationId),
-      );
+      const uniquePendingElicitations = acceptLifecycle
+        ? pendingElicitationBlocks.filter(
+            (b) => b.type !== "elicitation" || !seenElicitationIds.has(b.elicitationId),
+          )
+        : [];
       // Synthesize a visible error block when the session failed and no error
       // block was already produced by itemsToBlocks. The `response.error` SSE
       // event is transient (published to the in-memory session stream which
@@ -4496,7 +4721,7 @@ async function bindStream(
         ...(p.createdBy !== undefined ? { author: p.createdBy } : {}),
       });
       let candidatePending: PendingUserMessage[];
-      if (!hydratePending) {
+      if (!hydratePending || !acceptLifecycle) {
         candidatePending = state.pendingUserMessages;
       } else {
         const serverPending = (session.pendingInputs ?? []).map(toPending);
@@ -4523,25 +4748,31 @@ async function bindStream(
       // leaving the POSTed text at the end, so match with endsWith.
       // Image-only entries (no text) are kept.
       //
-      // A cold bind has no live optimistic bubbles of its own — the entry was
-      // just created — so every candidate here comes from the server's
-      // `pending_inputs`, and deduping against all committed copies is correct.
+      // Live sends can arrive during the fetch. Only snapshot-owned inputs
+      // can be replay ghosts deduplicated against committed history.
       // (The old baseline arithmetic existed only because `switchTo` used to
       // destroy state and restore bubbles from a stash, which could collide
       // with an older identical message in history.)
-      const dedupePending = hydratePending && candidatePending.length > 0;
+      const dedupePending = acceptLifecycle && hydratePending && candidatePending.length > 0;
+      const snapshotPendingIds = new Set(
+        (session.pendingInputs ?? []).map((input) => input.pendingId),
+      );
       const committedUserTexts = dedupePending ? committedUserTextsOf(allBlocks) : [];
       const countEndsWith = (texts: string[], suffix: string): number =>
         texts.reduce((n, c) => (c.endsWith(suffix) ? n + 1 : n), 0);
       const snapshotPending: PendingUserMessage[] = dedupePending
         ? candidatePending.filter((p) => {
+            if (!snapshotPendingIds.has(p.tempId)) return true;
             const text = messageContentText(p.content);
             if (text === "") return true;
             return countEndsWith(committedUserTexts, text) === 0;
           })
         : candidatePending;
       const syntheticError: ErrorBlock | null =
-        session.status === "failed" && session.lastTaskError != null && !hasErrorBlock
+        acceptLifecycle &&
+        session.status === "failed" &&
+        session.lastTaskError != null &&
+        !hasErrorBlock
           ? {
               type: "error",
               ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null },
@@ -4562,14 +4793,21 @@ async function bindStream(
         historyGeneration: state.historyGeneration + 1,
         // The voided page's stale early-return skips its own flag clear.
         loadingMoreHistory: false,
-        sessionStatus: session.status,
+        sessionStatus: acceptLifecycle ? session.status : state.sessionStatus,
+        sessionObservation: acceptLifecycle
+          ? (session.sessionObservation ?? state.sessionObservation)
+          : state.sessionObservation,
+        runnerOfflineEpisodeId: acceptLifecycle
+          ? (session.runnerOfflineEpisodeId ?? null)
+          : state.runnerOfflineEpisodeId,
         // Mid-turn first open: the snapshot carries the in-flight turn's
         // `activeResponseId`, and the turn-start `running` edge that would
         // have opened the streaming lifecycle is long gone from the SSE
         // stream. Open it here — mirroring `reconnectStatusPatch` — so the
         // live turn's bubble renders streaming (trace expanded, tool
         // spinners live) instead of prematurely settled and folded.
-        ...(session.status === "running" &&
+        ...(acceptLifecycle &&
+        session.status === "running" &&
         session.activeResponseId != null &&
         state.activeResponse?.responseId !== session.activeResponseId
           ? {
@@ -4584,9 +4822,13 @@ async function bindStream(
         // Re-show "N background tasks still running" after a reload/navigate-back: the
         // live SSE edge that set this is long gone, so the count rides in on
         // the snapshot (server keeps it sticky past the trailing PTY `idle`).
-        backgroundTaskCount: session.backgroundTaskCount ?? 0,
-        backgroundTasks: session.backgroundTasks ?? [],
-        blockedOn: null,
+        ...(acceptLifecycle
+          ? {
+              backgroundTaskCount: session.backgroundTaskCount ?? 0,
+              backgroundTasks: session.backgroundTasks ?? [],
+              blockedOn: null,
+            }
+          : {}),
         // This conversation's own effective effort, which is what a warm switch
         // back re-projects (it does not re-bind, so it cannot recompute it).
         sessionReasoningEffort: effectiveEffort,
@@ -4815,8 +5057,20 @@ function reconnectStatusPatch(
   s: ChatState,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
 ): Partial<ChatState> {
+  if (
+    !acceptSessionProjection(
+      session.sessionObservation,
+      session.runnerOfflineEpisodeId,
+      s.sessionObservation,
+      s.runnerOfflineEpisodeId,
+    )
+  ) {
+    return {};
+  }
   const patch: Partial<ChatState> = {
     sessionStatus: session.status,
+    sessionObservation: session.sessionObservation ?? s.sessionObservation,
+    runnerOfflineEpisodeId: session.runnerOfflineEpisodeId ?? null,
     ...mcpStartupSnapshotPatch(session, s, launchBeforeFetch),
   };
   // Recover the background-shell tally across the gap too, so the spinner
@@ -4989,7 +5243,9 @@ function reconcileElicitationBlocks(
   snapshotPending: AnyBlock[],
   preGapPendingIds: Set<string>,
   preGapAutoResolvedIds: Set<string>,
+  snapshotAccepted: boolean,
 ): AnyBlock[] | null {
+  if (!snapshotAccepted) return null;
   const pendingNow = new Set(
     snapshotPending
       .filter((b): b is ElicitationBlock => b.type === "elicitation")
@@ -5188,6 +5444,7 @@ async function rehydrateWindowOnReconnect(
         snapshotPending,
         preGapElicitations.pending,
         preGapElicitations.autoResolved,
+        sessionSnapshotIsCurrent(session, s),
       ) ?? merged;
     return {
       ...statusPatch,
@@ -5197,7 +5454,7 @@ async function rehydrateWindowOnReconnect(
       blocks:
         snapshotCompactionSpinners(blocks, s.activeResponse, statusPatch.activeResponse) ?? blocks,
       hasMoreHistory: fresh.hasMore,
-      oldestItemId: fresh.items[0]?.id ?? null,
+      oldestItemId: fresh.olderCursor,
       loadingMoreHistory: false,
       // The window cursor was reset: void any in-flight loadMoreHistory.
       historyGeneration: s.historyGeneration + 1,
@@ -5262,6 +5519,7 @@ async function reconcileOnReconnect(
     [session, page] = await Promise.all([
       queryClient.fetchQuery({
         queryKey: ["session", id],
+        structuralSharing: shareSessionSnapshot,
         queryFn: () => getSessionSlim(id),
         staleTime: 0,
         retry: false,
@@ -5280,12 +5538,14 @@ async function reconcileOnReconnect(
   // fetch (loadMoreHistory only pages older than the pre-gap window top).
   let items = page.items;
   let hasMore = page.hasMore;
+  let cursor = page.olderCursor;
+  const seenCursors = new Set<string>();
   let covered = !hasMore || items.some((it) => preGapIds.has(it.id));
   // Each page starts before the cursor returned by the prior page.
   /* oxlint-disable no-await-in-loop */
   for (let fetched = 1; !covered && fetched < RECONNECT_BACKFILL_MAX_PAGES; fetched += 1) {
-    const cursor = items[0]?.id;
-    if (!cursor) break;
+    if (!cursor || seenCursors.has(cursor)) break;
+    seenCursors.add(cursor);
     let older: SessionItemsPage;
     try {
       older = await fetchSessionItemsPage(id, { olderThan: cursor });
@@ -5300,7 +5560,7 @@ async function reconcileOnReconnect(
     items = [...older.items, ...items];
     hasMore = older.hasMore;
     covered = !hasMore || older.items.some((it) => preGapIds.has(it.id));
-    if (older.items.length === 0) break; // no progress; avoid refetching the same cursor
+    cursor = older.olderCursor;
   }
   /* oxlint-enable no-await-in-loop */
   const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
@@ -5323,6 +5583,7 @@ async function reconcileOnReconnect(
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   const snapshotItemIds = new Set(items.map((it) => it.id));
   set((s) => {
+    const acceptLifecycle = sessionSnapshotIsCurrent(session, s);
     const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
     const seen = new Set(
       currentBlocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
@@ -5344,7 +5605,7 @@ async function reconcileOnReconnect(
     const recoveredUserInputs = unseen.filter(
       (b) => b.type === "user_message" && !isSystemUserContent(b.content),
     ).length;
-    if (recoveredUserInputs > 0) {
+    if (acceptLifecycle && recoveredUserInputs > 0) {
       patch.pendingUserMessages = s.pendingUserMessages.slice(recoveredUserInputs);
     }
     let nextBlocks = reconciledBlocks;
@@ -5380,6 +5641,7 @@ async function reconcileOnReconnect(
       snapshotPending,
       preGapElicitations.pending,
       preGapElicitations.autoResolved,
+      acceptLifecycle,
     );
     if (reconciled !== null) nextBlocks = reconciled;
     nextBlocks =
@@ -6827,6 +7089,7 @@ function reconcileSendDraftWithSnapshot(
   itemIds: ReadonlySet<string>,
   session: Session,
 ): Partial<ChatState> {
+  if (!sessionSnapshotIsCurrent(session, s)) return {};
   if (session.lastTaskError?.code !== "runner_rejected_event") {
     return retractDeliveredSendDraft(s, itemIds, "persisted");
   }
@@ -6968,6 +7231,7 @@ async function refetchRunnerBackedSessionState(
     if (queryClient !== null) {
       session = await queryClient.fetchQuery({
         queryKey: ["session", conversationId],
+        structuralSharing: shareSessionSnapshot,
         queryFn: () => getSessionSlim(conversationId, { refreshState: options.refreshState }),
         staleTime: 0,
         retry: false,
@@ -6979,7 +7243,9 @@ async function refetchRunnerBackedSessionState(
       // The event can race the bind snapshot's in-flight query. Once that
       // request settles, issue a second read instead of accepting its stale [].
       session = await getSessionSlim(conversationId);
-      queryClient?.setQueryData(["session", conversationId], session);
+      queryClient?.setQueryData<Session>(["session", conversationId], (previous) =>
+        mergeSessionSnapshot(previous, session),
+      );
     }
   } catch {
     // The runner may have dropped again before the fetch landed. Keep
@@ -6992,7 +7258,7 @@ async function refetchRunnerBackedSessionState(
   // session's model catalog must be there when the user
   // returns. `setterForState` / `setterFor` no-op once it has been evicted.
   const currentState = setterForState(conversationId);
-  if (currentState === null) return;
+  if (currentState === null || !sessionSnapshotIsCurrent(session, currentState)) return;
   if (options.modelOptionsResolved === true && (session.codexModelOptions ?? []).length > 0) {
     racedNativeModelOptions.set(conversationId, session.codexModelOptions ?? []);
   }
@@ -7099,6 +7365,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
   // belong. Default to the active conversation so a caller that omits the id
   // keeps today's behaviour.
   const sourceConversationId = streamConversationId ?? useChatStore.getState().conversationId;
+  if (!acceptOwnedLifecycleSignal(event, sourceConversationId)) return;
 
   /**
    * Write conversation-scoped state onto the conversation whose stream
@@ -7418,6 +7685,26 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       emitBrowserActionRequest(event, sourceConversationId);
       return;
     case "session_status": {
+      if (
+        !acceptKnownSessionProjection(
+          event.conversationId,
+          event.sessionObservation,
+          event.runnerOfflineEpisodeId,
+        )
+      )
+        return;
+      rememberSessionProjection(
+        event.conversationId,
+        event.sessionObservation,
+        event.runnerOfflineEpisodeId,
+      );
+      observeSessionHostProjection(event.conversationId, {
+        observation: event.sessionObservation,
+        episodeId: event.runnerOfflineEpisodeId,
+      });
+      queryClient?.setQueryData<Session>(["session", event.conversationId], (previous) =>
+        sessionSnapshotFromStatus(previous, event),
+      );
       // Captured BEFORE the patch below adopts event.responseId, so a
       // running/waiting status carrying an unseen id marks a new turn.
       const prevResponseId = useChatStore.getState().activeResponse?.responseId;
@@ -7434,6 +7721,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         // to response_end, but that is separate from the session-level status.
         const patch: Partial<ChatState> = {
           sessionStatus: event.status,
+          sessionObservation: event.sessionObservation ?? s.sessionObservation,
+          runnerOfflineEpisodeId: event.runnerOfflineEpisodeId ?? null,
           // Not sticky, unlike the background tally: every edge carries the
           // current reason (the runner re-attaches it to its own pane edges),
           // so an absent one means "no longer parked".
@@ -7652,7 +7941,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // chat's "Working…" indicator — the exact desync users hit on a
       // claude-native session (chat clears/sets working instantly while
       // the sidebar dot stays stale).
-      patchConversationStatusInCache(event.conversationId, event.status);
+      patchConversationStatusInCache(event.conversationId, event.status, {
+        observation: event.sessionObservation,
+        episodeId: event.runnerOfflineEpisodeId,
+        event,
+      });
       // On turn completion, refresh the Agents-rail preview for this
       // conversation. A child (added agent) finishing a turn leaves a stale
       // last_message_preview in its parent's child-sessions list (the runner
@@ -7992,7 +8285,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Child status delta pushed to the parent stream — patch the
       // child-sessions cache in place (no refetch). Also covers the
       // snapshot-on-connect frames, which reuse this event shape.
-      applyChildSessionUpdated(event.conversationId, event.childSessionId, event.child);
+      if (!applyChildSessionUpdated(event.conversationId, event.childSessionId, event.child))
+        return;
       // A claude-native child's turn-complete delta carries busy=false but no
       // last_message_preview (its reply lives in the tmux pane, not the
       // runner's in-process history). Refetch the parent's child list so the
@@ -8084,31 +8378,160 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
  * or already shows the target status, so repeated ``running`` ticks
  * don't churn the sidebar.
  */
+function acceptKnownSessionProjection(
+  conversationId: string,
+  observation: SessionObservation | null | undefined,
+  episodeId: string | null | undefined,
+): boolean {
+  const activity = knownSessionProjections.get(conversationId);
+  if (
+    activity &&
+    !acceptSessionProjection(observation, episodeId, activity.observation, activity.episodeId)
+  )
+    return false;
+  const state = conversationRegistry.peek(conversationId)?.getState();
+  if (
+    state &&
+    !acceptSessionProjection(
+      observation,
+      episodeId,
+      state.sessionObservation,
+      state.runnerOfflineEpisodeId,
+    )
+  )
+    return false;
+  const snapshot = queryClient?.getQueryData<Session>(["session", conversationId]);
+  if (
+    snapshot &&
+    !acceptSessionProjection(
+      observation,
+      episodeId,
+      snapshot.sessionObservation,
+      snapshot.runnerOfflineEpisodeId,
+    )
+  )
+    return false;
+  for (const row of knownConversationRows(conversationId)) {
+    if (
+      !acceptSessionProjection(
+        observation,
+        episodeId,
+        row.session_observation,
+        row.runner_offline_episode_id,
+      )
+    )
+      return false;
+  }
+  for (const [key, children] of queryClient?.getQueriesData<ChildSessionInfo[]>({
+    queryKey: ["conversation"],
+  }) ?? []) {
+    if (key.length !== 3 || key[2] !== "child_sessions") continue;
+    const child = children?.find((item) => item.id === conversationId);
+    if (
+      child &&
+      !acceptSessionProjection(
+        observation,
+        episodeId,
+        child.session_observation,
+        child.runner_offline_episode_id,
+      )
+    )
+      return false;
+  }
+  return true;
+}
+
+function knownConversationRows(conversationId: string): Conversation[] {
+  if (queryClient === null) return [];
+  const rows: Conversation[] = [];
+  for (const prefix of ["conversations", "project-sessions"]) {
+    for (const [, data] of queryClient.getQueriesData<InfiniteData<ConversationsPage>>({
+      queryKey: [prefix],
+    })) {
+      for (const page of data?.pages ?? []) {
+        const row = page.data.find((item) => item.id === conversationId);
+        if (row) rows.push(row);
+      }
+    }
+  }
+  for (const [, data] of queryClient.getQueriesData<PinnedConversationsResult>({
+    queryKey: ["pinned-conversations"],
+  })) {
+    const row = data?.conversations.find((item) => item.id === conversationId);
+    if (row) rows.push(row);
+  }
+  return rows;
+}
+
 function patchConversationStatusInCache(
   conversationId: string,
   sessionStatus: SessionStatus,
+  projection?: { observation?: SessionObservation; episodeId?: string; event?: SessionStatusEvent },
 ): void {
   if (queryClient === null) return;
-  // Background shells outliving a turn do NOT light the row: the server
-  // delivers that turn-end as `idle` (it takes a new message right away), and
-  // the in-chat indicator still reports the shells from the tally.
   const working = sessionStatus === "running" || sessionStatus === "waiting";
   const listStatus: NonNullable<Conversation["status"]> =
     sessionStatus === "failed" ? "failed" : working ? "running" : "idle";
-  queryClient.setQueriesData<InfiniteData<ConversationsPage>>(
-    { queryKey: ["conversations"] },
+  const patchRow = (row: Conversation): Conversation => {
+    if (row.id !== conversationId) return row;
+    if (
+      projection &&
+      !acceptSessionProjection(
+        projection.observation,
+        projection.episodeId,
+        row.session_observation,
+        row.runner_offline_episode_id,
+      )
+    )
+      return row;
+    const sameFence =
+      projection === undefined ||
+      (row.session_observation?.binding_epoch === projection.observation?.binding_epoch &&
+        row.session_observation?.revision === projection.observation?.revision &&
+        (row.runner_offline_episode_id ?? null) === (projection.episodeId ?? null));
+    if (row.status === listStatus && sameFence) return row;
+    const bindingChanged =
+      projection?.observation !== undefined &&
+      (projection.observation.binding_epoch !== row.session_observation?.binding_epoch ||
+        projection.observation.runner_id !== row.session_observation?.runner_id);
+    return {
+      ...row,
+      status: listStatus,
+      ...(projection
+        ? {
+            session_observation: projection.observation,
+            runner_offline_episode_id: projection.episodeId ?? null,
+            ...(projection.observation ? { runner_id: projection.observation.runner_id } : {}),
+            ...(bindingChanged
+              ? { host_id: undefined, runner_online: undefined, host_online: undefined }
+              : {}),
+            ...(projection.event
+              ? { labels: sessionLabelsFromStatus(row.labels, projection.event, bindingChanged) }
+              : {}),
+          }
+        : {}),
+    };
+  };
+  const patchRows = (rows: Conversation[]): Conversation[] => {
+    const next = rows.map(patchRow);
+    return next.every((row, index) => row === rows[index]) ? rows : next;
+  };
+  for (const prefix of ["conversations", "project-sessions"]) {
+    queryClient.setQueriesData<InfiniteData<ConversationsPage>>({ queryKey: [prefix] }, (data) => {
+      if (!data) return data;
+      const pages = data.pages.map((page) => {
+        const rows = patchRows(page.data);
+        return rows === page.data ? page : { ...page, data: rows };
+      });
+      return pages.every((page, index) => page === data.pages[index]) ? data : { ...data, pages };
+    });
+  }
+  queryClient.setQueriesData<PinnedConversationsResult>(
+    { queryKey: ["pinned-conversations"] },
     (data) => {
       if (!data) return data;
-      let mutated = false;
-      const pages = data.pages.map((page) => {
-        const idx = page.data.findIndex((c) => c.id === conversationId);
-        if (idx === -1 || page.data[idx].status === listStatus) return page;
-        mutated = true;
-        const nextData = [...page.data];
-        nextData[idx] = { ...nextData[idx], status: listStatus };
-        return { ...page, data: nextData };
-      });
-      return mutated ? { ...data, pages } : data;
+      const rows = patchRows(data.conversations);
+      return rows === data.conversations ? data : { ...data, conversations: rows };
     },
   );
 }
@@ -8167,17 +8590,32 @@ function applyChildSessionUpdated(
   parentId: string,
   childId: string,
   child: Record<string, unknown>,
-): void {
-  if (queryClient === null) return;
+): boolean {
+  if (queryClient === null) return false;
   const key = childSessionsQueryKey(parentId);
   // Initialize a cold cache rather than skipping: snapshot-on-connect
   // sends full child rows over the stream, so seeding here lets child
   // status/preview update live even when no useChildSessions is mounted.
   const current = queryClient.getQueryData<ChildSessionInfo[]>(key) ?? [];
 
+  const previous = current.find((row) => row.id === childId);
+  const observation = parseSessionObservation(child.session_observation);
+  const episodeId =
+    typeof child.runner_offline_episode_id === "string" ? child.runner_offline_episode_id : null;
+  const lifecycle =
+    observation !== undefined ||
+    ["busy", "current_task_status", "last_task_error", "pending_elicitations_count"].some(
+      (field) => field in child,
+    );
+  if (lifecycle && !acceptKnownSessionProjection(childId, observation, episodeId)) return false;
   // Build a patch from only the fields PRESENT in the payload (undefined
   // = "not in this delta, leave as-is"); explicit null is a real value.
   const patch: Partial<ChildSessionInfo> = {};
+  if (observation !== undefined) {
+    patch.session_observation = observation;
+    patch.runner_offline_episode_id = episodeId;
+  }
+
   const strOrNull = (v: unknown): string | null => (typeof v === "string" ? v : null);
   const strRecordOrEmpty = (v: unknown): Record<string, string> =>
     v && typeof v === "object"
@@ -8199,7 +8637,19 @@ function applyChildSessionUpdated(
   if (child.tool !== undefined) patch.tool = strOrNull(child.tool);
   if (child.session_name !== undefined) patch.session_name = strOrNull(child.session_name);
   if (child.task_summary !== undefined) patch.task_summary = strOrNull(child.task_summary);
-  if (child.labels !== undefined) patch.labels = strRecordOrEmpty(child.labels);
+  if (child.labels !== undefined) {
+    const labels = strRecordOrEmpty(child.labels);
+    patch.labels =
+      previous &&
+      !acceptSessionProjection(
+        observation,
+        episodeId,
+        previous.session_observation,
+        previous.runner_offline_episode_id,
+      )
+        ? preserveSessionErrorLabels(labels, previous.labels)
+        : labels;
+  }
   if (child.current_task_status !== undefined)
     patch.current_task_status = strOrNull(child.current_task_status);
   if (child.last_task_error !== undefined)
@@ -8217,6 +8667,8 @@ function applyChildSessionUpdated(
     // update (snapshot/refetch) fills them in.
     const inserted: ChildSessionInfo = {
       id: childId,
+      session_observation: patch.session_observation,
+      runner_offline_episode_id: patch.runner_offline_episode_id,
       title: patch.title ?? null,
       task_summary: patch.task_summary ?? null,
       tool: patch.tool ?? null,
@@ -8229,11 +8681,12 @@ function applyChildSessionUpdated(
       pending_elicitations_count: patch.pending_elicitations_count ?? 0,
     };
     queryClient.setQueryData<ChildSessionInfo[]>(key, [inserted, ...current]);
-    return;
+    return true;
   }
   const next = [...current];
   next[idx] = { ...current[idx], ...patch };
   queryClient.setQueryData<ChildSessionInfo[]>(key, next);
+  return true;
 }
 
 /**
@@ -8250,6 +8703,9 @@ async function* tapSessionEvents(
   beforeTurnEdge?: () => void,
 ): AsyncIterable<StreamEvent> {
   for await (const event of events) {
+    pushSseEvent(conversationId, event);
+    if (!acceptOwnedLifecycleSignal(event, conversationId) || !acceptLiveChildActivity(event))
+      continue;
     if (!isConversationDisposed(conversationId)) {
       streamEventRevisions.set(conversationId, (streamEventRevisions.get(conversationId) ?? 0) + 1);
     }
@@ -8260,9 +8716,56 @@ async function* tapSessionEvents(
     if (event.type === "elicitation_resolved") {
       onElicitationResolved?.(event.elicitationId);
     }
-    pushSseEvent(conversationId, event);
     yield event;
   }
+}
+
+/** Owned ephemeral signals cannot change a newer turn or its startup state. */
+function acceptOwnedLifecycleSignal(event: StreamEvent, conversationId: string | null): boolean {
+  if (
+    event.type !== "error" &&
+    event.type !== "session_terminal_pending" &&
+    event.type !== "response_created" &&
+    event.type !== "response_queued" &&
+    event.type !== "response_in_progress" &&
+    event.type !== "response_completed" &&
+    event.type !== "response_failed" &&
+    event.type !== "response_incomplete" &&
+    event.type !== "response_cancelled" &&
+    event.type !== "text_delta"
+  )
+    return true;
+  if (!("sessionObservation" in event)) return true;
+  if (!conversationId || !event.sessionObservation) return false;
+  if (event.conversationId != null && event.conversationId !== conversationId) return false;
+  if (
+    !acceptKnownSessionProjection(
+      conversationId,
+      event.sessionObservation,
+      event.runnerOfflineEpisodeId,
+    )
+  )
+    return false;
+  rememberSessionProjection(conversationId, event.sessionObservation, event.runnerOfflineEpisodeId);
+  return true;
+}
+
+/** Annotated live activity belongs to its child's current lifecycle observation. */
+function acceptLiveChildActivity(event: StreamEvent): boolean {
+  if (event.type !== "native_tool_call" || event.toolType !== "subagent_activity") return true;
+  const resource = event.data.resource;
+  if (resource === null || typeof resource !== "object" || !("session_observation" in resource))
+    return true;
+  const observation = parseSessionObservation(resource.session_observation);
+  const childId = event.data.resource_id;
+  if (!observation || typeof childId !== "string" || !childId) return false;
+  const rawEpisodeId =
+    "runner_offline_episode_id" in resource ? resource.runner_offline_episode_id : null;
+  if (rawEpisodeId != null && typeof rawEpisodeId !== "string") return false;
+  const episodeId = typeof rawEpisodeId === "string" ? rawEpisodeId : null;
+  if (!acceptKnownSessionProjection(childId, observation, episodeId)) return false;
+  rememberSessionProjection(childId, observation, episodeId);
+  return true;
 }
 
 /**

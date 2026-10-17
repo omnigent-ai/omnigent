@@ -1354,16 +1354,18 @@ async def test_list_tasks_leaves_young_running_run_untouched(
 
 
 def _seed_running_run_for_conv(db_uri: str, conversation_id: str) -> tuple[str, str]:
-    """Create a task + a ``running`` run bound to ``conversation_id``.
+    """Create a conversation, task, and ``running`` run bound to ``conversation_id``.
 
     :returns: ``(task_id, run_id)``.
     """
     import uuid
 
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
         SqlAlchemyScheduledTaskStore,
     )
 
+    SqlAlchemyConversationStore(db_uri).create_conversation(conversation_id=conversation_id)
     store = SqlAlchemyScheduledTaskStore(db_uri)
     task_id = uuid.uuid4().hex
     store.create(
@@ -1410,7 +1412,7 @@ def _wait_for_run_status(
                 return r
         time.sleep(0.02)
     # Return the current row (whatever status) so the caller's assert reports it.
-    for r in store.list_runs(task_id):
+    for r in store.list_runs(task_id)[0]:
         if r.id == run_id:
             return r
     return None

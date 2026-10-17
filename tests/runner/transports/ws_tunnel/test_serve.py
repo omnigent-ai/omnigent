@@ -856,6 +856,7 @@ async def test_serve_tunnel_fails_loud_on_auth_redirect(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
+    monkeypatch.delenv("OMNIGENT_WRAPPER_COMMAND", raising=False)
     login_url = (
         "https://example.databricks.com/oidc/oauth2/v2.0/authorize"
         "?client_id=abc&response_type=code"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import threading
 from collections.abc import AsyncIterator
@@ -16,14 +17,14 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from omnigent.entities import MessageData, NewConversationItem, SlashCommandData
+from omnigent.entities import ErrorData, MessageData, NewConversationItem, SlashCommandData
 from omnigent.errors import OmnigentError
 from omnigent.runtime import session_stream
 from omnigent.server import session_live_state, session_metadata_logging
 from omnigent.server.routes import sessions
-from omnigent.server.routes._sessions import common
+from omnigent.server.routes._sessions import common, helpers, orchestration
 from omnigent.server.routes.sessions import routes_events
-from omnigent.server.schemas import BackgroundTaskInfo, ErrorDetail
+from omnigent.server.schemas import BackgroundTaskInfo, ErrorDetail, SessionEventInput
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
@@ -35,9 +36,11 @@ _BACKGROUND_TASK = BackgroundTaskInfo(status="running", description="Wait for CI
 
 async def _flush_live_state() -> None:
     """Wait for ordered persistence and parent fanout before inspecting their effects."""
-    done = threading.Event()
-    session_live_state.submit("test_barrier", done.set)
-    assert await asyncio.to_thread(done.wait, 10)
+    # A committed status queues child and scheduled projections after the first barrier.
+    for _ in range(2):
+        done = threading.Event()
+        session_live_state.submit("test_barrier", done.set)
+        assert await asyncio.to_thread(done.wait, 10)
 
 
 @dataclass
@@ -223,6 +226,7 @@ async def test_subagent_idle_publishes_status_without_completion(
             "conversation_id": sid,
             "status": "idle",
             "error": None,
+            "session_observation": route.store.get_session_observation(sid).model_dump(),
             **wire_fields,
         }
     ]
@@ -301,6 +305,7 @@ async def test_subagent_idle_preserves_failed_status(status_route: _StatusRoute)
     sid = route.child_id
     common._session_status_cache[sid] = "failed"
     route.store.set_session_live_status(sid, "failed")
+    common._session_active_response_cache.pop(sid, None)
     response = await route.client.post(
         f"/v1/sessions/{sid}/events", json={"type": "subagent.status", "data": {"idle": True}}
     )
@@ -416,8 +421,850 @@ async def test_external_session_status_still_forwards_to_runner(
         assert failure["attributes"]["origin"] == "external_session_status"
         if structured:
             assert failure["attributes"]["provider_error_param"] == "input[3].content"
-    assert body["data"] == expected_data
+    projected_data = dict(body["data"])
+    observation = projected_data.pop("session_observation")
+    assert observation == route.store.get_session_observation(sid).model_dump()
+    assert projected_data.pop("subagent_dispatch_id", None) is None
+    assert projected_data == expected_data
     assert route.telemetry.call_count == (0 if status == "running" else 1)
+
+
+async def test_external_status_counts_each_no_id_turn_failure_without_reusing_response(
+    status_route: _StatusRoute,
+) -> None:
+    """A new native turn without an ID must not reuse the last failed turn's identity."""
+    route = status_route
+    observations = []
+    with capture_debug_rows("server") as rows:
+        for data in (
+            {"status": "running", "response_id": "first-turn"},
+            {"status": "failed", "output": "same genuine failure"},
+            {"status": "running"},
+            {"status": "failed", "output": "same genuine failure"},
+            {"status": "failed", "output": "same genuine failure"},
+        ):
+            response = await route.client.post(
+                f"/v1/sessions/{route.child_id}/events",
+                json={"type": "external_session_status", "data": data},
+            )
+            assert response.status_code == 202, response.text
+            await _flush_live_state()
+            observations.append(route.store.get_session_observation(route.child_id))
+
+    first_failure, no_id_running, second_failure, replay = observations[1:]
+    assert first_failure.response_id == "first-turn"
+    assert no_id_running.response_id is None
+    assert second_failure.response_id is None
+    assert second_failure.observation_id != first_failure.observation_id
+    assert replay == second_failure
+    failures = [row for row in rows if row["event_name"] == "session_turn_failed"]
+    assert len(failures) == 2
+    source_ids = [row["attributes"]["source_event_id"] for row in failures]
+    assert source_ids == [first_failure.observation_id, second_failure.observation_id]
+    assert failures[0]["attributes"]["response_id"] == "first-turn"
+    assert failures[1]["attributes"].get("response_id") is None
+
+
+async def test_external_status_counts_distinct_explicit_setup_failures_without_busy_edge(
+    status_route: _StatusRoute,
+) -> None:
+    """Consecutive setup failures with distinct response IDs are separate source events."""
+    route = status_route
+    observations = []
+    with capture_debug_rows("server") as rows:
+        for response_id in ("first-turn", "second-turn", "second-turn"):
+            response = await route.client.post(
+                f"/v1/sessions/{route.child_id}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {
+                        "status": "failed",
+                        "response_id": response_id,
+                        "output": "same setup failure",
+                    },
+                },
+            )
+            assert response.status_code == 202, response.text
+            await _flush_live_state()
+            observations.append(route.store.get_session_observation(route.child_id))
+    first, second, retry = observations
+    assert first.response_id == "first-turn"
+    assert second.response_id == "second-turn"
+    assert second.observation_id != first.observation_id
+    assert retry == second
+    failures = [row for row in rows if row["event_name"] == "session_turn_failed"]
+    assert len(failures) == 2
+    assert [row["attributes"]["response_id"] for row in failures] == [
+        "first-turn",
+        "second-turn",
+    ]
+    assert [row["attributes"]["source_event_id"] for row in failures] == [
+        first.observation_id,
+        second.observation_id,
+    ]
+
+
+@pytest.mark.parametrize("boundary", ["ensure", "append"])
+@pytest.mark.parametrize("replacement", ["same-binding", "rebound", "aba", "current"])
+async def test_native_boot_failure_keeps_captured_dispatch_through_awaits(
+    status_route: _StatusRoute,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    replacement: str,
+) -> None:
+    """Old setup failure keeps its history but cannot fail replacement work."""
+    from omnigent.runner import create_runner_app, subagent_work
+    from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
+    from tests.runner.test_app_sessions_native_supervision import _WakeRecordingServerClient
+
+    route = status_route
+    sid = route.child_id
+    route.store.replace_runner_id(sid, "runner-a")
+    route.store.set_session_live_status(sid, "idle")
+    route.store.set_labels(
+        sid,
+        {
+            "omnigent.wrapper": "claude-code-native-ui",
+            "omnigent.subagent.dispatch_id": "dispatch-a",
+        },
+    )
+    snapshot = route.store.get_conversation(sid)
+    assert snapshot is not None
+    entered, release = threading.Event(), threading.Event()
+    append = route.store.append
+
+    def delayed_append(session_id, items, **kwargs):
+        if boundary == "append" and session_id == sid and items[0].type == "message":
+            entered.set()
+            assert release.wait(10)
+        return append(session_id, items, **kwargs)
+
+    async def ensure_failure(*_args, **_kwargs):
+        if boundary == "ensure":
+            entered.set()
+            assert await asyncio.to_thread(release.wait, 10)
+        return helpers._NativeTerminalEnsureOutcome(
+            error=ErrorData(
+                source="execution", code="native_terminal_start_failed", message="boot A failed"
+            )
+        )
+
+    monkeypatch.setattr(route.store, "append", delayed_append)
+    monkeypatch.setattr(orchestration, "_ensure_native_terminal_ready", ensure_failure)
+    server = _WakeRecordingServerClient(route.parent_id)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),
+        server_client=server,
+    )
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    subagent_work._session_inboxes_ref[route.parent_id] = inbox
+    subagent_work.register_subagent_work(
+        parent_session_id=route.parent_id,
+        child_session_id=sid,
+        agent="worker",
+        title="Worker",
+        work_id="dispatch-a",
+    )
+    forwarded = []
+    try:
+        async with _runner_client(app) as runner:
+
+            async def forward(session_id, _router, body, **_kwargs):
+                forwarded.append(body)
+                response = await runner.post(f"/v1/sessions/{session_id}/events", json=body)
+                return helpers._RunnerForwardResult(response.status_code, response.text)
+
+            monkeypatch.setattr(orchestration, "_forward_session_change_to_runner", forward)
+            with capture_debug_rows("server") as rows:
+                pending = asyncio.create_task(
+                    orchestration._dispatch_session_event_to_runner_impl(
+                        sid,
+                        snapshot,
+                        SessionEventInput(
+                            type="message",
+                            data={
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": "request A"}],
+                            },
+                        ),
+                        route.store,
+                        runner,
+                        agent_name="worker",
+                        file_store=None,
+                        artifact_store=None,
+                    )
+                )
+                try:
+                    assert await asyncio.to_thread(entered.wait, 10)
+                    if replacement != "current":
+                        if replacement in {"rebound", "aba"}:
+                            route.store.replace_runner_id(sid, "runner-b")
+                        if replacement == "aba":
+                            route.store.replace_runner_id(sid, "runner-a")
+                        route.store.set_labels(
+                            sid, {"omnigent.subagent.dispatch_id": "dispatch-b"}
+                        )
+                        current = route.store.record_session_observation(
+                            sid, "running", response_id="turn-b"
+                        )
+                        assert current is not None
+                        helpers._publish_status(
+                            sid, "running", persist_live_status=False, session_observation=current
+                        )
+                        subagent_work.unregister_subagent_work(sid)
+                        subagent_work.register_subagent_work(
+                            parent_session_id=route.parent_id,
+                            child_session_id=sid,
+                            agent="worker",
+                            title="Worker B",
+                            work_id="dispatch-b",
+                        )
+                        subagent_work.mark_subagent_work_started(sid)
+                        route.published.reset_mock()
+                    release.set()
+                    result = await asyncio.wait_for(pending, 10)
+                    assert result.item_id is not None
+                    await _flush_live_state()
+                finally:
+                    release.set()
+                    if not pending.done():
+                        pending.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await pending
+            entry = subagent_work.get_subagent_work(sid)
+            assert entry is not None
+            if replacement == "current":
+                assert route.store.get_session_observation(sid).status == "failed"
+                assert entry.work_id == "dispatch-a" and entry.status == "failed"
+                assert inbox.qsize() == 1
+                assert len(forwarded) == 1
+                assert forwarded[0]["data"]["subagent_dispatch_id"] == "dispatch-a"
+                assert forwarded[0]["data"]["session_observation"] == (
+                    route.store.get_session_observation(sid).model_dump()
+                )
+            else:
+                assert route.store.get_session_observation(sid) == current
+                assert entry.work_id == "dispatch-b" and entry.status == "running"
+                assert inbox.empty()
+                assert not forwarded
+                assert not any(
+                    call.args[1].get("type") in {"response.error", "session.terminal_pending"}
+                    for call in route.published.call_args_list
+                )
+            items = route.store.list_items(sid).data
+            assert [item.type for item in items] == ["message", "error"]
+            assert items[1].data.message == "boot A failed"
+            assert len([row for row in rows if row["event_name"] == "session_turn_failed"]) == 1
+    finally:
+        release.set()
+        subagent_work.unregister_subagent_work(sid)
+        subagent_work._session_inboxes_ref.pop(route.parent_id, None)
+
+
+@pytest.mark.parametrize("producer", ["native", "host"])
+@pytest.mark.parametrize("rebound", [False, True], ids=["same-binding", "rebound"])
+async def test_setup_failure_resuming_after_commit_cannot_clear_new_turn(
+    status_route: _StatusRoute,
+    monkeypatch: pytest.MonkeyPatch,
+    producer: str,
+    rebound: bool,
+) -> None:
+    """A committed A result keeps its token when B starts before A's caller resumes."""
+    from omnigent.runner import create_runner_app, subagent_work
+    from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
+    from tests.runner.test_app_sessions_native_supervision import _WakeRecordingServerClient
+
+    route = status_route
+    sid = route.child_id
+    route.store.replace_runner_id(sid, "runner-a")
+    route.store.set_session_live_status(sid, "idle")
+    route.store.set_labels(sid, {"omnigent.subagent.dispatch_id": "dispatch-a"})
+    snapshot = route.store.get_conversation(sid)
+    assert snapshot is not None
+    owner, predecessor = helpers._capture_status_observation(sid, snapshot.session_observation)
+    committed, release = asyncio.Event(), asyncio.Event()
+    await_status = orchestration._await_failure_status
+    accepted_observations = []
+
+    async def pause_after_commit(status_write):
+        result = await await_status(status_write)
+        accepted_observations.append(result[1])
+        committed.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(orchestration, "_await_failure_status", pause_after_commit)
+    server = _WakeRecordingServerClient(route.parent_id)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])), server_client=server
+    )
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    subagent_work._session_inboxes_ref[route.parent_id] = inbox
+    forwarded = []
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "request A"}]},
+    )
+    try:
+        async with _runner_client(app) as runner:
+
+            async def forward(session_id, _router, event, **_kwargs):
+                forwarded.append(event)
+                response = await runner.post(f"/v1/sessions/{session_id}/events", json=event)
+                return helpers._RunnerForwardResult(response.status_code, response.text)
+
+            monkeypatch.setattr(orchestration, "_forward_session_change_to_runner", forward)
+            kwargs = {
+                "created_by": None,
+                "owner": owner,
+                "predecessor": predecessor,
+                "dispatch_id": "dispatch-a",
+            }
+            if producer == "native":
+                failure = orchestration._persist_native_terminal_failure(
+                    sid,
+                    snapshot,
+                    body,
+                    route.store,
+                    ErrorData(
+                        source="execution", code="native_terminal_start_failed", message="A failed"
+                    ),
+                    None,
+                    **kwargs,
+                )
+            else:
+                failure = orchestration._persist_host_launch_failure_turn(
+                    sid,
+                    snapshot,
+                    body,
+                    route.store,
+                    "A failed",
+                    None,
+                    host_error_code=orchestration._HARNESS_NOT_CONFIGURED_ERROR_CODE,
+                    **kwargs,
+                )
+            with capture_debug_rows("server") as rows:
+                pending = asyncio.create_task(failure)
+                try:
+                    await asyncio.wait_for(committed.wait(), 10)
+                    assert accepted_observations[0] is not None
+                    assert not pending.done()
+                    if rebound:
+                        route.store.replace_runner_id(sid, "runner-b")
+                    route.store.set_labels(sid, {"omnigent.subagent.dispatch_id": "dispatch-b"})
+                    current = route.store.record_session_observation(
+                        sid, "running", response_id="turn-b"
+                    )
+                    assert current is not None
+                    current = route.store.begin_terminal_startup(sid, current, "startup-b")
+                    assert current is not None
+                    helpers._publish_status(
+                        sid, "running", persist_live_status=False, session_observation=current
+                    )
+                    helpers._publish_terminal_pending(sid, True, session_observation=current)
+                    subagent_work.register_subagent_work(
+                        parent_session_id=route.parent_id,
+                        child_session_id=sid,
+                        agent="worker",
+                        title="Worker B",
+                        work_id="dispatch-b",
+                    )
+                    subagent_work.mark_subagent_work_started(sid)
+                    route.published.reset_mock()
+                    release.set()
+                    await asyncio.wait_for(pending, 10)
+                    await _flush_live_state()
+                finally:
+                    release.set()
+                    if not pending.done():
+                        pending.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await pending
+            assert route.store.get_session_observation(sid) == current
+            entry = subagent_work.get_subagent_work(sid)
+            assert entry is not None and entry.status == "running"
+            assert inbox.empty()
+            assert common._session_terminal_pending_cache[sid] is True
+            assert not any(
+                call.args[1].get("type") in {"response.error", "session.terminal_pending"}
+                for call in route.published.call_args_list
+            )
+            assert len(forwarded) == 1
+            assert forwarded[0]["data"]["subagent_dispatch_id"] == "dispatch-a"
+            assert (
+                forwarded[0]["data"]["session_observation"]
+                == accepted_observations[0].model_dump()
+            )
+            assert [item.type for item in route.store.list_items(sid).data] == ["message", "error"]
+            assert len([row for row in rows if row["event_name"] == "session_turn_failed"]) == 1
+    finally:
+        release.set()
+        subagent_work.unregister_subagent_work(sid)
+        subagent_work._session_inboxes_ref.pop(route.parent_id, None)
+        common._session_terminal_pending_cache.pop(sid, None)
+
+
+def test_owned_terminal_pending_does_not_clear_a_newer_pending_owner_without_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pending lifecycle can learn B before B's status edge reaches this replica."""
+    from omnigent.entities import Conversation
+    from omnigent.entities.session_observation import SessionObservation
+
+    sid = uuid4().hex
+    old = SessionObservation(runner_id="runner-a", binding_epoch=1, revision=1, observation_id="a")
+    newer = old.model_copy(update={"revision": 2, "observation_id": "b"})
+    published = Mock()
+    monkeypatch.setattr(session_stream, "publish", published)
+    try:
+        helpers._publish_status(sid, "running", persist_live_status=False, session_observation=old)
+        helpers._publish_terminal_pending(
+            sid, True, session_observation=newer, response_id="turn-b"
+        )
+        assert common._session_terminal_pending_cache[sid] is True
+        assert common._session_status_cache.projection(sid).observation == old
+        snapshot = Conversation(
+            id=sid,
+            created_at=1,
+            updated_at=1,
+            root_conversation_id=sid,
+            runner_id=old.runner_id,
+            runner_binding_epoch=old.binding_epoch,
+            live_status_revision=old.revision,
+            live_status_observation_id=old.observation_id,
+        )
+        common._session_terminal_pending_cache.hydrate(snapshot)
+        assert common._session_terminal_pending_cache[sid] is True
+        published.reset_mock()
+        helpers._publish_terminal_pending(
+            sid, False, session_observation=old, response_id="turn-a"
+        )
+        assert common._session_terminal_pending_cache[sid] is True
+        published.assert_not_called()
+        helpers._publish_terminal_pending(
+            sid, False, session_observation=newer, response_id="turn-b"
+        )
+        assert common._session_terminal_pending_cache.get(sid, False) is False
+        assert published.call_count == 1
+        helpers._publish_terminal_pending(
+            sid, True, session_observation=newer, response_id="turn-b"
+        )
+        snapshot.live_status_revision = 3
+        snapshot.live_status_observation_id = "c"
+        common._session_terminal_pending_cache.hydrate(snapshot)
+        assert common._session_terminal_pending_cache.get(sid, False) is False
+        published.reset_mock()
+        helpers._publish_terminal_pending(
+            sid, True, session_observation=newer, response_id="turn-b"
+        )
+        assert common._session_terminal_pending_cache.get(sid, False) is False
+        published.assert_not_called()
+    finally:
+        common._session_status_cache.pop(sid, None)
+        common._session_terminal_pending_cache.pop(sid, None)
+
+
+async def test_real_concurrent_terminal_ensures_reserve_order_without_running_edge(
+    status_route: _StatusRoute,
+) -> None:
+    """A's actual ensure completion cannot clear B's newer reserved startup."""
+    from omnigent.entities.session_observation import SessionObservation
+
+    route = status_route
+    sid = route.child_id
+    route.store.replace_runner_id(sid, "runner-a")
+    route.store.set_labels(sid, {"omnigent.wrapper": "claude-code-native-ui"})
+    prior = route.store.record_session_observation(
+        sid,
+        "failed",
+        response_id="prior-turn",
+        error_key="prior-error",
+        error_labels={
+            "omnigent.last_task_error_code": "prior-error",
+            "omnigent.last_task_error_message": "prior genuine failure",
+        },
+    )
+    assert prior is not None
+    snapshot = route.store.get_conversation(sid)
+    assert snapshot is not None
+    entered = [asyncio.Event(), asyncio.Event()]
+    release = [asyncio.Event(), asyncio.Event()]
+    observed = []
+
+    async def provider(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == f"/v1/sessions/{sid}/resources/terminals"
+        body = json.loads(request.content)
+        assert body["ensure_native_terminal"] is True
+        observation = SessionObservation.model_validate(body["session_observation"])
+        index = len(observed)
+        observed.append(observation)
+        entered[index].set()
+        await release[index].wait()
+        return httpx.Response(200, json={})
+
+    tasks = []
+    with capture_debug_rows("server") as rows:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(provider), base_url="http://runner"
+        ) as runner:
+            try:
+                tasks.append(
+                    asyncio.create_task(
+                        orchestration._ensure_native_terminal_ready(runner, sid, snapshot)
+                    )
+                )
+                await asyncio.wait_for(entered[0].wait(), 10)
+                before_b = route.store.get_conversation(sid)
+                assert before_b is not None
+                tasks.append(
+                    asyncio.create_task(
+                        orchestration._ensure_native_terminal_ready(runner, sid, before_b)
+                    )
+                )
+                await asyncio.wait_for(entered[1].wait(), 10)
+                first, second = observed
+                assert second.revision > first.revision > prior.revision
+                assert second.observation_id != first.observation_id
+                assert (
+                    (first.status, first.response_id, first.error_key)
+                    == (second.status, second.response_id, second.error_key)
+                    == (prior.status, prior.response_id, prior.error_key)
+                )
+                current = route.store.get_conversation(sid)
+                assert current is not None and current.session_observation == second
+                assert current.terminal_pending is True
+                assert (
+                    current.labels["omnigent.last_task_error_message"] == "prior genuine failure"
+                )
+                assert common._session_terminal_pending_cache[sid] is True
+                route.published.reset_mock()
+                helpers._publish_terminal_pending(sid, True, session_observation=first)
+                common._session_terminal_pending_cache.hydrate(before_b)
+                assert common._session_terminal_pending_cache[sid] is True
+                release[0].set()
+                with pytest.raises(OmnigentError, match="session changed"):
+                    await asyncio.wait_for(tasks[0], 10)
+                assert common._session_terminal_pending_cache[sid] is True
+                assert route.store.get_conversation(sid).terminal_pending is True
+                assert not any(
+                    call.args[1].get("type") == "session.terminal_pending"
+                    for call in route.published.call_args_list
+                )
+                release[1].set()
+                outcome_b = await asyncio.wait_for(tasks[1], 10)
+                completed = outcome_b.observation
+                assert outcome_b.error is None and completed is not None
+                assert completed.revision > second.revision
+                assert (completed.status, completed.response_id, completed.error_key) == (
+                    second.status,
+                    second.response_id,
+                    second.error_key,
+                )
+                assert common._session_terminal_pending_cache.get(sid, False) is False
+                pending_events = [
+                    call.args[1]
+                    for call in route.published.call_args_list
+                    if call.args[1].get("type") == "session.terminal_pending"
+                ]
+                assert len(pending_events) == 1
+                assert pending_events[0]["pending"] is False
+                assert pending_events[0]["session_observation"] == completed.model_dump()
+                assert route.store.get_session_observation(sid) == completed
+                assert route.store.get_conversation(sid).terminal_pending is False
+                assert not any(row["event_name"] == "session_turn_failed" for row in rows)
+            finally:
+                for gate in release:
+                    gate.set()
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                common._session_terminal_pending_cache.pop(sid, None)
+
+
+@pytest.mark.parametrize("busy_at_ingress", [False, True], ids=["delayed-denial", "already-busy"])
+async def test_delayed_input_policy_denial_cannot_settle_a_newer_turn(
+    status_route: _StatusRoute,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    busy_at_ingress: bool,
+) -> None:
+    """A denied input keeps its sentinel history without ending concurrent work."""
+    route = status_route
+    agent_id = uuid4().hex
+    SqlAlchemyAgentStore(db_uri).create(agent_id, "policy-worker", "unused-test-bundle")
+    conv = route.store.create_conversation(agent_id=agent_id, runner_id="runner-a")
+    sid = conv.id
+    old = route.store.record_session_observation(
+        sid,
+        "running" if busy_at_ingress else "idle",
+        response_id="turn-b" if busy_at_ingress else None,
+    )
+    assert old is not None
+    helpers._publish_status(
+        sid,
+        old.status,
+        response_id=old.response_id,
+        persist_live_status=False,
+        session_observation=old,
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def deny_after_wait(*_args, **_kwargs):
+        entered.set()
+        if not busy_at_ingress:
+            await release.wait()
+        return {"verdict": "deny", "reason": "denied input A"}
+
+    monkeypatch.setattr(routes_events, "_evaluate_input_policy", deny_after_wait)
+    pending = asyncio.create_task(
+        route.client.post(
+            f"/v1/sessions/{sid}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "A"}]},
+            },
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        current = (
+            old
+            if busy_at_ingress
+            else route.store.record_session_observation(sid, "running", response_id="turn-b")
+        )
+        assert current is not None
+        helpers._publish_status(
+            sid,
+            "running",
+            response_id="turn-b",
+            persist_live_status=False,
+            session_observation=current,
+        )
+        route.published.reset_mock()
+        release.set()
+        response = await asyncio.wait_for(pending, 10)
+        assert response.status_code == 202, response.text
+        assert response.json()["denied"] is True
+        await _flush_live_state()
+        assert route.store.get_session_observation(sid) == current
+        assert common._session_active_response_cache[sid] == "turn-b"
+        assert len(route.store.list_items(sid).data) == 1
+    finally:
+        release.set()
+        if not pending.done():
+            pending.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pending
+        common._session_status_cache.pop(sid, None)
+        common._session_active_response_cache.pop(sid, None)
+
+
+def test_rejected_sticky_idle_does_not_clear_another_active_response() -> None:
+    """A rejected A idle cannot erase B's response staged before its status commits."""
+    from omnigent.entities.session_observation import SessionObservation
+
+    sid = uuid4().hex
+    failed = SessionObservation(
+        runner_id="runner-a",
+        binding_epoch=1,
+        revision=2,
+        observation_id="failed-a",
+        status="failed",
+        response_id="turn-a",
+    )
+    try:
+        common._session_active_response_cache[sid] = "turn-a"
+        helpers._publish_status(
+            sid,
+            "failed",
+            persist_live_status=False,
+            session_observation=failed,
+            failure_logged=True,
+        )
+        assert sid not in common._session_active_response_cache
+        common._session_active_response_cache[sid] = "turn-b"
+        helpers._publish_status(sid, "idle", response_id="turn-a", owner=failed)
+        assert common._session_status_cache[sid] == "failed"
+        assert common._session_active_response_cache[sid] == "turn-b"
+    finally:
+        common._session_status_cache.pop(sid, None)
+        common._session_active_response_cache.pop(sid, None)
+
+
+async def test_delayed_relay_running_and_terminal_keep_new_owner_state_and_old_history(
+    status_route: _StatusRoute, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rejected relay edge cannot consume B's deny marker or lose A's prose."""
+    route = status_route
+    sid = route.child_id
+    route.store.replace_runner_id(sid, "runner-a")
+    original = route.store.record_session_observation(sid, "running", response_id="turn-a")
+    assert original is not None
+    helpers._publish_status(
+        sid,
+        "running",
+        response_id="turn-a",
+        persist_live_status=False,
+        session_observation=original,
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+    persist_labels = orchestration._persist_session_status_error_labels
+
+    async def pause_running_labels(session_id, error, store, **kwargs):
+        if session_id == sid and error is None:
+            entered.set()
+            await release.wait()
+        return await persist_labels(session_id, error, store, **kwargs)
+
+    monkeypatch.setattr(
+        orchestration, "_persist_session_status_error_labels", pause_running_labels
+    )
+    start = asyncio.Event()
+    start.set()
+    runner = _ScriptedRunnerClient(
+        start,
+        [
+            {"type": "response.in_progress", "response": {"id": "turn-a", "model": "worker"}},
+            {"type": "response.output_text.delta", "delta": "A narration"},
+            {"type": "session.status", "status": "running", "response_id": "turn-a"},
+            {"type": "response.completed", "response": {"id": "turn-a", "model": "worker"}},
+        ],
+    )
+    pending = asyncio.create_task(
+        orchestration._relay_runner_stream_once(
+            sid, runner, route.store, runner_id="runner-a", owner=original
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        route.store.replace_runner_id(sid, "runner-b")
+        current = route.store.record_session_observation(sid, "running", response_id="turn-b")
+        assert current is not None
+        helpers._publish_status(
+            sid,
+            "running",
+            response_id="turn-b",
+            persist_live_status=False,
+            session_observation=current,
+        )
+        common._llm_response_denied_turns[sid] = "deny B only"
+        release.set()
+        await asyncio.wait_for(pending, 10)
+        await _flush_live_state()
+        assert route.store.get_session_observation(sid) == current
+        assert common._session_active_response_cache[sid] == "turn-b"
+        assert common._llm_response_denied_turns[sid] == "deny B only"
+        narration = [
+            item
+            for item in route.store.list_items(sid).data
+            if isinstance(item.data, MessageData) and item.data.role == "assistant"
+        ]
+        assert len(narration) == 1
+        assert narration[0].response_id == "turn-a"
+        assert narration[0].data.content == [{"type": "output_text", "text": "A narration"}]
+    finally:
+        release.set()
+        if not pending.done():
+            pending.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pending
+        common._llm_response_denied_turns.pop(sid, None)
+
+
+async def test_delayed_external_terminal_status_cannot_forward_into_new_child_turn(
+    status_route: _StatusRoute, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The actual HTTP callback rejects old terminal effects after enrichment yields."""
+    route = status_route
+    sid = route.child_id
+    route.store.set_runner_id(sid, "runner-a")
+    route.store.set_labels(sid, {"omnigent.subagent.dispatch_id": "dispatch-a"})
+    route.store.record_session_observation(sid, "running", response_id="turn-a")
+    historical = route.store.append(
+        sid,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="turn-a",
+                data=MessageData(
+                    role="assistant",
+                    agent="worker",
+                    content=[{"type": "text", "text": "old source failure"}],
+                ),
+            )
+        ],
+    )[0]
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    enrich = routes_events._enrich_terminal_status_with_subagent_output
+
+    async def delayed_enrichment(data, status, session_id, store, **kwargs):
+        if data.get("response_id") == "turn-a":
+            entered.set()
+            await release.wait()
+        return await enrich(data, status, session_id, store, **kwargs)
+
+    monkeypatch.setattr(
+        routes_events, "_enrich_terminal_status_with_subagent_output", delayed_enrichment
+    )
+    with capture_debug_rows("server") as rows:
+        pending = asyncio.create_task(
+            route.client.post(
+                f"/v1/sessions/{sid}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {
+                        "status": "failed",
+                        "response_id": "turn-a",
+                        "output": "old source failure",
+                        "turn_outcome": "failed",
+                    },
+                },
+            )
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=10)
+            route.store.set_labels(sid, {"omnigent.subagent.dispatch_id": "dispatch-b"})
+            running = await route.client.post(
+                f"/v1/sessions/{sid}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {
+                        "status": "running",
+                        "response_id": "turn-b",
+                    },
+                },
+            )
+            assert running.status_code == 202, running.text
+            await _flush_live_state()
+            expected = route.store.get_session_observation(sid)
+            assert expected is not None and expected.response_id == "turn-b"
+            new_turn_forward = route.forwarded[-1][1]
+            route.forwarded.clear()
+            route.published.reset_mock()
+            release.set()
+            response = await asyncio.wait_for(pending, timeout=10)
+            assert response.status_code == 202, response.text
+            await _flush_live_state()
+            assert route.store.get_session_observation(sid) == expected
+            assert common._session_status_cache[sid] == "running"
+            assert route.forwarded == []
+            assert new_turn_forward["data"]["subagent_dispatch_id"] == "dispatch-b"
+            assert new_turn_forward["data"]["session_observation"] == expected.model_dump()
+            assert all(
+                call.args[1].get("status") != "failed" for call in route.published.call_args_list
+            )
+            assert historical.id in [item.id for item in route.store.list_items(sid).data]
+        finally:
+            release.set()
+            if not pending.done():
+                pending.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await pending
+    failures = [row for row in rows if row["event_name"] == "session_turn_failed"]
+    assert len(failures) == 1
+    assert failures[0]["attributes"]["response_id"] == "turn-a"
 
 
 @pytest.mark.parametrize("is_child", [False, True], ids=["main", "native-child"])

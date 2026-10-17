@@ -45,6 +45,11 @@ from omnigent.debug_logging import (
     runner_primary_session_id,
     set_current_session_id,
 )
+from omnigent.entities.session_observation import (
+    SessionObservation,
+    accept_session_projection,
+    is_versioned_session_observation,
+)
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     session_resource_view_to_dict,
@@ -173,6 +178,7 @@ from omnigent.runner.subagent_work import (
     _SUBAGENT_DELIVERY_MISSING_PARENT_INBOX,
     _SUBAGENT_TERMINAL_STATUSES,
     _WAKE_POST_MAX_ATTEMPTS,
+    SUBAGENT_DISPATCH_ID_LABEL_KEY,
     _child_session_parents,
     _ChildParentMeta,
     _deliver_subagent_completion,
@@ -525,6 +531,7 @@ class _SessionSnapshot:
     sub_agent_name: str | None = None
     parent_session_id: str | None = None
     agent_name: str | None = None
+    subagent_dispatch_id: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1253,6 +1260,7 @@ def create_runner_app(
     _session_root_spec_cache: dict[str, _SpecEntry] = {}  # session_id → unresolved root spec
     _resp_to_conv: dict[str, str] = {}  # harness response_id → conversation_id
     _live_response_id: dict[str, str] = {}
+    _forwarded_status_observations: dict[str, SessionObservation] = {}
     app.state.live_response_id = _live_response_id
     _session_start_cache: dict[str, float] = {}  # session_id → registered start time
     _session_spec_cache: dict[str, _SpecEntry | None] = {}  # session_id → session AgentSpec
@@ -1655,13 +1663,22 @@ def create_runner_app(
         session_id: str,
         status: str,
         blocked_on: str | None = None,
+        *,
+        pane_activity: bool = False,
     ) -> None:
         event: dict[str, object] = {"type": "session.status", "status": status}
+        if pane_activity:
+            event["status_source"] = "pane_activity"
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
         _publish_event(session_id, event)
 
-    resource_registry.set_session_status_publisher(_publish_session_status)
+    resource_registry.set_session_status_publisher(
+        _publish_session_status,
+        pane_activity_publisher=lambda session_id, status, blocked_on: _publish_session_status(
+            session_id, status, blocked_on, pane_activity=True
+        ),
+    )
 
     def _format_terminal_command_for_failure(event: TerminalExitEvent) -> str:
         if event.command is None:
@@ -1990,6 +2007,7 @@ def create_runner_app(
             sub_agent_name: str | None = None
             parent_session_id: str | None = None
             agent_name: str | None = None
+            subagent_dispatch_id: str | None = None
             try:
                 resp = await server_client.get(
                     f"/v1/sessions/{session_id}", params=_SESSION_METADATA_PARAMS
@@ -2013,6 +2031,14 @@ def create_runner_app(
                     raw_agent_name = body.get("agent_name")
                     if isinstance(raw_agent_name, str) and raw_agent_name:
                         agent_name = raw_agent_name
+                    labels = body.get("labels")
+                    raw_dispatch_id = (
+                        labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
+                        if isinstance(labels, dict)
+                        else None
+                    )
+                    if isinstance(raw_dispatch_id, str) and raw_dispatch_id:
+                        subagent_dispatch_id = raw_dispatch_id
             except Exception:  # noqa: BLE001 — best-effort; created_at falls back to wall time
                 pass
             snapshot = _SessionSnapshot(
@@ -2024,6 +2050,7 @@ def create_runner_app(
                 sub_agent_name=sub_agent_name,
                 parent_session_id=parent_session_id,
                 agent_name=agent_name,
+                subagent_dispatch_id=subagent_dispatch_id,
             )
             if snapshot.ok and snapshot.agent_id is not None:
                 if _session_cache_generation_is_current(session_id, generation):
@@ -2109,6 +2136,7 @@ def create_runner_app(
             agent_id=agent_id,
             sub_agent_name=envelope.sub_agent_name,
             parent_session_id=snapshot.parent_session_id,
+            subagent_dispatch_id=snapshot.labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY),
         )
         _session_start_cache[session_id] = float(snapshot.created_at)
         _session_workspace_cache[session_id] = snapshot.workspace
@@ -2400,6 +2428,25 @@ def create_runner_app(
             )
         session_id = cast(str, session_id)
         agent_id = cast(str, agent_id)
+        raw_startup_observation = body.get("session_observation")
+        startup_observation = None
+        if raw_startup_observation is not None:
+            try:
+                startup_observation = SessionObservation.model_validate(raw_startup_observation)
+            except ValueError:
+                return JSONResponse(
+                    status_code=400, content={"error": "invalid session observation"}
+                )
+
+        def publish_startup_event(event_session_id: str, event: _JsonObject) -> None:
+            if startup_observation is not None:
+                event = {
+                    **event,
+                    "conversation_id": event_session_id,
+                    "session_observation": startup_observation.model_dump(mode="json"),
+                }
+            _publish_event(event_session_id, event)
+
         initial_turn_epoch = _turn_bind_epoch.get(session_id)
         initial_native_activity = resource_registry.session_activity_epoch(session_id)
         initially_active = session_id in _active_turns or resource_registry.session_turn_is_active(
@@ -2569,7 +2616,10 @@ def create_runner_app(
             except OmnigentError as exc:
                 # The relay also needs the failure when init precedes the first turn.
                 _publish_turn_status(
-                    session_id, "failed", error={"code": exc.code, "message": str(exc)}
+                    session_id,
+                    "failed",
+                    error={"code": exc.code, "message": str(exc)},
+                    session_observation=startup_observation,
                 )
                 raise
             if spawn_env is None:
@@ -2706,7 +2756,7 @@ def create_runner_app(
             _launch_ctx = NativeLaunchContext(
                 session_id=session_id,
                 resource_registry=resource_registry,
-                publish_event=_publish_event,
+                publish_event=publish_startup_event,
                 server_client=server_client,
                 event_dispatcher=getattr(app.state, "runner_event_dispatcher", None),
                 ensure_comment_relay=_ensure_comment_relay_started,
@@ -3555,6 +3605,7 @@ def create_runner_app(
         *,
         source_error: Mapping[str, object] | None = None,
         response_id: str | None = None,
+        session_observation: SessionObservation | None = None,
     ) -> None:
         if status == "waiting" and not (
             _server_version is not None and _version_supports_waiting_status(_server_version)
@@ -3575,6 +3626,9 @@ def create_runner_app(
         if status == "idle" and harness in {"codex-native", "antigravity-native"}:
             return
         event: _JsonObject = {"type": "session.status", "status": status}
+        if session_observation is not None:
+            event["conversation_id"] = conv_id
+            event["session_observation"] = session_observation.model_dump(mode="json")
         if error is not None:
             event["error"] = error
         if response_id is not None:
@@ -3876,7 +3930,7 @@ def create_runner_app(
             _interrupted_sessions.discard(conv_id)
             _append_cancellation_items(conv_id)
             if not has_buffered and not _suppress_status:
-                _publish_turn_status(conv_id, "idle")
+                _publish_turn_status(conv_id, "idle", response_id=owner_response_id)
         elif error is not None:
             normalized_error = _normalize_turn_error(error)
             if not _suppress_status:
@@ -3897,7 +3951,11 @@ def create_runner_app(
                     and e.status in ("launching", "running", "waiting")
                     for c in children
                 )
-                _publish_turn_status(conv_id, "waiting" if has_running_children else "idle")
+                _publish_turn_status(
+                    conv_id,
+                    "waiting" if has_running_children else "idle",
+                    response_id=owner_response_id,
+                )
         if was_interrupted:
             if conv_id in _desynced_sessions and not has_buffered:
                 # This turn was torn down by desync recovery (which sets the
@@ -6659,6 +6717,48 @@ def create_runner_app(
         if body_type == "external_session_status":
             data = body.get("data") if isinstance(body, dict) else None
             status = data.get("status") if isinstance(data, dict) else None
+            raw_observation = data.get("session_observation") if isinstance(data, dict) else None
+            try:
+                observation = (
+                    SessionObservation.model_validate(raw_observation)
+                    if raw_observation is not None
+                    else None
+                )
+            except ValueError:
+                return JSONResponse(
+                    status_code=400, content={"error": "invalid_session_observation"}
+                )
+            initial_work = get_subagent_work(conversation_id)
+            raw_dispatch_id = data.get("subagent_dispatch_id") if isinstance(data, dict) else None
+            if raw_dispatch_id is not None and (
+                not isinstance(raw_dispatch_id, str) or not raw_dispatch_id
+            ):
+                return JSONResponse(
+                    status_code=400, content={"error": "invalid_subagent_dispatch_id"}
+                )
+            expected_work_id = raw_dispatch_id or (
+                initial_work.work_id if initial_work is not None else None
+            )
+
+            def owns_status() -> bool:
+                current = get_subagent_work(conversation_id)
+                if (
+                    expected_work_id is not None
+                    and current is not None
+                    and current.work_id != expected_work_id
+                ):
+                    return False
+                if not accept_session_projection(
+                    observation, None, _forwarded_status_observations.get(conversation_id), None
+                ):
+                    return False
+                if is_versioned_session_observation(observation):
+                    assert observation is not None
+                    _forwarded_status_observations[conversation_id] = observation
+                return True
+
+            if not owns_status():
+                return Response(status_code=204)
             forwarded_output = data.get("output") if isinstance(data, dict) else None
             output = forwarded_output if isinstance(forwarded_output, str) else None
             delivery_ack: _SubagentDeliveryAck | None = None
@@ -6668,7 +6768,16 @@ def create_runner_app(
                 recovered_entry = get_subagent_work(conversation_id)
                 turn_outcome = data.get("turn_outcome") if isinstance(data, dict) else None
                 if turn_outcome in ("completed", "cancelled", "failed"):
-                    recovered_entry = await _ensure_subagent_work_entry(conversation_id)
+                    recovered_entry = await _ensure_subagent_work_entry(
+                        conversation_id, expected_work_id=expected_work_id
+                    )
+                    if (
+                        get_subagent_work(conversation_id) is not recovered_entry
+                        or not owns_status()
+                    ):
+                        return Response(status_code=204)
+                    if expected_work_id is None and recovered_entry is not None:
+                        expected_work_id = recovered_entry.work_id
                     terminal_status = turn_outcome
                     if turn_outcome == "cancelled" and recovered_entry is not None:
                         recovered_entry.cancellation_confirmed = True
@@ -6682,20 +6791,6 @@ def create_runner_app(
                     # while its parent inbox is still unavailable.
                     terminal_status = "cancelled"
                     output = recovered_entry.output
-            if status in ("running", "waiting", "idle", "failed"):
-                # Forwarders report these edges straight to the server, so record
-                # them here too; the idle watchdog reads them for native turns.
-                _native_pane_status[conversation_id] = status
-                resource_registry.note_external_session_status(conversation_id, status)
-                child_status = (
-                    "idle" if terminal_status == "completed" else terminal_status or status
-                )
-                _fan_out_child_delta_to_parent(
-                    conversation_id,
-                    {"type": "session.status", "status": child_status},
-                    latest_assistant_text=output,
-                    allow_history_preview_fallback=False,
-                )
             turn_completed = data.get("turn_completed") if isinstance(data, dict) else None
             interrupt_pending = False
             interrupt_work_id: str | None = None
@@ -6722,6 +6817,26 @@ def create_runner_app(
                 and not interrupt_pending
                 and _native_turn_outcome_is_forwarder_confirmed(conversation_id)
             )
+            if status in ("idle", "failed") and terminal_status is None and not ambiguous_idle:
+                recovered_entry = await _ensure_subagent_work_entry(
+                    conversation_id, expected_work_id=expected_work_id
+                )
+                if get_subagent_work(conversation_id) is not recovered_entry or not owns_status():
+                    return Response(status_code=204)
+                if expected_work_id is None and recovered_entry is not None:
+                    expected_work_id = recovered_entry.work_id
+            if status in ("running", "waiting", "idle", "failed"):
+                _native_pane_status[conversation_id] = status
+                resource_registry.note_external_session_status(conversation_id, status)
+                child_status = (
+                    "idle" if terminal_status == "completed" else terminal_status or status
+                )
+                _fan_out_child_delta_to_parent(
+                    conversation_id,
+                    {"type": "session.status", "status": child_status},
+                    latest_assistant_text=output,
+                    allow_history_preview_fallback=False,
+                )
             if terminal_status is not None:
                 _native_interrupt_runner.clear_pending_interrupt(conversation_id)
                 if terminal_status == "cancelled":
@@ -6732,6 +6847,7 @@ def create_runner_app(
                     conversation_id,
                     status=terminal_status,
                     output=output if output is not None else "",
+                    only_if_work_id=expected_work_id,
                 )
             elif ambiguous_idle:
                 # This harness's forwarder marks genuine turn completions
@@ -6751,8 +6867,6 @@ def create_runner_app(
                 if delivery_ack.delivered_now:
                     _schedule_subagent_wake(entry)
             else:
-                if status in ("idle", "failed"):
-                    recovered_entry = await _ensure_subagent_work_entry(conversation_id)
                 if status == "idle" and interrupt_pending:
                     # Interrupt with no confirming edge, resolved to the CURRENT
                     # dispatch (``resolve_pending_interrupt`` only reports pending
@@ -6770,6 +6884,7 @@ def create_runner_app(
                         conversation_id,
                         status="completed",
                         output=output if output is not None else "",
+                        only_if_work_id=expected_work_id,
                     )
                 elif status == "failed":
                     _native_interrupt_runner.clear_pending_interrupt(conversation_id)
@@ -6777,6 +6892,7 @@ def create_runner_app(
                         conversation_id,
                         status="failed",
                         output=output or "Error: native sub-agent turn failed",
+                        only_if_work_id=expected_work_id,
                     )
             if delivery_ack is not None:
                 if (

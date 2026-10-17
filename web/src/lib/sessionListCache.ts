@@ -12,6 +12,11 @@
 import type { InfiniteData, QueryClient } from "@tanstack/react-query";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
+import {
+  acceptSessionProjection,
+  parseSessionObservation,
+  preserveSessionErrorLabels,
+} from "@/lib/sessionObservation";
 
 /** Cache value shape for a `useConversations` infinite query. */
 export type ConversationsInfiniteData = InfiniteData<ConversationsPage, string | undefined>;
@@ -97,7 +102,12 @@ export type SessionListWireItem = Partial<Conversation> & { id: string };
 export function nullsToUndefined(wire: SessionListWireItem): SessionListWireItem {
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(wire)) {
-    out[key] = value === null ? undefined : value;
+    out[key] =
+      key === "session_observation"
+        ? parseSessionObservation(value)
+        : value === null
+          ? undefined
+          : value;
   }
   return out as SessionListWireItem;
 }
@@ -122,13 +132,50 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
   const row = conv as unknown as Record<string, unknown>;
   for (const [key, value] of Object.entries(wire)) {
     const current = row[key];
-    if (key === "labels") {
+    if (key === "labels" || key === "session_observation") {
       if (JSON.stringify(current) !== JSON.stringify(value)) changed.add(key);
     } else if (current !== value) {
       changed.add(key);
     }
   }
   return changed;
+}
+
+const SESSION_LIFECYCLE_FIELDS = new Set<string>([
+  "session_observation",
+  "runner_offline_episode_id",
+  "status",
+  "runner_id",
+  "host_id",
+  "host_online",
+  "runner_online",
+  "pending_elicitations_count",
+]);
+
+/** Fence lifecycle fields without blocking independent partial metadata updates. */
+export function mergeSessionListProjection(
+  previous: Conversation,
+  incoming: SessionListWireItem,
+): SessionListWireItem {
+  const observation = parseSessionObservation(incoming.session_observation);
+  const patch = { ...incoming };
+  if ("session_observation" in incoming) patch.session_observation = observation;
+  if (
+    acceptSessionProjection(
+      observation,
+      incoming.runner_offline_episode_id,
+      previous.session_observation,
+      previous.runner_offline_episode_id,
+    )
+  )
+    return patch;
+  const metadata = Object.fromEntries(
+    Object.entries(patch).filter(([key]) => !SESSION_LIFECYCLE_FIELDS.has(key)),
+  ) as SessionListWireItem;
+  if (metadata.labels !== undefined) {
+    metadata.labels = preserveSessionErrorLabels(metadata.labels, previous.labels);
+  }
+  return metadata;
 }
 
 /**
@@ -288,12 +335,13 @@ export function mergeItemsIntoPages(
     let rowChanged = false;
     const nextData: Conversation[] = [];
     for (const conv of page.data) {
-      const wire = itemsById.get(conv.id);
-      if (!wire) {
+      const incoming = itemsById.get(conv.id);
+      if (!incoming) {
         nextData.push(conv);
         continue;
       }
       found.add(conv.id);
+      const wire = mergeSessionListProjection(conv, incoming);
       const changed = changedWireFields(conv, wire);
       if (changed.size === 0) {
         nextData.push(conv);

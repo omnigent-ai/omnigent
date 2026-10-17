@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import dataclasses
+import json
 import logging
+import threading
+from collections.abc import Iterator
+from concurrent.futures import Future
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -13,6 +19,7 @@ import pytest
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import Conversation, MessageData, NewConversationItem
+from omnigent.entities.session_observation import RunnerOfflineDecision, SessionObservation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
 from omnigent.runner.session_init_protocol import (
@@ -766,3 +773,687 @@ async def test_init_rejection_level_by_status(status: int, level: str) -> None:
     assert rejected["level"] == level
     assert rejected["attributes"]["response_body"] == "nope"
     assert "finished" not in rejected["message"]
+
+
+@pytest.fixture
+def native_init_store(db_uri: str) -> Iterator[SqlAlchemyConversationStore]:
+    from omnigent.server import session_live_state
+    from omnigent.server.routes._sessions import common
+
+    store = SqlAlchemyConversationStore(db_uri)
+    common._session_status_cache.clear()
+    common._session_terminal_pending_cache.clear()
+    session_live_state.configure(store)
+    try:
+        yield store
+    finally:
+        session_live_state.submit("test_barrier", lambda: None).result(timeout=10)
+        session_live_state.configure(None)
+        common._session_status_cache.clear()
+        common._session_terminal_pending_cache.clear()
+
+
+class _ObservedInitClient(_Client):
+    def __init__(self, store: SqlAlchemyConversationStore, session_id: str) -> None:
+        super().__init__()
+        self._store = store
+        self._session_id = session_id
+        self.at_post: list[Conversation | None] = []
+
+    async def post(self, path: str, **kwargs: Any) -> httpx.Response:
+        self.at_post.append(self._store.get_conversation(self._session_id))
+        response = await super().post(path, **kwargs)
+        response.request = httpx.Request("POST", "http://runner" + path)
+        return response
+
+
+def _native_initializer(
+    store: SqlAlchemyConversationStore,
+) -> tuple[Conversation, _Registry, _ObservedInitClient, RunnerSessionInitializer]:
+    conversation = store.create_conversation(
+        agent_id=generate_agent_id(),
+        runner_id="runner_init",
+        harness_override="claude-native",
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+    )
+    registry, client = _Registry(), _ObservedInitClient(store, conversation.id)
+    client.response_json = {
+        "status": "initialized",
+        "session_init_protocol_version": 2,
+        "terminal_ready": True,
+    }
+    initializer = RunnerSessionInitializer(
+        registry,
+        server_version="test",
+        conversation_store=store,  # type: ignore[arg-type]
+    )
+    return conversation, registry, client, initializer
+
+
+@pytest.mark.asyncio
+async def test_native_initializer_reserves_before_post_and_shares_owned_completion(
+    native_init_store: SqlAlchemyConversationStore,
+) -> None:
+    store = native_init_store
+    conv, _, client, initializer = _native_initializer(store)
+    previous = store.record_session_observation(
+        conv.id,
+        "failed",
+        response_id="previous-response",
+        error_key="previous-error",
+        error_labels={"omnigent.last_task_error_code": "native_turn_error"},
+    )
+    assert previous is not None
+    conv = store.get_conversation(conv.id)
+    assert conv is not None
+    second_conv = dataclasses.replace(conv)
+    first = asyncio.create_task(initializer.initialize(conv, client, timeout=10))
+    second = None
+    try:
+        await asyncio.wait_for(client.entered.wait(), 10)
+        pending = client.at_post[0]
+        assert pending is not None and pending.terminal_pending
+        reservation = pending.session_observation
+        assert reservation is not None and reservation != previous
+        assert client.calls[0]["session_observation"] == reservation.model_dump()
+        assert pending.live_status == "failed"
+        assert reservation.response_id == previous.response_id
+        assert reservation.error_key == previous.error_key
+        second = asyncio.create_task(initializer.initialize(second_conv, client, timeout=10))
+        await asyncio.sleep(0)
+        assert len(client.calls) == 1
+        assert store.get_session_observation(conv.id) == reservation
+        client.release.set()
+        responses = await asyncio.gather(first, second)
+        assert responses[0] is responses[1] and responses[0].status_code == 201
+        current = store.get_conversation(conv.id)
+        assert current is not None and not current.terminal_pending
+        assert current.live_status == "failed"
+        assert current.session_observation.response_id == previous.response_id
+        assert current.session_observation.error_key == previous.error_key
+        assert current.session_observation.revision > reservation.revision
+        completed = SessionObservation.model_validate(
+            responses[0].extensions["session_observation"]
+        )
+        assert completed == current.session_observation
+        assert conv is not second_conv
+        assert conv.session_observation == second_conv.session_observation == completed
+        assert initializer.is_initialized(conv, client)
+    finally:
+        client.release.set()
+        await asyncio.gather(
+            *[task for task in (first, second) if task is not None], return_exceptions=True
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "pending-pane",
+        "completed-pane",
+        "replacement-pane",
+        "pending-file",
+        "pending-idle",
+        "replacement-file",
+        "replacement-idle",
+    ],
+)
+async def test_late_runner_status_after_init_response_keeps_its_source_ownership(
+    native_init_store: SqlAlchemyConversationStore, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes._sessions import common, orchestration
+
+    replacement_startup = mode.startswith("replacement-")
+    file_running = mode in {"pending-file", "replacement-file"}
+    idle_resync = mode in {"pending-idle", "replacement-idle"}
+    store = native_init_store
+    conv, _, client, initializer = _native_initializer(store)
+    previous = store.record_session_observation(conv.id, "idle", response_id="prior-response")
+    assert previous is not None
+    conv = store.get_conversation(conv.id)
+    assert conv is not None
+    completion_entered, completion_release = asyncio.Event(), asyncio.Event()
+    complete = orchestration._complete_native_terminal_startup
+    events: list[dict[str, Any]] = []
+    publish = session_stream.publish
+
+    def capture(session_id: str, event: dict[str, Any]) -> None:
+        events.append(event)
+        publish(session_id, event)
+
+    async def paused_completion(
+        session_id: str, owner: SessionObservation
+    ) -> SessionObservation | None:
+        completed = await complete(session_id, owner) if mode == "completed-pane" else None
+        completion_entered.set()
+        await completion_release.wait()
+        return completed if completed is not None else await complete(session_id, owner)
+
+    monkeypatch.setattr(session_stream, "publish", capture)
+    monkeypatch.setattr(orchestration, "_complete_native_terminal_startup", paused_completion)
+    task = asyncio.create_task(initializer.initialize(conv, client, timeout=10))
+    try:
+        await asyncio.wait_for(client.entered.wait(), 10)
+        client.release.set()
+        await asyncio.wait_for(completion_entered.wait(), 10)
+        assert len(client.calls) == 1
+        current = store.get_conversation(conv.id)
+        assert current is not None
+        if replacement_startup:
+            replacement = await orchestration._begin_native_terminal_startup(
+                conv.id, current.session_observation
+            )
+            assert replacement is not None
+            current = store.get_conversation(conv.id)
+            assert current is not None and current.session_observation == replacement
+        projection = common._session_status_cache.projection(conv.id)
+        assert projection is not None and projection.observation == current.session_observation
+        assert (
+            common._session_terminal_pending_cache.get(conv.id, False) == current.terminal_pending
+        )
+        events.clear()
+        frames = [
+            {"type": "session.terminal.activity", "terminal_id": "terminal_claude_main"},
+            {
+                "type": "session.status",
+                "status": "idle" if idle_resync else "running",
+                "status_source": (
+                    "claude_status_file" if file_running or idle_resync else "pane_activity"
+                ),
+            },
+        ]
+        response_text = "".join("data: " + json.dumps(event) + "\n\n" for event in frames)
+        response_text += "data: [DONE]\n\n"
+        async with httpx.AsyncClient(
+            base_url="http://runner",
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(200, text=response_text)
+            ),
+        ) as relay_client:
+            await orchestration._relay_runner_stream_once(
+                conv.id,
+                relay_client,
+                store,
+                runner_id=conv.runner_id,
+                owner=current.session_observation,
+            )
+        after = store.get_conversation(conv.id)
+        assert after is not None
+        assert any(event["type"] == "session.terminal.activity" for event in events)
+        if file_running:
+            assert after.live_status == "running" and not after.terminal_pending
+            assert after.session_observation.revision > current.session_observation.revision
+            assert any(event["type"] == "session.status" for event in events)
+        else:
+            assert after.session_observation == current.session_observation
+            assert after.terminal_pending == current.terminal_pending
+            assert common._session_status_cache.projection(conv.id) == projection
+            if not idle_resync:
+                assert all(event["type"] != "session.status" for event in events)
+        completion_release.set()
+        if replacement_startup or file_running:
+            with pytest.raises(OmnigentError):
+                await asyncio.wait_for(task, 10)
+            assert not initializer.is_initialized(conv, client)
+            assert store.get_session_observation(conv.id) == after.session_observation
+        else:
+            response = await asyncio.wait_for(task, 10)
+            assert response.status_code == 201 and initializer.is_initialized(conv, client)
+            settled = store.get_conversation(conv.id)
+            assert settled is not None and not settled.terminal_pending
+            assert settled.session_observation.status == current.session_observation.status
+        assert len(client.calls) == 1
+    finally:
+        client.release.set()
+        completion_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    "queued_status", ["running", "waiting", "failed", "startup", "binding-aba"]
+)
+@pytest.mark.parametrize("resolution", ["done", "pending", "failed", "unresolved"])
+def test_idle_resync_never_adopts_its_queued_successor(
+    native_init_store: SqlAlchemyConversationStore, queued_status: str, resolution: str
+) -> None:
+    from omnigent.server import session_live_state
+
+    store = native_init_store
+    conv, _, _, _ = _native_initializer(store)
+    owner = store.record_session_observation(conv.id, "idle", response_id="native-old-turn")
+    assert owner is not None
+    queued: Future[SessionObservation | None] = Future()
+    predecessor = session_live_state.PendingObservation(
+        owner, queued_status, "native-new-turn", None, None, "queued-work", queued
+    )
+    blocked, release = threading.Event(), threading.Event()
+
+    def hold_writer() -> None:
+        blocked.set()
+        assert release.wait(10)
+
+    barrier = session_live_state.submit("held_writer", hold_writer)
+    assert blocked.wait(10)
+
+    def replace() -> SessionObservation:
+        if queued_status == "startup":
+            replacement = store.begin_terminal_startup(conv.id, owner, "newer-startup")
+        elif queued_status == "binding-aba":
+            store.replace_runner_id(conv.id, "runner-other")
+            store.replace_runner_id(conv.id, owner.runner_id)
+            replacement = store.record_session_observation(
+                conv.id, "idle", response_id=owner.response_id
+            )
+        else:
+            replacement = store.record_session_observation(
+                conv.id,
+                queued_status,
+                response_id="native-new-turn",
+                expected_observation=owner,
+                starts_new_turn=True,
+            )
+        assert replacement is not None
+        return replacement
+
+    current = owner
+    if resolution == "done":
+        current = replace()
+        queued.set_result(current)
+    elif resolution == "failed":
+        queued.set_exception(RuntimeError("synthetic predecessor failure"))
+    committed: list[SessionObservation] = []
+    refreshed: list[Conversation] = []
+    try:
+        future = session_live_state.persist_status_observation(
+            conv.id,
+            "idle",
+            owner=owner,
+            predecessor=predecessor,
+            response_id=None,
+            error=None,
+            error_labels={},
+            on_commit=lambda observation, _pending: committed.append(observation),
+            on_current=refreshed.append,
+        )
+        assert future is not None
+        if resolution == "pending":
+            assert not queued.done()
+            current = replace()
+            queued.set_result(current)
+        release.set()
+        barrier.result(timeout=10)
+        observed = future.result(timeout=10)
+        assert store.get_session_observation(conv.id) == current
+        if resolution in {"failed", "unresolved"}:
+            assert observed == owner and committed == [owner] and refreshed == []
+            assert queued.done() is (resolution == "failed")
+        else:
+            assert observed is None and committed == []
+            assert len(refreshed) == 1 and refreshed[0].session_observation == current
+            if queued_status == "startup":
+                fresh = store.get_conversation(conv.id)
+                assert fresh is not None and fresh.terminal_pending
+    finally:
+        if not queued.done():
+            queued.set_result(None)
+        release.set()
+        barrier.result(timeout=10)
+
+
+@pytest.mark.parametrize("owner_status", ["running", "waiting"])
+@pytest.mark.parametrize("explicit_id", [False, True])
+def test_native_idle_preserves_its_captured_busy_owner_without_adopting_new_work(
+    native_init_store: SqlAlchemyConversationStore, owner_status: str, explicit_id: bool
+) -> None:
+    from omnigent.server import session_live_state
+
+    store = native_init_store
+    conv, _, _, _ = _native_initializer(store)
+    old = store.record_session_observation(conv.id, owner_status, response_id="native-turn-a")
+    assert old is not None
+    current = store.record_session_observation(
+        conv.id,
+        "running",
+        response_id="native-turn-b",
+        expected_observation=old,
+        starts_new_turn=True,
+    )
+    assert current is not None
+    future = session_live_state.persist_status_observation(
+        conv.id,
+        "idle",
+        owner=old,
+        predecessor=None,
+        response_id=old.response_id if explicit_id else None,
+        error=None,
+        error_labels={},
+        on_commit=lambda *_args: pytest.fail("stale terminal edge committed"),
+        on_current=lambda refreshed: None,
+    )
+    assert future is not None and future.result(timeout=10) is None
+    assert store.get_session_observation(conv.id) == current
+    committed: list[SessionObservation] = []
+    future = session_live_state.persist_status_observation(
+        conv.id,
+        "idle",
+        owner=current,
+        predecessor=None,
+        response_id=current.response_id,
+        error=None,
+        error_labels={},
+        on_commit=lambda observation, _pending: committed.append(observation),
+        on_current=lambda _refreshed: pytest.fail("current terminal edge was refused"),
+    )
+    assert future is not None
+    completed = future.result(timeout=10)
+    assert completed is not None and committed == [completed]
+    assert completed.status == "idle" and completed.response_id == current.response_id
+
+
+@pytest.mark.asyncio
+async def test_native_initializer_cannot_complete_a_newer_startup_reservation(
+    native_init_store: SqlAlchemyConversationStore,
+) -> None:
+    store = native_init_store
+    conv, _, client, initializer = _native_initializer(store)
+    task = asyncio.create_task(initializer.initialize(conv, client, timeout=10))
+    try:
+        await asyncio.wait_for(client.entered.wait(), 10)
+        captured = store.get_session_observation(conv.id)
+        assert captured is not None
+        replacement = store.begin_terminal_startup(conv.id, captured, "replacement-startup")
+        assert replacement is not None
+        client.release.set()
+        response = None
+        with contextlib.suppress(ConnectionError, OmnigentError):
+            response = await asyncio.wait_for(task, 10)
+        assert response is None or response.status_code >= 400
+        current = store.get_conversation(conv.id)
+        assert current is not None and current.terminal_pending
+        assert current.session_observation == replacement
+        assert not initializer.is_initialized(conv, client)
+    finally:
+        client.release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_native_initializer_metadata_outage_prevents_runner_post(
+    native_init_store: SqlAlchemyConversationStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = native_init_store
+    conv, _, client, initializer = _native_initializer(store)
+    client.release.set()
+    attempts = 0
+
+    def unavailable(*_args: Any, **_kwargs: Any):
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("synthetic startup metadata outage")
+
+    monkeypatch.setattr(store, "begin_terminal_startup", unavailable)
+    response = None
+    with contextlib.suppress(RuntimeError, OmnigentError, ConnectionError):
+        response = await initializer.initialize(conv, client, timeout=10)
+    assert attempts >= 1
+    assert client.calls == []
+    assert response is None or response.status_code >= 400
+    assert not initializer.is_initialized(conv, client)
+
+
+@pytest.mark.asyncio
+async def test_native_initializer_completion_outage_does_not_cache_success(
+    native_init_store: SqlAlchemyConversationStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = native_init_store
+    conv, _, client, initializer = _native_initializer(store)
+    client.release.set()
+    attempts = 0
+
+    def unavailable(*_args: Any, **_kwargs: Any):
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("synthetic completion metadata outage")
+
+    monkeypatch.setattr(store, "finish_terminal_startup", unavailable)
+    response = None
+    with contextlib.suppress(RuntimeError, OmnigentError, ConnectionError):
+        response = await initializer.initialize(conv, client, timeout=10)
+    assert attempts >= 1
+    assert len(client.calls) == 1
+    assert response is None or response.status_code >= 400
+    assert not initializer.is_initialized(conv, client)
+    current = store.get_conversation(conv.id)
+    assert current is not None and current.terminal_pending
+
+
+@pytest.mark.asyncio
+async def test_initializer_waiters_apply_captured_completion_before_a_newer_startup(
+    native_init_store: SqlAlchemyConversationStore,
+) -> None:
+    store = native_init_store
+    conv, _, client, initializer = _native_initializer(store)
+    previous = store.record_session_observation(
+        conv.id, "failed", response_id="old-response", error_key="old-error"
+    )
+    assert previous is not None
+    conv = store.get_conversation(conv.id)
+    assert conv is not None
+    second_conv = dataclasses.replace(conv)
+    first = asyncio.create_task(initializer.initialize(conv, client, timeout=10))
+    second = None
+    completed: list[SessionObservation] = []
+    replacements: list[SessionObservation | None] = []
+
+    def advance_after_completion(done: asyncio.Task[httpx.Response]) -> None:
+        captured = SessionObservation.model_validate(
+            done.result().extensions["session_observation"]
+        )
+        completed.append(captured)
+        replacements.append(store.begin_terminal_startup(conv.id, captured, "newer-startup"))
+
+    try:
+        await asyncio.wait_for(client.entered.wait(), 10)
+        second = asyncio.create_task(initializer.initialize(second_conv, client, timeout=10))
+        await asyncio.sleep(0)
+        assert len(initializer._tasks) == 1
+        next(iter(initializer._tasks.values())).add_done_callback(advance_after_completion)
+        client.release.set()
+        await asyncio.gather(first, second)
+        assert len(completed) == 1 and replacements[0] is not None
+        assert store.get_session_observation(conv.id) == replacements[0]
+        assert conv.session_observation == second_conv.session_observation == completed[0]
+        assert completed[0].status == previous.status
+        assert completed[0].response_id == previous.response_id
+        assert completed[0].error_key == previous.error_key
+    finally:
+        client.release.set()
+        await asyncio.gather(
+            *[task for task in (first, second) if task is not None], return_exceptions=True
+        )
+
+
+@pytest.mark.asyncio
+async def test_native_ensure_initialization_keeps_normal_failure_without_passive_recovery(
+    native_init_store: SqlAlchemyConversationStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes import sessions as sessions_routes
+
+    store = native_init_store
+    conv, _, client, initializer = _native_initializer(store)
+    previous = store.record_session_observation(
+        conv.id, "failed", response_id="old-response", error_key="old-error"
+    )
+    conv = store.get_conversation(conv.id)
+    assert previous is not None and conv is not None
+    client.release.set()
+
+    async def no_recovery(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("native metadata-only completion started passive recovery")
+
+    async def noop(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(sessions_routes, "_publish_runner_recovered_status", no_recovery)
+    monkeypatch.setattr(sessions_routes, "_ensure_runner_relay_ready", noop)
+    monkeypatch.setattr("omnigent.server.child_session_recovery.restore_active_children", noop)
+    ready = await sessions_routes._ensure_runner_session_initialized(
+        conv.id, conv, client, store, initializer=initializer, require_success=True
+    )
+    assert ready
+    current = store.get_conversation(conv.id)
+    assert current is not None and not current.terminal_pending
+    assert conv.session_observation == current.session_observation
+    assert current.live_status == previous.status
+    assert current.session_observation.response_id == previous.response_id
+    assert current.session_observation.error_key == previous.error_key
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["running", "failed"])
+async def test_cached_initializer_readiness_does_not_rewind_a_later_turn(
+    native_init_store: SqlAlchemyConversationStore, status: str
+) -> None:
+    store = native_init_store
+    conv, _, client, initializer = _native_initializer(store)
+    client.release.set()
+    first = await initializer.initialize(conv, client, timeout=10)
+    completed = first.extensions["session_observation"]
+    newer = store.record_session_observation(
+        conv.id,
+        status,
+        response_id="newer-turn",
+        error_key="newer-error" if status == "failed" else None,
+    )
+    assert newer is not None and newer.revision > completed.revision
+    current = store.get_conversation(conv.id)
+    assert current is not None
+    cached = await initializer.initialize(current, client, timeout=10)
+    assert cached is first and len(client.calls) == 1
+    assert current.session_observation == newer
+    assert store.get_session_observation(conv.id) == newer
+
+
+@pytest.mark.asyncio
+async def test_native_initializer_offline_startup_retry_keeps_previous_real_failure_payload(
+    native_init_store: SqlAlchemyConversationStore,
+) -> None:
+    store = native_init_store
+    conv, _, client, initializer = _native_initializer(store)
+    failure = {
+        "omnigent.last_task_error_code": "native_turn_error",
+        "omnigent.last_task_error_message": "real previous failure",
+    }
+    previous = store.record_session_observation(
+        conv.id,
+        "failed",
+        response_id="previous-turn",
+        error_key="previous-error",
+        error_labels=failure,
+    )
+    assert previous is not None
+    startup = store.begin_terminal_startup(conv.id, previous, "interrupted-startup")
+    assert startup is not None
+    assert (
+        store.record_runner_offline_decision(
+            conv.id,
+            RunnerOfflineDecision(
+                observation=startup,
+                episode_id="interrupted-startup-episode",
+                error_labels={
+                    "omnigent.last_task_error_code": "runner_disconnected",
+                    "omnigent.last_task_error_message": "startup runner disappeared",
+                },
+            ),
+        )
+        is not None
+    )
+    conv = store.get_conversation(conv.id)
+    assert conv is not None
+    client.release.set()
+    await initializer.initialize(conv, client, timeout=10)
+    current = store.get_conversation(conv.id)
+    assert current is not None
+    assert current.session_observation.status == previous.status
+    assert current.session_observation.response_id == previous.response_id
+    assert current.session_observation.error_key == previous.error_key
+    assert current.runner_offline_decision is None and not current.terminal_pending
+    assert current.live_status_error_labels == failure
+    assert conv.live_status_error_labels == failure
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [403, 500, 503])
+async def test_configured_initializer_preserves_the_runner_rejection(status: int) -> None:
+    conversation = _conversation()
+    conversation.inference_snapshot = {"runtime_config": {"providers": {}}}
+    client = _Client()
+    client.status_code = status
+    client.response_json = {
+        "error": "real_runner_failure",
+        "detail": "runner rejected this startup",
+    }
+    client.release.set()
+    initializer = RunnerSessionInitializer(_Registry(), server_version="test")  # type: ignore[arg-type]
+    response = await initializer.initialize(conversation, client, timeout=10)  # type: ignore[arg-type]
+    assert response.status_code == status
+    assert response.json() == client.response_json
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("previous_response", [None, "turn-a"])
+async def test_prior_turn_stop_during_initialize_keeps_the_original_startup_claim(
+    native_init_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    previous_response: str | None,
+) -> None:
+    from omnigent.server.routes._sessions import common, helpers, orchestration
+
+    store = native_init_store
+    conv, _, client, initializer = _native_initializer(store)
+    previous = store.record_session_observation(conv.id, "running", response_id=previous_response)
+    assert previous is not None
+    conv = store.get_conversation(conv.id)
+    assert conv is not None
+    entered, release = asyncio.Event(), asyncio.Event()
+    complete = orchestration._complete_native_terminal_startup
+
+    async def held_completion(
+        session_id: str, owner: SessionObservation
+    ) -> SessionObservation | None:
+        entered.set()
+        await release.wait()
+        return await complete(session_id, owner)
+
+    monkeypatch.setattr(orchestration, "_complete_native_terminal_startup", held_completion)
+    task = asyncio.create_task(initializer.initialize(conv, client, timeout=10))
+    try:
+        await asyncio.wait_for(client.entered.wait(), 10)
+        startup = client.at_post[0].session_observation
+        client.release.set()
+        await asyncio.wait_for(entered.wait(), 10)
+        stopped = helpers._publish_status(conv.id, "idle", response_id="turn-a", owner=startup)
+        assert stopped is not None
+        idle = await asyncio.wrap_future(stopped)
+        assert idle is not None and idle.response_id == "turn-a" and idle.status == "idle"
+        current = store.get_conversation(conv.id)
+        assert current is not None and current.terminal_pending
+        release.set()
+        response = await asyncio.wait_for(task, 10)
+        completed = response.extensions["session_observation"]
+        assert response.status_code == 201 and initializer.is_initialized(conv, client)
+        assert len(client.calls) == 1
+        assert completed.status == "idle" and completed.response_id == "turn-a"
+        assert completed.revision == idle.revision + 1
+        current = store.get_conversation(conv.id)
+        assert current is not None and current.session_observation == completed
+        assert not current.terminal_pending and current.labels == conv.labels
+        projection = common._session_status_cache.projection(conv.id)
+        assert projection is not None and projection.observation == completed
+        assert not common._session_terminal_pending_cache.get(conv.id, False)
+    finally:
+        client.release.set()
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)

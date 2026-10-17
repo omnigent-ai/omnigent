@@ -21,6 +21,10 @@ surface at import time or in a sub-second unit test.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+from collections.abc import AsyncIterator
+
 import pytest
 from omnigent_client._events import (
     ReasoningDelta,
@@ -35,27 +39,269 @@ from omnigent_client._events import (
     ResponseQueued,
     TextDelta,
 )
+from omnigent_client._sessions import Session as SessionSnapshot
+from omnigent_ui_sdk.terminal._host import TerminalHost
 
+from omnigent.entities.session_observation import SessionObservation
 from omnigent.repl._repl import (
     _plan_output_item_render,
     _server_event_to_sdk_event,
+    _SessionsChatReplAdapter,
     _TurnProseTracker,
 )
 from omnigent.server.schemas import (
     CancelledEvent,
     CompletedEvent,
     CreatedEvent,
+    ErrorEvent,
     FailedEvent,
     IncompleteDetails,
     IncompleteEvent,
     InProgressEvent,
+    OutputItemDoneEvent,
     OutputTextDeltaEvent,
     QueuedEvent,
     ReasoningStartedEvent,
     ReasoningSummaryTextDeltaEvent,
     ReasoningTextDeltaEvent,
     ResponseObject,
+    ServerStreamEvent,
+    SessionStatusEvent,
+    SessionTerminalPendingEvent,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["message", "skill"])
+async def test_raw_repl_denial_ack_finishes_request_without_a_global_terminal(kind: str) -> None:
+    current = SessionObservation(runner_id="runner-b", binding_epoch=2, revision=3)
+
+    class _Sessions:
+        def __init__(self) -> None:
+            self.snapshot_reads = 0
+
+        async def get(self, session_id):
+            self.snapshot_reads += 1
+            return SessionSnapshot(
+                id=session_id,
+                agent_id="agent",
+                status="running",
+                created_at=1,
+                runner_id="runner-b",
+                session_observation=current,
+            )
+
+        async def post_event(self, session_id, event):
+            assert session_id == "conv_busy"
+            assert event["type"] == ("message" if kind == "message" else "slash_command")
+            return {
+                "queued": False,
+                "denied": True,
+                "reason": "blocked A",
+                "response_id": "deny-a",
+            }
+
+        async def stream(self, session_id):
+            assert session_id == "conv_busy"
+            await asyncio.Event().wait()
+            yield SessionStatusEvent(
+                type="session.status", conversation_id=session_id, status="idle"
+            )
+
+    class _Client:
+        def __init__(self) -> None:
+            self.sessions = _Sessions()
+
+    client = _Client()
+    adapter = _SessionsChatReplAdapter(client, "agent", session_id="conv_busy", attach_only=True)  # type: ignore[arg-type]
+    adapter._current_response_id = "turn-b"
+    try:
+        stream = (
+            adapter.send("A")
+            if kind == "message"
+            else adapter.send_skill_slash_command("review", "A")
+        )
+
+        async def collect():
+            return [event async for event in stream]
+
+        events = await asyncio.wait_for(collect(), 1)
+        assert len(events) == 1 and isinstance(events[0], ResponseCompleted)
+        assert events[0].response.id == "deny-a"
+        assert (
+            events[0].response.output[0]["content"][0]["text"] == "[Denied by policy: blocked A]"
+        )
+        assert adapter._current_response_id == "turn-b"
+        assert not adapter._turn_done.is_set()
+        assert adapter._stream_task is not None and not adapter._stream_task.done()
+        assert adapter._projection_fences["conv_busy"].observation == current
+        assert adapter._pending_local_user_sends == 0
+        assert adapter._pending_local_skill_slash_commands == []
+        assert client.sessions.snapshot_reads == 1
+    finally:
+        await adapter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_raw_stream_fences_failure_before_render_and_turn_completion() -> None:
+    """The raw REPL consumer keeps its fence across snapshots before UI effects."""
+    current = SessionObservation(
+        runner_id="runner_a", binding_epoch=3, revision=2, response_id="resp_2"
+    )
+    stale = SessionStatusEvent(
+        type="session.status",
+        conversation_id="conv_test",
+        status="failed",
+        session_observation=current.model_copy(update={"binding_epoch": 1, "revision": 1}),
+        runner_offline_episode_id="old",
+    )
+    terminal = stale.model_copy(
+        update={
+            "status": "idle",
+            "session_observation": current.model_copy(update={"revision": 3}),
+            "runner_offline_episode_id": None,
+        }
+    )
+    old_error = ErrorEvent(
+        type="response.error",
+        source="execution",
+        error={"code": "native_terminal_start_failed", "message": "old boot error"},
+        session_observation=stale.session_observation,
+    )
+    old_pending = SessionTerminalPendingEvent(
+        type="session.terminal_pending",
+        conversation_id="conv_test",
+        pending=False,
+        session_observation=stale.session_observation,
+    )
+    current_error = old_error.model_copy(
+        update={"session_observation": terminal.session_observation}
+    )
+    current_pending = old_pending.model_copy(
+        update={"session_observation": terminal.session_observation}
+    )
+    legacy_error = old_error.model_copy(update={"session_observation": None})
+    legacy_pending = old_pending.model_copy(update={"session_observation": None})
+    old_denial = CompletedEvent(
+        type="response.completed", response=_resp_obj("completed")
+    ).model_copy(update={"session_observation": stale.session_observation})
+    old_delta = OutputTextDeltaEvent(
+        type="response.output_text.delta", delta="old denial"
+    ).model_copy(update={"session_observation": stale.session_observation})
+    current_delta = old_delta.model_copy(
+        update={"session_observation": terminal.session_observation}
+    )
+    legacy_delta = old_delta.model_copy(update={"session_observation": None})
+    stale_child_activity = OutputItemDoneEvent(
+        type="response.output_item.done",
+        item={
+            "type": "resource_event",
+            "event_type": "session.subagent.returned",
+            "resource_id": "child",
+            "resource_type": "session",
+            "resource": {
+                "status": "failed",
+                "session_observation": stale.session_observation.model_dump(),
+                "runner_offline_episode_id": "old",
+                "turn_id": "resp_1",
+            },
+        },
+    )
+
+    class _Sessions:
+        def __init__(self) -> None:
+            self.delivered_stale = asyncio.Event()
+            self.release_terminal = asyncio.Event()
+            self.delivered_terminal = asyncio.Event()
+
+        async def stream(self, session_id: str) -> AsyncIterator[ServerStreamEvent]:
+            assert session_id == "conv_test"
+            yield stale_child_activity
+            yield stale
+            yield old_error
+            yield old_pending
+            yield old_denial
+            yield old_delta
+            yield legacy_error.model_copy(update={"runner_offline_episode_id": "missing-owner"})
+            yield legacy_pending.model_copy(update={"runner_offline_episode_id": "missing-owner"})
+            self.delivered_stale.set()
+            await self.release_terminal.wait()
+            yield current_error
+            yield current_pending
+            yield current_delta
+            yield legacy_error
+            yield legacy_pending
+            yield legacy_delta
+            yield terminal
+            self.delivered_terminal.set()
+            await asyncio.Event().wait()
+
+    class _Client:
+        def __init__(self) -> None:
+            self.sessions = _Sessions()
+
+    client = _Client()
+    host = TerminalHost(model_name="test")
+    host.seed_subagent_tree(
+        "conv_test",
+        [
+            {
+                "id": "child",
+                "current_task_status": "in_progress",
+                "busy": True,
+                "session_observation": current.model_dump(),
+            }
+        ],
+    )
+    adapter = _SessionsChatReplAdapter(client, "agent", session_id="conv_test", host=host)  # type: ignore[arg-type]
+    adapter._hydrate_from_session_snapshot(
+        SessionSnapshot(
+            id="conv_test",
+            agent_id="ag",
+            agent_name="current",
+            status="running",
+            created_at=0,
+            runner_id="runner_a",
+            session_observation=current,
+        )
+    )
+    adapter._turn_done = asyncio.Event()
+    rendered: list[object] = []
+    adapter._on_event = rendered.append
+    task = asyncio.create_task(adapter._stream_pump())
+    try:
+        await asyncio.wait_for(client.sessions.delivered_stale.wait(), timeout=1)
+        assert rendered == []
+        assert not adapter._turn_done.is_set()
+        old_snapshot = SessionSnapshot(
+            id="conv_test",
+            agent_id="ag",
+            agent_name="old",
+            status="failed",
+            created_at=0,
+            runner_id="old_runner",
+            session_observation=stale.session_observation,
+        )
+        adapter._hydrate_from_session_snapshot(old_snapshot)
+        assert adapter.model == "current"
+        assert adapter._bound_runner_id == "runner_a"
+        assert not adapter._accept_session_snapshot(old_snapshot)
+        client.sessions.release_terminal.set()
+        await asyncio.wait_for(client.sessions.delivered_terminal.wait(), timeout=1)
+        assert rendered == [
+            current_error,
+            current_pending,
+            current_delta,
+            legacy_error,
+            legacy_pending,
+            legacy_delta,
+            terminal,
+        ]
+        assert adapter._turn_done.is_set()
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 def _resp_obj(status: str = "in_progress") -> ResponseObject:

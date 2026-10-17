@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.entities.session_observation import SessionObservation
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_conversation_id,
@@ -506,6 +507,270 @@ async def test_external_session_status_idle_delivers_forwarded_native_output_to_
     assert "sub-agent task 66a84f142181a489d004f744cc76c67b completed" in inbox_output
     assert "worker:native returned: AP_NATIVE_DONE" in inbox_output
     assert "LOCAL_SHOULD_NOT_WIN" not in inbox_output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "outcome"),
+    [
+        ("failed", None),
+        ("idle", None),
+        ("idle", "completed"),
+        ("idle", "cancelled"),
+        ("idle", "failed"),
+    ],
+)
+@pytest.mark.parametrize("stale_kind", ["old-dispatch", "old-revision", "legacy"])
+async def test_external_terminal_status_fences_dispatch_and_observation_before_effects(
+    status: str, outcome: str | None, stale_kind: str
+) -> None:
+    """Late terminal effects cannot settle current work; owned duplicates still deliver once."""
+    parent_id, child_id = uuid.uuid4().hex, uuid.uuid4().hex
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    server = _WakeRecordingServerClient(parent_id)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=server,  # type: ignore[arg-type]
+    )
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    subagent_work.register_child_session(
+        child_id,
+        parent_session_id=parent_id,
+        title="worker:test",
+        tool="worker",
+        session_name="test",
+    )
+    entry = subagent_work.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="worker",
+        title="test",
+        work_id="dispatch-b",
+    )
+    current = SessionObservation(
+        runner_id="runner-a", binding_epoch=3, revision=2, status="running", response_id="turn-b"
+    )
+    try:
+        async with _runner_client(app) as client:
+            started = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {
+                        "status": "running",
+                        "session_observation": current.model_dump(),
+                        "subagent_dispatch_id": "dispatch-b",
+                    },
+                },
+            )
+            assert started.status_code == 204, started.text
+            data: dict[str, Any] = {"status": status, "output": "OLD", "turn_completed": True}
+            if outcome is not None:
+                data["turn_outcome"] = outcome
+            if stale_kind != "legacy":
+                data["session_observation"] = current.model_copy(
+                    update={"revision": 1, "response_id": "turn-a", "status": status}
+                ).model_dump()
+                data["subagent_dispatch_id"] = (
+                    "dispatch-a" if stale_kind == "old-dispatch" else "dispatch-b"
+                )
+            stale = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={"type": "external_session_status", "data": data},
+            )
+            assert stale.status_code == 204, stale.text
+            assert subagent_work.get_subagent_work(child_id) is entry
+            assert entry.status == "running"
+            assert not entry.cancellation_confirmed
+            assert app.state.native_pane_status[child_id] == "running"
+            assert inbox.empty()
+            assert server.wake_posts == []
+
+            data.update(
+                {
+                    "output": "CURRENT",
+                    "subagent_dispatch_id": "dispatch-b",
+                    "session_observation": current.model_copy(
+                        update={"revision": 3, "status": status}
+                    ).model_dump(),
+                }
+            )
+            for _ in range(2):
+                response = await client.post(
+                    f"/v1/sessions/{child_id}/events",
+                    json={"type": "external_session_status", "data": data},
+                )
+                assert response.status_code == 204, response.text
+            await asyncio.wait_for(server.wake_seen.wait(), timeout=5)
+            assert entry.status == (outcome or ("failed" if status == "failed" else "completed"))
+            assert inbox.qsize() == 1
+            assert inbox.get_nowait()["output"] == "CURRENT"
+            assert len(server.wake_posts) == 1
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work.unregister_child_session(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", [None, "completed", "cancelled", "failed"])
+async def test_terminal_recovery_cannot_replace_new_dispatch_after_snapshot_await(
+    outcome: str | None,
+) -> None:
+    """Recovery retains the work registered while an old terminal request waits for metadata."""
+    parent_id, child_id = uuid.uuid4().hex, uuid.uuid4().hex
+    entered, release = asyncio.Event(), asyncio.Event()
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    class _GatedServer(NullServerClient):
+        async def get(self, url: str, **kwargs: Any):
+            if url == f"/v1/sessions/{child_id}":
+                entered.set()
+                await release.wait()
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": child_id,
+                        "parent_session_id": parent_id,
+                        "agent_id": "worker",
+                        "agent_name": "worker",
+                        "created_at": 1,
+                        "labels": {subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: "dispatch-a"},
+                    },
+                )
+            return await super().get(url, **kwargs)
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=_GatedServer(),  # type: ignore[arg-type]
+    )
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    observation = SessionObservation(
+        runner_id="runner-a", binding_epoch=1, revision=1, status="idle", response_id="turn-a"
+    )
+    data: dict[str, Any] = {
+        "status": "idle",
+        "turn_completed": True,
+        "output": "OLD",
+        "session_observation": observation.model_dump(),
+        "subagent_dispatch_id": "dispatch-a",
+    }
+    if outcome is not None:
+        data["turn_outcome"] = outcome
+    async with _runner_client(app) as client:
+        pending = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={"type": "external_session_status", "data": data},
+            )
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            current = subagent_work.register_subagent_work(
+                parent_session_id=parent_id,
+                child_session_id=child_id,
+                agent="worker",
+                title="new",
+                work_id="dispatch-b",
+            )
+            current.status = "running"
+            app.state.native_pane_status[child_id] = "running"
+            release.set()
+            response = await asyncio.wait_for(pending, timeout=5)
+            assert response.status_code == 204, response.text
+            assert subagent_work.get_subagent_work(child_id) is current
+            assert current.status == "running"
+            assert not current.cancellation_confirmed
+            assert app.state.native_pane_status[child_id] == "running"
+            assert inbox.empty()
+        finally:
+            release.set()
+            if not pending.done():
+                pending.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await pending
+            subagent_work.unregister_subagent_work(child_id)
+            subagent_work._session_inboxes_ref.pop(parent_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("annotated", "healed"),
+    [(False, False), (True, False), (True, True)],
+    ids=["legacy", "versioned", "versioned-after-owner-heal"],
+)
+async def test_external_terminal_recovery_retains_ingress_dispatch_identity(
+    annotated: bool,
+    healed: bool,
+) -> None:
+    """A current completion recovers its durable dispatch ID and reaches the parent once."""
+    parent_id, child_id = uuid.uuid4().hex, uuid.uuid4().hex
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+
+    class _SnapshotServer(_WakeRecordingServerClient):
+        async def get(self, url: str, **kwargs: Any):
+            if url == f"/v1/sessions/{child_id}":
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": child_id,
+                        "parent_session_id": parent_id,
+                        "agent_id": "worker",
+                        "agent_name": "worker",
+                        "created_at": 1,
+                        "labels": {subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: "dispatch-a"},
+                        **(
+                            {
+                                "runner_id": None,
+                                "session_observation": SessionObservation(
+                                    runner_id=None, binding_epoch=2, revision=3
+                                ).model_dump(),
+                            }
+                            if healed
+                            else {}
+                        ),
+                    },
+                )
+            return await super().get(url, **kwargs)
+
+    server = _SnapshotServer(parent_id)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=server,  # type: ignore[arg-type]
+    )
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    data: dict[str, Any] = {"status": "idle", "turn_completed": True, "output": "CURRENT"}
+    if annotated:
+        data.update(
+            {
+                "subagent_dispatch_id": "dispatch-a",
+                "session_observation": SessionObservation(
+                    runner_id="runner-a",
+                    binding_epoch=1,
+                    revision=2,
+                    status="idle",
+                    response_id="turn-a",
+                ).model_dump(),
+            }
+        )
+    try:
+        async with _runner_client(app) as client:
+            for _ in range(2):
+                response = await client.post(
+                    f"/v1/sessions/{child_id}/events",
+                    json={"type": "external_session_status", "data": data},
+                )
+                assert response.status_code == 204, response.text
+            await asyncio.wait_for(server.wake_seen.wait(), timeout=5)
+            entry = subagent_work.get_subagent_work(child_id)
+            assert entry is not None and entry.work_id == "dispatch-a"
+            assert entry.status == "completed"
+            assert inbox.qsize() == 1
+            assert inbox.get_nowait()["work_id"] == "dispatch-a"
+            assert len(server.wake_posts) == 1
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
 
 @pytest.mark.asyncio

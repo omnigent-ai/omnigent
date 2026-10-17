@@ -63,6 +63,7 @@ from omnigent.runner.launch_failure import (
     diagnose_codex_model_rejection,
 )
 from omnigent.runner.routing import RunnerRouter, routing_host_id
+from omnigent.runner.subagent_work import SUBAGENT_DISPATCH_ID_LABEL_KEY
 from omnigent.runner.transports.ws_tunnel.frames import (
     EventAckFrame,
     EventBatchFrame,
@@ -75,7 +76,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
-from omnigent.server import presence
+from omnigent.server import presence, session_live_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -176,6 +177,7 @@ from omnigent.server.routes._sessions.helpers import (
     _background_task_delivery_status,
     _build_actor,
     _build_skill_slash_command_policy_body,
+    _capture_status_observation,
     _dispatch_skill_slash_command_to_runner,
     _evaluate_output_policy,
     _filesystem_attachment_in_history,
@@ -1181,6 +1183,48 @@ def register_events_routes(
         # fall through to the normal persist/forward path.
         _policy_body = body  # may be replaced by OUTPUT deny
         _actor = _build_actor(user_id)
+        policy_conv = conv
+        assert policy_conv is not None
+        policy_owner, policy_predecessor = _capture_status_observation(
+            session_id, policy_conv.session_observation
+        )
+
+        async def finish_input_denial(reason: str) -> str | None:
+            response_id = await _persist_policy_deny_sentinel(
+                session_id, policy_conv, reason, conversation_store, agent_store
+            )
+            # A refused request must not end work that was already running.
+            if (policy_owner is not None and policy_owner.status in {"running", "waiting"}) or (
+                policy_predecessor is not None
+                and policy_predecessor.status in {"running", "waiting"}
+            ):
+                return response_id
+            status_write = _publish_status(
+                session_id, "idle", owner=policy_owner, predecessor=policy_predecessor
+            )
+            observation = None
+            if status_write is not None:
+                try:
+                    observation = await asyncio.shield(asyncio.wrap_future(status_write))
+                except Exception as exc:
+                    raise OmnigentError(
+                        "Policy denial status could not be persisted; retry the request.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    ) from exc
+                if observation is None:
+                    return response_id
+            elif session_live_state.conversation_store() is not None:
+                return response_id
+            _publish_policy_deny(session_id, reason, session_observation=observation)
+            _publish_input_deny_terminal(
+                session_id,
+                policy_conv,
+                reason,
+                session_observation=observation,
+                response_id=response_id,
+            )
+            return response_id
+
         if (
             body.type == "message" and body.data.get("role", "user") == "user"
         ) or body.type == _SLASH_COMMAND_TYPE:
@@ -1245,31 +1289,23 @@ def register_events_routes(
                     policy_phase="input",
                     policy_reason=reason,
                 )
-                _publish_policy_deny(session_id, reason)
-                await _persist_policy_deny_sentinel(
-                    session_id,
-                    conv,
-                    reason,
-                    conversation_store,
-                    agent_store,
-                )
-                # Terminal ``response.completed`` renders the sentinel; the
-                # trailing ``idle`` ends the turn. A request-phase deny/refuse
-                # IS a turn boundary — the client optimistically went "working"
-                # on send — but the message never reached a harness, so nothing
-                # downstream (harness / interrupt / status file) emits the
-                # turn-end. This ``idle`` is that signal; clients that settle a
-                # turn only on a ``session.status`` edge (the REPL, the headless
-                # ``-p`` client) hang without it. No leading ``running``: the
-                # turn never dispatched, and a phantom ``running`` would fold a
-                # concurrent live bubble mid-stream.
-                _publish_input_deny_terminal(session_id, conv, reason)
-                _publish_status(session_id, "idle")
+                # Settle the refused request only while its captured lifecycle
+                # remains current; the ACK also completes its local consumer.
+                denial_response_id = await finish_input_denial(reason)
                 # Return the same shape the client expects from POST
                 # /events so postEvent doesn't throw on an unexpected
                 # response body. queued=False signals the event was
                 # handled synchronously (denied, not queued for a turn).
-                return {"queued": False, "denied": True, "reason": reason}
+                return {
+                    "queued": False,
+                    "denied": True,
+                    "reason": reason,
+                    **(
+                        {"response_id": denial_response_id}
+                        if denial_response_id is not None
+                        else {}
+                    ),
+                }
         elif body.type == _SLASH_COMMAND_TYPE and conv.agent_id is not None:
             _input_verdict = await _evaluate_input_policy(
                 cast("Request", request),
@@ -1284,20 +1320,17 @@ def register_events_routes(
             )
             if _input_verdict is not None:
                 reason = _input_verdict.get("reason", "Denied by policy")
-                _publish_policy_deny(session_id, reason)
-                await _persist_policy_deny_sentinel(
-                    session_id,
-                    conv,
-                    reason,
-                    conversation_store,
-                    agent_store,
-                )
-                # Terminal response.completed + trailing ``idle`` turn-end (see
-                # the message branch above for why the idle is required and the
-                # leading running is not).
-                _publish_input_deny_terminal(session_id, conv, reason)
-                _publish_status(session_id, "idle")
-                return {"queued": False, "denied": True, "reason": reason}
+                denial_response_id = await finish_input_denial(reason)
+                return {
+                    "queued": False,
+                    "denied": True,
+                    "reason": reason,
+                    **(
+                        {"response_id": denial_response_id}
+                        if denial_response_id is not None
+                        else {}
+                    ),
+                }
         elif (
             body.type == "message"
             and body.data.get("role") == "assistant"
@@ -1672,6 +1705,7 @@ def register_events_routes(
                         session_id,
                         conversation_store,
                         int(time.time()) - RUNNER_LIVENESS_TTL_S,
+                        owner=stop_conv.session_observation if stop_conv is not None else None,
                     )
             # Stop is non-sticky: no persistent marker is written. The
             # runner tunnel dropping above flips ``runner_online`` to false
@@ -1912,6 +1946,10 @@ def register_events_routes(
             _signal_harness_elicitation_resolved_by_id(session_id, elicitation_id)
             return {"queued": False}
         if body.type in (_EXTERNAL_SESSION_STATUS_TYPE, _SUBAGENT_STATUS_TYPE):
+            status_owner, status_predecessor = _capture_status_observation(
+                session_id, conv.session_observation
+            )
+            dispatch_id = conv.labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
             status = body.data.get("status")
             if body.type == _SUBAGENT_STATUS_TYPE:
                 if body.data.get("idle") is not True:
@@ -1930,6 +1968,10 @@ def register_events_routes(
                 raise OmnigentError(
                     f"{body.type} data.response_id must be a string",
                     code=ErrorCode.INVALID_INPUT,
+                )
+            if response_id is None and status_owner is not None:
+                response_id = session_live_state.captured_response_id(
+                    status if isinstance(status, str) else "idle", status_owner, status_predecessor
                 )
             # ``None`` (field absent) = no information; leave the sticky
             # tally untouched (the PTY-activity ``idle`` carries none). An
@@ -1965,6 +2007,8 @@ def register_events_routes(
                     background_task_count=bg_count,
                     background_tasks=bg_tasks,
                     blocked_on=blocked_on,
+                    owner=status_owner,
+                    predecessor=status_predecessor,
                 )
                 return {"queued": False}
             assert isinstance(status, str)
@@ -1985,7 +2029,14 @@ def register_events_routes(
             # derived so the pill, ``last_task_error``, and the parent inbox
             # all see the same detail.
             data = await _enrich_terminal_status_with_subagent_output(
-                body.data, status, session_id, conversation_store
+                {**body.data, **({"response_id": response_id} if response_id else {})},
+                status,
+                session_id,
+                conversation_store,
+                expected_observation=status_owner
+                if session_live_state.conversation_store() is not None
+                else None,
+                predecessor=status_predecessor,
             )
             # Surface the failure reason a native forwarder carries so a
             # top-level session sees it on its own status edge and persisted
@@ -2055,20 +2106,41 @@ def register_events_routes(
                     conversation_store,
                     owner_runner_id=conv.runner_id,
                     agent_name=failed_agent_name,
+                    owner=status_owner,
                 )
             elif status == "running":
-                await _persist_session_status_error_labels(session_id, None, conversation_store)
-            _publish_status(
+                await _persist_session_status_error_labels(
+                    session_id, None, conversation_store, owner=status_owner
+                )
+            status_write = _publish_status(
                 session_id,
                 status,
                 status_error,
                 failure_origin="external_session_status",
+                owner=status_owner,
+                predecessor=status_predecessor,
                 failure_context=data.get("failure_context"),
                 response_id=response_id,
                 background_task_count=bg_count,
                 background_tasks=bg_tasks,
                 blocked_on=blocked_on,
             )
+            committed_observation = None
+            if status_write is not None:
+                try:
+                    committed_observation = await asyncio.shield(asyncio.wrap_future(status_write))
+                except Exception as exc:
+                    raise OmnigentError(
+                        "Session status persistence is temporarily unavailable; retry the callback.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    ) from exc
+                if committed_observation is None:
+                    return {"queued": False, "ignored": True}
+                data = {**data, "session_observation": committed_observation.model_dump()}
+                if dispatch_id:
+                    data["subagent_dispatch_id"] = dispatch_id
+            elif session_live_state.conversation_store() is not None:
+                return {"queued": False, "ignored": True}
             if (
                 conv.parent_conversation_id is not None
                 and status in {"idle", "failed"}
@@ -2091,8 +2163,18 @@ def register_events_routes(
                         session_id,
                         "returned",
                         conversation_store,
-                        turn_id=response_id,
+                        turn_id=(
+                            response_id
+                            or (
+                                committed_observation.response_id
+                                if committed_observation
+                                else None
+                            )
+                        ),
                         status=outcome,
+                        observation=committed_observation,
+                        dispatch_id=dispatch_id,
+                        snapshot=conv,
                     )
             # Emit a turn-end telemetry event for native harnesses. "idle"
             # means the turn completed normally; "failed" means it errored.
@@ -2456,6 +2538,10 @@ def register_events_routes(
             # Side chats share the source's runner and have no host. A categorical
             # source relaunch refusal consumes the message with its actionable
             # reason, like the host-bound relaunch below.
+            refusal_owner, refusal_predecessor = _capture_status_observation(
+                session_id, conv.session_observation
+            )
+            refusal_dispatch = conv.labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
             try:
                 runner_client, conv = await _recover_side_chat_runner_via_source(
                     conv,
@@ -2486,6 +2572,9 @@ def register_events_routes(
                     runner_router,
                     created_by=created_by,
                     host_error_code=refusal_code,
+                    owner=refusal_owner,
+                    predecessor=refusal_predecessor,
+                    dispatch_id=refusal_dispatch,
                 )
                 return {"queued": True, "item_id": item_id}
             if runner_client is not None:
@@ -2503,6 +2592,10 @@ def register_events_routes(
         relaunch_refusal_reason: str | None = None
         relaunch_refusal_visible = False
         host_wait_started = time.monotonic()
+        launch_owner, launch_predecessor = _capture_status_observation(
+            session_id, conv.session_observation
+        )
+        launch_dispatch = conv.labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
         _host_conn: HostConnection | None = None
         if runner_client is None and conv.host_id is not None:
             _tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
@@ -2614,6 +2707,11 @@ def register_events_routes(
                         _host_reg,
                         _host_conn,
                     )
+                    if launch_attempt.observation is not None:
+                        launch_owner = launch_attempt.observation
+                        launch_predecessor = None
+                    if launch_attempt.dispatch_id is not None:
+                        launch_dispatch = launch_attempt.dispatch_id
                     host_error_code = _classify_launch_refusal(
                         launch_attempt.error_code,
                         launch_attempt.error,
@@ -2638,6 +2736,9 @@ def register_events_routes(
                             runner_router,
                             created_by=created_by,
                             host_error_code=host_error_code,
+                            owner=launch_owner,
+                            predecessor=launch_predecessor,
+                            dispatch_id=launch_dispatch,
                         )
                         return {"queued": True, "item_id": item_id}
                     relaunched_runner_id = launch_attempt.runner_id
@@ -2692,6 +2793,20 @@ def register_events_routes(
             fresh_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if fresh_conv is None:
                 raise _session_not_found()
+            if (
+                conv.host_id is None
+                and fresh_conv.host_id is None
+                and conv.runner_id is not None
+                and fresh_conv.runner_id is None
+                and relaunched_runner_id is None
+                and fresh_conv.live_status_observation_id is None
+                and fresh_conv.live_status not in ("running", "waiting")
+                and not fresh_conv.terminal_pending
+            ):
+                # No provider ran: choose the cleared binding before accepting this input.
+                launch_owner = fresh_conv.session_observation
+                launch_predecessor = None
+                launch_dispatch = fresh_conv.labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
             runner_client = await _get_runner_client(
                 session_id, runner_router, conversation=fresh_conv
             )
@@ -2795,6 +2910,9 @@ def register_events_routes(
                     offline_error,
                     runner_router,
                     created_by=created_by,
+                    owner=launch_owner,
+                    predecessor=launch_predecessor,
+                    dispatch_id=launch_dispatch,
                 )
                 return {"queued": True, "item_id": item_id}
             # Raise so the Omnigent server doesn't persist an item the

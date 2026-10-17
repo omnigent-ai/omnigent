@@ -27,6 +27,7 @@ from omnigent.chat import (
     _extract_agent_name,
     _is_url,
     _materialize_override_bundle,
+    _persisted_turn_error,
     _persisted_turn_text,
     _pick_agent,
     _prepare_chat_session_via_daemon,
@@ -4088,7 +4089,9 @@ class _FakeSessionsNamespace:
         """Pretend to bind a runner; echo back the session id."""
         return SimpleNamespace(id=session_id)
 
-    async def list_items(self, session_id: str, *, limit: int, order: str) -> PaginatedList:
+    async def list_items(
+        self, session_id: str, *, limit: int, order: str, after: str | None = None
+    ) -> PaginatedList:
         """
         Return the controlled transcript honoring ``order``.
 
@@ -4105,6 +4108,7 @@ class _FakeSessionsNamespace:
         :returns: The transcript items in the requested order.
         """
         self.list_items_calls += 1
+        assert after is None
         if self._forbid_list_items:
             raise AssertionError(
                 "list_items must NOT be read when the live turn returned "
@@ -4480,6 +4484,36 @@ async def test_persisted_turn_text_anchors_on_last_user_message() -> None:
         ]
     )
     assert await _persisted_turn_text(client, "conv_test") == "NEW answer"
+
+
+@pytest.mark.parametrize("consumer", ["text", "error"])
+@pytest.mark.parametrize("visible", [[], [{"id": "visible", "type": "resource_event"}]])
+async def test_persisted_turn_reconciliation_follows_filtered_page(
+    consumer: str, visible: list[dict[str, object]]
+) -> None:
+    class _FilteredSessions(_FakeSessionsNamespace):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.cursors: list[str | None] = []
+
+        async def list_items(
+            self, session_id: str, *, limit: int, order: str, after: str | None = None
+        ) -> PaginatedList:
+            self.cursors.append(after)
+            assert order == "desc"
+            if after is None:
+                return PaginatedList(data=visible, has_more=True, last_id="filtered")
+            assert after == "filtered"
+            result = _item_assistant("answer") if consumer == "text" else _item_error("real error")
+            return PaginatedList(data=[result, _item_user("q")], has_more=True, last_id="user")
+
+    client = _FakeAPClient([])
+    client.sessions = _FilteredSessions()
+    if consumer == "text":
+        assert await _persisted_turn_text(client, "conv_test") == "answer"
+    else:
+        assert await _persisted_turn_error(client, "conv_test") == "real error"
+    assert client.sessions.cursors == [None, "filtered"]
 
 
 async def test_persisted_turn_text_none_when_no_assistant_after_user() -> None:

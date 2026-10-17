@@ -144,6 +144,12 @@ describe("createSession", () => {
       runnerId: undefined,
       hostId: null,
       hostResumable: false,
+      hostOnline: undefined,
+      runnerOnline: undefined,
+      sessionObservation: undefined,
+      runnerOfflineEpisodeId: null,
+      backgroundTasks: undefined,
+      subagentRoutingOverride: undefined,
       archived: false,
       status: "idle",
       createdAt: 1704067200,
@@ -1424,7 +1430,91 @@ describe("exportSessionTranscript", () => {
   });
 });
 
+describe("session routing observation ordering", () => {
+  it("keeps the newer host when a stale HTTP snapshot is parsed", async () => {
+    const observation = {
+      runner_id: "runner_B",
+      binding_epoch: 2,
+      revision: 5,
+      observation_id: "new",
+      status: "running",
+      response_id: "new_turn",
+      error_key: null,
+    };
+    const row = {
+      id: "conv_route_observation",
+      agent_id: "agent",
+      created_at: 0,
+      status: "running",
+    };
+    fetchMock
+      .mockResolvedValueOnce(
+        mockJsonResponse({
+          ...row,
+          host_id: "host_B",
+          session_observation: observation,
+        }),
+      )
+      .mockResolvedValueOnce(
+        mockJsonResponse({
+          ...row,
+          host_id: "host_A",
+          session_observation: {
+            ...observation,
+            runner_id: "runner_A",
+            binding_epoch: 1,
+            revision: 4,
+          },
+        }),
+      );
+    await getSessionSlim(row.id);
+    await getSessionSlim(row.id);
+    expect(getSessionHost(row.id)).toBe("host_B");
+  });
+});
+
 describe("fetchSessionItemsPage", () => {
+  it("crosses invisible pages and preserves the underlying cursor on a short visible page", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockJsonResponse({
+          object: "list",
+          data: [],
+          first_id: "hidden_3",
+          last_id: "hidden_2",
+          has_more: true,
+        }),
+      )
+      .mockResolvedValueOnce(
+        mockJsonResponse({
+          object: "list",
+          data: [{ id: "visible", type: "message" }],
+          first_id: "visible",
+          last_id: "hidden_1",
+          has_more: true,
+        }),
+      );
+    const page = await fetchSessionItemsPage("conv_filtered", { limit: 2 });
+    expect(page.items.map((item) => item.id)).toEqual(["visible"]);
+    expect(page.hasMore).toBe(true);
+    expect(page.olderCursor).toBe("hidden_1");
+    expect(String(fetchMock.mock.calls[1]![0])).toContain("after=hidden_2");
+  });
+
+  it("rejects a repeated invisible-page cursor instead of looping", async () => {
+    fetchMock.mockResolvedValue(
+      mockJsonResponse({
+        object: "list",
+        data: [],
+        first_id: "hidden",
+        last_id: "hidden",
+        has_more: true,
+      }),
+    );
+    await expect(fetchSessionItemsPage("conv_filtered")).rejects.toThrow("cursor did not advance");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("requests the newest page (order=desc) and returns items oldest-to-newest", async () => {
     // Server returns newest-first; the helper must reverse to chronological
     // so history renders in the same order the live stream appends.

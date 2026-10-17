@@ -32,6 +32,8 @@ from omnigent.runner.app import (
 )
 from omnigent.runner.native import NativeLaunchContext, _resolve_native_spawn_env
 from omnigent.runner.resource_registry import (
+    CLAUDE_NATIVE_TERMINAL_ROLE,
+    PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec, LocalToolInfo
@@ -47,7 +49,84 @@ from tests.runner.conftest import (
     _ScriptedHarnessClient,
     _sse,
 )
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import NullServerClient, make_test_terminal_instance
+
+
+@pytest.mark.asyncio
+async def test_runner_pane_status_after_init_response_keeps_its_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from omnigent.terminals import TerminalRegistry
+
+    session_id, agent_id = uuid.uuid4().hex, uuid.uuid4().hex
+    registry = SessionResourceRegistry(terminal_registry=TerminalRegistry())
+    spec = AgentSpec(
+        spec_version=1,
+        name="native-status-provenance",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
+    )
+
+    async def resolve(*_args: Any, **_kwargs: Any) -> AgentSpec:
+        return spec
+
+    async def launch(ctx: NativeLaunchContext) -> SessionResourceView:
+        return SessionResourceView(
+            id="terminal_pi_main", type="terminal", session_id=ctx.session_id, name="pi:main"
+        )
+
+    monkeypatch.setattr("omnigent.runner.native._launch_pi", launch)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=resolve,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        resource_registry=registry,
+    )
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions", json={"session_id": session_id, "agent_id": agent_id}
+        )
+        assert response.status_code == 201
+        queue = app.state.session_event_queues[session_id]
+        while not queue.empty():
+            queue.get_nowait()
+        instance = make_test_terminal_instance("pi", "main", tmp_path)
+        watcher = Mock()
+        monkeypatch.setattr(instance, "start_idle_watcher_thread", watcher)
+        await registry.observe_required_terminal(
+            session_id, "pi", "main", instance, resource_role=PI_NATIVE_TERMINAL_ROLE
+        )
+        watcher.call_args.kwargs["on_activity"]()
+        watcher.call_args.kwargs["on_idle"]()
+        await asyncio.sleep(0)
+        events = []
+        while not queue.empty():
+            events.append(queue.get_nowait())
+        statuses = [event for event in events if event["type"] == "session.status"]
+        assert [event["status"] for event in statuses] == ["running", "idle"]
+        assert all(event.get("status_source") == "pane_activity" for event in statuses)
+        assert any(event["type"] == "session.terminal.activity" for event in events)
+
+        file_callbacks: list[Any] = []
+
+        def build_poller(**kwargs: Any) -> Any:
+            file_callbacks.append(kwargs["on_status"])
+            return SimpleNamespace(active=True)
+
+        monkeypatch.setattr(registry, "_build_claude_native_status_poller", build_poller)
+        claude = make_test_terminal_instance("claude", "main", tmp_path)
+        monkeypatch.setattr(claude, "start_idle_watcher_thread", Mock())
+        await registry.observe_required_terminal(
+            session_id, "claude", "main", claude, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
+        )
+        file_callbacks[0]("running", "permission prompt")
+        await asyncio.sleep(0)
+        event = queue.get_nowait()
+        assert event["type"] == "session.status" and event["status"] == "running"
+        assert event.get("blocked_on") == "permission prompt"
+        assert "status_source" not in event
 
 
 @pytest.mark.asyncio
@@ -2963,3 +3042,226 @@ def test_kimi_auto_create_clears_forwarder_state_before_supervising() -> None:
     assert src.index("clear_kimi_bridge_state(bridge_dir)") < src.rindex(
         "supervise_kimi_forwarder("
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["created", "failed"])
+@pytest.mark.parametrize("annotated", [True, False], ids=["owned", "legacy"])
+async def test_native_auto_create_events_keep_the_init_reservation(
+    monkeypatch: pytest.MonkeyPatch, outcome: str, annotated: bool
+) -> None:
+    from omnigent.entities.session_observation import SessionObservation
+
+    observation = SessionObservation(
+        runner_id="runner-init",
+        binding_epoch=2,
+        revision=3,
+        observation_id="captured-init-reservation",
+        status="idle",
+    )
+    session_id, agent_id = uuid.uuid4().hex, uuid.uuid4().hex
+    spec = AgentSpec(
+        spec_version=1,
+        name="native-init-owned-events",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
+    )
+
+    async def resolve(*_args: Any, **_kwargs: Any) -> AgentSpec:
+        return spec
+
+    async def launch(ctx: NativeLaunchContext) -> SessionResourceView:
+        if outcome == "failed":
+            raise RuntimeError("synthetic native launch failure")
+        view = SessionResourceView(
+            id="terminal_pi_main",
+            type="terminal",
+            session_id=ctx.session_id,
+            name="pi:main",
+        )
+        ctx.publish_event(
+            ctx.session_id,
+            {"type": "session.resource.created", "resource": dataclasses.asdict(view)},
+        )
+        return view
+
+    monkeypatch.setattr("omnigent.runner.native._launch_pi", launch)
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=resolve,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        resource_registry=SessionResourceRegistry(terminal_registry=None),
+    )
+    payload = {
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "session_init": {
+            "protocol_version": 2,
+            "server_version": "test",
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "snapshot": {"created_at": 1, "updated_at": 1, "workspace": None, "labels": {}},
+        },
+    }
+    if annotated:
+        payload["session_observation"] = observation.model_dump()
+    async with _runner_client(app) as client:
+        response = await client.post("/v1/sessions", json=payload)
+        assert response.status_code == 201, response.text
+        queue = app.state.session_event_queues[session_id]
+        events = []
+        while not queue.empty():
+            events.append(queue.get_nowait())
+    relevant = [
+        event
+        for event in events
+        if event.get("type")
+        in {
+            "session.terminal_pending",
+            "session.resource.created",
+            "response.error",
+            "session.status",
+        }
+    ]
+    assert [
+        event["pending"] for event in relevant if event["type"] == "session.terminal_pending"
+    ] == [True, False]
+    expected = "session.resource.created" if outcome == "created" else "session.status"
+    assert any(event["type"] == expected for event in relevant)
+    expected_observation = observation.model_dump() if annotated else None
+    assert all(event.get("session_observation") == expected_observation for event in relevant)
+
+
+@pytest.mark.asyncio
+async def test_late_auto_create_callback_keeps_its_own_reservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.entities.session_observation import SessionObservation
+
+    session_id, agent_id = uuid.uuid4().hex, uuid.uuid4().hex
+    owner = SessionObservation(
+        runner_id="runner-init",
+        binding_epoch=1,
+        revision=1,
+        observation_id="startup-a",
+        status="idle",
+    )
+    replacement = owner.model_copy(update={"revision": 2, "observation_id": "startup-b"})
+    spec = AgentSpec(
+        spec_version=1,
+        name="native-init-captured-publisher",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
+    )
+    publishers = []
+
+    async def resolve(*_args: Any, **_kwargs: Any) -> AgentSpec:
+        return spec
+
+    async def launch(ctx: NativeLaunchContext) -> SessionResourceView:
+        publishers.append(ctx.publish_event)
+        return SessionResourceView(
+            id="terminal_pi_main", type="terminal", session_id=ctx.session_id, name="pi:main"
+        )
+
+    monkeypatch.setattr("omnigent.runner.native._launch_pi", launch)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=resolve,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        resource_registry=SessionResourceRegistry(terminal_registry=None),
+    )
+
+    def payload(observation: SessionObservation) -> dict[str, Any]:
+        return {
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "session_observation": observation.model_dump(),
+            "session_init": {
+                "protocol_version": 2,
+                "server_version": "test",
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "snapshot": {"created_at": 1, "updated_at": 1, "workspace": None, "labels": {}},
+            },
+        }
+
+    async with _runner_client(app) as client:
+        first = await client.post("/v1/sessions", json=payload(owner))
+        second = await client.post("/v1/sessions", json=payload(replacement))
+        assert first.status_code == second.status_code == 201
+        assert len(publishers) == 2
+        queue = app.state.session_event_queues[session_id]
+        while not queue.empty():
+            queue.get_nowait()
+        resource = dataclasses.asdict(
+            SessionResourceView(
+                id="terminal_pi_main", type="terminal", session_id=session_id, name="pi:main"
+            )
+        )
+        publishers[0](session_id, {"type": "session.resource.created", "resource": resource})
+        assert queue.get_nowait()["session_observation"] == owner.model_dump()
+        publishers[1](session_id, {"type": "session.resource.created", "resource": resource})
+        assert queue.get_nowait()["session_observation"] == replacement.model_dump()
+
+
+@pytest.mark.asyncio
+async def test_native_init_pre_spawn_failure_keeps_its_reservation_on_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.entities.session_observation import SessionObservation
+
+    owner = SessionObservation(
+        runner_id="runner-init",
+        binding_epoch=1,
+        revision=3,
+        observation_id="pre-spawn-reservation",
+        status="idle",
+    )
+    session_id, agent_id = uuid.uuid4().hex, uuid.uuid4().hex
+    spec = AgentSpec(
+        spec_version=1,
+        name="native-init-pre-spawn",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}),
+    )
+
+    async def resolve(*_args: Any, **_kwargs: Any) -> AgentSpec:
+        return spec
+
+    def unavailable(*_args: Any, **_kwargs: Any) -> None:
+        raise OmnigentError(
+            "synthetic launch configuration failure", code=ErrorCode.HARNESS_NOT_CONFIGURED
+        )
+
+    monkeypatch.setattr("omnigent.runner.app._build_spawn_env_from_spec", unavailable)
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=resolve,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        resource_registry=SessionResourceRegistry(terminal_registry=None),
+    )
+    payload = {
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "session_observation": owner.model_dump(),
+        "session_init": {
+            "protocol_version": 2,
+            "server_version": "test",
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "snapshot": {"created_at": 1, "updated_at": 1, "workspace": None, "labels": {}},
+        },
+    }
+    async with _runner_client(app) as client:
+        response = None
+        with contextlib.suppress(OmnigentError):
+            response = await client.post("/v1/sessions", json=payload)
+        assert response is None or response.status_code >= 400
+        assert pm.get_client_calls == []
+        queue = app.state.session_event_queues[session_id]
+        events = []
+        while not queue.empty():
+            events.append(queue.get_nowait())
+    failures = [event for event in events if event.get("type") == "session.status"]
+    assert len(failures) == 1 and failures[0]["status"] == "failed"
+    assert failures[0]["session_observation"] == owner.model_dump()

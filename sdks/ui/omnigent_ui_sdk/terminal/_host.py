@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from omnigent_client import TERMINAL_TASK_STATUSES, child_session_busy
+from omnigent_client._session_projection import SessionProjectionFence
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application
 from prompt_toolkit.application.current import get_app
@@ -928,6 +929,7 @@ class TerminalHost:
         # from each node's ``parent_id``. ``_subagent_root`` is the session
         # the tree is rooted at (the originally-launched "main" session).
         self._subagents: dict[str, _SubagentNode] = {}
+        self._subagent_projection_fences: dict[str, SessionProjectionFence] = {}
         self._subagent_root: str | None = None
         # Bumped every time the tree is cleared (``/switch`` / ``/new`` /
         # ``/clear`` start a fresh root). A background ``seed_subagent_tree``
@@ -3145,6 +3147,8 @@ class TerminalHost:
         if node is None:
             node = _SubagentNode(session_id=session_id, started_at=self._monotonic())
             self._subagents[session_id] = node
+        fence = self._subagent_projection_fences.setdefault(session_id, SessionProjectionFence())
+        child = fence.filter_child(child)
         if parent_id is not None and parent_id != session_id:
             node.parent_id = parent_id
         agent = child.get("agent_name") or child.get("tool")

@@ -228,7 +228,9 @@ def test_send_rechecks_unsent_upload_after_fork_into_another_harness(
     policy = AsyncMock(return_value={"verdict": "deny", "reason": "test policy"})
     dispatch = AsyncMock()
     monkeypatch.setattr(routes_events, "_evaluate_input_policy", policy)
-    monkeypatch.setattr(routes_events, "_persist_policy_deny_sentinel", AsyncMock())
+    monkeypatch.setattr(
+        routes_events, "_persist_policy_deny_sentinel", AsyncMock(return_value=None)
+    )
     monkeypatch.setattr(routes_events, "_dispatch_session_event_to_runner", dispatch)
     response = client.post(
         f"/v1/sessions/{session_id}/events",

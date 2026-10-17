@@ -1,3 +1,4 @@
+import { shareSessionSnapshot } from "@/lib/sessionSnapshot";
 /** Browser MCP relay hook — runs agent-issued browser actions against the
  *  Electron WebContentsView via a claim-first protocol: on a
  *  `browser.action_request` SSE event every renderer races to CLAIM the action
@@ -15,7 +16,12 @@ import type { BrowserActionRequestEvent } from "@/lib/events";
 import { supportsBrowser } from "@/lib/nativeBridge";
 import { authenticatedFetch } from "@/lib/identity";
 import { useQueryClient } from "@tanstack/react-query";
-import { sessionRoutingHostId, setSessionHost, setSessionParent } from "@/lib/sessionHost";
+import {
+  getOwnSessionHost,
+  sessionRoutingHostId,
+  setSessionHost,
+  setSessionParent,
+} from "@/lib/sessionHost";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import type { Host } from "@/hooks/useHosts";
@@ -258,14 +264,19 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
             // oxlint-disable-next-line no-await-in-loop -- Each parent comes from the previous snapshot.
             const source: Session = await queryClient.fetchQuery({
               queryKey: ["session", hopId],
+              structuralSharing: shareSessionSnapshot,
               queryFn: () => getSessionSlim(hopId),
               staleTime: Infinity,
               retry: false,
             });
-            setSessionHost(source.id, sessionRoutingHostId(source.hostId, source.labels));
+            setSessionHost(source.id, sessionRoutingHostId(source.hostId, source.labels), {
+              observation: source.sessionObservation,
+              episodeId: source.runnerOfflineEpisodeId,
+            });
             setSessionParent(source.id, source.parentSessionId);
-            if (source.hostId) {
-              sourceHostId = source.hostId;
+            const resolvedHost = getOwnSessionHost(source.id);
+            if (resolvedHost) {
+              sourceHostId = resolvedHost;
               break;
             }
             id = source.parentSessionId;

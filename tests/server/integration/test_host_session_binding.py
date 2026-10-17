@@ -2133,7 +2133,9 @@ async def test_runner_exited_before_connect_fails_idle_session(
     caplog.set_level("WARNING", logger="omnigent")
     _comm = await _report_runner_exited(app, "runner_never_connected", had_connected=had_connected)
     async with asyncio.timeout(5.0):
-        while _persisted_task_error(conv_store, conv.id) is None:
+        while _persisted_task_error(conv_store, conv.id) is None or not _turn_failed_events(
+            caplog, conv.id
+        ):
             await asyncio.sleep(0.01)
 
     error = _persisted_task_error(conv_store, conv.id)

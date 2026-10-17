@@ -20,6 +20,8 @@ from omnigent_ui_sdk.terminal._host import TerminalHost
 from prompt_toolkit.output import DummyOutput
 from rich.text import Text
 
+from omnigent.entities.session_observation import SessionObservation
+
 
 def _formatted_text_plain(fragments: Iterable[tuple[str, str]]) -> str:
     """
@@ -1317,6 +1319,74 @@ def test_subagent_partial_update_preserves_label() -> None:
     sid, label = rows[0]
     assert sid == "conv_c1"
     assert "reviewer:auth" in label  # label survived the status-only delta
+
+
+def test_subagent_snapshot_cannot_rewind_live_ownership() -> None:
+    """Stale polls and deltas preserve a newer child while metadata stays mergeable."""
+    host = TerminalHost(model_name="test")
+    current = SessionObservation(
+        runner_id="runner_a", binding_epoch=3, revision=2, response_id="resp_2"
+    )
+    old = current.model_copy(update={"binding_epoch": 1, "revision": 1, "response_id": "resp_1"})
+    host.upsert_subagent("child", child={**_busy(), "session_observation": current.model_dump()})
+    host.seed_subagent_tree(
+        "root",
+        [
+            {
+                "id": "child",
+                **_done("failed"),
+                "last_task_error": {"code": "runner_offline"},
+                "session_observation": old.model_dump(),
+                "title": "updated title",
+            }
+        ],
+    )
+    host.upsert_subagent("child", child={"agent_name": "updated agent"})
+    host.upsert_subagent("child", child={**_done("failed")})
+    node = host._subagents["child"]
+    assert (node.status, node.busy, node.last_task_error, node.done_at) == (
+        "in_progress",
+        True,
+        False,
+        None,
+    )
+    assert (node.title, node.agent) == ("updated title", "updated agent")
+
+    host.upsert_subagent(
+        "child",
+        child={
+            **_done("failed"),
+            "session_observation": current.model_dump(),
+            "runner_offline_episode_id": "offline_1",
+        },
+    )
+    assert node.status == "failed"
+    host.upsert_subagent("child", child={**_busy(), "session_observation": current.model_dump()})
+    assert node.status == "failed"
+    host.upsert_subagent(
+        "child",
+        child={
+            **_busy(),
+            "session_observation": current.model_copy(
+                update={"revision": 3, "response_id": "resp_3"}
+            ).model_dump(),
+        },
+    )
+    assert (node.status, node.busy, node.done_at) == ("in_progress", True, None)
+
+
+def test_subagent_snapshot_removal_retains_projection_fence() -> None:
+    """Removing a terminal row must not let a delayed legacy event revive its lifecycle."""
+    host = TerminalHost(model_name="test")
+    observation = SessionObservation(runner_id="runner_a", binding_epoch=1, revision=1)
+    host.upsert_subagent(
+        "child", child={**_done(), "session_observation": observation.model_dump()}
+    )
+    host.seed_subagent_tree("root", [])
+    assert "child" not in host._subagents
+    host.upsert_subagent("child", child={**_busy(), "title": "still searchable"})
+    node = host._subagents["child"]
+    assert (node.status, node.busy, node.title) == (None, False, "still searchable")
 
 
 def test_subagent_status_label_pending_elicitation_outranks_busy() -> None:

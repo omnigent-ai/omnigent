@@ -1,3 +1,5 @@
+import { parseSessionObservation, type SessionObservation } from "./sessionObservation";
+
 // Mirrors sdks/python-client/omnigent_client/_sse.py.
 //
 // Parses raw `text/event-stream` bytes into typed `StreamEvent`
@@ -377,6 +379,23 @@ export function parseBackgroundTasks(raw: unknown): BackgroundTaskInfo[] | undef
   return tasks.length > 0 ? tasks : undefined;
 }
 
+function ownedLifecycleFields(data: Record<string, unknown>): {
+  sessionObservation?: SessionObservation | null;
+  runnerOfflineEpisodeId?: string | null;
+} {
+  if (data.session_observation == null && data.runner_offline_episode_id == null) return {};
+  const episode = data.runner_offline_episode_id;
+  const invalidConversationId =
+    data.conversation_id != null && typeof data.conversation_id !== "string";
+  return {
+    sessionObservation:
+      invalidConversationId || (episode != null && (typeof episode !== "string" || !episode))
+        ? null
+        : (parseSessionObservation(data.session_observation) ?? null),
+    runnerOfflineEpisodeId: typeof episode === "string" ? episode : null,
+  };
+}
+
 /**
  * Parse one raw SSE-shaped event payload (e.g. an entry from the
  * snapshot's `pending_elicitations` field) into a typed
@@ -395,27 +414,43 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
 
   // Response lifecycle.
   if (eventType === "response.created") {
-    return { type: "response_created", response: parseResponse(data) } satisfies ResponseCreated;
+    return {
+      type: "response_created",
+      response: parseResponse(data),
+      ...(typeof data.conversation_id === "string" ? { conversationId: data.conversation_id } : {}),
+      ...ownedLifecycleFields(data),
+    } satisfies ResponseCreated;
   }
   if (eventType === "response.queued") {
-    return { type: "response_queued", response: parseResponse(data) } satisfies ResponseQueued;
+    return {
+      type: "response_queued",
+      response: parseResponse(data),
+      ...(typeof data.conversation_id === "string" ? { conversationId: data.conversation_id } : {}),
+      ...ownedLifecycleFields(data),
+    } satisfies ResponseQueued;
   }
   if (eventType === "response.in_progress") {
     return {
       type: "response_in_progress",
       response: parseResponse(data),
+      ...(typeof data.conversation_id === "string" ? { conversationId: data.conversation_id } : {}),
+      ...ownedLifecycleFields(data),
     } satisfies ResponseInProgress;
   }
   if (eventType === "response.completed") {
     return {
       type: "response_completed",
       response: parseResponse(data),
+      ...(typeof data.conversation_id === "string" ? { conversationId: data.conversation_id } : {}),
+      ...ownedLifecycleFields(data),
     } satisfies ResponseCompleted;
   }
   if (eventType === "response.failed") {
     return {
       type: "response_failed",
       response: parseResponse(data),
+      ...(typeof data.conversation_id === "string" ? { conversationId: data.conversation_id } : {}),
+      ...ownedLifecycleFields(data),
       ...(typeof data.source === "string" ? { source: data.source } : {}),
     } satisfies ResponseFailed;
   }
@@ -424,6 +459,8 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     return {
       type: "response_incomplete",
       response: resp,
+      ...(typeof data.conversation_id === "string" ? { conversationId: data.conversation_id } : {}),
+      ...ownedLifecycleFields(data),
       reason: resp.incompleteDetails?.reason ?? "",
     } satisfies ResponseIncomplete;
   }
@@ -431,6 +468,8 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     return {
       type: "response_cancelled",
       response: parseResponse(data),
+      ...(typeof data.conversation_id === "string" ? { conversationId: data.conversation_id } : {}),
+      ...ownedLifecycleFields(data),
     } satisfies ResponseCancelled;
   }
 
@@ -445,7 +484,15 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     const messageId = typeof data.message_id === "string" ? data.message_id : undefined;
     const index = typeof data.index === "number" ? data.index : undefined;
     const final = typeof data.final === "boolean" ? data.final : undefined;
-    return { type: "text_delta", delta, messageId, index, final } satisfies TextDelta;
+    return {
+      type: "text_delta",
+      delta,
+      messageId,
+      index,
+      final,
+      ...(typeof data.conversation_id === "string" ? { conversationId: data.conversation_id } : {}),
+      ...ownedLifecycleFields(data),
+    } satisfies TextDelta;
   }
   if (eventType === "response.function_call_output.delta") {
     const callId = data.call_id;
@@ -504,6 +551,9 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       source: String(data.source ?? ""),
       toolName: data.tool_name != null ? String(data.tool_name) : null,
       error: parseErrorInfo(data.error),
+      ...(typeof data.conversation_id === "string" ? { conversationId: data.conversation_id } : {}),
+      ...(typeof data.response_id === "string" ? { responseId: data.response_id } : {}),
+      ...ownedLifecycleFields(data),
     } satisfies ErrorEvent;
   }
 
@@ -586,6 +636,11 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         conversationId,
         status,
         responseId,
+        sessionObservation: parseSessionObservation(data.session_observation),
+        runnerOfflineEpisodeId:
+          typeof data.runner_offline_episode_id === "string"
+            ? data.runner_offline_episode_id
+            : undefined,
         backgroundTaskCount,
         ...(backgroundTasks !== undefined ? { backgroundTasks } : {}),
         ...(blockedOn !== undefined ? { blockedOn } : {}),
@@ -760,6 +815,8 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       type: "session_terminal_pending",
       conversationId,
       pending,
+      ...(typeof data.response_id === "string" ? { responseId: data.response_id } : {}),
+      ...ownedLifecycleFields(data),
     } satisfies SessionTerminalPendingEvent;
   }
   if (eventType === "session.sandbox_status") {

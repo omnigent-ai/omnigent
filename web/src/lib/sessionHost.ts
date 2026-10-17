@@ -1,3 +1,5 @@
+import { isVersionedSessionObservation, type SessionObservation } from "@/lib/sessionObservation";
+
 // Client-side `session_id → host_id` map for host-sharded routing.
 //
 // When the server shards replicas by host_id, a session's runner tunnel lives
@@ -10,11 +12,49 @@
 //
 // A small standalone map (rather than reading the TanStack Query cache) keeps
 // this decoupled from the query-key convention and needs no QueryClient handle.
-// A session's host_id is fixed for its lifetime, so the recorded value can't go
-// stale. Returns `null` when the session hasn't been loaded yet or is a hostless
+// Versioned snapshots cannot rewind a newer routing binding. Returns `null`
+// when the session has not been loaded yet or is a hostless
 // local session, leaving routing to the default.
 
 const _sessionHosts = new Map<string, string>();
+interface HostProjection {
+  observation?: SessionObservation | null;
+  episodeId?: string | null;
+}
+const _sessionHostProjections = new Map<string, SessionObservation>();
+
+function acceptHostBinding(sessionId: string, incoming: HostProjection): boolean {
+  const observation = incoming.observation;
+  const previous = _sessionHostProjections.get(sessionId);
+  if (!isVersionedSessionObservation(observation)) return previous === undefined;
+  if (
+    previous &&
+    (observation.binding_epoch < previous.binding_epoch ||
+      (observation.binding_epoch === previous.binding_epoch &&
+        observation.runner_id !== previous.runner_id))
+  )
+    return false;
+  // Turn revisions do not change the host within a binding.
+  if (!previous || observation.binding_epoch > previous.binding_epoch) {
+    _sessionHostProjections.set(sessionId, observation);
+  }
+  return true;
+}
+
+/** A new binding without an address must not keep routing through its predecessor. */
+export function observeSessionHostProjection(sessionId: string, incoming: HostProjection): boolean {
+  const previous = _sessionHostProjections.get(sessionId);
+  if (!acceptHostBinding(sessionId, incoming)) return false;
+  if (
+    isVersionedSessionObservation(incoming.observation) &&
+    (!previous || incoming.observation.binding_epoch > previous.binding_epoch) &&
+    _sessionHosts.delete(sessionId)
+  ) {
+    notifySessionHostChanges();
+  }
+  return true;
+}
+
 const _hostChangeListeners = new Set<() => void>();
 
 /** Subscribe to host/parent changes so live streams can recheck their effective host. */
@@ -34,14 +74,20 @@ function notifySessionHostChanges(): void {
  * object is parsed; a null/absent host clears any stale mapping so a session
  * that loses its host binding stops routing to the old replica.
  */
-export function setSessionHost(sessionId: string, hostId: string | null | undefined): void {
-  if ((_sessionHosts.get(sessionId) ?? null) === (hostId || null)) return;
+export function setSessionHost(
+  sessionId: string,
+  hostId: string | null | undefined,
+  projection?: HostProjection,
+): boolean {
+  if (projection && !acceptHostBinding(sessionId, projection)) return false;
+  if ((_sessionHosts.get(sessionId) ?? null) === (hostId || null)) return true;
   if (hostId) {
     _sessionHosts.set(sessionId, hostId);
   } else {
     _sessionHosts.delete(sessionId);
   }
   notifySessionHostChanges();
+  return true;
 }
 
 // A managed create that chose its sandbox host's id records it in this label;
@@ -100,6 +146,11 @@ export function setSessionParent(
  */
 export function getSessionParent(sessionId: string): string | null {
   return _sessionParents.get(sessionId) ?? null;
+}
+
+/** Return only this session's recorded host, without trusting cached ancestry. */
+export function getOwnSessionHost(sessionId: string): string | null {
+  return _sessionHosts.get(sessionId) ?? null;
 }
 
 /**

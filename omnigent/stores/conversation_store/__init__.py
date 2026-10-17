@@ -15,6 +15,11 @@ from omnigent.entities import (
     NewConversationItem,
     PagedList,
 )
+from omnigent.entities.session_observation import (
+    RecordedRunnerOfflineDecision,
+    RunnerOfflineDecision,
+    SessionObservation,
+)
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
 
 if TYPE_CHECKING:
@@ -695,6 +700,10 @@ class ConversationStore(ABC):
         Both ``after`` and ``before`` can be used together to
         select a window. Used by the agent loop
         (``after=last_seen``) to poll for steering items.
+
+        Owned lifecycle projections can expire while their source rows remain.
+        An empty visible page may therefore retain cursors and ``has_more``;
+        callers must advance by the source cursor rather than stop on empty data.
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
@@ -1543,6 +1552,62 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def get_session_observation(self, conversation_id: str) -> SessionObservation | None:
+        """Read the current binding and ordered live observation from metadata."""
+        ...
+
+    @abstractmethod
+    def begin_terminal_startup(
+        self, conversation_id: str, expected: SessionObservation, observation_id: str
+    ) -> SessionObservation | None:
+        """Reserve one startup revision without changing the last normal result."""
+        ...
+
+    @abstractmethod
+    def finish_terminal_startup(
+        self, conversation_id: str, expected: SessionObservation, observation_id: str
+    ) -> SessionObservation | None:
+        """Complete an exact startup with a new canonical revision and stable token."""
+        ...
+
+    @abstractmethod
+    def record_session_observation(
+        self,
+        conversation_id: str,
+        status: str,
+        *,
+        response_id: str | None = None,
+        observation_id: str | None = None,
+        error_key: str | None = None,
+        error_labels: dict[str, str] | None = None,
+        expected_observation: SessionObservation | None = None,
+        expected_binding_epoch: int | None = None,
+        expected_revision: int | None = None,
+        starts_new_turn: bool = False,
+    ) -> SessionObservation | None:
+        """Record a normal edge, optionally promoting a captured cached observation.
+
+        Revision advances for a changed status, response, error, or recovery from
+        an owned failure. Duplicate observations retain their canonical revision.
+        A promotion accepts only the complete expected observation or its exact
+        already-persisted observation ID. It never bumps ``updated_at``.
+        Trusted setup failures may start a new response only with an exact captured fence.
+        """
+        ...
+
+    @abstractmethod
+    def record_runner_offline_decision(
+        self, conversation_id: str, decision: RunnerOfflineDecision
+    ) -> RecordedRunnerOfflineDecision | None:
+        """Record a failure only for the exact current binding and live revision.
+
+        The transaction records metadata only. An existing decision is returned
+        without replacing its cause; publication happens after commit and carries
+        this immutable ownership. A stale or missing observation returns ``None``.
+        """
+        ...
+
+    @abstractmethod
     def settle_intentionally_stopped_session(self, conversation_id: str, runner_id: str) -> bool:
         """Set idle only while this runner still owns a non-failed session.
 
@@ -1570,6 +1635,23 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
+    def settle_stopped_session_observation(
+        self,
+        conversation_id: str,
+        runner_id: str,
+        expected: SessionObservation | None = None,
+    ) -> SessionObservation | None:
+        """Settle non-failed stop intent and return its committed revision."""
+        ...
+
+    @abstractmethod
+    def settle_orphaned_session_observation(
+        self, conversation_id: str, stale_before: int, expected: SessionObservation | None = None
+    ) -> SessionObservation | None:
+        """Settle stale liveness for the captured lifecycle and return its revision."""
+        ...
+
+    @abstractmethod
     def set_pending_elicitation_count(self, conversation_id: str, count: int) -> None:
         """
         Persist the outstanding elicitation count for one session.
@@ -1585,7 +1667,12 @@ class ConversationStore(ABC):
 
     @abstractmethod
     def replace_runner_id(
-        self, conversation_id: str, runner_id: str, *, expected_runner_id: str | None = None
+        self,
+        conversation_id: str,
+        runner_id: str,
+        *,
+        expected_runner_id: str | None = None,
+        expected_observation: SessionObservation | None = None,
     ) -> Conversation:
         """
         Replace ``conversations.runner_id`` for a conversation.
@@ -1606,6 +1693,8 @@ class ConversationStore(ABC):
             by the route before calling the store.
         :param expected_runner_id: Update only while the old binding matches; otherwise
             return the current conversation unchanged. None means unconditional.
+        :param expected_observation: Require this exact binding epoch and live state;
+            otherwise return the current conversation without changing its binding.
         :returns: The updated :class:`Conversation`.
         :raises ConversationNotFoundError: If no conversation row
             with ``conversation_id`` exists.

@@ -45,6 +45,136 @@ const DEFAULT_FILTERS = { searchQuery: "", includeArchived: false };
 const NO_ACTIVE = undefined;
 
 describe("mergeItemsIntoPages", () => {
+  it("rejects stale lifecycle in a WS snapshot while retaining independent metadata", () => {
+    const observation = {
+      runner_id: "B",
+      binding_epoch: 2,
+      revision: 5,
+      observation_id: "new",
+      status: "running",
+      response_id: "new_turn",
+      error_key: null,
+    };
+    const before = data([
+      conv("a", {
+        status: "running",
+        runner_id: "B",
+        host_id: "host_B",
+        host_online: true,
+        runner_online: false,
+        session_observation: observation,
+        labels: { project: "old" },
+        pending_elicitations_count: 1,
+      }),
+    ]);
+    const { data: after } = mergeItemsIntoPages(
+      before,
+      new Map([
+        [
+          "a",
+          {
+            id: "a",
+            status: "failed",
+            runner_id: "A",
+            host_id: "host_A",
+            host_online: false,
+            runner_online: true,
+            title: "New title",
+            labels: { project: "new", "omnigent.last_task_error_code": "runner_disconnected" },
+            pending_elicitations_count: 0,
+            session_observation: { ...observation, binding_epoch: 1, revision: 4 },
+            runner_offline_episode_id: "old_outage",
+          } as SessionListWireItem,
+        ],
+      ]),
+      DEFAULT_FILTERS,
+      NO_ACTIVE,
+    );
+    expect(after!.pages[0].data[0]).toMatchObject({
+      status: "running",
+      runner_id: "B",
+      host_id: "host_B",
+      host_online: true,
+      runner_online: false,
+      title: "New title",
+      labels: { project: "new" },
+      pending_elicitations_count: 1,
+      session_observation: observation,
+    });
+    expect(after!.pages[0].data[0].labels).not.toHaveProperty("omnigent.last_task_error_code");
+  });
+
+  it("accepts metadata-only label updates without clearing a versioned owned error", () => {
+    const before = data([
+      conv("a", {
+        status: "failed",
+        session_observation: {
+          runner_id: "A",
+          binding_epoch: 1,
+          revision: 4,
+          observation_id: "old",
+          status: "running",
+          response_id: "old_turn",
+          error_key: null,
+        },
+        runner_offline_episode_id: "outage",
+        labels: { "omnigent.last_task_error_code": "runner_disconnected" },
+      }),
+    ]);
+    const { data: after } = mergeItemsIntoPages(
+      before,
+      new Map([
+        [
+          "a",
+          {
+            id: "a",
+            title: "Renamed",
+            labels: { project: "new" },
+          },
+        ],
+      ]),
+      DEFAULT_FILTERS,
+      NO_ACTIVE,
+    );
+    expect(after!.pages[0].data[0]).toMatchObject({
+      status: "failed",
+      title: "Renamed",
+      labels: {
+        project: "new",
+        "omnigent.last_task_error_code": "runner_disconnected",
+      },
+      runner_offline_episode_id: "outage",
+    });
+  });
+
+  it("keeps cache identity for an identical parsed observation snapshot", () => {
+    const observation = {
+      runner_id: "A",
+      binding_epoch: 1,
+      revision: 4,
+      observation_id: "old",
+      status: "running",
+      response_id: "old_turn",
+      error_key: null,
+    };
+    const before = data([conv("a", { session_observation: observation })]);
+    const { data: after } = mergeItemsIntoPages(
+      before,
+      new Map([
+        [
+          "a",
+          {
+            id: "a",
+            session_observation: { ...observation },
+          },
+        ],
+      ]),
+      DEFAULT_FILTERS,
+      NO_ACTIVE,
+    );
+    expect(after).toBe(before);
+  });
+
   it("overlays changed fields onto the matching row", () => {
     const before = data([conv("a", { status: "idle", title: "old" }), conv("b")]);
     const items = new Map<string, SessionListWireItem>([

@@ -1,3 +1,5 @@
+import { parseSessionObservation, type SessionObservation } from "@/lib/sessionObservation";
+
 import { useContext, useEffect, useRef } from "react";
 import { useViewerId } from "./useViewerId";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
@@ -27,6 +29,7 @@ import {
   useQuery,
   useQueryClient,
   type QueryClient,
+  type InfiniteData,
 } from "@tanstack/react-query";
 import { authenticatedFetch, getCurrentUserId } from "@/lib/identity";
 import { filterSessionScope, sessionVisibility } from "@/lib/sessionVisibility";
@@ -37,6 +40,7 @@ import {
   insertNewRowsIntoPages,
   markRecentlyCreated,
   mergeItemsIntoPages,
+  mergeSessionListProjection,
   overlayArchivedIntoCaches,
   overlayTitleIntoCaches,
   PIN_WRITE_MUTATION_KEY,
@@ -151,6 +155,8 @@ export class BulkConversationMutationError extends Error {
 /** Mirrors the server's `SessionListItem` / `ConversationObject` shape. */
 export interface Conversation {
   id: string;
+  session_observation?: SessionObservation | null;
+  runner_offline_episode_id?: string | null;
   object: "conversation";
   title: string | null;
   created_at: number;
@@ -481,7 +487,10 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
   // enter client state only through here, and terminal-attach / session-scoped
   // requests key their slice off this map — so record the host before returning
   // the row, or those requests fall back to the modal and can miss the replica.
-  setSessionHost(wire.id, sessionRoutingHostId(wire.host_id, wire.labels));
+  setSessionHost(wire.id, sessionRoutingHostId(wire.host_id, wire.labels), {
+    observation: parseSessionObservation(wire.session_observation),
+    episodeId: wire.runner_offline_episode_id,
+  });
   setSessionParent(wire.id, wire.parent_session_id, wire.labels);
   return {
     id: wire.id,
@@ -499,6 +508,8 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     agent_name: wire.agent_name ?? null,
     pending_elicitations_count: wire.pending_elicitations_count ?? 0,
     status: wire.status ?? "idle",
+    session_observation: parseSessionObservation(wire.session_observation),
+    runner_offline_episode_id: wire.runner_offline_episode_id ?? null,
     runner_online: wire.runner_online ?? undefined,
     host_online: wire.host_online ?? undefined,
     git_branch: wire.git_branch ?? null,
@@ -562,10 +573,13 @@ export async function fetchConversationsPage({
   // than whichever single session happened to be fetched individually first;
   // (2) a session-scoped request (`/v1/sessions/{id}/*`) issued before that
   // session's own snapshot loads still keys to the right replica instead of
-  // falling back to the modal. host_id is fixed for a session's life, so this
-  // can't seed a stale value; a hostless row clears any prior mapping.
+  // falling back to the modal. The observation fence rejects stale bindings;
+  // a current hostless row clears any prior mapping.
   for (const row of page.data) {
-    setSessionHost(row.id, sessionRoutingHostId(row.host_id, row.labels));
+    setSessionHost(row.id, sessionRoutingHostId(row.host_id, row.labels), {
+      observation: parseSessionObservation(row.session_observation),
+      episodeId: row.runner_offline_episode_id,
+    });
     setSessionParent(row.id, row.parent_session_id, row.labels);
   }
   return applySessionTombstones(
@@ -630,6 +644,31 @@ export async function timeInitialConversationLoad(
   }
 }
 
+/** Keep lifecycle versions learned while an older list request was in flight. */
+export function mergeConversationLifecycle(
+  previous: Conversation | undefined,
+  incoming: Conversation,
+): Conversation {
+  if (!previous) return incoming;
+  return { ...previous, ...mergeSessionListProjection(previous, incoming) };
+}
+
+function mergeConversationPages(
+  previous: InfiniteData<ConversationsPage> | undefined,
+  incoming: InfiniteData<ConversationsPage>,
+): InfiniteData<ConversationsPage> {
+  const known = new Map(
+    previous?.pages.flatMap((page) => page.data.map((row) => [row.id, row] as const)),
+  );
+  return {
+    ...incoming,
+    pages: incoming.pages.map((page) => ({
+      ...page,
+      data: page.data.map((row) => mergeConversationLifecycle(known.get(row.id), row)),
+    })),
+  };
+}
+
 export function useConversations(
   searchQuery = "",
   includeArchived = false,
@@ -663,6 +702,11 @@ export function useConversations(
           : ["conversations", searchQuery, includeArchived];
   const query = useInfiniteQuery({
     queryKey,
+    structuralSharing: (previous, incoming) =>
+      mergeConversationPages(
+        previous as InfiniteData<ConversationsPage> | undefined,
+        incoming as InfiniteData<ConversationsPage>,
+      ),
     queryFn: async ({ pageParam }) => {
       const fetchPage = () =>
         fetchConversationsPage({
@@ -1708,6 +1752,17 @@ export function usePinnedConversations(sharedEnabled = true, limit = sidebarConf
   const query = useQuery<PinnedConversationsResult>({
     queryKey: PINNED_CONVERSATIONS_KEY,
     queryFn: () => fetchPinnedConversations(sharedEnabled, limit),
+    structuralSharing: (previous, incoming) => {
+      const old = previous as PinnedConversationsResult | undefined;
+      const next = incoming as PinnedConversationsResult;
+      const known = new Map(old?.conversations.map((row) => [row.id, row]));
+      return {
+        ...next,
+        conversations: next.conversations.map((row) =>
+          mergeConversationLifecycle(known.get(row.id), row),
+        ),
+      };
+    },
     select: (data) =>
       sharedEnabled
         ? data
@@ -2545,6 +2600,11 @@ export function useProjectSessions(
     queryKey,
     queryFn: ({ pageParam }) =>
       fetchProjectSessionsPage(project, pageParam as string | undefined, 20, sortBy),
+    structuralSharing: (previous, incoming) =>
+      mergeConversationPages(
+        previous as InfiniteData<ConversationsPage> | undefined,
+        incoming as InfiniteData<ConversationsPage>,
+      ),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>
       lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,

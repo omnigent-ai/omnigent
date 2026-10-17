@@ -31,7 +31,9 @@ from omnigent.entities import (
     FunctionCallOutputData,
     MessageData,
     NewConversationItem,
+    ResourceEventData,
 )
+from omnigent.entities.session_observation import RunnerOfflineDecision
 from omnigent.repl._session_log import (
     DEFAULT_LOG_DIR,
     default_log_path,
@@ -236,6 +238,56 @@ def test_write_session_log_from_store_pages_long_conversations(
     assert last_text == "msg-149", (
         f"Last item should be 'msg-149' (most recent), got {last_text!r}."
     )
+
+
+def test_store_log_follows_empty_page_of_stale_owned_child_activity(
+    db_uri: str, tmp_path: Path
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(parent_conversation_id=parent.id, runner_id="runner_a")
+    observation = store.record_session_observation(child.id, "running", response_id="old_turn")
+    assert observation is not None
+    decision = RunnerOfflineDecision(
+        observation=observation,
+        episode_id="offline_1",
+        error_labels={"omnigent.last_task_error_code": "runner_disconnected"},
+    )
+    assert store.record_runner_offline_decision(child.id, decision) is not None
+    markers = [
+        NewConversationItem(
+            type="resource_event",
+            response_id="old_turn",
+            data=ResourceEventData(
+                event_type="session.subagent.returned",
+                resource_id=child.id,
+                resource_type="session",
+                resource={
+                    "status": "failed",
+                    "session_observation": observation.model_dump(),
+                    "runner_offline_episode_id": decision.episode_id,
+                },
+            ),
+        )
+        for _ in range(100)
+    ]
+    for start in range(0, len(markers), 50):
+        store.append(parent.id, markers[start : start + 50])
+    tail = store.append(
+        parent.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="next_turn",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "kept"}]),
+            )
+        ],
+    )[0]
+    store.replace_runner_id(child.id, "runner_b")
+
+    path = write_session_log_from_store(store, parent.id, agent_name="test", log_dir=tmp_path)
+    items = json.loads(path.read_text())["conversation"]["items"]
+    assert [item["id"] for item in items] == [tail.id]
 
 
 # ── 3. Sub-agent children walk ────────────────────────────

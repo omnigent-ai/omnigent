@@ -40,9 +40,11 @@ import pytest
 from omnigent_client._errors import OmnigentError
 from omnigent_client._sessions import (
     Session,
+    SessionListItem,
     SessionsNamespace,
 )
 
+from omnigent.entities.session_observation import SessionObservation
 from omnigent.server.schemas import (
     CompletedEvent,
     OutputTextDeltaEvent,
@@ -51,6 +53,33 @@ from omnigent.server.schemas import (
 )
 
 # ── Helpers ───────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("snapshot_type", [Session, SessionListItem])
+def test_session_snapshots_preserve_projection_ownership(
+    snapshot_type: type[Session] | type[SessionListItem],
+) -> None:
+    """Full and list snapshots retain the ordering fence without requiring new wire fields."""
+    raw = {
+        "id": "conv_abc",
+        "agent_id": "ag_abc",
+        "status": "failed",
+        "created_at": 1,
+        "updated_at": 2,
+    }
+    legacy = snapshot_type.from_dict(raw)
+    assert legacy.session_observation is None
+    assert legacy.runner_offline_episode_id is None
+    observation = SessionObservation(runner_id="runner_a", binding_epoch=3, revision=4)
+    owned = snapshot_type.from_dict(
+        {
+            **raw,
+            "session_observation": observation.model_dump(),
+            "runner_offline_episode_id": "offline_1",
+        }
+    )
+    assert owned.session_observation == observation
+    assert owned.runner_offline_episode_id == "offline_1"
 
 
 def _make_namespace(
@@ -677,6 +706,57 @@ async def test_stream_skips_malformed_and_unknown_events() -> None:
     assert len(events) == 1
     assert isinstance(events[0], OutputTextDeltaEvent)
     assert events[0].delta == "ok"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "response.error",
+        "session.terminal_pending",
+        "response.completed",
+        "response.output_text.delta",
+    ],
+)
+async def test_stream_preserves_signal_defaults_and_skips_malformed_ownership(kind: str) -> None:
+    if kind == "response.error":
+        base = {
+            "type": kind,
+            "source": "execution",
+            "error": {"code": "boot", "message": "failed"},
+        }
+    elif kind == "session.terminal_pending":
+        base = {"type": kind, "conversation_id": "conv_abc", "pending": False}
+    elif kind == "response.output_text.delta":
+        base = {"type": kind, "delta": "denied input"}
+    else:
+        base = {"type": kind, "response": _completed_response_dict()}
+    zero = SessionObservation(runner_id="runner-a").model_dump()
+    payloads = [
+        (kind, {**base, "session_observation": None, "runner_offline_episode_id": None}),
+        (kind, {**base, "session_observation": zero}),
+        (kind, {**base, "session_observation": {**zero, "binding_epoch": -1}}),
+        (kind, {**base, "session_observation": "invalid"}),
+        ("response.output_text.delta", {"type": "response.output_text.delta", "delta": "kept"}),
+        ("done", "[DONE]"),
+    ]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=_format_sse_lines(payloads),
+            headers={"content-type": "text/event-stream"},
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        events = [event async for event in ns.stream("conv_abc")]
+    finally:
+        await client.aclose()
+    assert len(events) == 3
+    assert events[0].session_observation is None
+    assert events[1].session_observation == SessionObservation.model_validate(zero)
+    assert isinstance(events[2], OutputTextDeltaEvent) and events[2].delta == "kept"
 
 
 @pytest.mark.asyncio

@@ -1,3 +1,5 @@
+import type { SessionObservation } from "./sessionObservation";
+
 // Mirrors the response/error/usage types in
 // sdks/python-client/omnigent_client/_types.py.
 //
@@ -314,6 +316,8 @@ export interface Session {
    */
   archived?: boolean;
   status: SessionStatus;
+  sessionObservation?: SessionObservation | null;
+  runnerOfflineEpisodeId?: string | null;
   /**
    * Background shells (claude-native) still running as of the last status
    * edge, so a reload re-shows "N background tasks still running" even though the

@@ -28,7 +28,9 @@ from typing import Any, Literal
 
 import pytest
 
-from omnigent.runtime import session_stream
+from omnigent.db.db_models import workspace_scope
+from omnigent.entities.session_observation import SessionObservation
+from omnigent.runtime import inflight_text, session_stream
 
 
 # Each test resets the global subscriber registry so cross-test leak
@@ -43,8 +45,12 @@ def _clean_session_stream_registry() -> None:
     of every later test by retaining the leak's slot.
     """
     session_stream._subscribers.clear()
+    session_stream.reset_observation_floors()
+    inflight_text.reset_for_tests()
     yield
     session_stream._subscribers.clear()
+    session_stream.reset_observation_floors()
+    inflight_text.reset_for_tests()
 
 
 async def _collect(conv_id: str, expected: int) -> list[dict[str, Any]]:
@@ -1299,3 +1305,280 @@ def test_failed_event_logs_omit_unrecognized_sources(
     for record in [*sse_records, *audit_records]:
         assert record.attributes["error_code"] == "failed"
         assert "error_source" not in record.attributes
+
+
+def _owned_observation(epoch: int, response_id: str = "response") -> SessionObservation:
+    return SessionObservation(
+        runner_id=f"runner-{epoch}",
+        binding_epoch=epoch,
+        revision=1,
+        observation_id=f"observation-{epoch}",
+        status="running",
+        response_id=response_id,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stale_type", ["response.failed", "response.output_text.delta", "response.in_progress"]
+)
+async def test_owned_publication_cannot_rewind_replay_or_live_tail(stale_type: str) -> None:
+    cid = "owned-stream"
+    old, current = _owned_observation(1, "old"), _owned_observation(2, "current")
+    header = {
+        "type": "response.in_progress",
+        "response": {"id": "current"},
+        "session_observation": current.model_dump(),
+    }
+    text = {
+        "type": "response.output_text.delta",
+        "delta": "current prefix",
+        "session_observation": current.model_dump(),
+    }
+    sentinel = {"type": "marker"}
+    task = asyncio.create_task(_collect(cid, expected=3))
+    await asyncio.sleep(0)
+    session_stream.publish(cid, header)
+    session_stream.publish(cid, text)
+    stale = {
+        "type": stale_type,
+        "response": {"id": "old"},
+        "delta": "stale prefix",
+        "session_observation": old.model_dump(),
+    }
+    assert session_stream.publish(cid, stale) == 0
+    session_stream.publish(cid, sentinel)
+    assert await asyncio.wait_for(task, 2) == [header, text, sentinel]
+    replay = inflight_text.snapshot_for(cid)
+    assert replay[0]["response"]["id"] == "current"
+    assert replay[-1]["delta"] == "current prefix"
+
+
+def test_learned_snapshot_fence_precedes_the_next_response_header() -> None:
+    cid = "hydrated-stream"
+    old, current = _owned_observation(1), _owned_observation(2)
+    assert session_stream.learn_observation(cid, current)
+    assert not session_stream.learn_observation(cid, old)
+    session_stream.publish(
+        cid,
+        {
+            "type": "response.in_progress",
+            "response": {"id": "old"},
+            "session_observation": old.model_dump(),
+        },
+    )
+    session_stream.publish(cid, {"type": "response.output_text.delta", "delta": "legacy"})
+    assert inflight_text.snapshot_for(cid) == [
+        {"type": "response.output_text.delta", "delta": "legacy"}
+    ]
+
+
+def test_owned_reset_preserves_same_response_id_after_a_binding_change() -> None:
+    cid = "same-response-reset"
+    old, current = _owned_observation(1), _owned_observation(2)
+    session_stream.publish(
+        cid,
+        {
+            "type": "response.in_progress",
+            "response": {"id": "response"},
+            "session_observation": current.model_dump(),
+        },
+    )
+    session_stream.publish(cid, {"type": "response.output_text.delta", "delta": "current"})
+    assert not session_stream.reset_inflight_text(cid, response_id="response", observation=old)
+    assert inflight_text.snapshot_for(cid)[-1]["delta"] == "current"
+    assert session_stream.reset_inflight_text(cid, response_id="response", observation=current)
+    assert inflight_text.snapshot_for(cid) == []
+
+
+def test_legacy_reset_and_source_logging_remain_compatible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cid = "legacy-stream-reset"
+    current, old = _owned_observation(2), _owned_observation(1)
+    assert session_stream.learn_observation(cid, current)
+    logged: list[dict[str, Any]] = []
+    monkeypatch.setattr(session_stream, "_log_sse_event", lambda _cid, event: logged.append(event))
+    stale = {"type": "response.failed", "session_observation": old.model_dump()}
+    assert session_stream.publish(cid, stale) == 0
+    assert logged == [stale]
+    session_stream.publish(cid, {"type": "response.output_text.delta", "delta": "legacy"})
+    assert inflight_text.snapshot_for(cid)
+    assert session_stream.reset_inflight_text(cid)
+    assert inflight_text.snapshot_for(cid) == []
+
+
+def test_stream_observation_floors_are_workspace_scoped() -> None:
+    cid = "colliding-conversation"
+    with workspace_scope(1):
+        assert session_stream.learn_observation(cid, _owned_observation(9))
+    with workspace_scope(2):
+        assert session_stream.learn_observation(cid, _owned_observation(1))
+        session_stream.publish(
+            cid,
+            {
+                "type": "response.in_progress",
+                "response": {"id": "workspace-two"},
+                "session_observation": _owned_observation(1).model_dump(),
+            },
+        )
+        session_stream.publish(cid, {"type": "response.output_text.delta", "delta": "two"})
+        assert inflight_text.snapshot_for(cid)[-1]["delta"] == "two"
+    with workspace_scope(1):
+        assert not session_stream.learn_observation(cid, _owned_observation(1))
+        assert inflight_text.snapshot_for(cid) == []
+
+
+@pytest.mark.parametrize("annotation", ["invalid", {"binding_epoch": "2"}, {"revision": -1}])
+def test_malformed_explicit_annotation_does_not_change_replay(annotation: object) -> None:
+    cid = "malformed-stream-owner"
+    session_stream.publish(
+        cid, {"type": "response.output_text.delta", "delta": "kept", "session_observation": None}
+    )
+    assert (
+        session_stream.publish(cid, {"type": "response.failed", "session_observation": annotation})
+        == 0
+    )
+    assert inflight_text.snapshot_for(cid)[-1]["delta"] == "kept"
+
+
+def test_owned_discard_preserves_replacement_native_and_response_text() -> None:
+    cid = "owned-replay-discard"
+    old, current = _owned_observation(1), _owned_observation(2)
+    session_stream.publish(
+        cid,
+        {
+            "type": "response.in_progress",
+            "response": {"id": "response"},
+            "session_observation": current.model_dump(),
+        },
+    )
+    session_stream.publish(cid, {"type": "response.output_text.delta", "delta": "current"})
+    session_stream.publish(
+        cid,
+        {
+            "type": "response.output_text.delta",
+            "delta": "native current",
+            "message_id": "native-b",
+            "index": 0,
+        },
+    )
+    before = inflight_text.snapshot_for(cid)
+    assert not session_stream.discard_inflight_text(cid, observation=old)
+    assert inflight_text.snapshot_for(cid) == before
+    assert session_stream.discard_inflight_text(cid, observation=current)
+    assert inflight_text.snapshot_for(cid) == []
+    session_stream.publish(cid, {"type": "response.output_text.delta", "delta": "legacy"})
+    assert session_stream.discard_inflight_text(cid)
+    assert inflight_text.snapshot_for(cid) == []
+
+
+def test_normal_cleanup_cannot_remove_a_derived_failure_with_the_same_observation() -> None:
+    cid = "derived-failure-cleanup"
+    owner = _owned_observation(1)
+    session_stream.publish(
+        cid,
+        {
+            "type": "response.in_progress",
+            "response": {"id": "response"},
+            "session_observation": owner.model_dump(),
+        },
+    )
+    session_stream.publish(cid, {"type": "response.output_text.delta", "delta": "kept prefix"})
+    assert session_stream.learn_observation(cid, owner, "offline-episode")
+    assert not session_stream.reset_inflight_text(cid, response_id="response", observation=owner)
+    assert not session_stream.discard_inflight_text(cid, observation=owner)
+    assert inflight_text.snapshot_for(cid)[-1]["delta"] == "kept prefix"
+    assert session_stream.reset_inflight_text(
+        cid,
+        response_id="response",
+        observation=owner,
+        runner_offline_episode_id="offline-episode",
+    )
+    assert inflight_text.snapshot_for(cid) == []
+
+
+@pytest.mark.parametrize("include_observation", [True, False])
+def test_orphan_episode_does_not_become_legacy_cleanup(include_observation: bool) -> None:
+    cid = "orphan-episode"
+    session_stream.publish(cid, {"type": "response.output_text.delta", "delta": "kept"})
+    event: dict[str, Any] = {
+        "type": "response.failed",
+        "runner_offline_episode_id": "offline-episode",
+    }
+    if include_observation:
+        event["session_observation"] = None
+    assert session_stream.publish(cid, event) == 0
+    assert inflight_text.snapshot_for(cid)[-1]["delta"] == "kept"
+    session_stream.publish(
+        cid,
+        {
+            "type": "response.failed",
+            "session_observation": None,
+            "runner_offline_episode_id": None,
+        },
+    )
+    assert inflight_text.snapshot_for(cid) == []
+
+
+@pytest.mark.parametrize("rejected_owner", ["stale", "malformed", "orphan_episode"])
+def test_disconnect_observer_only_receives_accepted_stream_events(
+    monkeypatch: pytest.MonkeyPatch, rejected_owner: str
+) -> None:
+    cid = "outcome-stream-fence"
+    current = _owned_observation(2)
+    assert session_stream.learn_observation(cid, current)
+    observed: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        session_stream.disconnect_outcome,
+        "observe_event",
+        lambda session_id, event: observed.append((session_id, event)),
+    )
+    rejected: dict[str, Any] = {"type": "response.output_text.delta", "delta": "rejected"}
+    if rejected_owner == "stale":
+        rejected["session_observation"] = _owned_observation(1).model_dump()
+    elif rejected_owner == "malformed":
+        rejected["session_observation"] = {"revision": -1}
+    else:
+        rejected["runner_offline_episode_id"] = "orphan"
+    assert session_stream.publish(cid, rejected) == 0
+    assert observed == []
+
+    accepted = {
+        "type": "response.output_text.delta",
+        "delta": "accepted",
+        "session_observation": current.model_dump(),
+    }
+    session_stream.publish(cid, accepted)
+    assert observed == [(cid, accepted)]
+
+
+def test_disconnect_observer_uses_reconciled_live_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    cid = "outcome-stream-reconciliation"
+    committed = {
+        "type": "response.output_item.done",
+        "item": {
+            "type": "message",
+            "role": "assistant",
+            "id": "committed",
+            "content": [{"type": "output_text", "text": "OK"}],
+        },
+    }
+    hidden = {
+        "type": "response.output_text.delta",
+        "delta": "OK",
+        "message_id": "native-message",
+        "index": 0,
+    }
+    divergent = {**hidden, "delta": " then", "index": 1}
+    observed: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        session_stream.disconnect_outcome,
+        "observe_event",
+        lambda session_id, event: observed.append((session_id, event)),
+    )
+    session_stream.publish(cid, committed)
+    assert session_stream.publish(cid, hidden) == 0
+    assert observed == [(cid, committed)]
+    session_stream.publish(cid, divergent)
+    assert observed == [(cid, committed), (cid, {**divergent, "delta": "OK then"})]

@@ -32,6 +32,7 @@ import yaml
 
 from omnigent.entities import Conversation
 from omnigent.entities.conversation import MessageData, NewConversationItem
+from omnigent.entities.session_observation import SessionObservation
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes.sessions import routes_events as routes_events_module
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -695,15 +696,18 @@ async def test_child_status_edge_fans_out_to_parent_stream(
     )
     collector = await start_session_stream_collector(session["id"])
     try:
-        sessions_module._publish_status(child.id, "running")
-        sessions_module._publish_status(child.id, "running")
-        sessions_module._publish_status(child.id, "idle")
-
         updates: list[dict[str, Any]] = []
-        while len(updates) < 2:
-            event = await asyncio.wait_for(collector.queue.get(), timeout=5.0)
-            if event.get("type") == "session.child_session.updated":
-                updates.append(event)
+        for status in ("running", "idle"):
+            status_write = sessions_module._publish_status(child.id, status)
+            if status == "running":
+                sessions_module._publish_status(child.id, status)
+            if status_write is not None:
+                await asyncio.wrap_future(status_write)
+            while True:
+                event = await asyncio.wait_for(collector.queue.get(), timeout=5.0)
+                if event.get("type") == "session.child_session.updated":
+                    updates.append(event)
+                    break
         assert [u["child_session_id"] for u in updates] == [child.id, child.id]
         assert [u["conversation_id"] for u in updates] == [session["id"]] * 2
         assert updates[0]["child"]["busy"] is True
@@ -1511,6 +1515,7 @@ async def test_subagent_create_ignores_caller_supplied_launch_args(
 )
 async def test_native_subagent_message_uses_native_terminal_forward(
     client: httpx.AsyncClient,
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     harness: str,
     expected_wrapper: str,
@@ -1528,6 +1533,7 @@ async def test_native_subagent_message_uses_native_terminal_forward(
     writer for conversation items.
 
     :param client: Test HTTP client.
+    :param db_uri: Per-test database for observing committed startup ownership.
     :param monkeypatch: Pytest monkeypatch fixture.
     :param harness: Native harness declared by the sub-agent spec,
         e.g. ``"claude-native"``.
@@ -1557,6 +1563,8 @@ async def test_native_subagent_message_uses_native_terminal_forward(
     assert child["labels"].get("omnigent.wrapper") == expected_wrapper
 
     forwarded: list[dict[str, Any]] = []
+    startup_observations: list[SessionObservation] = []
+    store = SqlAlchemyConversationStore(db_uri)
 
     def _handler(request: httpx.Request) -> httpx.Response:
         """
@@ -1571,6 +1579,13 @@ async def test_native_subagent_message_uses_native_terminal_forward(
                 "body": json.loads(request.content),
             }
         )
+        if request.url.path.endswith("/resources/terminals"):
+            pending = store.get_conversation(child["id"])
+            assert pending is not None and pending.terminal_pending
+            assert forwarded[-1]["body"]["session_observation"] == (
+                pending.session_observation.model_dump(mode="json")
+            )
+            startup_observations.append(pending.session_observation)
         return httpx.Response(204)
 
     fake_runner = httpx.AsyncClient(
@@ -1623,6 +1638,7 @@ async def test_native_subagent_message_uses_native_terminal_forward(
 
     parent_agent = get_agent_store().get(parent["agent_id"])
     assert parent_agent is not None
+    [startup] = startup_observations
     assert forwarded == [
         {
             "path": f"/v1/sessions/{child['id']}/resources/terminals",
@@ -1631,6 +1647,7 @@ async def test_native_subagent_message_uses_native_terminal_forward(
                 "session_key": "main",
                 "ensure_native_terminal": True,
                 "persist_resource_event": True,
+                "session_observation": startup.model_dump(mode="json"),
             },
         },
         {

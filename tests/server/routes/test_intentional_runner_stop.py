@@ -24,6 +24,21 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 _RUNNER = "runner-stopped"
 
 
+def _raw_last_error_code(store: SqlAlchemyConversationStore, conversation_id: str) -> str | None:
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlConversationLabel, current_workspace_id
+
+    with store._conv_session("inspect_preserved_error_history") as session:
+        return session.scalar(
+            select(SqlConversationLabel.value).where(
+                SqlConversationLabel.workspace_id == current_workspace_id(),
+                SqlConversationLabel.conversation_id == conversation_id,
+                SqlConversationLabel.key == "omnigent.last_task_error_code",
+            )
+        )
+
+
 @pytest.fixture
 def family(
     db_uri: str, monkeypatch: pytest.MonkeyPatch
@@ -75,8 +90,10 @@ async def test_host_stop_ack_settles_late_native_activity(
         # The relay ends before the native status forwarder finishes shutting down.
         sessions._intentional_stop_sessions.pop(child_id, None)
         helpers._publish_status(child_id, "idle")
-        helpers._publish_status(child_id, "running")
+        running = helpers._publish_status(child_id, "running")
         if handoff == "rebound":
+            assert running is not None
+            await asyncio.wrap_future(running)
             store.replace_runner_id(child_id, "runner-replacement")
         elif handoff == "failed":
             helpers._publish_status(child_id, "failed")
@@ -102,6 +119,80 @@ async def test_host_stop_ack_settles_late_native_activity(
                 store.get_conversation(child_id).labels
             )
     finally:
+        await asyncio.wrap_future(session_live_state.submit("drain_test_writes", lambda: None))
+        session_live_state.configure(None)
+
+
+async def test_stop_ack_preserves_replacement_turn_during_an_old_status_write(
+    family: tuple[SqlAlchemyConversationStore, dict[str, str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, ids = family
+    child_id = ids["active"]
+    session_live_state.configure(store)
+    entered, release = threading.Event(), threading.Event()
+    record = store.record_session_observation
+    old_results = []
+    replacement = None
+
+    def hold_old_activity(session_id, status, **kwargs):
+        owner = kwargs.get("expected_observation")
+        old_activity = (
+            session_id == child_id
+            and status == "running"
+            and owner is not None
+            and owner.runner_id == _RUNNER
+        )
+        if old_activity:
+            entered.set()
+            assert release.wait(5)
+        result = record(session_id, status, **kwargs)
+        if old_activity:
+            old_results.append(result)
+        return result
+
+    async def teardown(*_args, **_kwargs):
+        nonlocal replacement
+        sessions._intentional_stop_sessions.pop(child_id, None)
+        idle = helpers._publish_status(child_id, "idle")
+        assert idle is not None
+        owner = await asyncio.wrap_future(idle)
+        assert owner is not None
+        helpers._publish_status(child_id, "running", owner=owner)
+        assert await asyncio.to_thread(entered.wait, 5)
+        store.replace_runner_id(child_id, "runner-replacement")
+        rebound = store.get_session_observation(child_id)
+        assert rebound is not None
+        replacement = record(
+            child_id,
+            "running",
+            response_id="replacement-turn",
+            expected_observation=rebound,
+            starts_new_turn=True,
+        )
+        assert replacement is not None
+        helpers._publish_status(
+            child_id,
+            "running",
+            response_id="replacement-turn",
+            persist_live_status=False,
+            session_observation=replacement,
+        )
+        release.set()
+        return True
+
+    monkeypatch.setattr(store, "record_session_observation", hold_old_activity)
+    monkeypatch.setattr(sessions, "_stop_session_host_runner", teardown)
+    try:
+        assert await orchestration._stop_host_runner_intentionally(
+            ids["parent"], "host", _RUNNER, None, store
+        )
+        await asyncio.wrap_future(session_live_state.submit("drain_test_writes", lambda: None))
+        assert old_results == [None]
+        assert store.get_session_observation(child_id) == replacement
+        assert sessions._session_status_cache[child_id] == "running"
+    finally:
+        release.set()
         await asyncio.wrap_future(session_live_state.submit("drain_test_writes", lambda: None))
         session_live_state.configure(None)
 
@@ -249,7 +340,10 @@ async def test_disconnect_sweep_settles_children_without_relays_and_consumes_int
     assert sessions._session_status_cache[ids["failed"]] == "failed"
 
     # A later active turn losing its runner must still report the genuine failure.
-    sessions._session_status_cache[ids["active"]] = "running"
+    current = store.record_session_observation(ids["active"], "running", response_id="next-turn")
+    helpers._publish_status(
+        ids["active"], "running", persist_live_status=False, session_observation=current
+    )
     await sessions._mark_runner_sessions_offline(
         [store.get_conversation(ids["active"])], error, store
     )
@@ -425,8 +519,10 @@ async def test_unconsumed_stop_expires_before_a_later_disconnect(
     assert ids["cold"] not in sessions._intentional_stop_sessions
 
     # A later turn must still report a real disconnect after Stop's intent expires.
-    store.set_session_live_status(ids["cold"], "running")
-    sessions._session_status_cache[ids["cold"]] = "running"
+    current = store.record_session_observation(ids["cold"], "running", response_id="next-turn")
+    helpers._publish_status(
+        ids["cold"], "running", persist_live_status=False, session_observation=current
+    )
     error = ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly.")
     await sessions._mark_runner_sessions_offline(
         [store.get_conversation(ids["cold"])], error, store
@@ -620,7 +716,21 @@ async def test_old_runner_sweep_preserves_rebound_session(
         after = store.get_conversation(child_id)
         assert after.runner_id == "runner-replacement"
         assert after.live_status == "running"
-        assert after.labels["omnigent.last_task_error_code"] == "replacement_error"
+        assert sessions._last_task_error_from_labels(after.labels) is None
+        from sqlalchemy import select
+
+        from omnigent.db.db_models import SqlConversationLabel
+
+        with store._conv_session("inspect_preserved_replacement_labels") as session:
+            assert (
+                session.scalar(
+                    select(SqlConversationLabel.value).where(
+                        SqlConversationLabel.conversation_id == child_id,
+                        SqlConversationLabel.key == "omnigent.last_task_error_code",
+                    )
+                )
+                == "replacement_error"
+            )
         if stopped_runner == _RUNNER:
             assert child_id not in sessions._intentional_stop_sessions
             # The old stop must not suppress a real crash of the replacement.
@@ -690,7 +800,7 @@ async def test_offline_sweep_retries_a_transient_settlement_write(
     store, ids = family
     child_id = ids["active"]
     snapshot = store.get_conversation(child_id)
-    settle = store.settle_intentionally_stopped_session
+    settle = store.settle_stopped_session_observation
     failed = threading.Event()
     sessions._intentional_stop_sessions[child_id] = _RUNNER
 
@@ -700,7 +810,7 @@ async def test_offline_sweep_retries_a_transient_settlement_write(
             raise RuntimeError("metadata write temporarily unavailable")
         return settle(*args)
 
-    monkeypatch.setattr(store, "settle_intentionally_stopped_session", transient_failure)
+    monkeypatch.setattr(store, "settle_stopped_session_observation", transient_failure)
     error = ErrorDetail(code="runner_disconnected", message="Runner disappeared.")
     sweep = asyncio.create_task(sessions._mark_runner_sessions_offline([snapshot], error, store))
     relay = None
@@ -729,7 +839,11 @@ async def test_offline_sweep_retries_a_transient_settlement_write(
         else:
             assert child_id not in sessions._intentional_stop_sessions
         if recovery in {"failed", "rebound"}:
-            assert after.labels["omnigent.last_task_error_code"] == "preserved"
+            assert _raw_last_error_code(store, child_id) == "preserved"
+            if recovery == "failed":
+                assert after.labels["omnigent.last_task_error_code"] == "preserved"
+            else:
+                assert sessions._last_task_error_from_labels(after.labels) is None
         if recovery == "rebound":
             assert after.runner_id == "runner-replacement"
     finally:
@@ -824,7 +938,7 @@ async def test_failed_stop_settlement_preserves_intent_for_safe_reconciliation(
     store, ids = family
     child_id = ids["active"]
     old_row = store.get_conversation(child_id)
-    settle = store.settle_intentionally_stopped_session
+    settle = store.settle_stopped_session_observation
     sessions._intentional_stop_sessions[child_id] = _RUNNER
     attempts = 0
 
@@ -833,7 +947,7 @@ async def test_failed_stop_settlement_preserves_intent_for_safe_reconciliation(
         attempts += 1
         raise RuntimeError("metadata write temporarily unavailable")
 
-    monkeypatch.setattr(store, "settle_intentionally_stopped_session", unavailable)
+    monkeypatch.setattr(store, "settle_stopped_session_observation", unavailable)
     error = ErrorDetail(code="runner_disconnected", message="Runner disappeared.")
     await sessions._mark_runner_sessions_offline([old_row], error, store)
     assert attempts == 3
@@ -841,7 +955,7 @@ async def test_failed_stop_settlement_preserves_intent_for_safe_reconciliation(
     assert sessions._session_status_cache[child_id] == "running"
     assert store.get_conversation(child_id).live_status == "running"
 
-    monkeypatch.setattr(store, "settle_intentionally_stopped_session", settle)
+    monkeypatch.setattr(store, "settle_stopped_session_observation", settle)
     if recovery == "failed":
         store.set_session_live_status(child_id, "failed")
         sessions._session_status_cache[child_id] = "failed"
@@ -856,7 +970,11 @@ async def test_failed_stop_settlement_preserves_intent_for_safe_reconciliation(
     assert sessions._session_status_cache[child_id] == after.live_status
     assert child_id not in sessions._intentional_stop_sessions
     if recovery != "idle":
-        assert after.labels["omnigent.last_task_error_code"] == "preserved"
+        assert _raw_last_error_code(store, child_id) == "preserved"
+        if recovery == "failed":
+            assert after.labels["omnigent.last_task_error_code"] == "preserved"
+        else:
+            assert sessions._last_task_error_from_labels(after.labels) is None
     if recovery == "rebound":
         assert after.runner_id == "runner-replacement"
 

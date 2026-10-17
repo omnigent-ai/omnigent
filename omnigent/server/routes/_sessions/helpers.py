@@ -26,9 +26,10 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
+from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import PurePath
-from typing import Any, Final, Literal, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 import httpx
 from fastapi import (
@@ -39,6 +40,9 @@ from fastapi import (
 from fastapi.responses import Response
 from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError, StatementError
+
+if TYPE_CHECKING:
+    from omnigent.server.runner_session_init import RunnerSessionInitializer
 
 from omnigent.codex_approval_modes import CODEX_NATIVE_PERMISSION_VALUES
 from omnigent.db.utils import generate_task_id
@@ -61,6 +65,12 @@ from omnigent.entities.conversation import (
     parse_item_data,
 )
 from omnigent.entities.permission import SessionPermission
+from omnigent.entities.session_observation import (
+    RunnerOfflineDecision,
+    SessionObservation,
+    accept_session_projection,
+    is_versioned_session_observation,
+)
 from omnigent.errors import (
     SESSION_AGENT_MISSING_MESSAGE,
     ErrorCategory,
@@ -98,6 +108,7 @@ from omnigent.runner.identity import (
 from omnigent.runner.launch_failure import classify_native_turn_error, diagnose_model_unavailable
 from omnigent.runner.routing import RunnerRouter
 from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
+from omnigent.runner.subagent_work import SUBAGENT_DISPATCH_ID_LABEL_KEY
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
 from omnigent.runtime import (
     get_policy_store,
@@ -298,6 +309,7 @@ from omnigent.server.schemas import (
     ToolOutputDeltaEvent,
 )
 from omnigent.server.session_metadata_logging import harness_attributes
+from omnigent.server.session_observations import SessionProjection
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -1318,9 +1330,12 @@ def _owner_from_grants(grants: list[SessionPermission]) -> str | None:
     return next((g.user_id for g in grants if g.level >= LEVEL_OWNER), None)
 
 
+@_session_status_cache.synchronized
 def _session_status_from_cache(
     conversation_id: str,
     db_status: str | None = None,
+    *,
+    conversation: Conversation | None = None,
 ) -> Literal["idle", "running", "failed"]:
     """
     Map the relay-fed status cache value to a list-item status.
@@ -1339,6 +1354,23 @@ def _session_status_from_cache(
         the row, else ``None``.
     :returns: One of ``"idle"``, ``"running"``, ``"failed"``.
     """
+    if conversation is not None:
+        _session_terminal_pending_cache.hydrate(conversation)
+        before = _session_status_cache.projection(conversation_id)
+        if _session_status_cache.hydrate(conversation):
+            current = _session_status_cache.projection(conversation_id)
+            if current is not None and current != before:
+                if before is not None and (
+                    current.observation.binding_epoch != before.observation.binding_epoch
+                ):
+                    _session_background_task_count_cache.pop(conversation_id, None)
+                    _session_background_tasks_cache.pop(conversation_id, None)
+                if current.status in {"running", "waiting"} and current.observation.response_id:
+                    _session_active_response_cache[conversation_id] = (
+                        current.observation.response_id
+                    )
+                else:
+                    _session_active_response_cache.pop(conversation_id, None)
     cached = _session_status_cache.get(conversation_id)
     if cached is None:
         cached = db_status
@@ -4773,7 +4805,12 @@ def _require_permission_mode_forward(
     return settled if isinstance(settled, str) and settled else mode
 
 
-def _publish_child_status_to_parent(session_id: str, status: str) -> None:
+def _publish_child_status_to_parent(
+    session_id: str,
+    status: str,
+    observation: SessionObservation | None = None,
+    offline_episode_id: str | None = None,
+) -> None:
     """
     Mirror a status transition onto the session's parent stream.
 
@@ -4802,6 +4839,16 @@ def _publish_child_status_to_parent(session_id: str, status: str) -> None:
     def _fan_out() -> None:
         conv = store.get_conversation(session_id)
         if conv is None or conv.parent_conversation_id is None:
+            return
+        if observation is not None and (
+            conv.session_observation != observation
+            or (
+                conv.runner_offline_decision.episode_id
+                if conv.runner_offline_decision is not None
+                else None
+            )
+            != offline_episode_id
+        ):
             return
         parent_id = conv.parent_conversation_id
         items_by_child = store.list_latest_message_items_for_conversations([conv.id], 10)
@@ -4889,6 +4936,63 @@ def _failure_log_detail(error: ErrorDetail | None) -> str:
     return f"{message[:_FAILURE_LOG_DETAIL_MAX_CHARS]}… (+{dropped} chars)"
 
 
+def _log_status_failure(
+    session_id: str,
+    error: ErrorDetail | None,
+    origin: str,
+    previous_status: str | None,
+    response_id: str | None,
+    observation: SessionObservation | None,
+    offline_episode_id: str | None,
+    failure_context: object,
+    source_event_id: str | None = None,
+) -> None:
+    """Account an explicit source error independently from its live projection."""
+    failure_code = error.code if error is not None else "none"
+    _logger.error(
+        "session turn failed for %s (origin=%s code=%s prev=%s): %s",
+        session_id,
+        origin,
+        failure_code,
+        previous_status or "unknown",
+        _failure_log_detail(error),
+        extra=debug_event(
+            "session_turn_failed",
+            session_id=session_id,
+            origin=origin,
+            code=failure_code,
+            previous_status=previous_status or "unknown",
+            response_id=response_id,
+            runner_id=(observation.runner_id if observation else None),
+            runner_binding_epoch=(observation.binding_epoch if observation else None),
+            live_status_revision=(observation.revision if observation else None),
+            runner_offline_episode_id=offline_episode_id,
+            cached_background_task_count=_session_background_task_count_cache.get(session_id),
+            source_event_id=source_event_id,
+            observation_committed=observation is not None and source_event_id is None,
+            **failure_log_attributes(failure_context),
+        ),
+    )
+
+
+@_session_status_cache.synchronized
+def _capture_status_observation(
+    session_id: str, owner: SessionObservation | None
+) -> tuple[SessionObservation | None, session_live_state.PendingObservation | None]:
+    """Capture a runner edge's state and exact queued predecessor before awaiting."""
+    if owner is None:
+        return None, None
+    projection = _session_status_cache.projection(session_id)
+    if projection is not None and (
+        projection.observation.runner_id == owner.runner_id
+        and projection.observation.binding_epoch == owner.binding_epoch
+        and projection.observation.revision >= owner.revision
+    ):
+        owner = projection.observation
+    return owner, session_live_state.pending_observation(session_id, owner)
+
+
+@_session_status_cache.synchronized
 def _publish_status(
     session_id: str,
     status: str,
@@ -4901,7 +5005,13 @@ def _publish_status(
     scheduled_run_outcome: Literal["auto", "failed"] = "auto",
     failure_origin: str | None = None,
     failure_context: object = None,
-) -> None:
+    owner: SessionObservation | None = None,
+    predecessor: session_live_state.PendingObservation | None = None,
+    session_observation: SessionObservation | None = None,
+    runner_offline_decision: RunnerOfflineDecision | None = None,
+    failure_logged: bool = False,
+    starts_new_turn: bool = False,
+) -> Future[SessionObservation | None] | None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
     update the cache the list endpoint reads.
@@ -4948,16 +5058,123 @@ def _publish_status(
     # in-process flow performs a legitimate ``failed`` → ``idle``
     # transition (compaction failure publishes ``running`` → ``idle``, not
     # ``failed``), so this is a safe, harness-agnostic invariant.
-    if status == "idle" and _session_status_cache.get(session_id) == "failed":
-        # Session stays ``failed`` (terminal); the turn is over, so drop any
-        # tracked in-flight response id rather than leaving it for the
-        # snapshot to reopen a streaming bubble.
-        _session_active_response_cache.pop(session_id, None)
-        return
+    previous_projection = _session_status_cache.projection(session_id)
+    if (
+        status == "idle"
+        and _session_status_cache.get(session_id) == "failed"
+        and (previous_projection is None or previous_projection.offline_episode_id is None)
+        and (
+            session_observation is None
+            or not is_versioned_session_observation(session_observation)
+            or (
+                previous_projection is not None
+                and (
+                    session_observation.binding_epoch,
+                    session_observation.revision,
+                )
+                <= previous_projection.order[:2]
+            )
+        )
+        and (
+            owner is None
+            or previous_projection is None
+            or (owner.binding_epoch, owner.revision) <= previous_projection.order[:2]
+        )
+    ):
+        return None
+    if persist_live_status and session_live_state.conversation_store() is not None:
+
+        def publish_committed(observation: SessionObservation, terminal_pending: bool) -> None:
+            _publish_status(
+                session_id,
+                status,
+                error,
+                response_id=response_id,
+                background_task_count=background_task_count,
+                background_tasks=background_tasks,
+                blocked_on=blocked_on,
+                persist_live_status=False,
+                scheduled_run_outcome=scheduled_run_outcome,
+                failure_origin=failure_origin,
+                failure_context=failure_context,
+                failure_logged=failure_logged or status == "failed",
+                session_observation=observation,
+            )
+            if not terminal_pending and _session_terminal_pending_cache.get(session_id, False):
+                _publish_terminal_pending(session_id, False, session_observation=observation)
+
+        source_previous_status = (
+            owner.status if owner is not None else _session_status_cache.get(session_id)
+        )
+        if (
+            predecessor is not None
+            and owner is not None
+            and predecessor.owner is not None
+            and (
+                predecessor.owner.runner_id == owner.runner_id
+                and predecessor.owner.binding_epoch == owner.binding_epoch
+            )
+        ):
+            source_previous_status = predecessor.status
+        return session_live_state.persist_status_observation(
+            session_id,
+            status,
+            owner=owner,
+            predecessor=predecessor,
+            starts_new_turn=starts_new_turn,
+            response_id=response_id,
+            error=error.model_dump(mode="json") if error is not None else None,
+            error_labels=(
+                session_live_state.status_error_labels(
+                    session_id,
+                    owner,
+                    _session_status_error_labels(
+                        error, owner_runner_id=owner.runner_id if owner else None
+                    ),
+                )
+                if error is not None
+                else {}
+                if status != "failed" or not failure_logged
+                else None
+            ),
+            on_commit=publish_committed,
+            on_current=lambda current: _session_status_from_cache(
+                session_id, current.live_status, conversation=current
+            ),
+            on_source_failure=(
+                lambda source_id: _log_status_failure(
+                    session_id,
+                    error,
+                    failure_origin or "unattributed",
+                    source_previous_status,
+                    response_id
+                    if response_id is not None
+                    else session_live_state.captured_response_id(status, owner, predecessor),
+                    owner,
+                    None,
+                    failure_context,
+                    source_event_id=source_id,
+                )
+            )
+            if status == "failed" and not failure_logged
+            else None,
+        )
     previous_status = _session_status_cache.get(session_id)
-    _session_status_cache[session_id] = status
+    episode_id = (
+        runner_offline_decision.episode_id if runner_offline_decision is not None else None
+    )
+    if session_observation is not None:
+        if not _session_status_cache.accept(
+            session_id, SessionProjection(session_observation, status, episode_id)
+        ):
+            return None
+    else:
+        # A legacy callback cannot rewind a learned durable fence.
+        if previous_projection is not None:
+            return None
+        _session_status_cache[session_id] = status
     if previous_status != status:
-        _publish_child_status_to_parent(session_id, status)
+        _publish_child_status_to_parent(session_id, status, session_observation, episode_id)
     # Mirror the transition onto the conversation row (best-effort,
     # deduplicated, off-loop) so replicas that don't hold this session's
     # runner tunnel serve the same sidebar status.
@@ -4979,9 +5196,12 @@ def _publish_status(
             "failed",
             error_code="incomplete",
             error="runner disappeared before the turn reached a terminal state",
+            observation=session_observation,
         )
     elif status == "idle":
-        session_live_state.persist_scheduled_run_completion(session_id, "succeeded")
+        session_live_state.persist_scheduled_run_completion(
+            session_id, "succeeded", observation=session_observation
+        )
     elif status == "failed":
         # Canonical server-side broken-turn signal: every server-originated
         # failed turn (runner disconnect mid-turn, setup/dispatch failure,
@@ -4993,32 +5213,25 @@ def _publish_status(
         # path published it: the origin slug, the failure code, and the status
         # the session was leaving. The message keeps its "session turn failed
         # for <id>: <detail>" shape so existing detail-matching stays valid.
-        origin = failure_origin or "unattributed"
-        failure_code = error.code if error is not None else "none"
-        _logger.error(
-            "session turn failed for %s (origin=%s code=%s prev=%s): %s",
-            session_id,
-            origin,
-            failure_code,
-            previous_status or "unknown",
-            _failure_log_detail(error),
-            extra=debug_event(
-                "session_turn_failed",
-                session_id=session_id,
-                origin=origin,
-                code=failure_code,
-                previous_status=previous_status or "unknown",
-                response_id=response_id,
-                cached_background_task_count=_session_background_task_count_cache.get(session_id),
-                **failure_log_attributes(failure_context),
-            ),
-        )
-        session_live_state.persist_scheduled_run_completion(
-            session_id,
-            "failed",
-            error_code=error.code if error is not None else None,
-            error=error.message if error is not None else None,
-        )
+        if not failure_logged:
+            _log_status_failure(
+                session_id,
+                error,
+                failure_origin or "unattributed",
+                previous_status,
+                response_id,
+                session_observation,
+                episode_id,
+                failure_context,
+            )
+        if runner_offline_decision is None:
+            session_live_state.persist_scheduled_run_completion(
+                session_id,
+                "failed",
+                error_code=error.code if error is not None else None,
+                error=error.message if error is not None else None,
+                observation=session_observation,
+            )
     # Track the in-flight response id for snapshot-based reconnect (see
     # _session_active_response_cache). A running/waiting edge that names a
     # turn opens it; any idle/failed edge closes it.
@@ -5062,8 +5275,14 @@ def _publish_status(
         background_task_count=background_task_count,
         background_tasks=background_tasks,
         blocked_on=blocked_on,
+        session_observation=session_observation,
+        runner_offline_episode_id=episode_id,
     )
     payload = event.model_dump()
+    if session_observation is None:
+        payload.pop("session_observation", None)
+    if episode_id is None:
+        payload.pop("runner_offline_episode_id", None)
     if response_id is None:
         payload.pop("response_id", None)
     if background_task_count is None:
@@ -5076,12 +5295,15 @@ def _publish_status(
     if blocked_on is None:
         payload.pop("blocked_on", None)
     session_stream.publish(session_id, payload)
+    return None
 
 
 def reconcile_orphaned_running_status(
     session_id: str,
     conversation_store: ConversationStore,
     stale_before: int,
+    *,
+    owner: SessionObservation | None = None,
 ) -> bool:
     """
     Settle a session that reads ``running`` but whose runner is
@@ -5107,13 +5329,20 @@ def reconcile_orphaned_running_status(
     :param stale_before: Runner stamps at or after this epoch are fresh.
     :returns: Whether this call performed the transition.
     """
-    if not conversation_store.settle_orphaned_live_status(session_id, stale_before):
+    captured = owner or conversation_store.get_session_observation(session_id)
+    if captured is None:
+        return False
+    observation = conversation_store.settle_orphaned_session_observation(
+        session_id, stale_before, expected=captured
+    )
+    if observation is None:
         return False
     _publish_status(
         session_id,
         "idle",
         persist_live_status=False,
         scheduled_run_outcome="failed",
+        session_observation=observation,
     )
     return True
 
@@ -5174,40 +5403,19 @@ def _truncate_error_message_label(message: str) -> str:
     return f"{summary}{_ELIDED_LOG_LINES_MARKER}{last_line}"
 
 
-async def _persist_session_status_error_labels(
-    session_id: str,
+def _session_status_error_labels(
     error: ErrorDetail | None,
-    conversation_store: ConversationStore,
     *,
     owner_runner_id: str | None = None,
     agent_name: str | None = None,
     item_id: str | None = None,
-) -> None:
-    """
-    Persist or clear the reload-visible failure detail for a session status.
-
-    ``session.status`` is an SSE edge, so its ``error`` object disappears on
-    reload. Terminal-native sessions can fail before any transcript item is
-    written, so store the latest failure detail as runner-owned labels and let
-    snapshots project it as ``last_task_error``. Empty string clears stale
-    values because the label store is upsert-only.
-
-    :param session_id: Session/conversation identifier.
-    :param error: Failure detail from a ``session.status: failed`` edge, or
-        ``None`` to clear stale error labels on subsequent activity.
-    :param conversation_store: Store used to upsert labels.
-    :param owner_runner_id: Runner this failure belongs to, so a later exit from a
-        replacement runner surfaces its own startup failure instead of this cause.
-        Callers pass the runner they already hold; ``None`` leaves it unattributed.
-    :param agent_name: Agent responsible for this failure, captured before a rebind.
-    :param item_id: Persisted item a ``runner_rejected_event`` failure refers to, so
-        a client whose POST answer was lost can match the refusal to its own send.
-    """
+) -> dict[str, str]:
+    """Build the label projection shared by normal and owned failures."""
     # Structured fields are optional (present only when the runner classified
     # the failure). Always write all keys — empty when absent — because the
     # label store is upsert-only and a stale title/cause from a prior failure
     # must not leak onto a later, unclassified one.
-    updates = (
+    return (
         {
             _LAST_TASK_ERROR_CODE_LABEL_KEY: _truncate_label(error.code),
             _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: _truncate_error_message_label(error.message),
@@ -5230,6 +5438,44 @@ async def _persist_session_status_error_labels(
             _LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY: "",
         }
     )
+
+
+async def _persist_session_status_error_labels(
+    session_id: str,
+    error: ErrorDetail | None,
+    conversation_store: ConversationStore,
+    *,
+    owner_runner_id: str | None = None,
+    agent_name: str | None = None,
+    item_id: str | None = None,
+    owner: SessionObservation | None = None,
+) -> None:
+    """
+    Persist or clear the reload-visible failure detail for a session status.
+
+    ``session.status`` is an SSE edge, so its ``error`` object disappears on
+    reload. Terminal-native sessions can fail before any transcript item is
+    written, so store the latest failure detail as runner-owned labels and let
+    snapshots project it as ``last_task_error``. Empty string clears stale
+    values because the label store is upsert-only.
+
+    :param session_id: Session/conversation identifier.
+    :param error: Failure detail from a ``session.status: failed`` edge, or
+        ``None`` to clear stale error labels on subsequent activity.
+    :param conversation_store: Store used to upsert labels.
+    :param owner_runner_id: Runner this failure belongs to, so a later exit from a
+        replacement runner surfaces its own startup failure instead of this cause.
+        Callers pass the runner they already hold; ``None`` leaves it unattributed.
+    :param agent_name: Agent responsible for this failure, captured before a rebind.
+    :param item_id: Persisted item a ``runner_rejected_event`` failure refers to, so
+        a client whose POST answer was lost can match the refusal to its own send.
+    """
+    updates = _session_status_error_labels(
+        error, owner_runner_id=owner_runner_id, agent_name=agent_name, item_id=item_id
+    )
+    if session_live_state.conversation_store() is not None and owner is not None:
+        session_live_state.stage_status_error_labels(session_id, owner, updates)
+        return
     try:
         await asyncio.to_thread(conversation_store.set_labels, session_id, updates)
     except Exception:  # noqa: BLE001
@@ -5285,7 +5531,15 @@ def _last_task_error_runner_id_from_labels(labels: Mapping[str, str]) -> str | N
     return labels.get(_LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY) or None
 
 
-def _publish_terminal_pending(session_id: str, pending: bool) -> None:
+@_session_status_cache.synchronized
+def _publish_terminal_pending(
+    session_id: str,
+    pending: bool,
+    *,
+    session_observation: SessionObservation | None = None,
+    response_id: str | None = None,
+    runner_offline_episode_id: str | None = None,
+) -> None:
     """
     Publish a typed :class:`SessionTerminalPendingEvent` and update the
     cache the snapshot reads.
@@ -5302,20 +5556,38 @@ def _publish_terminal_pending(session_id: str, pending: bool) -> None:
     :param pending: ``True`` while the runner is auto-creating the
         terminal; ``False`` once it lands or auto-create fails.
     """
-    # Store only ``True`` entries; delete on clear so the cache never
-    # accumulates stale ``False`` entries for every terminal-first session
-    # that has ever completed spin-up. The snapshot getter uses
-    # ``.get(id, False)`` so absent == False.
-    if pending:
-        _session_terminal_pending_cache[session_id] = True
-    else:
-        _session_terminal_pending_cache.pop(session_id, None)
+    current = _session_status_cache.projection(session_id)
+    if (
+        session_observation is not None
+        and current is not None
+        and not accept_session_projection(
+            session_observation,
+            runner_offline_episode_id,
+            current.observation,
+            current.offline_episode_id,
+        )
+    ):
+        return
+    if not _session_terminal_pending_cache.accept(
+        session_id, pending, session_observation, runner_offline_episode_id
+    ):
+        return
     event = SessionTerminalPendingEvent(
         type="session.terminal_pending",
         conversation_id=session_id,
         pending=pending,
     )
-    session_stream.publish(session_id, event.model_dump())
+    payload = event.model_dump()
+    for key, value in (
+        ("session_observation", session_observation.model_dump() if session_observation else None),
+        ("response_id", response_id),
+        ("runner_offline_episode_id", runner_offline_episode_id),
+    ):
+        if value is not None:
+            payload[key] = value
+        else:
+            payload.pop(key, None)
+    session_stream.publish(session_id, payload)
 
 
 def _publish_sandbox_status(*args: Any, **kwargs: Any) -> None:
@@ -6002,6 +6274,8 @@ class _HostLaunchAttempt:
     error_code: str | None = None
     error: str | None = None
     acknowledged: bool = False
+    observation: SessionObservation | None = None
+    dispatch_id: str | None = None
 
 
 async def _launch_runner_on_host(*args: Any, **kwargs: Any) -> _HostLaunchAttempt:
@@ -6131,7 +6405,11 @@ async def _launch_runner_on_host_impl(
             last = _relaunch_last_attempt.get(conv.id)
             if last is not None and last.runner_id == fresh.runner_id:
                 return last
-            return _HostLaunchAttempt(runner_id=fresh.runner_id)
+            return _HostLaunchAttempt(
+                runner_id=fresh.runner_id,
+                observation=fresh.session_observation,
+                dispatch_id=conv.labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY),
+            )
         attempt = await _launch_runner_on_host_locked(
             fresh, conversation_store, host_registry, host_conn
         )
@@ -6154,6 +6432,8 @@ async def _launch_runner_on_host_locked(
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
     from omnigent.runner.identity import token_bound_runner_id
 
+    captured = conv.session_observation
+    dispatch_id = conv.labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
     await host_registry.admit_launch(host_conn, conv.id)
     superseded_runner_id = conv.runner_id
     binding_token = secrets.token_urlsafe(32)
@@ -6163,7 +6443,69 @@ async def _launch_runner_on_host_locked(
         conversation_store.replace_runner_id,
         conv.id,
         new_runner_id,
+        expected_observation=captured,
     )
+    if bound_conv.runner_id != new_runner_id:
+        return _HostLaunchAttempt(
+            runner_id=bound_conv.runner_id or "",
+            error_code="launch_superseded",
+            error="session changed while its runner launch was being admitted",
+            observation=captured,
+            dispatch_id=dispatch_id,
+        )
+
+    launch_observation = bound_conv.session_observation
+    reserved_startup = False
+    if _native_coding_agent_for_session(conv) is not None:
+        reservation = session_live_state.reserve_terminal_startup(
+            conv.id, launch_observation, None
+        )
+        if reservation is not None:
+            try:
+                reserved = await asyncio.shield(asyncio.wrap_future(reservation))
+            except Exception as exc:
+                raise OmnigentError(
+                    "Terminal startup ownership is temporarily unavailable; retry the message.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                ) from exc
+            if reserved is None:
+                return _HostLaunchAttempt(
+                    runner_id=new_runner_id,
+                    error_code="launch_superseded",
+                    error="session changed before its runner launch",
+                    observation=launch_observation,
+                    dispatch_id=dispatch_id,
+                )
+            launch_observation = reserved
+            reserved_startup = True
+        _publish_terminal_pending(conv.id, True, session_observation=launch_observation)
+
+    async def outcome(
+        *, error_code: str | None = None, error: str | None = None, acknowledged: bool = False
+    ) -> _HostLaunchAttempt:
+        observation = launch_observation
+        if reserved_startup and (error_code or error):
+            completion = session_live_state.complete_terminal_startup(conv.id, launch_observation)
+            if completion is not None:
+                try:
+                    completed = await asyncio.shield(asyncio.wrap_future(completion))
+                except Exception:  # noqa: BLE001 — preserve the definitive source refusal
+                    _logger.warning(
+                        "Cannot settle refused terminal startup for %s", conv.id, exc_info=True
+                    )
+                else:
+                    if completed is not None:
+                        observation = completed
+                        _publish_terminal_pending(conv.id, False, session_observation=completed)
+        return _HostLaunchAttempt(
+            runner_id=new_runner_id,
+            error_code=error_code,
+            error=error,
+            acknowledged=acknowledged,
+            observation=observation,
+            dispatch_id=dispatch_id,
+        )
+
     if bound_conv.runner_last_seen is not None:
         # The new token has not reached the host, so this stamp can only
         # belong to the previous runner. Clear it before launching.
@@ -6205,7 +6547,7 @@ async def _launch_runner_on_host_locked(
                     error_code="host_launch_failed",
                 ),
             )
-            return _HostLaunchAttempt(runner_id=new_runner_id)
+            return await outcome()
         request_id = secrets.token_hex(8)
         launch_future: asyncio.Future[dict[str, str | None]] = (
             asyncio.get_running_loop().create_future()
@@ -6241,7 +6583,7 @@ async def _launch_runner_on_host_locked(
                     error_code="host_launch_failed",
                 ),
             )
-            return _HostLaunchAttempt(runner_id=new_runner_id)
+            return await outcome()
         try:
             result = await asyncio.wait_for(
                 launch_future,
@@ -6263,7 +6605,7 @@ async def _launch_runner_on_host_locked(
                     error_phase=ErrorPhase.RUNNER_LAUNCH.value,
                 ),
             )
-            return _HostLaunchAttempt(runner_id=new_runner_id)
+            return await outcome()
         if result.get("status") == "failed":
             refusal_code = result.get("error_code")
             # Unmapped codes (spawn failures) are attributed on the host's own row.
@@ -6283,12 +6625,11 @@ async def _launch_runner_on_host_locked(
                     error_phase=ErrorPhase.RUNNER_LAUNCH.value,
                 ),
             )
-            return _HostLaunchAttempt(
-                runner_id=new_runner_id,
+            return await outcome(
                 error_code=result.get("error_code"),
                 error=result.get("error"),
             )
-        return _HostLaunchAttempt(runner_id=new_runner_id, acknowledged=True)
+        return await outcome(acknowledged=True)
 
 
 async def cancel_managed_launch_tasks() -> None:
@@ -6655,7 +6996,12 @@ async def _proxy_get_session_resources_to_runner(
         ) from exc
 
 
-def _native_coding_agent_for_session(conv: Conversation) -> NativeCodingAgent | None:
+def _native_coding_agent_for_session(
+    conv: Conversation,
+    *,
+    agent_store: AgentStore | None = None,
+    agent_cache: AgentCache | None = None,
+) -> NativeCodingAgent | None:
     """
     Resolve native terminal metadata for a session, by wrapper label OR harness.
 
@@ -6685,7 +7031,11 @@ def _native_coding_agent_for_session(conv: Conversation) -> NativeCodingAgent | 
     native_agent = native_coding_agent_for_wrapper_label(wrapper)
     if native_agent is not None:
         return native_agent
-    return native_coding_agent_for_harness(_resolve_harness(conv))
+    return native_coding_agent_for_harness(
+        _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
+        if agent_store is not None or agent_cache is not None
+        else _resolve_harness(conv)
+    )
 
 
 def _native_terminal_name_for_harness(harness: str) -> str:
@@ -6811,6 +7161,7 @@ class _NativeTerminalEnsureOutcome:
     error: ErrorData | None
     policy_notice: str | None = None
     failure_context: FailureContext | None = None
+    observation: SessionObservation | None = None
 
 
 def _policy_notice_from_ensure_response(resp: httpx.Response) -> str | None:
@@ -6835,7 +7186,15 @@ def _policy_notice_from_ensure_response(resp: httpx.Response) -> str | None:
     return reason if isinstance(reason, str) and reason.strip() else None
 
 
-def _publish_error_event(session_id: str, error: ErrorData) -> None:
+@_session_status_cache.synchronized
+def _publish_error_event(
+    session_id: str,
+    error: ErrorData,
+    *,
+    session_observation: SessionObservation | None = None,
+    response_id: str | None = None,
+    runner_offline_episode_id: str | None = None,
+) -> None:
     """
     Publish a live ``response.error`` event for a persisted error item.
 
@@ -6844,12 +7203,38 @@ def _publish_error_event(session_id: str, error: ErrorData) -> None:
     :param error: Durable error payload to mirror into SSE.
     :returns: None.
     """
+    current = _session_status_cache.projection(session_id)
+    if (
+        session_observation is not None
+        and current is not None
+        and not accept_session_projection(
+            session_observation,
+            runner_offline_episode_id,
+            current.observation,
+            current.offline_episode_id,
+        )
+    ):
+        return
     event = ErrorEvent(
         type="response.error",
         source=error.source,
         error=RetryErrorDetail(code=error.code, message=error.message),
     )
-    session_stream.publish(session_id, event.model_dump())
+    payload = event.model_dump()
+    if session_observation is not None:
+        payload["conversation_id"] = session_id
+    else:
+        payload.pop("conversation_id", None)
+    for key, value in (
+        ("session_observation", session_observation.model_dump() if session_observation else None),
+        ("response_id", response_id),
+        ("runner_offline_episode_id", runner_offline_episode_id),
+    ):
+        if value is not None:
+            payload[key] = value
+        else:
+            payload.pop(key, None)
+    session_stream.publish(session_id, payload)
 
 
 #: Error code for a model change the terminal never applied.
@@ -7651,6 +8036,9 @@ async def _dispatch_skill_slash_command_to_runner(
     """
     import uuid
 
+    status_owner, status_predecessor = _capture_status_observation(
+        session_id, conv.session_observation
+    )
     skill_name, arguments = _parse_skill_slash_command(body)
     meta_text = await _resolve_skill_meta_text_via_runner(
         session_id,
@@ -7745,7 +8133,7 @@ async def _dispatch_skill_slash_command_to_runner(
             session_id,
             extra={"session_id": session_id},
         )
-        _publish_status(session_id, "idle")
+        _publish_status(session_id, "idle", owner=status_owner, predecessor=status_predecessor)
         raise OmnigentError(
             "Runner is unreachable; message was persisted but could not be delivered. "
             "The runner may be restarting — retry or spawn a new session.",
@@ -8439,6 +8827,7 @@ async def _flush_relay_text(
     deny_reason: str | None = None,
     evaluate_response_phase: bool = False,
     turn_final: bool = False,
+    observation: SessionObservation | None = None,
 ) -> None:
     """
     Persist buffered assistant text as a message item and clear the buffer.
@@ -8511,7 +8900,9 @@ async def _flush_relay_text(
         # Whitespace-only: nothing worth persisting. Drop it so it neither
         # accumulates into the next segment nor replays as an empty bubble.
         text_acc.clear()
-        inflight_text.reset_text(session_id)
+        session_stream.reset_inflight_text(
+            session_id, response_id=response_id, observation=observation
+        )
         return
     if conversation_store is None:
         text_acc.clear()
@@ -8536,7 +8927,7 @@ async def _flush_relay_text(
         # retry — and a stateful policy whose labels moved on the first
         # DENY could flip to ALLOW and leak the original text.
         text_acc[:] = [text]
-        _publish_policy_deny(session_id, deny_reason)
+        _publish_policy_deny(session_id, deny_reason, session_observation=observation)
     import uuid
 
     try:
@@ -8567,7 +8958,9 @@ async def _flush_relay_text(
     # the next yield), so no reconnect observes the committed message and a
     # stale replay together.
     text_acc.clear()
-    inflight_text.reset_text(session_id)
+    session_stream.reset_inflight_text(
+        session_id, response_id=response_id, observation=observation
+    )
     # Publish the persisted item so live clients learn its store-assigned
     # id and stamp it onto the already-rendered streamed text (see the
     # docstring). Ordered before the boundary item / terminal event the
@@ -8777,7 +9170,7 @@ def _filesystem_attachment_in_history(
                 file_id = block.get("file_id")
                 if isinstance(file_id, str) and file_id in filenames:
                     return filenames[file_id]
-        if not page.has_more or not page.data:
+        if not page.has_more or page.last_id is None:
             return None
         items_after = page.last_id
 
@@ -9137,7 +9530,9 @@ def _extract_user_text_from_event(body: SessionEventInput) -> str:
     return "\n".join(parts)
 
 
-def _publish_policy_deny(session_id: str, reason: str) -> None:
+def _publish_policy_deny(
+    session_id: str, reason: str, *, session_observation: SessionObservation | None = None
+) -> None:
     """
     Publish the ``[Denied by policy: ...]`` sentinel on the session stream.
 
@@ -9170,11 +9565,26 @@ def _publish_policy_deny(session_id: str, reason: str) -> None:
             # block; a single delta carries the whole sentinel, so index 0.
             "message_id": f"deny_{secrets.token_hex(8)}",
             "index": 0,
+            **(
+                {
+                    "conversation_id": session_id,
+                    "session_observation": session_observation.model_dump(),
+                }
+                if session_observation is not None
+                else {}
+            ),
         },
     )
 
 
-def _publish_input_deny_terminal(session_id: str, conv: Conversation, reason: str) -> None:
+def _publish_input_deny_terminal(
+    session_id: str,
+    conv: Conversation,
+    reason: str,
+    *,
+    session_observation: SessionObservation | None = None,
+    response_id: str | None = None,
+) -> None:
     """
     Publish a terminal ``response.completed`` for an INPUT-phase DENY.
 
@@ -9192,7 +9602,7 @@ def _publish_input_deny_terminal(session_id: str, conv: Conversation, reason: st
     """
     sentinel = f"{_DENY_SENTINEL_PREFIX}{reason}]"
     response = ResponseObject(
-        id=f"deny_{secrets.token_hex(8)}",
+        id=response_id or f"deny_{secrets.token_hex(8)}",
         status="completed",
         model=conv.agent_id or "policy",
         created_at=int(time.time()),
@@ -9207,7 +9617,12 @@ def _publish_input_deny_terminal(session_id: str, conv: Conversation, reason: st
     )
     session_stream.publish(
         session_id,
-        CompletedEvent(type="response.completed", response=response).model_dump(exclude_none=True),
+        CompletedEvent(
+            type="response.completed",
+            response=response,
+            conversation_id=session_id if session_observation is not None else None,
+            session_observation=session_observation,
+        ).model_dump(exclude_none=True),
     )
 
 
@@ -9217,7 +9632,7 @@ async def _persist_policy_deny_sentinel(
     reason: str,
     conversation_store: ConversationStore,
     agent_store: AgentStore,
-) -> None:
+) -> str | None:
     """
     Persist the ``[Denied by policy: ...]`` sentinel as assistant history.
 
@@ -9242,6 +9657,7 @@ async def _persist_policy_deny_sentinel(
     :param reason: Human-readable deny reason from the policy verdict.
     :param conversation_store: Store for item persistence.
     :param agent_store: Store used to resolve the agent's display name.
+    :returns: Persisted denial response ID, or ``None`` when no item was returned.
     """
     import uuid
 
@@ -9268,6 +9684,8 @@ async def _persist_policy_deny_sentinel(
             item=persisted[0].to_api_dict(),
         )
         session_stream.publish(session_id, done_event.model_dump())
+        return persisted[0].response_id
+    return None
 
 
 def _extract_assistant_text_from_event(body: SessionEventInput) -> str:
@@ -10732,6 +11150,9 @@ async def _notify_runner_of_bundled_child(
     session_id: str,
     agent_id: str,
     runner_router: RunnerRouter | None,
+    *,
+    conversation_store: ConversationStore | None = None,
+    initializer: RunnerSessionInitializer | None = None,
 ) -> None:
     """
     Notify the inherited runner that a bundled child session exists.
@@ -10752,6 +11173,14 @@ async def _notify_runner_of_bundled_child(
     if runner_client is None:
         return
     try:
+        if initializer is not None and conversation_store is not None:
+            conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conversation is not None and conversation.runner_id is not None:
+                response = await initializer.initialize(
+                    conversation, runner_client, timeout=10.0, suppress_recovery_turn=True
+                )
+                response.raise_for_status()
+                return
         # Bundled children keep the legacy id-only body: bundle creation plumbs
         # no harness/model override for a session-init envelope to seed. The
         # create and rebind notifies send the full envelope instead.
@@ -10764,7 +11193,7 @@ async def _notify_runner_of_bundled_child(
             },
             timeout=10.0,
         )
-    except (httpx.HTTPError, ConnectionError):
+    except (httpx.HTTPError, ConnectionError, OmnigentError):
         _logger.warning(
             "Failed to notify runner about bundled session %s",
             session_id,
@@ -10928,6 +11357,7 @@ def _child_session_summary_from_conversation(
         edge instead of the latest status repeated.
     :returns: A populated :class:`ChildSessionSummary`.
     """
+    _session_status_from_cache(conv.id, conv.live_status, conversation=conv)
     display_title = title_without_closed_marker(conv.title)
     # Child sessions aren't pinnable (the pin affordance lives on top-level
     # sidebar rows only), but strip any per-user ``omnigent.pinned.<user>`` keys
@@ -10975,6 +11405,13 @@ def _child_session_summary_from_conversation(
     # Derive busy from the relay-fed cache; tasks table is gone.
     if cached_status is None:
         cached_status = _session_status_cache.get(conv.id)
+        projection = _session_status_cache.projection(conv.id)
+        if projection is not None and (
+            projection.observation != conv.session_observation
+            or projection.offline_episode_id
+            != (conv.runner_offline_decision.episode_id if conv.runner_offline_decision else None)
+        ):
+            cached_status = conv.live_status
     if cached_status in ("running", "waiting"):
         busy = True
     else:
@@ -10996,6 +11433,10 @@ def _child_session_summary_from_conversation(
     routing_decision_id = conv.labels.get(ROUTING_DECISION_LABEL_KEY)
     return ChildSessionSummary(
         id=conv.id,
+        session_observation=conv.session_observation,
+        runner_offline_episode_id=(
+            conv.runner_offline_decision.episode_id if conv.runner_offline_decision else None
+        ),
         parent_session_id=parent_session_id,
         title=display_title,
         task_summary=conv.task_summary,

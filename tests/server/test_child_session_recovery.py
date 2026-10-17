@@ -535,7 +535,7 @@ async def test_parent_recovery_published_before_descendant_store_failure(
     monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", ready)
 
     def fail_lookup(*_args: Any) -> None:
-        recovered.assert_awaited_once_with(parent.id, store)
+        recovered.assert_awaited_once_with(parent.id, store, owner=parent.session_observation)
         ready.assert_awaited_once_with(
             parent.id, parent.runner_id, client, store, conversation=parent
         )

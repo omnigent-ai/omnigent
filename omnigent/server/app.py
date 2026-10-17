@@ -129,6 +129,7 @@ from omnigent.server.routes.usage import create_usage_router
 from omnigent.server.runner_session_init import (
     TRANSIENT_REJECTION_STATUSES,
     RunnerSessionInitializer,
+    apply_initialization_observation,
     is_session_agent_removed,
     runner_response_error_body,
 )
@@ -3996,6 +3997,8 @@ def create_app(
                     if fresh is None or fresh.runner_id != runner_id:
                         return
                     conv = fresh
+                    recovery_owner = conv.session_observation
+                    initialized_owner = None
                     runner_session_initializer.require_generation(
                         runner_id, client, connection.generation
                     )
@@ -4017,13 +4020,18 @@ def create_app(
                         if is_session_agent_removed(response):
                             return
                         response.raise_for_status()
+                        initialized_owner = apply_initialization_observation(conv, response)
                     prefetch_session_routing_catalogs(conv.id, conv, client)
-                    # Clear only a root's disconnect failure, after successful init.
-                    # Children retain interruption evidence until continuation runs.
-                    async with store_slots:
-                        await _publish_runner_recovered_status(
-                            conv.id, conversation_store, require_disconnect_code=True
-                        )
+                    # Owned startup already invalidates its derived disconnect cause.
+                    # Other reconnect paths reconcile only the captured lifecycle.
+                    if initialized_owner is None:
+                        async with store_slots:
+                            await _publish_runner_recovered_status(
+                                conv.id,
+                                conversation_store,
+                                require_disconnect_code=True,
+                                owner=recovery_owner,
+                            )
                     if initialize_runtime:
                         await restore_active_children(
                             conv,
@@ -4049,6 +4057,12 @@ def create_app(
                                 "runner_reconnect_reassign_lost_tunnel",
                                 exc_type=type(exc).__name__,
                             ),
+                        )
+                    elif (
+                        isinstance(exc, OmnigentError) and exc.code == ErrorCode.RUNNER_UNAVAILABLE
+                    ):
+                        _logger.warning(
+                            "Session %s initialization is not current or ready: %s", conv.id, exc
                         )
                     elif isinstance(exc, httpx.HTTPStatusError):
                         body = runner_response_error_body(exc.response)

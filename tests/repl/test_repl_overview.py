@@ -70,7 +70,9 @@ class _Sessions:
         page = self.pages.pop(0) if self.pages else []
         if isinstance(page, Exception):
             raise page
-        return PaginatedList.from_dict({"data": page})
+        if isinstance(page, PaginatedList):
+            return page
+        return PaginatedList.from_dict({"data": page, "has_more": len(page) == limit})
 
     async def get(self, session_id: str) -> SimpleNamespace:
         if self.get_error is not None:
@@ -249,6 +251,23 @@ async def test_list_all_items_pages_until_short_page() -> None:
 
     assert len(items) == 101
     assert sessions.list_calls == [None, "i99"]
+
+
+@pytest.mark.parametrize("visible", [[], [{"id": "visible"}]])
+async def test_list_all_items_follows_underlying_cursor_after_filtered_page(
+    visible: list[dict[str, object]],
+) -> None:
+    sessions = _Sessions(
+        pages=[
+            PaginatedList(data=visible, has_more=True, last_id="filtered"),
+            PaginatedList(data=[{"id": "tail"}], has_more=False),
+        ]
+    )
+    assert await _list_all_conversation_items(_client(sessions), "conv_a") == [
+        *visible,
+        {"id": "tail"},
+    ]  # type: ignore[arg-type]
+    assert sessions.list_calls == [None, "filtered"]
 
 
 async def test_list_all_items_restarts_from_first_page_on_stale_cursor() -> None:

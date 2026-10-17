@@ -13,7 +13,8 @@ vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
 import { getSessionHost } from "@/lib/sessionHost";
 import { getSessionSlim } from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
-import { prefetchSessionHostChain, useSession } from "./useSession";
+import { handleSessionEvent, initChatStore } from "@/store/chatStore";
+import { prefetchSessionHostChain, useRootSessionId, useSession } from "./useSession";
 
 const getSessionSlimMock = vi.mocked(getSessionSlim);
 
@@ -53,7 +54,207 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
   vi.useRealTimers();
+});
+
+describe("shared session snapshot ownership", () => {
+  it.each(
+    [
+      {
+        name: "rebound",
+        oldEpoch: 1,
+        epoch: 2,
+        oldRevision: 4,
+        revision: 5,
+        oldRunner: "runner-a",
+        runner: "runner-b",
+      },
+      {
+        name: "aba",
+        oldEpoch: 1,
+        epoch: 3,
+        oldRevision: 4,
+        revision: 5,
+        oldRunner: "runner-a",
+        runner: "runner-a",
+      },
+      {
+        name: "new-turn",
+        oldEpoch: 1,
+        epoch: 1,
+        oldRevision: 4,
+        revision: 5,
+        oldRunner: "runner-a",
+        runner: "runner-a",
+      },
+      {
+        name: "legacy",
+        oldEpoch: 0,
+        epoch: 1,
+        oldRevision: 0,
+        revision: 1,
+        oldRunner: "runner-a",
+        runner: "runner-b",
+      },
+    ].flatMap((scenario) => [
+      { ...scenario, initial: false },
+      { ...scenario, initial: true },
+    ]),
+  )(
+    "keeps $name live state in hook and graph-root cache after late HTTP (initial: $initial)",
+    async ({ name, oldEpoch, epoch, oldRevision, revision, oldRunner, runner, initial }) => {
+      const id = `session-query-${name}-${initial ? "initial" : "refetch"}`;
+      const oldObservation = {
+        runner_id: oldRunner,
+        binding_epoch: oldEpoch,
+        revision: oldRevision,
+        observation_id: oldEpoch === 0 ? null : "old-observation",
+        status: "running",
+        response_id: "old-turn",
+        error_key: null,
+      };
+      const currentObservation = {
+        runner_id: runner,
+        binding_epoch: epoch,
+        revision,
+        observation_id: "current-observation",
+        status: "running",
+        response_id: "current-turn",
+        error_key: null,
+      };
+      const wire = {
+        id,
+        agent_id: "agent",
+        created_at: 1,
+        title: "Old title",
+        status: "failed",
+        runner_id: oldRunner,
+        host_id: "host-a",
+        parent_session_id: null,
+        session_observation: oldObservation,
+        runner_offline_episode_id: "old-episode",
+        labels: {
+          "omnigent.last_task_error_code": "runner_disconnected",
+          "omnigent.sandbox.requested_host_id": "host-a",
+          custom: "old",
+        },
+        last_task_error: { code: "runner_disconnected", message: "Old runner disappeared" },
+      };
+      let release!: (response: Response) => void;
+      let requests = 0;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => {
+          requests += 1;
+          if (requests === (initial ? 1 : 2))
+            return new Promise<Response>((resolve) => {
+              release = resolve;
+            });
+          return new Response(JSON.stringify(wire), { status: 200 });
+        }),
+      );
+      const actualApi = await vi.importActual<typeof SessionsApiModule>("@/lib/sessionsApi");
+      getSessionSlimMock.mockImplementation(actualApi.getSessionSlim);
+      const { client, Wrapper } = harness();
+      initChatStore(client);
+      if (!initial) client.setQueryData(["session", id], await actualApi.getSessionSlim(id));
+      const { result } = renderHook(
+        () => {
+          const rootId = useRootSessionId(`child-${name}`, id);
+          return { rootId, session: useSession(rootId).session };
+        },
+        { wrapper: Wrapper },
+      );
+      await flush();
+      let refetch: Promise<void> | undefined;
+      if (!initial) {
+        expect(result.current.rootId).toBe(id);
+        expect(result.current.session?.status).toBe("failed");
+        act(() => {
+          refetch = client.invalidateQueries({ queryKey: ["session", id], exact: true });
+        });
+      }
+      await flush();
+      expect(requests).toBe(initial ? 1 : 2);
+      act(() =>
+        handleSessionEvent(
+          {
+            type: "session_status",
+            conversationId: id,
+            status: "running",
+            sessionObservation: currentObservation,
+          },
+          id,
+        ),
+      );
+      await flush();
+      if (initial) {
+        expect(result.current.session).toBeNull();
+      } else {
+        expect(result.current.session?.status).toBe("running");
+        expect(result.current.session?.lastTaskError).toBeNull();
+      }
+      release(
+        new Response(
+          JSON.stringify({
+            ...wire,
+            title: "Fresh independent metadata",
+            reasoning_effort: "high",
+            labels: { ...wire.labels, custom: "new" },
+          }),
+          { status: 200 },
+        ),
+      );
+      await act(async () => {
+        await refetch;
+      });
+      await flush();
+      expect(result.current.rootId).toBe(id);
+      const cached = client.getQueryData<Session>(["session", id]);
+      expect(result.current.session).toBe(cached);
+      expect(cached).toMatchObject({
+        status: "running",
+        sessionObservation: currentObservation,
+        runnerOfflineEpisodeId: null,
+        runnerId: runner,
+        activeResponseId: "current-turn",
+        lastTaskError: null,
+        title: "Fresh independent metadata",
+        reasoningEffort: "high",
+      });
+      expect(cached?.labels?.custom).toBe("new");
+      expect(cached?.labels?.["omnigent.last_task_error_code"]).toBeUndefined();
+      if (epoch !== oldEpoch) {
+        expect(cached?.hostId).toBeNull();
+        expect(cached?.labels?.["omnigent.sandbox.requested_host_id"]).toBeUndefined();
+        expect(getSessionHost(id)).toBeNull();
+      }
+      const failure = { code: "provider_error", message: "Current genuine failure" };
+      act(() =>
+        handleSessionEvent(
+          {
+            type: "session_status",
+            conversationId: id,
+            status: "failed",
+            sessionObservation: {
+              ...currentObservation,
+              revision: revision + 1,
+              observation_id: "genuine-failure",
+              status: "failed",
+              error_key: "provider-error",
+            },
+            error: failure,
+          },
+          id,
+        ),
+      );
+      await flush();
+      expect(result.current.session?.status).toBe("failed");
+      expect(result.current.session?.lastTaskError).toEqual(failure);
+      client.clear();
+    },
+  );
 });
 
 describe("useSession — refresh_state", () => {

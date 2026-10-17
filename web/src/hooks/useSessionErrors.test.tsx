@@ -30,8 +30,13 @@ const errorPage: SessionItemsPage = {
     ),
   ],
   hasMore: true,
+  olderCursor: "message1",
 };
-const normalPage: SessionItemsPage = { items: [message("Recovered.")], hasMore: true };
+const normalPage: SessionItemsPage = {
+  items: [message("Recovered.")],
+  hasMore: true,
+  olderCursor: "message1",
+};
 const disconnectPage: SessionItemsPage = {
   items: [
     {
@@ -45,6 +50,7 @@ const disconnectPage: SessionItemsPage = {
     },
   ],
   hasMore: true,
+  olderCursor: "disconnect1",
 };
 const runnerError: ErrorItem = {
   id: "error1",
@@ -125,8 +131,8 @@ describe("useSessionErrors", () => {
       const disconnect = disconnectPage.items[0]!;
       const fullItems = [runnerError, disconnect];
       fetchPage
-        .mockResolvedValueOnce({ items: [disconnect], hasMore: true })
-        .mockResolvedValueOnce({ items: [runnerError], hasMore: false });
+        .mockResolvedValueOnce({ items: [disconnect], hasMore: true, olderCursor: "disconnect1" })
+        .mockResolvedValueOnce({ items: [runnerError], hasMore: false, olderCursor: "error1" });
       const fullState = latestActivityErrorState(itemsToBlocks(fullItems), hostOnline);
       const { wrapper } = harness();
       const hook = renderHook(
@@ -147,8 +153,8 @@ describe("useSessionErrors", () => {
   it("keeps a conservative fault when the disconnect boundary exceeds the bounded read", async () => {
     const disconnect = disconnectPage.items[0]!;
     fetchPage
-      .mockResolvedValueOnce({ items: [disconnect], hasMore: true })
-      .mockResolvedValueOnce({ items: [], hasMore: true });
+      .mockResolvedValueOnce({ items: [disconnect], hasMore: true, olderCursor: "disconnect1" })
+      .mockResolvedValueOnce({ items: [], hasMore: true, olderCursor: "hidden" });
     const { wrapper } = harness();
     const hook = renderHook(
       () => useSessionErrorStates([{ ...session, status: "failed", host_online: true }]),
@@ -161,7 +167,7 @@ describe("useSessionErrors", () => {
   it("keeps partial disconnect evidence when its pagination request returns 503", async () => {
     const disconnect = disconnectPage.items[0]!;
     fetchPage
-      .mockResolvedValueOnce({ items: [disconnect], hasMore: true })
+      .mockResolvedValueOnce({ items: [disconnect], hasMore: true, olderCursor: "disconnect1" })
       .mockRejectedValueOnce(new Error("503 Service Unavailable"));
     const { wrapper } = harness();
     const hook = renderHook(
@@ -403,6 +409,7 @@ describe("useSessionErrors", () => {
       .mockResolvedValueOnce({
         items: [{ ...message("Hidden context"), is_meta: true }],
         hasMore: true,
+        olderCursor: "message1",
       })
       .mockResolvedValueOnce(errorPage);
     const { wrapper } = harness();

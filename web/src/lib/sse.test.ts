@@ -538,3 +538,98 @@ describe("parseEvent — response.elicitation_resolved", () => {
     } satisfies ElicitationResolved);
   });
 });
+
+describe("owned ephemeral lifecycle metadata", () => {
+  const observation = {
+    runner_id: "B",
+    binding_epoch: 2,
+    revision: 5,
+    observation_id: "owned",
+    status: "failed",
+    response_id: "turn-b",
+    error_key: "failure",
+  };
+
+  it.each(["response.error", "session.terminal_pending"])("retains ownership on %s", (type) => {
+    expect(
+      parseEvent(type, {
+        conversation_id: "session",
+        response_id: "turn-b",
+        pending: false,
+        source: "execution",
+        error: { code: "failure", message: "Current failure" },
+        session_observation: observation,
+        runner_offline_episode_id: "episode",
+      }),
+    ).toMatchObject({
+      conversationId: "session",
+      responseId: "turn-b",
+      sessionObservation: observation,
+      runnerOfflineEpisodeId: "episode",
+    });
+  });
+
+  it("keeps explicit null optional fields compatible with legacy error frames", () => {
+    expect(
+      parseEvent("response.error", {
+        source: "execution",
+        error: { code: "failure", message: "Legacy failure" },
+        session_observation: null,
+        runner_offline_episode_id: null,
+      }),
+    ).not.toHaveProperty("sessionObservation");
+  });
+
+  it.each([
+    "response.created",
+    "response.queued",
+    "response.in_progress",
+    "response.completed",
+    "response.failed",
+    "response.incomplete",
+    "response.cancelled",
+    "response.output_text.delta",
+  ])("retains ownership and rejects malformed metadata on %s", (type) => {
+    const data = {
+      conversation_id: "session",
+      response: { id: "turn-b", status: "completed", output: [] },
+      delta: "Denied by policy",
+    };
+    expect(
+      parseEvent(type, {
+        ...data,
+        session_observation: observation,
+        runner_offline_episode_id: "episode",
+      }),
+    ).toMatchObject({
+      conversationId: "session",
+      sessionObservation: observation,
+      runnerOfflineEpisodeId: "episode",
+    });
+    expect(parseEvent(type, { ...data, session_observation: "bad" })).toHaveProperty(
+      "sessionObservation",
+      null,
+    );
+    expect(parseEvent(type, { ...data, runner_offline_episode_id: "orphan" })).toHaveProperty(
+      "sessionObservation",
+      null,
+    );
+    expect(
+      parseEvent(type, { ...data, session_observation: observation, conversation_id: 42 }),
+    ).toHaveProperty("sessionObservation", null);
+    expect(
+      parseEvent(type, {
+        ...data,
+        session_observation: observation,
+        runner_offline_episode_id: "",
+      }),
+    ).toHaveProperty("sessionObservation", null);
+    expect(
+      parseEvent(type, {
+        ...data,
+        session_observation: null,
+        runner_offline_episode_id: null,
+      }),
+    ).not.toHaveProperty("sessionObservation");
+  });
+});

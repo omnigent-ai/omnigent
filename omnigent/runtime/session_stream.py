@@ -33,6 +33,8 @@ import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from typing import Any
 
+from pydantic import ValidationError
+
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import (
     audit_event_logger,
@@ -40,6 +42,11 @@ from omnigent.debug_logging import (
     debug_sink_enabled,
     sse_event_logger,
     sse_logging_enabled,
+)
+from omnigent.entities.session_observation import (
+    SessionObservation,
+    accept_session_projection,
+    is_versioned_session_observation,
 )
 from omnigent.errors import ErrorImpact, ErrorPhase
 from omnigent.native.input_diagnostics import input_attributes
@@ -68,6 +75,75 @@ _subscribers: WorkspaceScopedCache[
     set[tuple[asyncio.Queue[dict[str, Any] | object], asyncio.AbstractEventLoop]],
 ] = WorkspaceScopedCache()
 _lock = threading.Lock()
+# Lock order: server status cache, stream observation fence, then in-flight text.
+_observation_lock = threading.RLock()
+_observation_floors: WorkspaceScopedCache[str, tuple[SessionObservation, str | None]] = (
+    WorkspaceScopedCache()
+)
+
+
+def learn_observation(
+    conversation_id: str,
+    observation: SessionObservation,
+    runner_offline_episode_id: str | None = None,
+) -> bool:
+    """Advance the stream fence from an accepted durable projection or snapshot."""
+    with _observation_lock:
+        previous = _observation_floors.get(conversation_id)
+        if not accept_session_projection(
+            observation,
+            runner_offline_episode_id,
+            previous[0] if previous is not None else None,
+            previous[1] if previous is not None else None,
+        ):
+            return False
+        if is_versioned_session_observation(observation):
+            _observation_floors[conversation_id] = (observation, runner_offline_episode_id)
+        return True
+
+
+def reset_observation_floors() -> None:
+    """Clear all workspace fences when stores or global test state are reset."""
+    with _observation_lock:
+        _observation_floors.clear()
+
+
+def reset_inflight_text(
+    conversation_id: str,
+    *,
+    response_id: str | None = None,
+    observation: SessionObservation | None = None,
+    runner_offline_episode_id: str | None = None,
+) -> bool:
+    """Clear one response's persisted prefix while its captured owner is current."""
+    with _observation_lock:
+        if not _observation_matches(conversation_id, observation, runner_offline_episode_id):
+            return False
+        return inflight_text.reset_text(conversation_id, response_id=response_id)
+
+
+def discard_inflight_text(
+    conversation_id: str,
+    *,
+    observation: SessionObservation | None = None,
+    runner_offline_episode_id: str | None = None,
+) -> bool:
+    """Discard a relay's replay index only while its captured owner is current."""
+    with _observation_lock:
+        if not _observation_matches(conversation_id, observation, runner_offline_episode_id):
+            return False
+        inflight_text.discard(conversation_id)
+        return True
+
+
+def _observation_matches(
+    conversation_id: str,
+    observation: SessionObservation | None,
+    runner_offline_episode_id: str | None,
+) -> bool:
+    if observation is None:
+        return runner_offline_episode_id is None
+    return _observation_floors.get(conversation_id) == (observation, runner_offline_episode_id)
 
 
 def _enqueue_or_overflow(
@@ -331,7 +407,24 @@ def publish(conversation_id: str, event: dict[str, Any]) -> int:
     # no-op unless a sink is enabled). Done first so it captures every event the
     # server produces — including ones with no live subscriber.
     _log_sse_event(conversation_id, event)
-    disconnect_outcome.observe_event(conversation_id, event)
+    with _observation_lock:
+        raw_observation = event.get("session_observation")
+        episode_id = event.get("runner_offline_episode_id")
+        if raw_observation is None and episode_id is not None:
+            return 0
+        if raw_observation is not None:
+            try:
+                observation = SessionObservation.model_validate(raw_observation)
+            except (ValidationError, TypeError, ValueError):
+                return 0
+            if episode_id is not None and (not isinstance(episode_id, str) or not episode_id):
+                return 0
+            if not learn_observation(conversation_id, observation, episode_id):
+                return 0
+        return _publish_live_event(conversation_id, event)
+
+
+def _publish_live_event(conversation_id: str, event: dict[str, Any]) -> int:
     # Track reconnect state and centrally suppress or rewrite native deltas
     # before they reach subscribers.
     live_event = inflight_text.record_publish(conversation_id, event)
@@ -343,6 +436,7 @@ def publish(conversation_id: str, event: dict[str, Any]) -> int:
     pending_elicitations.record_publish(conversation_id, event)
     if live_event is None:
         return 0
+    disconnect_outcome.observe_event(conversation_id, live_event)
     with _lock:
         subs = list(_subscribers.get(conversation_id, ()))
     scheduled = 0

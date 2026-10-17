@@ -2648,6 +2648,28 @@ def _response_output_text(output: _ResponseOutput) -> str | None:
     return "".join(parts) if parts else None
 
 
+async def _persisted_turn_items(client: OmnigentClient, session_id: str) -> _ResponseOutput:
+    """Fill the latest-turn window across pages with filtered lifecycle markers."""
+    recent: _ResponseOutput = []
+    after: str | None = None
+    visited: set[str] = set()
+    while len(recent) < _RECONCILE_ITEMS_LIMIT:
+        page = await client.sessions.list_items(
+            session_id, limit=_RECONCILE_ITEMS_LIMIT, order="desc", after=after
+        )
+        recent.extend(page.data[: _RECONCILE_ITEMS_LIMIT - len(recent)])
+        if not page.has_more or any(
+            item.get("type") == "message" and item.get("role") == "user" for item in recent
+        ):
+            break
+        last_id = page.last_id or (page.data[-1].get("id") if page.data else None)
+        if not isinstance(last_id, str) or not last_id or last_id in visited:
+            break
+        visited.add(last_id)
+        after = last_id
+    return recent
+
+
 async def _persisted_turn_text(
     client: OmnigentClient,
     session_id: str,
@@ -2691,11 +2713,7 @@ async def _persisted_turn_text(
         # resumed session can have far more than the limit of history;
         # fetching ``asc`` would return the oldest items and miss this
         # turn entirely.
-        recent: _ResponseOutput = (
-            await client.sessions.list_items(
-                session_id, limit=_RECONCILE_ITEMS_LIMIT, order="desc"
-            )
-        ).data
+        recent = await _persisted_turn_items(client, session_id)
     except ClientOmnigentError as exc:
         # The reconcile read is itself best-effort: if the items
         # endpoint is unreachable, fall back to the original outcome
@@ -2743,11 +2761,7 @@ async def _persisted_turn_error(
     :returns: The current turn's terminal error message, or ``None``.
     """
     try:
-        recent: _ResponseOutput = (
-            await client.sessions.list_items(
-                session_id, limit=_RECONCILE_ITEMS_LIMIT, order="desc"
-            )
-        ).data
+        recent = await _persisted_turn_items(client, session_id)
     except ClientOmnigentError as exc:
         logger.debug("reconcile error read failed for %s: %r", session_id, exc)
         return None

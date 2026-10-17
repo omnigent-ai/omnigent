@@ -629,7 +629,7 @@ def discard(conversation_id: str) -> None:
         _native_recent_committed.pop(conversation_id, None)
 
 
-def reset_text(conversation_id: str) -> None:
+def reset_text(conversation_id: str, *, response_id: str | None = None) -> bool:
     """
     Clear the response-scoped accumulated text but keep the turn header.
 
@@ -642,11 +642,15 @@ def reset_text(conversation_id: str) -> None:
     untouched — it has its own per-message commit eviction.
 
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param response_id: Expected response owner; ``None`` preserves the legacy reset.
+    :returns: Whether a matching response's accumulated text was cleared.
     """
     with _lock:
         entry = _inflight.get(conversation_id)
-        if entry is not None:
-            entry.parts.clear()
+        if entry is None or (response_id is not None and entry.response_id != response_id):
+            return False
+        entry.parts.clear()
+        return True
 
 
 def reset_for_tests() -> None:

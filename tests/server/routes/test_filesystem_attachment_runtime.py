@@ -4,13 +4,81 @@ from unittest.mock import Mock
 
 import pytest
 
+from omnigent.entities import MessageData, NewConversationItem, ResourceEventData
+from omnigent.entities.session_observation import RunnerOfflineDecision
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import HostHelloFrame, decode_host_frame, encode_host_frame
 from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
 from omnigent.runner.transports.ws_tunnel.frames import HelloFrame, decode_frame, encode_frame
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.server.host_registry import HostRegistry
-from omnigent.server.routes._sessions.helpers import require_filesystem_attachment_runtime
+from omnigent.server.routes._sessions.helpers import (
+    _filesystem_attachment_in_history,
+    require_filesystem_attachment_runtime,
+)
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+
+@pytest.mark.parametrize("marker_page", ["expired", "current", "terminal-empty"])
+def test_attachment_history_advances_by_source_cursor_after_marker_projection(
+    db_uri: str, marker_page: str
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    files = SqlAlchemyFileStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(parent_conversation_id=parent.id, runner_id="runner-a")
+    observed = store.record_session_observation(child.id, "running", response_id="child-turn")
+    assert observed is not None
+    decision = RunnerOfflineDecision(
+        observation=observed,
+        episode_id="offline-episode",
+        error_labels={"omnigent.last_task_error_code": "runner_disconnected"},
+    )
+    assert store.record_runner_offline_decision(child.id, decision) is not None
+    attached = files.create("sample.zip", bytes=4, session_id=parent.id)
+    if marker_page != "terminal-empty":
+        store.append(
+            parent.id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id="attached-turn",
+                    data=MessageData(
+                        role="user", content=[{"type": "input_file", "file_id": attached.id}]
+                    ),
+                )
+            ],
+        )
+    markers = store.append(
+        parent.id,
+        [
+            NewConversationItem(
+                type="resource_event",
+                response_id="child-turn",
+                data=ResourceEventData(
+                    event_type="session.subagent.returned",
+                    resource_id=child.id,
+                    resource_type="session",
+                    resource={
+                        "session_observation": observed.model_dump(),
+                        "runner_offline_episode_id": decision.episode_id,
+                    },
+                ),
+            )
+            for _ in range(1000)
+        ],
+    )
+    if marker_page != "current":
+        store.replace_runner_id(child.id, "runner-b")
+    first = store.list_items(parent.id, limit=1000, order="desc")
+    assert bool(first.data) is (marker_page == "current")
+    assert first.has_more is (marker_page != "terminal-empty")
+    assert first.last_id == markers[0].id
+
+    assert _filesystem_attachment_in_history(parent.id, store, files) == (
+        None if marker_page == "terminal-empty" else "sample.zip"
+    )
 
 
 @pytest.mark.asyncio

@@ -31,6 +31,7 @@ from typing import Any, Literal
 import httpx
 from pydantic import TypeAdapter
 
+from omnigent.entities.session_observation import SessionObservation
 from omnigent.server.schemas import ServerStreamEvent
 
 from ._child_status import child_summary_busy
@@ -202,6 +203,8 @@ class Session:
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None
     archived: bool = False
+    session_observation: SessionObservation | None = None
+    runner_offline_episode_id: str | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Session:
@@ -238,6 +241,12 @@ class Session:
             last_task_error=raw.get("last_task_error"),
             external_session_id=raw.get("external_session_id"),
             archived=bool(raw.get("archived", False)),
+            session_observation=(
+                SessionObservation.model_validate(raw["session_observation"])
+                if raw.get("session_observation") is not None
+                else None
+            ),
+            runner_offline_episode_id=raw.get("runner_offline_episode_id"),
         )
 
 
@@ -297,6 +306,8 @@ class SessionListItem:
     pending_elicitations_count: int = 0
     archived: bool = False
     parent_session_id: str | None = None
+    session_observation: SessionObservation | None = None
+    runner_offline_episode_id: str | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> SessionListItem:
@@ -324,6 +335,12 @@ class SessionListItem:
             pending_elicitations_count=raw.get("pending_elicitations_count", 0),
             archived=bool(raw.get("archived", False)),
             parent_session_id=raw.get("parent_session_id"),
+            session_observation=(
+                SessionObservation.model_validate(raw["session_observation"])
+                if raw.get("session_observation") is not None
+                else None
+            ),
+            runner_offline_episode_id=raw.get("runner_offline_episode_id"),
         )
 
 

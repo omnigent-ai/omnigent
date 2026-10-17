@@ -63,6 +63,8 @@ import type {
   TerminalCommandEvent,
 } from "@/lib/events";
 import type { TerminalInfo } from "@/hooks/useTerminals";
+import type { Session } from "@/lib/types";
+import type { SessionObservation } from "@/lib/sessionObservation";
 import { terminalsQueryKey } from "@/hooks/useTerminals";
 import { type ChildSessionInfo, childSessionsQueryKey } from "@/hooks/useChildSessions";
 import {
@@ -1388,6 +1390,188 @@ describe("chatStore — switchTo", () => {
     expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual(["pend_keep"]);
   });
 
+  it.each(["stale", "current"] as const)(
+    "review: a %s owner snapshot can resolve only its own current approval",
+    async (snapshotOwner) => {
+      const id = "conv_review_approval";
+      seedSession(id, []);
+      const sink = pushableStream();
+      const oldOwner = {
+        runner_id: "A",
+        binding_epoch: 1,
+        revision: 4,
+        observation_id: "old",
+        status: "waiting",
+        response_id: "turn_A",
+        error_key: null,
+      };
+      const currentOwner = {
+        ...oldOwner,
+        runner_id: "B",
+        binding_epoch: 2,
+        revision: 5,
+        observation_id: "current",
+        response_id: "turn_B",
+      };
+      let refetch = false;
+      let release!: () => void;
+      let requested!: () => void;
+      const requestStarted = new Promise<void>((resolve) => {
+        requested = resolve;
+      });
+      const snapshot = (observation: typeof oldOwner) =>
+        mockResponse({
+          id,
+          agent_id: "agent_xyz",
+          created_at: 0,
+          status: "waiting",
+          session_observation: observation,
+          pending_elicitations: [],
+          pending_inputs: [],
+        });
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url === `/v1/sessions/${id}/stream`) {
+          return mockResponse(null, { bodyStream: sink.stream });
+        }
+        if (url.split("?")[0] === `/v1/sessions/${id}` && (init?.method ?? "GET") === "GET") {
+          if (!refetch) return snapshot(oldOwner);
+          requested();
+          return new Promise<Response>((resolve) => {
+            release = () => resolve(snapshot(snapshotOwner === "stale" ? oldOwner : currentOwner));
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+      try {
+        await useChatStore.getState().switchTo(id);
+        handleSessionEvent({
+          type: "session_status",
+          conversationId: id,
+          status: "waiting",
+          sessionObservation: currentOwner,
+        });
+        sink.push(sse("response.created", { id: "turn_B", status: "in_progress", output: [] }));
+        sink.push(
+          sse("response.elicitation_request", {
+            elicitation_id: "current_approval",
+            params: {
+              mode: "form",
+              message: "Approve current B operation?",
+              phase: "tool_call_approval",
+              policy_name: "test_policy",
+              content_preview: "",
+            },
+          }),
+        );
+        await tick();
+        await tick();
+        const cards = () =>
+          useChatStore
+            .getState()
+            .blocks.filter((block): block is ElicitationBlock => block.type === "elicitation");
+        expect(cards()).toHaveLength(1);
+        expect(cards()[0]!.status).toBe("pending");
+        expect(client.getQueryData<Session>(["session", id])!.sessionObservation).toEqual(
+          currentOwner,
+        );
+        refetch = true;
+        document.dispatchEvent(new Event("visibilitychange"));
+        await requestStarted;
+        release();
+        await tick();
+        await tick();
+        expect(cards()).toHaveLength(1);
+        expect(cards()[0]!.status).toBe(snapshotOwner === "stale" ? "pending" : "responded");
+      } finally {
+        sink.push("data: [DONE]\n\n");
+        sink.close();
+        await tick();
+      }
+    },
+  );
+
+  it("review: keeps a current approval that arrives after the focus snapshot starts", async () => {
+    const id = "conv_review_focus_new";
+    seedSession(id, []);
+    const sink = pushableStream();
+    const owner = {
+      runner_id: "B",
+      binding_epoch: 2,
+      revision: 5,
+      observation_id: "current",
+      status: "waiting",
+      response_id: "turn_B",
+      error_key: null,
+    };
+    let refetch = false;
+    let release!: () => void;
+    let requested!: () => void;
+    const requestStarted = new Promise<void>((resolve) => {
+      requested = resolve;
+    });
+    const snapshot = () =>
+      mockResponse({
+        id,
+        agent_id: "agent_xyz",
+        created_at: 0,
+        status: "waiting",
+        session_observation: owner,
+        pending_elicitations: [],
+        pending_inputs: [],
+      });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === `/v1/sessions/${id}/stream`) {
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      if (url.split("?")[0] === `/v1/sessions/${id}` && (init?.method ?? "GET") === "GET") {
+        if (!refetch) return snapshot();
+        requested();
+        return new Promise<Response>((resolve) => {
+          release = () => resolve(snapshot());
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    try {
+      await useChatStore.getState().switchTo(id);
+      refetch = true;
+      document.dispatchEvent(new Event("visibilitychange"));
+      await requestStarted;
+      sink.push(sse("response.created", { id: "turn_B", status: "in_progress", output: [] }));
+      sink.push(
+        sse("response.elicitation_request", {
+          elicitation_id: "new_current_approval",
+          params: {
+            mode: "form",
+            message: "Approve new current operation?",
+            phase: "tool_call_approval",
+            policy_name: "test_policy",
+            content_preview: "",
+          },
+        }),
+      );
+      await tick();
+      await tick();
+      const cards = () =>
+        useChatStore
+          .getState()
+          .blocks.filter((block): block is ElicitationBlock => block.type === "elicitation");
+      expect(cards()).toHaveLength(1);
+      expect(cards()[0]!.status).toBe("pending");
+      release();
+      await tick();
+      await tick();
+      expect(cards()).toHaveLength(1);
+      expect(cards()[0]!.status).toBe("pending");
+    } finally {
+      sink.push("data: [DONE]\n\n");
+      sink.close();
+      await tick();
+    }
+  });
+
   it("reconciles a backgrounded conversation's stale approval card on tab focus", async () => {
     // `bindStream` registers a visibilitychange reconcile per stream, so every
     // LIVE conversation gets one — not just the visible one. Gating the apply on
@@ -1898,6 +2082,349 @@ describe("chatStore — switchTo", () => {
       .blocks.filter((b): b is ElicitationBlock => b.type === "elicitation");
     expect(cards).toHaveLength(1);
     expect(cards[0]!.ctx.itemId).toBe("fc_ask:answer");
+  });
+
+  it("keeps a streamed newer turn when the initial HTTP snapshot reports an old offline failure", async () => {
+    seedSession("conv_stale", []);
+    let release!: () => void;
+    let signalRequested!: () => void;
+    const requested = new Promise<void>((resolve) => {
+      signalRequested = resolve;
+    });
+    const observation = {
+      runner_id: "B",
+      binding_epoch: 2,
+      revision: 5,
+      observation_id: "new",
+      status: "running",
+      response_id: "new_turn",
+      error_key: null,
+    };
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.split("?")[0] === "/v1/sessions/conv_stale" && (init?.method ?? "GET") === "GET") {
+        signalRequested();
+        return new Promise<Response>((resolve) => {
+          release = () =>
+            resolve(
+              mockResponse({
+                id: "conv_stale",
+                agent_id: "agent_xyz",
+                status: "failed",
+                created_at: 0,
+                session_observation: {
+                  ...observation,
+                  runner_id: "A",
+                  binding_epoch: 1,
+                  revision: 4,
+                },
+                runner_offline_episode_id: "old_outage",
+                last_task_error: { code: "runner_disconnected", message: "old runner failure" },
+                active_response_id: "old_turn",
+              }),
+            );
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const bind = useChatStore.getState().switchTo("conv_stale");
+    await requested;
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_stale",
+      status: "running",
+      responseId: "new_turn",
+      sessionObservation: observation,
+    });
+    release();
+    await bind;
+    const state = useChatStore.getState();
+    expect(state.sessionStatus).toBe("running");
+    expect(state.sessionObservation).toEqual(observation);
+    expect(state.activeResponse).toMatchObject({ responseId: "new_turn", state: "streaming" });
+    expect(state.blocks.filter((block) => block.type === "error")).toEqual([]);
+  });
+
+  it("does not restore old approvals or startup state over a streamed owned failure", async () => {
+    seedSession("conv_stale_pending", []);
+    let release!: () => void;
+    let signalRequested!: () => void;
+    const requested = new Promise<void>((resolve) => {
+      signalRequested = resolve;
+    });
+    const observation = {
+      runner_id: "B",
+      binding_epoch: 2,
+      revision: 5,
+      observation_id: "new_failure",
+      status: "failed",
+      response_id: "new_turn",
+      error_key: "current_failure",
+    };
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (
+        String(input).split("?")[0] === "/v1/sessions/conv_stale_pending" &&
+        (init?.method ?? "GET") === "GET"
+      ) {
+        signalRequested();
+        return new Promise<Response>((resolve) => {
+          release = () =>
+            resolve(
+              mockResponse({
+                id: "conv_stale_pending",
+                agent_id: "agent_xyz",
+                created_at: 0,
+                status: "waiting",
+                session_observation: {
+                  ...observation,
+                  runner_id: "A",
+                  binding_epoch: 1,
+                  revision: 4,
+                },
+                terminal_pending: true,
+                sandbox_status: { stage: "provisioning", error: null },
+                mcp_startup: { old_server: { status: "starting", error: null } },
+                pending_elicitations: [
+                  {
+                    type: "response.elicitation_request",
+                    elicitation_id: "old_approval",
+                    message: "Old approval",
+                    requested_schema: { type: "object" },
+                  },
+                ],
+                pending_inputs: [
+                  {
+                    pending_id: "old_input",
+                    content: [{ type: "input_text", text: "Old queued input" }],
+                  },
+                ],
+              }),
+            );
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const bind = useChatStore.getState().switchTo("conv_stale_pending");
+    await requested;
+    handleSessionEvent({
+      type: "session_status",
+      conversationId: "conv_stale_pending",
+      status: "failed",
+      sessionObservation: observation,
+      error: { code: "current_failure", message: "Current failure" },
+    });
+    release();
+    await bind;
+    const state = useChatStore.getState();
+    expect(state.sessionStatus).toBe("failed");
+    expect(state.sessionObservation).toEqual(observation);
+    expect(state.terminalPending).toBe(false);
+    expect(state.sandboxStatus).toBeNull();
+    expect(state.mcpStartup).toBeNull();
+    expect(state.pendingUserMessages).toEqual([]);
+    expect(state.blocks.filter((block) => block.type === "elicitation")).toEqual([]);
+    expect(state.blocks.filter((block) => block.type === "error")).toEqual([
+      expect.objectContaining({ message: "Current failure" }),
+    ]);
+  });
+
+  it.each(["stale", "current"] as const)(
+    "review: cold bind uses only a %s snapshot to dedupe queued input",
+    async (snapshotOwner) => {
+      const id = "conv_review_bind_queue";
+      const historical = userMessage("turn_A", "repeat me");
+      seedSession(id, [historical]);
+      const sink = pushableStream();
+      const oldOwner = {
+        runner_id: "A",
+        binding_epoch: 1,
+        revision: 4,
+        observation_id: "old",
+        status: "running",
+        response_id: "turn_A",
+        error_key: null,
+      };
+      const owner = {
+        ...oldOwner,
+        runner_id: "B",
+        binding_epoch: 2,
+        revision: 5,
+        observation_id: "current",
+        response_id: "turn_B",
+      };
+      let release!: () => void;
+      let requested!: () => void;
+      const requestStarted = new Promise<void>((resolve) => {
+        requested = resolve;
+      });
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url === `/v1/sessions/${id}/stream`) {
+          return mockResponse(null, { bodyStream: sink.stream });
+        }
+        if (url.split("?")[0] === `/v1/sessions/${id}` && (init?.method ?? "GET") === "GET") {
+          requested();
+          return new Promise<Response>((resolve) => {
+            release = () =>
+              resolve(
+                mockResponse({
+                  id,
+                  agent_id: "agent_xyz",
+                  created_at: 0,
+                  status: "running",
+                  session_observation: snapshotOwner === "stale" ? oldOwner : owner,
+                  pending_inputs:
+                    snapshotOwner === "current"
+                      ? [
+                          {
+                            pending_id: "snapshot_ghost",
+                            content: [{ type: "input_text", text: "repeat me" }],
+                          },
+                        ]
+                      : [],
+                  pending_elicitations: [],
+                }),
+              );
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const bind = useChatStore.getState().switchTo(id);
+      try {
+        await requestStarted;
+        handleSessionEvent({
+          type: "session_status",
+          conversationId: id,
+          status: "running",
+          sessionObservation: owner,
+        });
+        let pendingId: string | undefined;
+        if (snapshotOwner === "stale") {
+          await useChatStore.getState().send("repeat me", "agent_xyz");
+          const pending = useChatStore.getState().pendingUserMessages;
+          expect(pending).toHaveLength(1);
+          expect(pending[0]!.posted).toBe(true);
+          pendingId = pending[0]!.tempId;
+        }
+        release();
+        await bind;
+        const state = useChatStore.getState();
+        expect(state.sessionObservation).toEqual(owner);
+        expect(state.blocks.map((block) => block.ctx.itemId)).toContain(historical.id);
+        if (snapshotOwner === "stale") {
+          expect(state.pendingUserMessages.map((pending) => pending.tempId)).toEqual([pendingId]);
+        } else {
+          expect(state.pendingUserMessages).toEqual([]);
+        }
+      } finally {
+        release();
+        await bind;
+        sink.push("data: [DONE]\n\n");
+        sink.close();
+        await tick();
+      }
+    },
+  );
+
+  it("review: current-owner cold bind keeps a live send created after the snapshot starts", async () => {
+    const id = "conv_review_current_bind_queue";
+    const historical = userMessage("turn_A", "repeat me");
+    seedSession(id, [historical]);
+    const sink = pushableStream();
+    const owner = {
+      runner_id: "B",
+      binding_epoch: 2,
+      revision: 5,
+      observation_id: "current",
+      status: "running",
+      response_id: "turn_B",
+      error_key: null,
+    };
+    let release!: () => void;
+    let requested!: () => void;
+    const requestStarted = new Promise<void>((resolve) => {
+      requested = resolve;
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === `/v1/sessions/${id}/stream`) {
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      if (url.split("?")[0] === `/v1/sessions/${id}` && (init?.method ?? "GET") === "GET") {
+        const captured = mockResponse({
+          id,
+          agent_id: "agent_xyz",
+          created_at: 0,
+          status: "running",
+          session_observation: owner,
+          pending_inputs: [],
+          pending_elicitations: [],
+        });
+        requested();
+        return new Promise<Response>((resolve) => {
+          release = () => resolve(captured);
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const bind = useChatStore.getState().switchTo(id);
+    try {
+      await requestStarted;
+      handleSessionEvent({
+        type: "session_status",
+        conversationId: id,
+        status: "running",
+        sessionObservation: owner,
+      });
+      await useChatStore.getState().send("repeat me", "agent_xyz");
+      const pending = useChatStore.getState().pendingUserMessages;
+      expect(pending).toHaveLength(1);
+      expect(pending[0]!.posted).toBe(true);
+      const pendingId = pending[0]!.tempId;
+      release();
+      await bind;
+      const state = useChatStore.getState();
+      expect(state.sessionObservation).toEqual(owner);
+      expect(state.blocks.map((block) => block.ctx.itemId)).toContain(historical.id);
+      expect(state.pendingUserMessages.map((message) => message.tempId)).toEqual([pendingId]);
+    } finally {
+      release();
+      await bind;
+      sink.push("data: [DONE]\n\n");
+      sink.close();
+      await tick();
+    }
+  });
+
+  it("scrolls past invisible history pages using the underlying cursor", async () => {
+    const newest = userMessage("newest", "Latest");
+    const older = userMessage("older", "Earlier");
+    seedSession("conv_filtered", [newest]);
+    const cursors: (string | null)[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.startsWith("/v1/sessions/conv_filtered/items?")) {
+        const cursor = new URL(url, "http://test.local").searchParams.get("after");
+        cursors.push(cursor);
+        if (!cursor)
+          return mockResponse({ data: [newest], last_id: "hidden_tail", has_more: true });
+        if (cursor === "hidden_tail")
+          return mockResponse({ data: [], last_id: "hidden_middle", has_more: true });
+        if (cursor === "hidden_middle")
+          return mockResponse({ data: [older], last_id: older.id, has_more: false });
+        throw new Error(`Unexpected cursor ${cursor}`);
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().switchTo("conv_filtered");
+    expect(useChatStore.getState().oldestItemId).toBe("hidden_tail");
+    await useChatStore.getState().loadMoreHistory();
+    expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual([
+      older.id,
+      newest.id,
+    ]);
+    expect(useChatStore.getState().hasMoreHistory).toBe(false);
+    expect(cursors).toEqual([null, "hidden_tail", "hidden_middle"]);
   });
 
   it("hydrates only the initial window and flags that older history remains", async () => {
@@ -3223,7 +3750,7 @@ describe("chatStore — send (first-send ordering)", () => {
       conversationId: "conv_existing",
       abortController: new AbortController(),
       status: "idle",
-      sessionStatus: "running",
+      sessionStatus: "idle",
     });
     fetchMock.mockImplementation((input, init) => {
       const url = String(input);
@@ -4213,7 +4740,7 @@ describe("chatStore — sendSlashCommand", () => {
       conversationId: "conv_existing",
       abortController: new AbortController(),
       status: "idle",
-      sessionStatus: "running",
+      sessionStatus: "idle",
     });
     fetchMock.mockImplementation((input, init) => {
       const url = String(input);
@@ -4396,6 +4923,228 @@ describe("chatStore — sendSlashCommand", () => {
     expect(useChatStore.getState().status).toBe("idle");
     // And rolls back the optimistic echo — no receipt will ever pop it.
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+  });
+});
+
+describe("chatStore — denied POST ownership", () => {
+  const kinds = ["message", "slash"] as const;
+  const submit = (kind: (typeof kinds)[number]) =>
+    kind === "message"
+      ? useChatStore.getState().send("blocked A", "agent_xyz")
+      : useChatStore.getState().sendSlashCommand("review", "A", "agent_xyz");
+
+  it.each(kinds.flatMap((kind) => ["running", "failed", "legacy"].map((next) => ({ kind, next }))))(
+    "keeps newer $next lifecycle when $kind A POST fails",
+    async ({ kind, next }) => {
+      const id = `failure-${kind}-${next}`;
+      useChatStore.setState({
+        conversationId: id,
+        abortController: new AbortController(),
+        status: "idle",
+        sessionStatus: "idle",
+      });
+      let entered!: () => void;
+      const posted = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      let release!: () => void;
+      fetchMock.mockImplementation((input, init) => {
+        if (String(input).endsWith(`/v1/sessions/${id}/events`)) {
+          entered();
+          return new Promise<Response>((resolve) => {
+            release = () =>
+              resolve(
+                mockResponse(
+                  { error: { code: "input_rejected", message: "A refused" } },
+                  { ok: false, status: 503 },
+                ),
+              );
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const pending = submit(kind);
+      await posted;
+      const status = next === "failed" ? "failed" : "running";
+      handleSessionEvent(
+        {
+          type: "session_status",
+          conversationId: id,
+          status,
+          responseId: "turn-b",
+          ...(next === "legacy"
+            ? {}
+            : {
+                sessionObservation: {
+                  runner_id: "runner-b",
+                  binding_epoch: 2,
+                  revision: 3,
+                  observation_id: "b",
+                  status,
+                  response_id: "turn-b",
+                  error_key: status === "failed" ? "provider" : null,
+                },
+              }),
+          ...(status === "failed"
+            ? { error: { code: "provider", message: "B genuine failure" } }
+            : {}),
+          backgroundTaskCount: 2,
+          backgroundTasks: [{ description: "B shell", status: "running" }],
+        },
+        id,
+      );
+      const current = useChatStore.getState();
+      release();
+      await pending;
+      const settled = useChatStore.getState();
+      expect(settled.pendingUserMessages).toEqual([]);
+      expect(settled.status).toBe(current.status);
+      expect(settled.sessionStatus).toBe(current.sessionStatus);
+      expect(settled.sessionObservation).toEqual(current.sessionObservation);
+      expect(settled.activeResponse).toEqual(current.activeResponse);
+      expect(settled.backgroundTaskCount).toBe(current.backgroundTaskCount);
+      expect(settled.backgroundTasks).toEqual(current.backgroundTasks);
+      expect(settled.blocks.slice(0, current.blocks.length)).toEqual(current.blocks);
+      expect(settled.blocks.at(-1)).toMatchObject({ type: "error", message: "A refused" });
+    },
+  );
+
+  it.each(kinds.flatMap((kind) => ["running", "failed", "legacy"].map((next) => ({ kind, next }))))(
+    "keeps newer $next lifecycle when denied $kind A ACK arrives",
+    async ({ kind, next }) => {
+      const id = `denial-${kind}-${next}`;
+      useChatStore.setState({
+        conversationId: id,
+        abortController: new AbortController(),
+        status: "idle",
+        sessionStatus: "idle",
+      });
+      let entered!: () => void;
+      const posted = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      let release!: () => void;
+      fetchMock.mockImplementation((input, init) => {
+        if (String(input).endsWith(`/v1/sessions/${id}/events`)) {
+          entered();
+          return new Promise<Response>((resolve) => {
+            release = () => resolve(mockResponse({ queued: false, denied: true }));
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const pending = submit(kind);
+      await posted;
+      const status = next === "failed" ? "failed" : "running";
+      handleSessionEvent(
+        {
+          type: "session_status",
+          conversationId: id,
+          status,
+          responseId: "turn-b",
+          ...(next === "legacy"
+            ? {}
+            : {
+                sessionObservation: {
+                  runner_id: "runner-b",
+                  binding_epoch: 2,
+                  revision: 3,
+                  observation_id: "b",
+                  status,
+                  response_id: "turn-b",
+                  error_key: status === "failed" ? "provider" : null,
+                },
+              }),
+          ...(status === "failed"
+            ? { error: { code: "provider", message: "B genuine failure" } }
+            : {}),
+          backgroundTaskCount: 2,
+          backgroundTasks: [{ description: "B shell", status: "running" }],
+        },
+        id,
+      );
+      const current = useChatStore.getState();
+      release();
+      await pending;
+      const settled = useChatStore.getState();
+      expect(settled.pendingUserMessages).toEqual([]);
+      expect(settled.status).toBe(current.status);
+      expect(settled.sessionStatus).toBe(current.sessionStatus);
+      expect(settled.sessionObservation).toEqual(current.sessionObservation);
+      expect(settled.activeResponse).toEqual(current.activeResponse);
+      expect(settled.backgroundTaskCount).toBe(current.backgroundTaskCount);
+      expect(settled.backgroundTasks).toEqual(current.backgroundTasks);
+      expect(settled.blocks).toEqual(current.blocks);
+    },
+  );
+
+  it.each(
+    kinds.flatMap((kind) => ["idle", "failed", "running"].map((initial) => ({ kind, initial }))),
+  )(
+    "settles only optimistic $kind state from $initial on denied ACK",
+    async ({ kind, initial }) => {
+      const id = `denial-initial-${kind}-${initial}`;
+      const active =
+        initial === "idle"
+          ? null
+          : {
+              responseId: "prior-turn",
+              state: initial === "failed" ? ("failed" as const) : ("streaming" as const),
+              error: initial === "failed" ? "prior genuine failure" : null,
+            };
+      useChatStore.setState({
+        conversationId: id,
+        abortController: new AbortController(),
+        status: initial === "running" ? "streaming" : "idle",
+        sessionStatus: initial as "idle" | "failed" | "running",
+        activeResponse: active,
+      });
+      fetchMock.mockImplementation((input, init) =>
+        String(input).endsWith(`/v1/sessions/${id}/events`)
+          ? mockResponse({ queued: false, denied: true })
+          : defaultFetchHandler(input, init),
+      );
+      await submit(kind);
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages).toEqual([]);
+      expect(state.sessionStatus).toBe(initial);
+      expect(state.status).toBe(initial === "running" ? "streaming" : "idle");
+      expect(state.activeResponse).toEqual(active);
+    },
+  );
+
+  it.each(kinds)("removes only denied %s A's pending bubble", async (kind) => {
+    const id = `denial-pending-${kind}`;
+    useChatStore.setState({
+      conversationId: id,
+      abortController: new AbortController(),
+      status: "idle",
+      sessionStatus: "idle",
+    });
+    let entered!: () => void;
+    const posted = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release!: () => void;
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith(`/v1/sessions/${id}/events`)) {
+        entered();
+        return new Promise<Response>((resolve) => {
+          release = () => resolve(mockResponse({ queued: false, denied: true }));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const pending = submit(kind);
+    await posted;
+    const next = { tempId: "pending-b", content: [{ type: "input_text" as const, text: "B" }] };
+    useChatStore.setState((state) => ({
+      pendingUserMessages: [...state.pendingUserMessages, next],
+    }));
+    release();
+    await pending;
+    expect(useChatStore.getState().pendingUserMessages).toEqual([next]);
+    expect(useChatStore.getState().status).toBe("streaming");
   });
 });
 
@@ -6179,6 +6928,264 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
   });
 
   describe("session.status", () => {
+    it("retains a versioned child's lifecycle while accepting metadata-only deltas", () => {
+      const childClient = new QueryClient();
+      initChatStore(childClient);
+      const observation = {
+        runner_id: "runner_B",
+        binding_epoch: 2,
+        revision: 5,
+        observation_id: "child_new",
+        status: "running",
+        response_id: "child_turn",
+        error_key: null,
+      };
+      childClient.setQueryData(childSessionsQueryKey("conv_abc"), [
+        {
+          id: "child",
+          title: "Child",
+          task_summary: null,
+          tool: null,
+          session_name: null,
+          current_task_status: "running",
+          busy: true,
+          last_message_preview: "New work",
+          pending_elicitations_count: 0,
+          session_observation: observation,
+        },
+      ]);
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_abc",
+        childSessionId: "child",
+        child: {
+          busy: false,
+          current_task_status: "failed",
+          last_task_error: { code: "runner_disconnected", message: "old runner" },
+          session_observation: {
+            ...observation,
+            runner_id: "runner_A",
+            binding_epoch: 1,
+            revision: 4,
+          },
+          runner_offline_episode_id: "old_outage",
+        },
+      });
+      expect(
+        childClient.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey("conv_abc"))?.[0].busy,
+      ).toBe(true);
+      handleSessionEvent({
+        type: "session_child_session_updated",
+        conversationId: "conv_abc",
+        childSessionId: "child",
+        child: { last_message_preview: "Current preview", title: "Updated title" },
+      });
+      const child = childClient.getQueryData<ChildSessionInfo[]>(
+        childSessionsQueryKey("conv_abc"),
+      )?.[0];
+      expect(child?.busy).toBe(true);
+      expect(child?.current_task_status).toBe("running");
+      expect(child?.last_task_error).toBeUndefined();
+      expect(child?.last_message_preview).toBe("Current preview");
+      expect(child?.session_observation).toEqual(observation);
+      childClient.clear();
+    });
+
+    it.each([
+      { name: "rebound runner", epoch: 2, runner: "runner_B", revision: 5 },
+      { name: "ABA binding", epoch: 3, runner: "runner_A", revision: 5 },
+      { name: "later same-runner turn", epoch: 1, runner: "runner_A", revision: 5 },
+    ])("keeps $name running when an old owned failure arrives", ({ epoch, runner, revision }) => {
+      const previous = {
+        runner_id: runner,
+        binding_epoch: epoch,
+        revision,
+        observation_id: "new_observation",
+        status: "running",
+        response_id: "new_turn",
+        error_key: null,
+      };
+      useChatStore.setState({
+        sessionStatus: "running",
+        sessionObservation: previous,
+        runnerOfflineEpisodeId: null,
+        status: "streaming",
+        activeResponse: { responseId: "new_turn", state: "streaming", error: null },
+        blocks: [],
+      });
+      handleSessionEvent({
+        type: "session_status",
+        conversationId: "conv_abc",
+        status: "failed",
+        responseId: "old_turn",
+        sessionObservation: {
+          runner_id: "runner_A",
+          binding_epoch: 1,
+          revision: 4,
+          observation_id: "old_observation",
+          status: "running",
+          response_id: "old_turn",
+          error_key: null,
+        },
+        runnerOfflineEpisodeId: "old_outage",
+        error: { code: "runner_disconnected", message: "old runner lost" },
+      });
+      const state = useChatStore.getState();
+      expect(state.sessionStatus).toBe("running");
+      expect(state.sessionObservation).toEqual(previous);
+      expect(state.activeResponse?.responseId).toBe("new_turn");
+      expect(state.activeResponse?.state).toBe("streaming");
+      expect(state.blocks).toEqual([]);
+    });
+
+    it("applies a current owned failure and waits for a newer normal observation to clear it", () => {
+      const observation = {
+        runner_id: "runner_A",
+        binding_epoch: 1,
+        revision: 4,
+        observation_id: "active_observation",
+        status: "running",
+        response_id: "active_turn",
+        error_key: null,
+      };
+      useChatStore.setState({
+        conversationId: "conv_owned_current",
+        sessionStatus: "running",
+        sessionObservation: observation,
+        runnerOfflineEpisodeId: null,
+        blocks: [],
+      });
+      handleSessionEvent({
+        type: "session_status",
+        conversationId: "conv_owned_current",
+        status: "failed",
+        sessionObservation: observation,
+        runnerOfflineEpisodeId: "current_outage",
+        error: { code: "runner_disconnected", message: "current runner lost" },
+      });
+      expect(useChatStore.getState().sessionStatus).toBe("failed");
+      expect(useChatStore.getState().blocks.some((block) => block.type === "error")).toBe(true);
+      handleSessionEvent({
+        type: "session_status",
+        conversationId: "conv_owned_current",
+        status: "running",
+        sessionObservation: observation,
+      });
+      expect(useChatStore.getState().sessionStatus).toBe("failed");
+      handleSessionEvent({
+        type: "session_status",
+        conversationId: "conv_owned_current",
+        status: "running",
+      });
+      expect(useChatStore.getState().sessionStatus).toBe("failed");
+      handleSessionEvent({
+        type: "session_status",
+        conversationId: "conv_owned_current",
+        status: "running",
+        sessionObservation: {
+          ...observation,
+          revision: 5,
+          observation_id: "recovered_observation",
+        },
+      });
+      expect(useChatStore.getState().sessionStatus).toBe("running");
+      expect(useChatStore.getState().runnerOfflineEpisodeId).toBe(null);
+      expect(useChatStore.getState().blocks).toEqual([]);
+    });
+
+    it.each(["pinned-conversations", "project-sessions"])(
+      "uses the newer %s row to reject stale status and learns current failures",
+      (prefix) => {
+        const id = `owned-list-cache-${prefix}`;
+        const cacheClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+        initChatStore(cacheClient);
+        const old = {
+          runner_id: "runner-a",
+          binding_epoch: 1,
+          revision: 1,
+          observation_id: "old",
+          status: "running",
+          response_id: "old-turn",
+          error_key: null,
+        };
+        const current = {
+          ...old,
+          runner_id: "runner-b",
+          binding_epoch: 2,
+          revision: 2,
+          observation_id: "current",
+          response_id: "current-turn",
+        };
+        const row = { id, status: "running", session_observation: current, labels: {} };
+        const key = [prefix, "projection-test"];
+        if (prefix === "pinned-conversations") {
+          cacheClient.setQueryData(key, { conversations: [row], filterHonored: true });
+        } else {
+          cacheClient.setQueryData(key, {
+            pages: [{ data: [row], has_more: false }],
+            pageParams: [null],
+          });
+        }
+        cacheClient.setQueryData(["session", id], {
+          id,
+          status: "running",
+          sessionObservation: old,
+        });
+        handleSessionEvent(
+          {
+            type: "session_status",
+            conversationId: id,
+            status: "failed",
+            sessionObservation: old,
+            runnerOfflineEpisodeId: "old-outage",
+            error: { code: "runner_disconnected", message: "Old runner" },
+          },
+          id,
+        );
+        expect(cacheClient.getQueryData<Session>(["session", id])?.status).toBe("running");
+        handleSessionEvent(
+          {
+            type: "session_status",
+            conversationId: id,
+            status: "running",
+            sessionObservation: current,
+          },
+          id,
+        );
+        expect(cacheClient.getQueryData<Session>(["session", id])?.sessionObservation).toEqual(
+          current,
+        );
+        const failure = { code: "provider-error", message: "Current genuine failure" };
+        const failed = {
+          ...current,
+          revision: 3,
+          observation_id: "failed",
+          status: "failed",
+          error_key: "provider-error",
+        };
+        handleSessionEvent(
+          {
+            type: "session_status",
+            conversationId: id,
+            status: "failed",
+            sessionObservation: failed,
+            error: failure,
+          },
+          id,
+        );
+        const data = cacheClient.getQueryData<{
+          conversations?: Conversation[];
+          pages?: ConversationsPage[];
+        }>(key);
+        const updated =
+          prefix === "pinned-conversations" ? data?.conversations?.[0] : data?.pages?.[0].data[0];
+        expect(updated?.status).toBe("failed");
+        expect(updated?.session_observation).toEqual(failed);
+        expect(cacheClient.getQueryData<Session>(["session", id])?.lastTaskError).toEqual(failure);
+        cacheClient.clear();
+      },
+    );
+
     it("updates sessionStatus from the event", () => {
       const event: SessionStatusEvent = {
         type: "session_status",
@@ -12067,6 +13074,378 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     vi.useRealTimers();
   });
 
+  it.each(["error", "pending"])(
+    "fences owned %s signals after a newer turn without erasing history",
+    async (kind) => {
+      const id = `ephemeral-${kind}`;
+      const observation = {
+        runner_id: "B",
+        binding_epoch: 2,
+        revision: 5,
+        observation_id: "current",
+        status: "running",
+        response_id: "turn-b",
+        error_key: null,
+      };
+      const old = {
+        ...observation,
+        runner_id: "A",
+        binding_epoch: 1,
+        revision: 4,
+        observation_id: "old",
+        response_id: "turn-a",
+      };
+      const history: ConversationItem = {
+        id: `${id}-history`,
+        type: "error",
+        status: "completed",
+        response_id: "historical-turn",
+        source: "execution",
+        code: "old-source",
+        message: "Historical source error",
+      };
+      seedSession(id, [history]);
+      const snapshot = await getSessionSlim(id);
+      client.setQueryData(["session", id], {
+        ...snapshot,
+        status: "running",
+        sessionObservation: observation,
+      });
+      const sinks = routeStreamOpens();
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        sessionStatus: "running",
+        sessionObservation: observation,
+        terminalPending: true,
+        blocks: itemsToBlocks([history]),
+        activeResponse: { responseId: "turn-b", state: "streaming", error: null },
+      });
+      const loop = startStreamPump(id, controller, setState, getState);
+      const signal = (message: string, owner?: unknown) =>
+        sse(kind === "error" ? "response.error" : "session.terminal_pending", {
+          conversation_id: id,
+          response_id: "turn-b",
+          pending: false,
+          source: "execution",
+          error: { code: message, message },
+          ...(owner !== undefined ? { session_observation: owner } : {}),
+        });
+      try {
+        await drainAsync();
+        sinks[0]!.push(signal("stale-signal", old));
+        sinks[0]!.push(signal("malformed-signal", "bad"));
+        sinks[0]!.push(signal("zero-signal", { binding_epoch: 0, revision: 0 }));
+        await vi.advanceTimersByTimeAsync(40);
+        expect(useChatStore.getState().terminalPending).toBe(true);
+        expect(
+          useChatStore.getState().blocks.filter((block) => block.type === "error"),
+        ).toHaveLength(1);
+        sinks[0]!.push(signal("current-signal", observation));
+        await vi.advanceTimersByTimeAsync(40);
+        if (kind === "pending") expect(useChatStore.getState().terminalPending).toBe(false);
+        else
+          expect(
+            useChatStore
+              .getState()
+              .blocks.some((block) => block.type === "error" && block.message === "current-signal"),
+          ).toBe(true);
+        expect(
+          useChatStore.getState().blocks.some((block) => block.ctx.itemId === history.id),
+        ).toBe(true);
+        sinks[0]!.push(signal("legacy-signal"));
+        await vi.advanceTimersByTimeAsync(40);
+        if (kind === "error")
+          expect(
+            useChatStore
+              .getState()
+              .blocks.some((block) => block.type === "error" && block.message === "legacy-signal"),
+          ).toBe(true);
+      } finally {
+        controller.abort();
+        sinks[0]?.close();
+        await drainAsync();
+        await loop;
+      }
+    },
+  );
+
+  it.each([
+    "response.created",
+    "response.in_progress",
+    "response.completed",
+    "response.failed",
+    "response.incomplete",
+    "response.cancelled",
+    "response.output_text.delta",
+  ])(
+    "fences owned %s before stream reduction and accepts current and legacy output",
+    async (type) => {
+      const id = `owned-lifecycle-${type}`;
+      const startsResponse = type === "response.created" || type === "response.in_progress";
+      const observation = {
+        runner_id: "B",
+        binding_epoch: 2,
+        revision: 5,
+        observation_id: "current",
+        status: "running",
+        response_id: "turn-b",
+        error_key: null,
+      };
+      const old = { ...observation, revision: 4, observation_id: "old", response_id: "turn-a" };
+      seedSession(id, []);
+      client.setQueryData(["session", id], {
+        ...(await getSessionSlim(id)),
+        status: "running",
+        sessionObservation: observation,
+      });
+      const sinks = routeStreamOpens();
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        sessionStatus: "running",
+        sessionObservation: observation,
+        blocks: [],
+      });
+      const loop = startStreamPump(id, controller, setState, getState);
+      const signal = (owner: unknown, responseId = "turn-b", conversationId = id) =>
+        sse(type, {
+          conversation_id: conversationId,
+          response: {
+            id: responseId,
+            status: type.split(".")[1],
+            output: [],
+            usage: { input_tokens: 666, output_tokens: 0, total_tokens: 666 },
+          },
+          delta: "Denied by policy: old request must not change this turn. ",
+          session_observation: owner,
+        });
+      try {
+        await drainAsync();
+        sinks[0]!.push(sse("response.in_progress", { id: "turn-b", status: "in_progress" }));
+        sinks[0]!.push(sse("response.output_text.delta", { delta: "Current turn is working. " }));
+        await vi.advanceTimersByTimeAsync(40);
+        const before = structuredClone(useChatStore.getState().blocks);
+        const activeBefore = structuredClone(useChatStore.getState().activeResponse);
+        sinks[0]!.push(signal(old, startsResponse ? "turn-a" : "turn-b"));
+        sinks[0]!.push(signal("bad"));
+        sinks[0]!.push(signal({ binding_epoch: 0, revision: 0 }));
+        sinks[0]!.push(
+          signal(
+            { ...observation, revision: 99, observation_id: "other-session" },
+            "turn-b",
+            "other",
+          ),
+        );
+        await vi.advanceTimersByTimeAsync(40);
+        expect(useChatStore.getState().blocks).toEqual(before);
+        expect(useChatStore.getState().activeResponse).toEqual(activeBefore);
+        expect(useChatStore.getState().tokensUsed).not.toBe(666);
+
+        const next = { ...observation, revision: 6, observation_id: "next", response_id: "turn-c" };
+        sinks[0]!.push(
+          signal(startsResponse ? next : observation, startsResponse ? "turn-c" : "turn-b"),
+        );
+        await vi.advanceTimersByTimeAsync(40);
+        if (startsResponse)
+          expect(useChatStore.getState().activeResponse?.responseId).toBe("turn-c");
+        else if (type !== "response.output_text.delta") {
+          expect(useChatStore.getState().activeResponse?.state).toBe(type.split(".")[1]);
+          if (type === "response.completed" || type === "response.failed")
+            expect(useChatStore.getState().tokensUsed).toBe(666);
+        } else expect(JSON.stringify(useChatStore.getState().blocks)).toContain("Denied by policy");
+
+        sinks[0]!.push(sse("response.in_progress", { id: "turn-legacy", status: "in_progress" }));
+        sinks[0]!.push(
+          sse("response.output_text.delta", {
+            delta: "Legacy output still reaches this conversation. ",
+          }),
+        );
+        sinks[0]!.push(
+          sse("response.completed", { id: "turn-legacy", status: "completed", output: [] }),
+        );
+        await vi.advanceTimersByTimeAsync(40);
+        expect(JSON.stringify(useChatStore.getState().blocks)).toContain(
+          "Legacy output still reaches",
+        );
+        expect(useChatStore.getState().activeResponse?.state).toBe("completed");
+      } finally {
+        controller.abort();
+        sinks[0]?.close();
+        await drainAsync();
+        await loop;
+      }
+    },
+  );
+
+  it.each(["normal", "offline"])(
+    "fences annotated live %s child activity without dropping source history or output",
+    async (kind) => {
+      const parentId = `activity-parent-${kind}`;
+      const childId = `activity-child-${kind}`;
+      const current = {
+        runner_id: "runner-b",
+        binding_epoch: 2,
+        revision: 5,
+        observation_id: "current-child",
+        status: "running",
+        response_id: "child-turn-b",
+        error_key: null,
+      };
+      const old = {
+        ...current,
+        runner_id: "runner-a",
+        binding_epoch: 1,
+        revision: 4,
+        observation_id: "old-child",
+        response_id: "child-turn-a",
+      };
+      const activity = (
+        id: string,
+        observation?: SessionObservation,
+      ): ConversationItem & Record<string, unknown> => ({
+        id,
+        type: "resource_event",
+        response_id: "parent-turn",
+        status: "completed",
+        resource_type: "session",
+        resource_id: childId,
+        event_type: "session.subagent.returned",
+        resource: {
+          title: "Worker",
+          status: "failed",
+          ...(observation
+            ? {
+                session_observation: observation,
+                ...(kind === "offline" ? { runner_offline_episode_id: `${id}-outage` } : {}),
+              }
+            : {}),
+        },
+      });
+      const historical = activity("accepted-source-history", old);
+      seedSession(parentId, [historical]);
+      client.setQueryData(childSessionsQueryKey(parentId), [
+        {
+          id: childId,
+          title: "Worker",
+          task_summary: null,
+          tool: null,
+          session_name: null,
+          current_task_status: "running",
+          busy: true,
+          last_message_preview: null,
+          pending_elicitations_count: 0,
+          session_observation: current,
+        },
+      ] satisfies ChildSessionInfo[]);
+      const sinks = routeStreamOpens();
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: parentId,
+        abortController: controller,
+        blocks: itemsToBlocks([historical]),
+      });
+      const loop = startStreamPump(parentId, controller, setState, getState);
+      try {
+        await drainAsync();
+        expect(sinks).toHaveLength(1);
+        sinks[0]!.push(
+          sse("session.child_session.updated", {
+            conversation_id: parentId,
+            child_session_id: childId,
+            child: {
+              current_task_status: "running",
+              busy: true,
+              session_observation: current,
+            },
+          }),
+        );
+        await drainAsync();
+        expect(
+          client.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey(parentId))?.[0]
+            .session_observation,
+        ).toEqual(current);
+        client.removeQueries({ queryKey: childSessionsQueryKey(parentId), exact: true });
+        expect(client.getQueryData(childSessionsQueryKey(parentId))).toBeUndefined();
+        sinks[0]!.push(
+          sse("session.child_session.updated", {
+            conversation_id: parentId,
+            child_session_id: childId,
+            child: {
+              current_task_status: "failed",
+              busy: false,
+              session_observation: old,
+            },
+          }),
+        );
+        await drainAsync();
+        expect(client.getQueryData(childSessionsQueryKey(parentId))).toBeUndefined();
+        sinks[0]!.push(sse("response.output_item.done", { item: activity("late-old", old) }));
+        sinks[0]!.push(
+          sse("response.output_item.done", {
+            item: activity("late-default-zero", {
+              ...old,
+              binding_epoch: 0,
+              revision: 0,
+              observation_id: null,
+            }),
+          }),
+        );
+        await drainAsync();
+        expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual([
+          historical.id,
+        ]);
+
+        const failed = {
+          ...current,
+          revision: 6,
+          observation_id: "genuine-current-failure",
+          status: "failed",
+          error_key: "provider_error",
+        };
+        sinks[0]!.push(
+          sse("response.output_item.done", { item: activity("genuine-current", failed) }),
+        );
+        await drainAsync();
+        expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual([
+          historical.id,
+          "genuine-current",
+        ]);
+
+        client.removeQueries({ queryKey: childSessionsQueryKey(parentId), exact: true });
+        sinks[0]!.push(
+          sse("response.output_item.done", { item: activity("late-after-eviction", current) }),
+        );
+        const malformed = activity("malformed-ownership");
+        malformed.resource = { session_observation: { binding_epoch: "bad" } };
+        sinks[0]!.push(sse("response.output_item.done", { item: malformed }));
+        sinks[0]!.push(sse("response.output_item.done", { item: activity("legacy-source") }));
+        sinks[0]!.push(
+          sse("response.output_item.done", { item: assistantMessage("parent-answer", "answer") }),
+        );
+        await drainAsync();
+        expect(useChatStore.getState().blocks.map((block) => block.ctx.itemId)).toEqual([
+          historical.id,
+          "genuine-current",
+          "legacy-source",
+          "msg_parent-answer_asst",
+        ]);
+        const genuine = useChatStore
+          .getState()
+          .blocks.find((block): block is NativeToolBlock => block.ctx.itemId === "genuine-current");
+        expect(genuine?.data.resource).toMatchObject({ status: "failed" });
+      } finally {
+        controller.abort();
+        sinks[sinks.length - 1]!.push("data: [DONE]\n\n");
+        sinks[sinks.length - 1]!.close();
+        await drainAsync(2);
+        await loop;
+      }
+    },
+  );
+
   it("reopens the stream after a transport drop, then stops on [DONE]", async () => {
     seedSession("conv_loop", []);
     const sinks = routeStreamOpens();
@@ -13968,6 +15347,110 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await drainAsync(2);
     await loop;
   });
+
+  it.each(["stale", "current"] as const)(
+    "review: fresh-window fallback keeps current approval against a %s snapshot",
+    async (snapshotOwner) => {
+      const id = "conv_review_fallback";
+      const preGap = Array.from({ length: 30 }, (_, i) => gapUser("review_pre", i));
+      const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
+      seedSession(id, preGap);
+      const owner = {
+        runner_id: "B",
+        binding_epoch: 2,
+        revision: 5,
+        observation_id: "current",
+        status: "waiting",
+        response_id: "turn_B",
+        error_key: null,
+      };
+      const sinks = routeStreamOpens();
+      const routed = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (
+          String(input).split("?")[0] === `/v1/sessions/${id}` &&
+          (init?.method ?? "GET") === "GET"
+        ) {
+          return mockResponse({
+            id,
+            agent_id: "agent_xyz",
+            created_at: 0,
+            status: "waiting",
+            session_observation:
+              snapshotOwner === "stale"
+                ? {
+                    ...owner,
+                    runner_id: "A",
+                    binding_epoch: 1,
+                    revision: 4,
+                    observation_id: "old",
+                    response_id: "turn_A",
+                  }
+                : owner,
+            pending_elicitations: [],
+            pending_inputs: [],
+          });
+        }
+        return routed(input, init);
+      });
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        sessionObservation: owner,
+        sessionStatus: "waiting",
+        blocks: itemsToBlocks(windowItems),
+        hasMoreHistory: true,
+        oldestItemId: windowItems[0]!.id,
+      });
+      const loop = startStreamPump(id, controller, setState, getState);
+      try {
+        await drainAsync();
+        expect(sinks).toHaveLength(1);
+        sinks[0]!.push(
+          sse("response.created", { id: "turn_B", status: "in_progress", output: [] }),
+        );
+        sinks[0]!.push(
+          sse("response.elicitation_request", {
+            elicitation_id: "current_fallback_approval",
+            params: {
+              mode: "form",
+              message: "Approve current fallback operation?",
+              phase: "tool_call_approval",
+              policy_name: "test_policy",
+              content_preview: "",
+            },
+          }),
+        );
+        await drainAsync();
+        const cards = () =>
+          useChatStore
+            .getState()
+            .blocks.filter((block): block is ElicitationBlock => block.type === "elicitation");
+        expect(cards()).toHaveLength(1);
+        expect(cards()[0]!.status).toBe("pending");
+        const gap = Array.from({ length: 100 }, (_, i) => gapUser("review_gap", i));
+        seedSessionItems(id, [...preGap, ...gap]);
+        sinks[0]!.error();
+        await drainAsync();
+        expect(sinks).toHaveLength(2);
+        const state = useChatStore.getState();
+        expect(state.oldestItemId).toBe(gap.at(-INITIAL_WINDOW_ITEMS)!.id);
+        expect(
+          state.blocks.filter((block) => block.ctx.itemId).map((block) => block.ctx.itemId),
+        ).toEqual(gap.slice(-INITIAL_WINDOW_ITEMS).map((item) => item.id));
+        expect(state.sessionObservation).toEqual(owner);
+        expect(cards()).toHaveLength(1);
+        expect(cards()[0]!.status).toBe(snapshotOwner === "stale" ? "pending" : "responded");
+      } finally {
+        const last = sinks.at(-1)!;
+        last.push("data: [DONE]\n\n");
+        last.close();
+        await drainAsync(2);
+        await loop;
+      }
+    },
+  );
 
   it("re-hydrates the window when the gap outruns the backfill page cap", async () => {
     const preGap = Array.from({ length: 30 }, (_, i) => gapUser("pre", i));

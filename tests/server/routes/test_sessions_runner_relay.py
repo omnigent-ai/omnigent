@@ -125,6 +125,22 @@ class _HeartbeatRunnerClient:
         return _HeartbeatStreamResponse(self._release)
 
 
+def _raw_error_labels(store: SqlAlchemyConversationStore, conversation_id: str) -> dict[str, str]:
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlConversationLabel, current_workspace_id
+
+    with store._conv_session("inspect_historical_error_labels") as session:
+        return dict(
+            session.execute(
+                select(SqlConversationLabel.key, SqlConversationLabel.value).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id == conversation_id,
+                )
+            ).all()
+        )
+
+
 @pytest.mark.asyncio
 async def test_runner_relay_ready_waits_for_runner_heartbeat() -> None:
     """
@@ -751,13 +767,19 @@ async def test_relay_publishes_failed_status_on_tunnel_close(
             "session.subagent.delegated",
             "session.subagent.returned",
         ]
-        assert items[-1].data.resource == {"title": "Audit", "status": "failed"}
+        resource = items[-1].data.resource
+        assert resource["title"] == "Audit" and resource["status"] == "failed"
+        if failure_path != "relay":
+            assert resource["runner_offline_episode_id"] == event["runner_offline_episode_id"]
+            assert resource["session_observation"] == event["session_observation"]
+        owned = store.get_conversation(session_id).runner_offline_decision
         await record_subagent_activity(
             session_id,
             "returned",
             store,
             status="failed",
-            turn_id=child.id if failure_path == "sweep_after_restart" else "child-turn",
+            turn_id=owned.activity_turn_id if owned is not None else "child-turn",
+            offline_decision=owned,
         )
         assert len(store.list_items(parent.id).data) == 2
         if failure_path == "relay":
@@ -2120,6 +2142,229 @@ async def test_relay_disconnect_status_after_adoption(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_path", ["relay", "sweep"])
+@pytest.mark.parametrize("lookup_result", ["found", "missing", "error"])
+@pytest.mark.parametrize(
+    ("kind", "status", "expect_failed"),
+    [
+        ("claude", "running", False),
+        ("claude", "waiting", False),
+        ("codex", "running", False),
+        ("acp", "running", False),
+        ("sub_agent", "running", True),
+        ("default", "running", True),
+    ],
+)
+async def test_disconnect_keeps_hydrated_status_distinct_from_live_activity(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_path: str,
+    lookup_result: str,
+    kind: str,
+    status: str,
+    expect_failed: bool,
+) -> None:
+    """Relay adoption and snapshot hydration retain a fence, not a live turn edge."""
+    from omnigent.runtime import session_stream
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S", 0.0
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    session_live_state.configure(store)
+    parent = store.create_conversation()
+    child = store.create_conversation(
+        kind="default" if kind == "default" else "sub_agent",
+        parent_conversation_id=None if kind == "default" else parent.id,
+        runner_id="runner_hydrated",
+    )
+    labels = {
+        "claude": {"omnigent.wrapper": "claude-code-native-ui-subagent"},
+        "codex": {"omnigent.wrapper": "codex-native-ui-subagent"},
+        "acp": {"omnigent.acp.subagent_id": "acp_child"},
+    }.get(kind)
+    if labels:
+        store.set_labels(child.id, labels)
+    owner = store.record_session_observation(child.id, status, response_id="saved-turn")
+    assert owner is not None
+    snapshot = store.get_conversation(child.id)
+    assert snapshot is not None and snapshot.session_observation == owner
+    gate = asyncio.Event()
+    handle = None
+    get_conversation = store.get_conversation
+    looked_up = False
+
+    def disconnect_lookup(conversation_id: str) -> Conversation | None:
+        nonlocal looked_up
+        if conversation_id == child.id and not looked_up:
+            looked_up = True
+            if lookup_result == "error":
+                raise RuntimeError("status lookup unavailable")
+            if lookup_result == "missing":
+                return None
+        return get_conversation(conversation_id)
+
+    try:
+        if failure_path == "relay":
+            handle = await sessions_module._ensure_runner_relay_ready(
+                child.id,
+                child.runner_id,
+                _ScriptedThenDropRunnerClient([], gate),  # type: ignore[arg-type]
+                store,
+                conversation=snapshot,
+            )
+            assert handle is not None
+        else:
+            assert sessions_module._session_status_cache.hydrate(snapshot)
+        assert sessions_module._session_status_cache[child.id] == status
+        assert not sessions_module._session_status_cache.has_live_status(child.id)
+        monkeypatch.setattr(store, "get_conversation", disconnect_lookup)
+
+        with capture_debug_rows("server") as rows:
+            if handle is not None:
+                gate.set()
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+            else:
+                await sessions_module._mark_runner_sessions_offline(
+                    [snapshot],
+                    ErrorDetail(code="runner_disconnected", message="Disconnected"),
+                    store,
+                )
+        await asyncio.wrap_future(session_live_state.submit("test_barrier", lambda: None))
+
+        refreshed = get_conversation(child.id)
+        assert refreshed is not None
+        error = sessions_module._last_task_error_from_labels(refreshed.labels)
+        if expect_failed:
+            assert refreshed.live_status == "failed"
+            assert error is not None and error["code"] == "runner_disconnected"
+            assert refreshed.runner_offline_decision is not None
+        else:
+            assert looked_up
+            assert refreshed.session_observation == owner
+            assert sessions_module._session_status_cache.projection(child.id).observation == owner
+            assert not sessions_module._session_status_cache.has_live_status(child.id)
+            assert error is None
+            assert store.list_items(parent.id).data == []
+            assert not any(row["event_name"] == "session_turn_failed" for row in rows)
+        logged = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
+        assert logged["attributes"]["decision"] == (
+            "failed_mid_turn" if expect_failed else "subagent_unobserved"
+        )
+        if not expect_failed:
+            assert logged["attributes"]["status_source"] == (
+                "persisted"
+                if lookup_result == "found"
+                else "relay_snapshot"
+                if failure_path == "relay"
+                else "snapshot"
+            )
+            assert logged["attributes"]["status_lookup"] == lookup_result
+    finally:
+        gate.set()
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await handle.task
+        session_live_state.submit("test_barrier", lambda: None).result(timeout=10)
+        session_live_state.configure(None)
+        sessions_module._session_status_cache.pop(child.id, None)
+        session_stream.close(child.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_path", ["relay", "sweep"])
+@pytest.mark.parametrize("live_status", ["running", "waiting", "idle"])
+async def test_disconnect_preserves_live_native_child_activity_after_hydration(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_path: str,
+    live_status: str,
+) -> None:
+    """A genuine local edge still decides interruption after cold adoption."""
+    from omnigent.runtime import session_stream
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S", 0.0
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    session_live_state.configure(store)
+    parent = store.create_conversation()
+    child = store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        runner_id="runner_live_child",
+        labels={"omnigent.wrapper": "claude-code-native-ui-subagent"},
+    )
+    owner = store.record_session_observation(child.id, "running", response_id="child-turn")
+    snapshot = store.get_conversation(child.id)
+    assert snapshot is not None and owner is not None
+    gate = asyncio.Event()
+    handle = None
+    try:
+        if failure_path == "relay":
+            handle = await sessions_module._ensure_runner_relay_ready(
+                child.id,
+                child.runner_id,
+                _ScriptedThenDropRunnerClient(
+                    [f'data: {{"type": "session.status", "status": "{live_status}"}}\n\n'],
+                    gate,
+                ),  # type: ignore[arg-type]
+                store,
+                conversation=snapshot,
+            )
+            assert handle is not None
+        else:
+            assert sessions_module._session_status_cache.hydrate(snapshot)
+        assert not sessions_module._session_status_cache.has_live_status(child.id)
+        with capture_debug_rows("server") as rows:
+            if handle is not None:
+                gate.set()
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+            else:
+                published = sessions_module._publish_status(child.id, live_status, owner=owner)
+                assert published is not None
+                assert await asyncio.wrap_future(published) is not None
+                current = store.get_conversation(child.id)
+                assert current is not None
+                await sessions_module._mark_runner_sessions_offline(
+                    [current],
+                    ErrorDetail(code="runner_disconnected", message="Disconnected"),
+                    store,
+                )
+        await asyncio.wrap_future(session_live_state.submit("test_barrier", lambda: None))
+        current = store.get_conversation(child.id)
+        assert current is not None
+        error = sessions_module._last_task_error_from_labels(current.labels)
+        failed = live_status != "idle"
+        assert current.live_status == ("failed" if failed else "idle")
+        assert (error is not None and error["code"] == "runner_disconnected") is failed
+        assert sessions_module._session_status_cache.has_live_status(child.id)
+        logged = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
+        assert logged["attributes"]["status_source"] == "cache"
+        assert logged["attributes"]["cached_session_status"] == live_status
+        assert logged["attributes"]["decision"] == (
+            "failed_mid_turn" if failed else "idle_no_failure"
+        )
+    finally:
+        gate.set()
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await handle.task
+        session_live_state.submit("test_barrier", lambda: None).result(timeout=10)
+        session_live_state.configure(None)
+        sessions_module._session_status_cache.pop(child.id, None)
+        session_stream.close(child.id)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("scenario", "expect_failed"),
     [
@@ -2291,6 +2536,8 @@ async def test_disconnect_uses_status_arriving_during_lookup(
             release_read.set()
             await asyncio.wait_for(task, timeout=_TASK_TIMEOUT_S)
 
+        # A new busy observation arriving after a sweep began belongs to a newer turn.
+        expect_failed = expect_failed and failure_path != "sweep"
         expected = "failed" if expect_failed else arriving_status
         assert sessions_module._session_status_cache[child.id] == expected
         refreshed = get_conversation(child.id)
@@ -2312,7 +2559,9 @@ async def test_disconnect_uses_status_arriving_during_lookup(
             decision["attributes"].items()
             >= {
                 "origin": origin,
-                "decision": "failed_mid_turn" if expect_failed else "idle_no_failure",
+                "decision": "failed_mid_turn"
+                if arriving_status in {"running", "waiting"}
+                else "idle_no_failure",
                 "status_source": "cache",
                 "cached_session_status": arriving_status,
                 "status_lookup": lookup_result,
@@ -3224,6 +3473,99 @@ async def test_offline_sweep_scopes_preserved_cause_to_owning_runner(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("rebound", [False, True])
+@pytest.mark.parametrize("status", ["running", "waiting"])
+async def test_offline_sweep_does_not_fail_a_replacement_before_its_relay_exists(
+    db_uri: str,
+    rebound: bool,
+    status: str,
+) -> None:
+    """The persisted binding owns the turn even before its new relay subscribes."""
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(runner_id="runner-exiting")
+    store.set_session_live_status(conv.id, status)
+    stale = store.get_conversation(conv.id)
+    assert stale is not None
+    if rebound:
+        store.replace_runner_id(conv.id, "runner-replacement")
+    assert conv.id not in sessions_module._runner_relay_tasks
+    sessions_module._session_status_cache[conv.id] = status
+    try:
+        with capture_debug_rows("server") as rows:
+            await sessions_module._mark_runner_sessions_offline(
+                [stale],
+                ErrorDetail(code="runner_disconnected", message="Synthetic runner exit"),
+                store,
+            )
+        refreshed = store.get_conversation(conv.id)
+        assert refreshed is not None
+        assert refreshed.runner_id == ("runner-replacement" if rebound else "runner-exiting")
+        assert sessions_module._session_status_cache[conv.id] == (status if rebound else "failed")
+        error = sessions_module._last_task_error_from_labels(refreshed.labels)
+        assert (error is None) is rebound
+        assert any(row["event_name"] == "session_turn_failed" for row in rows) is not rebound
+    finally:
+        sessions_module._session_status_cache.pop(conv.id, None)
+        session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rebind_after_update", [False, True])
+async def test_offline_sweep_keeps_the_replacement_after_failure_settlement(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    rebind_after_update: bool,
+) -> None:
+    """A remote replacement can bind before the old sweep publishes its result."""
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(runner_id="runner-exiting")
+    store.set_session_live_status(conv.id, "running")
+    stale = store.get_conversation(conv.id)
+    assert stale is not None
+    record = store.record_runner_offline_decision
+
+    def rebind_at_settlement(session_id, decision):
+        if not rebind_after_update:
+            store.replace_runner_id(session_id, "runner-replacement")
+        applied = record(session_id, decision)
+        if rebind_after_update:
+            assert applied is not None
+            store.replace_runner_id(session_id, "runner-replacement")
+        store.set_session_live_status(session_id, "running")
+        return applied
+
+    monkeypatch.setattr(store, "record_runner_offline_decision", rebind_at_settlement)
+    sessions_module._session_status_cache[conv.id] = "running"
+    try:
+        with capture_debug_rows("server") as rows:
+            await sessions_module._mark_runner_sessions_offline(
+                [stale],
+                ErrorDetail(code="runner_disconnected", message="Synthetic runner exit"),
+                store,
+            )
+        refreshed = store.get_conversation(conv.id)
+        assert refreshed is not None and refreshed.runner_id == "runner-replacement"
+        assert refreshed.live_status == "running"
+        assert sessions_module._session_status_cache[conv.id] == "running"
+        assert sessions_module._last_task_error_from_labels(refreshed.labels) is None
+        failures = [row for row in rows if row["event_name"] == "session_turn_failed"]
+        assert len(failures) == int(rebind_after_update)
+        if failures:
+            assert failures[0]["attributes"]["runner_id"] == "runner-exiting"
+    finally:
+        sessions_module._session_status_cache.pop(conv.id, None)
+        session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
 async def test_offline_sweep_preserves_cause_when_session_rebound_mid_sweep(
     db_uri: str,
 ) -> None:
@@ -3268,7 +3610,11 @@ async def test_offline_sweep_preserves_cause_when_session_rebound_mid_sweep(
             )
         refreshed = store.get_conversation(conv.id)
         assert refreshed is not None
-        assert sessions_module._last_task_error_from_labels(refreshed.labels) == original
+        assert sessions_module._last_task_error_from_labels(refreshed.labels) is None
+        assert (
+            sessions_module._last_task_error_from_labels(_raw_error_labels(store, conv.id))
+            == original
+        )
         assert not any(row["event_name"] == "session_turn_failed" for row in rows)
         decision = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
         assert decision["attributes"]["decision"] == "already_failed"
@@ -3300,8 +3646,10 @@ async def test_persist_error_labels_records_passed_owner_runner_despite_rebind(
     )
     refreshed = store.get_conversation(conv.id)
     assert refreshed is not None
-    assert refreshed.labels.get("omnigent.last_task_error_runner_id") == "runner-source"
-    assert sessions_module._last_task_error_from_labels(refreshed.labels) == {
+    raw = _raw_error_labels(store, conv.id)
+    assert raw.get("omnigent.last_task_error_runner_id") == "runner-source"
+    assert sessions_module._last_task_error_from_labels(refreshed.labels) is None
+    assert sessions_module._last_task_error_from_labels(raw) == {
         "code": "native_turn_error",
         "message": "Synthetic provider rejection",
     }

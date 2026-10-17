@@ -1,3 +1,4 @@
+import { shareSessionSnapshot } from "@/lib/sessionSnapshot";
 // Single-conversation snapshot hook keyed on conversation id.
 //
 // Shares the ``["session", id]`` TanStack Query cache with
@@ -67,6 +68,7 @@ export function useSession(conversationId: string | null | undefined): UseSessio
   const serverId = isTempConvId(conversationId) ? null : (conversationId ?? null);
   const { data, isLoading, error } = useQuery({
     queryKey: serverId ? ["session", serverId] : ["session", null],
+    structuralSharing: shareSessionSnapshot,
     queryFn: () => getSessionSlim(serverId as string, { refreshState: true }),
     enabled: serverId !== null,
     staleTime: Infinity,
@@ -119,6 +121,7 @@ export function useRootSessionId(
         // oxlint-disable-next-line no-await-in-loop
         const session = await queryClient.fetchQuery({
           queryKey: ["session", hopId],
+          structuralSharing: shareSessionSnapshot,
           queryFn: () => getSessionSlim(hopId),
           staleTime: Infinity,
           retry: false,
@@ -197,6 +200,7 @@ export async function prefetchSessionHostChain(
     const hopId: string = id;
     const queryOptions = {
       queryKey: ["session", hopId],
+      structuralSharing: shareSessionSnapshot,
       queryFn: () => getSessionSlim(hopId),
       staleTime: options.force ? 0 : Infinity,
       retry: false,
@@ -215,7 +219,10 @@ export async function prefetchSessionHostChain(
     const session: Session = await queryClient.fetchQuery(queryOptions);
     // `sessionFromWire` records these on a live fetch; re-record so a cached
     // snapshot seeds the map the same way.
-    setSessionHost(session.id, sessionRoutingHostId(session.hostId, session.labels));
+    setSessionHost(session.id, sessionRoutingHostId(session.hostId, session.labels), {
+      observation: session.sessionObservation,
+      episodeId: session.runnerOfflineEpisodeId,
+    });
     setSessionParent(session.id, session.parentSessionId, session.labels);
     id = getSessionParent(session.id);
   }

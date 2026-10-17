@@ -916,15 +916,11 @@ async def test_on_runner_connect_restarts_relay_via_router(
     routed_calls: list[str] = []
     routed_clients: dict[str, Any] = {}
 
-    class _StubResponse:
-        status_code = 200
-
-        def raise_for_status(self) -> None:
-            return None
-
     class _StubClient:
-        async def post(self, *args: Any, **kwargs: Any) -> _StubResponse:
-            return _StubResponse()
+        async def post(self, path: str, *args: Any, **kwargs: Any) -> httpx.Response:
+            return httpx.Response(
+                200, json={}, request=httpx.Request("POST", f"http://runner{path}")
+            )
 
     def _spy_resolver(conv_id: str, **kwargs: Any):  # type: ignore[no-untyped-def]
         routed_calls.append(conv_id)
@@ -1083,18 +1079,11 @@ async def _reconnect_fires_connect_hook(
     router = ap_app.state.runner_router
     real_resolver = router.client_for_session_resources
 
-    class _StubResponse:
-        status_code = 200
-
-        def raise_for_status(self) -> None:
-            return None
-
-        def json(self) -> dict[str, object]:
-            return {}
-
     class _StubClient:
-        async def post(self, *args: Any, **kwargs: Any) -> _StubResponse:
-            return _StubResponse()
+        async def post(self, path: str, *args: Any, **kwargs: Any) -> httpx.Response:
+            return httpx.Response(
+                200, json={}, request=httpx.Request("POST", f"http://runner{path}")
+            )
 
     def _spy_resolver(conv_id: str, **kwargs: Any):  # type: ignore[no-untyped-def]
         real_routed = real_resolver(conv_id, **kwargs)
@@ -1319,6 +1308,13 @@ async def test_on_runner_connect_retains_idle_child_status_for_disconnect(
         ):
             handle = sessions_module._runner_relay_tasks[child.id]
             await asyncio.wait_for(handle.ready.wait(), timeout=budget(10.0))
+            assert sessions_module._session_status_cache.get(child.id) == "idle"
+            projection = sessions_module._session_status_cache.projection(child.id)
+            assert projection is not None
+            assert projection.observation == store.get_session_observation(child.id)
+            assert not sessions_module._session_status_cache.has_live_status(child.id)
+            # Exercise the relay snapshot after its hydrated cache value is evicted.
+            sessions_module._session_status_cache.pop(child.id, None)
             assert sessions_module._session_status_cache.get(child.id) is None
             monkeypatch.setattr(store, "get_conversation", fail_disconnect_lookup)
             with capture_debug_rows("server") as rows:
@@ -1557,15 +1553,11 @@ def _stub_connect_hook_for_pumpless_ws(ap_app: FastAPI, monkeypatch: pytest.Monk
     from omnigent.runner.routing import RoutedRunner
     from omnigent.server.routes import sessions as sessions_module
 
-    class _StubResponse:
-        status_code = 200
-
-        def raise_for_status(self) -> None:
-            return None
-
     class _StubClient:
-        async def post(self, *args: Any, **kwargs: Any) -> _StubResponse:
-            return _StubResponse()
+        async def post(self, path: str, *args: Any, **kwargs: Any) -> httpx.Response:
+            return httpx.Response(
+                200, json={}, request=httpx.Request("POST", f"http://runner{path}")
+            )
 
     router = ap_app.state.runner_router
     real_resolver = router.client_for_session_resources
@@ -2180,12 +2172,14 @@ async def test_on_runner_disconnect_spares_idle_sessions_and_labels_interrupted_
         await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
 
         async def _hook_ran() -> None:
-            # The hook publishes the status first and persists the labels on
-            # a later await, so wait for the labels — the end state asserted
-            # below — instead of the status flip that precedes them.
+            # Wait for the durable cause and its committed live projection.
             while True:
                 conv = store.get_conversation(running_id)
-                if conv is not None and sessions_module._last_task_error_from_labels(conv.labels):
+                if (
+                    conv is not None
+                    and sessions_module._last_task_error_from_labels(conv.labels)
+                    and sessions_module._session_status_cache.get(running_id) == "failed"
+                ):
                     return
                 await asyncio.sleep(0.01)
 

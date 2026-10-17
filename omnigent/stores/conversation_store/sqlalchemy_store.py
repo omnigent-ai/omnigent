@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from collections.abc import Mapping
 from contextlib import suppress
+from itertools import batched
 from pathlib import PureWindowsPath
 from typing import Any, Protocol, cast
 
@@ -15,6 +17,7 @@ from sqlalchemy import (
     Select,
     and_,
     asc,
+    case,
     delete,
     desc,
     func,
@@ -84,7 +87,15 @@ from omnigent.entities import (
     ConversationItem,
     NewConversationItem,
     PagedList,
+    ResourceEventData,
     parse_item_data,
+)
+from omnigent.entities.session_observation import (
+    SESSION_ERROR_LABEL_KEYS,
+    RecordedRunnerOfflineDecision,
+    RunnerOfflineDecision,
+    SessionObservation,
+    TerminalStartupClaim,
 )
 from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
@@ -180,6 +191,95 @@ class _RowCountResult(Protocol):
     rowcount: int
 
 
+def _session_observation(meta: SqlConversationMetadata) -> SessionObservation:
+    return SessionObservation(
+        runner_id=meta.runner_id,
+        binding_epoch=meta.runner_binding_epoch,
+        revision=meta.live_status_revision,
+        observation_id=meta.live_status_observation_id,
+        status=decode_session_live_status(meta.live_status)
+        if meta.live_status is not None
+        else None,
+        response_id=meta.live_status_response_id,
+        error_key=meta.live_status_error_key,
+    )
+
+
+def _current_offline_decision(meta: SqlConversationMetadata) -> RunnerOfflineDecision | None:
+    if meta.runner_offline_decision is None:
+        return None
+    try:
+        decision = RunnerOfflineDecision.model_validate_json(meta.runner_offline_decision)
+    except ValueError:
+        _logger.warning("Ignoring malformed runner offline decision for session %s", meta.id)
+        return None
+    return decision if decision.matches(_session_observation(meta)) else None
+
+
+def _current_terminal_startup_claim(meta: SqlConversationMetadata) -> TerminalStartupClaim | None:
+    if meta.terminal_startup_claim is None:
+        return None
+    try:
+        claim = TerminalStartupClaim.model_validate_json(meta.terminal_startup_claim)
+    except ValueError:
+        _logger.warning("Ignoring malformed terminal startup claim for session %s", meta.id)
+        return None
+    current = _session_observation(meta)
+    if (
+        claim.observation != current
+        or claim.reservation.runner_id != current.runner_id
+        or claim.reservation.binding_epoch != current.binding_epoch
+        or claim.reservation.revision > current.revision
+        or meta.terminal_pending == claim.completed
+    ):
+        return None
+    return claim
+
+
+def _session_error_labels(meta: SqlConversationMetadata | None) -> dict[str, str] | None:
+    if meta is None or meta.live_status_error_labels is None:
+        return None
+    try:
+        labels = json.loads(meta.live_status_error_labels)
+        if not isinstance(labels, dict) or not all(
+            key in SESSION_ERROR_LABEL_KEYS and isinstance(value, str)
+            for key, value in labels.items()
+        ):
+            raise ValueError("Invalid owned error labels")
+        return labels
+    except ValueError:
+        _logger.warning("Ignoring malformed live error projection for session %s", meta.id)
+        return {}
+
+
+def _settle_idle_observation(meta: SqlConversationMetadata) -> SessionObservation:
+    meta.live_status = encode_session_live_status("idle")
+    meta.live_status_revision += 1
+    meta.live_status_observation_id = uuid.uuid4().hex
+    meta.live_status_response_id = None
+    meta.live_status_error_key = None
+    meta.live_status_error_labels = "{}"
+    meta.terminal_pending = False
+    meta.terminal_startup_claim = None
+    meta.runner_offline_decision = None
+    return _session_observation(meta)
+
+
+def _change_runner_binding(meta: SqlConversationMetadata, runner_id: str | None) -> None:
+    if meta.runner_id == runner_id:
+        return
+    meta.runner_id = runner_id
+    meta.runner_binding_epoch += 1
+    meta.runner_offline_decision = None
+    meta.live_status_observation_id = None
+    meta.live_status_response_id = None
+    meta.live_status_error_key = None
+    if meta.live_status_error_labels is not None:
+        meta.live_status_error_labels = "{}"
+    meta.terminal_pending = False
+    meta.terminal_startup_claim = None
+
+
 def _to_conversation(
     row: SqlConversation,
     meta: SqlConversationMetadata | None = None,
@@ -211,6 +311,16 @@ def _to_conversation(
     if meta and meta.session_usage:
         session_usage = json.loads(meta.session_usage)
     overrides = _decode_session_overrides(row.session_overrides)
+    offline_decision = _current_offline_decision(meta) if meta is not None else None
+    projected_labels = dict(labels or {})
+    error_labels = _session_error_labels(meta)
+    legacy_owner = projected_labels.get("omnigent.last_task_error_runner_id")
+    if error_labels is not None or (meta and legacy_owner and legacy_owner != meta.runner_id):
+        for key in SESSION_ERROR_LABEL_KEYS:
+            projected_labels.pop(key, None)
+        projected_labels.update(error_labels or {})
+    if offline_decision is not None:
+        projected_labels.update(offline_decision.error_labels)
     return Conversation(
         id=row.id,
         created_at=row.created_at,
@@ -226,7 +336,7 @@ def _to_conversation(
         agent_id=row.agent_id,
         runner_id=meta.runner_id if meta else None,
         host_id=meta.host_id if meta else None,
-        labels=labels if labels is not None else {},
+        labels=projected_labels,
         session_state=session_state,
         session_usage=session_usage,
         session_todos=session_todos,
@@ -259,10 +369,20 @@ def _to_conversation(
         git_branch=meta.git_branch if meta else None,
         archived=row.archived,
         live_status=(
-            decode_session_live_status(meta.live_status)
+            "failed"
+            if offline_decision is not None
+            else decode_session_live_status(meta.live_status)
             if meta and meta.live_status is not None
             else None
         ),
+        runner_binding_epoch=meta.runner_binding_epoch if meta else 0,
+        live_status_revision=meta.live_status_revision if meta else 0,
+        live_status_observation_id=meta.live_status_observation_id if meta else None,
+        live_status_response_id=meta.live_status_response_id if meta else None,
+        live_status_error_key=meta.live_status_error_key if meta else None,
+        live_status_error_labels=error_labels,
+        terminal_pending=meta.terminal_pending if meta else False,
+        runner_offline_decision=offline_decision,
         pending_elicitation_count=meta.pending_elicitation_count if meta else None,
         runner_last_seen=meta.runner_last_seen if meta else None,
         project_id=meta.project_id if meta else None,
@@ -2141,6 +2261,66 @@ class SqlAlchemyConversationStore(ConversationStore):
             decoded = self._decode_item_data_batch([r.data for r in ordered])
             return [_to_item(r, d) for r, d in zip(ordered, decoded, strict=True)]
 
+    def _current_owned_subagent_activity(
+        self, items: list[ConversationItem]
+    ) -> list[ConversationItem]:
+        """Project only explicitly inferred offline markers whose decision is current."""
+        owned: dict[str, tuple[str, SessionObservation, str] | None] = {}
+        for item in items:
+            data = item.data
+            if (
+                not isinstance(data, ResourceEventData)
+                or data.event_type != "session.subagent.returned"
+                or data.resource_type != "session"
+                or not isinstance(data.resource, dict)
+                or data.resource.get("runner_offline_episode_id") is None
+            ):
+                continue
+            owned[item.id] = None
+            try:
+                child_id = uuid.UUID(data.resource_id).hex
+                observation = SessionObservation.model_validate(
+                    data.resource["session_observation"]
+                )
+                episode = data.resource.get("runner_offline_episode_id")
+                if isinstance(episode, str) and episode:
+                    owned[item.id] = (child_id, observation, episode)
+            except (ValueError, TypeError, AttributeError, KeyError):
+                continue
+        if not owned:
+            return items
+        child_ids = {value[0] for value in owned.values() if value is not None}
+        decisions: dict[str, RunnerOfflineDecision | None] = {}
+        try:
+            with self._session("project_owned_subagent_activity") as session:
+                for child_id_chunk in batched(child_ids, 200):
+                    rows = session.scalars(
+                        select(SqlConversationMetadata).where(
+                            SqlConversationMetadata.workspace_id == current_workspace_id(),
+                            SqlConversationMetadata.id.in_(child_id_chunk),
+                        )
+                    ).all()
+                    decisions.update({row.id: _current_offline_decision(row) for row in rows})
+        except Exception:  # noqa: BLE001 — unavailable ownership must preserve ordinary history
+            _logger.warning("Cannot resolve owned subagent activity", exc_info=True)
+        visible: list[ConversationItem] = []
+        for item in items:
+            if item.id not in owned:
+                visible.append(item)
+                continue
+            captured = owned[item.id]
+            if captured is None:
+                continue
+            child_id, observation, episode = captured
+            decision = decisions.get(child_id)
+            if (
+                decision is not None
+                and decision.observation == observation
+                and decision.episode_id == episode
+            ):
+                visible.append(item)
+        return visible
+
     def get_item(self, conversation_id: str, item_id: str) -> ConversationItem | None:
         """
         Fetch one persisted item by id, or ``None`` when absent.
@@ -2162,7 +2342,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             if row is None:
                 return None
             [data] = self._decode_item_data_batch([row.data])
-            return _to_item(row, data)
+            item = _to_item(row, data)
+        current = self._current_owned_subagent_activity([item])
+        return current[0] if current else None
 
     def list_items(
         self,
@@ -2268,12 +2450,15 @@ class SqlAlchemyConversationStore(ConversationStore):
                 rows = rows[:limit]
             decoded = self._decode_item_data_batch([r.data for r in rows])
             items = [_to_item(r, d) for r, d in zip(rows, decoded, strict=True)]
-            return PagedList(
+            page = PagedList(
                 data=items,
                 first_id=items[0].id if items else None,
                 last_id=items[-1].id if items else None,
                 has_more=has_more,
             )
+        # Cursors track source rows even if all owned markers on a page expire.
+        page.data = self._current_owned_subagent_activity(page.data)
+        return page
 
     @staticmethod
     def _resolve_item_cursor_position(
@@ -3743,7 +3928,22 @@ class SqlAlchemyConversationStore(ConversationStore):
                     SqlConversationMetadata.id == conversation_id,
                 )
                 .where(SqlConversationMetadata.runner_id.is_(None))
-                .values(runner_id=runner_id)
+                .values(
+                    runner_id=runner_id,
+                    runner_binding_epoch=SqlConversationMetadata.runner_binding_epoch + 1,
+                    live_status_observation_id=None,
+                    live_status_response_id=None,
+                    live_status_error_key=None,
+                    live_status_error_labels=case(
+                        (SqlConversationMetadata.live_status_error_labels.is_(None), None),
+                        else_=literal(
+                            "{}", type_=SqlConversationMetadata.live_status_error_labels.type
+                        ),
+                    ),
+                    terminal_pending=False,
+                    terminal_startup_claim=None,
+                    runner_offline_decision=None,
+                )
             )
             result = cast(_RowCountResult, session.execute(stmt))
             return result.rowcount == 1
@@ -3817,83 +4017,360 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param conversation_id: Session/conversation identifier.
         :param status: One of ``enum_codecs.SESSION_LIVE_STATUS``.
         """
-        from sqlalchemy import update
+        self._record_session_observation(conversation_id, status, legacy_labels=True)
 
-        encoded_status = encode_session_live_status(status)
+    def get_session_observation(self, conversation_id: str) -> SessionObservation | None:
+        """Read ownership without touching the conversation database."""
+        with self._session("get_session_observation") as session:
+            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            return _session_observation(meta) if meta is not None else None
 
-        def write(session: Session) -> None:
-            session.execute(
-                update(SqlConversationMetadata)
-                .where(
-                    SqlConversationMetadata.workspace_id == current_workspace_id(),
-                    SqlConversationMetadata.id == conversation_id,
+    def begin_terminal_startup(
+        self, conversation_id: str, expected: SessionObservation, observation_id: str
+    ) -> SessionObservation | None:
+        """Advance the startup fence while retaining the last normal result payload."""
+        if not observation_id:
+            raise ValueError("Terminal startup requires an immutable observation ID")
+
+        def write(session: Session) -> SessionObservation | None:
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
+            )
+            if meta is None:
+                return None
+            current = _session_observation(meta)
+            reserved = expected.model_copy(
+                update={"revision": expected.revision + 1, "observation_id": observation_id}
+            )
+            claim = _current_terminal_startup_claim(meta)
+            if claim is not None and claim.reservation.observation_id == observation_id:
+                return (
+                    claim.reservation
+                    if claim.reservation == reserved
+                    and not claim.completed
+                    and meta.terminal_pending
+                    and _current_offline_decision(meta) is None
+                    else None
                 )
-                .values(live_status=encoded_status)
+            if current.observation_id == observation_id:
+                return None
+            if current != expected:
+                return None
+            meta.live_status_revision = reserved.revision
+            meta.live_status_observation_id = observation_id
+            meta.terminal_pending = True
+            meta.terminal_startup_claim = TerminalStartupClaim(
+                reservation=reserved, observation=reserved
+            ).model_dump_json()
+            meta.runner_offline_decision = None
+            return _session_observation(meta)
+
+        return run_write_transaction(self._session_immediate, "begin_terminal_startup", write)
+
+    def finish_terminal_startup(
+        self, conversation_id: str, expected: SessionObservation, observation_id: str
+    ) -> SessionObservation | None:
+        """Complete the exact claim while preserving its protected normal result."""
+        if not observation_id:
+            raise ValueError("Terminal completion requires an immutable observation ID")
+
+        def write(session: Session) -> SessionObservation | None:
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
             )
-
-        run_write_transaction(self._session_immediate, "set_session_live_status", write)
-
-    def settle_intentionally_stopped_session(self, conversation_id: str, runner_id: str) -> bool:
-        """Settle stop intent without overwriting a replacement runner or failure."""
-
-        def write(session: Session) -> bool:
-            result = cast(
-                _RowCountResult,
-                session.execute(
-                    update(SqlConversationMetadata)
-                    .where(
-                        SqlConversationMetadata.workspace_id == current_workspace_id(),
-                        SqlConversationMetadata.id == conversation_id,
-                        SqlConversationMetadata.runner_id == runner_id,
-                        or_(
-                            SqlConversationMetadata.live_status.is_(None),
-                            SqlConversationMetadata.live_status.in_(
-                                [
-                                    encode_session_live_status("idle"),
-                                    encode_session_live_status("running"),
-                                    encode_session_live_status("waiting"),
-                                ]
-                            ),
-                        ),
-                    )
-                    .values(live_status=encode_session_live_status("idle"))
-                ),
+            if meta is None:
+                return None
+            current = _session_observation(meta)
+            claim = _current_terminal_startup_claim(meta)
+            if claim is None or claim.reservation != expected:
+                return None
+            if claim.completed:
+                return (
+                    current
+                    if current.observation_id == observation_id
+                    and not meta.terminal_pending
+                    and _current_offline_decision(meta) is None
+                    else None
+                )
+            if not meta.terminal_pending or _current_offline_decision(meta) is not None:
+                return None
+            completed = current.model_copy(
+                update={"revision": current.revision + 1, "observation_id": observation_id}
             )
-            return result.rowcount == 1
+            meta.terminal_pending = False
+            meta.live_status_revision = completed.revision
+            meta.live_status_observation_id = observation_id
+            meta.terminal_startup_claim = claim.model_copy(
+                update={"observation": completed, "completed": True}
+            ).model_dump_json()
+            return _session_observation(meta)
 
-        return run_write_transaction(
-            self._session_immediate, "settle_intentionally_stopped_session", write
+        return run_write_transaction(self._session_immediate, "finish_terminal_startup", write)
+
+    def record_session_observation(
+        self,
+        conversation_id: str,
+        status: str,
+        *,
+        response_id: str | None = None,
+        observation_id: str | None = None,
+        error_key: str | None = None,
+        error_labels: dict[str, str] | None = None,
+        expected_observation: SessionObservation | None = None,
+        expected_binding_epoch: int | None = None,
+        expected_revision: int | None = None,
+        starts_new_turn: bool = False,
+    ) -> SessionObservation | None:
+        """Record a normal edge with an atomic owned error projection."""
+        return self._record_session_observation(
+            conversation_id,
+            status,
+            response_id=response_id,
+            observation_id=observation_id,
+            error_key=error_key,
+            error_labels=error_labels,
+            expected_observation=expected_observation,
+            expected_binding_epoch=expected_binding_epoch,
+            expected_revision=expected_revision,
+            starts_new_turn=starts_new_turn,
         )
 
-    def settle_orphaned_live_status(self, conversation_id: str, stale_before: int) -> bool:
-        """Settle a stale running row with one conditional update."""
+    def _record_session_observation(
+        self,
+        conversation_id: str,
+        status: str,
+        *,
+        response_id: str | None = None,
+        observation_id: str | None = None,
+        error_key: str | None = None,
+        error_labels: dict[str, str] | None = None,
+        expected_observation: SessionObservation | None = None,
+        expected_binding_epoch: int | None = None,
+        expected_revision: int | None = None,
+        starts_new_turn: bool = False,
+        legacy_labels: bool = False,
+    ) -> SessionObservation | None:
+        """Order an observed edge against binding and state changes."""
+        encoded_status = encode_session_live_status(status)
+        if (
+            starts_new_turn
+            and expected_observation is None
+            and (expected_binding_epoch is None or expected_revision is None)
+        ):
+            raise ValueError("Starting a turn requires an exact captured observation")
 
-        def write(session: Session) -> bool:
-            result = cast(
-                _RowCountResult,
-                session.execute(
-                    update(SqlConversationMetadata)
-                    .where(
-                        SqlConversationMetadata.workspace_id == current_workspace_id(),
-                        SqlConversationMetadata.id == conversation_id,
-                        SqlConversationMetadata.runner_id.is_not(None),
-                        SqlConversationMetadata.live_status.in_(
-                            [
-                                encode_session_live_status("running"),
-                                encode_session_live_status("waiting"),
-                            ]
-                        ),
-                        or_(
-                            SqlConversationMetadata.runner_last_seen.is_(None),
-                            SqlConversationMetadata.runner_last_seen < stale_before,
-                        ),
-                    )
-                    .values(live_status=encode_session_live_status("idle"))
-                ),
+        def write(session: Session) -> SessionObservation | None:
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
             )
-            return result.rowcount == 1
+            if meta is None or (
+                expected_binding_epoch is not None
+                and meta.runner_binding_epoch != expected_binding_epoch
+            ):
+                return None
+            before = _session_observation(meta)
+            if expected_observation is not None and (
+                before.runner_id != expected_observation.runner_id
+                or before.binding_epoch != expected_observation.binding_epoch
+            ):
+                return None
+            if (
+                status in {"idle", "failed"}
+                and not starts_new_turn
+                and expected_binding_epoch is not None
+                and response_id is not None
+                and before.response_id is not None
+                and response_id != before.response_id
+                and before.status in {"running", "waiting"}
+            ):
+                return None
+            observed_response_id = response_id
+            if (
+                observed_response_id is None
+                and status in {"running", "waiting", "failed"}
+                and (
+                    before.status in {"running", "waiting"}
+                    or (status == "failed" and before.status == "failed")
+                )
+            ):
+                observed_response_id = before.response_id
+            observed_error_key = error_key
+            if observed_error_key is None and status == "failed" and before.status == "failed":
+                observed_error_key = before.error_key
+            signature = (status, observed_response_id, observed_error_key)
+            previous_signature = (before.status, before.response_id, before.error_key)
+            claim = _current_terminal_startup_claim(meta)
+            preserves_startup = (
+                claim is not None
+                and status == "idle"
+                and not starts_new_turn
+                and expected_observation == before
+                and before.status != "failed"
+                and (
+                    before.response_id is None
+                    or observed_response_id is None
+                    or observed_response_id == before.response_id
+                )
+                and (not claim.completed or signature == previous_signature)
+            )
+            if observation_id is not None and before.observation_id == observation_id:
+                if signature != previous_signature:
+                    raise ValueError(
+                        "An observation ID cannot describe two different session states"
+                    )
+                if expected_observation is not None and before.revision not in {
+                    expected_observation.revision,
+                    expected_observation.revision + 1,
+                }:
+                    return None
+                if (
+                    claim is None
+                    or preserves_startup
+                    or (status == "idle" and not starts_new_turn)
+                ):
+                    return before if _current_offline_decision(meta) is None else None
+            if expected_observation is not None and before != expected_observation:
+                return None
+            if expected_revision is not None and before.revision != expected_revision:
+                return None
+            if signature == previous_signature and _current_offline_decision(meta) is not None:
+                return None
+            if (
+                signature != previous_signature
+                or starts_new_turn
+                or (claim is not None and not preserves_startup)
+                or before.observation_id is None
+                or _current_offline_decision(meta) is not None
+            ):
+                meta.live_status = encoded_status
+                meta.terminal_pending = bool(
+                    preserves_startup and claim is not None and not claim.completed
+                )
+                meta.live_status_revision += 1
+                meta.live_status_observation_id = observation_id or uuid.uuid4().hex
+                meta.live_status_response_id = observed_response_id
+                meta.live_status_error_key = observed_error_key
+                if legacy_labels:
+                    meta.live_status_error_labels = None
+                elif error_labels is not None:
+                    meta.live_status_error_labels = json.dumps(
+                        {
+                            key: value
+                            for key, value in error_labels.items()
+                            if key in SESSION_ERROR_LABEL_KEYS
+                        }
+                    )
+                elif status != "failed":
+                    meta.live_status_error_labels = "{}"
+                elif before.status != "failed":
+                    meta.live_status_error_labels = None
+                meta.runner_offline_decision = None
+                meta.terminal_startup_claim = (
+                    claim.model_copy(
+                        update={"observation": _session_observation(meta)}
+                    ).model_dump_json()
+                    if preserves_startup and claim is not None
+                    else None
+                )
+            return _session_observation(meta)
 
-        return run_write_transaction(self._session_immediate, "settle_orphaned_live_status", write)
+        return run_write_transaction(self._session_immediate, "record_session_observation", write)
+
+    def record_runner_offline_decision(
+        self, conversation_id: str, decision: RunnerOfflineDecision
+    ) -> RecordedRunnerOfflineDecision | None:
+        """Commit an owned decision without publishing or mutating error labels."""
+
+        def write(session: Session) -> RecordedRunnerOfflineDecision | None:
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
+            )
+            if meta is None or not decision.matches(_session_observation(meta)):
+                return None
+            current = _current_offline_decision(meta)
+            if current is not None:
+                return RecordedRunnerOfflineDecision(decision=current, created=False)
+            meta.runner_offline_decision = decision.model_dump_json()
+            meta.terminal_pending = False
+            meta.terminal_startup_claim = None
+            return RecordedRunnerOfflineDecision(decision=decision, created=True)
+
+        return run_write_transaction(
+            self._session_immediate, "record_runner_offline_decision", write
+        )
+
+    def settle_intentionally_stopped_session(self, conversation_id: str, runner_id: str) -> bool:
+        """Legacy boolean interface for an explicitly stopped runner."""
+        return self.settle_stopped_session_observation(conversation_id, runner_id) is not None
+
+    def settle_stopped_session_observation(
+        self,
+        conversation_id: str,
+        runner_id: str,
+        expected: SessionObservation | None = None,
+    ) -> SessionObservation | None:
+        """Capture a terminal revision without overwriting a new owner or failure."""
+        allowed = {
+            None,
+            encode_session_live_status("idle"),
+            encode_session_live_status("running"),
+            encode_session_live_status("waiting"),
+        }
+
+        def write(session: Session) -> SessionObservation | None:
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
+            )
+            if (
+                meta is None
+                or meta.runner_id != runner_id
+                or meta.live_status not in allowed
+                or _current_offline_decision(meta) is not None
+                or (expected is not None and _session_observation(meta) != expected)
+            ):
+                return None
+            return _settle_idle_observation(meta)
+
+        return run_write_transaction(self._session_immediate, "settle_stopped_session", write)
+
+    def settle_orphaned_live_status(self, conversation_id: str, stale_before: int) -> bool:
+        """Legacy boolean interface for lazy stale-state reconciliation."""
+        return self.settle_orphaned_session_observation(conversation_id, stale_before) is not None
+
+    def settle_orphaned_session_observation(
+        self, conversation_id: str, stale_before: int, expected: SessionObservation | None = None
+    ) -> SessionObservation | None:
+        """Settle stale liveness and return the exact committed idle observation."""
+        allowed = {encode_session_live_status("running"), encode_session_live_status("waiting")}
+
+        def write(session: Session) -> SessionObservation | None:
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
+            )
+            if (
+                meta is None
+                or (expected is not None and _session_observation(meta) != expected)
+                or meta.runner_id is None
+                or meta.live_status not in allowed
+                or (meta.runner_last_seen is not None and meta.runner_last_seen >= stale_before)
+                or _current_offline_decision(meta) is not None
+            ):
+                return None
+            return _settle_idle_observation(meta)
+
+        return run_write_transaction(self._session_immediate, "settle_orphaned_session", write)
 
     def set_pending_elicitation_count(self, conversation_id: str, count: int) -> None:
         """
@@ -3920,7 +4397,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         run_write_transaction(self._session_immediate, "set_pending_elicitation_count", write)
 
     def replace_runner_id(
-        self, conversation_id: str, runner_id: str, *, expected_runner_id: str | None = None
+        self,
+        conversation_id: str,
+        runner_id: str,
+        *,
+        expected_runner_id: str | None = None,
+        expected_observation: SessionObservation | None = None,
     ) -> Conversation:
         """
         Atomically overwrite ``conversations.runner_id``.
@@ -3939,24 +4421,22 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
 
         def write(session: Session) -> SqlConversationMetadata:
-            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
+            )
             if meta is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
-            if expected_runner_id is None:
-                meta.runner_id = runner_id
-            else:
-                session.execute(
-                    update(SqlConversationMetadata)
-                    .where(
-                        SqlConversationMetadata.workspace_id == current_workspace_id(),
-                        SqlConversationMetadata.id == conversation_id,
-                        SqlConversationMetadata.runner_id == expected_runner_id,
-                    )
-                    .values(runner_id=runner_id)
-                )
-                session.refresh(meta)
+            if (
+                expected_observation is not None
+                and _session_observation(meta) != expected_observation
+            ):
+                return meta
+            if expected_runner_id is None or meta.runner_id == expected_runner_id:
+                _change_runner_binding(meta, runner_id)
             return meta
 
         meta = run_write_transaction(self._session_immediate, "replace_runner_id", write)
@@ -3981,12 +4461,16 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
 
         def write(session: Session) -> SqlConversationMetadata:
-            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
+            )
             if meta is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
                 )
-            meta.runner_id = None
+            _change_runner_binding(meta, None)
             return meta
 
         meta = run_write_transaction(self._session_immediate, "clear_runner_id", write)
@@ -4016,7 +4500,11 @@ class SqlAlchemyConversationStore(ConversationStore):
         """
 
         def write(session: Session) -> SqlConversationMetadata:
-            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            meta = session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
+            )
             if meta is None:
                 raise ConversationNotFoundError(
                     f"conversation {conversation_id!r} does not exist",
@@ -4024,7 +4512,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta.host_id = None
             meta.workspace = None
             meta.git_branch = None
-            meta.runner_id = None
+            _change_runner_binding(meta, None)
             return meta
 
         meta = run_write_transaction(self._session_immediate, "clear_host_binding", write)

@@ -3499,7 +3499,21 @@ def test_settle_intentionally_stopped_session_requires_current_runner(
     assert settled is (status != "failed")
     after = conversation_store.get_conversation(conv.id)
     assert after.live_status == ("failed" if status == "failed" else "idle")
-    assert after.labels == before.labels
+    assert after.labels == (before.labels if status == "failed" else {})
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlConversationLabel
+
+    with conversation_store._conv_session("inspect_preserved_error_history") as session:
+        assert (
+            session.scalar(
+                select(SqlConversationLabel.value).where(
+                    SqlConversationLabel.conversation_id == conv.id,
+                    SqlConversationLabel.key == "omnigent.last_task_error_code",
+                )
+            )
+            == "preserved"
+        )
     assert after.updated_at == before.updated_at
     assert not conversation_store.settle_intentionally_stopped_session("0" * 32, "runner-stopped")
 

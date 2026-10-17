@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import builtins
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import and_, asc, delete, desc, func, or_, select, tuple_
+from sqlalchemy import and_, asc, delete, desc, func, or_, select, tuple_, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
@@ -485,15 +486,27 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         running_code = encode_scheduled_task_run_status("running")
 
         def write(session: Session) -> ScheduledTaskRun | None:
-            row = session.get(SqlScheduledTaskRun, (current_workspace_id(), run_id))
-            if row is None or row.status != running_code:
+            result = cast(
+                CursorResult[Any],
+                session.execute(
+                    update(SqlScheduledTaskRun)
+                    .where(
+                        SqlScheduledTaskRun.workspace_id == current_workspace_id(),
+                        SqlScheduledTaskRun.id == run_id,
+                        SqlScheduledTaskRun.status == running_code,
+                    )
+                    .values(
+                        status=encode_scheduled_task_run_status(status),
+                        finished_at=finished_at,
+                        error=error,
+                        error_code=error_code,
+                    )
+                ),
+            )
+            if result.rowcount != 1:
                 return None
-            row.status = encode_scheduled_task_run_status(status)
-            row.finished_at = finished_at
-            row.error = error
-            row.error_code = error_code
-            session.flush()
-            return _run_to_entity(row)
+            row = session.get(SqlScheduledTaskRun, (current_workspace_id(), run_id))
+            return _run_to_entity(row) if row is not None else None
 
         return run_write_transaction(self._session_immediate, "update_task_run", write)
 

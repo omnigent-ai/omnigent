@@ -12,6 +12,7 @@ import httpx
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import Conversation
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_plugins import native_agents
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.server.runner_session_init import RunnerSessionInitializer, is_session_agent_removed
@@ -266,6 +267,7 @@ async def restore_active_children(
                 return False
             initializer.require_generation(runner_id, client, generation)
             try:
+                resume_interrupted_turn = _interrupted(child)
                 if child.runner_id != parent.runner_id:
                     if router is not None and router.runner_is_online(child.runner_id):
                         return False
@@ -288,8 +290,8 @@ async def restore_active_children(
                         child,
                         client,
                         timeout=10.0,
-                        suppress_recovery_turn=not _interrupted(child),
-                        resume_interrupted_turn=_interrupted(child),
+                        suppress_recovery_turn=not resume_interrupted_turn,
+                        resume_interrupted_turn=resume_interrupted_turn,
                         generation=generation,
                         store_slots=store_slots,
                     )
@@ -301,6 +303,11 @@ async def restore_active_children(
                 # Only execution status can clear the interruption. Initialization
                 # may return before a native continuation emits its first running edge.
                 return True
+            except OmnigentError as exc:
+                if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                    raise
+                log_restore_failure(snapshot.id, logging.WARNING)
+                return False
             except (httpx.HTTPError, ConnectionError, ConversationNotFoundError):
                 log_restore_failure(snapshot.id, logging.WARNING)
                 return False

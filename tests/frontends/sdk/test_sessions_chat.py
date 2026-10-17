@@ -26,11 +26,13 @@ Each test names the production behavior it pins:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import pathlib
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
+import httpx
 import pytest
 from omnigent_client._query import QueryResult, QueryStream
 from omnigent_client._sessions import Session, SessionsNamespace
@@ -41,11 +43,13 @@ from omnigent_client._sessions_chat import (
 from omnigent_client._tool_handler import StreamHooks
 from omnigent_client._types import File
 
+from omnigent.entities.session_observation import SessionObservation
 from omnigent.server.schemas import (
     CompletedEvent,
     CreatedEvent,
     ElicitationRequestEvent,
     ElicitationRequestParams,
+    ErrorEvent,
     OutputFileDoneEvent,
     OutputItemDoneEvent,
     OutputTextDeltaEvent,
@@ -58,6 +62,7 @@ from omnigent.server.schemas import (
     SessionCreatedEvent,
     SessionHeartbeatEvent,
     SessionStatusEvent,
+    SessionTerminalPendingEvent,
 )
 
 _ASSISTANT_MESSAGE_ITEM: dict[str, Any] = {
@@ -140,8 +145,8 @@ class _FakeNamespace(SessionsNamespace):
         self.interrupt_calls: list[str] = []
         self.create_calls: list[tuple[bytes, str]] = []
         self.get_calls: list[str] = []
-        self.subtree_busy_calls: list[tuple[str, int]] = []
-        self._subtree_busy_result: bool = False
+        self.child_tree_calls: list[tuple[str, int]] = []
+        self._child_tree_rows: list[dict[str, Any]] = []
 
     async def create(  # type: ignore[override]
         self,
@@ -186,16 +191,16 @@ class _FakeNamespace(SessionsNamespace):
     async def interrupt(self, session_id: str) -> None:  # type: ignore[override]
         self.interrupt_calls.append(session_id)
 
-    async def subtree_busy(  # type: ignore[override]
+    async def child_sessions_tree(  # type: ignore[override]
         self,
         session_id: str,
         *,
         max_depth: int = 3,
         limit: int = 100,
-    ) -> bool:
+    ) -> list[dict[str, Any]]:
         del limit
-        self.subtree_busy_calls.append((session_id, max_depth))
-        return self._subtree_busy_result
+        self.child_tree_calls.append((session_id, max_depth))
+        return [dict(row) for row in self._child_tree_rows]
 
     def stream(  # type: ignore[override]
         self,
@@ -699,7 +704,10 @@ async def test_send_routes_elicitation_hook_to_resolve_endpoint() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_raises_on_failed_status_with_error_message() -> None:
+@pytest.mark.parametrize("observation", [None, SessionObservation(runner_id="runner_a")])
+async def test_send_raises_on_failed_status_with_error_message(
+    observation: SessionObservation | None,
+) -> None:
     """A terminal ``session.status: failed`` raises with its error message.
 
     Regression for the silent headless ``-p`` failure mode: a SETUP-phase
@@ -714,7 +722,7 @@ async def test_send_raises_on_failed_status_with_error_message() -> None:
 
     from omnigent.server.schemas import ErrorDetail
 
-    session = _make_session()
+    session = replace(_make_session(), session_observation=observation)
     failed = SessionStatusEvent(
         type="session.status",
         conversation_id="conv_abc",
@@ -1831,7 +1839,7 @@ async def test_stream_dispatches_action_required_calls() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tree_busy_delegates_to_namespace_with_session_id() -> None:
+async def test_tree_busy_queries_tree_with_session_id() -> None:
     """``chat.tree_busy()`` rolls up via the namespace for THIS session.
 
     This is the SDK-driver accessor from #444: a per-session ``status`` reads
@@ -1841,7 +1849,10 @@ async def test_tree_busy_delegates_to_namespace_with_session_id() -> None:
     """
     session = _make_session(session_id="conv_parent")
     ns = _FakeNamespace(stream_scripts=[], session_obj=session)
-    ns._subtree_busy_result = True
+    ns._child_tree_rows = [
+        {"id": "child", "parent_id": session.id, "busy": False},
+        {"id": "grandchild", "parent_id": "child", "busy": True},
+    ]
     chat = SessionsChat(
         namespace=ns,
         files_uploader=None,
@@ -1850,14 +1861,14 @@ async def test_tree_busy_delegates_to_namespace_with_session_id() -> None:
     )
 
     assert await chat.tree_busy() is True
-    assert ns.subtree_busy_calls == [("conv_parent", 3)]
+    assert await chat.tree_busy(max_depth=1) is False
+    assert ns.child_tree_calls == [("conv_parent", 3), ("conv_parent", 1)]
 
 
 @pytest.mark.asyncio
 async def test_tree_busy_forwards_max_depth_and_false_verdict() -> None:
     session = _make_session(session_id="conv_parent")
     ns = _FakeNamespace(stream_scripts=[], session_obj=session)
-    ns._subtree_busy_result = False
     chat = SessionsChat(
         namespace=ns,
         files_uploader=None,
@@ -1866,7 +1877,7 @@ async def test_tree_busy_forwards_max_depth_and_false_verdict() -> None:
     )
 
     assert await chat.tree_busy(max_depth=5) is False
-    assert ns.subtree_busy_calls == [("conv_parent", 5)]
+    assert ns.child_tree_calls == [("conv_parent", 5)]
 
 
 # ── sub-agent lifecycle hooks ─────────────────────────────────────────
@@ -1893,6 +1904,8 @@ def _child_updated_event(
     status: str | None = "completed",
     tool: str | None = "summarizer",
     preview: str | None = None,
+    observation: SessionObservation | None = None,
+    episode_id: str | None = None,
 ) -> SessionChildSessionUpdatedEvent:
     """Build a partial child status delta as the runner fan-out emits it."""
     child: dict[str, Any] = {"id": child_id, "busy": busy}
@@ -1902,6 +1915,10 @@ def _child_updated_event(
         child["tool"] = tool
     if preview is not None:
         child["last_message_preview"] = preview
+    if observation is not None:
+        child["session_observation"] = observation.model_dump()
+    if episode_id is not None:
+        child["runner_offline_episode_id"] = episode_id
     return SessionChildSessionUpdatedEvent(
         type="session.child_session.updated",
         conversation_id="conv_abc",
@@ -1934,6 +1951,548 @@ async def _run_turn_with_subagent_hooks(
     async for _ in chat.send("hi"):
         pass
     return spawned, completed
+
+
+def _observation(epoch: int, revision: int = 1, runner_id: str = "runner_a") -> SessionObservation:
+    """An immutable lifecycle observation used by the real stream consumers."""
+    return SessionObservation(
+        runner_id=runner_id,
+        binding_epoch=epoch,
+        revision=revision,
+        observation_id=f"{epoch}:{revision}",
+        status="running",
+        response_id=f"resp_{revision}",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consumer", ["send", "stream"])
+@pytest.mark.parametrize(
+    ("current", "incoming", "episode_id"),
+    [
+        (_observation(2, runner_id="runner_b"), _observation(1), None),
+        (_observation(3), _observation(1), None),
+        (_observation(1, 2), _observation(1), None),
+        (_observation(1), None, None),
+        (_observation(1), SessionObservation(runner_id="runner_a"), None),
+        (_observation(1), _observation(1), "offline_1"),
+        (_observation(1), _observation(1).model_copy(update={"response_id": "other"}), None),
+    ],
+    ids=["rebind", "aba", "new-turn", "unknown", "default-zero", "owned", "same-version-mismatch"],
+)
+async def test_lifecycle_consumers_reject_stale_failure_before_side_effects(
+    consumer: str,
+    current: SessionObservation,
+    incoming: SessionObservation | None,
+    episode_id: str | None,
+) -> None:
+    """A learned snapshot fence blocks stale failure while preserving real output."""
+    session = replace(
+        _make_session(), session_observation=current, runner_offline_episode_id=episode_id
+    )
+    stale = SessionStatusEvent(
+        type="session.status",
+        conversation_id=session.id,
+        status="failed",
+        session_observation=incoming,
+    )
+    output = OutputTextDeltaEvent(type="response.output_text.delta", delta="kept")
+    terminal = _completed_event()
+    ns = _FakeNamespace([_StreamScript([stale, output, terminal])], session)
+    chat = SessionsChat(ns, None, None, session)
+
+    stream = chat.send("hi") if consumer == "send" else chat.stream()
+    assert [event async for event in stream] == [output, terminal]
+    assert chat.status == "running"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consumer", ["send", "stream"])
+@pytest.mark.parametrize(
+    ("current", "incoming", "episode"),
+    [
+        (_observation(2, runner_id="runner_b"), _observation(1), None),
+        (_observation(3), _observation(1), None),
+        (_observation(1, 2), _observation(1), None),
+        (_observation(1), SessionObservation(runner_id="runner_a"), None),
+        (_observation(1), _observation(1), "outage-b"),
+    ],
+    ids=["rebind", "aba", "new-turn", "default-zero", "owned"],
+)
+async def test_owned_error_and_pending_signals_are_fenced_before_callbacks(
+    monkeypatch: pytest.MonkeyPatch,
+    consumer: str,
+    current: SessionObservation,
+    incoming: SessionObservation,
+    episode: str | None,
+) -> None:
+    """Late setup signals cannot escape before their current-turn controls."""
+    session = replace(
+        _make_session(), session_observation=current, runner_offline_episode_id=episode
+    )
+    old_error = ErrorEvent(
+        type="response.error",
+        source="execution",
+        error={"code": "native_terminal_start_failed", "message": "old boot error"},
+        conversation_id=session.id,
+        session_observation=incoming,
+    )
+    old_pending = SessionTerminalPendingEvent(
+        type="session.terminal_pending",
+        conversation_id=session.id,
+        pending=False,
+        session_observation=incoming,
+    )
+    accepted = current.model_copy(update={"revision": current.revision + 1})
+    current_error = old_error.model_copy(
+        update={
+            "session_observation": accepted,
+            "error": old_error.error.model_copy(update={"message": "current genuine failure"}),
+        }
+    )
+    current_pending = old_pending.model_copy(update={"session_observation": accepted})
+    old_delta = OutputTextDeltaEvent(
+        type="response.output_text.delta", delta="old denial"
+    ).model_copy(update={"session_observation": incoming, "conversation_id": session.id})
+    current_delta = old_delta.model_copy(
+        update={"session_observation": accepted, "delta": "current denial"}
+    )
+    legacy_delta = old_delta.model_copy(update={"session_observation": None})
+    legacy_error = old_error.model_copy(update={"session_observation": None})
+    legacy_pending = old_pending.model_copy(update={"session_observation": None})
+    output = OutputTextDeltaEvent(type="response.output_text.delta", delta="kept")
+    terminal = _completed_event()
+    expected = [
+        current_error,
+        current_pending,
+        current_delta,
+        legacy_error,
+        legacy_pending,
+        legacy_delta,
+        output,
+        terminal,
+    ]
+    missing_owner_error = legacy_error.model_copy(update={"runner_offline_episode_id": "bad"})
+    missing_owner_pending = legacy_pending.model_copy(update={"runner_offline_episode_id": "bad"})
+    missing_owner_delta = legacy_delta.model_copy(update={"runner_offline_episode_id": "bad"})
+    ns = _FakeNamespace(
+        [
+            _StreamScript(
+                [
+                    old_error,
+                    old_pending,
+                    old_delta,
+                    missing_owner_error,
+                    missing_owner_pending,
+                    missing_owner_delta,
+                    current_error.model_copy(update={"runner_offline_episode_id": ""}),
+                    current_pending.model_copy(update={"runner_offline_episode_id": ""}),
+                    current_delta.model_copy(update={"runner_offline_episode_id": ""}),
+                    current_error.model_copy(update={"conversation_id": ""}),
+                    current_pending.model_copy(update={"conversation_id": ""}),
+                    current_delta.model_copy(update={"conversation_id": ""}),
+                    *expected,
+                ]
+            )
+        ],
+        session,
+    )
+    chat = SessionsChat(ns, None, None, session)
+    callbacks = []
+    fire_hooks = chat._fire_stream_hooks
+
+    async def record_callback(event, state):
+        callbacks.append(event)
+        await fire_hooks(event, state)
+
+    monkeypatch.setattr(chat, "_fire_stream_hooks", record_callback)
+    stream = chat.send("hi") if consumer == "send" else chat.stream()
+    assert [event async for event in stream] == expected
+    assert callbacks == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consumer", ["send", "stream"])
+async def test_signal_ownership_defaults_are_legacy_until_a_version_is_learned(
+    consumer: str,
+) -> None:
+    session = _make_session()
+    zero = SessionObservation(runner_id="runner_a")
+    error = ErrorEvent(
+        type="response.error",
+        source="execution",
+        error={"code": "native_terminal_start_failed", "message": "initial failure"},
+        session_observation=zero,
+    )
+    pending = SessionTerminalPendingEvent(
+        type="session.terminal_pending",
+        conversation_id=session.id,
+        pending=False,
+        session_observation=zero,
+    )
+    null_error = error.model_copy(update={"session_observation": None})
+    null_pending = pending.model_copy(update={"session_observation": None})
+    delta = OutputTextDeltaEvent(
+        type="response.output_text.delta", delta="initial denial"
+    ).model_copy(update={"session_observation": zero})
+    null_delta = delta.model_copy(update={"session_observation": None})
+    learned = SessionStatusEvent(
+        type="session.status",
+        conversation_id=session.id,
+        status="running",
+        session_observation=_observation(1),
+    )
+    output = OutputTextDeltaEvent(type="response.output_text.delta", delta="kept")
+    terminal = _completed_event()
+    expected = [
+        error,
+        pending,
+        delta,
+        null_error,
+        null_pending,
+        null_delta,
+        learned,
+        output,
+        terminal,
+    ]
+    ns = _FakeNamespace(
+        [_StreamScript([*expected[:7], error, pending, delta, output, terminal])], session
+    )
+    chat = SessionsChat(ns, None, None, session)
+    stream = chat.send("hi") if consumer == "send" else chat.stream()
+    assert [event async for event in stream] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consumer", ["send", "stream"])
+@pytest.mark.parametrize("owned_terminal", [False, True], ids=["legacy-current", "owned-current"])
+async def test_owned_denial_terminal_cannot_finish_a_newer_send(
+    consumer: str, owned_terminal: bool
+) -> None:
+    current = _observation(2, 2)
+    session = replace(_make_session(), session_observation=current)
+    stale = _completed_event("deny-old").model_copy(
+        update={"conversation_id": session.id, "session_observation": _observation(1)}
+    )
+    output = OutputTextDeltaEvent(type="response.output_text.delta", delta="newer work")
+    terminal = _completed_event("current-turn")
+    if owned_terminal:
+        terminal = terminal.model_copy(
+            update={
+                "conversation_id": session.id,
+                "session_observation": current.model_copy(update={"revision": 3}),
+            }
+        )
+    ns = _FakeNamespace([_StreamScript([stale, output, terminal])], session)
+    chat = SessionsChat(ns, None, None, session)
+    stream = chat.send("hi") if consumer == "send" else chat.stream()
+    assert [event async for event in stream] == [output, terminal]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consumer", ["send", "query"])
+async def test_denied_ack_finishes_only_its_request_while_another_turn_is_running(
+    consumer: str,
+) -> None:
+    current = _observation(2, 2)
+    session = replace(_make_session(), session_observation=current)
+    output = OutputTextDeltaEvent(type="response.output_text.delta", delta="B finishes normally")
+    terminal = _completed_event("turn-b")
+    idle = SessionStatusEvent(
+        type="session.status",
+        conversation_id=session.id,
+        status="idle",
+        session_observation=current.model_copy(update={"revision": 3}),
+    )
+
+    class _DeniedNamespace(_FakeNamespace):
+        def __init__(self) -> None:
+            super().__init__([_StreamScript([output, terminal, idle])], session)
+            self.opened = 0
+            self.denied_subscription_closed = False
+
+        async def post_event(self, session_id, event):
+            await super().post_event(session_id, event)
+            return {
+                "queued": False,
+                "denied": True,
+                "reason": "blocked input A",
+                "response_id": "deny-request-a",
+            }
+
+        def stream(self, session_id):
+            self.opened += 1
+            if self.opened != 1:
+                return super().stream(session_id)
+
+            async def parked_subscription():
+                try:
+                    yield SessionHeartbeatEvent(type="session.heartbeat")
+                    raise AssertionError("Denied A must not consume unrelated B's stream")
+                finally:
+                    self.denied_subscription_closed = True
+
+            return parked_subscription()
+
+    ns = _DeniedNamespace()
+    chat = SessionsChat(ns, None, None, session)
+    if consumer == "query":
+        assert (await chat.query("A")).text == "[Denied by policy: blocked input A]"
+    else:
+        events = [event async for event in chat.send("A")]
+        assert len(events) == 2
+        assert isinstance(events[0], OutputTextDeltaEvent)
+        assert events[0].delta == "[Denied by policy: blocked input A]"
+        assert isinstance(events[1], CompletedEvent)
+        assert events[1].response.id == "deny-request-a"
+    assert ns.denied_subscription_closed
+    assert chat.status == "running"
+    assert chat._session.session_observation == current
+    assert [event async for event in chat.stream()] == [output, terminal, idle]
+    assert chat.status == "idle"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("consumer", ["send", "stream"])
+@pytest.mark.parametrize(
+    "kind", ["created", "queued", "in_progress", "failed", "incomplete", "cancelled"]
+)
+async def test_owned_raw_response_lifecycle_keeps_its_fence_through_wire_parsing(
+    consumer: str,
+    kind: str,
+) -> None:
+    from tests.frontends.sdk.test_sessions_namespace import (
+        _completed_response_dict,
+        _format_sse_lines,
+        _make_namespace,
+    )
+
+    current = _observation(2, 2)
+    session = replace(_make_session(), session_observation=current)
+    response = {
+        **_completed_response_dict(),
+        "id": "old-turn",
+        "status": "in_progress" if kind == "created" else kind,
+    }
+    payloads = [
+        (
+            f"response.{kind}",
+            {
+                "type": f"response.{kind}",
+                "response": response,
+                "session_observation": _observation(1).model_dump(),
+                "conversation_id": session.id,
+            },
+        ),
+        *[
+            (
+                f"response.{kind}",
+                {
+                    "type": f"response.{kind}",
+                    "response": response,
+                    "session_observation": current.model_dump(),
+                    **invalid,
+                },
+            )
+            for invalid in (
+                {"conversation_id": 42},
+                {"conversation_id": ""},
+                {"runner_offline_episode_id": ""},
+            )
+        ],
+        ("response.output_text.delta", {"type": "response.output_text.delta", "delta": "kept"}),
+        (
+            "response.completed",
+            {"type": "response.completed", "response": _completed_response_dict()},
+        ),
+        ("done", "[DONE]"),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(202, json={"queued": True})
+        return httpx.Response(
+            200, content=_format_sse_lines(payloads), headers={"content-type": "text/event-stream"}
+        )
+
+    ns, client = _make_namespace(handler)
+    chat = SessionsChat(ns, None, None, session)
+    try:
+        stream = chat.send("hi") if consumer == "send" else chat.stream()
+        events = [event async for event in stream]
+    finally:
+        await client.aclose()
+    assert len(events) == 2
+    assert isinstance(events[0], OutputTextDeltaEvent) and events[0].delta == "kept"
+    assert isinstance(events[1], CompletedEvent)
+
+
+@pytest.mark.asyncio
+async def test_stream_fence_survives_refresh_and_next_send() -> None:
+    """A late snapshot and failed status cannot rewind a fence learned by another subscription."""
+    session = replace(_make_session(), status="failed", last_task_error={"code": "old_failure"})
+    running = SessionStatusEvent(
+        type="session.status",
+        conversation_id=session.id,
+        status="running",
+        session_observation=_observation(2, 2),
+    )
+    stale = running.model_copy(update={"status": "failed", "session_observation": _observation(1)})
+    completed = _completed_event()
+    ns = _FakeNamespace([_StreamScript([running]), _StreamScript([stale, completed])], session)
+    chat = SessionsChat(ns, None, None, session)
+    assert [event async for event in chat.stream()] == [running]
+    ns._session_obj = replace(session, status="failed", session_observation=_observation(1))
+    assert (await chat.refresh()).status == "running"
+    assert (await chat.refresh()).last_task_error is None
+    assert [event async for event in chat.send("next")] == [completed]
+
+    ns._session_obj = replace(session, status="idle", session_observation=_observation(2, 3))
+    assert (await chat.refresh()).status == "idle"
+
+
+@pytest.mark.asyncio
+async def test_tree_busy_reconciles_delayed_snapshot_with_newer_child_stream() -> None:
+    """An HTTP response captured before a rebind cannot report a live child idle."""
+    session = _make_session()
+    running = _child_updated_event(busy=True, status="in_progress", observation=_observation(3, 2))
+    terminal = _child_updated_event(status="completed", observation=_observation(3, 3))
+
+    class _GatedTreeNamespace(_FakeNamespace):
+        def __init__(self) -> None:
+            super().__init__([_StreamScript([running]), _StreamScript([terminal])], session)
+            self.snapshot_started = asyncio.Event()
+            self.release_snapshot = asyncio.Event()
+
+        async def child_sessions_tree(
+            self, session_id: str, *, max_depth: int = 3, limit: int = 100
+        ) -> list[dict[str, Any]]:
+            self.snapshot_started.set()
+            await self.release_snapshot.wait()
+            return await super().child_sessions_tree(session_id, max_depth=max_depth, limit=limit)
+
+    ns = _GatedTreeNamespace()
+    ns._child_tree_rows = [
+        {
+            "id": "conv_child_1",
+            "parent_id": session.id,
+            "busy": False,
+            "current_task_status": "completed",
+            "session_observation": _observation(1).model_dump(),
+        }
+    ]
+    chat = SessionsChat(ns, None, None, session)
+    poll = asyncio.create_task(chat.tree_busy())
+    try:
+        await asyncio.wait_for(ns.snapshot_started.wait(), timeout=1)
+        assert [event async for event in chat.stream()] == [running]
+        ns.release_snapshot.set()
+        assert await asyncio.wait_for(poll, timeout=1) is True
+        ns._child_tree_rows = []
+        assert await chat.tree_busy() is True
+        assert [event async for event in chat.stream()] == [terminal]
+        assert await chat.tree_busy() is False
+    finally:
+        if not poll.done():
+            poll.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await poll
+
+
+@pytest.mark.asyncio
+async def test_child_fence_blocks_old_completion_and_preserves_metadata_partial() -> None:
+    """Only the current owned child failure completes the spawned child callback."""
+    spawned, completed = await _run_turn_with_subagent_hooks(
+        [
+            _child_created_event(),
+            _child_updated_event(busy=True, status="in_progress", observation=_observation(3, 2)),
+            _child_updated_event(status="failed", observation=_observation(1)),
+            SessionChildSessionUpdatedEvent(
+                type="session.child_session.updated",
+                conversation_id="conv_abc",
+                child_session_id="conv_child_1",
+                child={"tool": "new name", "last_message_preview": "current preview"},
+            ),
+            _child_updated_event(
+                status="failed",
+                tool=None,
+                observation=_observation(3, 2),
+                episode_id="offline_current",
+            ),
+            _completed_event(),
+        ]
+    )
+    assert len(spawned) == 1
+    assert [(c.status, c.agent_name, c.output_summary) for c in completed] == [
+        ("failed", "new name", "current preview")
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("episode_id", [None, "old"], ids=["normal", "offline"])
+async def test_child_fence_survives_new_subscription_and_owned_activity(
+    episode_id: str | None,
+) -> None:
+    """Stale annotated activity is suppressed alongside stale child status."""
+    current = _child_updated_event(busy=True, status="in_progress", observation=_observation(3, 2))
+    stale_activity = OutputItemDoneEvent(
+        type="response.output_item.done",
+        item={
+            "type": "resource_event",
+            "event_type": "session.subagent.returned",
+            "resource_id": "conv_child_1",
+            "resource_type": "session",
+            "resource": {
+                "status": "failed",
+                "session_observation": _observation(1).model_dump(),
+                "runner_offline_episode_id": episode_id,
+                "turn_id": "resp_1",
+            },
+        },
+    )
+    historical = stale_activity.model_copy(
+        update={"item": {**stale_activity.item, "resource": {"status": "failed"}}}
+    )
+    current_activity = stale_activity.model_copy(
+        update={
+            "item": {
+                **stale_activity.item,
+                "resource": {
+                    "status": "failed",
+                    "session_observation": _observation(3, 2).model_dump(),
+                    "runner_offline_episode_id": "current",
+                    "turn_id": "resp_2",
+                },
+            }
+        }
+    )
+    completed: list[Any] = []
+    session = _make_session()
+    ns = _FakeNamespace(
+        [
+            _StreamScript([current]),
+            _StreamScript(
+                [
+                    _child_created_event(),
+                    _child_updated_event(status="failed"),
+                    stale_activity,
+                    historical,
+                    current_activity,
+                    _completed_event(),
+                ]
+            ),
+        ],
+        session,
+    )
+    chat = SessionsChat(
+        ns, None, None, session, hooks=StreamHooks(on_sub_agent_completed=completed.append)
+    )
+    assert [event async for event in chat.stream()] == [current]
+    events = [event async for event in chat.send("next")]
+    assert completed == []
+    assert stale_activity not in events
+    assert historical in events
+    assert current_activity in events
 
 
 @pytest.mark.asyncio

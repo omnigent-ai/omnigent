@@ -27,10 +27,12 @@ import pytest
 import pytest_asyncio
 
 from omnigent.db.utils import generate_agent_id
+from omnigent.entities.session_observation import SessionObservation
 from omnigent.server.routes._sessions.helpers import (
     _session_status_cache,
     reconcile_orphaned_running_status,
 )
+from omnigent.server.session_observations import SessionProjection
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
@@ -90,6 +92,7 @@ def test_reconcile_is_conditional_and_marks_scheduled_run_incomplete(
     sid = _seed_running_session(db_uri, runner_fresh=False)
     store = SqlAlchemyConversationStore(db_uri)
     completions: list[tuple[str, str, str | None]] = []
+    observations: list[SessionObservation | None] = []
 
     def _record_completion(
         conversation_id: str,
@@ -97,9 +100,11 @@ def test_reconcile_is_conditional_and_marks_scheduled_run_incomplete(
         *,
         error_code: str | None = None,
         error: str | None = None,
+        observation: SessionObservation | None = None,
     ) -> None:
         del error
         completions.append((conversation_id, status, error_code))
+        observations.append(observation)
 
     monkeypatch.setattr(session_live_state, "persist_scheduled_run_completion", _record_completion)
 
@@ -107,6 +112,7 @@ def test_reconcile_is_conditional_and_marks_scheduled_run_incomplete(
     assert store.get_conversation(sid).live_status == "idle"  # type: ignore[union-attr]
     assert _session_status_cache[sid] == "idle"
     assert completions == [(sid, "failed", "incomplete")]
+    assert observations == [store.get_session_observation(sid)]
     assert not reconcile_orphaned_running_status(sid, store, int(time.time()) - 90)
 
     fresh_sid = _seed_running_session(db_uri, runner_fresh=True)
@@ -131,6 +137,13 @@ async def test_list_reconciles_orphaned_running_session(
     assert resp.status_code == 200
     item = next(s for s in resp.json()["data"] if s["id"] == session_id)
     assert item["status"] == "idle"
+    current = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert current is not None
+    assert (
+        SessionObservation.model_validate(item["session_observation"])
+        == current.session_observation
+    )
+    assert current.terminal_pending is False
 
 
 async def test_list_leaves_running_session_with_fresh_runner(
@@ -146,6 +159,45 @@ async def test_list_leaves_running_session_with_fresh_runner(
     assert resp.status_code == 200
     item = next(s for s in resp.json()["data"] if s["id"] == session_id)
     assert item["status"] == "running"
+
+
+async def test_list_hydration_does_not_keep_an_expired_runner_running(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    session_id = _seed_running_session(db_uri, runner_fresh=True)
+    first = await client.get("/v1/sessions")
+    assert first.status_code == 200
+    assert (
+        next(row for row in first.json()["data"] if row["id"] == session_id)["status"] == "running"
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    current = store.get_conversation(session_id)
+    assert current is not None and current.runner_id is not None
+    store.clear_runner_liveness(current.runner_id)
+    second = await client.get("/v1/sessions")
+    assert second.status_code == 200
+    assert (
+        next(row for row in second.json()["data"] if row["id"] == session_id)["status"] == "idle"
+    )
+
+
+async def test_list_keeps_live_local_activity_despite_an_old_runner_lease(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    session_id = _seed_running_session(db_uri, runner_fresh=False)
+    store = SqlAlchemyConversationStore(db_uri)
+    owner = store.get_session_observation(session_id)
+    assert owner is not None
+    assert _session_status_cache.accept(session_id, SessionProjection(owner, "running"))
+    response = await client.get("/v1/sessions")
+    assert response.status_code == 200
+    assert (
+        next(row for row in response.json()["data"] if row["id"] == session_id)["status"]
+        == "running"
+    )
+    assert store.get_session_observation(session_id) == owner
 
 
 # ── Facet 2: stop_session settles instead of false-succeeding ────────────

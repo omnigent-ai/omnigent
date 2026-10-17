@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 from omnigent_client import PaginatedList, StaleCursorError
 
+from omnigent.entities.pagination import PagedList
 from omnigent.repl import _session_log
 from omnigent.repl._session_log import (
     _build_node_async,
@@ -67,7 +68,7 @@ class _FakeSessions:
         start = 0
         if after is not None:
             start = next(i for i, row in enumerate(rows) if row["id"] == after) + 1
-        return PaginatedList(data=rows[start : start + limit])
+        return PaginatedList(data=rows[start : start + limit], has_more=start + limit < len(rows))
 
 
 def _client(items: dict[str, list[dict[str, object]]]) -> SimpleNamespace:
@@ -265,6 +266,26 @@ async def test_fetch_items_via_sessions_pages_until_short_page() -> None:
     assert client.sessions.list_calls == [("conv_a", None), ("conv_a", "i99")]
 
 
+@pytest.mark.parametrize("visible", [[], [{"id": "visible"}]])
+async def test_fetch_items_via_sessions_follows_filtered_page_cursor(
+    visible: list[dict[str, object]],
+) -> None:
+    class _FilteredSessions(_FakeSessions):
+        async def list_items(
+            self, session_id: str, *, limit: int, after: str | None, order: str
+        ) -> PaginatedList:
+            self.list_calls.append((session_id, after))
+            if after is None:
+                return PaginatedList(data=visible, has_more=True, last_id="filtered")
+            assert after == "filtered"
+            return PaginatedList(data=[{"id": "tail"}], has_more=False)
+
+    sessions = _FilteredSessions({})
+    client = SimpleNamespace(sessions=sessions)
+    assert await _fetch_all_items_via_sessions(client, "conv_a") == [*visible, {"id": "tail"}]  # type: ignore[arg-type]
+    assert sessions.list_calls == [("conv_a", None), ("conv_a", "filtered")]
+
+
 async def test_fetch_items_via_sessions_stops_on_empty_page_or_missing_id() -> None:
     client = _client({"conv_empty": [], "conv_no_id": [{"type": "message"}]})
 
@@ -343,9 +364,10 @@ class _FakeStore:
         limit: int,
         after: str | None,
         order: str,
-    ) -> SimpleNamespace:
+    ) -> PagedList[_Row]:
         self.calls.append(after)
-        return SimpleNamespace(data=self.pages.pop(0) if self.pages else [])
+        rows = self.pages.pop(0) if self.pages else []
+        return PagedList(data=rows, has_more=len(rows) == limit)
 
     def get_conversation(self, conversation_id: str) -> object | None:
         return self.conversation

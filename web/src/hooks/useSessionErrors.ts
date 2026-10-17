@@ -54,7 +54,7 @@ async function fetchLatestError(
     let older: SessionItemsPage;
     try {
       older = await fetchSessionItemsPage(id, {
-        olderThan: page.items[0]?.id,
+        olderThan: page.olderCursor ?? undefined,
         limit: 8,
         signal,
       });

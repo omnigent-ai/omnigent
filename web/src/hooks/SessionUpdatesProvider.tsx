@@ -34,11 +34,18 @@ import {
   filtersFromConversationQueryKey,
   insertNewRowsIntoPages,
   mergeItemsIntoPages,
+  mergeSessionListProjection,
   nullsToUndefined,
   PROJECT_LABEL_KEY,
   removeIdsFromPages,
 } from "@/lib/sessionListCache";
-import { isModalHostResolved, resolveModalHost } from "@/lib/sessionHost";
+import {
+  isModalHostResolved,
+  resolveModalHost,
+  setSessionHost,
+  sessionRoutingHostId,
+  observeSessionHostProjection,
+} from "@/lib/sessionHost";
 import { type SessionUpdatesFrame, sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
 import { isTempConvId } from "@/lib/tempConversationId";
 
@@ -74,10 +81,15 @@ function applyItemsToCache(
   const itemsById = new Map<string, SessionListWireItem>();
   for (const item of items) {
     if (isSessionDeleting(item.id)) continue;
-    itemsById.set(
-      item.id,
-      nullsToUndefined(isSessionArchiving(item.id) ? { ...item, archived: true } : item),
-    );
+    const wire = nullsToUndefined(isSessionArchiving(item.id) ? { ...item, archived: true } : item);
+    itemsById.set(item.id, wire);
+    const projection = {
+      observation: wire.session_observation,
+      episodeId: wire.runner_offline_episode_id,
+    };
+    if ("host_id" in wire)
+      setSessionHost(wire.id, sessionRoutingHostId(wire.host_id, wire.labels), projection);
+    else if (wire.session_observation) observeSessionHostProjection(wire.id, projection);
   }
   const foundAnywhere = new Set<string>();
   let needsRefetch = false;
@@ -143,13 +155,14 @@ function applyItemsToCache(
         const item = itemsById.get(row.id);
         if (!item) return row;
         foundAnywhere.add(row.id);
+        const patch = mergeSessionListProjection(row, item);
         changed = true;
         // Pin membership and pin timestamps reconcile through the pinned query.
         return {
           ...row,
-          ...item,
+          ...patch,
           labels: {
-            ...(item.labels ?? row.labels),
+            ...(patch.labels ?? row.labels),
             ["omnigent.pinned"]: row.labels["omnigent.pinned"],
           },
         };

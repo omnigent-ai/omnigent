@@ -35,8 +35,10 @@ import inspect
 import json
 import mimetypes
 import pathlib
+import time
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, Protocol, overload
 
 from omnigent.server.schemas import (
@@ -44,6 +46,7 @@ from omnigent.server.schemas import (
     CompletedEvent,
     CreatedEvent,
     ElicitationRequestEvent,
+    ErrorEvent,
     FailedEvent,
     IncompleteEvent,
     InProgressEvent,
@@ -54,16 +57,19 @@ from omnigent.server.schemas import (
     ReasoningStartedEvent,
     ReasoningSummaryTextDeltaEvent,
     ReasoningTextDeltaEvent,
+    ResponseObject,
     ServerStreamEvent,
     SessionChildSessionUpdatedEvent,
     SessionCreatedEvent,
     SessionStatusEvent,
+    SessionTerminalPendingEvent,
 )
 
 from ._child_status import TERMINAL_TASK_STATUSES, child_summary_busy
 from ._errors import OmnigentError
 from ._files import FilesNamespace
 from ._query import QueryResult, QueryStream
+from ._session_projection import SessionProjectionFence, accept_owned_child_activity
 from ._sessions import Session, SessionsNamespace
 from ._tool_handler import (
     ElicitationRequestCtx,
@@ -224,10 +230,59 @@ _TURN_TERMINAL_EVENT_TYPES = (
     CancelledEvent,
 )
 
+
+def denied_input_events(
+    ack: object, *, model: str
+) -> tuple[OutputTextDeltaEvent, CompletedEvent] | None:
+    """Complete a denied request locally without waiting on unrelated session work."""
+    if (
+        not isinstance(ack, dict)
+        or ack.get("denied") is not True
+        or ack.get("queued") is not False
+    ):
+        return None
+    reason = ack.get("reason")
+    if not isinstance(reason, str):
+        reason = "Denied by policy"
+    text = f"[Denied by policy: {reason}]"
+    response_id = ack.get("response_id")
+    if not isinstance(response_id, str) or not response_id:
+        response_id = f"deny_{uuid.uuid4().hex}"
+    now = int(time.time())
+    return (
+        OutputTextDeltaEvent(type="response.output_text.delta", delta=text),
+        CompletedEvent(
+            type="response.completed",
+            response=ResponseObject(
+                id=response_id,
+                status="completed",
+                model=model,
+                created_at=now,
+                completed_at=now,
+                output=[
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": text}],
+                    }
+                ],
+            ),
+        ),
+    )
+
+
 _RESPONSE_START_EVENT_TYPES = (
     CreatedEvent,
     QueuedEvent,
     InProgressEvent,
+)
+
+_OWNED_SIGNAL_EVENT_TYPES = (
+    ErrorEvent,
+    SessionTerminalPendingEvent,
+    OutputTextDeltaEvent,
+    *_RESPONSE_START_EVENT_TYPES,
+    *_TURN_TERMINAL_EVENT_TYPES,
 )
 
 # Newer servers emit an immediate ``session.heartbeat`` after the
@@ -358,6 +413,11 @@ class SessionsChat:
         self._files_uploader = files_uploader
         self._files_getter = files_getter
         self._session = session
+        self._projection_fence = SessionProjectionFence(
+            session.session_observation, session.runner_offline_episode_id
+        )
+        self._child_projection_fences: dict[str, SessionProjectionFence] = {}
+        self._child_summaries: dict[str, dict[str, Any]] = {}
         self._tool_callables: dict[str, ToolCallable] = (
             dict(tool_callables) if tool_callables else {}
         )
@@ -455,7 +515,7 @@ class SessionsChat:
     @property
     def status(self) -> str:
         """
-        Last-known session status from the most recent snapshot.
+        Last-known session status from an accepted snapshot or lifecycle event.
 
         Note: this is point-in-time — the actual server-side status
         may have advanced since :meth:`create`/:meth:`refresh` was
@@ -470,14 +530,18 @@ class SessionsChat:
         Fetch a fresh snapshot from the server and update internal state.
 
         Calls :meth:`SessionsNamespace.get` and replaces the cached
-        :class:`Session`. Useful after a reconnect to reconcile
-        local state with the server.
+        :class:`Session` when its ownership has not been superseded by
+        live state. Useful after a reconnect to reconcile with the server.
 
-        :returns: The freshly fetched :class:`Session` snapshot.
+        :returns: The latest accepted :class:`Session` snapshot.
         :raises OmnigentError: If the session no longer exists
             (404) or another HTTP error occurs.
         """
-        self._session = await self._namespace.get(self._session.id)
+        session = await self._namespace.get(self._session.id)
+        if self._projection_fence.accept(
+            session.session_observation, session.runner_offline_episode_id
+        ):
+            self._session = session
         return self._session
 
     async def tree_busy(self, *, max_depth: int = 3) -> bool:
@@ -494,15 +558,41 @@ class SessionsChat:
             if not await chat.tree_busy():
                 await chat.send("your turn")  # only when nothing is still working
 
-        Point-in-time and recursive (capped at *max_depth*); delegates to
-        :meth:`SessionsNamespace.subtree_busy`, which applies the same canonical
-        "busy" definition as the CLI badge and the web ``SubagentsPanel``.
+        Fetches the recursive snapshot (capped at *max_depth*) and reconciles it
+        with live child observations before applying the same canonical "busy"
+        definition as the CLI badge and the web ``SubagentsPanel``.
 
         :param max_depth: Levels of the sub-agent tree to descend.
         :returns: ``True`` while any descendant sub-agent is busy.
         :raises OmnigentError: On non-2xx status.
         """
-        return await self._namespace.subtree_busy(self._session.id, max_depth=max_depth)
+        nodes = await self._namespace.child_sessions_tree(self._session.id, max_depth=max_depth)
+        seen: set[str] = set()
+        for node in nodes:
+            child_id = node.get("id")
+            if not isinstance(child_id, str):
+                continue
+            seen.add(child_id)
+            self._merge_child_projection(child_id, node)
+        for child_id, summary in list(self._child_summaries.items()):
+            if child_id in seen:
+                continue
+            fence = self._child_projection_fences[child_id]
+            if fence.observation is None or not child_summary_busy(summary):
+                del self._child_summaries[child_id]
+        frontier = {self.session_id}
+        visited = set(frontier)
+        for _ in range(max_depth):
+            children = {
+                child_id
+                for child_id, summary in self._child_summaries.items()
+                if summary.get("parent_id") in frontier and child_id not in visited
+            }
+            if any(child_summary_busy(self._child_summaries[child_id]) for child_id in children):
+                return True
+            visited.update(children)
+            frontier = children
+        return False
 
     async def send(
         self,
@@ -585,7 +675,15 @@ class SessionsChat:
                 first_event = None
             except StopAsyncIteration:
                 return
-            await self._namespace.post_event(self._session.id, event_payload)
+            ack = await self._namespace.post_event(self._session.id, event_payload)
+            denied = denied_input_events(
+                ack, model=self._session.agent_name or self._session.agent_id or "policy"
+            )
+            if denied is not None:
+                for local_event in denied:
+                    await self._fire_stream_hooks(local_event, hook_state)
+                    yield local_event
+                return
             event: ServerStreamEvent
             if first_event is None:
                 try:
@@ -595,6 +693,14 @@ class SessionsChat:
             else:
                 event = first_event
             while True:
+                projected = self._accept_lifecycle_event(event)
+                if projected is None:
+                    try:
+                        event = await stream_aiter.__anext__()
+                    except StopAsyncIteration:
+                        return
+                    continue
+                event = projected
                 await self._fire_stream_hooks(event, hook_state)
                 yield event
                 # Dispatch client-side tool calls inline, BEFORE
@@ -842,6 +948,10 @@ class SessionsChat:
         hook_state = _StreamHookState()
         try:
             async for event in stream_aiter:
+                projected = self._accept_lifecycle_event(event)
+                if projected is None:
+                    continue
+                event = projected
                 await self._fire_stream_hooks(event, hook_state)
                 yield event
                 # Same dispatch path as :meth:`send` — see the
@@ -851,6 +961,66 @@ class SessionsChat:
                     await self._maybe_dispatch_tool_call(event, hook_state)
         finally:
             await _aclose(stream_aiter)
+
+    def _accept_lifecycle_event(self, event: ServerStreamEvent) -> ServerStreamEvent | None:
+        """Fence lifecycle effects before callbacks, completion, or failed raises."""
+        if isinstance(event, _OWNED_SIGNAL_EVENT_TYPES):
+            observation = getattr(event, "session_observation", None)
+            episode = getattr(event, "runner_offline_episode_id", None)
+            if observation is None and episode is None:
+                return event
+            conversation_id = getattr(event, "conversation_id", None)
+            if (
+                conversation_id is not None and conversation_id != self.session_id
+            ) or not self._projection_fence.accept_signal(observation, episode):
+                return None
+        elif isinstance(event, SessionStatusEvent) and event.conversation_id == self.session_id:
+            if not self._projection_fence.accept(
+                event.session_observation, event.runner_offline_episode_id
+            ):
+                return None
+            self._session = replace(
+                self._session,
+                status=event.status,
+                runner_id=(
+                    event.session_observation.runner_id
+                    if event.session_observation is not None
+                    else self._session.runner_id
+                ),
+                last_task_error=(
+                    {
+                        key: value
+                        for key, value in event.error.model_dump(exclude_none=True).items()
+                        if isinstance(value, str)
+                    }
+                    if event.error is not None
+                    else None
+                ),
+                session_observation=event.session_observation,
+                runner_offline_episode_id=event.runner_offline_episode_id,
+            )
+        elif isinstance(event, SessionChildSessionUpdatedEvent):
+            child = self._merge_child_projection(
+                event.child_session_id, event.child, parent_id=event.conversation_id
+            )
+            if child is not event.child:
+                return event.model_copy(update={"child": child})
+        elif isinstance(event, OutputItemDoneEvent) and isinstance(event.item, dict):
+            if not accept_owned_child_activity(event.item, self._child_projection_fences):
+                return None
+        return event
+
+    def _merge_child_projection(
+        self, child_id: str, child: dict[str, Any], *, parent_id: str | None = None
+    ) -> dict[str, Any]:
+        """Reconcile child snapshots and stream partials against one retained fence."""
+        fence = self._child_projection_fences.setdefault(child_id, SessionProjectionFence())
+        child = fence.filter_child(child)
+        summary = {**self._child_summaries.get(child_id, {}), **child}
+        if parent_id is not None:
+            summary["parent_id"] = parent_id
+        self._child_summaries[child_id] = summary
+        return child
 
     async def _fire_stream_hooks(
         self,

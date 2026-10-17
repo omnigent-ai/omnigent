@@ -62,6 +62,105 @@ def _pill(page: Page, count: int) -> Locator:
     )
 
 
+def test_delayed_offline_failure_preserves_the_current_runner_turn(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    pytestconfig: pytest.Config,
+    browser_name: str,
+) -> None:
+    demo_dir = pytestconfig.rootpath / "artifacts" / "session-observation-demo" / browser_name
+    demo_dir.mkdir(parents=True, exist_ok=True)
+    chat = chat_session_contract
+    chat.seed_transcript(1)
+    page.goto(chat.url)
+    expect(page.get_by_label("Message the agent")).to_be_visible(timeout=20_000)
+    chat.wait_for_stream()
+    observation = {
+        "runner_id": "runner_B",
+        "binding_epoch": 2,
+        "revision": 5,
+        "observation_id": "current",
+        "status": "running",
+        "response_id": "current_turn",
+        "error_key": None,
+    }
+    chat.update_session(
+        status="running", session_observation=observation, active_response_id="current_turn"
+    )
+    chat.emit(
+        {
+            "event": "session.status",
+            "data": {
+                "conversation_id": chat.session_id,
+                "status": "running",
+                "response_id": "current_turn",
+                "session_observation": observation,
+            },
+        }
+    )
+    working = page.get_by_test_id("working-indicator")
+    expect(working).to_be_visible(timeout=10_000)
+    chat.emit(
+        {
+            "event": "session.status",
+            "data": {
+                "conversation_id": chat.session_id,
+                "status": "failed",
+                "response_id": "old_turn",
+                "session_observation": {
+                    **observation,
+                    "runner_id": "runner_A",
+                    "binding_epoch": 1,
+                    "revision": 4,
+                    "observation_id": "old",
+                    "response_id": "old_turn",
+                },
+                "runner_offline_episode_id": "old_offline_episode",
+                "error": {"code": "runner_disconnected", "message": "Old runner interruption"},
+            },
+        }
+    )
+    # A title event confirms the earlier frame was consumed without changing lifecycle.
+    chat.emit(
+        {
+            "event": "session.title",
+            "data": {
+                "conversation_id": chat.session_id,
+                "title": "Current runner work",
+            },
+        }
+    )
+    expect(page.get_by_role("button", name="Current runner work", exact=True)).to_be_visible(
+        timeout=10_000
+    )
+    expect(working).to_be_visible()
+    expect(page.get_by_role("button", name="Dismiss error message", exact=True)).to_have_count(0)
+    page.screenshot(path=str(demo_dir / "current-turn-survives-old-offline.png"), full_page=True)
+
+    chat.emit(
+        {
+            "event": "session.status",
+            "data": {
+                "conversation_id": chat.session_id,
+                "status": "failed",
+                "response_id": "current_turn",
+                "session_observation": observation,
+                "runner_offline_episode_id": "current_offline_episode",
+                "error": {"code": "runner_disconnected", "message": "Current runner interruption"},
+            },
+        }
+    )
+    expect(working).to_be_hidden(timeout=10_000)
+    expect(
+        page.get_by_role(
+            "button", name="The connection to the host dropped unexpectedly.", exact=True
+        )
+    ).to_be_visible(timeout=10_000)
+    page.screenshot(
+        path=str(demo_dir / "genuine-current-failure-remains-visible.png"), full_page=True
+    )
+
+
 def test_bare_idle_clears_the_live_working_indicator(
     page: Page,
     chat_session_contract: ChatSessionContract,

@@ -15,10 +15,10 @@ class PagedList(Generic[T]):
     A page of results matching the OpenAI list pagination shape.
 
     :param data: The items in this page.
-    :param first_id: ID of the first item in the page, or ``None``
-        if empty.
-    :param last_id: ID of the last item in the page, or ``None``
-        if empty.
+    :param first_id: Cursor for the first source item, or ``None`` when no
+        source rows exist. A filtered page may retain this with empty data.
+    :param last_id: Cursor for the last source item, or ``None`` when no
+        source rows exist. Use this with ``has_more`` to advance filtered pages.
     :param has_more: ``True`` if more pages exist after this one.
     """
 

@@ -40,8 +40,10 @@ from omnigent.entities import (
     synthesize_conversation_title,
 )
 from omnigent.entities.permission import SessionPermission
+from omnigent.entities.session_observation import SessionObservation
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.models.model_override import validate_model_override
+from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
@@ -53,6 +55,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.server import session_live_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -386,6 +389,14 @@ def _codex_update_unconfirmed(result: _RunnerForwardResult) -> bool:
     return _runner_reply_field(result.body, "error") == "codex_native_settings_update_timeout"
 
 
+@dataclasses.dataclass(frozen=True)
+class _CreatedHostLaunch:
+    runner_id: str
+    observation: SessionObservation
+    terminal_pending: bool
+    failed: bool
+
+
 def register_core_routes(
     router: APIRouter,
     *,
@@ -586,7 +597,8 @@ def register_core_routes(
         workspace: str | None,
         harness: str | None,
         conversation: Conversation | None = None,
-    ) -> tuple[str, bool] | None:
+        terminal_pending: bool = False,
+    ) -> _CreatedHostLaunch | None:
         """
         Bind a just-created session to a caller-supplied host and launch.
 
@@ -622,7 +634,7 @@ def register_core_routes(
         :param conversation: Optional authoritative row already returned by
             session creation, used to avoid re-reading it during launch
             authorization. Its id must match ``session_id``.
-        :returns: ``(runner_id, launch_failed)`` after the bind, or
+        :returns: The captured launch result after the bind, or
             ``None`` when the server has no host registry/store wired
             (minimal test wirings — nothing was attempted).
         :raises OmnigentError: ``CONFLICT`` when a runner is already
@@ -671,6 +683,33 @@ def register_core_routes(
                 f"Session {session_id!r} already has a runner bound",
                 code=ErrorCode.CONFLICT,
             )
+        launch_observation = target.conv.session_observation.model_copy(
+            update={
+                "runner_id": runner_id,
+                "binding_epoch": target.conv.runner_binding_epoch + 1,
+                "observation_id": None,
+                "response_id": None,
+                "error_key": None,
+            }
+        )
+        pending = False
+        if terminal_pending or native_coding_agent_for_harness(harness) is not None:
+            reservation = session_live_state.reserve_terminal_startup(
+                session_id, launch_observation, None
+            )
+            if reservation is not None:
+                try:
+                    reserved = await asyncio.shield(asyncio.wrap_future(reservation))
+                except Exception:
+                    _logger.warning(
+                        "Cannot reserve created terminal startup for %s", session_id, exc_info=True
+                    )
+                    return _CreatedHostLaunch(runner_id, launch_observation, False, True)
+                if reserved is None:
+                    return _CreatedHostLaunch(runner_id, launch_observation, False, True)
+                launch_observation = reserved
+            pending = True
+            _publish_terminal_pending(session_id, True, session_observation=launch_observation)
         set_current_runner_id(runner_id)
         add_audit_attrs(runner_id=runner_id)
         _logger.info(
@@ -729,6 +768,29 @@ def register_core_routes(
                 future.cancel()
         launch_failed = launch_result.get("status") == "failed"
         if launch_failed:
+            if pending:
+                completion = session_live_state.complete_terminal_startup(
+                    session_id, launch_observation
+                )
+                if completion is not None:
+                    try:
+                        completed = await asyncio.shield(asyncio.wrap_future(completion))
+                    except Exception:
+                        _logger.warning(
+                            "Cannot settle created terminal startup for %s",
+                            session_id,
+                            exc_info=True,
+                        )
+                    else:
+                        if completed is not None:
+                            launch_observation = completed
+                            pending = False
+                            _publish_terminal_pending(
+                                session_id, False, session_observation=completed
+                            )
+                else:
+                    pending = False
+                    _publish_terminal_pending(session_id, False)
             # The runner failed to come up (generic launch-failure path with no
             # structured error_code), blocking the session at launch. A coded
             # deployment failure (harness_not_configured, etc.) is attributed
@@ -749,7 +811,7 @@ def register_core_routes(
                     error_phase=ErrorPhase.RUNNER_LAUNCH.value,
                 ),
             )
-        return runner_id, launch_failed
+        return _CreatedHostLaunch(runner_id, launch_observation, pending, launch_failed)
 
     @router.post(
         "/sessions",
@@ -872,7 +934,9 @@ def register_core_routes(
             and conv.labels.get(_CLAUDE_NATIVE_UI_LABEL_KEY) == _CLAUDE_NATIVE_UI_LABEL_VALUE
         )
         if _terminal_first_create:
-            _publish_terminal_pending(resp.id, True)
+            _publish_terminal_pending(
+                resp.id, True, session_observation=conv.session_observation if conv else None
+            )
         _rc = await _get_runner_client(
             resp.id,
             runner_router,
@@ -915,13 +979,41 @@ def register_core_routes(
                         exc_info=True,
                     )
             try:
-                await _rc.post("/v1/sessions", json=init_body, timeout=10.0)
-            except (httpx.HTTPError, ConnectionError):
+                initializer = getattr(request.app.state, "runner_session_initializer", None)
+                if (
+                    initializer is not None
+                    and conv.runner_id is not None
+                    and conv.agent_id is not None
+                ):
+                    from omnigent.server.runner_session_init import is_session_agent_removed
+
+                    initialized = await initializer.initialize(
+                        conv, _rc, timeout=10.0, suppress_recovery_turn=True
+                    )
+                    if not is_session_agent_removed(initialized):
+                        initialized.raise_for_status()
+                    resp.session_observation = conv.session_observation
+                    resp.terminal_pending = conv.terminal_pending
+                else:
+                    await _rc.post("/v1/sessions", json=init_body, timeout=10.0)
+            except (httpx.HTTPError, ConnectionError, OmnigentError):
                 _logger.warning(
                     "Failed to notify runner about session %s",
                     resp.id,
                     exc_info=True,
                 )
+                try:
+                    fresh = await asyncio.to_thread(conversation_store.get_conversation, resp.id)
+                except Exception:
+                    _logger.warning(
+                        "Cannot refresh session %s after runner notification failed",
+                        resp.id,
+                        exc_info=True,
+                    )
+                else:
+                    if fresh is not None:
+                        resp.session_observation = fresh.session_observation
+                        resp.terminal_pending = fresh.terminal_pending
         # Grant the creator ownership BEFORE any host launch so the
         # launch's session-ownership check (shared with
         # POST /v1/hosts/{host_id}/runners via resolve_host_launch)
@@ -982,16 +1074,12 @@ def register_core_routes(
                 # Already canonical (see _resolve_harness).
                 harness=resp.harness,
                 conversation=conv,
+                terminal_pending=_terminal_first_create,
             )
             if launched is not None:
-                runner_id, launch_failed = launched
-                if launch_failed and _terminal_first_create:
-                    # The runner never booted, so its pending=False clear
-                    # will never fire. Clear the spin-up flag here so a
-                    # failed launch doesn't strand the Terminal-pill
-                    # spinner. No-op when we never set it.
-                    _publish_terminal_pending(resp.id, False)
-                resp.runner_id = runner_id
+                resp.runner_id = launched.runner_id
+                resp.session_observation = launched.observation
+                resp.terminal_pending = launched.terminal_pending
                 resp.host_id = launch_host_id
 
         # Default-public grant only once every launch step has been accepted, so a
@@ -1190,6 +1278,8 @@ def register_core_routes(
                 result.session_id,
                 result.agent_id,
                 runner_router,
+                conversation_store=conversation_store,
+                initializer=getattr(request.app.state, "runner_session_initializer", None),
             )
         # Grant the creator ownership BEFORE scheduling the managed
         # launch, mirroring the JSON path: a managed-guard failure
@@ -1710,6 +1800,7 @@ def register_core_routes(
         # here and never reaches the probe. Only stamp-stale candidates fall
         # through to liveness_lookup, which additionally rules out a runner
         # whose tunnel is live on THIS replica before we settle.
+        reconciled_ids: set[str] = set()
         if liveness_lookup is not None:
             orphan_suspects = [
                 conv
@@ -1717,7 +1808,7 @@ def register_core_routes(
                 if conv.agent_id is not None
                 and conv.runner_id is not None
                 and conv.live_status in ("running", "waiting")
-                and _session_status_cache.get(conv.id) is None
+                and not _session_status_cache.has_live_status(conv.id)
                 and not runner_seen_is_fresh(conv.runner_last_seen)
                 and (
                     permission_store is None
@@ -1740,12 +1831,24 @@ def register_core_routes(
                     # stale past the TTL), so this fires for a genuinely
                     # orphaned runner, never one mid-reconnect within grace.
                     if result is not None and not result.runner_online:
-                        await asyncio.to_thread(
+                        reconciled = await asyncio.to_thread(
                             reconcile_orphaned_running_status,
                             conv.id,
                             conversation_store,
                             int(time.time()) - RUNNER_LIVENESS_TTL_S,
+                            owner=conv.session_observation,
                         )
+                        if reconciled:
+                            reconciled_ids.add(conv.id)
+        if reconciled_ids:
+            refreshed = await asyncio.to_thread(
+                conversation_store.get_conversations, list(reconciled_ids)
+            )
+            page.data = [
+                refreshed[conv.id] if conv.id in reconciled_ids else conv
+                for conv in page.data
+                if conv.id not in reconciled_ids or conv.id in refreshed
+            ]
         # Build items after reconciliation so each settled row reads its new
         # status straight from the (now-updated) cache.
         items: list[SessionListItem] = [
@@ -2767,7 +2870,10 @@ def register_core_routes(
                 conv = conversation_store.get_conversation(
                     session_id,
                 )
+                initializer = getattr(request.app.state, "runner_session_initializer", None)
+                captured_owner = conv.session_observation if conv is not None else None
                 parent_initialized = False
+                owned_initialization = False
                 if _runner_client is not None and conv is not None and conv.agent_id is not None:
                     # The versioned payload's snapshot carries harness_override,
                     # so a rebind after a cross-harness create initializes the
@@ -2776,14 +2882,21 @@ def register_core_routes(
                     # initial_items ran on the spec's harness. Recovery stays
                     # enabled: on rebind it is what runs the pending kickoff.
                     try:
-                        runner_init_resp = await _runner_client.post(
-                            "/v1/sessions",
-                            json=build_runner_session_init_payload(
+                        if initializer is not None:
+                            runner_init_resp = await initializer.initialize(
                                 conv,
-                                server_version=VERSION,
-                            ),
-                            timeout=10.0,
-                        )
+                                _runner_client,
+                                timeout=10.0,
+                            )
+                        else:
+                            runner_init_resp = await _runner_client.post(
+                                "/v1/sessions",
+                                json=build_runner_session_init_payload(
+                                    conv,
+                                    server_version=VERSION,
+                                ),
+                                timeout=10.0,
+                            )
                     except (httpx.HTTPError, ConnectionError):
                         # ConnectionError covers a tunnel close mid-POST
                         # (same source as the relay's except clause).
@@ -2793,12 +2906,20 @@ def register_core_routes(
                             exc_info=True,
                         )
                     else:
-                        from omnigent.server.runner_session_init import runner_inference_verified
+                        from omnigent.server.runner_session_init import (
+                            apply_initialization_observation,
+                            runner_inference_verified,
+                        )
 
                         parent_initialized = (
                             runner_init_resp.status_code < 400
                             and runner_inference_verified(conv, runner_init_resp)
                         )
+                        if parent_initialized:
+                            owned_initialization = (
+                                apply_initialization_observation(conv, runner_init_resp)
+                                is not None
+                            )
                 if (
                     conv is not None
                     and conv.inference_snapshot is not None
@@ -2835,15 +2956,19 @@ def register_core_routes(
                 )
                 if parent_initialized:
                     assert conv is not None and _runner_client is not None
-                    await _publish_runner_recovered_status(session_id, conversation_store)
-                    from omnigent.server.child_session_recovery import restore_active_children
+                    if not owned_initialization:
+                        await _publish_runner_recovered_status(
+                            session_id, conversation_store, owner=captured_owner
+                        )
+                    if initializer is not None:
+                        from omnigent.server.child_session_recovery import restore_active_children
 
-                    await restore_active_children(
-                        conv,
-                        _runner_client,
-                        conversation_store,
-                        request.app.state.runner_session_initializer,
-                    )
+                        await restore_active_children(
+                            conv,
+                            _runner_client,
+                            conversation_store,
+                            initializer,
+                        )
         else:
             conv = conv_for_collaboration_mode
             if conv is None:

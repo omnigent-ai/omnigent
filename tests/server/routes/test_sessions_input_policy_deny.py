@@ -108,10 +108,13 @@ def test_input_policy_deny_persists_item_readable_from_items_api(
         )
 
     assert resp.status_code == 202
+    response_id = resp.json()["response_id"]
+    assert isinstance(response_id, str) and response_id.startswith("deny_")
     assert resp.json() == {
         "queued": False,
         "denied": True,
         "reason": "Request contains BLOCK_THIS_TOKEN",
+        "response_id": response_id,
     }
     mock_stream.publish.assert_any_call(
         session_id,
@@ -128,6 +131,7 @@ def test_input_policy_deny_persists_item_readable_from_items_api(
     items = items_resp.json()["data"]
     assert [item["type"] for item in items] == ["message"]
     persisted = items[0]
+    assert persisted["response_id"] == response_id
     assert persisted["role"] == "assistant"
     assert persisted["model"] == "test-agent"
     assert persisted["content"] == [
@@ -136,3 +140,11 @@ def test_input_policy_deny_persists_item_readable_from_items_api(
             "text": "[Denied by policy: Request contains BLOCK_THIS_TOKEN]",
         }
     ]
+    completions = [
+        call.args[1]
+        for call in mock_stream.publish.call_args_list
+        if call.args[1]["type"] == "response.completed"
+    ]
+    assert len(completions) == 1
+    assert completions[0]["response"]["id"] == response_id
+    assert completions[0]["response"]["output"][0]["content"] == persisted["content"]

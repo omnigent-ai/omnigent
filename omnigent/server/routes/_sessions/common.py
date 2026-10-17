@@ -53,6 +53,7 @@ from omnigent.server.schemas import (
     SandboxStatus,
     ServerStreamEvent,
 )
+from omnigent.server.session_observations import SessionStatusCache, SessionTerminalPendingCache
 from omnigent.spec.types import (
     StateUpdate,
 )
@@ -597,7 +598,7 @@ _SERVER_STREAM_EVENT_ADAPTER: TypeAdapter[ServerStreamEvent] = TypeAdapter(Serve
 _WATCHER_TASKS: set[asyncio.Task[None]] = set()
 
 
-_session_status_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
+_session_status_cache: SessionStatusCache = SessionStatusCache()
 
 
 @dataclass
@@ -694,7 +695,7 @@ _SESSION_UPDATES_MAX_WATCHED: int = 500
 _SHARED_DISCOVERY_KEY = "__all__"
 
 
-_session_terminal_pending_cache: WorkspaceScopedCache[str, bool] = WorkspaceScopedCache()
+_session_terminal_pending_cache: SessionTerminalPendingCache = SessionTerminalPendingCache()
 
 
 _session_sandbox_status_cache: WorkspaceScopedCache[str, SandboxStatus] = WorkspaceScopedCache()

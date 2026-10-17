@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from omnigent.entities.session_observation import RunnerOfflineDecision, SessionObservation
 from omnigent.inner.native_attachments import (
     UNRESOLVED_ATTACHMENT_MARKER_PATTERN,
     reject_authored_framework_notices,
@@ -270,12 +271,36 @@ class Conversation:
     # seconds, None = no live stamp) — carried on the row so a session list
     # can judge runner liveness without a second connectivity query.
     live_status: str | None = None
+    runner_binding_epoch: int = 0
+    live_status_revision: int = 0
+    live_status_observation_id: str | None = None
+    live_status_response_id: str | None = None
+    live_status_error_key: str | None = None
+    live_status_error_labels: dict[str, str] | None = None
+    terminal_pending: bool = False
+    runner_offline_decision: RunnerOfflineDecision | None = None
+
     pending_elicitation_count: int | None = None
     runner_last_seen: int | None = None
     project_id: str | None = None
     # Transient: populated only by list_conversations on a content search;
     # never read from or written to the DB.
     search_snippet: str | None = None
+
+    @property
+    def session_observation(self) -> SessionObservation:
+        """The underlying observation, before an owned offline projection."""
+        if self.runner_offline_decision is not None:
+            return self.runner_offline_decision.observation
+        return SessionObservation(
+            runner_id=self.runner_id,
+            binding_epoch=self.runner_binding_epoch,
+            revision=self.live_status_revision,
+            observation_id=self.live_status_observation_id,
+            status=self.live_status,
+            response_id=self.live_status_response_id,
+            error_key=self.live_status_error_key,
+        )
 
 
 # ── Conversation item data types ───────────────────────

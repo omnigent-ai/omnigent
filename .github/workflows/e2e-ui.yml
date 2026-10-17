@@ -213,6 +213,15 @@ jobs:
             --screenshot=only-on-failure \
             --video=retain-on-failure
 
+      - name: Upload session ownership regression screenshots
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: session-observation-demo-${{ github.run_id }}
+          path: artifacts/session-observation-demo/
+          retention-days: 7
+          if-no-files-found: ignore
+
       - name: Upload Playwright artifacts on failure
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1

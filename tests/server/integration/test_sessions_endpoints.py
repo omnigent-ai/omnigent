@@ -5113,6 +5113,7 @@ async def test_post_external_session_status_carries_response_id(
 
 
 async def test_publish_status_keeps_failed_sticky_against_trailing_idle(
+    client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -5134,16 +5135,16 @@ async def test_publish_status_keeps_failed_sticky_against_trailing_idle(
         "omnigent.server.routes.sessions.session_stream.publish",
         lambda _session_id, event: published.append(event),
     )
-    sid = "ee38ff3453b8ccac61b85acb8c670b59"
+    agent = await create_test_agent(client)
+    sid = (await _create_session(client, agent["id"]))["id"]
     sessions_module._session_status_cache.pop(sid, None)
     try:
-        sessions_module._publish_status(sid, "failed")
-        # Trailing PTY ``idle`` must be suppressed while ``failed`` stands.
-        sessions_module._publish_status(sid, "idle")
-        # New activity clears ``failed``...
-        sessions_module._publish_status(sid, "running")
-        # ...after which ``idle`` publishes normally again.
-        sessions_module._publish_status(sid, "idle")
+        for status in ("failed", "idle", "running", "idle"):
+            status_write = sessions_module._publish_status(
+                sid, status, failure_origin="sticky_failure_control"
+            )
+            if status_write is not None:
+                await asyncio.wrap_future(status_write)
         cache_after = sessions_module._session_status_cache.get(sid)
     finally:
         sessions_module._session_status_cache.pop(sid, None)
@@ -5158,6 +5159,7 @@ async def test_publish_status_keeps_failed_sticky_against_trailing_idle(
 
 
 async def test_publish_status_tracks_in_flight_response_id(
+    client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
@@ -5175,18 +5177,25 @@ async def test_publish_status_tracks_in_flight_response_id(
         "omnigent.server.routes.sessions.session_stream.publish",
         lambda _session_id, _event: None,
     )
-    sid = "dcc9f70cf10c73bb49c3b465b929747c"
+    agent = await create_test_agent(client)
+    sid = (await _create_session(client, agent["id"]))["id"]
     sessions_module._session_status_cache.pop(sid, None)
     sessions_module._session_active_response_cache.pop(sid, None)
     try:
         # Turn start: running with the turn id opens the tracked entry.
-        sessions_module._publish_status(sid, "running", response_id="resp_turn_1")
+        status_write = sessions_module._publish_status(sid, "running", response_id="resp_turn_1")
+        if status_write is not None:
+            await asyncio.wrap_future(status_write)
         assert sessions_module._session_active_response_cache.get(sid) == "resp_turn_1"
         # Bare PTY running (no id) must not erase the tracked turn id.
-        sessions_module._publish_status(sid, "running")
+        status_write = sessions_module._publish_status(sid, "running")
+        if status_write is not None:
+            await asyncio.wrap_future(status_write)
         assert sessions_module._session_active_response_cache.get(sid) == "resp_turn_1"
         # Turn end: idle clears it.
-        sessions_module._publish_status(sid, "idle", response_id="resp_turn_1")
+        status_write = sessions_module._publish_status(sid, "idle", response_id="resp_turn_1")
+        if status_write is not None:
+            await asyncio.wrap_future(status_write)
         assert sessions_module._session_active_response_cache.get(sid) is None
     finally:
         sessions_module._session_status_cache.pop(sid, None)
@@ -5223,6 +5232,7 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
             *,
             json: dict[str, Any],
             timeout: float,
+            extensions: dict[str, Any] | None = None,
         ) -> httpx.Response:
             """
             Record the runner init POST.
@@ -5317,7 +5327,7 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
         )
     sessions_module._session_status_cache.pop(sid, None)
     try:
-        sessions_module._publish_status(
+        status_write = sessions_module._publish_status(
             sid,
             "failed",
             sessions_module.ErrorDetail(
@@ -5325,6 +5335,9 @@ async def test_patch_runner_rebind_clears_stale_failed_status(
                 message="old startup failure",
             ),
         )
+
+        if status_write is not None:
+            await asyncio.wrap_future(status_write)
 
         resp = await client.patch(
             f"/v1/sessions/{sid}",
@@ -5426,12 +5439,23 @@ async def test_post_external_session_status_idle_forwards_persisted_assistant_ou
         )
 
     assert status_resp.status_code == 202, status_resp.text
+    from omnigent.server import session_live_state
+
+    store = session_live_state.conversation_store()
+    assert store is not None
+    observation = store.get_session_observation(child["id"])
+    assert observation is not None and observation.revision > 0
+    assert observation.status == "idle"
     assert forwarded == [
         {
             "path": f"/v1/sessions/{child['id']}/events",
             "body": {
                 "type": "external_session_status",
-                "data": {"status": "idle", "output": "AP_NATIVE_DONE"},
+                "data": {
+                    "status": "idle",
+                    "output": "AP_NATIVE_DONE",
+                    "session_observation": observation.model_dump(),
+                },
                 "model_override": None,
                 "tools": None,
                 "created_by": None,
@@ -5517,8 +5541,16 @@ async def test_post_external_session_status_failed_forwards_persisted_assistant_
         )
 
     assert status_resp.status_code == 202, status_resp.text
+    from omnigent.server import session_live_state
+
+    store = session_live_state.conversation_store()
+    assert store is not None
+    observation = store.get_session_observation(child["id"])
+    assert observation is not None and observation.revision > 0
+    assert observation.status == "failed"
     assert forwarded, "the failed edge was never forwarded to the runner"
     assert forwarded[0]["body"]["data"] == {
+        "session_observation": observation.model_dump(),
         "status": "failed",
         "output": detail,
         "failure_context": {
@@ -5795,6 +5827,7 @@ async def test_native_failures_are_coded_live_and_after_reload(
     status_extra: dict[str, str],
 ) -> None:
     """Native failures keep their diagnosis and raw detail through status and persistence."""
+    monkeypatch.delenv("OMNIGENT_WRAPPER_COMMAND", raising=False)
     published: list[dict[str, Any]] = []
     monkeypatch.setattr(
         "omnigent.server.routes.sessions.session_stream.publish",
@@ -12848,6 +12881,78 @@ async def test_message_forward_rejection_surfaces_failed_with_reason(
         assert "harness_spawn_failed" in last_error["message"], last_error
 
 
+@pytest.mark.parametrize("replacement", [False, True])
+async def test_runner_rejection_waits_for_its_owned_status_before_answering(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: bool,
+) -> None:
+    from omnigent.server.routes._sessions import helpers
+
+    def reject(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            return httpx.Response(
+                503, json={"error": "harness_spawn_failed", "detail": "A rejected"}
+            )
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(reject), base_url="http://runner"
+    ) as runner:
+        _route_to_runner(monkeypatch, runner)
+        agent = await create_test_agent(client)
+        session = await _create_session(client, agent["id"])
+        sid = session["id"]
+        store = SqlAlchemyConversationStore(db_uri)
+        entered, release = threading.Event(), threading.Event()
+        record = SqlAlchemyConversationStore.record_session_observation
+
+        def hold_failure(self, session_id: str, status: str, **kwargs: Any):
+            if session_id == sid and status == "failed":
+                entered.set()
+                assert release.wait(10)
+            return record(self, session_id, status, **kwargs)
+
+        monkeypatch.setattr(
+            SqlAlchemyConversationStore, "record_session_observation", hold_failure
+        )
+        pending = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{sid}/events",
+                json={
+                    "type": "message",
+                    "data": {"role": "user", "content": [{"type": "input_text", "text": "A"}]},
+                },
+            )
+        )
+        current = None
+        try:
+            assert await asyncio.to_thread(entered.wait, 10)
+            done, _ = await asyncio.wait([pending], timeout=0.1)
+            assert not done, "The HTTP refusal escaped before its owned status decision"
+            if replacement:
+                current = store.record_session_observation(sid, "running", response_id="turn-b")
+                assert current is not None
+                helpers._publish_status(
+                    sid, "running", persist_live_status=False, session_observation=current
+                )
+            release.set()
+            response = await asyncio.wait_for(pending, 10)
+            assert response.status_code == 503, response.text
+            fresh = store.get_conversation(sid)
+            assert fresh is not None
+            if replacement:
+                assert fresh.session_observation == current
+            else:
+                assert fresh.live_status == "failed"
+                assert fresh.labels["omnigent.last_task_error_code"] == "runner_rejected_event"
+                assert fresh.labels["omnigent.last_task_error_message"].endswith("A rejected")
+        finally:
+            release.set()
+            await asyncio.gather(pending, return_exceptions=True)
+
+
 async def test_create_child_session_duplicate_title_returns_409(
     client: httpx.AsyncClient,
 ) -> None:
@@ -12939,6 +13044,109 @@ async def test_create_session_notifies_runner_with_init_envelope(
         "runner seeds it into the first spawn; got "
         f"{envelope.snapshot.model_override!r}"
     )
+
+
+@pytest.mark.parametrize("kind", ["json", "bundle"])
+@pytest.mark.parametrize("superseded", [False, True])
+async def test_create_native_notify_reserves_and_completes_only_its_startup(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    superseded: bool,
+) -> None:
+    from omnigent.entities.session_observation import SessionObservation
+    from tests.server.helpers import build_agent_bundle
+
+    agent = await create_test_agent(
+        client,
+        name=f"owned-notify-{kind}",
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation(agent_id=agent["id"], runner_id="notify-runner")
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls: list[dict[str, Any]] = []
+    at_post = []
+
+    async def initialize(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/v1/sessions":
+            body = json.loads(request.content)
+            calls.append(body)
+            at_post.append(store.get_conversation(body["session_id"]))
+            entered.set()
+            await release.wait()
+        return httpx.Response(
+            201,
+            json={
+                "status": "initialized",
+                "session_init_protocol_version": 2,
+                "terminal_ready": True,
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(initialize), base_url="http://runner"
+    ) as runner:
+        _route_to_runner(monkeypatch, runner)
+        if kind == "json":
+            request = client.post(
+                "/v1/sessions",
+                json={"agent_id": agent["id"], "parent_session_id": parent.id},
+            )
+        else:
+            request = client.post(
+                "/v1/sessions",
+                data={"metadata": json.dumps({"parent_session_id": parent.id})},
+                files={
+                    "bundle": (
+                        "agent.tar.gz",
+                        build_agent_bundle(
+                            name="owned-bundle-child",
+                            executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+                        ),
+                        "application/gzip",
+                    )
+                },
+            )
+        pending = asyncio.create_task(request)
+        replacement = None
+        try:
+            await asyncio.wait_for(entered.wait(), 10)
+            observed = at_post[0]
+            assert observed is not None
+            if superseded:
+                replacement = store.begin_terminal_startup(
+                    observed.id, observed.session_observation, "newer-native-notify"
+                )
+                assert replacement is not None
+            release.set()
+            response = await asyncio.wait_for(pending, 10)
+            assert response.status_code == 201, response.text
+            assert observed.terminal_pending is True
+            assert (
+                SessionObservation.model_validate(calls[0]["session_observation"])
+                == observed.session_observation
+            )
+            fresh = store.get_conversation(observed.id)
+            assert fresh is not None
+            if superseded:
+                assert fresh.session_observation == replacement and fresh.terminal_pending
+            else:
+                assert not fresh.terminal_pending
+                assert fresh.session_observation.revision > observed.session_observation.revision
+                assert fresh.session_observation.status == observed.session_observation.status
+            if kind == "json":
+                assert (
+                    response.json()["session_observation"]
+                    == fresh.session_observation.model_dump()
+                )
+                assert response.json()["terminal_pending"] is fresh.terminal_pending
+            assert len(calls) == 1
+        finally:
+            release.set()
+            await asyncio.gather(pending, return_exceptions=True)
 
 
 async def test_external_info_error_item_publishes_and_persists_level(

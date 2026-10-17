@@ -1,3 +1,5 @@
+import type { SessionObservation } from "./sessionObservation";
+
 // Mirrors sdks/python-client/omnigent_client/_events.py.
 //
 // Hand-ported. When _events.py changes, update this file and the
@@ -45,30 +47,45 @@ export const MCP_ELICITATION_METHOD = "elicitation/create";
 export interface ResponseCreated {
   type: "response_created";
   response: Response;
+  conversationId?: string;
+  sessionObservation?: SessionObservation | null;
+  runnerOfflineEpisodeId?: string | null;
 }
 
 /** `response.queued` — only when `background=true`. */
 export interface ResponseQueued {
   type: "response_queued";
   response: Response;
+  conversationId?: string;
+  sessionObservation?: SessionObservation | null;
+  runnerOfflineEpisodeId?: string | null;
 }
 
 /** `response.in_progress` — execution started. */
 export interface ResponseInProgress {
   type: "response_in_progress";
   response: Response;
+  conversationId?: string;
+  sessionObservation?: SessionObservation | null;
+  runnerOfflineEpisodeId?: string | null;
 }
 
 /** `response.completed` — agent finished successfully. */
 export interface ResponseCompleted {
   type: "response_completed";
   response: Response;
+  conversationId?: string;
+  sessionObservation?: SessionObservation | null;
+  runnerOfflineEpisodeId?: string | null;
 }
 
 /** `response.failed` — unrecoverable error. */
 export interface ResponseFailed {
   type: "response_failed";
   response: Response;
+  conversationId?: string;
+  sessionObservation?: SessionObservation | null;
+  runnerOfflineEpisodeId?: string | null;
   /** Where the failure originated, when supplied by the server. */
   source?: string;
 }
@@ -77,6 +94,9 @@ export interface ResponseFailed {
 export interface ResponseIncomplete {
   type: "response_incomplete";
   response: Response;
+  conversationId?: string;
+  sessionObservation?: SessionObservation | null;
+  runnerOfflineEpisodeId?: string | null;
   /** "max_iterations", "execution_timeout", etc. */
   reason: string;
 }
@@ -85,6 +105,9 @@ export interface ResponseIncomplete {
 export interface ResponseCancelled {
   type: "response_cancelled";
   response: Response;
+  conversationId?: string;
+  sessionObservation?: SessionObservation | null;
+  runnerOfflineEpisodeId?: string | null;
 }
 
 // ── Text streaming ───────────────────────────────────────
@@ -93,6 +116,9 @@ export interface ResponseCancelled {
 export interface TextDelta {
   type: "text_delta";
   delta: string;
+  conversationId?: string;
+  sessionObservation?: SessionObservation | null;
+  runnerOfflineEpisodeId?: string | null;
   /**
    * For terminal-observed live streaming (claude-native), the vendor's
    * stable per-assistant-message id. Lets the store scope an in-flight
@@ -442,6 +468,9 @@ export interface RetryEvent {
 /** `response.error` — an error during execution. */
 export interface ErrorEvent {
   type: "error";
+  conversationId?: string;
+  sessionObservation?: SessionObservation | null;
+  runnerOfflineEpisodeId?: string | null;
   /** "llm" or "tool". */
   source: string;
   toolName: string | null;
@@ -520,6 +549,8 @@ export interface SessionStatusEvent {
   type: "session_status";
   conversationId: string;
   status: "idle" | "launching" | "running" | "waiting" | "failed";
+  sessionObservation?: SessionObservation;
+  runnerOfflineEpisodeId?: string;
   responseId?: string;
   backgroundTaskCount?: number;
   /**
@@ -702,6 +733,9 @@ export interface SessionTerminalPendingEvent {
   type: "session_terminal_pending";
   conversationId: string;
   pending: boolean;
+  responseId?: string;
+  sessionObservation?: SessionObservation | null;
+  runnerOfflineEpisodeId?: string | null;
 }
 
 /**

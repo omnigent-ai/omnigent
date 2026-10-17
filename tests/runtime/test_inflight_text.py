@@ -718,3 +718,13 @@ def test_native_discard_clears_previews() -> None:
     inflight_text.discard(cid)
 
     assert inflight_text.snapshot_for(cid) == []
+
+
+def test_reset_text_only_clears_the_expected_response() -> None:
+    cid = "response-reset-owner"
+    inflight_text.record_publish(cid, _created("current"))
+    inflight_text.record_publish(cid, _delta("current prefix"))
+    assert not inflight_text.reset_text(cid, response_id="old")
+    assert inflight_text.snapshot_for(cid)[-1]["delta"] == "current prefix"
+    assert inflight_text.reset_text(cid, response_id="current")
+    assert inflight_text.snapshot_for(cid) == []

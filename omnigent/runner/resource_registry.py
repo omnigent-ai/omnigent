@@ -494,6 +494,7 @@ class SessionResourceRegistry:
         # → running / ``Stop`` → idle bracketing. Set by the runner via
         # :meth:`set_session_status_publisher`.
         self._session_status_publisher: Callable[[str, str, str | None], None] | None = None
+        self._pane_activity_status_publisher: Callable[[str, str, str | None], None] | None = None
         # Latest PTY-derived status (running/idle) per session. Lets
         # :meth:`_handle_terminal_exit` tell a clean shutdown (idle) from a
         # mid-turn crash. Written from the watcher thread and the turn-start
@@ -541,6 +542,8 @@ class SessionResourceRegistry:
     def set_session_status_publisher(
         self,
         publisher: Callable[[str, str, str | None], None],
+        *,
+        pane_activity_publisher: Callable[[str, str, str | None], None] | None = None,
     ) -> None:
         """Install the PTY-activity-derived session-status publisher.
 
@@ -556,8 +559,11 @@ class SessionResourceRegistry:
             None`` where *status* is ``"running"`` or ``"idle"`` and
             *blocked_on* is a short reason the agent is parked on a dialog
             (e.g. ``"permission prompt"``), or ``None``.
+        :param pane_activity_publisher: Non-owning Claude/Pi pane hints;
+            their file/hook lifecycle edges continue through *publisher*.
         """
         self._session_status_publisher = publisher
+        self._pane_activity_status_publisher = pane_activity_publisher
 
     def set_terminal_exit_publisher(
         self,
@@ -1421,12 +1427,9 @@ class SessionResourceRegistry:
         For the claude-native *agent* terminal (``resource_role`` ==
         :data:`CLAUDE_NATIVE_TERMINAL_ROLE` or
         :data:`PI_NATIVE_TERMINAL_ROLE`) the same watcher also drives the
-        session's working status: pane activity → ``running`` and a short
-        quiescence → ``idle``, emitted via the session-status publisher.
-        This PTY-derived status catches cases lifecycle hooks can miss
-        because it observes the terminal directly. The status edges are
-        gated to these roles so a side shell's output never flips the
-        session's status.
+        activity and exit hints. Pane activity/quiescence uses the separate
+        pane publisher when configured; Claude's status file supplies
+        lifecycle edges. A side shell contributes no session status hints.
 
         :param session_id: Session/conversation identifier.
         :param terminal_name: Terminal name from the agent spec.
@@ -1448,6 +1451,10 @@ class SessionResourceRegistry:
         emit_status = (
             status_publisher is not None and resource_role in _STATUS_EMITTING_TERMINAL_ROLES
         )
+        separate_pane_status = resource_role in {
+            CLAUDE_NATIVE_TERMINAL_ROLE,
+            PI_NATIVE_TERMINAL_ROLE,
+        }
         if activity_publisher is None and not emit_status and exit_publisher is None:
             return
         resource_id = terminal_resource_id(terminal_name, session_key)
@@ -1459,23 +1466,29 @@ class SessionResourceRegistry:
         # :data:`_TERMINAL_ACTIVITY_EMIT_MIN_INTERVAL_SECONDS`. ``None``
         # means "never emitted", so the first changed tick always fires.
         last_activity_emit: dict[str, float | None] = {"value": None}
+        last_pane_status: tuple[str, str | None] | None = None
 
         def _publish_status(
             status: str, blocked_on: str | None = None, *, record_activity: bool = False
         ) -> None:
-            # Publish one running/idle edge: dedup against the last value,
-            # memo for exit classification, and hop to the loop (publishers
-            # are loop-only). Shared by the PTY edges and the claude-native
-            # status-file poller so both go through the same dedup/memo. The
-            # dedup baseline lives on the registry, not this closure, so a
-            # forwarder's hook-derived edge resyncs it (see
-            # :meth:`note_external_session_status`).
+            nonlocal last_pane_status
+            # File and hook edges share canonical dedup. Pane hints stay local
+            # so they cannot consume a real same-status lifecycle edge.
             if status_publisher is None:
                 return
             explicit_activity = record_activity and status in {"running", "waiting"}
             if explicit_activity:
                 self._set_session_status_memo(session_id, status)
-            if not self._claim_status_edge(session_id, status, blocked_on):
+            pane_publisher = (
+                self._pane_activity_status_publisher
+                if not record_activity and separate_pane_status
+                else None
+            )
+            if pane_publisher is not None:
+                if last_pane_status == (status, blocked_on):
+                    return
+                last_pane_status = (status, blocked_on)
+            elif not self._claim_status_edge(session_id, status, blocked_on):
                 return
             with contextlib.suppress(Exception):
                 instance.lifecycle_trace.note_status(
@@ -1484,7 +1497,8 @@ class SessionResourceRegistry:
             # Pane repaints can be startup output, not a new agent turn.
             if not explicit_activity:
                 self._set_session_status_memo(session_id, status, record_activity=False)
-            loop.call_soon_threadsafe(status_publisher, session_id, status, blocked_on)
+            publisher = pane_publisher or status_publisher
+            loop.call_soon_threadsafe(publisher, session_id, status, blocked_on)
 
         def _file_owns_status() -> bool:
             # Once Claude's own status file is readable it is the session's

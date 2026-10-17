@@ -12,8 +12,20 @@ import httpx
 
 from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import Conversation
-from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory, ErrorCode, ErrorImpact
+from omnigent.entities.session_observation import (
+    SESSION_ERROR_LABEL_KEYS,
+    SessionObservation,
+    accept_session_projection,
+)
+from omnigent.errors import (
+    SESSION_AGENT_MISSING_MESSAGE,
+    ErrorCategory,
+    ErrorCode,
+    ErrorImpact,
+    OmnigentError,
+)
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+from omnigent.server import session_live_state
 
 if TYPE_CHECKING:
     from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
@@ -80,6 +92,41 @@ def is_session_agent_removed(response: httpx.Response) -> bool:
 
 
 _logger = logging.getLogger(__name__)
+
+
+def apply_initialization_observation(
+    conversation: Conversation, response: httpx.Response
+) -> SessionObservation | None:
+    """Apply the startup owner without rewinding a later caller snapshot."""
+    observation = response.extensions.get("session_observation")
+    if not isinstance(observation, SessionObservation):
+        return None
+    previous_episode = (
+        conversation.runner_offline_decision.episode_id
+        if conversation.runner_offline_decision is not None
+        else None
+    )
+    if not accept_session_projection(
+        observation, None, conversation.session_observation, previous_episode
+    ):
+        return observation
+    if conversation.runner_offline_decision is not None:
+        conversation.labels = {
+            key: value
+            for key, value in conversation.labels.items()
+            if key not in SESSION_ERROR_LABEL_KEYS
+        }
+        if conversation.live_status_error_labels is not None:
+            conversation.labels.update(conversation.live_status_error_labels)
+    conversation.runner_binding_epoch = observation.binding_epoch
+    conversation.live_status_revision = observation.revision
+    conversation.live_status_observation_id = observation.observation_id
+    conversation.live_status = observation.status
+    conversation.live_status_response_id = observation.response_id
+    conversation.live_status_error_key = observation.error_key
+    conversation.runner_offline_decision = None
+    conversation.terminal_pending = False
+    return observation
 
 
 class RunnerSessionInitializer:
@@ -158,6 +205,12 @@ class RunnerSessionInitializer:
         agent_id = conversation.agent_id
         if runner_id is None or agent_id is None:
             raise ValueError("runner session initialization requires runner_id and agent_id")
+        startup_owner = conversation.session_observation
+        startup_predecessor = session_live_state.pending_observation(
+            conversation.id, startup_owner
+        )
+        if startup_predecessor is not None and startup_predecessor.owner != startup_owner:
+            startup_predecessor = None
         if generation is None:
             generation = self.generation_for(runner_id, runner_client)
         self.require_generation(runner_id, runner_client, generation)
@@ -225,6 +278,14 @@ class RunnerSessionInitializer:
             )
 
             async def post_session_init() -> httpx.Response:
+                from omnigent.server.routes._sessions.helpers import (
+                    _native_coding_agent_for_session,
+                )
+                from omnigent.server.routes._sessions.orchestration import (
+                    _begin_native_terminal_startup,
+                    _complete_native_terminal_startup,
+                )
+
                 if self._conversation_store is not None and self._file_store is not None:
                     from omnigent.server.routes._sessions.helpers import (
                         _filesystem_attachment_in_history,
@@ -246,17 +307,64 @@ class RunnerSessionInitializer:
                             tunnel_registry=self._registry,
                         )
                 self.require_generation(runner_id, runner_client, generation)
-                return await self._post_initialize(
-                    runner_client,
-                    session_id=conversation.id,
-                    runner_id=runner_id,
-                    payload=payload,
-                    timeout=timeout,
-                    resume_interrupted_turn=resume_interrupted_turn,
-                    suppress_recovery_turn=suppress_recovery_turn,
-                    recovery_id=recovery_id,
-                    generation=generation,
-                )
+                startup = None
+                if self._conversation_store is not None:
+                    async with store_slots or nullcontext():
+                        native_agent = await asyncio.to_thread(
+                            _native_coding_agent_for_session,
+                            conversation,
+                            agent_store=self._agent_store,
+                            agent_cache=self._agent_cache,
+                        )
+                    self.require_generation(runner_id, runner_client, generation)
+                    if native_agent is not None:
+                        startup = await _begin_native_terminal_startup(
+                            conversation.id, startup_owner, startup_predecessor
+                        )
+                        if startup is not None:
+                            payload["session_observation"] = startup.model_dump(mode="json")
+                try:
+                    self.require_generation(runner_id, runner_client, generation)
+                    response = await self._post_initialize(
+                        runner_client,
+                        session_id=conversation.id,
+                        runner_id=runner_id,
+                        payload=payload,
+                        timeout=timeout,
+                        resume_interrupted_turn=resume_interrupted_turn,
+                        suppress_recovery_turn=suppress_recovery_turn,
+                        recovery_id=recovery_id,
+                        generation=generation,
+                    )
+                except BaseException:
+                    if startup is not None:
+                        try:
+                            await _complete_native_terminal_startup(conversation.id, startup)
+                        except Exception:  # noqa: BLE001 -- cleanup must preserve the original cancellation
+                            _logger.warning(
+                                "Cannot settle cancelled session initialization for %s",
+                                conversation.id,
+                                exc_info=True,
+                            )
+                    raise
+                if startup is not None:
+                    try:
+                        completed = await _complete_native_terminal_startup(
+                            conversation.id, startup
+                        )
+                    except OmnigentError:
+                        if response.status_code < 400:
+                            raise
+                        return response
+                    if completed is None:
+                        if response.status_code < 400:
+                            raise OmnigentError(
+                                "The session changed during initialization; retry the request.",
+                                code=ErrorCode.RUNNER_UNAVAILABLE,
+                            )
+                    else:
+                        response.extensions["session_observation"] = completed
+                return response
 
             task = asyncio.create_task(
                 post_session_init(),
@@ -289,7 +397,9 @@ class RunnerSessionInitializer:
                 self._tasks.pop(key, None)
             raise
         self.require_generation(runner_id, runner_client, generation)
-        if not runner_inference_verified(conversation, response):
+        if 200 <= response.status_code < 300 and not runner_inference_verified(
+            conversation, response
+        ):
             response = httpx.Response(
                 409,
                 json={"error": "The runner did not accept this session's inference configuration"},
@@ -297,6 +407,8 @@ class RunnerSessionInitializer:
             )
         if response.status_code >= 400 and self._tasks.get(key) is task:
             self._tasks.pop(key, None)
+        if 200 <= response.status_code < 300:
+            apply_initialization_observation(conversation, response)
         return response
 
     def invalidate_session(

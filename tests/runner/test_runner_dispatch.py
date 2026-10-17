@@ -10845,7 +10845,8 @@ async def test_run_turn_bg_finalizer_identity_guard_spares_foreign_slot() -> Non
 
 
 @pytest.mark.asyncio
-async def test_on_proxy_stream_end_spares_superseded_response() -> None:
+@pytest.mark.parametrize("ending", ["idle", "waiting", "interrupted"])
+async def test_on_proxy_stream_end_spares_superseded_response(ending: str) -> None:
     """BLOCKING-1: a stale stream terminal must not clobber a newer turn's state."""
     conv = "conv_stream_supersede"
     pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
@@ -10855,21 +10856,40 @@ async def test_on_proxy_stream_end_spares_superseded_response() -> None:
     )
 
     newer = asyncio.create_task(asyncio.Event().wait())
+    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    app.state.session_event_queues[conv] = queue
+    child_id = "conv_stream_supersede_child"
     try:
         app.state.active_turns[conv] = newer
         app.state.live_response_id[conv] = "resp_new"
+        if ending == "waiting":
+            subagent_work.register_subagent_work(
+                parent_session_id=conv, child_session_id=child_id, agent="worker", title="work"
+            ).status = "running"
+        elif ending == "interrupted":
+            app.state.interrupted_sessions.add(conv)
 
         app.state.on_proxy_stream_end(conv, owner_response_id="resp_old")
 
         assert app.state.active_turns.get(conv) is newer
         assert app.state.live_response_id.get(conv) == "resp_new"
         assert conv not in pm.cleared_in_flight
+        assert queue.empty()
+        assert (conv in app.state.interrupted_sessions) is (ending == "interrupted")
 
         app.state.on_proxy_stream_end(conv, owner_response_id="resp_new")
         assert conv not in app.state.active_turns
         assert conv not in app.state.live_response_id
         assert conv in pm.cleared_in_flight
+        terminal = queue.get_nowait()
+        # The unversioned peer receives waiting as running.
+        assert terminal == {
+            "type": "session.status",
+            "status": "running" if ending == "waiting" else "idle",
+            "response_id": "resp_new",
+        }
     finally:
+        subagent_work.unregister_subagent_work(child_id)
         newer.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await newer

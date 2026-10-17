@@ -16,14 +16,21 @@ from unittest.mock import Mock
 import pytest
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
+from omnigent.entities.session_resources import SessionResourceView
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
+from omnigent.runner.native import (
+    NativeLaunchContext,
+    _ensure_native_terminal,
+    _launch_native_terminal,
+)
 from omnigent.runner.resource_registry import (
     _TERMINAL_EXIT_OUTPUT_MAX_CHARS,
     _TERMINAL_EXIT_OUTPUT_MAX_LINES,
     CLAUDE_NATIVE_TERMINAL_ROLE,
     CODEX_NATIVE_TERMINAL_ROLE,
+    KIRO_NATIVE_TERMINAL_ROLE,
     PI_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
     TerminalExitEvent,
@@ -35,6 +42,125 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.terminals import TerminalRegistry
 from tests.runner.helpers import make_test_terminal_instance
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry", ["initialize", "ensure"])
+async def test_native_startup_and_late_pane_output_keep_distinct_publishers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str
+) -> None:
+    session_id = "conv_startup"
+    terminals = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminals)
+    instance = make_test_terminal_instance("pi", "main", tmp_path)
+    watcher = Mock()
+    monkeypatch.setattr(instance, "start_idle_watcher_thread", watcher)
+    statuses: list[str] = []
+    pane_statuses: list[str] = []
+    activity: list[str] = []
+    registry.set_session_status_publisher(
+        lambda _session, status, _blocked=None: statuses.append(status),
+        pane_activity_publisher=lambda _session, status, _blocked=None: pane_statuses.append(
+            status
+        ),
+    )
+    registry.set_terminal_activity_publisher(lambda _session, terminal: activity.append(terminal))
+
+    async def launch(ctx: NativeLaunchContext) -> SessionResourceView:
+        terminals._by_conversation.setdefault(session_id, {})[("pi", "main")] = instance
+        await registry.observe_required_terminal(
+            session_id, "pi", "main", instance, resource_role=PI_NATIVE_TERMINAL_ROLE
+        )
+        watcher.call_args.kwargs["on_activity"]()
+        watcher.call_args.kwargs["on_idle"]()
+        await asyncio.sleep(0)
+        assert activity == ["terminal_pi_main"]
+        assert statuses == []
+        assert pane_statuses == ["running", "idle"]
+        assert not registry.session_turn_is_active(session_id)
+        return SessionResourceView(
+            id="terminal_pi_main", type="terminal", session_id=session_id, name="pi:main"
+        )
+
+    monkeypatch.setattr("omnigent.runner.native._launch_pi", launch)
+    ctx = NativeLaunchContext(
+        session_id=session_id, resource_registry=registry, publish_event=lambda *_args: None
+    )
+    if entry == "initialize":
+        assert await _launch_native_terminal("pi-native", ctx, ensure_locks={}) is True
+    else:
+        response = await _ensure_native_terminal("pi", ctx, ensure_locks={})
+        assert response is not None and response.status_code == 200
+
+    watcher.call_args.kwargs["on_activity"]()
+    watcher.call_args.kwargs["on_idle"]()
+    await asyncio.sleep(0)
+    assert statuses == []
+    assert pane_statuses == ["running", "idle", "running", "idle"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["running", "idle"])
+async def test_native_file_and_hook_status_keep_their_lifecycle_publisher(
+    tmp_path: Path, status: str
+) -> None:
+    callbacks, statuses, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_startup_sources"
+    )
+    pane_statuses: list[str] = []
+    registry.set_session_status_publisher(
+        lambda _session, status, _blocked=None: statuses.append(status),
+        pane_activity_publisher=lambda _session, status, _blocked=None: pane_statuses.append(
+            status
+        ),
+    )
+    callbacks["on_activity" if status == "running" else "on_idle"]()
+    await asyncio.sleep(0)
+    assert statuses == []
+    assert pane_statuses == [status]
+
+    pollers[0].active = True
+    pollers[0].emit(status)
+    await asyncio.sleep(0)
+    assert statuses == [status]
+    registry.note_external_session_status("conv_startup_sources", "idle")
+    pollers[0].emit("running")
+    await asyncio.sleep(0)
+    assert statuses == [status, "running"]
+    assert registry.session_turn_is_active("conv_startup_sources")
+    registry.note_external_session_status("conv_startup_sources", "idle")
+    assert not registry.session_turn_is_active("conv_startup_sources")
+    pollers[0].emit("running")
+    pollers[0].emit("idle")
+    await asyncio.sleep(0)
+    assert statuses == [status, "running", "running", "idle"]
+    assert pane_statuses == [status]
+
+
+@pytest.mark.asyncio
+async def test_pane_owned_harness_keeps_its_lifecycle_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = SessionResourceRegistry(terminal_registry=TerminalRegistry())
+    instance = make_test_terminal_instance("kiro", "main", tmp_path)
+    watcher = Mock()
+    monkeypatch.setattr(instance, "start_idle_watcher_thread", watcher)
+    statuses: list[str] = []
+    pane_statuses: list[str] = []
+    registry.set_session_status_publisher(
+        lambda _session, status, _blocked=None: statuses.append(status),
+        pane_activity_publisher=lambda _session, status, _blocked=None: pane_statuses.append(
+            status
+        ),
+    )
+    await registry.observe_required_terminal(
+        "conv_kiro", "kiro", "main", instance, resource_role=KIRO_NATIVE_TERMINAL_ROLE
+    )
+    watcher.call_args.kwargs["on_activity"]()
+    watcher.call_args.kwargs["on_idle"]()
+    await asyncio.sleep(0)
+    assert statuses == ["running", "idle"]
+    assert pane_statuses == []
 
 
 @dataclass

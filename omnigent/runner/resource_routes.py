@@ -22,6 +22,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from omnigent._platform import normalize_interactive_shells
+from omnigent.entities.session_observation import SessionObservation
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     SessionResourceView,
@@ -378,10 +379,25 @@ def register_resource_routes(
                 }
             )[_ensure_agent.key]
             persist_resource_event = body.get("persist_resource_event") is not False
+            raw_observation = body.get("session_observation")
+            ensure_observation = None
+            if raw_observation is not None:
+                try:
+                    ensure_observation = SessionObservation.model_validate(raw_observation)
+                except ValueError:
+                    return JSONResponse(
+                        status_code=400, content={"error": "invalid session observation"}
+                    )
 
             def _publish_ensure_event(event_session_id: str, event: _JsonObject) -> None:
                 """Publish terminal readiness, optionally without durable history."""
                 event_type = event.get("type")
+                if ensure_observation is not None:
+                    event = {
+                        **event,
+                        "conversation_id": event_session_id,
+                        "session_observation": ensure_observation.model_dump(mode="json"),
+                    }
                 if not persist_resource_event and event_type in (
                     "session.resource.created",
                     "session.resource.deleted",

@@ -35,12 +35,7 @@ class _CaptureClient:
         self._captured["body"] = json
         self._captured.setdefault("posts", []).append((path, json))
 
-        class _Resp:
-            status_code = 202
-            headers: dict[str, str] = {}
-            text = ""
-
-        return _Resp()
+        return httpx.Response(202, request=httpx.Request("POST", f"http://runner{path}"))
 
     async def get(self, *_: Any, **__: Any) -> Any:
         raise NotImplementedError

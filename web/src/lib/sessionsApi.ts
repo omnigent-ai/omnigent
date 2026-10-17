@@ -1,3 +1,5 @@
+import { parseSessionObservation } from "./sessionObservation";
+
 // Typed client for the four `/v1/sessions` endpoints introduced in
 // commit `e64a490` ("Migrate session ↔ client interactions to
 // /v1/sessions"). Mirrors `omnigent/server/routes/sessions.py`.
@@ -107,6 +109,8 @@ interface SessionResponseWire {
   agent_id: string;
   /** Human-readable name of the bound agent, e.g. ``"research-agent"``. */
   agent_name?: string | null;
+  session_observation?: unknown;
+  runner_offline_episode_id?: string | null;
   runner_id?: string | null;
   /**
    * Host that launched (or should launch) the runner, e.g. ``"host_a1b2"``.
@@ -317,7 +321,10 @@ function sessionFromWire(wire: SessionResponseWire): Session {
   // Record the session's host so slice-key routing (turn dispatch, terminal
   // attach) can pin to the replica holding that host's runner tunnel; a
   // sub-agent child inherits its parent's through the recorded parent link.
-  setSessionHost(wire.id, sessionRoutingHostId(wire.host_id, wire.labels));
+  setSessionHost(wire.id, sessionRoutingHostId(wire.host_id, wire.labels), {
+    observation: parseSessionObservation(wire.session_observation),
+    episodeId: wire.runner_offline_episode_id,
+  });
   setSessionParent(wire.id, wire.parent_session_id, wire.labels);
   return {
     id: wire.id,
@@ -330,6 +337,8 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     hostResumable: wire.host_resumable ?? false,
     archived: wire.archived ?? false,
     status: wire.status,
+    sessionObservation: parseSessionObservation(wire.session_observation),
+    runnerOfflineEpisodeId: wire.runner_offline_episode_id ?? null,
     backgroundTaskCount: wire.background_task_count ?? undefined,
     backgroundTasks: parseBackgroundTasks(wire.background_tasks),
     createdAt: wire.created_at,
@@ -1258,6 +1267,8 @@ export interface SessionItemsPage {
   items: ConversationItem[];
   /** True when older items exist before the first item in this page. */
   hasMore: boolean;
+  /** Underlying descending cursor, including activity markers hidden by the server. */
+  olderCursor: string | null;
 }
 
 /**
@@ -1281,16 +1292,29 @@ export async function fetchSessionItemsPage(
     signal,
   }: { olderThan?: string; limit?: number; signal?: AbortSignal } = {},
 ): Promise<SessionItemsPage> {
-  const params = new URLSearchParams({ limit: String(limit), order: "desc" });
-  // "Older than the cursor" within a descending scan = items after it.
-  if (olderThan) params.set("after", olderThan);
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
-    { signal },
-  );
-  const page = await readJsonOrThrow<SessionItemsResponseWire>(res);
-  // Server returns newest-first; reverse to chronological for rendering.
-  return { items: [...page.data].reverse(), hasMore: page.has_more };
+  let cursor = olderThan;
+  const seen = new Set<string>(cursor ? [cursor] : []);
+  // A page can contain only stale activity markers, omitted from visible data.
+  /* oxlint-disable no-await-in-loop */
+  for (;;) {
+    const params = new URLSearchParams({ limit: String(limit), order: "desc" });
+    if (cursor) params.set("after", cursor);
+    const res = await authenticatedFetch(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
+      { signal },
+    );
+    const page = await readJsonOrThrow<SessionItemsResponseWire>(res);
+    const olderCursor = page.last_id ?? page.data.at(-1)?.id ?? null;
+    if (page.has_more && (!olderCursor || seen.has(olderCursor))) {
+      throw new Error("Session history cursor did not advance");
+    }
+    if (page.data.length > 0 || !page.has_more) {
+      return { items: [...page.data].reverse(), hasMore: page.has_more, olderCursor };
+    }
+    cursor = olderCursor!;
+    seen.add(cursor);
+  }
+  /* oxlint-enable no-await-in-loop */
 }
 
 /**

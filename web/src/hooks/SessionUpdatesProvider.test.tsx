@@ -18,6 +18,7 @@ import {
   type ConversationsPage,
 } from "@/hooks/useConversations";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
+import { getSessionHost } from "@/lib/sessionHost";
 
 // Mock the socket transport so setWatched is observable and start/stop are
 // inert. subscribe/subscribeStatus return no-op unsubscribers.
@@ -672,4 +673,57 @@ it("keeps a directly opened shared session watched and permission-aware with the
     client.clear();
     vi.unstubAllGlobals();
   }
+});
+
+it("keeps pinned lifecycle and routing on B when a stale A snapshot arrives", () => {
+  const client = new QueryClient();
+  const id = "pinned_stream_owned";
+  seedConversations(client, [id]);
+  const observation = {
+    runner_id: "B",
+    binding_epoch: 2,
+    revision: 5,
+    observation_id: "new",
+    status: "running",
+    response_id: "new_turn",
+    error_key: null,
+  };
+  const row: Conversation = {
+    ...conv(id),
+    labels: { "omnigent.pinned": "123" },
+    status: "running",
+    runner_id: "B",
+    host_id: "host_B",
+    session_observation: observation,
+  };
+  client.setQueryData(["pinned-conversations"], { conversations: [row], filterHonored: true });
+  renderProvider(client, [`/c/${id}`]);
+  const handler = frameHandler();
+  act(() => handler({ type: "changed", items: [row] }));
+  expect(getSessionHost(id)).toBe("host_B");
+  act(() =>
+    handler({
+      type: "snapshot",
+      items: [
+        {
+          ...row,
+          status: "failed",
+          runner_id: "A",
+          host_id: "host_A",
+          session_observation: { ...observation, runner_id: "A", binding_epoch: 1, revision: 4 },
+          runner_offline_episode_id: "old_outage",
+        },
+      ],
+    }),
+  );
+  expect(
+    client.getQueryData<{ conversations: Conversation[] }>(["pinned-conversations"])
+      ?.conversations[0],
+  ).toMatchObject({
+    status: "running",
+    runner_id: "B",
+    host_id: "host_B",
+    session_observation: observation,
+  });
+  expect(getSessionHost(id)).toBe("host_B");
 });

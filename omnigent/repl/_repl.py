@@ -38,6 +38,8 @@ from omnigent_client import (
     ToolResultBlock,
     format_tool_args_brief,
 )
+from omnigent_client._session_projection import SessionProjectionFence, accept_owned_child_activity
+from omnigent_client._sessions_chat import denied_input_events
 from omnigent_ui_sdk import (
     DEFAULT_USER_CONFIG,
     OverlayTarget,
@@ -1355,6 +1357,10 @@ class _SessionsChatReplAdapter:
         self._host = host
         self._fmt = fmt
         self._session_id: str | None = session_id
+        self._projection_fences: dict[str, SessionProjectionFence] = {}
+        self._child_projection_fences: dict[str, SessionProjectionFence] = getattr(
+            host, "_subagent_projection_fences", {}
+        )
         self._session_bundle = session_bundle
         self._session_bundle_filename = session_bundle_filename
         self._runner_id = runner_id
@@ -1656,6 +1662,8 @@ class _SessionsChatReplAdapter:
             attributes.
         :returns: None.
         """
+        if not self._accept_session_snapshot(session):
+            return
         self._agent_id = session.agent_id
         # The agent name changes when the session is switched in place
         # to a different agent (web UI "Switch agent"). Don't clobber
@@ -1676,6 +1684,16 @@ class _SessionsChatReplAdapter:
             self._harness = session.harness
         self._context_window = session.context_window
         self._last_total_tokens = session.last_total_tokens
+
+    def _accept_session_snapshot(self, session: _SessionSnapshot) -> bool:
+        """Retain session ownership when a delayed snapshot arrives after live state."""
+        session_id = getattr(session, "id", self._session_id)
+        if session_id is None or session_id != self._session_id:
+            return False
+        return self._projection_fences.setdefault(session_id, SessionProjectionFence()).accept(
+            getattr(session, "session_observation", None),
+            getattr(session, "runner_offline_episode_id", None),
+        )
 
     async def _ensure_session(self) -> str:
         """
@@ -2223,7 +2241,45 @@ class _SessionsChatReplAdapter:
 
         Cancelled on REPL exit via ``_stream_task.cancel()``.
         """
-        from omnigent.server.schemas import SessionStatusEvent as _StatusEv
+        from omnigent.server.schemas import (
+            CancelledEvent as _CancelledEv,
+        )
+        from omnigent.server.schemas import (
+            CompletedEvent as _CompletedEv,
+        )
+        from omnigent.server.schemas import (
+            CreatedEvent as _CreatedEv,
+        )
+        from omnigent.server.schemas import (
+            ErrorEvent as _ErrorEv,
+        )
+        from omnigent.server.schemas import (
+            FailedEvent as _FailedEv,
+        )
+        from omnigent.server.schemas import (
+            IncompleteEvent as _IncompleteEv,
+        )
+        from omnigent.server.schemas import (
+            InProgressEvent as _ProgressEv,
+        )
+        from omnigent.server.schemas import (
+            OutputItemDoneEvent as _OutputEv,
+        )
+        from omnigent.server.schemas import (
+            OutputTextDeltaEvent as _TextEv,
+        )
+        from omnigent.server.schemas import (
+            QueuedEvent as _QueuedEv,
+        )
+        from omnigent.server.schemas import (
+            SessionChildSessionUpdatedEvent as _ChildEv,
+        )
+        from omnigent.server.schemas import (
+            SessionStatusEvent as _StatusEv,
+        )
+        from omnigent.server.schemas import (
+            SessionTerminalPendingEvent as _PendingEv,
+        )
 
         _dbg = bool(os.environ.get("OMNIGENT_SESSIONS_ADAPTER_DEBUG"))
         backoff = 0.5
@@ -2238,6 +2294,53 @@ class _SessionsChatReplAdapter:
                         flush=True,
                     )
                 async for event in self._client.sessions.stream(self._session_id):
+                    if isinstance(
+                        event,
+                        (
+                            _ErrorEv,
+                            _PendingEv,
+                            _CompletedEv,
+                            _TextEv,
+                            _CreatedEv,
+                            _QueuedEv,
+                            _ProgressEv,
+                            _FailedEv,
+                            _IncompleteEv,
+                            _CancelledEv,
+                        ),
+                    ):
+                        observation = getattr(event, "session_observation", None)
+                        episode = getattr(event, "runner_offline_episode_id", None)
+                        if observation is not None or episode is not None:
+                            conversation_id = getattr(event, "conversation_id", None)
+                            if (
+                                conversation_id is not None and conversation_id != self._session_id
+                            ) or not self._projection_fences.setdefault(
+                                self._session_id, SessionProjectionFence()
+                            ).accept_signal(observation, episode):
+                                continue
+                    elif isinstance(event, _StatusEv):
+                        if event.conversation_id != self._session_id:
+                            continue
+                        fence = self._projection_fences.setdefault(
+                            event.conversation_id, SessionProjectionFence()
+                        )
+                        if not fence.accept(
+                            event.session_observation, event.runner_offline_episode_id
+                        ):
+                            continue
+                    elif isinstance(event, _ChildEv):
+                        fence = self._child_projection_fences.setdefault(
+                            event.child_session_id, SessionProjectionFence()
+                        )
+                        child = fence.filter_child(event.child)
+                        if child is not event.child:
+                            event = event.model_copy(update={"child": child})
+                    elif isinstance(event, _OutputEv) and isinstance(event.item, dict):
+                        if not accept_owned_child_activity(
+                            event.item, self._child_projection_fences
+                        ):
+                            continue
                     if isinstance(event, _StatusEv) and event.status in (
                         "idle",
                         "waiting",
@@ -2375,7 +2478,12 @@ class _SessionsChatReplAdapter:
                     file=sys.stderr,
                     flush=True,
                 )
-            await self._client.sessions.post_event(session_id, event_payload)
+            ack = await self._client.sessions.post_event(session_id, event_payload)
+            denied = denied_input_events(ack, model=self._agent_name or "policy")
+            if denied is not None:
+                self._pending_local_user_sends = max(0, self._pending_local_user_sends - 1)
+                yield _server_event_to_sdk_event(denied[1])
+                return
             if _dbg:
                 print(
                     "[sessions-adapter] POST returned; waiting for terminal event",
@@ -2403,7 +2511,7 @@ class _SessionsChatReplAdapter:
                     )
                 except asyncio.TimeoutError:
                     snap = await self._client.sessions.get(session_id)
-                    if snap.status in ("idle", "failed"):
+                    if self._accept_session_snapshot(snap) and snap.status in ("idle", "failed"):
                         self._turn_done.set()
             # Yield a terminal event so callers iterating send()
             # observe completion. Rendering already happened via
@@ -2474,7 +2582,11 @@ class _SessionsChatReplAdapter:
                     file=sys.stderr,
                     flush=True,
                 )
-            await self._client.sessions.post_event(session_id, event_payload)
+            ack = await self._client.sessions.post_event(session_id, event_payload)
+            denied = denied_input_events(ack, model=self._agent_name or "policy")
+            if denied is not None:
+                yield _server_event_to_sdk_event(denied[1])
+                return
             while not self._turn_done.is_set():
                 try:
                     await asyncio.wait_for(
@@ -6512,14 +6624,14 @@ async def _list_all_conversation_items(
         except Exception:  # noqa: BLE001 — overlay builder: any other per-page error falls back to whatever was already fetched; partial sidebar beats no sidebar
             break
         page: list[dict[str, object]] = raw_page.data
-        if not page:
-            break
         all_items.extend(page)
-        if len(page) < page_size:
+        if not raw_page.has_more:
             break
-        last_item = page[-1]
-        last_id = last_item.get("id") if isinstance(last_item, dict) else None
-        if not isinstance(last_id, str):
+        last_item = page[-1] if page else None
+        last_id = raw_page.last_id or (
+            last_item.get("id") if isinstance(last_item, dict) else None
+        )
+        if not isinstance(last_id, str) or not last_id or last_id == after:
             break
         after = last_id
     return all_items

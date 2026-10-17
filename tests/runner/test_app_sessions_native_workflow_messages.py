@@ -266,6 +266,9 @@ async def test_turn_lifecycle_events() -> None:
     assert statuses[-1] in ("idle", "failed"), (
         f"last session.status must be idle or failed, got statuses: {statuses}"
     )
+    [completed] = [e for e in collected if e.get("type") == "response.completed"]
+    terminal = [e for e in collected if e.get("type") == "session.status"][-1]
+    assert terminal["response_id"] == completed["response"]["id"]
 
 
 @pytest.mark.asyncio

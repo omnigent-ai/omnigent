@@ -86,6 +86,7 @@ class _StubResourceRegistry:
     def set_session_status_publisher(
         self,
         publisher: Callable[[str, str], None],
+        **_kwargs: object,
     ) -> None:
         """
         Accept the session-status publisher installed by the runner app.

@@ -538,7 +538,21 @@ def test_intentional_stop_settlement_uses_only_metadata(
         event.remove(store._conv_engine, "before_cursor_execute", unavailable)
     after = store.get_conversation(conv.id)
     assert after.live_status == "idle"
-    assert after.labels["omnigent.last_task_error_code"] == "preserved"
+    assert "omnigent.last_task_error_code" not in after.labels
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlConversationLabel
+
+    with store._conv_session("inspect_preserved_error_history") as session:
+        assert (
+            session.scalar(
+                select(SqlConversationLabel.value).where(
+                    SqlConversationLabel.conversation_id == conv.id,
+                    SqlConversationLabel.key == "omnigent.last_task_error_code",
+                )
+            )
+            == "preserved"
+        )
 
 
 # ── fork_conversation ──────────────────────────────────

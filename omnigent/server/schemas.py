@@ -31,6 +31,7 @@ from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
     ConversationItem,
 )
+from omnigent.entities.session_observation import SessionObservation
 from omnigent.inner.native_attachments import reject_authored_framework_notices
 
 # ── Shared ──────────────────────────────────────────────────────
@@ -926,6 +927,8 @@ class ChildSessionSummary(BaseModel):
     current_task_id: str | None = None
     current_task_status: str | None = None
     busy: bool = False
+    session_observation: SessionObservation | None = None
+    runner_offline_episode_id: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     last_task_error: dict[str, str] | None = None
     last_message_preview: str | None = None
@@ -2332,6 +2335,8 @@ class SessionResponse(BaseModel):
     agent_id: str
     agent_name: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
+    session_observation: SessionObservation | None = None
+    runner_offline_episode_id: str | None = None
     background_task_count: int | None = None
     background_tasks: list[BackgroundTaskInfo] | None = None
     created_at: int
@@ -2958,6 +2963,8 @@ class SessionListItem(BaseModel):
     agent_id: str
     agent_name: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
+    session_observation: SessionObservation | None = None
+    runner_offline_episode_id: str | None = None
     created_at: int
     updated_at: int
     title: str | None = None
@@ -3281,6 +3288,8 @@ class SessionStatusEvent(_SSEEventBase):
     type: Literal["session.status"]
     conversation_id: str
     status: Literal["idle", "launching", "running", "waiting", "failed"]
+    session_observation: SessionObservation | None = None
+    runner_offline_episode_id: str | None = None
     response_id: str | None = None
     error: ErrorDetail | None = None
     background_task_count: int | None = None
@@ -3566,6 +3575,9 @@ class SessionTerminalPendingEvent(_SSEEventBase):
     type: Literal["session.terminal_pending"]
     conversation_id: str
     pending: bool
+    response_id: str | None = None
+    session_observation: SessionObservation | None = None
+    runner_offline_episode_id: str | None = None
 
 
 class SessionSandboxStatusEvent(_SSEEventBase):
@@ -3940,6 +3952,9 @@ class OutputTextDeltaEvent(_SSEEventBase):
     message_id: str | None = None
     index: int | None = None
     final: bool | None = None
+    conversation_id: str | None = None
+    session_observation: SessionObservation | None = None
+    runner_offline_episode_id: str | None = None
 
 
 class ToolOutputDeltaEvent(_SSEEventBase):
@@ -4426,6 +4441,9 @@ class CreatedEvent(_SSEEventBase):
 
     type: Literal["response.created"]
     response: ResponseObject
+    conversation_id: str | None = None
+    session_observation: SessionObservation | None = None
+    runner_offline_episode_id: str | None = None
 
 
 class QueuedEvent(_SSEEventBase):
@@ -4442,6 +4460,9 @@ class QueuedEvent(_SSEEventBase):
 
     type: Literal["response.queued"]
     response: ResponseObject
+    conversation_id: str | None = None
+    session_observation: SessionObservation | None = None
+    runner_offline_episode_id: str | None = None
 
 
 class InProgressEvent(_SSEEventBase):
@@ -4458,6 +4479,9 @@ class InProgressEvent(_SSEEventBase):
 
     type: Literal["response.in_progress"]
     response: ResponseObject
+    conversation_id: str | None = None
+    session_observation: SessionObservation | None = None
+    runner_offline_episode_id: str | None = None
 
 
 class CompletedEvent(_SSEEventBase):
@@ -4474,6 +4498,9 @@ class CompletedEvent(_SSEEventBase):
 
     type: Literal["response.completed"]
     response: ResponseObject
+    conversation_id: str | None = None
+    session_observation: SessionObservation | None = None
+    runner_offline_episode_id: str | None = None
 
 
 class FailedEvent(_SSEEventBase):
@@ -4496,6 +4523,9 @@ class FailedEvent(_SSEEventBase):
     type: Literal["response.failed"]
     source: Literal["llm", "execution", "tool", "harness"] = "execution"
     response: ResponseObject | FailedResponseObject
+    conversation_id: str | None = None
+    session_observation: SessionObservation | None = None
+    runner_offline_episode_id: str | None = None
 
 
 class CancelledEvent(_SSEEventBase):
@@ -4509,6 +4539,9 @@ class CancelledEvent(_SSEEventBase):
 
     type: Literal["response.cancelled"]
     response: ResponseObject
+    conversation_id: str | None = None
+    session_observation: SessionObservation | None = None
+    runner_offline_episode_id: str | None = None
 
 
 class IncompleteEvent(_SSEEventBase):
@@ -4524,6 +4557,9 @@ class IncompleteEvent(_SSEEventBase):
 
     type: Literal["response.incomplete"]
     response: ResponseObject
+    conversation_id: str | None = None
+    session_observation: SessionObservation | None = None
+    runner_offline_episode_id: str | None = None
 
 
 class RetryErrorDetail(BaseModel):
@@ -4607,6 +4643,10 @@ class ErrorEvent(_SSEEventBase):
     source: Literal["llm", "execution", "tool", "harness"]
     tool_name: str | None = None
     error: RetryErrorDetail
+    conversation_id: str | None = None
+    response_id: str | None = None
+    session_observation: SessionObservation | None = None
+    runner_offline_episode_id: str | None = None
 
 
 class CompactionInProgressEvent(_SSEEventBase):

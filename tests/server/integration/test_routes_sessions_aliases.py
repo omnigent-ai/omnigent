@@ -309,6 +309,7 @@ async def test_delete_session_cancels_relays_waiting_out_runner_grace(
     prior = _globals._runner_router
     try:
         for session_id in (conv_id, child_id):
+            store.set_runner_id(session_id, "runner_dropped")
             sessions_module._session_status_cache[session_id] = "running"
             handle = sessions_module._ensure_runner_relay(
                 session_id,

@@ -409,6 +409,20 @@ def mock_llm() -> Iterator[ControllableMockClient]:
 
 
 @pytest.fixture(autouse=True)
+def _reset_session_live_state() -> Iterator[None]:
+    """Keep each test's app stores and ordered lifecycle writes in its own scope."""
+    from omnigent.server import session_live_state
+
+    session_live_state.submit("test_state_reset", lambda: None).result(timeout=10)
+    session_live_state.configure(None)
+    try:
+        yield
+    finally:
+        session_live_state.submit("test_state_reset", lambda: None).result(timeout=10)
+        session_live_state.configure(None)
+
+
+@pytest.fixture(autouse=True)
 def _reset_elicitation_state() -> Iterator[None]:
     """
     Clear the module-global elicitation state after every test.

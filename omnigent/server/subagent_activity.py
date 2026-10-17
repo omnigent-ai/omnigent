@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import logging
 import re
-from typing import Literal
+from typing import Any, Literal
 
 from omnigent.entities import (
     Conversation,
@@ -17,8 +17,10 @@ from omnigent.entities import (
     ResourceEventData,
     SlashCommandData,
 )
+from omnigent.entities.session_observation import RunnerOfflineDecision, SessionObservation
 from omnigent.harness_aliases import is_native_harness
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+from omnigent.runner.subagent_work import SUBAGENT_DISPATCH_ID_LABEL_KEY
 from omnigent.runtime import session_stream
 from omnigent.server.schemas import OutputItemDoneEvent
 from omnigent.stores import ConversationStore
@@ -158,6 +160,25 @@ def _native_request_id(child_id: str, turn_id: str, store: ConversationStore) ->
         after = page.last_id
 
 
+def _activity_observation_matches(
+    child: Conversation,
+    observation: SessionObservation | None,
+    dispatch_id: str | None,
+    offline_decision: RunnerOfflineDecision | None,
+) -> bool:
+    if offline_decision is not None:
+        return child.runner_offline_decision == offline_decision
+    if observation is None:
+        return True
+    return (
+        child.session_observation == observation
+        and child.runner_offline_decision is None
+        and (
+            dispatch_id is None or child.labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY) == dispatch_id
+        )
+    )
+
+
 async def record_subagent_activity(
     child_id: str,
     phase: Literal["delegated", "returned"],
@@ -167,10 +188,18 @@ async def record_subagent_activity(
     turn_id: str | None = None,
     status: str | None = None,
     from_runner: bool = False,
+    offline_decision: RunnerOfflineDecision | None = None,
+    observation: SessionObservation | None = None,
+    dispatch_id: str | None = None,
+    snapshot: Conversation | None = None,
 ) -> None:
     """Persist and publish a child lifecycle edge once, including across retries."""
     try:
-        child = await asyncio.to_thread(store.get_conversation, child_id)
+        child = (
+            snapshot
+            if snapshot is not None and snapshot.id == child_id
+            else await asyncio.to_thread(store.get_conversation, child_id)
+        )
         if (
             child is None
             or child.parent_conversation_id is None
@@ -180,6 +209,21 @@ async def record_subagent_activity(
             return
         if parent_id is not None and child.parent_conversation_id != parent_id:
             return
+        if offline_decision is not None and not _activity_observation_matches(
+            child, observation, dispatch_id, offline_decision
+        ):
+            return
+        if offline_decision is not None and turn_id != offline_decision.activity_turn_id:
+            return
+        synthetic_turn_id = observation is not None and not turn_id and not observation.response_id
+        if observation is not None:
+            turn_id = (
+                turn_id
+                or observation.response_id
+                or (f"dispatch:{dispatch_id}" if dispatch_id else observation.observation_id)
+            )
+            if turn_id is None:
+                return
         parent_id = child.parent_conversation_id
         native_completion = False
         if phase == "returned" and status == "completed":
@@ -219,13 +263,28 @@ async def record_subagent_activity(
                     return
                 # A runner can die before producing any transcript for its first turn.
                 turn_id = child.id
-        if native_completion and turn_id is not None:
+        if native_completion and turn_id is not None and not synthetic_turn_id:
             # Native notifications can finish new responses for the same request.
             request_id = await asyncio.to_thread(_native_request_id, child.id, turn_id, store)
             if request_id is not None:
                 turn_id = request_id
         key = f"{child.id}:{phase}:{turn_id or ''}"
+        if offline_decision is not None:
+            key += f":runner-offline:{offline_decision.episode_id}"
+        elif dispatch_id is not None:
+            key += f":dispatch:{dispatch_id}"
         stable_id = hashlib.sha256(key.encode()).hexdigest()[:32]
+        ownership: dict[str, Any] = {}
+        if offline_decision is not None:
+            ownership = {
+                "session_observation": offline_decision.observation.model_dump(),
+                "runner_offline_episode_id": offline_decision.episode_id,
+                "turn_id": turn_id,
+            }
+        elif observation is not None:
+            ownership = {"session_observation": observation.model_dump(), "turn_id": turn_id}
+            if dispatch_id is not None:
+                ownership["subagent_dispatch_id"] = dispatch_id
         item = NewConversationItem(
             type="resource_event",
             stable_id=stable_id,
@@ -234,11 +293,21 @@ async def record_subagent_activity(
                 event_type=f"session.subagent.{phase}",
                 resource_id=child.id,
                 resource_type="session",
-                resource={"title": _title(child), **({"status": status} if status else {})},
+                resource={
+                    "title": _title(child),
+                    **({"status": status} if status else {}),
+                    **ownership,
+                },
             ),
         )
         persisted = (await asyncio.to_thread(store.append, parent_id, [item]))[0]
         if not persisted.deduplicated:
+            if offline_decision is not None or observation is not None:
+                current = await asyncio.to_thread(store.get_conversation, child_id)
+                if current is None or not _activity_observation_matches(
+                    current, observation, dispatch_id, offline_decision
+                ):
+                    return
             event = OutputItemDoneEvent(
                 type="response.output_item.done", item=persisted.to_api_dict()
             )

@@ -23,6 +23,7 @@ import {
   useBulkStopSessions,
   undoArchiveConversations,
   useConversations,
+  usePinnedConversations,
   useDeleteProject,
   useProjects,
   useProjectConfig,
@@ -132,6 +133,144 @@ describe("renameConversation", () => {
     await expect(renameConversation("conv_x", "release notes/2026-09")).rejects.toThrow(
       "Workspace items cannot contain the '/' character",
     );
+  });
+});
+
+describe("useConversations observation ordering", () => {
+  it("keeps a newer streamed lifecycle when a stale list request finishes", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    let release!: (response: Response) => void;
+    fetchMock.mockReturnValueOnce(
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client }, children);
+    const { result } = renderHook(() => useConversations("", false), { wrapper });
+    const observation = {
+      runner_id: "B",
+      binding_epoch: 2,
+      revision: 5,
+      observation_id: "new",
+      status: "running",
+      response_id: "new_turn",
+      error_key: null,
+    };
+    const row: Conversation = {
+      id: "conv",
+      object: "conversation",
+      title: "Old title",
+      created_at: 0,
+      updated_at: 1,
+      permission_level: null,
+      labels: {},
+      status: "running",
+      runner_id: "B",
+      session_observation: observation,
+      pending_elicitations_count: 1,
+    };
+    act(() =>
+      client.setQueryData(["conversations", "", false], {
+        pages: [{ data: [row], first_id: "conv", last_id: "conv", has_more: false }],
+        pageParams: [undefined],
+      }),
+    );
+    await act(async () =>
+      release(
+        mockResponse({
+          data: [
+            {
+              ...row,
+              title: "New title",
+              status: "failed",
+              runner_id: "A",
+              session_observation: { ...observation, binding_epoch: 1, revision: 4 },
+              runner_offline_episode_id: "old_outage",
+              pending_elicitations_count: 0,
+              labels: { project: "new", "omnigent.last_task_error_code": "runner_disconnected" },
+            },
+          ],
+          first_id: "conv",
+          last_id: "conv",
+          has_more: false,
+        }),
+      ),
+    );
+    await waitFor(() => expect(result.current.data?.pages[0].data[0].title).toBe("New title"));
+    expect(result.current.data!.pages[0].data[0]).toMatchObject({
+      status: "running",
+      runner_id: "B",
+      session_observation: observation,
+      pending_elicitations_count: 1,
+      labels: { project: "new" },
+    });
+    expect(result.current.data!.pages[0].data[0].labels).not.toHaveProperty(
+      "omnigent.last_task_error_code",
+    );
+  });
+});
+
+describe("pinned observation ordering", () => {
+  it("keeps a newer pinned lifecycle when a stale HTTP request finishes", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    let release!: (response: Response) => void;
+    fetchMock.mockReturnValueOnce(
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client }, children);
+    renderHook(() => usePinnedConversations(false), { wrapper });
+    const observation = {
+      runner_id: "B",
+      binding_epoch: 2,
+      revision: 5,
+      observation_id: "new",
+      status: "running",
+      response_id: "new_turn",
+      error_key: null,
+    };
+    const row: Conversation = {
+      id: "pinned_owned",
+      object: "conversation",
+      title: "Pinned",
+      created_at: 0,
+      updated_at: 1,
+      labels: { "omnigent.pinned": "123" },
+      permission_level: null,
+      status: "running",
+      runner_id: "B",
+      session_observation: observation,
+    };
+    act(() =>
+      client.setQueryData(["pinned-conversations"], { conversations: [row], filterHonored: true }),
+    );
+    await act(async () =>
+      release(
+        mockResponse({
+          data: [
+            {
+              ...row,
+              status: "failed",
+              runner_id: "A",
+              session_observation: { ...observation, binding_epoch: 1 },
+            },
+          ],
+          first_id: row.id,
+          last_id: row.id,
+          has_more: false,
+        }),
+      ),
+    );
+    await waitFor(() =>
+      expect(client.getQueryState(["pinned-conversations"])?.fetchStatus).toBe("idle"),
+    );
+    expect(
+      client.getQueryData<{ conversations: Conversation[] }>(["pinned-conversations"])
+        ?.conversations[0],
+    ).toMatchObject({ status: "running", runner_id: "B", session_observation: observation });
   });
 });
 

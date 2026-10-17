@@ -811,9 +811,33 @@
       "CancelledEvent": {
         "description": "Terminal event for a turn cancelled before completion.",
         "properties": {
+          "conversation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Conversation Id"
+          },
           "response": {
             "$ref": "#/components/schemas/ResponseObject",
             "description": "The final response object with `status=\"cancelled\"`."
+          },
+          "runner_offline_episode_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Runner Offline Episode Id"
           },
           "sequence_number": {
             "anyOf": [
@@ -827,6 +851,17 @@
             ],
             "default": null,
             "title": "Sequence Number"
+          },
+          "session_observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionObservation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "type": {
             "const": "response.cancelled",
@@ -1040,6 +1075,17 @@
             "description": "Identifier of the routing decision that produced `routed_model`, mirroring `RoutingDecisionData.decision_id`. Read from the child's `omnigent.routing.decision_id` label, stamped when routing pins the model. `None` when the child was not routed.",
             "title": "Routing Decision Id"
           },
+          "runner_offline_episode_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runner Offline Episode Id"
+          },
           "session_name": {
             "anyOf": [
               {
@@ -1051,6 +1097,16 @@
             ],
             "description": "Sub-agent instance name, the suffix of `title` after the first `\":\"`, e.g. `\"auth\"`. `None` if `title` is `None` or missing a colon.",
             "title": "Session Name"
+          },
+          "session_observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionObservation"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "task_summary": {
             "anyOf": [
@@ -1501,9 +1557,33 @@
       "CompletedEvent": {
         "description": "Terminal event for a successfully completed turn.\n\nCarries the final\n`omnigent.server.schemas.ResponseObject`.",
         "properties": {
+          "conversation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Conversation Id"
+          },
           "response": {
             "$ref": "#/components/schemas/ResponseObject",
             "description": "The final response object with `status=\"completed\"`."
+          },
+          "runner_offline_episode_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Runner Offline Episode Id"
           },
           "sequence_number": {
             "anyOf": [
@@ -1517,6 +1597,17 @@
             ],
             "default": null,
             "title": "Sequence Number"
+          },
+          "session_observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionObservation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "type": {
             "const": "response.completed",
@@ -1813,9 +1904,33 @@
       "CreatedEvent": {
         "description": "Initial event emitted at the start of every streaming response.\n\nCarries the freshly-allocated\n`omnigent.server.schemas.ResponseObject` (status will\nbe `\"queued\"` or `\"in_progress\"` depending on whether the\ntask started immediately).",
         "properties": {
+          "conversation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Conversation Id"
+          },
           "response": {
             "$ref": "#/components/schemas/ResponseObject",
             "description": "The newly-allocated response object."
+          },
+          "runner_offline_episode_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Runner Offline Episode Id"
           },
           "sequence_number": {
             "anyOf": [
@@ -1829,6 +1944,17 @@
             ],
             "default": null,
             "title": "Sequence Number"
+          },
+          "session_observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionObservation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "type": {
             "const": "response.created",
@@ -2240,9 +2366,45 @@
       "ErrorEvent": {
         "description": "Non-recoverable error reported during the turn.\n\nEmitted from multiple sites in\n`omnigent/runtime/workflow.py` \u2014 terminal LLM failures\n(`_emit_llm_error_event`), execution timeouts\n(`_handle_execution_timeout`), and the agent-loop catch-all\n(`except Exception`). Wire shape matches those emits.",
         "properties": {
+          "conversation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Conversation Id"
+          },
           "error": {
             "$ref": "#/components/schemas/RetryErrorDetail",
             "description": "Classified error description."
+          },
+          "response_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Response Id"
+          },
+          "runner_offline_episode_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Runner Offline Episode Id"
           },
           "sequence_number": {
             "anyOf": [
@@ -2256,6 +2418,17 @@
             ],
             "default": null,
             "title": "Sequence Number"
+          },
+          "session_observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionObservation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "source": {
             "description": "Origin of the error -- `\"llm\"` for LLM-call failures, `\"execution\"` for timeouts, `\"tool\"` for tool failures, `\"harness\"` for harness process failures.",
@@ -2638,6 +2811,18 @@
       "FailedEvent": {
         "description": "Terminal event for a turn that ended with an error.\n\nCarries a `omnigent.server.schemas.FailedResponseObject`\nwhose `error` field describes the failure. Response metadata may\nbe absent when the failure occurs before response allocation.",
         "properties": {
+          "conversation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Conversation Id"
+          },
           "response": {
             "anyOf": [
               {
@@ -2649,6 +2834,18 @@
             ],
             "description": "The failure response object with `status=\"failed\"` and `error` populated.",
             "title": "Response"
+          },
+          "runner_offline_episode_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Runner Offline Episode Id"
           },
           "sequence_number": {
             "anyOf": [
@@ -2662,6 +2859,17 @@
             ],
             "default": null,
             "title": "Sequence Number"
+          },
+          "session_observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionObservation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "source": {
             "default": "execution",
@@ -3411,9 +3619,33 @@
       "InProgressEvent": {
         "description": "Event emitted once the task transitions to in-progress.\n\nAlways follows `response.created` (and `response.queued`\nfor background tasks).",
         "properties": {
+          "conversation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Conversation Id"
+          },
           "response": {
             "$ref": "#/components/schemas/ResponseObject",
             "description": "The response object with `status=\"in_progress\"`."
+          },
+          "runner_offline_episode_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Runner Offline Episode Id"
           },
           "sequence_number": {
             "anyOf": [
@@ -3427,6 +3659,17 @@
             ],
             "default": null,
             "title": "Sequence Number"
+          },
+          "session_observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionObservation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "type": {
             "const": "response.in_progress",
@@ -3460,9 +3703,33 @@
       "IncompleteEvent": {
         "description": "Terminal event for a turn that ended without completing\n(e.g. hit the iteration cap or token budget).",
         "properties": {
+          "conversation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Conversation Id"
+          },
           "response": {
             "$ref": "#/components/schemas/ResponseObject",
             "description": "The final response object with `status=\"incomplete\"` and `incomplete_details` populated describing the reason."
+          },
+          "runner_offline_episode_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Runner Offline Episode Id"
           },
           "sequence_number": {
             "anyOf": [
@@ -3476,6 +3743,17 @@
             ],
             "default": null,
             "title": "Sequence Number"
+          },
+          "session_observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionObservation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "type": {
             "const": "response.incomplete",
@@ -4416,6 +4694,18 @@
       "OutputTextDeltaEvent": {
         "description": "Incremental assistant-text token emitted during streaming.\n\nWire shape matches the existing raw-dict emit at\n`omnigent/runtime/workflow.py:1352-1356`.",
         "properties": {
+          "conversation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Conversation Id"
+          },
           "delta": {
             "description": "The text fragment for this chunk, e.g. `\"Hello\"`.",
             "title": "Delta",
@@ -4461,6 +4751,18 @@
             "description": "For native terminal streaming, the provider's stable per-message id, e.g. `\"2ca51d97-2f0f-493a-aed7-85a5b56c5747\"`. `None` for ordinary in-process task streaming, where deltas group by the active response.",
             "title": "Message Id"
           },
+          "runner_offline_episode_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Runner Offline Episode Id"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -4473,6 +4775,17 @@
             ],
             "default": null,
             "title": "Sequence Number"
+          },
+          "session_observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionObservation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "type": {
             "const": "response.output_text.delta",
@@ -4912,9 +5225,33 @@
       "QueuedEvent": {
         "description": "Optional event emitted between `created` and `in_progress`\nfor background tasks that are queued before they start.\n\nForeground streaming responses skip this event.",
         "properties": {
+          "conversation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Conversation Id"
+          },
           "response": {
             "$ref": "#/components/schemas/ResponseObject",
             "description": "The response object with `status=\"queued\"`."
+          },
+          "runner_offline_episode_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Runner Offline Episode Id"
           },
           "sequence_number": {
             "anyOf": [
@@ -4928,6 +5265,17 @@
             ],
             "default": null,
             "title": "Sequence Number"
+          },
+          "session_observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionObservation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "type": {
             "const": "response.queued",
@@ -7047,6 +7395,17 @@
             "description": "Runner currently bound to the session.",
             "title": "Runner Id"
           },
+          "runner_offline_episode_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runner Offline Episode Id"
+          },
           "runner_online": {
             "anyOf": [
               {
@@ -7070,6 +7429,16 @@
             ],
             "description": "Excerpt of the chat content that matched the request's `search_query`, centered on the match with `\u2026` marking elided ends, so the search UI can show *where* a session matched in its body. Present whenever the query hit an item body (even if the title also matched); `None` on non-search reads and when only the title matched.",
             "title": "Search Snippet"
+          },
+          "session_observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionObservation"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "status": {
             "description": "Derived session lifecycle status.",
@@ -7260,6 +7629,82 @@
           "conversation_id"
         ],
         "title": "SessionModelOptionsEvent",
+        "type": "object"
+      },
+      "SessionObservation": {
+        "description": "One ordered live-state observation within a runner binding.",
+        "properties": {
+          "binding_epoch": {
+            "default": 0,
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Binding Epoch",
+            "type": "integer"
+          },
+          "error_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error Key"
+          },
+          "observation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observation Id"
+          },
+          "response_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Response Id"
+          },
+          "revision": {
+            "default": 0,
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Revision",
+            "type": "integer"
+          },
+          "runner_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runner Id"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          }
+        },
+        "title": "SessionObservation",
         "type": "object"
       },
       "SessionPermissionModeEvent": {
@@ -7997,6 +8442,17 @@
             "description": "Runner currently bound to this session, e.g. `\"runner_abc123\"`. `None` until a client binds one via `PATCH /v1/sessions/{id}`.",
             "title": "Runner Id"
           },
+          "runner_offline_episode_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runner Offline Episode Id"
+          },
           "runner_online": {
             "anyOf": [
               {
@@ -8019,6 +8475,16 @@
               }
             ],
             "description": "Managed-sandbox launch progress while the session's background sandbox launch is in flight or has failed \u2014 see `SandboxStatus`. `None` for sessions without a managed launch and once the launch succeeds. Sourced from the Omnigent server's in-memory `_session_sandbox_status_cache` at snapshot build time, so a client opening the session mid-launch sees the current stage."
+          },
+          "session_observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionObservation"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "share_workspace_files": {
             "default": false,
@@ -8323,6 +8789,18 @@
             "description": "Optional active response id for terminal-backed integrations, e.g. `\"codex_turn_abc123\"`. Clients use it to associate coarse session status edges with the assistant bubble they describe. `None` for ordinary in-process runtime edges.",
             "title": "Response Id"
           },
+          "runner_offline_episode_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Runner Offline Episode Id"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -8335,6 +8813,17 @@
             ],
             "default": null,
             "title": "Sequence Number"
+          },
+          "session_observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionObservation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "status": {
             "description": "New session status. `\"launching\"` (session or child task created, but no concrete harness start observed), `\"idle\"` (no loop running), `\"running\"` (loop executing), `\"waiting\"` (parent turn parked on the async-work drain), or `\"failed\"` (terminal failure).",
@@ -8465,6 +8954,30 @@
             "title": "Pending",
             "type": "boolean"
           },
+          "response_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Response Id"
+          },
+          "runner_offline_episode_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Runner Offline Episode Id"
+          },
           "sequence_number": {
             "anyOf": [
               {
@@ -8477,6 +8990,17 @@
             ],
             "default": null,
             "title": "Sequence Number"
+          },
+          "session_observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SessionObservation"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           },
           "type": {
             "const": "session.terminal_pending",

@@ -17,6 +17,8 @@ import secrets
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from concurrent.futures import Future
+from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
 
 import httpx
@@ -49,6 +51,12 @@ from omnigent.entities.conversation import (
     parse_item_data,
 )
 from omnigent.entities.permission import SessionPermission
+from omnigent.entities.session_observation import (
+    RecordedRunnerOfflineDecision,
+    RunnerOfflineDecision,
+    SessionObservation,
+    is_versioned_session_observation,
+)
 from omnigent.errors import ElicitationDeclinedError, ErrorCode, OmnigentError
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
@@ -103,11 +111,11 @@ from omnigent.runner.subagent_routing import (
     harness_family,
     subagent_routing_enabled,
 )
+from omnigent.runner.subagent_work import SUBAGENT_DISPATCH_ID_LABEL_KEY
 from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import (
     disconnect_outcome,
     get_policy_store,
-    inflight_text,
     pending_elicitations,
     pending_inputs,
 )
@@ -253,6 +261,7 @@ from omnigent.server.routes._sessions.helpers import (
     _await_settled_managed_launch,
     _build_new_item,
     _build_policy_engine_from_spec,
+    _capture_status_observation,
     _child_session_summary_from_conversation,
     _codex_subagent_labels_from_body,
     _coerce_cumulative_field,
@@ -271,6 +280,7 @@ from omnigent.server.routes._sessions.helpers import (
     _extract_persistent_item_from_sse,
     _extract_user_text_for_routing,
     _extract_user_text_from_event,
+    _failure_log_detail,
     _find_codex_native_subagent_child,
     _find_devin_native_subagent_child,
     _find_subagent_child_by_title,
@@ -345,6 +355,7 @@ from omnigent.server.routes._sessions.helpers import (
     _routing_decision_item_from_sse,
     _RunnerForwardResult,
     _seed_missing_title_from_user_message,
+    _session_status_error_labels,
     _session_status_from_cache,
     _session_status_with_child_rollup,
     _SessionEventDispatchResult,
@@ -382,6 +393,7 @@ from omnigent.server.schemas import (
     SessionStatusEvent,
     SessionUsageEvent,
 )
+from omnigent.server.session_observations import SessionProjection
 from omnigent.server.subagent_activity import (
     claude_subagent_completion_markers,
     record_claude_subagent_return,
@@ -887,7 +899,7 @@ async def _stop_host_runner_intentionally(
                 settled = await asyncio.wrap_future(
                     session_live_state.submit(
                         "settle_intentional_stop",
-                        conversation_store.settle_intentionally_stopped_session,
+                        conversation_store.settle_stopped_session_observation,
                         related_id,
                         runner_id,
                     )
@@ -895,7 +907,12 @@ async def _stop_host_runner_intentionally(
                 handle = _runner_relay_tasks.get(related_id)
                 if settled and (handle is None or handle.runner_id == runner_id):
                     session_live_state.forget_live_status(related_id)
-                    _publish_status(related_id, "idle", persist_live_status=False)
+                    _publish_status(
+                        related_id,
+                        "idle",
+                        persist_live_status=False,
+                        session_observation=settled,
+                    )
         return acknowledged
 
 
@@ -1201,19 +1218,54 @@ def _build_session_list_item(
     # ``conv.agent_id`` is guaranteed non-None by the caller (sessions
     # only); assert for the type checker without a runtime branch.
     assert conv.agent_id is not None
+    _session_status_from_cache(conv.id, conv.live_status, conversation=conv)
     level = _permission_level_from_grants(user_id, grants, user_is_admin)
     owner = _owner_from_grants(grants) if permissions_enabled else None
     # Per-viewer read tracking, embedded so the client hydrates the unread
     # dots straight from the list (no separate fetch). Built per-user here —
     # `user_id` is the requesting caller, never broadcast to other viewers.
     viewer_last_seen, viewer_unread = _read_state_entry(user_id, conv.id)
+    list_status = _session_status_with_child_rollup(conv.id, child_session_ids, conv.live_status)
+    projection = _session_status_cache.projection(conv.id)
+    if projection is not None and (
+        projection.observation != conv.session_observation
+        or projection.offline_episode_id
+        != (conv.runner_offline_decision.episode_id if conv.runner_offline_decision else None)
+    ):
+        list_status = (
+            "running"
+            if conv.live_status in _MID_TURN_STATUSES
+            else "failed"
+            if conv.live_status == "failed"
+            else "idle"
+        )
+        if list_status == "idle" and any(
+            _session_status_cache.get(child_id) in _MID_TURN_STATUSES
+            for child_id in child_session_ids
+        ):
+            list_status = "running"
     return SessionListItem(
         id=conv.id,
+        session_observation=conv.session_observation,
+        runner_offline_episode_id=(
+            conv.runner_offline_decision.episode_id if conv.runner_offline_decision else None
+        ),
         agent_id=conv.agent_id,
         agent_name=agent_names_by_id.get(conv.agent_id),
         status=_list_status_with_starting(
-            _session_status_with_child_rollup(conv.id, child_session_ids, conv.live_status),
+            list_status,
             conv.id,
+            conversation=conv,
+            allow_cached_starting=projection is None
+            or (
+                projection.observation == conv.session_observation
+                and projection.offline_episode_id
+                == (
+                    conv.runner_offline_decision.episode_id
+                    if conv.runner_offline_decision
+                    else None
+                )
+            ),
         ),
         created_at=conv.created_at,
         updated_at=conv.updated_at,
@@ -1420,6 +1472,25 @@ def _build_session_response(
             "Session has no agent binding",
             code=ErrorCode.INTERNAL_ERROR,
         )
+    observation = conv.session_observation
+    projection = _session_status_cache.projection(conv.id)
+    versioned = is_versioned_session_observation(observation)
+    if projection is not None and (
+        projection.observation != observation
+        or projection.offline_episode_id
+        != (conv.runner_offline_decision.episode_id if conv.runner_offline_decision else None)
+    ):
+        # A snapshot must not attach an older token to newer cached lifecycle data.
+        status = (
+            "running"
+            if conv.live_status in _MID_TURN_STATUSES
+            else "failed"
+            if conv.live_status == "failed"
+            else "idle"
+        )
+        last_task_error = _last_task_error_from_labels(conv.labels)
+        background_task_count = None
+        background_tasks = None
     # Usage to display for this node: the SUBTREE total (this session + its
     # sub-agents) when the caller computed it, else this conversation's own
     # usage. Shared by the cost indicator and the per-model breakdown so
@@ -1444,6 +1515,10 @@ def _build_session_response(
         labels = {**labels, CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE}
     return SessionResponse(
         id=conv.id,
+        session_observation=conv.session_observation,
+        runner_offline_episode_id=(
+            conv.runner_offline_decision.episode_id if conv.runner_offline_decision else None
+        ),
         agent_id=conv.agent_id,
         agent_name=agent_name,
         status=status,
@@ -1514,7 +1589,7 @@ def _build_session_response(
         # sees the Terminal-pill spinner. Populated by the runner SSE
         # relay; absent (False) for non-terminal-first sessions or once
         # the terminal lands / auto-create fails.
-        terminal_pending=_session_terminal_pending_cache.get(conv.id, False),
+        terminal_pending=_session_terminal_pending_cache.value_for(conv),
         # Replay managed-sandbox launch progress so a client opening the
         # session mid-launch (the Web UI navigates here immediately
         # after the non-blocking managed create) sees the provisioning
@@ -1529,7 +1604,11 @@ def _build_session_response(
         # ``activeResponse`` (the turn-start ``running`` edge that carried it
         # is not replayed on the SSE stream). Populated for native-terminal
         # sessions whose forwarder stamps a turn id; ``None`` otherwise.
-        active_response_id=_session_active_response_cache.get(conv.id),
+        active_response_id=(
+            observation.response_id if conv.live_status in _MID_TURN_STATUSES else None
+        )
+        if versioned
+        else _session_active_response_cache.get(conv.id),
         project_id=conv.project_id,
     )
 
@@ -3508,6 +3587,9 @@ async def _enrich_terminal_status_with_subagent_output(
     status: str,
     session_id: str,
     conversation_store: ConversationStore,
+    *,
+    expected_observation: SessionObservation | None = None,
+    predecessor: session_live_state.PendingObservation | None = None,
 ) -> dict[str, Any]:
     """
     Attach a native session's durable assistant text to a terminal status edge.
@@ -3556,15 +3638,50 @@ async def _enrich_terminal_status_with_subagent_output(
     if isinstance(failure_detail, str) and failure_detail.strip():
         context.setdefault("detail_source", "external_status_failure_detail")
         return {**data, "output": failure_detail.strip()}
-    raw_response_id = data.get("response_id") if current_turn_only else None
-    response_id = raw_response_id if isinstance(raw_response_id, str) and raw_response_id else None
-    output = await asyncio.to_thread(
-        _latest_assistant_text_from_store,
-        conversation_store,
-        session_id,
-        response_id=response_id,
-        stop_at_user_message=current_turn_only,
+    raw_response_id = (
+        data.get("response_id") if current_turn_only or expected_observation is not None else None
     )
+    response_id = raw_response_id if isinstance(raw_response_id, str) and raw_response_id else None
+    if expected_observation is not None and predecessor is not None:
+        try:
+            queued = await asyncio.shield(asyncio.wrap_future(predecessor.future))
+        except Exception:  # noqa: BLE001 — no persistence proof means generic source detail
+            queued = None
+        if queued is not None and (
+            queued.runner_id == expected_observation.runner_id
+            and queued.binding_epoch == expected_observation.binding_epoch
+            and queued.revision >= expected_observation.revision
+        ):
+            expected_observation = queued
+
+    def read_output() -> str | None:
+        if (
+            response_id is None
+            and expected_observation is not None
+            and (conversation_store.get_session_observation(session_id) != expected_observation)
+        ):
+            return None
+        output = _latest_assistant_text_from_store(
+            conversation_store,
+            session_id,
+            response_id=response_id,
+            stop_at_user_message=current_turn_only,
+        )
+        if (
+            response_id is None
+            and expected_observation is not None
+            and (conversation_store.get_session_observation(session_id) != expected_observation)
+        ):
+            return None
+        return output
+
+    try:
+        output = await asyncio.to_thread(read_output)
+    except Exception:  # noqa: BLE001 — fallback text is optional source detail
+        _logger.warning(
+            "Cannot read source-owned terminal output for %s", session_id, exc_info=True
+        )
+        output = None
     if output is None:
         if status == "failed":
             context["detail_source"] = "missing"
@@ -3579,6 +3696,8 @@ async def _heal_subagent_runner_binding_via_parent(
     runner_router: RunnerRouter | None,
     tunnel_registry: TunnelRegistry | None,
     conversation_store: ConversationStore,
+    *,
+    expected_observation: SessionObservation | None = None,
 ) -> httpx.AsyncClient | None:
     """
     Repair a sub-agent's stale ``runner_id`` and return its parent's live client.
@@ -3618,6 +3737,7 @@ async def _heal_subagent_runner_binding_via_parent(
     # live runner.  A single hop covers the common case; two hops cover nested
     # sub-agents where the immediate parent's runner is also stale but the root
     # is still healthy.
+    captured = expected_observation or getattr(child_conv, "session_observation", None)
     candidate_ids: list[str] = []
     if child_conv.parent_conversation_id and child_conv.parent_conversation_id != child_conv.id:
         candidate_ids.append(child_conv.parent_conversation_id)
@@ -3662,19 +3782,33 @@ async def _heal_subagent_runner_binding_via_parent(
         from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 
         if is_side_chat_child(child_conv.labels):
-            # The side chat's ephemeral fork died with its runner; it can't move.
             return None
-        # Heal the divergence so this child's row matches the live runner: the
-        # next forward resolves directly and a future ``_on_runner_connect``
-        # (which rebinds by matching runner_id) can recover it.
+    if live_runner_id != child_conv.runner_id or captured is not None:
         try:
-            await asyncio.to_thread(
-                conversation_store.replace_runner_id, child_conv.id, live_runner_id
-            )
+            if captured is None:
+                await asyncio.to_thread(
+                    conversation_store.replace_runner_id, child_conv.id, live_runner_id
+                )
+            else:
+                updated = await asyncio.to_thread(
+                    conversation_store.replace_runner_id,
+                    child_conv.id,
+                    live_runner_id,
+                    expected_observation=captured,
+                )
+                changed = live_runner_id != captured.runner_id
+                expected_after = captured.model_copy(
+                    update={
+                        "runner_id": live_runner_id,
+                        "binding_epoch": captured.binding_epoch + int(changed),
+                        "observation_id": None if changed else captured.observation_id,
+                        "response_id": None if changed else captured.response_id,
+                        "error_key": None if changed else captured.error_key,
+                    }
+                )
+                if updated.session_observation != expected_after:
+                    return None
         except ConversationNotFoundError:
-            # The child was deleted between reading it and this heal (e.g.
-            # removed mid-teardown).  Degrade gracefully rather than surfacing
-            # a benign race as an unhandled 500.
             return None
 
     return live_client
@@ -3722,10 +3856,28 @@ async def _recover_subagent_status_forward_via_parent(
         runner was resolved, or ``None`` when none could be (the caller then
         fails the forward as before).
     """
+    data = forward_body.get("data")
+    raw_observation = data.get("session_observation") if isinstance(data, dict) else None
+    expected = None
+    if raw_observation is not None:
+        try:
+            expected = SessionObservation.model_validate(raw_observation)
+        except ValueError:
+            return _RunnerForwardResult(204, '{"ignored":true}')
     client = await _heal_subagent_runner_binding_via_parent(
-        child_conv, runner_router, tunnel_registry, conversation_store
+        child_conv,
+        runner_router,
+        tunnel_registry,
+        conversation_store,
+        expected_observation=expected,
     )
     if client is None:
+        if expected is not None:
+            current = await asyncio.to_thread(
+                conversation_store.get_session_observation, child_conv.id
+            )
+            if current != expected:
+                return _RunnerForwardResult(204, '{"ignored":true}')
         return None
     return await _forward_session_change_to_runner(
         child_conv.id,
@@ -3781,6 +3933,8 @@ async def _publish_runner_recovered_status_impl(
     conversation_store: ConversationStore,
     *,
     require_disconnect_code: bool = False,
+    owner: SessionObservation | None = None,
+    predecessor: session_live_state.PendingObservation | None = None,
 ) -> None:
     """
     Clear a stale failed session status after runner recovery.
@@ -3828,26 +3982,93 @@ async def _publish_runner_recovered_status_impl(
     # reconnect proves the runner is reachable again, which invalidates a
     # disconnect failure but says nothing about a genuine task error —
     # leave that one alone. Explicit rebinds skip this guard.
+    captured = owner
+    if captured is not None and predecessor is not None:
+        queued = await asyncio.shield(asyncio.wrap_future(predecessor.future))
+        if queued is not None and (
+            queued.runner_id == captured.runner_id
+            and queued.binding_epoch == captured.binding_epoch
+            and queued.revision >= captured.revision
+        ):
+            captured = queued
+    conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    if captured is not None and (
+        not isinstance(conv, Conversation) or conv.session_observation != captured
+    ):
+        return
     if require_disconnect_code:
-        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         last_error = _last_task_error_from_labels(conv.labels) if conv is not None else None
         if last_error is None or last_error.get("code") != "runner_disconnected":
             return
-    _session_status_cache[session_id] = "idle"
-    session_live_state.persist_live_status(session_id, "idle")
-    event = SessionStatusEvent(
-        type="session.status",
-        conversation_id=session_id,
-        status="idle",
-        error=None,
-    )
-    session_stream.publish(session_id, event.model_dump())
-    if require_disconnect_code:
-        # Only a passive reconnect can show the same turn resuming on its own.
-        disconnect_outcome.note_disconnect_failure_cleared(
-            session_id, failure_code="runner_disconnected"
+    versioned_store = callable(getattr(conversation_store, "record_session_observation", None))
+    recovered_observation: SessionObservation | None = None
+    if isinstance(conv, Conversation) and versioned_store:
+        captured = captured or conv.session_observation
+        observed = await asyncio.wrap_future(
+            session_live_state.submit(
+                "record_runner_recovery",
+                lambda: conversation_store.record_session_observation(
+                    session_id,
+                    "idle",
+                    expected_binding_epoch=captured.binding_epoch,
+                    expected_revision=captured.revision,
+                ),
+            )
         )
-    await _persist_session_status_error_labels(session_id, None, conversation_store)
+        if observed is None:
+            return
+        _publish_status(
+            session_id, "idle", persist_live_status=False, session_observation=observed
+        )
+        recovered_observation = observed
+    else:
+        _session_status_cache[session_id] = "idle"
+        session_live_state.persist_live_status(session_id, "idle")
+        event = SessionStatusEvent(
+            type="session.status", conversation_id=session_id, status="idle", error=None
+        )
+        session_stream.publish(session_id, event.model_dump())
+    if require_disconnect_code and (
+        recovered_observation is None
+        or _relay_projection_is_current(session_id, recovered_observation)
+    ):
+        disconnect_outcome.note_disconnect_failure_cleared(
+            session_id,
+            failure_code="runner_disconnected",
+            runner_id=captured.runner_id if captured is not None else None,
+        )
+    # Owned disconnect causes live in metadata and clear with the observation.
+    if not isinstance(conv, Conversation) or not versioned_store:
+        await _persist_session_status_error_labels(session_id, None, conversation_store)
+
+
+@dataclass(frozen=True)
+class _RunnerOfflineCandidate:
+    snapshot: Conversation
+    observation: SessionObservation
+    pending: session_live_state.PendingObservation | None
+    cached_status: str | None
+    turn_id: str | None
+
+
+@_session_status_cache.synchronized
+def _capture_runner_offline_candidate(conv: Conversation) -> _RunnerOfflineCandidate:
+    captured = conv.session_observation
+    projection = _session_status_cache.projection(conv.id)
+    if (
+        projection is not None
+        and projection.observation.runner_id == captured.runner_id
+        and projection.observation.binding_epoch == captured.binding_epoch
+        and projection.observation.revision >= captured.revision
+    ):
+        captured = projection.observation
+    return _RunnerOfflineCandidate(
+        replace(conv, labels=dict(conv.labels)),
+        captured,
+        session_live_state.pending_observation(conv.id, captured),
+        _session_status_cache.get(conv.id),
+        captured.response_id or _session_active_response_cache.get(conv.id),
+    )
 
 
 _RUNNER_OFFLINE_RETRY_DELAYS_S = (0.5, 1.0)
@@ -3896,7 +4117,7 @@ async def _mark_runner_sessions_offline_impl(
         children are skipped either way.
     :returns: None.
     """
-    pending = convs
+    pending = [_capture_runner_offline_candidate(conv) for conv in convs]
     for delay in (0.0, *_RUNNER_OFFLINE_RETRY_DELAYS_S):
         if delay:
             await asyncio.sleep(delay)
@@ -3909,20 +4130,25 @@ async def _mark_runner_sessions_offline_impl(
         "Runner offline reconciliation exhausted metadata retries for %d session(s); "
         "sample session IDs: %s",
         len(pending),
-        [conv.id for conv in pending[:10]],
+        [candidate.snapshot.id for candidate in pending[:10]],
     )
 
 
 async def _mark_runner_sessions_offline_once(
-    convs: list[Conversation],
+    candidates: list[_RunnerOfflineCandidate],
     error: ErrorDetail,
     conversation_store: ConversationStore,
     *,
     fail_idle_top_level: bool,
-) -> list[Conversation]:
+) -> list[_RunnerOfflineCandidate]:
     """Reconcile each session once and return the ones blocked by metadata errors."""
-    retry: list[Conversation] = []
-    for conv in convs:
+    retry: list[_RunnerOfflineCandidate] = []
+    for candidate in candidates:
+        conv = candidate.snapshot
+        captured = candidate.observation
+        pending = candidate.pending
+        cached_status = candidate.cached_status
+        captured_turn_id = candidate.turn_id
         handle = _runner_relay_tasks.get(conv.id)
         stopped_runner_id = _intentional_stop_sessions.get(conv.id)
         if handle is not None and handle.runner_id != conv.runner_id:
@@ -3940,7 +4166,7 @@ async def _mark_runner_sessions_offline_once(
                     exc_info=True,
                     extra={"session_id": conv.id},
                 )
-                retry.append(conv)
+                retry.append(candidate)
                 continue
             if binding is None or binding[0] != conv.runner_id:
                 continue
@@ -3953,17 +4179,21 @@ async def _mark_runner_sessions_offline_once(
                 if _session_status_cache.get(conv.id, conv.live_status) in _MID_TURN_STATUSES:
                     # Order the conditional settlement after earlier live-state writes.
                     # The database binding guards sessions rebound before a relay exists.
-                    settled = await asyncio.wrap_future(
+                    result = await asyncio.wrap_future(
                         session_live_state.submit(
                             "settle_intentional_stop",
-                            conversation_store.settle_intentionally_stopped_session,
+                            _settle_stopped_observation,
+                            conversation_store,
                             conv.id,
                             stopped_runner_id,
+                            captured,
+                            pending,
                         )
                     )
-                    if settled is None:
-                        retry.append(conv)
+                    if result is None:
+                        retry.append(candidate)
                         continue
+                    [settled] = result
                     current_handle = _runner_relay_tasks.get(conv.id)
                     if (
                         current_handle is not None
@@ -3975,7 +4205,12 @@ async def _mark_runner_sessions_offline_once(
                         current_handle is None or current_handle.runner_id == stopped_runner_id
                     ):
                         session_live_state.forget_live_status(conv.id)
-                        _publish_status(conv.id, "idle", persist_live_status=False)
+                        _publish_status(
+                            conv.id,
+                            "idle",
+                            persist_live_status=False,
+                            session_observation=settled,
+                        )
                 if _intentional_stop_sessions.get(conv.id) == stopped_runner_id:
                     _intentional_stop_sessions.pop(conv.id, None)
             continue
@@ -3988,15 +4223,197 @@ async def _mark_runner_sessions_offline_once(
             error_code=error.code,
         ):
             continue
-        turn_id = _session_active_response_cache.get(conv.id)
-        _publish_status(conv.id, "failed", error, failure_origin="runner_offline_sweep")
-        await record_subagent_activity(
-            conv.id, "returned", conversation_store, turn_id=turn_id, status="failed"
+        recorded = await asyncio.wrap_future(
+            session_live_state.submit(
+                "record_runner_offline_decision",
+                _record_runner_offline_decision,
+                conversation_store,
+                conv,
+                captured,
+                pending,
+                cached_status,
+                captured_turn_id,
+                error,
+                fail_idle_top_level,
+            )
         )
-        await _persist_session_status_error_labels(
-            conv.id, error, conversation_store, owner_runner_id=conv.runner_id
+        if recorded is None:
+            # The helper distinguishes stale ownership from storage errors by
+            # raising only the latter; submit logs and returns None on errors.
+            retry.append(candidate)
+            continue
+        if recorded is False:
+            continue
+        decision = recorded.decision
+        publication_error = error
+        if not recorded.created:
+            labels = decision.error_labels
+            publication_error = ErrorDetail(
+                code=labels.get("omnigent.last_task_error_code", error.code),
+                message=labels.get("omnigent.last_task_error_message", error.message),
+                title=labels.get("omnigent.last_task_error_title") or None,
+                cause=labels.get("omnigent.last_task_error_cause") or None,
+                remediation=labels.get("omnigent.last_task_error_remediation") or None,
+            )
+        session_live_state.persist_owned_scheduled_run_completion(
+            conv.id,
+            decision,
+            error_code=publication_error.code,
+            error=publication_error.message,
+        )
+        if recorded.created:
+            _logger.error(
+                "session turn failed for %s (origin=runner_offline_sweep code=%s prev=%s): %s",
+                conv.id,
+                error.code,
+                decision.observation.status or "unknown",
+                _failure_log_detail(error),
+                extra=debug_event(
+                    "session_turn_failed",
+                    session_id=conv.id,
+                    origin="runner_offline_sweep",
+                    code=error.code,
+                    previous_status=decision.observation.status or "unknown",
+                    response_id=decision.observation.response_id,
+                    runner_id=decision.observation.runner_id,
+                    runner_binding_epoch=decision.observation.binding_epoch,
+                    live_status_revision=decision.observation.revision,
+                    runner_offline_episode_id=decision.episode_id,
+                ),
+            )
+        try:
+            current = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+        except Exception:  # noqa: BLE001 — retain the committed decision for a projection retry
+            _logger.warning(
+                "Cannot resolve committed offline projection for %s",
+                conv.id,
+                exc_info=True,
+                extra={"session_id": conv.id},
+            )
+            retry.append(candidate)
+            continue
+        if current is None or current.runner_offline_decision != decision:
+            continue
+        _publish_status(
+            conv.id,
+            "failed",
+            publication_error,
+            response_id=decision.observation.response_id,
+            failure_origin="runner_offline_sweep",
+            persist_live_status=False,
+            session_observation=decision.observation,
+            runner_offline_decision=decision,
+            failure_logged=True,
+        )
+        await record_subagent_activity(
+            conv.id,
+            "returned",
+            conversation_store,
+            turn_id=decision.activity_turn_id,
+            status="failed",
+            offline_decision=decision,
         )
     return retry
+
+
+def _settle_stopped_observation(
+    store: ConversationStore,
+    session_id: str,
+    runner_id: str,
+    captured: SessionObservation,
+    pending: session_live_state.PendingObservation | None,
+) -> tuple[SessionObservation | None]:
+    """Distinguish a rejected ownership check from a failed metadata write."""
+    if pending is not None:
+        queued = session_live_state.resolved_observation(pending)
+        if (
+            queued is not None
+            and queued.runner_id == captured.runner_id
+            and queued.binding_epoch == captured.binding_epoch
+            and queued.revision >= captured.revision
+        ):
+            captured = queued
+    settled = store.settle_stopped_session_observation(session_id, runner_id, captured)
+    if settled is None:
+        current = store.get_session_observation(session_id)
+        if current is not None and (
+            current.runner_id == captured.runner_id
+            and current.binding_epoch == captured.binding_epoch
+            and current.status == "idle"
+        ):
+            settled = current
+    return (settled,)
+
+
+def _record_runner_offline_decision(
+    store: ConversationStore,
+    snapshot: Conversation,
+    captured: SessionObservation,
+    pending: session_live_state.PendingObservation | None,
+    cached_status: str | None,
+    turn_id: str | None,
+    error: ErrorDetail,
+    fail_idle_top_level: bool,
+) -> RecordedRunnerOfflineDecision | Literal[False]:
+    """Promote the exact queued edge and commit its interruption on the worker."""
+    observation = captured
+    if pending is not None:
+        queued = session_live_state.resolved_observation(pending)
+        if (
+            queued is None
+            and pending.owner is not None
+            and (
+                pending.owner.runner_id == captured.runner_id
+                and pending.owner.binding_epoch == captured.binding_epoch
+            )
+        ):
+            queued = store.record_session_observation(
+                snapshot.id,
+                pending.status,
+                response_id=pending.response_id,
+                error_key=pending.error_key,
+                error_labels=pending.error_labels,
+                observation_id=pending.observation_id,
+                expected_binding_epoch=captured.binding_epoch,
+                expected_revision=captured.revision,
+            )
+        if (
+            queued is None
+            or queued.runner_id != snapshot.runner_id
+            or queued.binding_epoch != snapshot.runner_binding_epoch
+        ):
+            return False
+        if queued.revision >= captured.revision:
+            observation = queued
+    elif cached_status is not None and cached_status != captured.status:
+        promoted = store.record_session_observation(
+            snapshot.id,
+            cached_status,
+            response_id=turn_id if cached_status in _MID_TURN_STATUSES else None,
+            observation_id=uuid.uuid4().hex,
+            expected_binding_epoch=captured.binding_epoch,
+            expected_revision=captured.revision,
+        )
+        if promoted is None:
+            return False
+        observation = promoted
+    if observation.status not in _MID_TURN_STATUSES:
+        if (
+            not fail_idle_top_level
+            or snapshot.kind == "sub_agent"
+            or (observation.status == "failed" and observation.error_key is not None)
+        ):
+            return False
+    episode_id = uuid.uuid4().hex
+    decision = RunnerOfflineDecision(
+        observation=observation,
+        episode_id=episode_id,
+        error_labels=_session_status_error_labels(error, owner_runner_id=snapshot.runner_id),
+        activity_turn_id=observation.response_id or turn_id or f"runner-offline:{episode_id}",
+        scheduled_run_id=session_live_state.capture_scheduled_run_id(snapshot.id),
+    )
+    recorded = store.record_runner_offline_decision(snapshot.id, decision)
+    return recorded if recorded is not None else False
 
 
 async def _wait_for_host_reconnect(
@@ -5551,6 +5968,7 @@ async def _ensure_runner_session_initialized(
     :returns: ``True`` when a current runner explicitly confirmed its native
         terminal is ready; ``False`` for legacy or non-native responses.
     """
+    captured_owner = conv.session_observation
     try:
         if initializer is not None:
             resp = await initializer.initialize(
@@ -5572,6 +5990,7 @@ async def _ensure_runner_session_initialized(
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
             )
         from omnigent.server.runner_session_init import (
+            apply_initialization_observation,
             is_session_agent_removed,
             runner_inference_verified,
         )
@@ -5582,16 +6001,12 @@ async def _ensure_runner_session_initialized(
             if require_success or conv.inference_snapshot is not None:
                 raise _agent_removed()
             return False
+        resp.raise_for_status()
         if not runner_inference_verified(conv, resp):
             raise OmnigentError(
                 "The runner did not accept this session's saved inference configuration",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
-        # httpx only raises on transport errors; a 4xx/5xx means create_session
-        # likely didn't run (terminal + forwarder not set up), so surface it
-        # via the same warning path rather than silently forwarding into a
-        # half-initialized runner.
-        resp.raise_for_status()
     except (httpx.HTTPError, ConnectionError) as exc:
         _logger.warning(
             "Session-init handshake to runner failed for session %s; "
@@ -5607,7 +6022,10 @@ async def _ensure_runner_session_initialized(
             ) from exc
         return False
 
-    await _publish_runner_recovered_status(session_id, conversation_store)
+    if apply_initialization_observation(conv, resp) is None:
+        await _publish_runner_recovered_status(
+            session_id, conversation_store, owner=captured_owner
+        )
     from omnigent.server.child_session_recovery import (
         restore_active_children,
         schedule_child_restoration,
@@ -5678,6 +6096,8 @@ async def _ensure_native_terminal_ready(
     *,
     persist_resource_event: bool = True,
     runner_router: RunnerRouter | None = None,
+    owner: SessionObservation | None = None,
+    predecessor: session_live_state.PendingObservation | None = None,
 ) -> _NativeTerminalEnsureOutcome:
     """
     Ask the runner to create or return the native terminal for a message.
@@ -5713,6 +6133,13 @@ async def _ensure_native_terminal_ready(
     """
     display_name, _, harness = _native_terminal_runtime(conv)
     terminal_name = _native_terminal_name_for_harness(harness)
+    if owner is None:
+        owner, predecessor = _capture_status_observation(session_id, conv.session_observation)
+    startup = (
+        await _begin_native_terminal_startup(session_id, owner, predecessor)
+        if owner is not None
+        else None
+    )
 
     async def _post_ensure() -> httpx.Response:
         if runner_router is not None:
@@ -5724,6 +6151,7 @@ async def _ensure_native_terminal_ready(
                 "session_key": "main",
                 "ensure_native_terminal": True,
                 "persist_resource_event": persist_resource_event,
+                **({"session_observation": startup.model_dump()} if startup is not None else {}),
             },
             timeout=10.0,
         )
@@ -5757,49 +6185,124 @@ async def _ensure_native_terminal_ready(
             error=_native_terminal_ensure_transport_error(exc, display_name=display_name),
         )
 
-    try:
-        resp = await _post_ensure()
-    except (httpx.HTTPError, ConnectionError) as exc:
-        if runner_router is None or conv.runner_id is None or not _is_tunnel_loss(exc):
-            return _transport_failure(exc)
-        _logger.warning(
-            "%s terminal ensure lost the runner tunnel for session=%s; waiting up to "
-            "%.0fs for runner %s to reconnect",
-            display_name,
-            session_id,
-            _NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S,
-            conv.runner_id,
-            extra={"session_id": session_id},
-        )
-        if not await runner_router.wait_for_runner(
-            conv.runner_id, timeout_s=_NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S
-        ):
-            return _transport_failure(exc)
-        _logger.info(
-            "Runner %s reconnected; repeating %s terminal ensure for session=%s",
-            conv.runner_id,
-            display_name,
-            session_id,
-            extra={"session_id": session_id},
-        )
+    async def _perform_ensure() -> _NativeTerminalEnsureOutcome:
         try:
             resp = await _post_ensure()
-        except (httpx.HTTPError, ConnectionError) as retry_exc:
-            return _transport_failure(retry_exc)
-    if resp.status_code < 400:
-        return _NativeTerminalEnsureOutcome(
-            error=None,
-            policy_notice=_policy_notice_from_ensure_response(resp),
+        except (httpx.HTTPError, ConnectionError) as exc:
+            if runner_router is None or conv.runner_id is None or not _is_tunnel_loss(exc):
+                return _transport_failure(exc)
+            _logger.warning(
+                "%s terminal ensure lost the runner tunnel for session=%s; waiting up to "
+                "%.0fs for runner %s to reconnect",
+                display_name,
+                session_id,
+                _NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S,
+                conv.runner_id,
+                extra={"session_id": session_id},
+            )
+            if not await runner_router.wait_for_runner(
+                conv.runner_id, timeout_s=_NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S
+            ):
+                return _transport_failure(exc)
+            _logger.info(
+                "Runner %s reconnected; repeating %s terminal ensure for session=%s",
+                conv.runner_id,
+                display_name,
+                session_id,
+                extra={"session_id": session_id},
+            )
+            try:
+                resp = await _post_ensure()
+            except (httpx.HTTPError, ConnectionError) as retry_exc:
+                return _transport_failure(retry_exc)
+        if resp.status_code < 400:
+            return _NativeTerminalEnsureOutcome(
+                error=None,
+                policy_notice=_policy_notice_from_ensure_response(resp),
+            )
+        _logger.warning(
+            "%s terminal ensure failed definitively for session=%s status=%s body=%s",
+            display_name,
+            session_id,
+            resp.status_code,
+            resp.text[:500],
+            extra={"session_id": session_id},
         )
-    _logger.warning(
-        "%s terminal ensure failed definitively for session=%s status=%s body=%s",
-        display_name,
-        session_id,
-        resp.status_code,
-        resp.text[:500],
-        extra={"session_id": session_id},
-    )
-    return _native_terminal_failure_from_runner_response(resp, display_name=display_name)
+        return _native_terminal_failure_from_runner_response(resp, display_name=display_name)
+
+    try:
+        result = await _perform_ensure()
+    except BaseException:
+        if startup is not None:
+            try:
+                await _complete_native_terminal_startup(session_id, startup)
+            except Exception:  # noqa: BLE001 — cleanup must preserve the original startup error
+                _logger.warning(
+                    "Cannot settle cancelled terminal startup for %s", session_id, exc_info=True
+                )
+        raise
+    if startup is None:
+        return result
+    try:
+        completed = await _complete_native_terminal_startup(session_id, startup)
+    except OmnigentError:
+        if result.error is None:
+            raise
+        # The definitive source error must still be accounted for and persisted.
+        completed = None
+    if completed is None and result.error is None:
+        raise OmnigentError(
+            "The session changed while its terminal started; retry the message.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+    return replace(result, observation=completed or startup)
+
+
+async def _begin_native_terminal_startup(
+    session_id: str,
+    owner: SessionObservation,
+    predecessor: session_live_state.PendingObservation | None = None,
+) -> SessionObservation | None:
+    """Reserve and publish one exact durable startup before its provider runs."""
+    reservation = session_live_state.reserve_terminal_startup(session_id, owner, predecessor)
+    if reservation is None:
+        return None
+    try:
+        startup = await asyncio.shield(asyncio.wrap_future(reservation))
+    except Exception as exc:
+        raise OmnigentError(
+            "Terminal startup ownership is temporarily unavailable; retry the message.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        ) from exc
+    if startup is None:
+        raise OmnigentError(
+            "The session changed before terminal startup; retry the message.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+    _session_status_cache.accept(session_id, SessionProjection(startup, startup.status or "idle"))
+    _publish_terminal_pending(session_id, True, session_observation=startup)
+    return startup
+
+
+async def _complete_native_terminal_startup(
+    session_id: str, startup: SessionObservation
+) -> SessionObservation | None:
+    completion = session_live_state.complete_terminal_startup(session_id, startup)
+    if completion is None:
+        return None
+    try:
+        completed = await asyncio.shield(asyncio.wrap_future(completion))
+    except Exception as exc:
+        raise OmnigentError(
+            "Terminal startup completion is temporarily unavailable; retry the message.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        ) from exc
+    if completed is not None:
+        _session_status_cache.accept(
+            session_id, SessionProjection(completed, completed.status or "idle")
+        )
+        _publish_terminal_pending(session_id, False, session_observation=completed)
+    return completed
 
 
 async def _persist_native_terminal_failure(
@@ -5812,6 +6315,9 @@ async def _persist_native_terminal_failure(
     *,
     created_by: str | None,
     failure_context: FailureContext | None = None,
+    owner: SessionObservation | None = None,
+    predecessor: session_live_state.PendingObservation | None = None,
+    dispatch_id: str | None = None,
 ) -> str:
     """
     Persist a consumed user message and terminal-start error.
@@ -5845,13 +6351,27 @@ async def _persist_native_terminal_failure(
     :param failure_context: Normalized cause metadata from the runner's ensure response.
     :returns: Store-assigned id of the consumed user message item.
     """
+    if owner is None:
+        owner, predecessor = _capture_status_observation(session_id, conv.session_observation)
+    if dispatch_id is None:
+        dispatch_id = conv.labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
     turn_id = generate_task_id()
-    user_item = _build_new_item(body, turn_id, created_by=created_by)
+    user_item = _build_new_item(body, turn_id, created_by=created_by, adopt_stable_id=True)
     persisted_items = await asyncio.to_thread(
         conversation_store.append,
         session_id,
         [user_item],
     )
+    if (
+        user_item.stable_id is not None
+        and persisted_items[0].deduplicated
+        and not _stable_id_reuse_is_exact_retry(persisted_items[0], user_item)
+    ):
+        user_item = _build_new_item(body, turn_id, created_by=created_by)
+        persisted_items = await asyncio.to_thread(
+            conversation_store.append, session_id, [user_item]
+        )
+    turn_id = persisted_items[0].response_id or turn_id
     await _seed_missing_title_from_user_message(
         conv,
         user_item,
@@ -5868,15 +6388,26 @@ async def _persist_native_terminal_failure(
     )
     consumed = persisted_items[0]
     _publish_input_consumed(session_id, consumed)
-    if error_persist_result == "persisted":
-        _publish_error_event(session_id, error)
-    _publish_terminal_pending(session_id, False)
-    _publish_status(
+    status_write = _publish_status(
         session_id,
         "failed",
         ErrorDetail(code=error.code, message=error.message),
         failure_origin="native_terminal_boot_failed",
         failure_context=failure_context,
+        response_id=turn_id,
+        owner=owner,
+        predecessor=predecessor,
+        starts_new_turn=True,
+    )
+    accepted, observation = await _await_failure_status(status_write)
+    if not accepted:
+        return consumed.id
+    if error_persist_result == "persisted":
+        _publish_error_event(
+            session_id, error, session_observation=observation, response_id=turn_id
+        )
+    _publish_terminal_pending(
+        session_id, False, session_observation=observation, response_id=turn_id
     )
     # A boot failure on a native sub-agent must wake the parent — mirror
     # the normal terminal-status path (publish + forward), gated on
@@ -5886,6 +6417,8 @@ async def _persist_native_terminal_failure(
         conv,
         error,
         runner_router,
+        observation=observation,
+        dispatch_id=dispatch_id,
     )
     return consumed.id
 
@@ -5900,6 +6433,9 @@ async def _persist_host_launch_failure_turn(
     *,
     created_by: str | None,
     host_error_code: str,
+    owner: SessionObservation | None = None,
+    predecessor: session_live_state.PendingObservation | None = None,
+    dispatch_id: str | None = None,
 ) -> str:
     """
     Persist a consumed user message and a host-launch failure error.
@@ -5947,13 +6483,27 @@ async def _persist_host_launch_failure_turn(
         code=host_error_code,
         message=host_error if host_error else fallback_message,
     )
+    if owner is None:
+        owner, predecessor = _capture_status_observation(session_id, conv.session_observation)
+    if dispatch_id is None:
+        dispatch_id = conv.labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
     turn_id = generate_task_id()
-    user_item = _build_new_item(body, turn_id, created_by=created_by)
+    user_item = _build_new_item(body, turn_id, created_by=created_by, adopt_stable_id=True)
     persisted_items = await asyncio.to_thread(
         conversation_store.append,
         session_id,
         [user_item],
     )
+    if (
+        user_item.stable_id is not None
+        and persisted_items[0].deduplicated
+        and not _stable_id_reuse_is_exact_retry(persisted_items[0], user_item)
+    ):
+        user_item = _build_new_item(body, turn_id, created_by=created_by)
+        persisted_items = await asyncio.to_thread(
+            conversation_store.append, session_id, [user_item]
+        )
+    turn_id = persisted_items[0].response_id or turn_id
     await _seed_missing_title_from_user_message(conv, user_item, conversation_store)
     error_persist_result = await _relay_persist_error_once(
         conversation_store,
@@ -5962,19 +6512,48 @@ async def _persist_host_launch_failure_turn(
     )
     consumed = persisted_items[0]
     _publish_input_consumed(session_id, consumed)
-    if error_persist_result == "persisted":
-        _publish_error_event(session_id, error)
-    _publish_terminal_pending(session_id, False)
-    _publish_status(
+    status_write = _publish_status(
         session_id,
         "failed",
         ErrorDetail(code=error.code, message=error.message),
         failure_origin="host_launch_failed",
+        response_id=turn_id,
+        owner=owner,
+        predecessor=predecessor,
+        starts_new_turn=True,
+    )
+    accepted, observation = await _await_failure_status(status_write)
+    if not accepted:
+        return consumed.id
+    if error_persist_result == "persisted":
+        _publish_error_event(
+            session_id, error, session_observation=observation, response_id=turn_id
+        )
+    _publish_terminal_pending(
+        session_id, False, session_observation=observation, response_id=turn_id
     )
     # A host-launched sub-agent that cannot start must wake its parent,
     # the same way a boot failure does — no-ops for top-level sessions.
-    await _forward_native_subagent_terminal_failure(session_id, conv, error, runner_router)
+    await _forward_native_subagent_terminal_failure(
+        session_id, conv, error, runner_router, observation=observation, dispatch_id=dispatch_id
+    )
     return consumed.id
+
+
+async def _await_failure_status(
+    status_write: Future[SessionObservation | None] | None,
+) -> tuple[bool, SessionObservation | None]:
+    """Keep setup-failure side effects behind the captured observation's commit."""
+    if status_write is None:
+        return session_live_state.conversation_store() is None, None
+    try:
+        observation = await asyncio.shield(asyncio.wrap_future(status_write))
+    except Exception as exc:
+        raise OmnigentError(
+            "Session status persistence is temporarily unavailable; retry the message.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        ) from exc
+    return observation is not None, observation
 
 
 async def _forward_native_subagent_terminal_failure(
@@ -5982,6 +6561,9 @@ async def _forward_native_subagent_terminal_failure(
     conv: Conversation,
     error: ErrorData,
     runner_router: RunnerRouter | None,
+    *,
+    observation: SessionObservation | None = None,
+    dispatch_id: str | None = None,
 ) -> None:
     """
     Wake the parent runner when a native sub-agent fails to boot its terminal.
@@ -6018,6 +6600,12 @@ async def _forward_native_subagent_terminal_failure(
         # (runner: ``output or "...turn failed"``); pass the real error.
         "data": {"status": "failed", "output": error.message},
     }
+    if observation is not None:
+        forward_body["data"]["session_observation"] = observation.model_dump()
+        if observation.response_id is not None:
+            forward_body["data"]["response_id"] = observation.response_id
+        if dispatch_id:
+            forward_body["data"]["subagent_dispatch_id"] = dispatch_id
     runner_result = await _forward_session_change_to_runner(
         session_id,
         runner_router,
@@ -7194,6 +7782,9 @@ async def _forward_event_to_runner(
     # The runner's sessions-native POST returns 202 immediately
     # and starts the turn as a background task. No streaming
     # response to drain — events flow through GET /stream.
+    status_owner, status_predecessor = _capture_status_observation(
+        session_id, conv.session_observation
+    )
     try:
         _forward_resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
@@ -7239,13 +7830,18 @@ async def _forward_event_to_runner(
                 conversation_store,
                 owner_runner_id=conv.runner_id,
                 item_id=persisted_items[0].id,
+                owner=status_owner,
             )
-            _publish_status(
+            status_write = _publish_status(
                 session_id,
                 "failed",
                 _reject_error,
                 failure_origin="runner_rejected_event",
+                response_id=turn_id,
+                owner=status_owner,
+                predecessor=status_predecessor,
             )
+            await _await_failure_status(status_write)
             raise OmnigentError(
                 f"Runner rejected the message: {_reject_detail}",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
@@ -7356,7 +7952,7 @@ async def _forward_event_to_runner(
             session_id,
             extra={"session_id": session_id},
         )
-        _publish_status(session_id, "idle")
+        _publish_status(session_id, "idle", owner=status_owner, predecessor=status_predecessor)
         raise OmnigentError(
             "Runner is unreachable; message was persisted but could not be delivered. "
             "The runner may be restarting — retry or spawn a new session.",
@@ -7482,6 +8078,9 @@ def _session_is_starting(conversation_id: str) -> bool:
 def _list_status_with_starting(
     status: Literal["idle", "running", "failed"],
     conversation_id: str,
+    *,
+    conversation: Conversation | None = None,
+    allow_cached_starting: bool = True,
 ) -> Literal["idle", "running", "failed"]:
     """
     Promote an idle session with a message still waiting on its runner to running.
@@ -7490,7 +8089,10 @@ def _list_status_with_starting(
     :param conversation_id: Session/conversation identifier.
     :returns: ``"running"`` for a booting session, else *status* unchanged.
     """
-    if status == "idle" and _session_is_starting(conversation_id):
+    if status == "idle" and (
+        (conversation is not None and conversation.terminal_pending)
+        or (allow_cached_starting and _session_is_starting(conversation_id))
+    ):
         return "running"
     return status
 
@@ -7674,7 +8276,29 @@ async def _dispatch_session_event_to_runner_impl(
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
     """
-    if runner_router is not None:
+    status_owner = conv.session_observation
+    queued = session_live_state.pending_observation(session_id, status_owner)
+    status_predecessor = (
+        queued
+        if queued is not None
+        and (
+            queued.owner == status_owner
+            or (
+                queued.future.done()
+                and session_live_state.resolved_observation(queued) == status_owner
+            )
+        )
+        else None
+    )
+    dispatch_id = conv.labels.get(SUBAGENT_DISPATCH_ID_LABEL_KEY)
+    native_message = body.type == "message" and _is_native_terminal_session(conv)
+    codex_side_chat = (
+        body.type == "message" and conv.kind == "sub_agent" and _is_codex_native_subagent(conv)
+    )
+    # Native ensure reserves startup before its awaited compatibility check.
+    if runner_router is not None and (
+        not native_message or native_terminal_ready or codex_side_chat
+    ):
         await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
     if body.type == "message":
         disconnect_outcome.note_user_turn(conv.id)
@@ -7698,6 +8322,8 @@ async def _dispatch_session_event_to_runner_impl(
                 session_id,
                 conv,
                 runner_router=runner_router,
+                owner=status_owner,
+                predecessor=status_predecessor,
             )
         )
         if ensure_outcome.error is not None:
@@ -7710,6 +8336,9 @@ async def _dispatch_session_event_to_runner_impl(
                 runner_router,
                 created_by=created_by,
                 failure_context=ensure_outcome.failure_context,
+                owner=ensure_outcome.observation or status_owner,
+                predecessor=None if ensure_outcome.observation is not None else status_predecessor,
+                dispatch_id=dispatch_id,
             )
             return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
         if ensure_outcome.policy_notice is not None:
@@ -8167,12 +8796,22 @@ async def _runner_disconnect_requires_failure(
     Only top-level sessions can fail before startup with ``fail_idle_top_level``;
     one that already failed with a persisted cause keeps that cause instead.
 
-    A sub-agent mirrored from a native parent fails only on a turn in the
-    cache: its saved status can still read mid-turn after its last idle edge.
+    A sub-agent mirrored from a native parent fails only on a locally observed
+    turn: its saved status can still read mid-turn after its last idle edge.
     The parent's native runtime drives that turn and reports its outcome, so
     the saved status alone is no evidence of an interruption.
     """
-    cached = _session_status_cache.get(session_id)
+
+    @_session_status_cache.synchronized
+    def locally_observed_status() -> str | None:
+        pending = session_live_state.pending_observation(session_id)
+        if pending is not None and not pending.future.done():
+            return pending.status
+        if _session_status_cache.has_live_status(session_id):
+            return _session_status_cache.get(session_id)
+        return None
+
+    cached = locally_observed_status()
     persisted: Conversation | None = None
     lookup = "not_needed"
     if cached is None:
@@ -8187,7 +8826,7 @@ async def _runner_disconnect_requires_failure(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
-        cached = _session_status_cache.get(session_id)
+        cached = locally_observed_status()
 
     handle = _runner_relay_tasks.get(session_id)
     relay_snapshot = handle.status_snapshot if handle is not None else None
@@ -8375,6 +9014,22 @@ async def _relay_runner_stream(
         ready heartbeat; see :func:`_relay_runner_stream_once`.
     :param runner_id: The runner this relay owns, including after a session rebind.
     """
+    adoption = (
+        await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conversation_store is not None and session_live_state.conversation_store() is not None
+        else None
+    )
+    if not isinstance(adoption, Conversation):
+        adoption = None
+    if adoption is not None and runner_id is not None and adoption.runner_id != runner_id:
+        return
+    owner = adoption.session_observation if adoption is not None else None
+    native_agent = (
+        await asyncio.to_thread(_native_coding_agent_for_session, adoption)
+        if adoption is not None
+        else None
+    )
+    callback_owned_turns = native_agent is not None and native_agent.key in {"codex", "pi"}
     loop = asyncio.get_running_loop()
     deadline: float | None = None
     outage_started: float | None = None
@@ -8427,6 +9082,8 @@ async def _relay_runner_stream(
                 ready,
                 runner_id=runner_id,
                 on_stream_ready=_on_stream_ready,
+                owner=owner,
+                callback_owned_turns=callback_owned_turns,
             )
             return
         except _RelayTransportLost as lost:
@@ -8521,12 +9178,13 @@ async def _relay_runner_stream(
             if decision == "intentional_stop":
                 # An expected drop must not erase a real failure reported during
                 # teardown: preserve its labels when the sticky status stays failed.
-                _publish_status(session_id, "idle")
+                _publish_status(session_id, "idle", owner=owner)
                 if _session_status_cache.get(session_id) != "failed":
                     await _persist_session_status_error_labels(
                         session_id,
                         None,
                         conversation_store,
+                        owner=owner,
                     )
             elif decision == "server_shutdown":
                 # This server closed the tunnel on its way down; the runner is
@@ -8563,32 +9221,81 @@ async def _relay_runner_stream(
                     code="runner_disconnected",
                     message="Runner disconnected unexpectedly.",
                 )
-                turn_id = _session_active_response_cache.get(session_id)
-                _publish_status(
-                    session_id,
-                    "failed",
-                    disconnect_error,
-                    failure_origin="runner_disconnected_mid_turn",
-                )
-                await record_subagent_activity(
-                    session_id, "returned", conversation_store, turn_id=turn_id, status="failed"
-                )
-                # Persist the disconnect cause as durable labels so the
-                # distinction survives into snapshots and child-session
-                # summaries. Without this the relay-fed cache only carries a
-                # generic ``failed`` and ``last_task_error`` is dropped,
-                # leaving the UI unable to tell a benign runner disconnect
-                # from a real task failure (Option B: render a "Disconnected"
-                # pill, not the red "Failed" pill). Cleared on the next
-                # ``running`` edge by the session.status handler, exactly
-                # like other failure labels.
-                await _persist_session_status_error_labels(
-                    session_id,
-                    disconnect_error,
-                    conversation_store,
-                    owner_runner_id=runner_id,
-                )
+                if adoption is not None:
+                    await _mark_runner_sessions_offline_impl(
+                        [adoption], disconnect_error, conversation_store
+                    )
+                else:
+                    turn_id = _session_active_response_cache.get(session_id)
+                    _publish_status(
+                        session_id,
+                        "failed",
+                        disconnect_error,
+                        failure_origin="runner_disconnected_mid_turn",
+                    )
+                    await record_subagent_activity(
+                        session_id,
+                        "returned",
+                        conversation_store,
+                        turn_id=turn_id,
+                        status="failed",
+                    )
+                    # Persist the disconnect cause as durable labels so the
+                    # distinction survives into snapshots and child-session
+                    # summaries. Without this the relay-fed cache only carries a
+                    # generic ``failed`` and ``last_task_error`` is dropped,
+                    # leaving the UI unable to tell a benign runner disconnect
+                    # from a real task failure (Option B: render a "Disconnected"
+                    # pill, not the red "Failed" pill). Cleared on the next
+                    # ``running`` edge by the session.status handler, exactly
+                    # like other failure labels.
+                    await _persist_session_status_error_labels(
+                        session_id,
+                        disconnect_error,
+                        conversation_store,
+                        owner_runner_id=runner_id,
+                    )
             return
+
+
+def _relay_projection_is_current(session_id: str, observation: SessionObservation | None) -> bool:
+    if observation is None:
+        return session_live_state.conversation_store() is None
+    current = _session_status_cache.projection(session_id)
+    return (
+        current is not None
+        and current.observation == observation
+        and current.offline_episode_id is None
+    )
+
+
+@_session_status_cache.synchronized
+def _take_relay_deny(session_id: str, observation: SessionObservation | None) -> str | None:
+    if not _relay_projection_is_current(session_id, observation):
+        return None
+    return _llm_response_denied_turns.pop(session_id, None)
+
+
+@_session_status_cache.synchronized
+def _restore_relay_deny(
+    session_id: str, observation: SessionObservation | None, reason: str | None
+) -> None:
+    if reason is not None and _relay_projection_is_current(session_id, observation):
+        if _llm_response_denied_turns.get(session_id) is None:
+            _llm_response_denied_turns[session_id] = reason
+
+
+async def _await_relay_status(
+    status_write: Future[SessionObservation | None] | None,
+) -> tuple[bool, SessionObservation | None]:
+    if status_write is None:
+        return session_live_state.conversation_store() is None, None
+    try:
+        observation = await asyncio.shield(asyncio.wrap_future(status_write))
+    except Exception:  # noqa: BLE001 — preserve source history on persistence failure
+        _logger.warning("Relay status persistence failed", exc_info=True)
+        return False, None
+    return observation is not None, observation
 
 
 async def _relay_runner_stream_once(
@@ -8599,6 +9306,8 @@ async def _relay_runner_stream_once(
     *,
     runner_id: str | None = None,
     on_stream_ready: Callable[[], None] | None = None,
+    owner: SessionObservation | None = None,
+    callback_owned_turns: bool = False,
 ) -> None:
     """
     Subscribe to the runner's SSE stream and relay events locally.
@@ -8630,9 +9339,27 @@ async def _relay_runner_stream_once(
     :param on_stream_ready: Optional callback after this attempt's first
         ``session.heartbeat``. The supervisor uses it for one recovery row;
         it is synchronous and does not create a helper task.
+    :param callback_owned_turns: Codex/Pi callbacks name native turns independently
+        of the scaffold response IDs used for message delivery.
     """
+    if (
+        owner is None
+        and conversation_store is not None
+        and session_live_state.conversation_store() is not None
+    ):
+        observed = await asyncio.to_thread(conversation_store.get_session_observation, session_id)
+        if isinstance(observed, SessionObservation):
+            if runner_id is not None and observed.runner_id != runner_id:
+                return
+            owner = observed
+    if owner is not None:
+        _session_status_cache.accept(
+            session_id, SessionProjection(owner, owner.status or "idle"), published=False
+        )
     text_acc: list[str] = []
     current_response_id: str | None = None
+    current_observation = owner
+    response_observations: dict[str, SessionObservation] = {}
     pending_subagent_return_id: str | None = None
     pending_subagent_return_status = "completed"
     # Model/agent label from the turn header, stamped on text segments
@@ -8727,28 +9454,14 @@ async def _relay_runner_stream_once(
                             ready.set()
                         continue
 
-                    _record_native_input_lifecycle(session_id, event)
-
-                    if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES or (
-                        evt_type == "session.status" and event.get("status") == "running"
+                    # Pane repaints already have terminal.activity; they cannot own a turn.
+                    if (
+                        evt_type == "session.status"
+                        and event.get("status_source") == "pane_activity"
                     ):
-                        relay = _runner_relay_tasks.get(session_id)
-                        if relay is not None and relay.task is asyncio.current_task():
-                            if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES:
-                                relay.intentional_stop_turn_ended = (
-                                    runner_id is not None
-                                    and _intentional_stop_sessions.get(session_id) == runner_id
-                                )
-                            else:
-                                relay.running_event_count += 1
-                                # Running can resume the same turn, including after PTY idle.
-                                # Only completed stopped work makes its marker stale.
-                                if (
-                                    relay.intentional_stop_turn_ended
-                                    and _intentional_stop_sessions.get(session_id) == runner_id
-                                ):
-                                    _intentional_stop_sessions.pop(session_id, None)
-                                relay.intentional_stop_turn_ended = False
+                        continue
+
+                    _record_native_input_lifecycle(session_id, event)
 
                     if evt_type == "session.created":
                         child_id = event.get("child_session_id")
@@ -8759,6 +9472,7 @@ async def _relay_runner_stream_once(
                                 text_acc,
                                 current_response_id,
                                 current_model,
+                                observation=current_observation,
                             )
                             await record_subagent_activity(
                                 child_id, "delegated", conversation_store, parent_id=session_id
@@ -8768,34 +9482,49 @@ async def _relay_runner_stream_once(
                     # forward, no persist) but keep text_acc — the pre-stop
                     # narration the user watched persists at the terminal flush.
                     if session_id in _interrupt_fenced_sessions:
-                        if evt_type == "session.status" and event.get("status") == "running":
-                            _interrupt_fenced_sessions.discard(session_id)
-                        elif evt_type in _TERMINAL_RESPONSE_EVENT_TYPES:
-                            # Terminal proves the stopped turn is over (completed =
-                            # the stop lost the race); process it normally.
-                            _interrupt_fenced_sessions.discard(session_id)
-                        elif (
+                        if (
                             evt_type.startswith("response.")
+                            and evt_type not in _TERMINAL_RESPONSE_EVENT_TYPES
                             and evt_type not in _FENCE_EXEMPT_EVENT_TYPES
                         ):
                             continue
 
                     if evt_type == "session.status":
-                        status = event.get("status", "")
-                        if status in {"idle", "failed"} and pending_subagent_return_id is not None:
-                            await record_subagent_activity(
-                                session_id,
-                                "returned",
-                                conversation_store,
-                                turn_id=pending_subagent_return_id,
-                                status=(
-                                    "failed"
-                                    if status == "failed"
-                                    else pending_subagent_return_status
-                                ),
-                                from_runner=True,
+                        raw_response_id = event.get("response_id")
+                        known_response = (
+                            raw_response_id
+                            if isinstance(raw_response_id, str)
+                            else None
+                            if callback_owned_turns
+                            else current_response_id
+                        )
+                        known_owner = response_observations.get(known_response or "")
+                        raw_status_owner = event.get("session_observation")
+                        if raw_status_owner is not None:
+                            try:
+                                status_owner = SessionObservation.model_validate(raw_status_owner)
+                            except ValueError:
+                                continue
+                            status_predecessor = None
+                        else:
+                            status_owner, status_predecessor = (
+                                (known_owner, None)
+                                if known_owner is not None
+                                else _capture_status_observation(session_id, owner)
                             )
-                            pending_subagent_return_id = None
+                        status = event.get("status", "")
+                        if (
+                            callback_owned_turns
+                            and raw_status_owner is None
+                            and isinstance(raw_response_id, str)
+                            and raw_response_id
+                            and (
+                                status_owner is None or raw_response_id != status_owner.response_id
+                            )
+                        ):
+                            # Native callbacks own terminal turns; scaffold IDs name delivery only.
+                            continue
+                        accepted, committed = False, None
                         if status:
                             # Forward the runner's failure detail on a
                             # ``failed`` transition so a SETUP-phase
@@ -8815,6 +9544,7 @@ async def _relay_runner_stream_once(
                                     conversation_store,
                                     owner_runner_id=runner_id,
                                     agent_name=failure_agent_name,
+                                    owner=status_owner,
                                 )
                             elif status == "running":
                                 failure_agent_name = None
@@ -8822,6 +9552,7 @@ async def _relay_runner_stream_once(
                                     session_id,
                                     None,
                                     conversation_store,
+                                    owner=status_owner,
                                 )
                             # PTY-activity status is a UI signal only. Terminal
                             # sub-agent delivery rides the Stop/StopFailure hook
@@ -8844,6 +9575,8 @@ async def _relay_runner_stream_once(
                                         session_id,
                                         conversation_store,
                                         require_disconnect_code=True,
+                                        owner=status_owner,
+                                        predecessor=status_predecessor,
                                     )
                                 except Exception:  # noqa: BLE001 — a read error must not kill the relay
                                     # Fail soft: the session keeps its existing
@@ -8858,7 +9591,7 @@ async def _relay_runner_stream_once(
                                     )
                                 else:
                                     continue
-                            _publish_status(
+                            status_write = _publish_status(
                                 session_id,
                                 status,
                                 status_error,
@@ -8871,18 +9604,58 @@ async def _relay_runner_stream_once(
                                 ),
                                 failure_origin="relayed_runner_status",
                                 failure_context=event.get("failure_context"),
+                                owner=status_owner,
+                                predecessor=status_predecessor,
                                 blocked_on=(
                                     raw_blocked_on
                                     if isinstance(raw_blocked_on, str) and raw_blocked_on
                                     else None
                                 ),
                             )
+                            accepted, committed = await _await_relay_status(status_write)
+                        if not accepted:
+                            pending_subagent_return_id = None
+                            continue
+                        if committed is not None:
+                            if known_response:
+                                response_observations[known_response] = committed
+                            if (
+                                known_response == current_response_id
+                                or current_response_id is None
+                            ):
+                                current_observation = committed
+                        if status in {"idle", "failed"} and pending_subagent_return_id is not None:
+                            await record_subagent_activity(
+                                session_id,
+                                "returned",
+                                conversation_store,
+                                turn_id=pending_subagent_return_id,
+                                status="failed"
+                                if status == "failed"
+                                else pending_subagent_return_status,
+                                from_runner=True,
+                                observation=committed,
+                            )
+                            pending_subagent_return_id = None
                         if status == "running":
-                            text_acc.clear()
+                            if _relay_projection_is_current(session_id, committed):
+                                _interrupt_fenced_sessions.discard(session_id)
+                                relay = _runner_relay_tasks.get(session_id)
+                                if relay is not None and relay.task is asyncio.current_task():
+                                    relay.running_event_count += 1
+                                    # Only completed stopped work makes its marker stale.
+                                    if (
+                                        relay.intentional_stop_turn_ended
+                                        and _intentional_stop_sessions.get(session_id) == runner_id
+                                    ):
+                                        _intentional_stop_sessions.pop(session_id, None)
+                                    relay.intentional_stop_turn_ended = False
+                            if session_live_state.conversation_store() is None:
+                                text_acc.clear()
                             # A new turn invalidates any deny marker a prior
                             # turn left un-consumed (e.g. its terminal event
                             # never reached the relay across a reconnect).
-                            _llm_response_denied_turns.pop(session_id, None)
+                            _take_relay_deny(session_id, committed)
                         continue
 
                     # Terminal spin-up status from the runner's auto-create
@@ -8893,9 +9666,39 @@ async def _relay_runner_stream_once(
                         # Use ``is True`` (not bool()) so a malformed frame
                         # with a string like ``"false"`` can't strand the
                         # spinner on — the runner always sends a real bool.
+                        pending_owner = None
+                        raw_pending_owner = event.get("session_observation")
+                        if raw_pending_owner is not None:
+                            try:
+                                pending_owner = SessionObservation.model_validate(
+                                    raw_pending_owner
+                                )
+                            except ValueError:
+                                continue
+                        pending = event.get("pending") is True
+                        if not pending and pending_owner is not None:
+                            completion = session_live_state.complete_terminal_startup(
+                                session_id, pending_owner
+                            )
+                            if completion is not None:
+                                try:
+                                    pending_owner = await asyncio.shield(
+                                        asyncio.wrap_future(completion)
+                                    )
+                                except Exception:  # noqa: BLE001 — leave the newer startup untouched
+                                    _logger.warning(
+                                        "Relay terminal startup completion failed", exc_info=True
+                                    )
+                                    continue
+                                if pending_owner is None:
+                                    continue
                         _publish_terminal_pending(
                             session_id,
-                            event.get("pending") is True,
+                            pending,
+                            session_observation=pending_owner,
+                            response_id=event.get("response_id")
+                            if isinstance(event.get("response_id"), str)
+                            else None,
                         )
                         continue
 
@@ -8907,9 +9710,50 @@ async def _relay_runner_stream_once(
                         resp_obj = event.get("response", {})
                         _rid = resp_obj.get("id")
                         if isinstance(_rid, str) and _rid:
+                            if (
+                                current_response_id is not None
+                                and current_response_id != _rid
+                                and text_acc
+                            ):
+                                await _flush_relay_text(
+                                    conversation_store,
+                                    session_id,
+                                    text_acc,
+                                    current_response_id,
+                                    current_model,
+                                    observation=current_observation,
+                                )
                             current_response_id = _rid
+                            turn_owner = response_observations.get(_rid)
+                            turn_predecessor = None
+                            if turn_owner is None:
+                                if callback_owned_turns:
+                                    turn_owner = owner
+                                    if turn_owner is not None:
+                                        response_observations[_rid] = turn_owner
+                                else:
+                                    turn_owner, turn_predecessor = _capture_status_observation(
+                                        session_id, owner
+                                    )
+                            current_observation = turn_owner
+                            if (
+                                session_live_state.conversation_store() is not None
+                                and not callback_owned_turns
+                            ):
+                                status_write = _publish_status(
+                                    session_id,
+                                    "running",
+                                    response_id=_rid,
+                                    owner=turn_owner,
+                                    predecessor=turn_predecessor,
+                                )
+                                accepted, committed = await _await_relay_status(status_write)
+                                if accepted and committed is not None:
+                                    current_observation = committed
+                                    response_observations[_rid] = committed
+                            elif session_live_state.conversation_store() is None:
+                                _session_active_response_cache[session_id] = _rid
                             # Keep the turn identity across transport retries until final status.
-                            _session_active_response_cache[session_id] = _rid
                         _model = resp_obj.get("model")
                         failure_agent_name = _model if isinstance(_model, str) and _model else None
                         if isinstance(_model, str) and _model:
@@ -8973,7 +9817,7 @@ async def _relay_runner_stream_once(
                         # (harnesses that gate per LLM call) marks this segment
                         # as denied content; consume it the same way the
                         # terminal flush does.
-                        _boundary_deny = _llm_response_denied_turns.pop(session_id, None)
+                        _boundary_deny = _take_relay_deny(session_id, current_observation)
                         await _flush_relay_text(
                             conversation_store,
                             session_id,
@@ -8989,11 +9833,12 @@ async def _relay_runner_stream_once(
                             evaluate_response_phase=_boundary_deny is None,
                             # Progress text precedes more tool calls.
                             turn_final=False,
+                            observation=current_observation,
                         )
                         # A failed append leaves text_acc for retry — re-arm
                         # the marker so the retry persists the sentinel.
                         if _boundary_deny is not None and text_acc:
-                            _llm_response_denied_turns[session_id] = _boundary_deny
+                            _restore_relay_deny(session_id, current_observation, _boundary_deny)
 
                     conv_item = _extract_persistent_item_from_sse(
                         event,
@@ -9037,7 +9882,7 @@ async def _relay_runner_stream_once(
                         # with a persisted deny error item). Segment-complete
                         # durable gating is the RESPONSE phase's job — the
                         # boundary flush above evaluates it for every segment.
-                        _deny_reason = _llm_response_denied_turns.pop(session_id, None)
+                        _deny_reason = _take_relay_deny(session_id, current_observation)
                         await _flush_relay_text(
                             conversation_store,
                             session_id,
@@ -9049,12 +9894,13 @@ async def _relay_runner_stream_once(
                             evaluate_response_phase=_deny_reason is None,
                             # Only successful completion triggers final-response actions.
                             turn_final=evt_type == "response.completed",
+                            observation=current_observation,
                         )
                         # A failed append leaves text_acc intact for a retry
                         # at a later flush — re-arm the marker so the retry
                         # still persists the sentinel, not the denied text.
                         if _deny_reason is not None and text_acc:
-                            _llm_response_denied_turns[session_id] = _deny_reason
+                            _restore_relay_deny(session_id, current_observation, _deny_reason)
                         pending_subagent_return_id = current_response_id
                         pending_subagent_return_status = {
                             "response.failed": "failed",
@@ -9118,7 +9964,35 @@ async def _relay_runner_stream_once(
                             and resource_data.resource_type == "terminal"
                             and _session_terminal_pending_cache.get(session_id, False)
                         ):
-                            _publish_terminal_pending(session_id, False)
+                            resource_owner = None
+                            raw_resource_owner = event.get("session_observation")
+                            if raw_resource_owner is not None:
+                                try:
+                                    resource_owner = SessionObservation.model_validate(
+                                        raw_resource_owner
+                                    )
+                                except ValueError:
+                                    continue
+                            if resource_owner is not None:
+                                completion = session_live_state.complete_terminal_startup(
+                                    session_id, resource_owner
+                                )
+                                if completion is not None:
+                                    try:
+                                        resource_owner = await asyncio.shield(
+                                            asyncio.wrap_future(completion)
+                                        )
+                                    except Exception:  # noqa: BLE001 — leave the newer startup untouched
+                                        _logger.warning(
+                                            "Relay terminal resource completion failed",
+                                            exc_info=True,
+                                        )
+                                        continue
+                                    if resource_owner is None:
+                                        continue
+                            _publish_terminal_pending(
+                                session_id, False, session_observation=resource_owner
+                            )
 
                     # Intelligent-model-router decision emitted by the runner's
                     # cost advisor at turn start. Persist as a display-only
@@ -9322,6 +10196,42 @@ async def _relay_runner_stream_once(
                     ):
                         continue
 
+                    if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES:
+                        terminal_owner = current_observation
+                        raw_terminal_owner = event.get("session_observation")
+                        if callback_owned_turns and raw_terminal_owner is None:
+                            terminal_owner = None
+                        if raw_terminal_owner is not None:
+                            try:
+                                terminal_owner = SessionObservation.model_validate(
+                                    raw_terminal_owner
+                                )
+                            except ValueError:
+                                terminal_owner = None
+                        if (
+                            event.get("conversation_id") in (None, session_id)
+                            and event.get("runner_offline_episode_id") is None
+                            and _relay_projection_is_current(session_id, terminal_owner)
+                        ):
+                            _interrupt_fenced_sessions.discard(session_id)
+                            relay = _runner_relay_tasks.get(session_id)
+                            if relay is not None and relay.task is asyncio.current_task():
+                                relay.intentional_stop_turn_ended = (
+                                    runner_id is not None
+                                    and _intentional_stop_sessions.get(session_id) == runner_id
+                                )
+
+                    if (
+                        evt_type.startswith("response.")
+                        and current_observation is not None
+                        and event.get("session_observation") is None
+                    ):
+                        event = {
+                            **event,
+                            "conversation_id": session_id,
+                            "session_observation": current_observation.model_dump(),
+                        }
+
                     # Reset the turn-scoped response_id on any
                     # terminal event so it doesn't leak to the
                     # next turn.
@@ -9415,21 +10325,25 @@ async def _relay_runner_stream_once(
         # WITHOUT a terminal turn event (runner death / tunnel drop
         # mid-turn, or a rebind cancellation) can't strand it forever.
         # Normal turn-ends already clear via record_publish.
-        inflight_text.discard(session_id)
+        session_stream.discard_inflight_text(session_id, observation=current_observation)
         # The intentional-stop marker is consumed by the disconnect handler
         # above on the expected path; discard it here too so a relay that
         # exits some other way (clean [DONE], rebind cancellation) can't
         # leave a stale marker to swallow a later genuine disconnect on the
         # reused per-session relay task.
-        if _intentional_stop_sessions.get(session_id) == runner_id:
+        if (
+            _relay_projection_is_current(session_id, current_observation)
+            and _intentional_stop_sessions.get(session_id) == runner_id
+        ):
             _intentional_stop_sessions.pop(session_id, None)
         # Relay ended (runner dropped/rebound): re-discover runner-backed
         # snapshot overlays next time. Cancel in-flight fetches so they can't
         # land stale values from the dead runner; the model catalog is only
         # marked stale so the picker keeps serving it while the session sleeps.
-        _invalidate_runner_backed_snapshot_state(
-            session_id, cancel_inflight=True, drop_model_options=False
-        )
+        if _relay_projection_is_current(session_id, current_observation):
+            _invalidate_runner_backed_snapshot_state(
+                session_id, cancel_inflight=True, drop_model_options=False
+            )
 
 
 def _ensure_runner_relay(
@@ -12809,7 +13723,11 @@ def _runner_status_probe_window_s(failures: int) -> float:
 
 
 async def _probe_runner_live_status(
-    runner_client: httpx.AsyncClient, session_id: str, runner_id: str | None = None
+    runner_client: httpx.AsyncClient,
+    session_id: str,
+    runner_id: str | None = None,
+    *,
+    owner: SessionObservation | None = None,
 ) -> str | None:
     """
     Ask a session's bound runner for its live status, bounded, shared, and backed off.
@@ -12834,7 +13752,12 @@ async def _probe_runner_live_status(
             _runner_status_probe_backoff.pop(session_id, None)
         elif backoff is not None and time.monotonic() < backoff.skip_until:
             return None
-        probe = asyncio.create_task(_run_runner_status_probe(runner_client, session_id, runner_id))
+        status_owner, status_predecessor = _capture_status_observation(session_id, owner)
+        probe = asyncio.create_task(
+            _run_runner_status_probe(
+                runner_client, session_id, runner_id, status_owner, status_predecessor
+            )
+        )
         _runner_status_probe_inflight[session_id] = probe
     # Shielded so one cancelled snapshot request does not abort the probe the
     # other waiters share.
@@ -12842,7 +13765,11 @@ async def _probe_runner_live_status(
 
 
 async def _run_runner_status_probe(
-    runner_client: httpx.AsyncClient, session_id: str, runner_id: str | None
+    runner_client: httpx.AsyncClient,
+    session_id: str,
+    runner_id: str | None,
+    owner: SessionObservation | None = None,
+    predecessor: session_live_state.PendingObservation | None = None,
 ) -> str | None:
     """
     Run one bounded runner status probe and record its outcome.
@@ -12874,9 +13801,15 @@ async def _run_runner_status_probe(
                     payload = None
                 if isinstance(payload, dict):
                     raw = str(payload.get("status", "idle"))
-                    _session_status_cache[session_id] = raw
                     if raw in ("idle", "running", "waiting", "failed"):
-                        session_live_state.persist_live_status(session_id, raw)
+                        _publish_status(
+                            session_id,
+                            raw,
+                            failure_origin="runner_status_probe",
+                            owner=owner,
+                            predecessor=predecessor,
+                            failure_logged=True,
+                        )
                     _runner_status_probe_backoff.pop(session_id, None)
                     return raw
                 failure = "HTTP 200 with a malformed body"
@@ -13038,7 +13971,7 @@ async def _get_session_snapshot(
     # A server recycle clears this cache while the persisted relay status survives.
     # Prefer it because native injection can finish before an external harness turn,
     # making the runner's generic active-turn probe report a false ``idle``.
-    status = _session_status_from_cache(session_id, conv.live_status)
+    status = _session_status_from_cache(session_id, conv.live_status, conversation=conv)
     if status == "idle":
         # Cache miss (or truly idle): either the server restarted, or the
         # relay has not yet published the first ``"running"`` event for a
@@ -13054,7 +13987,9 @@ async def _get_session_snapshot(
             and runner_client is not None
         ):
             if (
-                await _probe_runner_live_status(runner_client, session_id, conv.runner_id)
+                await _probe_runner_live_status(
+                    runner_client, session_id, conv.runner_id, owner=conv.session_observation
+                )
                 is not None
             ):
                 status = _session_status_from_cache(session_id)

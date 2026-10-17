@@ -153,7 +153,11 @@ beforeEach(() => {
   vi.mocked(sessionsApi.approve).mockResolvedValue(
     {} as Awaited<ReturnType<typeof sessionsApi.approve>>,
   );
-  vi.mocked(sessionsApi.fetchSessionItemsPage).mockResolvedValue({ items: [], hasMore: false });
+  vi.mocked(sessionsApi.fetchSessionItemsPage).mockResolvedValue({
+    items: [],
+    hasMore: false,
+    olderCursor: null,
+  });
 });
 
 afterEach(() => {
@@ -527,6 +531,7 @@ describe("InboxPage unread sessions", () => {
     vi.mocked(sessionsApi.fetchSessionItemsPage).mockResolvedValue({
       items: [assistantReply("Refactor finished; 3 files changed.")],
       hasMore: false,
+      olderCursor: null,
     });
     renderPage();
 

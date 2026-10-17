@@ -535,18 +535,16 @@ def _fetch_all_items_sync(
             order="asc",
         )
         rows = list(page.data)
-        if not rows:
-            return collected
         for item in rows:
             # Items from the store are Pydantic models. ``model_dump``
             # produces a JSON-safe dict; the SDK path emits plain
             # dicts already. Falling back to ``dict(item)`` would
             # lose nested typed fields.
             collected.append(item.model_dump())
-        if len(rows) < page_size:
+        if not page.has_more:
             return collected
-        last_id = rows[-1].id
-        if not last_id:
+        last_id = page.last_id or (rows[-1].id if rows else None)
+        if not last_id or last_id == cursor:
             return collected
         cursor = last_id
 
@@ -607,12 +605,10 @@ async def _fetch_all_items_via_sessions_once(
             order="asc",
         )
         page = result.data
-        if not page:
-            return collected
         collected.extend(page)
-        last_id = page[-1].get("id")
-        if not isinstance(last_id, str) or not last_id:
+        if not result.has_more:
+            return collected
+        last_id = result.last_id or (page[-1].get("id") if page else None)
+        if not isinstance(last_id, str) or not last_id or last_id == cursor:
             return collected
         cursor = last_id
-        if len(page) < page_size:
-            return collected

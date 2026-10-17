@@ -1716,6 +1716,7 @@ describe("Sidebar idle latest-message error", () => {
         },
       ],
       hasMore: true,
+      olderCursor: "message1",
     });
   });
   afterEach(() => vi.mocked(sessionsApi.fetchSessionItemsPage).mockRestore());

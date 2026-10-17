@@ -1,3 +1,4 @@
+import { shareSessionSnapshot } from "@/lib/sessionSnapshot";
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangleIcon, GitBranchIcon } from "lucide-react";
@@ -95,6 +96,7 @@ export function ResumeWithDirectoryDialog({
   // the dialog is open and we actually have a source.
   const { data: source, isLoading: sourceLoading } = useQuery({
     queryKey: ["session", sourceSessionId],
+    structuralSharing: shareSessionSnapshot,
     queryFn: () => getSessionSlim(sourceSessionId as string),
     enabled: open && hasSource,
   });

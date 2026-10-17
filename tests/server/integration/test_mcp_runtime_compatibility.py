@@ -358,10 +358,9 @@ async def test_native_ensure_rechecks_reconnected_runner(
             json={"name": "tracker", "transport": "registry"},
         )
     ).status_code == 200
-    stored = get_conversation_store().get_conversation(sid)
+    stored = get_conversation_store().replace_runner_id(sid, "reconnecting-runner")
     conv = dataclasses.replace(
         stored,
-        runner_id="reconnecting-runner",
         labels={
             **stored.labels,
             "omnigent.ui": "terminal",
