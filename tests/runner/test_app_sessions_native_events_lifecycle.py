@@ -4337,7 +4337,10 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(
     instance.command = "worker-cli"
     instance.args = ["--profile", "test"]
     instance.launch_cwd = str(tmp_path)
-    instance._remember_pane_snapshot("startup failed\ncomplete setup first")
+    instance._remember_pane_snapshot(
+        "startup failed\ncomplete setup first\n"
+        "Cookie: s3cr3t-active-cookie-7b2c\npassword hunter2-active-secret-pw"
+    )
     terminal_registry._by_conversation.setdefault(conv_id, {})[("worker", "main")] = instance
     callbacks: dict[str, Any] = {}
 
@@ -4438,6 +4441,12 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(
     assert exit_record.attributes["error_category"] == "runner"
     assert exit_record.attributes["error_impact"] == "blocking"
     assert exit_record.attributes["error_code"] == "required_terminal_exited"
+    # Captured pane text can carry credentials the default log redactor misses,
+    # so the failing-turn ERROR message must redact them before it is logged.
+    exit_message = exit_record.getMessage()
+    assert "s3cr3t-active-cookie-7b2c" not in exit_message
+    assert "hunter2-active-secret-pw" not in exit_message
+    assert "[REDACTED]" in exit_message
     assert parent_events == [
         {
             "type": "session.child_session.updated",
@@ -4667,6 +4676,71 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_required_terminal_exit_while_idle_logs_its_diagnostics(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An idle exit fails no turn, so its log line is the only record of the cause."""
+    from omnigent.errors import ErrorImpact
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import TerminalExitEvent, TerminalLifecycle
+
+    conv_id = uuid.uuid4().hex
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    publish_exit = app.state.session_resource_registry._terminal_exit_publisher
+    assert callable(publish_exit)
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
+            publish_exit(
+                TerminalExitEvent(
+                    session_id=conv_id,
+                    terminal_id="terminal_claude_main",
+                    terminal_name="claude",
+                    session_key="main",
+                    lifecycle=TerminalLifecycle.REQUIRED,
+                    command="claude",
+                    last_output=(
+                        "Error: launcher config is unreadable\n"
+                        "Cookie: s3cr3t-cookie-value-9f8a\n"
+                        "password hunter2-super-secret-pw"
+                    ),
+                    exit_status=1,
+                    session_was_idle=True,
+                )
+            )
+        await asyncio.sleep(0)
+        events = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+
+    [record] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "required_terminal_exited_idle"
+    ]
+    message = record.getMessage()
+    assert record.levelno == logging.WARNING
+    # The cause survives sanitization, but captured credentials the default log
+    # redactor misses (whitespace-delimited values, cookies) must not.
+    assert "Error: launcher config is unreadable" in message
+    assert "s3cr3t-cookie-value-9f8a" not in message
+    assert "hunter2-super-secret-pw" not in message
+    assert "[REDACTED]" in message
+    assert record.attributes["terminal_exit_status"] == 1
+    assert record.attributes["error_code"] == "required_terminal_exited"
+    # An idle exit is recoverable, not lost progress.
+    assert record.attributes["error_impact"] == ErrorImpact.TRANSIENT.value
+    assert not [
+        event
+        for event in events
+        if event.get("type") == "session.status" and event.get("status") == "failed"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_auxiliary_codex_tui_exit_preserves_app_server(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4874,9 +4948,11 @@ async def test_required_terminal_voluntary_exit_publishes_idle_not_failed() -> N
     assert pm.released == [conv_id]
 
 
+@pytest.mark.parametrize("session_was_idle", [False, True])
 @pytest.mark.asyncio
 async def test_required_terminal_exit_during_shutdown_does_not_fail_session(
     caplog: pytest.LogCaptureFixture,
+    session_was_idle: bool,
 ) -> None:
     """A required terminal exit while the runner is shutting down is not a crash.
 
@@ -4886,6 +4962,10 @@ async def test_required_terminal_exit_during_shutdown_does_not_fail_session(
     the runner must still remove the terminal resource and release the
     harness, but must not log an ERROR or publish ``session.status: failed``
     — the server already handles a runner going away via the dropped tunnel.
+
+    Shutdown is handled ahead of the idle check, so stopping a runner with an
+    idle session takes the benign shutdown path rather than emitting a
+    ``required_terminal_exited_idle`` cause diagnostic for ordinary teardown.
     """
     import logging
 
@@ -4917,7 +4997,7 @@ async def test_required_terminal_exit_during_shutdown_does_not_fail_session(
                     session_key="main",
                     lifecycle=TerminalLifecycle.REQUIRED,
                     exit_status=None,
-                    session_was_idle=False,
+                    session_was_idle=session_was_idle,
                 )
             )
             queued_events: list[dict[str, Any]] = []
@@ -4949,6 +5029,11 @@ async def test_required_terminal_exit_during_shutdown_does_not_fail_session(
         "shutting down" in record.getMessage() and record.levelno == logging.INFO
         for record in caplog.records
     )
+    assert [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "required_terminal_exited_idle"
+    ] == []
     # The harness subprocess is still released — the terminal is gone.
     assert pm.released == [conv_id]
 
