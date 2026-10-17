@@ -70,7 +70,13 @@ An explicit subprocess `RUST_LOG` takes precedence, then a runner/CLI environmen
 value, including an empty filter or `off`. For a host-managed session, add
 `RUST_LOG` to `OMNIGENT_RUNNER_ENV_PASSTHROUGH` if you want to forward a custom
 host filter to the runner. Disabled capture does not inject or change the filter.
-Start a fresh host/session after changing its launch environment.
+A new CLI invocation republishes its environment to a supported background host
+daemon, so later sessions pick up changed values without restarting it. The
+refresh trusts the published file through POSIX ownership checks, so it applies
+on POSIX hosts only; on other platforms (e.g. Windows) change the environment
+and restart the daemon. A host daemon started before this behaviour shipped also
+still needs restarting, because its running code cannot read the refreshed
+environment.
 
 The default avoids broad core/protocol DEBUG filters, which can include prompts,
 tool payloads, and large amounts of span activity. It is not a content-security
