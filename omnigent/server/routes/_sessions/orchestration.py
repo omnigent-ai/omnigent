@@ -133,6 +133,7 @@ from omnigent.server._elicitation_registry import (
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.auth import (
+    LEVEL_EDIT,
     LEVEL_READ,
     local_single_user_enabled,
 )
@@ -161,6 +162,7 @@ from omnigent.server.managed_hosts import (
     parse_repo_workspace,
     read_managed_repo_workspaces,
 )
+from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
 )
@@ -394,6 +396,8 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
+    SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
     NameAlreadyExistsError,
     pinned_label_key,
@@ -4828,6 +4832,182 @@ async def ensure_runner_connected(
             conv = await _reread()
 
     return runner_client, conv
+
+
+def _side_chat_source_id(conv: Conversation) -> str | None:
+    """Return the source session whose runner a side chat shares, if any."""
+    if conv.kind != "default" or conv.host_id is not None:
+        return None
+    labels = conv.labels or {}
+    source_id = labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
+    if labels.get(SIDE_CHAT_LABEL_KEY) != "1" or not source_id or source_id == conv.id:
+        return None
+    return source_id
+
+
+_SIDE_CHAT_RECOVERY_ATTEMPTS = 3
+
+
+async def _may_edit_side_chat_source(
+    source_id: str,
+    *,
+    conversation_store: ConversationStore,
+    user_id: str | None,
+    permission_store: PermissionStore | None,
+    source: Conversation | None = None,
+) -> bool:
+    """Return whether the caller may relaunch a side chat's source runner.
+
+    Recovery restarts the source's runner, so it needs the same edit access a
+    message to the source would. Always ``True`` when auth is off.
+    """
+    if permission_store is None:
+        return True
+    return await asyncio.to_thread(
+        check_session_access,
+        user_id,
+        source_id,
+        LEVEL_EDIT,
+        permission_store,
+        conversation_store,
+        source,
+    )
+
+
+async def _recover_side_chat_runner_via_source(
+    side_chat: Conversation,
+    *,
+    app_state: Any,
+    conversation_store: ConversationStore,
+    runner_router: RunnerRouter | None,
+    user_id: str | None,
+    permission_store: PermissionStore | None,
+    raise_host_refusal: bool = False,
+) -> tuple[httpx.AsyncClient | None, Conversation]:
+    """
+    Rebind a side chat whose shared runner is gone to its source's live runner.
+
+    A side chat has no host of its own; its runner belongs to the source
+    session. This brings that runner back with :func:`ensure_runner_connected`
+    (relaunching it on the source's host when needed), revalidates the source,
+    and rebinds the side chat atomically so concurrent rebindings are
+    preserved. The caller must initialize the side chat on the returned
+    runner. Recovery requires edit access to the source and, like an explicit
+    runner attach, ownership of the runner the side chat would use; a runner
+    owned by another user raises ``FORBIDDEN`` with that explanation.
+    """
+    source_id = _side_chat_source_id(side_chat)
+    if source_id is None:
+        return None, side_chat
+    source = await asyncio.to_thread(conversation_store.get_conversation, source_id)
+    if source is None:
+        return None, side_chat
+    if not await _may_edit_side_chat_source(
+        source_id,
+        conversation_store=conversation_store,
+        user_id=user_id,
+        permission_store=permission_store,
+        source=source,
+    ):
+        return None, side_chat
+    for _ in range(_SIDE_CHAT_RECOVERY_ATTEMPTS):
+        # Checked per attempt: a retry's fresh source row can name another host.
+        if (
+            runner_router is not None
+            and source.host_id is not None
+            and await asyncio.to_thread(runner_router.host_is_on_another_replica, source.host_id)
+        ):
+            raise OmnigentError(
+                "side chat runner is connected to another server replica",
+                code=ErrorCode.WRONG_REPLICA,
+            )
+        source_client, source = await ensure_runner_connected(
+            session_id=source_id,
+            conv=source,
+            app_state=app_state,
+            conversation_store=conversation_store,
+            runner_router=runner_router,
+            raise_host_refusal=raise_host_refusal,
+        )
+        if source_client is None or source.runner_id is None:
+            return None, side_chat
+        # A concurrent recovery may have advanced the source past the snapshot
+        # ensure_runner_connected returned. Retry against the fresh row so the
+        # side chat follows the source instead of binding a superseded runner.
+        live_source = await asyncio.to_thread(conversation_store.get_conversation, source_id)
+        if live_source is None:
+            return None, side_chat
+        if live_source.runner_id != source.runner_id:
+            source = live_source
+            continue
+        if user_id is not None and runner_router is not None:
+            runner_owner = runner_router.runner_owner(source.runner_id)
+            if runner_owner is not None and runner_owner != user_id:
+                _logger.info(
+                    "Side chat %s not recovered: source runner %s has another owner",
+                    side_chat.id,
+                    source.runner_id,
+                    extra={"session_id": side_chat.id},
+                )
+                raise OmnigentError(
+                    "This side chat can't reconnect: its parent session runs on "
+                    "another user's runner.",
+                    code=ErrorCode.FORBIDDEN,
+                )
+        if source.runner_id != side_chat.runner_id:
+            try:
+                if side_chat.runner_id is None:
+                    # Absent-only bind: a concurrent recovery wins the
+                    # NULL → runner transition instead of being overwritten.
+                    await asyncio.to_thread(
+                        conversation_store.set_runner_id, side_chat.id, source.runner_id
+                    )
+                    refreshed = await asyncio.to_thread(
+                        conversation_store.get_conversation, side_chat.id
+                    )
+                    if refreshed is None:
+                        return None, side_chat
+                    side_chat = refreshed
+                else:
+                    # Compare-and-swap: a concurrent rebind of the side chat
+                    # wins, and the store returns its row either way.
+                    side_chat = await asyncio.to_thread(
+                        conversation_store.replace_runner_id,
+                        side_chat.id,
+                        source.runner_id,
+                        expected_runner_id=side_chat.runner_id,
+                    )
+            except ConversationNotFoundError:
+                return None, side_chat
+            if side_chat.runner_id != source.runner_id:
+                _logger.info(
+                    "Side chat %s kept concurrent binding %s",
+                    side_chat.id,
+                    side_chat.runner_id,
+                    extra={"session_id": side_chat.id},
+                )
+            else:
+                _logger.info(
+                    "Side chat %s rebound to source %s runner %s",
+                    side_chat.id,
+                    source_id,
+                    source.runner_id,
+                    extra={"session_id": side_chat.id},
+                )
+        if side_chat.runner_id is None:
+            return None, side_chat
+        return (
+            await _get_runner_client(side_chat.id, runner_router, conversation=side_chat),
+            side_chat,
+        )
+    _logger.warning(
+        "Side chat %s recovery gave up after %d attempts; source %s kept changing runners",
+        side_chat.id,
+        _SIDE_CHAT_RECOVERY_ATTEMPTS,
+        source_id,
+        extra={"session_id": side_chat.id},
+    )
+    return None, side_chat
 
 
 def _recorded_repo_workspaces(
