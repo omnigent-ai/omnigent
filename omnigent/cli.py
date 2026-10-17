@@ -162,6 +162,15 @@ def _routing_config_text(routing_cfg: Mapping[str, object], key: str) -> str:
     raise click.ClickException(f"routing.{key} must be a string")
 
 
+def _parse_exclude_models(raw: object) -> tuple[str, ...]:
+    """Parse ``routing.exclude_models``: a list of model lines or ids, e.g. ``[fable]``."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not all(isinstance(m, str) for m in raw):
+        raise click.ClickException("routing.exclude_models must be a list of strings")
+    return tuple(m.strip().lower() for m in raw if m.strip())
+
+
 def parse_routing_settings(
     routing_cfg: Any,  # type: ignore[explicit-any]  # parsed YAML block
 ) -> Any:  # type: ignore[explicit-any]  # RoutingSettings
@@ -192,6 +201,7 @@ def parse_routing_settings(
         selection_model=selection_model,
         # Only an absent key falls back: ``model_prefix: []`` means bare ids.
         model_prefixes=MODEL_ID_PREFIXES if prefixes is None else tuple(prefixes),
+        exclude_models=_parse_exclude_models(routing_cfg.get("exclude_models")),
         # The arm menu / alias / effort tables a deployment fronting a different
         # catalog overrides; absent keys keep the built-in defaults.
         **parse_routing_tables(routing_cfg),

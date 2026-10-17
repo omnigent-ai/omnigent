@@ -3498,3 +3498,23 @@ async def test_a_runner_rebind_invalidates_the_routing_catalog() -> None:
     await fetch_runner_models("conv_overlay", client)
 
     assert client.get.call_count == 2
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(None, ()), (["Fable", " claude-opus-4-8 ", ""], ("fable", "claude-opus-4-8"))],
+)
+def test_parse_routing_settings_exclude_models(raw: object, expected: tuple[str, ...]) -> None:
+    from omnigent.cli import parse_routing_settings
+
+    cfg = {"provider": "host"} if raw is None else {"provider": "host", "exclude_models": raw}
+    assert parse_routing_settings(cfg).exclude_models == expected
+
+
+def test_parse_routing_settings_rejects_a_bare_string_exclude() -> None:
+    import click
+
+    from omnigent.cli import parse_routing_settings
+
+    with pytest.raises(click.ClickException):
+        parse_routing_settings({"exclude_models": "fable"})

@@ -974,6 +974,9 @@ class RoutingSettings:
         :data:`~omnigent.util.reasoning_effort.DEFAULT_MODEL_EFFORT_CAPS`. The
         provider ladders themselves are not configurable — they are the wire
         APIs' own vocabularies, not a deployment fact.
+    :param exclude_models: Model lines (``fable``) or bare ids
+        (``claude-fable-5-1``), lowercase, that routing never picks. Empty
+        offers every candidate.
     """
 
     router_name: str = DEFAULT_ROUTER_NAME
@@ -983,6 +986,7 @@ class RoutingSettings:
     servable_aliases: Mapping[str, str] | None = None
     current_generation_models: Mapping[str, Sequence[str]] | None = None
     model_effort_caps: ModelEffortCaps | None = None
+    exclude_models: tuple[str, ...] = ()
 
 
 def _string_list(raw: Any) -> tuple[str, ...] | None:  # type: ignore[explicit-any]  # parsed YAML
@@ -1175,6 +1179,15 @@ def _model_tier(model: str, prefixes: Sequence[str] | None = None) -> str | None
     segments = _bare_id(model, prefixes).split("-")
     tier = next((s for s in reversed(segments) if s.isalpha()), None)
     return None if tier in ("gpt", "claude") else tier
+
+
+def is_excluded_model(model: str, excluded: Sequence[str]) -> bool:
+    """Whether *model* matches a ``routing.exclude_models`` entry, by model line or bare id.
+
+    :param model: Candidate id, e.g. ``"claude-fable-5-1"``.
+    :param excluded: Lowercase entries, e.g. ``("fable",)``.
+    """
+    return _model_tier(model) in excluded or _bare_id(model).lower() in excluded
 
 
 def _version_key(model: str, prefixes: Sequence[str] | None = None) -> tuple[int, ...]:
