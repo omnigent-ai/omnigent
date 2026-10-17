@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
@@ -7415,6 +7416,277 @@ def test_item_data_seam_subclass_encodes_and_decodes(db_uri: str) -> None:
     # Reads reverse the transform and recover the entity.
     [item] = store.list_items(conv.id).data
     assert item.data.content[0]["text"] == "secret-payload"
+
+
+def _rpc_error(status_name: str, detail: str) -> Exception:
+    """A structural stand-in for a grpc ``RpcError`` (the deployed build vendors
+    grpc, so the match is on class name and ``code()`` shape, not identity)."""
+
+    class _Status:
+        name = status_name
+
+    class RpcError(Exception):
+        def code(self) -> object:
+            return _Status()
+
+        def details(self) -> str:
+            return detail
+
+    return RpcError(detail)
+
+
+class _FrameLimitedDecodeStore(SqlAlchemyConversationStore):
+    """Batch decode refuses a page whose combined payload exceeds a limit — the
+    shape of a batched decrypt RPC hitting the sidecar's inbound frame cap."""
+
+    frame_limit = 4096
+
+    def __init__(self, db_uri: str) -> None:
+        super().__init__(db_uri)
+        self.decode_calls = 0
+
+    def _decode_item_data_batch(self, stored: list[str]) -> list[str]:
+        self.decode_calls += 1
+        frame = sum(len(s) for s in stored)
+        if frame > self.frame_limit:
+            raise _rpc_error(
+                "RESOURCE_EXHAUSTED", f"Frame size {frame} exceeds maximum: {self.frame_limit}"
+            )
+        return super()._decode_item_data_batch(stored)
+
+
+class _FailingDecodeStore(SqlAlchemyConversationStore):
+    """Batch decode raises the same error for every call, whatever the page holds."""
+
+    def __init__(self, db_uri: str, error: Exception) -> None:
+        super().__init__(db_uri)
+        self.error = error
+        self.decode_calls = 0
+
+    def _decode_item_data_batch(self, stored: list[str]) -> list[str]:
+        self.decode_calls += 1
+        raise self.error
+
+
+def test_list_items_survives_batch_decode_overflow(db_uri: str) -> None:
+    """A page whose combined size trips the batch decode still lists intact: the
+    page is split until every slice fits, so no content is lost and the store
+    issues fewer decode calls than one per row."""
+    store = _FrameLimitedDecodeStore(db_uri)
+    conv = store.create_conversation()
+    texts = [f"turn {i} " + "x" * 1200 for i in range(6)]
+    store.append(conv.id, [_user_message(text, "resp_bulk") for text in texts])
+    store.decode_calls = 0
+
+    page = store.list_items(conv.id)
+
+    assert [item.type for item in page.data] == ["message"] * 6
+    assert [item.data.content[0]["text"] for item in page.data] == texts
+    assert store.decode_calls < len(texts)
+
+
+@pytest.mark.parametrize("type_filter", [None, "message"], ids=["all_types", "type_filter"])
+def test_list_items_degrades_undecodable_item_instead_of_failing(
+    db_uri: str, type_filter: str | None
+) -> None:
+    """A row too large to decode even alone becomes an ``error`` placeholder
+    while the rest of the conversation stays readable — one oversized inline
+    attachment must not make the whole session unopenable. A ``type`` filter
+    selects rows by their stored type, so the placeholder is returned under it
+    too rather than failing the page or silently disappearing."""
+    store = _FrameLimitedDecodeStore(db_uri)
+    conv = store.create_conversation()
+    store.append(conv.id, [_user_message("before", "resp_a")])
+    [big] = store.append(conv.id, [_user_message("y" * (store.frame_limit + 1), "resp_big")])
+    store.append(conv.id, [_user_message("after", "resp_b")])
+
+    page = store.list_items(conv.id, type=type_filter)
+
+    assert [item.type for item in page.data] == ["message", "error", "message"]
+    placeholder = page.data[1]
+    assert isinstance(placeholder.data, ErrorData)
+    assert placeholder.data.code == "item_data_unreadable"
+    assert placeholder.data.title
+    assert placeholder.id == big.id
+    assert placeholder.response_id == "resp_big"
+    assert placeholder.status == big.status
+    assert placeholder.created_at == big.created_at
+    assert placeholder.created_by == big.created_by
+    assert page.data[0].data.content[0]["text"] == "before"
+    assert page.data[2].data.content[0]["text"] == "after"
+
+
+def test_list_items_degrades_sole_oversized_row(db_uri: str) -> None:
+    """A page made of one oversized row degrades to one placeholder rather than
+    failing: a one-message conversation stays openable."""
+    store = _FrameLimitedDecodeStore(db_uri)
+    conv = store.create_conversation()
+    store.append(conv.id, [_user_message("z" * (store.frame_limit + 1), "resp_only")])
+
+    page = store.list_items(conv.id)
+
+    assert [item.type for item in page.data] == ["error"]
+    assert page.data[0].response_id == "resp_only"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [_rpc_error("DATA_LOSS", "ciphertext corrupt"), _rpc_error("INVALID_ARGUMENT", "bad payload")],
+    ids=["data_loss", "invalid_argument"],
+)
+def test_list_items_degrades_row_with_corrupt_data(db_uri: str, error: Exception) -> None:
+    """A row the backend refuses as corrupt (``DATA_LOSS``, ``INVALID_ARGUMENT``)
+    degrades to a placeholder even when it is the smallest row on the page; its
+    readable neighbours stay intact."""
+
+    class _CorruptRowStore(SqlAlchemyConversationStore):
+        def _decode_item_data_batch(self, stored: list[str]) -> list[str]:
+            if any("corrupt-me" in s for s in stored):
+                raise error
+            return super()._decode_item_data_batch(stored)
+
+    store = _CorruptRowStore(db_uri)
+    conv = store.create_conversation()
+    store.append(conv.id, [_user_message("before " + "r" * 200, "resp_a")])
+    store.append(conv.id, [_user_message("corrupt-me", "resp_bad")])
+    store.append(conv.id, [_user_message("after " + "r" * 200, "resp_b")])
+
+    page = store.list_items(conv.id)
+
+    assert [item.type for item in page.data] == ["message", "error", "message"]
+    assert page.data[1].response_id == "resp_bad"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _rpc_error("PERMISSION_DENIED", "Received http2 header with status: 403"),
+        _rpc_error("UNAVAILABLE", "failed to connect to all addresses"),
+        _rpc_error("CANCELLED", "Cancelled"),
+        _rpc_error("RESOURCE_EXHAUSTED", "Quota exceeded for decrypt requests"),
+        ConnectionError("decrypt sidecar unreachable"),
+        httpx.ConnectError("decrypt service unreachable"),
+        ValueError("zstd: data corruption detected"),
+        TypeError("decode seam defect"),
+    ],
+    ids=[
+        "permission_denied",
+        "unavailable",
+        "cancelled",
+        "quota_exhausted",
+        "connection_error",
+        "httpx_connect_error",
+        "local_decode_error",
+        "seam_defect",
+    ],
+)
+def test_list_items_propagates_backend_failures_unchanged(db_uri: str, error: Exception) -> None:
+    """A decode failure the backend does not attribute to a row's payload — a
+    denial, an outage, a cancelled or refused connection, a quota-style
+    RESOURCE_EXHAUSTED, a local decode error, a defect inside the seam —
+    propagates as raised, after a single call, so the app's existing
+    403/499/500 handling still applies instead of a page of placeholders."""
+    store = _FailingDecodeStore(db_uri, error)
+    conv = store.create_conversation()
+    store.append(conv.id, [_user_message("a", "resp_a"), _user_message("b", "resp_b")])
+    store.decode_calls = 0
+
+    with pytest.raises(type(error)) as excinfo:
+        store.list_items(conv.id)
+
+    assert excinfo.value is error
+    assert store.decode_calls == 1
+
+
+def test_list_items_propagates_when_every_row_is_refused(db_uri: str) -> None:
+    """A payload refusal of every row on a page is a backend-wide fault — a
+    rotated decryption key, a request-format bug — not isolated bad payloads:
+    the original error propagates instead of a page of placeholders."""
+    error = _rpc_error("DATA_LOSS", "ciphertext corrupt")
+    store = _FailingDecodeStore(db_uri, error)
+    conv = store.create_conversation()
+    store.append(conv.id, [_user_message("a", "resp_a"), _user_message("b", "resp_b")])
+    store.decode_calls = 0
+
+    with pytest.raises(type(error)) as excinfo:
+        store.list_items(conv.id)
+
+    assert excinfo.value is error
+    assert store.decode_calls == 3
+
+
+@pytest.mark.parametrize(
+    "detail",
+    ["Quota exceeded for decrypt requests", "Message exceeds tenant quota"],
+    ids=["quota_exceeded", "message_exceeds_quota"],
+)
+def test_single_row_quota_refusal_propagates_for_list_and_point_lookup(
+    db_uri: str, detail: str
+) -> None:
+    """A quota-style RESOURCE_EXHAUSTED carries no size rejection — even when it
+    mentions the message — so a one-row page and a point lookup both propagate
+    it after a single call instead of presenting the refusal as an unreadable
+    item."""
+    error = _rpc_error("RESOURCE_EXHAUSTED", detail)
+    store = _FailingDecodeStore(db_uri, error)
+    conv = store.create_conversation()
+    [only] = store.append(conv.id, [_user_message("only", "resp_only")])
+    store.decode_calls = 0
+
+    with pytest.raises(type(error)) as listing:
+        store.list_items(conv.id)
+    with pytest.raises(type(error)) as lookup:
+        store.get_item(conv.id, only.id)
+
+    assert listing.value is error
+    assert lookup.value is error
+    assert store.decode_calls == 2
+
+
+def test_get_item_degrades_unreadable_row(db_uri: str) -> None:
+    """A point lookup of a row that ``list_items`` serves as a placeholder
+    returns the same placeholder instead of raising."""
+    store = _FrameLimitedDecodeStore(db_uri)
+    conv = store.create_conversation()
+    [big] = store.append(conv.id, [_user_message("q" * (store.frame_limit + 1), "resp_big")])
+
+    item = store.get_item(conv.id, big.id)
+
+    assert item is not None
+    assert item.type == "error"
+    assert isinstance(item.data, ErrorData)
+    assert item.data.code == "item_data_unreadable"
+    assert item.id == big.id
+
+
+def test_latest_message_summaries_survive_undecodable_item(db_uri: str) -> None:
+    """Multi-conversation message summaries degrade an undecodable row
+    instead of failing the whole fetch."""
+    store = _FrameLimitedDecodeStore(db_uri)
+    conv = store.create_conversation()
+    store.append(conv.id, [_user_message("small", "resp_s")])
+    store.append(conv.id, [_user_message("z" * (store.frame_limit + 1), "resp_l")])
+
+    result = store.list_latest_message_items_for_conversations([conv.id])
+
+    # Newest first: the oversized row degrades, the readable one survives.
+    assert [item.type for item in result[conv.id]] == ["error", "message"]
+    assert result[conv.id][1].data.content[0]["text"] == "small"
+
+
+def test_search_results_survive_undecodable_item(db_uri: str) -> None:
+    """Search result pages degrade an undecodable row instead of failing."""
+    store = _FrameLimitedDecodeStore(db_uri)
+    conv = store.create_conversation()
+    store.append(conv.id, [_user_message("needle in a small row", "resp_s")])
+    store.append(
+        conv.id,
+        [_user_message("needle " + "w" * (store.frame_limit + 1), "resp_l")],
+    )
+
+    results = store.search("needle", conversation_id=conv.id)
+
+    assert sorted(item.type for item in results) == ["error", "message"]
 
 
 def test_item_search_text_seam_redirects_persisted_value(db_uri: str) -> None:
