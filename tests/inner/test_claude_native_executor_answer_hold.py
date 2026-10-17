@@ -13,12 +13,13 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.harnesses.claude_native.bridge import ClaudeUserPromptPending
+from omnigent.harnesses.claude_native.bridge import ClaudeTerminalDialog, ClaudeUserPromptPending
 from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
 from omnigent.inner.executor import ExecutorError, TurnComplete
 
 _REFUSAL = "Answer the pending Claude question or permission request before sending a message."
+_DIALOG = "Claude Code is waiting for an answer in its terminal (Settings Error)"
 
 
 class _Pane:
@@ -32,6 +33,9 @@ class _Pane:
     def __init__(self, refusals: list[bool], pending_polls: int) -> None:
         self.refusals = list(refusals)
         self.pending_polls = pending_polls
+        # Refusals raised as a terminal dialog: ``awaits_answer`` flags, before ``refusals``.
+        self.dialogs: list[bool] = []
+        self.dialog_polls = 0
         self.delivered: list[str] = []
         self.deliveries = 0
         self.polls = 0
@@ -42,6 +46,10 @@ class _Pane:
     ) -> None:
         del bridge_dir, timeout_s
         self.deliveries += 1
+        if self.dialogs:
+            dialog = ClaudeTerminalDialog(_DIALOG)
+            dialog.awaits_answer = self.dialogs.pop(0)
+            raise dialog
         if self.refusals:
             refusal = ClaudeUserPromptPending(_REFUSAL)
             refusal.nothing_typed = self.refusals.pop(0)
@@ -53,6 +61,13 @@ class _Pane:
         self.polls += 1
         if self.pending_polls > 0:
             self.pending_polls -= 1
+            return True
+        return False
+
+    def terminal_dialog_pending(self, bridge_dir: Path) -> bool:
+        del bridge_dir
+        if self.dialog_polls > 0:
+            self.dialog_polls -= 1
             return True
         return False
 
@@ -70,6 +85,12 @@ def pane(monkeypatch: pytest.MonkeyPatch) -> _Pane:
         claude_native_executor,
         "has_pending_user_prompt",
         fake.has_pending_user_prompt,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        claude_native_executor,
+        "terminal_dialog_pending",
+        fake.terminal_dialog_pending,
         raising=False,
     )
     monkeypatch.setattr(claude_native_executor, "kill_session", fake.kill_session)
@@ -175,3 +196,43 @@ async def test_stopping_a_held_turn_keeps_the_pane(
     assert pane.kills == 0
     assert pane.deliveries == 1
     assert pane.delivered == []
+
+
+@pytest.mark.asyncio
+async def test_a_terminal_dialog_holds_the_message_until_it_closes(
+    pane: _Pane, tmp_path: Path
+) -> None:
+    """
+    A dialog only the terminal shows, e.g. a settings error, holds the message until answered.
+
+    On main the turn failed at once with "Claude Code is waiting for an answer
+    in its terminal (...)".
+    """
+    pane.refusals = []
+    pane.pending_polls = 0
+    pane.dialogs = [True]
+    pane.dialog_polls = 2
+
+    events = await _run(tmp_path)
+
+    assert events == [TurnComplete(response=None)]
+    assert pane.delivered == ["hello from the web"]
+    assert pane.deliveries == 2
+    assert pane.kills == 0
+
+
+@pytest.mark.asyncio
+async def test_a_surface_that_is_not_a_dialog_is_reported_at_once(
+    pane: _Pane, tmp_path: Path
+) -> None:
+    """A refusal such as "occupied by shell mode" waits on no answer, so it is not held."""
+    pane.refusals = []
+    pane.dialogs = [False]
+
+    events = await _run(tmp_path)
+
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert events[0].message.startswith(_DIALOG)
+    assert events[0].undelivered is True
+    assert pane.deliveries == 1
+    assert pane.polls == 0

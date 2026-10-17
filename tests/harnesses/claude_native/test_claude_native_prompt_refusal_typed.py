@@ -14,7 +14,11 @@ from pathlib import Path
 import pytest
 
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
-from omnigent.harnesses.claude_native.bridge import ClaudeUserPromptPending, write_tmux_target
+from omnigent.harnesses.claude_native.bridge import (
+    ClaudeTerminalDialog,
+    ClaudeUserPromptPending,
+    write_tmux_target,
+)
 
 _RULE = "──────────────────────────────"
 _PERMISSION_PROMPT = (
@@ -24,6 +28,18 @@ _PERMISSION_PROMPT = (
     "  ❯ 1. Yes\n"
     "    2. Yes, and don't ask again for rm commands\n"
     "    3. No, and tell Claude what to do differently (esc)\n"
+)
+
+
+_SETTINGS_ERROR_DIALOG = (
+    f"{_RULE}\n"
+    "  Settings Error\n"
+    "  /home/someone/.claude/settings.json\n"
+    "   └ Invalid or malformed JSON\n"
+    "  ❯ 1. Fix with Claude\n"
+    "    2. Exit and fix manually\n"
+    "    3. Continue without these settings\n"
+    "  Enter to confirm · Esc to cancel\n"
 )
 
 
@@ -109,3 +125,63 @@ def test_a_prompt_after_the_paste_is_not_retryable(
         )
 
     assert raised.value.nothing_typed is False
+
+
+def test_the_readiness_gate_dialog_refusal_awaits_an_answer(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dialog only the terminal shows is held by the executor until it closes."""
+    _show(monkeypatch, _SETTINGS_ERROR_DIALOG)
+
+    with pytest.raises(ClaudeTerminalDialog, match="Settings Error") as raised:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock", "main", timeout_s=1.0, bridge_dir=bridge_dir
+        )
+
+    assert raised.value.awaits_answer is True
+
+
+def test_an_occupied_input_box_refusal_awaits_no_answer(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shell mode is no dialog; nothing the person answers would free the box."""
+    _show(monkeypatch, f"{_RULE}\n! git status --short\n{_RULE}\n  ! for shell mode\n")
+
+    with pytest.raises(ClaudeTerminalDialog, match="occupied by shell mode") as raised:
+        claude_native_bridge.inject_user_message(bridge_dir, content="hi")
+
+    assert raised.value.awaits_answer is False
+
+
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        (_SETTINGS_ERROR_DIALOG, True),
+        (f"{_RULE}\n❯ \n{_RULE}\n  ? for shortcuts\n", False),
+        ("", False),
+    ],
+    ids=["dialog", "composer", "torn-capture"],
+)
+def test_terminal_dialog_pending_reads_the_pane(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, pane: str, expected: bool
+) -> None:
+    _show(monkeypatch, pane)
+
+    assert claude_native_bridge.terminal_dialog_pending(bridge_dir) is expected
+
+
+def test_terminal_dialog_pending_without_a_pane_is_false(tmp_path: Path) -> None:
+    assert claude_native_bridge.terminal_dialog_pending(tmp_path / "missing") is False
+
+
+def test_the_settings_pre_check_refuses_before_typing(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A routed ``/model`` refused up front can be retried as is once the prompt is answered."""
+    _show(monkeypatch, f"{_RULE}\n❯ \n{_RULE}\n  ? for shortcuts\n")
+    monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", lambda _dir: True)
+
+    with pytest.raises(ClaudeUserPromptPending, match="before changing settings") as raised:
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/model opus")
+
+    assert raised.value.nothing_typed is True
