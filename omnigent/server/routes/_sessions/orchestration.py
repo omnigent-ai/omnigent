@@ -879,7 +879,9 @@ async def _stop_host_runner_intentionally(
                 handle = _runner_relay_tasks.get(related_id)
                 if settled and (handle is None or handle.runner_id == runner_id):
                     session_live_state.forget_live_status(related_id)
-                    _publish_status(related_id, "idle", persist_live_status=False)
+                    _publish_status(
+                        related_id, "idle", background_task_count=0, persist_live_status=False
+                    )
         return acknowledged
 
 
@@ -3954,7 +3956,9 @@ async def _mark_runner_sessions_offline_once(
                         current_handle is None or current_handle.runner_id == stopped_runner_id
                     ):
                         session_live_state.forget_live_status(conv.id)
-                        _publish_status(conv.id, "idle", persist_live_status=False)
+                        _publish_status(
+                            conv.id, "idle", background_task_count=0, persist_live_status=False
+                        )
                 if _intentional_stop_sessions.get(conv.id) == stopped_runner_id:
                     _intentional_stop_sessions.pop(conv.id, None)
             continue
@@ -8498,7 +8502,8 @@ async def _relay_runner_stream(
             if decision == "intentional_stop":
                 # An expected drop must not erase a real failure reported during
                 # teardown: preserve its labels when the sticky status stays failed.
-                _publish_status(session_id, "idle")
+                # A stopped runtime leaves no background work running.
+                _publish_status(session_id, "idle", background_task_count=0)
                 if _session_status_cache.get(session_id) != "failed":
                     await _persist_session_status_error_labels(
                         session_id,
@@ -8807,6 +8812,8 @@ async def _relay_runner_stream_once(
                             # would deliver a premature, lock-out completion.
                             raw_blocked_on = event.get("blocked_on")
                             raw_response_id = event.get("response_id")
+                            # Only an ended runtime reports a count here (zero).
+                            raw_background_count = event.get("background_task_count")
                             # The runner finishing a turn the server had written
                             # off as a runner drop proves the drop was transient:
                             # honor the completion and clear the disconnect cause.
@@ -8853,6 +8860,7 @@ async def _relay_runner_stream_once(
                                     if isinstance(raw_blocked_on, str) and raw_blocked_on
                                     else None
                                 ),
+                                background_task_count=(0 if raw_background_count == 0 else None),
                             )
                         if status == "running":
                             text_acc.clear()

@@ -1846,8 +1846,14 @@ def create_runner_app(
         # A dead required terminal cannot still be working a turn.
         _native_pane_status.pop(event.session_id, None)
 
+        # The session's runtime is gone, so no background work outlives it.
+        stopped_idle: dict[str, object] = {
+            "type": "session.status",
+            "status": "idle",
+            "background_task_count": 0,
+        }
         if event.terminal_name in ("qwen", "antigravity") and event.session_key == "main":
-            _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
+            _publish_event(event.session_id, stopped_idle)
             _release_required_terminal_session(event.session_id)
             return
 
@@ -1860,11 +1866,14 @@ def create_runner_app(
             and event.last_output is not None
             and _CLAUDE_VOLUNTARY_EXIT_MARKER in event.last_output
         ):
-            _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
+            _publish_event(event.session_id, stopped_idle)
             _release_required_terminal_session(event.session_id)
             return
 
         if event.session_was_idle:
+            # A turn still streaming reports its own outcome for this exit.
+            if event.session_id not in _live_response_id:
+                _publish_event(event.session_id, stopped_idle)
             _release_required_terminal_session(event.session_id)
             return
 
