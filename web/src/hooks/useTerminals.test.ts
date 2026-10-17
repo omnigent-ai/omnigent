@@ -21,6 +21,7 @@ import {
   terminalInfoFromResource,
   terminalsReconcileInterval,
   terminalTabKey,
+  useCreateTerminal,
   useTerminals,
   type TerminalInfo,
 } from "./useTerminals";
@@ -41,6 +42,13 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 }));
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 
+// useCreateTerminal resolves the terminal theme against the app's
+// appearance at mutate time. Mock the app-side resolution so the tests
+// below can pin "the app renders dark" without a next-themes provider.
+vi.mock("@/components/theme/useResolvedThemeMode", () => ({
+  useResolvedThemeMode: vi.fn(() => "dark"),
+}));
+
 const runnerOnlineMock = vi.mocked(useSessionRunnerOnline);
 
 function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
@@ -53,6 +61,14 @@ function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): 
 }
 
 const fetchMock = vi.fn();
+
+// A fresh QueryClient per render so query cache never leaks between tests.
+// (Hooks that hard-code their own `retry` are not overridden by this default.)
+function makeWrapper() {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client }, children);
+}
 
 describe("terminalInfoFromResource", () => {
   it("lifts id, metadata.terminal_name, metadata.session_key, metadata.running", () => {
@@ -356,12 +372,18 @@ describe("createTerminal", () => {
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_abc/resources/terminals");
     expect(init.method).toBe("POST");
-    const body = JSON.parse(init.body as string) as { terminal: string; session_key: string };
+    const body = JSON.parse(init.body as string) as {
+      terminal: string;
+      session_key: string;
+      terminal_theme?: string;
+    };
     expect(body.terminal).toBe("shell");
     // A fresh random `u-` key per call: the runner's launch is
     // idempotent per (terminal, session_key), so a fixed key would
     // return the SAME terminal on every click instead of a new one.
     expect(body.session_key).toMatch(/^u-/);
+    // Omit the optional field when no resolved theme is provided.
+    expect("terminal_theme" in body).toBe(false);
     // Mapped through terminalInfoFromResource — proves the POST
     // response shape lands as a usable TerminalInfo, not raw wire.
     expect(out).toEqual({
@@ -370,6 +392,25 @@ describe("createTerminal", () => {
       session: "u-abc123",
       running: true,
     });
+  });
+
+  it("sends the resolved theme so the pane's PTY learns its background", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        id: "terminal_shell_u-abc123",
+        object: "session.resource",
+        type: "terminal",
+        session_id: "conv_abc",
+        name: "shell:u-abc123",
+        metadata: { terminal_name: "shell", session_key: "u-abc123", running: true },
+      }),
+    );
+
+    await createTerminal("conv_abc", "shell", "dark");
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string) as { terminal_theme?: string };
+    expect(body.terminal_theme).toBe("dark");
   });
 
   it("surfaces the server gate's message on a 400 rejection", async () => {
@@ -383,6 +424,55 @@ describe("createTerminal", () => {
       ),
     );
     await expect(createTerminal("conv_abc", "zsh")).rejects.toThrow(/not declared/);
+  });
+});
+
+describe("useCreateTerminal — resolved theme rides the create request", () => {
+  beforeEach(() => {
+    fetchMock.mockReset();
+    vi.stubGlobal("fetch", fetchMock);
+    window.localStorage.removeItem("omnigent:terminal-theme");
+  });
+  afterEach(() => {
+    window.localStorage.removeItem("omnigent:terminal-theme");
+    vi.unstubAllGlobals();
+  });
+
+  const created = () =>
+    mockResponse({
+      id: "terminal_zsh_u-abc123",
+      object: "session.resource",
+      type: "terminal",
+      session_id: "conv_abc",
+      name: "zsh:u-abc123",
+      metadata: { terminal_name: "zsh", session_key: "u-abc123", running: true },
+    });
+
+  async function mutateAndReadBody(beforeMutate?: () => void): Promise<Record<string, unknown>> {
+    fetchMock.mockResolvedValueOnce(created());
+    const { result } = renderHook(() => useCreateTerminal("conv_abc"), {
+      wrapper: makeWrapper(),
+    });
+    beforeMutate?.();
+    await act(async () => {
+      await result.current.mutateAsync("zsh");
+    });
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    return JSON.parse(init.body as string) as Record<string, unknown>;
+  }
+
+  it("resolves the default 'Match app' mode against the app appearance (dark)", async () => {
+    // useResolvedThemeMode is mocked to "dark" above; nothing stored = auto.
+    expect((await mutateAndReadBody()).terminal_theme).toBe("dark");
+  });
+
+  it("a pinned Light terminal theme wins over a dark app", async () => {
+    // Pin the mode after the hook has rendered: it must be read when the
+    // mutation fires, not captured at render time.
+    const body = await mutateAndReadBody(() =>
+      window.localStorage.setItem("omnigent:terminal-theme", "light"),
+    );
+    expect(body.terminal_theme).toBe("light");
   });
 });
 
@@ -442,15 +532,7 @@ describe("useTerminals reconcile poll (stuck-spinner self-heal)", () => {
     vi.unstubAllGlobals();
   });
 
-  function makeWrapper() {
-    // A fresh client per render so query cache never leaks between tests.
-    // (The hook hard-codes retry:1, which this default does not override; the
-    // mocks below always resolve, so no retry/backoff fires under fake timers.)
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    return ({ children }: { children: ReactNode }) =>
-      createElement(QueryClientProvider, { client }, children);
-  }
-
+  // The mocks below always resolve, so no retry/backoff fires under fake timers.
   const emptyList = () => mockResponse({ object: "list", data: [] });
   const oneShell = () =>
     mockResponse({
