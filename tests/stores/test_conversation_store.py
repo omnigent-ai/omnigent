@@ -1904,6 +1904,52 @@ def test_list_conversations_search_snippet_on_content_match(
     assert by_id[conv_title.id].search_snippet is None
 
 
+def test_list_conversations_search_pull_request_reference(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A PR query matches sessions that link or mention that exact PR.
+
+    ``#1234`` finds a linked PR URL, a ``PR #1234`` mention, and a title, but
+    not ``/pull/12345``; a PR URL query is limited to that repository. Runs on
+    every CI database, since each one evaluates the regex itself.
+
+    :param conversation_store: The conversation store fixture.
+    """
+
+    def session_with_text(title: str, text: str) -> str:
+        conv = conversation_store.create_conversation()
+        conversation_store.update_conversation(conv.id, title=title)
+        conversation_store.append(
+            conv.id,
+            [
+                NewConversationItem(
+                    type="function_call_output",
+                    response_id=f"resp_{conv.id}",
+                    data=FunctionCallOutputData(call_id=f"call_{conv.id}", output=text),
+                ),
+            ],
+        )
+        return conv.id
+
+    linked = session_with_text("Login fix", "https://github.com/acme/app/pull/1234\n")
+    mentioned = session_with_text("Release", "Merged PR #1234 into main.")
+    longer = session_with_text("Other fix", "https://github.com/acme/app/pull/12345\n")
+    titled = conversation_store.create_conversation()
+    conversation_store.update_conversation(titled.id, title="Review #1234")
+
+    by_id = {c.id: c for c in conversation_store.list_conversations(search_query="#1234").data}
+    assert set(by_id) == {linked, mentioned, titled.id}
+    assert longer not in by_id
+    assert "/pull/1234" in (by_id[linked].search_snippet or "")
+    assert by_id[titled.id].search_snippet is None
+
+    url_page = conversation_store.list_conversations(
+        search_query="https://github.com/acme/app/pull/1234/files"
+    )
+    assert [c.id for c in url_page.data] == [linked]
+
+
 def test_list_conversations_search_snippet_absent_without_query(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

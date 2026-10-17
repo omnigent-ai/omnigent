@@ -862,8 +862,10 @@ class ConversationStore(ABC):
             (``search_text``). ``None`` or empty string disables
             the filter. A conversation matches if its title
             contains the query OR any of its items' search text
-            does. Powers the sidebar's session search on
-            ``GET /v1/sessions?search_query=...``.
+            does. A query naming a pull request (``#1234``,
+            ``PR 1234``, or a PR URL) instead matches references
+            to that exact PR. Powers the sidebar's session search
+            on ``GET /v1/sessions?search_query=...``.
         :param accessible_by: When set, filter to sessions the
             user has a direct grant on in ``session_permissions``.
             Public (``"__public__"``) grants are deliberately NOT

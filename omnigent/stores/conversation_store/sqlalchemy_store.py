@@ -115,6 +115,10 @@ from omnigent.stores.conversation_store.overrides import (
 from omnigent.stores.conversation_store.overrides import (
     encode_session_overrides as _encode_session_overrides,
 )
+from omnigent.stores.conversation_store.pull_request_search import (
+    PullRequestSearch,
+    parse_pull_request_query,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -628,18 +632,42 @@ def _fetch_labels_bulk(
     return out
 
 
+def _item_text_match(query: str, pull_request: PullRequestSearch | None) -> ColumnElement[bool]:
+    """
+    Return the session-search predicate on one item's ``search_text``.
+
+    ILIKE on the raw column rather than ``lower(search_text) LIKE``: the lower()
+    form matches the pg_trgm index expression, and the planner then scans every
+    item in the workspace out of that index instead of probing the scoped btree.
+    Do not "simplify" this back to lower(...) LIKE; see the covering test.
+
+    :param query: The user's search string, e.g. ``"deploy error"``.
+    :param pull_request: The PR the query names, from
+        :func:`parse_pull_request_query`, or ``None`` for a substring search.
+    :returns: A boolean SQL expression over :class:`SqlConversationItem`.
+    """
+    if pull_request is None:
+        return SqlConversationItem.search_text.ilike(f"%{query.lower()}%")
+    # The substring test is a cheap prefilter before the regex.
+    return and_(
+        SqlConversationItem.search_text.ilike(f"%{pull_request.number}%"),
+        SqlConversationItem.search_text.regexp_match(pull_request.pattern),
+    )
+
+
 def _fetch_search_snippets(
     session: Session,
     conversation_ids: list[str],
     query: str,
+    pull_request: PullRequestSearch | None,
 ) -> dict[str, str]:
     """
     Build a per-conversation preview excerpt of matching chat content.
 
     For each conversation whose body matched ``query`` (case-insensitive
-    substring on ``search_text``), returns a short snippet centered on the
-    match so the search UI can show *where* the session matched. The
-    earliest matching item per conversation wins.
+    substring on ``search_text``, or a reference to ``pull_request``), returns
+    a short snippet centered on the match so the search UI can show *where*
+    the session matched. The earliest matching item per conversation wins.
 
     Bulk (no N+1) *and* bounded to one row per conversation: a grouped
     subquery finds the min matching ``position`` per conversation, then the
@@ -652,25 +680,22 @@ def _fetch_search_snippets(
     :param conversation_ids: Conversation IDs to build snippets for,
         e.g. ``["conv_a", "conv_b"]``.
     :param query: The user's search string.
+    :param pull_request: The PR the query names, or ``None`` for a substring
+        search.
     :returns: Mapping ``{conversation_id: snippet}``. Conversations whose
         only match was the title (no item body match) are absent — the
         caller leaves their ``search_snippet`` as ``None``.
     """
     if not conversation_ids or not query:
         return {}
-    pattern = f"%{query.lower()}%"
     workspace_id = current_workspace_id()
     # workspace_id leads the (workspace_id, conversation_id, position) index.
     # Both the aggregate and the join-back below must include it or Postgres
     # can't use that index and falls back to a full table scan of every item.
-    # ILIKE on the raw column rather than ``lower(search_text) LIKE`` for the
-    # same reason as the content match in ``list_conversations``: the lower()
-    # form matches the pg_trgm index expression, and the planner then scans the
-    # whole workspace even though this is already scoped to one page of ids.
     match_pred = and_(
         SqlConversationItem.workspace_id == workspace_id,
         SqlConversationItem.conversation_id.in_(conversation_ids),
-        SqlConversationItem.search_text.ilike(pattern),
+        _item_text_match(query, pull_request),
     )
     # Earliest matching position per conversation — a small (conv_id, position)
     # aggregate, no bodies materialized.
@@ -702,7 +727,8 @@ def _fetch_search_snippets(
     for conv_id, search_text in rows:
         if not search_text:
             continue
-        snippet = build_search_snippet(search_text, query)
+        term = query if pull_request is None else pull_request.matched_text(search_text)
+        snippet = build_search_snippet(search_text, term) if term else None
         if snippet is not None:
             out[conv_id] = snippet
     return out
@@ -2811,7 +2837,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``conversation_items.search_text`` contains the
             query. Implemented with the SQL ``LIKE`` operator
             (no FTS) so it works against both SQLite and
-            Postgres without extra extensions.
+            Postgres without extra extensions. A query naming a
+            pull request (``#1234``, ``PR 1234``, or a PR URL)
+            instead matches references to that exact PR; see
+            :func:`parse_pull_request_query`.
         :param include_archived: When ``False`` (default), exclude
             rows where ``archived`` is true. When ``True``, include
             archived rows alongside non-archived ones.
@@ -2918,6 +2947,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         accessible_set if accessible_set is not None else owned_set or set()
                     )
 
+        pull_request = parse_pull_request_query(search_query) if search_query else None
         with self._conv_session("list_conversations") as session:
             # Bound the content-search scan server-side (Postgres only). SET
             # LOCAL scopes to this transaction and reverts on commit, so it
@@ -3030,28 +3060,23 @@ class SqlAlchemyConversationStore(ConversationStore):
             if title is not None:
                 stmt = stmt.where(SqlConversation.title == title)
             if search_query:
-                pattern = f"%{search_query.lower()}%"
-                title_match = func.lower(SqlConversation.title).like(pattern)
+                title_match = (
+                    func.lower(SqlConversation.title).like(f"%{search_query.lower()}%")
+                    if pull_request is None
+                    else SqlConversation.title.regexp_match(pull_request.pattern)
+                )
                 # Correlated EXISTS rather than ``id IN (SELECT ...)``: the IN
                 # form is uncorrelated, so the match set is built for the WHOLE
                 # workspace before the outer query discards every row the caller
                 # cannot see. Correlating on conversation_id keeps each probe on
                 # the (workspace_id, conversation_id) index and lets it stop at
                 # the first matching item per conversation.
-                # ``ILIKE`` on the raw column, NOT ``lower(search_text) LIKE``:
-                # the latter matches the ``lower(search_text)`` pg_trgm index
-                # expression, and the planner then prefers that index — scanning
-                # every item in the workspace out of a multi-GB index that does
-                # not fit in shared_buffers. ILIKE is the same case-insensitive
-                # match but cannot use that index, so the probe stays on the
-                # (workspace_id, conversation_id) btree above. Do not "simplify"
-                # this back to lower(...) LIKE; see the covering test.
                 content_match = (
                     select(SqlConversationItem.conversation_id)
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
                         SqlConversationItem.conversation_id == SqlConversation.id,
-                        SqlConversationItem.search_text.ilike(pattern),
+                        _item_text_match(search_query, pull_request),
                     )
                     .exists()
                 )
@@ -3187,7 +3212,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             # search_snippet=None — the title already shows the hit. Items
             # are AP-side, so this must run inside the conv session.
             snippets = (
-                _fetch_search_snippets(session, row_ids, search_query) if search_query else {}
+                _fetch_search_snippets(session, row_ids, search_query, pull_request)
+                if search_query
+                else {}
             )
             # Build AP-only entities; metadata fetched separately below.
             ap_entities = [(r, labels_by_conv.get(r.id, {})) for r in rows]
