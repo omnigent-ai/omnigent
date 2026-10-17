@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -798,15 +799,17 @@ def test_claude_provider_project_disable_overrides_global_enable(
 def test_claude_provider_install_path_from_later_scope_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """installPath is taken from the first entry that has one, not blindly entries[0]."""
+    """installPath comes from the first entry naming an existing directory, not entries[0]."""
     home = tmp_path / "home"
     install = home / ".claude" / "plugins" / "cache" / "mkt" / "sp" / "1.0.0"
     _write_skill(install / "skills", "using-superpowers")
+    missing = home / ".claude" / "plugins" / "cache" / "mkt" / "sp" / "0.9.0"
     (home / ".claude").mkdir(parents=True, exist_ok=True)
     (home / ".claude" / "settings.json").write_text(
         json.dumps({"enabledPlugins": {"sp@mkt": True}})
     )
-    # First entry lacks installPath; the second carries it.
+    # The first entry lacks installPath and the second names a directory that
+    # is gone; the third carries the real install.
     (home / ".claude" / "plugins" / "installed_plugins.json").write_text(
         json.dumps(
             {
@@ -814,6 +817,7 @@ def test_claude_provider_install_path_from_later_scope_entry(
                 "plugins": {
                     "sp@mkt": [
                         {"scope": "project"},
+                        {"scope": "local", "installPath": str(missing)},
                         {"scope": "user", "installPath": str(install)},
                     ]
                 },
@@ -950,6 +954,133 @@ def test_claude_provider_skips_install_path_outside_plugins_root(
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")]
     assert "sp:using-superpowers" not in names
+
+
+def _config_dir_with_symlinked_cache(tmp_path: Path, plugins: dict[str, Path]) -> Path:
+    """A config dir whose ``plugins/cache`` links to a shared cache (ccs-style profile)."""
+    shared = tmp_path / "shared-cache"
+    shared.mkdir(exist_ok=True)
+    cfg = tmp_path / "profile"
+    (cfg / "plugins").mkdir(parents=True)
+    (cfg / "plugins" / "cache").symlink_to(shared, target_is_directory=True)
+    (cfg / "settings.json").write_text(
+        json.dumps({"enabledPlugins": dict.fromkeys(plugins, True)})
+    )
+    (cfg / "plugins" / "installed_plugins.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "plugins": {key: [{"installPath": str(path)}] for key, path in plugins.items()},
+            }
+        )
+    )
+    return cfg
+
+
+def test_claude_provider_follows_symlinked_plugin_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plugins in a symlinked shared cache surface via either path spelling."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    shared = tmp_path / "shared-cache"
+    _write_skill(shared / "mkt" / "linked" / "1.0.0" / "skills", "review")
+    _write_skill(shared / "mkt" / "direct" / "1.0.0" / "skills", "plan")
+    cfg = _config_dir_with_symlinked_cache(
+        tmp_path,
+        {
+            "linked@mkt": tmp_path / "profile" / "plugins" / "cache" / "mkt" / "linked" / "1.0.0",
+            "direct@mkt": shared / "mkt" / "direct" / "1.0.0",
+        },
+    )
+
+    out = resolve_harness_skills(
+        _ctx(tmp_path / "ws", home, claude_config_dir=cfg), "claude-native"
+    )
+    assert sorted(s.name for s in out) == ["direct:plan", "linked:review"]
+
+
+@pytest.mark.parametrize("escape", ["direct", "nested_symlink"])
+def test_claude_provider_symlinked_cache_does_not_trust_its_siblings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    escape: str,
+) -> None:
+    """Only the cache target is trusted: neither its siblings nor a link escaping it."""
+    caplog.set_level(logging.WARNING, logger="omnigent.spec.skill_sources")
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    outside = tmp_path / "evil"
+    _write_skill(outside / "skills", "review")
+    install = outside
+    if escape == "nested_symlink":
+        # A plugin directory inside the shared cache that links out of it.
+        (tmp_path / "shared-cache" / "mkt" / "sp").mkdir(parents=True)
+        (tmp_path / "shared-cache" / "mkt" / "sp" / "1.0.0").symlink_to(
+            outside, target_is_directory=True
+        )
+        install = tmp_path / "profile" / "plugins" / "cache" / "mkt" / "sp" / "1.0.0"
+    cfg = _config_dir_with_symlinked_cache(tmp_path, {"sp@mkt": install})
+
+    out = resolve_harness_skills(
+        _ctx(tmp_path / "ws", home, claude_config_dir=cfg), "claude-native"
+    )
+    assert out == []
+    rejection = next(m for m in caplog.messages if "outside the trusted roots" in m)
+    assert str((cfg / "plugins").resolve()) in rejection
+    assert str((tmp_path / "shared-cache").resolve()) in rejection
+
+
+@pytest.mark.parametrize("cache_link", ["loop", "dangling"])
+def test_claude_provider_survives_broken_plugin_cache_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    cache_link: str,
+) -> None:
+    """A looping or dangling ``plugins/cache`` link skips only the entries behind it."""
+    caplog.set_level(logging.WARNING, logger="omnigent.spec.skill_sources")
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    cfg = tmp_path / "profile"
+    (cfg / "plugins").mkdir(parents=True)
+    (cfg / "plugins" / "cache").symlink_to(
+        "cache" if cache_link == "loop" else tmp_path / "missing"
+    )
+    ordinary = cfg / "plugins" / "ordinary" / "sp" / "1.0.0"
+    _write_skill(ordinary / "skills", "using-superpowers")
+    fallback = cfg / "plugins" / "ordinary" / "multi" / "1.0.0"
+    _write_skill(fallback / "skills", "plan")
+    behind_link = cfg / "plugins" / "cache" / "mkt" / "cached" / "1.0.0"
+    (cfg / "settings.json").write_text(
+        json.dumps({"enabledPlugins": dict.fromkeys(["sp@mkt", "cached@mkt", "multi@mkt"], True)})
+    )
+    (cfg / "plugins" / "installed_plugins.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "plugins": {
+                    "sp@mkt": [{"installPath": str(ordinary)}],
+                    "cached@mkt": [{"installPath": str(behind_link)}],
+                    "multi@mkt": [
+                        {"installPath": str(behind_link)},
+                        {"installPath": str(fallback)},
+                    ],
+                },
+            }
+        )
+    )
+
+    out = resolve_harness_skills(
+        _ctx(tmp_path / "ws", home, claude_config_dir=cfg), "claude-native"
+    )
+    # The entry behind the link is unresolvable (loop) or outside every root
+    # (dangling); the plugin's next scope entry still counts either way.
+    assert sorted(s.name for s in out) == ["multi:plan", "sp:using-superpowers"]
+    assert any(
+        "plugins cache" in m and str(cfg / "plugins" / "cache") in m for m in caplog.messages
+    )
 
 
 def test_cursor_provider_tolerates_unreadable_skills_dir(
