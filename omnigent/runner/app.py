@@ -4559,12 +4559,16 @@ def create_runner_app(
         status: str,
         output: str | None,
         only_if_work_id: str | None = None,
+        confirmed_completion: bool = False,
+        confirmed_cancellation: bool = False,
     ) -> _SubagentDeliveryAck:
         ack = mark_subagent_work_terminal(
             child_session_id,
             status=status,
             output=output,
             only_if_work_id=only_if_work_id,
+            confirmed_completion=confirmed_completion,
+            confirmed_cancellation=confirmed_cancellation,
         )
         if ack.entry is not None and ack.delivered_now:
             _schedule_subagent_wake(ack.entry)
@@ -6670,8 +6674,6 @@ def create_runner_app(
                 if turn_outcome in ("completed", "cancelled", "failed"):
                     recovered_entry = await _ensure_subagent_work_entry(conversation_id)
                     terminal_status = turn_outcome
-                    if turn_outcome == "cancelled" and recovered_entry is not None:
-                        recovered_entry.cancellation_confirmed = True
                 elif (
                     status == "idle"
                     and recovered_entry is not None
@@ -6732,6 +6734,8 @@ def create_runner_app(
                     conversation_id,
                     status=terminal_status,
                     output=output if output is not None else "",
+                    confirmed_completion=terminal_status == "completed",
+                    confirmed_cancellation=terminal_status == "cancelled",
                 )
             elif ambiguous_idle:
                 # This harness's forwarder marks genuine turn completions
@@ -6766,10 +6770,14 @@ def create_runner_app(
                     )
                 elif status == "idle":
                     _native_interrupt_runner.clear_pending_interrupt(conversation_id)
+                    # Only a confirmed turn-end (``turn_completed``) may correct an
+                    # optimistic grace-timer cancellation; a legacy harness's bare
+                    # idle is unconfirmed and must not overturn it.
                     delivery_ack = _mark_subagent_terminal_and_wake(
                         conversation_id,
                         status="completed",
                         output=output if output is not None else "",
+                        confirmed_completion=turn_completed is True,
                     )
                 elif status == "failed":
                     _native_interrupt_runner.clear_pending_interrupt(conversation_id)
