@@ -70,6 +70,33 @@ def _parse_node_version(name: str) -> tuple[int, ...]:
         return ()
 
 
+#: Executable extensions probed when ``PATHEXT`` is unset or empty: the
+#: launchable CLI shim types from ``shutil.which``'s Windows default.
+_WINDOWS_DEFAULT_PATHEXT = ".COM;.EXE;.BAT;.CMD"
+
+
+def _fallback_candidate_names(name: str) -> list[str]:
+    """Return the basenames to probe for *name* in each fallback dir.
+
+    Mirrors :func:`shutil.which` on Windows: the ``PATHEXT`` spellings first and
+    the bare name last unless it already carries a ``PATHEXT`` suffix, so npm's
+    bare ``codex`` sh shim never shadows its ``codex.cmd``. POSIX probes the
+    bare name only.
+    """
+    if not IS_WINDOWS:
+        return [name]
+    # PATHEXT is ``;``-delimited on Windows; ``or`` also covers an empty value.
+    pathext = os.environ.get("PATHEXT") or _WINDOWS_DEFAULT_PATHEXT
+    extensions = [ext for ext in pathext.split(";") if ext]
+    names = [name + ext for ext in extensions]
+    suffix = os.path.splitext(name)[1].upper()
+    if any(suffix == ext.upper() for ext in extensions):
+        names.insert(0, name)
+    else:
+        names.append(name)
+    return names
+
+
 def resolve_cli_binary(
     name: str,
     *,
@@ -82,7 +109,9 @@ def resolve_cli_binary(
     on ``PATH``), then ``PATH`` via :func:`shutil.which`, then a ladder of
     common global install dirs (:func:`_cli_fallback_dirs`). This survives the
     host daemon's frozen ``PATH``, which omits nvm/npm/homebrew bin dirs that
-    only interactive shell init adds. Returns ``None`` when none resolve; the
+    only interactive shell init adds. On Windows the ladder probes the
+    ``PATHEXT`` spellings (``claude.exe``, ``codex.cmd``) in the order
+    :func:`shutil.which` uses. Returns ``None`` when none resolve; the
     caller decides whether that's fatal.
 
     :param name: The binary name, e.g. ``"codex"`` or ``"claude"``.
@@ -114,10 +143,13 @@ def resolve_cli_binary(
     on_path = which(name)
     if on_path is not None:
         return on_path
+    candidates = _fallback_candidate_names(name)
     for directory in _cli_fallback_dirs():
-        candidate = directory / name
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
+        for candidate_name in candidates:
+            candidate = directory / candidate_name
+            # os.path.isfile reads an unsearchable dir as absent; Path.is_file raises.
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return str(candidate)
     return None
 
 

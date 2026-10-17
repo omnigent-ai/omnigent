@@ -603,6 +603,87 @@ def test_resolve_cli_binary_falls_back_to_global_dir(monkeypatch, tmp_path):
     assert _platform.resolve_cli_binary("tool", env_var="OMNIGENT_TESTCLI_PATH") == str(tool)
 
 
+@pytest.mark.parametrize(("name", "ext"), [("claude", ".exe"), ("codex", ".cmd")])
+def test_resolve_cli_binary_fallback_applies_pathext_on_windows(
+    monkeypatch, tmp_path, name: str, ext: str
+):
+    """Windows installs the CLI as ``claude.exe`` / ``codex.cmd``, so the off-PATH
+    fallback must match it the way ``shutil.which`` applies ``PATHEXT`` on PATH.
+    A single lowercase PATHEXT entry keeps the probe meaningful on a
+    case-sensitive POSIX filesystem."""
+    fallback_dir = tmp_path / ".local" / "bin"
+    fallback_dir.mkdir(parents=True)
+    installed = fallback_dir / f"{name}{ext}"
+    installed.write_text("")
+    installed.chmod(0o755)
+    frozen_path = tmp_path / "daemon-path"
+    frozen_path.mkdir()
+    monkeypatch.setenv("PATH", str(frozen_path))
+    monkeypatch.setenv("PATHEXT", ext)
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (fallback_dir,))
+    assert _platform.resolve_cli_binary(name) == str(installed)
+
+
+def test_resolve_cli_binary_windows_fallback_prefers_pathext_match_over_bare_name(
+    monkeypatch, tmp_path
+):
+    """npm drops a bare ``codex`` sh shim beside ``codex.cmd``; like ``shutil.which``,
+    the Windows ladder must return the launchable ``.cmd`` rather than the shim."""
+    fallback_dir = tmp_path / "npm-global" / "bin"
+    fallback_dir.mkdir(parents=True)
+    for shim in ("codex", "codex.cmd"):
+        (fallback_dir / shim).write_text("")
+        (fallback_dir / shim).chmod(0o755)
+    monkeypatch.setenv("PATHEXT", ".com;.exe;.bat;.cmd")
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    monkeypatch.setattr(_platform.shutil, "which", lambda name: None)
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (fallback_dir,))
+    assert _platform.resolve_cli_binary("codex") == str(fallback_dir / "codex.cmd")
+
+
+def test_resolve_cli_binary_windows_fallback_accepts_explicit_extension(monkeypatch, tmp_path):
+    """A configured ``claude.exe`` still resolves once the ``PATHEXT`` expansion is on."""
+    installed = tmp_path / "claude.exe"
+    installed.write_text("")
+    installed.chmod(0o755)
+    monkeypatch.setenv("PATHEXT", ".com;.exe;.bat;.cmd")
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    monkeypatch.setattr(_platform.shutil, "which", lambda name: None)
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (tmp_path,))
+    assert _platform.resolve_cli_binary("claude.exe") == str(installed)
+
+
+@pytest.mark.parametrize("pathext", [None, ""])
+def test_resolve_cli_binary_windows_fallback_defaults_pathext(monkeypatch, tmp_path, pathext):
+    """An unset or empty ``PATHEXT`` falls back to the standard executable
+    extensions, as ``shutil.which`` does."""
+    installed = tmp_path / "claude.EXE"
+    installed.write_text("")
+    installed.chmod(0o755)
+    if pathext is None:
+        monkeypatch.delenv("PATHEXT", raising=False)
+    else:
+        monkeypatch.setenv("PATHEXT", pathext)
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    monkeypatch.setattr(_platform.shutil, "which", lambda name: None)
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (tmp_path,))
+    assert _platform.resolve_cli_binary("claude") == str(installed)
+
+
+def test_resolve_cli_binary_posix_fallback_keeps_bare_name(monkeypatch, tmp_path):
+    """The ``PATHEXT`` expansion is Windows-only: on POSIX a ``claude.EXE`` with no
+    bare ``claude`` beside it stays unresolved."""
+    shim = tmp_path / "claude.EXE"
+    shim.write_text("")
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATHEXT", ".COM;.EXE;.CMD")
+    monkeypatch.setattr(_platform, "IS_WINDOWS", False)
+    monkeypatch.setattr(_platform.shutil, "which", lambda name: None)
+    monkeypatch.setattr(_platform, "_cli_fallback_dirs", lambda: (tmp_path,))
+    assert _platform.resolve_cli_binary("claude") is None
+
+
 def test_resolve_cli_binary_returns_none_when_absent(monkeypatch, tmp_path):
     monkeypatch.delenv("OMNIGENT_TESTCLI_PATH", raising=False)
     monkeypatch.setattr(_platform.shutil, "which", lambda name: None)
