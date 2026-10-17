@@ -719,6 +719,26 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(screen.getByRole("button", { name: "Open new" })).not.toHaveFocus();
   });
 
+  it("opens a Side chat tab from the menu with its composer asked to take focus", async () => {
+    const previousHarness = useChatStore.getState().sessionHarness;
+    useChatStore.setState({ sessionHarness: "openai-agents", sideChatComposers: {} });
+    try {
+      const { onRightRailTabChange } = renderWorkspace({ rightRailTab: "sidechat" });
+
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+      fireEvent.click(await screen.findByRole("menuitem", { name: "Side chat" }));
+
+      const pendingId = screen.getByTestId("side-chat-pane-stub").textContent ?? "";
+      expect(pendingId).toMatch(/^pending:/);
+      expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat");
+      expect(useChatStore.getState().sideChatComposers).toEqual({
+        [pendingId]: { text: "", files: [], autoFocus: true },
+      });
+    } finally {
+      useChatStore.setState({ sessionHarness: previousHarness, sideChatComposers: {} });
+    }
+  });
+
   it("does not launch on the multi-shell row when the session is offline", async () => {
     // The row is disabled on an offline session. Its click handler is a
     // sub-trigger's onClick (which Radix runs before its own disabled check), so

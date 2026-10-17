@@ -3863,10 +3863,12 @@ function ComposerImpl(
                         const sourceId = useChatStore.getState().conversationId;
                         if (sourceId === null) return;
                         createSideChat(sourceId).then(
-                          ({ childSessionId }) =>
+                          ({ childSessionId }) => {
+                            useChatStore.getState().requestSideChatFocus(childSessionId);
                             useChatStore.setState({
                               sideChatToOpen: { childId: childSessionId, parentId: sourceId },
-                            }),
+                            });
+                          },
                           () => toast.error("Couldn't start a side chat for this session."),
                         );
                       }
