@@ -70,7 +70,9 @@ function AgentNodeComponent({ data }: NodeProps<Node<AgentNodeData>>) {
         style={{ width: NODE_WIDTH }}
       >
         <div className="flex items-center gap-1.5">
-          <span className="truncate text-sm font-medium leading-tight">{label}</span>
+          <span className="truncate text-sm font-medium leading-tight" title={label}>
+            {label}
+          </span>
           <span className="flex-1" />
           <NodeStatusDot activity={activity} />
         </div>

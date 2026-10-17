@@ -511,7 +511,9 @@ class SysSessionListTool(Tool):
       LLM uses these to decide which pairs already exist (so a follow-up
       ``sys_session_send`` continues rather than spawns) and to grab each
       child's ``conversation_id`` for ``sys_session_get_history`` /
-      ``sys_session_get_info`` / ``sys_session_close``.
+      ``sys_session_get_info`` / ``sys_session_close``. Each carries
+      ``task_summary``, the generated label the Subagents panel shows, so
+      the LLM can refer to a child by the name the user sees.
     - ``sessions`` — a **global** view of every session the caller can
       access (bounded by the server's per-user permission model), each
       with its status and runner connectivity. An optional
@@ -536,8 +538,9 @@ class SysSessionListTool(Tool):
         return (
             "List sessions in two views. 'sub_agents': the named "
             "(agent, title) children under this conversation (and your "
-            "parent/siblings) — use their conversation_id to read "
-            "history, get info, or close. 'sessions': a global list of "
+            "parent/siblings), each with the task_summary label the "
+            "Subagents panel shows the user — use their conversation_id to "
+            "read history, get info, or close. 'sessions': a global list of "
             "every session "
             "you can access, each with status + runner connectivity, "
             "for orchestration (inspect via sys_agent_get / "
@@ -614,7 +617,8 @@ class SysSessionListTool(Tool):
             view).
         :param ctx: Server-side execution context.
         :returns: JSON ``{"sub_agents": [{"agent": ..., "title": ...,
-            "conversation_id": ...}, ...], "sessions": []}``.
+            "conversation_id": ..., "task_summary": ...}, ...],
+            "sessions": []}``.
         """
         del arguments
         from omnigent.runtime import get_conversation_store
@@ -629,7 +633,7 @@ class SysSessionListTool(Tool):
             # would lose track regardless.
             limit=100,
         )
-        result: list[dict[str, str]] = []
+        result: list[dict[str, str | None]] = []
         for child in children.data:
             # Title is "<agent>:<title>" — split into the LLM-
             # friendly fields. Skip rows whose title doesn't
@@ -648,6 +652,7 @@ class SysSessionListTool(Tool):
                     "agent": sa_agent,
                     "title": sa_title,
                     "conversation_id": child.id,
+                    "task_summary": child.task_summary,
                 }
             )
         # ``sessions`` (the global, permission-bounded view) is empty on
@@ -665,9 +670,10 @@ class SysSessionGetInfoTool(Tool):
     model), not just the caller's spawn subtree. Reports lifecycle
     status, title, agent binding (id + name), runner binding and live
     connectivity, host and its reported harness readiness, reasoning effort,
-    effective model, parent
-    linkage, workspace / git branch, persisted last-activity time, and
-    the count of outstanding approval prompts. Comparing
+    effective model, parent linkage and the sub-agent's generated task
+    summary (the label the Subagents panel shows), workspace / git branch,
+    persisted last-activity time, and the count of outstanding approval
+    prompts. Comparing
     ``last_activity_at`` across polls distinguishes a running session that
     is advancing from one whose persisted output has stalled. For the
     conversation transcript, use
@@ -695,7 +701,8 @@ class SysSessionGetInfoTool(Tool):
             "Return a session's metadata: lifecycle status, title, "
             "agent binding (id/name), runner binding + connectivity, "
             "host + configured harness readiness, reasoning effort, model, "
-            "parent session, workspace, "
+            "parent session, task_summary (the label the Subagents panel "
+            "shows a sub-agent under), workspace, "
             "persisted last-activity time, and outstanding approval "
             "prompts. Global read — any "
             "session you can access. Pass session_id to target another "

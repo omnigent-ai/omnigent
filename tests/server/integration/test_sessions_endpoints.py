@@ -4554,6 +4554,36 @@ async def test_get_session_includes_title_labels_effort(
     assert body["reasoning_effort"] == "medium"
 
 
+async def test_get_session_snapshot_includes_task_summary(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A sub-agent's snapshot carries the generated label the Agents rail shows,
+    which ``sys_session_get_info`` projects so an orchestrator can learn the
+    name the user sees for a worker."""
+    agent = await create_test_agent(client, sub_agents=[{"name": "worker"}])
+    parent = await _create_session(client, agent["id"])
+    child_resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent["id"],
+            "sub_agent_name": "worker",
+            "title": "worker:deploy-profile-page",
+        },
+    )
+    assert child_resp.status_code == 201, child_resp.text
+    child_id = child_resp.json()["id"]
+    SqlAlchemyConversationStore(db_uri).set_task_summary(child_id, "Deploy PR41 via web ops")
+
+    child = await client.get(f"/v1/sessions/{child_id}")
+    assert child.status_code == 200
+    assert child.json()["task_summary"] == "Deploy PR41 via web ops"
+    parent_snapshot = await client.get(f"/v1/sessions/{parent['id']}")
+    assert parent_snapshot.status_code == 200
+    assert parent_snapshot.json()["task_summary"] is None
+
+
 async def test_get_session_labels_returns_labels_only(
     client: httpx.AsyncClient,
 ) -> None:

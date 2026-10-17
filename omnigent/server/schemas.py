@@ -2143,6 +2143,10 @@ class SessionResponse(BaseModel):
     :param sub_agent_name: For sub-agent sessions, the sub-agent
         type name within the parent's spec tree, e.g.
         ``"summarizer"``. ``None`` for top-level sessions.
+    :param task_summary: For sub-agent sessions, the generated
+        task-derived label the Agents rail leads with, e.g.
+        ``"Investigate auth token refresh"``. ``None`` until the
+        background generator writes it, and for top-level sessions.
     :param parent_session_id: For sub-agent sessions, the parent
         conversation's id, e.g. ``"conv_parent987"``. ``None`` for
         top-level sessions. Lets clients identify a session as a
@@ -2347,6 +2351,7 @@ class SessionResponse(BaseModel):
     items: list[ConversationItem] = Field(default_factory=list)
     permission_level: int | None = None
     sub_agent_name: str | None = None
+    task_summary: str | None = None
     kind: str = "default"
     parent_session_id: str | None = None
     root_conversation_id: str | None = None

@@ -1693,11 +1693,12 @@ describe("ElicitationCard — prompts mirrored from a sub-agent", () => {
 
   it("names and links the child session on pending and responded cards", () => {
     // WHY: the parent can run a different harness than the child, so a card
-    // tagged "Claude Code" in a Codex chat must say which sub-agent asked.
+    // tagged "Claude Code" in a Codex chat must say which sub-agent asked,
+    // pairing the summary with the orchestrator's handle like the Agents rail.
     const cache = { conv_parent: [childSession()] };
     const { unmount } = renderCard(elicitationItem(), cache);
     const requester = screen.getByTestId("approval-card-requester");
-    expect(requester).toHaveTextContent("Requested by sub-agent Review the auth change");
+    expect(requester).toHaveTextContent("Requested by sub-agent Review the auth change · review");
     expect(within(requester).getByRole("link")).toHaveAttribute("href", "/c/conv_child");
     unmount();
 
@@ -1710,7 +1711,7 @@ describe("ElicitationCard — prompts mirrored from a sub-agent", () => {
     );
     expect(screen.getByText("Approved · auto mode")).toBeDefined();
     expect(screen.getByTestId("approval-card-requester")).toHaveTextContent(
-      "Requested by sub-agent Review the auth change",
+      "Requested by sub-agent Review the auth change · review",
     );
   });
 
@@ -1756,13 +1757,12 @@ describe("ElicitationCard — prompts mirrored from a sub-agent", () => {
     expect(within(requester).getByRole("link")).toHaveAttribute("href", "/c/conv_child");
   });
 
-  it("treats an empty label as missing", () => {
-    // WHY: label fields fall through with ``??``, so an empty summary would
-    // otherwise render an empty, invisible link.
+  it("falls through to the handle when the summary is empty", () => {
+    // WHY: an empty summary must not render an empty, invisible link.
     renderCard(elicitationItem(), { conv_parent: [childSession({ task_summary: "" })] });
     const requester = screen.getByTestId("approval-card-requester");
-    expect(requester).toHaveTextContent("Requested by a sub-agent");
-    expect(within(requester).getByRole("link")).toHaveTextContent("sub-agent");
+    expect(requester).toHaveTextContent("Requested by sub-agent review");
+    expect(within(requester).getByRole("link")).toHaveTextContent("review");
   });
 
   it.each([

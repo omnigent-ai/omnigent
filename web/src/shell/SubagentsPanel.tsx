@@ -616,7 +616,9 @@ function SubagentRow({
                     <RoleIcon className="size-4 text-muted-foreground" />
                   )}
                 </span>
-                <span className="min-w-0 flex-1 truncate text-sm font-medium">{primary}</span>
+                <span className="min-w-0 flex-1 truncate text-sm font-medium" title={primary}>
+                  {primary}
+                </span>
                 {child.routed_model ? (
                   // Model the intelligent router picked for this sub-agent — the
                   // per-subagent half of routing visibility.
