@@ -74,6 +74,15 @@ _GRACEFUL_SHUTDOWN_TUNNEL_TIMEOUT_S = 15.0
 # expires, so a live session's HTTP callbacks never present an expired
 # token. Well under the server-side token TTL.
 _MANAGED_MINT_REFRESH_SKEW_S = 300.0
+# Delay the proactive exchange so normal startup pays no mint latency: the
+# first plain call at least this long after construction performs it, and a
+# transient mint failure retries with doubling delays up to the cap below.
+_BOOTSTRAP_BEARER_EXCHANGE_DELAY_S = 30.0
+_BOOTSTRAP_BEARER_EXCHANGE_MAX_DELAY_S = 300.0
+# Cadence of the runner's credential keepalive. Stays under
+# _MANAGED_MINT_REFRESH_SKEW_S so a tick lands inside the re-mint window even
+# when no callback has run for the token's whole lifetime.
+_CREDENTIAL_KEEPALIVE_INTERVAL_S = 120.0
 _logger = logging.getLogger(__name__)
 
 # Module-level singleton set once at runner startup. All later
@@ -496,7 +505,13 @@ def _invalidate_auth_token_factory(factory: Callable[[], str | None]) -> bool:
 
 
 class _InitialAuthTokenFactory:
-    """Use a host bearer until rejection, then lazily resolve runner auth."""
+    """Use a host bearer through boot, then switch to the runner's own owner JWT.
+
+    An Apps edge validates the bearer on the mint request too, so the exchange
+    (:data:`_BOOTSTRAP_BEARER_EXCHANGE_DELAY_S` after construction) must happen
+    while the host bearer is still accepted; after a rejection the runner could
+    only recover through SDK/OIDC credentials it is designed not to need.
+    """
 
     def __init__(self, token: str, server_url: str) -> None:
         """
@@ -508,13 +523,47 @@ class _InitialAuthTokenFactory:
         self._server_url = server_url
         self._fallback_factory: Callable[[], str | None] | None = None
         self._retry_discovery_at = 0.0
+        self._exchange_due_at = time.monotonic() + _BOOTSTRAP_BEARER_EXCHANGE_DELAY_S
+        self._exchange_retry_s = _BOOTSTRAP_BEARER_EXCHANGE_DELAY_S
+        self._exchange_unavailable = False
+        self._exchange_in_progress = False
         self._no_credential_logged = False
         self._lock = threading.Lock()
 
     def __call__(self) -> str | None:
-        """Return the host bearer or a token from the lazy local fallback."""
+        """Return the host bearer or a token from the lazy local fallback.
+
+        A due bootstrap exchange mints outside the lock so concurrent lookups
+        keep getting the bearer meanwhile; the keepalive is its usual caller.
+        :meth:`call_with_declined` (HTTP callbacks) never exchanges.
+        """
         with self._lock:
-            return self._call_locked()
+            token = self._call_locked()
+            mint = self._start_exchange_locked()
+        if mint is None:
+            return token
+        try:
+            try:
+                minted = mint()
+            except Exception:  # noqa: BLE001 — treated as a transient mint failure
+                minted = None
+                _logger.debug(
+                    "bootstrap bearer exchange failed unexpectedly",
+                    exc_info=True,
+                    extra={"session_id": runner_primary_session_id()},
+                )
+        except BaseException:
+            # Never leave the exchange latched in flight (e.g. SystemExit).
+            with self._lock:
+                self._exchange_in_progress = False
+            raise
+        with self._lock:
+            installed = self._finish_exchange_locked(mint, minted)
+            if installed is not None:
+                return installed
+            # A rejection may have invalidated the bearer captured in ``token``
+            # while the mint was in flight; never hand out that stale snapshot.
+            return token if self._initial_token is not None else self._call_locked()
 
     def _call_locked(self) -> str | None:
         """Body of :meth:`__call__`, run under :attr:`_lock`.
@@ -555,6 +604,63 @@ class _InitialAuthTokenFactory:
         elif token:
             self._no_credential_logged = False
         return token
+
+    def _start_exchange_locked(self) -> _ManagedMintTokenFactory | None:
+        """Hand out the mint factory for a due bootstrap exchange, else ``None``.
+
+        :returns: The factory to call outside the lock, or ``None`` when no
+            exchange is due, possible, or already in flight.
+        """
+        if (
+            self._initial_token is None
+            or self._exchange_unavailable
+            or self._exchange_in_progress
+            or time.monotonic() < self._exchange_due_at
+        ):
+            return None
+        mint = _delegated_mint_factory_from_env(self._server_url, proxy_bearer=self._initial_token)
+        if mint is None:
+            self._exchange_unavailable = True
+            return None
+        self._exchange_in_progress = True
+        return mint
+
+    def _finish_exchange_locked(
+        self, mint: _ManagedMintTokenFactory, token: str | None
+    ) -> str | None:
+        """Install a minted token or schedule the next exchange attempt.
+
+        :param mint: The factory :meth:`_start_exchange_locked` handed out.
+        :param token: Its mint result; ``None`` when the mint failed.
+        :returns: The installed token, or ``None`` while the bearer stays in use.
+        """
+        self._exchange_in_progress = False
+        if self._initial_token is None:
+            # Rejected meanwhile: keep a successful mint unless the rejection
+            # path already installed its own fallback.
+            if token and self._fallback_factory is None:
+                self._fallback_factory = mint
+                return token
+            return None
+        if token:
+            self._fallback_factory = mint
+            self._initial_token = None
+            _logger.info(
+                "exchanged the host bootstrap bearer for a runner-owned token",
+                extra={"session_id": runner_primary_session_id()},
+            )
+            return token
+        if (mint.declined and not mint.declined_by_server_error) or mint.proxy_auth_failed:
+            # The server never mints for this runner, or the bearer is already
+            # rejected: keep the bearer until the server rejects it.
+            self._exchange_unavailable = True
+            return None
+        # Transient failure: back off so a flapping server is not probed every call.
+        self._exchange_due_at = time.monotonic() + self._exchange_retry_s
+        self._exchange_retry_s = min(
+            self._exchange_retry_s * 2, _BOOTSTRAP_BEARER_EXCHANGE_MAX_DELAY_S
+        )
+        return None
 
     @property
     def declined(self) -> bool:
@@ -830,10 +936,7 @@ def _make_managed_mint_factory(
         latches ``proxy_auth_failed`` instead, which
         :class:`_InitialAuthTokenFactory` answers by re-resolving SDK/OIDC.
     """
-    from omnigent.runner.identity import token_bound_runner_id
-
-    runner_id = token_bound_runner_id(binding_token)
-    mint_url = f"{server_url.rstrip('/')}/v1/runners/{runner_id}/token"
+    mint_url = _managed_mint_url(server_url, binding_token)
 
     # Construction probe. Decline to install the factory ONLY when the
     # server definitively will not mint for this runner — HTTP 400 (no auth
@@ -1037,6 +1140,88 @@ class _ManagedMintTokenFactory:
         if self._cached_token is not None and now < self._cached_expires_at:
             return self._cached_token
         return None
+
+
+def _managed_mint_url(server_url: str, binding_token: str) -> str:
+    """Return the ``/v1/runners/{id}/token`` URL for *binding_token*'s runner.
+
+    :param server_url: Omnigent server base URL.
+    :param binding_token: The runner's tunnel binding token.
+    :returns: Fully-qualified mint endpoint URL.
+    """
+    from omnigent.runner.identity import token_bound_runner_id
+
+    return f"{server_url.rstrip('/')}/v1/runners/{token_bound_runner_id(binding_token)}/token"
+
+
+def _delegated_mint_factory_from_env(
+    server_url: str, *, proxy_bearer: str | None
+) -> _ManagedMintTokenFactory | None:
+    """Build the owner-token mint factory for a host-delegated runner.
+
+    Unlike :func:`_make_managed_mint_factory` this performs no construction
+    probe; the caller decides from the first call's latches.
+
+    :param server_url: Omnigent server base URL.
+    :param proxy_bearer: Bearer presented to an Apps edge on the mint request.
+    :returns: The factory, or ``None`` when the runner was not launched with
+        delegated auth and a binding token.
+    """
+    from omnigent.runner.identity import RUNNER_DELEGATED_AUTH_ENV_VAR
+
+    if os.environ.get(RUNNER_DELEGATED_AUTH_ENV_VAR, "").strip() != "1":
+        return None
+    try:
+        binding_token = _runner_tunnel_binding_token_from_env()
+    except RuntimeError:
+        return None
+    if binding_token is None:
+        return None
+    return _ManagedMintTokenFactory(
+        _managed_mint_url(server_url, binding_token),
+        server_url,
+        binding_token,
+        proxy_bearer=proxy_bearer,
+    )
+
+
+async def _run_credential_keepalive(
+    factory: Callable[[], str | None],
+    *,
+    interval_s: float,
+    initial_delay_s: float | None = None,
+) -> None:
+    """Call *factory* periodically so an idle runner's credential never lapses.
+
+    Callbacks renew a credential only on demand, so a session idle past the
+    token lifetime would present an expired token on its next request.
+
+    :param factory: The runner's auth token factory.
+    :param interval_s: Seconds between calls, e.g. ``120.0``.
+    :param initial_delay_s: Seconds before the first call, e.g. the bootstrap
+        exchange delay so a short-lived host bearer is exchanged in time.
+        ``None`` waits one interval.
+    :returns: Never; cancelled at runner shutdown.
+    """
+    consecutive_failures = 0
+    delay_s = interval_s if initial_delay_s is None else initial_delay_s
+    while True:
+        await asyncio.sleep(delay_s)
+        delay_s = interval_s
+        try:
+            await asyncio.to_thread(factory)
+        except Exception:  # noqa: BLE001 — best-effort; the next tick retries
+            consecutive_failures += 1
+            # Factories report "no token" by returning None, so an exception
+            # that keeps recurring is worth surfacing at the default log level.
+            log = _logger.warning if consecutive_failures >= 3 else _logger.debug
+            log(
+                "runner credential keepalive failed",
+                exc_info=True,
+                extra={"session_id": runner_primary_session_id()},
+            )
+        else:
+            consecutive_failures = 0
 
 
 def _mint_managed_owner_token(
@@ -1937,6 +2122,16 @@ async def _run_tunnel_from_env() -> None:
             ),
             name=f"runner-idle-monitor:{runner_id}",
         )
+    keepalive_task: asyncio.Task[None] | None = None
+    if auth_token_factory is not None:
+        keepalive_task = asyncio.create_task(
+            _run_credential_keepalive(
+                auth_token_factory,
+                interval_s=_CREDENTIAL_KEEPALIVE_INTERVAL_S,
+                initial_delay_s=_BOOTSTRAP_BEARER_EXCHANGE_DELAY_S,
+            ),
+            name=f"runner-credential-keepalive:{runner_id}",
+        )
     if parent_pid is not None:
 
         def _request_parent_death_shutdown() -> None:
@@ -1996,6 +2191,10 @@ async def _run_tunnel_from_env() -> None:
             )
         for task in wait_tasks:
             task.cancel()
+        if keepalive_task is not None:
+            # Cancel before the awaits below: a tunnel error re-raised there
+            # would otherwise skip this and leave the keepalive running.
+            keepalive_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await stop_task
         with contextlib.suppress(asyncio.CancelledError):
@@ -2003,6 +2202,9 @@ async def _run_tunnel_from_env() -> None:
         if idle_task is not None:
             with contextlib.suppress(asyncio.CancelledError):
                 await idle_task
+        if keepalive_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await keepalive_task
         if direct_attach_listener is not None:
             with contextlib.suppress(Exception):
                 await direct_attach_listener.stop()
