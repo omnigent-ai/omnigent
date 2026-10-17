@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import errno
 import hashlib
 import json
 import logging
@@ -59,6 +60,7 @@ from omnigent.native._native_post_delivery import (
     append_dead_letter,
     post_external_session_status,
     post_may_have_been_delivered,
+    post_session_event_with_retry,
 )
 from omnigent.native.failure_telemetry import (
     FailureContext,
@@ -342,6 +344,223 @@ def _observe_transcript_discovery(
         extra={"session_id": session_id},
     )
     diagnostics.warning_logged = True
+
+
+_MISSING_TRANSCRIPT_ERROR_CODE = "claude_transcript_missing"
+# The chat notice is posted once per turn ahead of the idle edge. Bounded
+# retries plus a wall-clock deadline cap how long the edge waits, including
+# when the tunnel that carries source-keyed items is down.
+_MISSING_TRANSCRIPT_NOTICE_ATTEMPTS = 3
+_MISSING_TRANSCRIPT_NOTICE_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+_MISSING_TRANSCRIPT_NOTICE_DEADLINE_S = 10.0
+
+
+def _transcript_write_blocker(transcript_path: Path) -> str:
+    """
+    Explain why a hook-reported transcript file could not be created.
+
+    Walks up from the file to the nearest existing ancestor and names the
+    errno a writer hits there, e.g. ``"/home/u/.claude is not writable
+    (EACCES)"`` for a root-owned config directory.
+
+    :param transcript_path: Transcript path Claude Code reported, e.g.
+        ``"/home/u/.claude/projects/-work/abc.jsonl"``.
+    :returns: One-line description naming the directory and errno.
+    """
+    for ancestor in transcript_path.parents:
+        try:
+            ancestor.stat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            code = errno.errorcode.get(exc.errno or 0, type(exc).__name__)
+            return f"{ancestor} is not accessible ({code})"
+        if not ancestor.is_dir():
+            return f"{ancestor} is not a directory (ENOTDIR)"
+        if not os.access(ancestor, os.W_OK | os.X_OK):
+            return f"{ancestor} is not writable ({_unwritable_directory_errno(ancestor)})"
+        if ancestor != transcript_path.parent:
+            return f"{transcript_path.parent} does not exist (ENOENT); {ancestor} is writable"
+        return f"{ancestor} is writable but the file was never created"
+    return f"no ancestor of {transcript_path} exists (ENOENT)"
+
+
+def _mount_is_read_only(directory: Path) -> bool:
+    """Whether the filesystem holding ``directory`` is mounted read-only."""
+    try:
+        return bool(os.statvfs(directory).f_flag & os.ST_RDONLY)
+    except OSError:
+        return False
+
+
+def _unwritable_directory_errno(
+    directory: Path, *, mount_is_read_only: Callable[[Path], bool] = _mount_is_read_only
+) -> str:
+    """Name the errno a writer hits in a directory ``os.access`` reports unwritable."""
+    # access(2) carries no errno; a read-only mount is the other common cause.
+    return "EROFS" if mount_is_read_only(directory) else "EACCES"
+
+
+@dataclass(frozen=True)
+class _UnreadTranscript:
+    """
+    A hook-reported transcript the forwarder could not read at the turn's ``Stop``.
+
+    :param path: Transcript path Claude Code reported.
+    :param blocker: Why it is unreadable, e.g. ``"/home/u/.claude is not writable (EACCES)"``.
+    :param exists: Whether the file exists but cannot be read, rather than never appeared.
+    """
+
+    path: Path
+    blocker: str
+    exists: bool
+
+
+def _missing_transcript_blocker(
+    bridge_dir: Path, hook_transcript_path: Path | None
+) -> _UnreadTranscript | None:
+    """
+    Return the hook-reported transcript and why it is unreadable, or ``None`` when it is fine.
+
+    :param bridge_dir: Native Claude bridge directory.
+    :param hook_transcript_path: Transcript path carried by the ``Stop`` hook record.
+    :returns: The unread transcript for a missing or unreadable file.
+    """
+    transcript_path = hook_transcript_path or read_transcript_path(bridge_dir)
+    if transcript_path is None:
+        return None
+    try:
+        if transcript_path.exists():
+            if os.access(transcript_path, os.R_OK):
+                return None
+            return _UnreadTranscript(
+                transcript_path, f"{transcript_path} is not readable (EACCES)", exists=True
+            )
+    except OSError:
+        # An unsearchable ancestor hides the file as surely as a missing one.
+        pass
+    return _UnreadTranscript(
+        transcript_path, _transcript_write_blocker(transcript_path), exists=False
+    )
+
+
+async def _surface_missing_transcript(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    record: ClaudeHookRecord,
+    dedupe: _ForwardDedupeState,
+) -> str | None:
+    """
+    Report a finished turn whose hook-reported transcript file still does not exist.
+
+    Claude Code keeps reporting ``transcript_path`` when it cannot create the
+    file (an unwritable ``~/.claude``) and still ends the turn with ``Stop``,
+    so nothing it mirrored explains the empty history. Logs once per path,
+    posts an error item into the session, and returns the text the idle edge
+    carries as ``output`` so the parent learns the result could not be read.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param bridge_dir: Native Claude bridge directory.
+    :param record: The ``Stop`` hook record ending the turn.
+    :param dedupe: Per-session baseline holding the once-per-path log latch.
+    :returns: Parent-facing notice naming the unread transcript, or ``None``
+        when the transcript exists or no path is known yet.
+    """
+    unread = await asyncio.to_thread(
+        _missing_transcript_blocker, bridge_dir, record.transcript_path
+    )
+    if unread is None:
+        return None
+    if unread.exists:
+        problem = "exists but could not be read"
+        title = "Claude Code's transcript could not be read"
+        message = (
+            f"Claude Code's transcript at {unread.path} exists, but Omnigent cannot read it, "
+            "so this turn's prompt and replies were not mirrored into this session."
+        )
+        remediation = (
+            "Make the transcript file readable by the session user so Omnigent can mirror it."
+        )
+    else:
+        problem = "never appeared"
+        title = "Claude Code's transcript was never written"
+        message = (
+            f"Claude Code reported its transcript at {unread.path}, but the file never "
+            "appeared, so this turn's prompt and replies were not mirrored into this session."
+        )
+        remediation = (
+            "Make that directory writable by the session user so Claude Code can write "
+            "its transcript."
+        )
+    if unread.path not in dedupe.missing_transcript_warned_paths:
+        dedupe.missing_transcript_warned_paths.add(unread.path)
+        _logger.warning(
+            "Claude transcript %s reported by hooks %s before the turn's Stop (%s); "
+            "the turn's prompt and replies were not mirrored; session=%s",
+            unread.path,
+            problem,
+            unread.blocker,
+            session_id,
+            extra={"session_id": session_id},
+        )
+    payload: dict[str, object] = {
+        "type": "external_conversation_item",
+        "data": {
+            # Stable per hook record, so a retried or re-seen Stop cannot
+            # duplicate the notice.
+            "source_id": f"missing-transcript:{record.event_cursor}:{record.byte_offset}",
+            "item_type": "error",
+            "item_data": {
+                "source": "harness",
+                "code": _MISSING_TRANSCRIPT_ERROR_CODE,
+                "title": title,
+                "message": message,
+                "cause": f"{unread.blocker}.",
+                "remediation": remediation,
+            },
+        },
+    }
+    outcome: str | None = None
+    try:
+        # Source-keyed items ride the tunnel and wait for its acknowledgement, so a
+        # wall-clock deadline keeps a tunnel outage from holding the idle edge.
+        response = await asyncio.wait_for(
+            post_session_event_with_retry(
+                client=client,
+                url=f"/v1/sessions/{url_component(session_id)}/events",
+                payload=payload,
+                event_type="external_conversation_item",
+                max_attempts=_MISSING_TRANSCRIPT_NOTICE_ATTEMPTS,
+                retry_status_codes=_MISSING_TRANSCRIPT_NOTICE_RETRY_STATUSES,
+                sleep=asyncio.sleep,
+                retry_delay=lambda attempt: 0.25 * attempt,
+                logger_name=__name__,
+            ),
+            timeout=_MISSING_TRANSCRIPT_NOTICE_DEADLINE_S,
+        )
+    except TimeoutError:
+        outcome = "deadline"
+    else:
+        if response is None:
+            outcome = "transport"
+        elif response.status_code >= 400:
+            outcome = str(response.status_code)
+    if outcome is not None:
+        _logger.warning(
+            "Failed to post Claude missing-transcript notice; "
+            "session=%s event_cursor=%s outcome=%s",
+            session_id,
+            record.event_cursor,
+            outcome,
+            extra={"session_id": session_id},
+        )
+    return (
+        "Omnigent could not read this turn's output: Claude Code's transcript "
+        f"{unread.path} {problem} ({unread.blocker})."
+    )
 
 
 def _log_new_observer_hook_stderr(
@@ -937,6 +1156,9 @@ class _ForwardDedupeState:
     # Session already logged as moved off this runner, so the notice is not
     # repeated for every item dropped afterwards.
     session_not_bound_logged_for: str | None = None
+    # Transcript paths whose never-created file was already logged, so the
+    # warning fires once per path while the per-turn notices keep posting.
+    missing_transcript_warned_paths: set[Path] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -4426,11 +4648,32 @@ async def _forward_available_status_events(
                 )
             except Exception as exc:  # noqa: BLE001 - telemetry must not prevent status delivery
                 _logger.debug("Claude hook failure telemetry failed: %s", type(exc).__name__)
+        # A finished turn whose hook-reported transcript still does not exist
+        # has nothing mirrored; tell the parent instead of settling a silent idle.
+        unread_transcript_output: str | None = None
+        if status == "idle":
+            try:
+                unread_transcript_output = await _surface_missing_transcript(
+                    client,
+                    session_id=session_id,
+                    bridge_dir=bridge_dir,
+                    record=record,
+                    dedupe=dedupe,
+                )
+            except Exception:  # noqa: BLE001 - diagnostics must not prevent status delivery
+                _logger.warning(
+                    "Claude missing-transcript diagnostic failed; session=%s event_cursor=%s",
+                    session_id,
+                    record.event_cursor,
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
         try:
             await post_external_session_status(
                 client,
                 session_id=session_id,
                 status=status,
+                output=unread_transcript_output,
                 response_id=response_id,
                 # The ``Stop`` hook fires exactly once per finished turn and
                 # never on an interrupt, so its ``idle`` edge is a confirmed
