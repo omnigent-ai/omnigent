@@ -6,9 +6,11 @@ is mocked; upload storage and model ingestion remain in tests/e2e.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
-from playwright.sync_api import Page, expect
+import pytest
+from playwright.sync_api import Page, Route, expect
 
 from tests.browser_ui.chat.session_contract import ChatSessionContract
 
@@ -17,8 +19,7 @@ _COMPOSER = "Send a message…"
 _ATTACH_NAME = "attach_sample.txt"
 _ATTACH_BODY = "composer attachment e2e sample\n"
 
-# An unsupported type: ``addFiles`` rejects it (no chip) and shows an inline
-# error. Office documents and archives are accepted.
+# Unsupported by the default server policy; an operator may explicitly allow it.
 _MEDIA_NAME = "clip.mp4"
 
 # JSON is its own MIME (``application/json``), which is NOT covered by the
@@ -110,7 +111,7 @@ def test_reject_unsupported_type(
     Covers the validation ``addFiles`` gained (``validateAttachments`` in
     lib/attachments.ts). Office documents and archives are no longer rejected
     here, so this pins the shape
-    that is still refused: media no harness can open from disk. Driving the
+    refused by the default server policy. Driving the
     hidden input directly (``set_input_files`` bypasses the accept filter, so
     the file reaches ``addFiles``) must yield NO chip and a visible error.
     """
@@ -312,3 +313,60 @@ def test_file_dropped_outside_the_chat_column_is_ignored(
     assert handled is True, "a drop outside the chat column was claimed"
     expect(page.get_by_test_id("file-drop-overlay")).to_have_count(0)
     expect(page.get_by_role("button", name=f"Remove {_ATTACH_NAME}")).to_have_count(0)
+
+
+@pytest.mark.parametrize("surface", ["chat", "landing"])
+@pytest.mark.parametrize("allowed", [True, False], ids=["allowed", "disabled"])
+def test_composer_uses_published_filesystem_policy(
+    page: Page,
+    seeded_session: tuple[str, str],
+    tmp_path: Path,
+    surface: str,
+    allowed: bool,
+) -> None:
+    """Both composers mirror server policy in the picker and preserve rejected drafts."""
+    base_url, session_id = seeded_session
+
+    def publish_policy(route: Route) -> None:
+        response = route.fetch()
+        info = response.json()
+        info["filesystem_attachment_policy"] = {
+            "allowed_extensions": [".mp4"] if allowed else [],
+            "denied_extensions": [],
+            "max_bytes": 50 * 1024 * 1024,
+            "max_total_bytes": 100 * 1024 * 1024,
+            "max_files": 10,
+            "harnesses": ["claude-native", "codex-native"],
+        }
+        route.fulfill(response=response, json=info)
+
+    page.route("**/v1/info", publish_policy)
+    page.goto(f"{base_url}/c/{session_id}" if surface == "chat" else base_url)
+    composer = (
+        page.get_by_placeholder(_COMPOSER)
+        if surface == "chat"
+        else page.get_by_test_id("new-chat-landing-input")
+    )
+    expect(composer).to_be_visible(timeout=30_000)
+    composer.fill("Inspect this video using local tools")
+    file_input = (
+        page.locator('input[type="file"][accept*="image/"]')
+        if surface == "chat"
+        else page.get_by_test_id("new-chat-landing-file-input")
+    )
+    expect(file_input).to_have_attribute("accept", re.compile(r".+"))
+    accept = file_input.get_attribute("accept") or ""
+    assert (".mp4" in accept.split(",")) is allowed
+    assert ".zip" not in accept.split(","), "configured allowlist replaces built-in types"
+    sample = tmp_path / _MEDIA_NAME
+    sample.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+    file_input.set_input_files(str(sample))
+    remove = page.get_by_role("button", name=f"Remove {_MEDIA_NAME}")
+    if allowed:
+        expect(remove).to_be_visible(timeout=10_000)
+    else:
+        expect(remove).to_have_count(0)
+        expect(
+            page.get_by_text("this file type is not allowed by server policy", exact=False)
+        ).to_be_visible()
+    expect(composer).to_have_value("Inspect this video using local tools")

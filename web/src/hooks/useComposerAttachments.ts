@@ -1,5 +1,7 @@
 import { useCallback, useRef, useState } from "react";
-import { validateAttachments } from "@/lib/attachments";
+import { attachmentAccept, validateAttachments } from "@/lib/attachments";
+
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 
 export interface UseComposerAttachmentsOptions {
   /**
@@ -19,6 +21,7 @@ export interface UseComposerAttachmentsOptions {
 
 export interface ComposerAttachmentsApi {
   files: File[];
+  accept: string | undefined;
   attachmentError: string | null;
   /** Validate, append the accepted files, and surface the rejections. */
   addFiles: (incoming: File[]) => void;
@@ -33,7 +36,7 @@ export interface ComposerAttachmentsApi {
    * Verbatim wholesale replacement for already-trusted files — re-validating
    * could silently drop them. Leaves the notice untouched.
    */
-  restoreFiles: (files: File[]) => void;
+  restoreFiles: (files: File[] | ((current: File[]) => File[])) => void;
   /**
    * Attach file-kind clipboard items instead of letting them insert as
    * text. The event is claimed only when a usable file was present, so a
@@ -56,7 +59,13 @@ export function useComposerAttachments({
   onAccepted,
   onRemoved,
 }: UseComposerAttachmentsOptions = {}): ComposerAttachmentsApi {
+  const info = useServerInfo();
+  const policy = info === "loading" ? undefined : info.filesystem_attachment_policy;
+  const policyRef = useRef(policy);
+  policyRef.current = policy;
   const [files, setFiles] = useState<File[]>(() => initialFiles ?? []);
+  const filesRef = useRef(files);
+  filesRef.current = files;
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   // Callback freshness is separated from action identity: the refs always
   // hold the latest options, so the actions below never need re-creating.
@@ -66,28 +75,32 @@ export function useComposerAttachments({
   onRemovedRef.current = onRemoved;
 
   const addFiles = useCallback((incoming: File[]) => {
-    const { accepted, errors } = validateAttachments(incoming);
+    const { accepted, errors } = validateAttachments(incoming, policyRef.current, filesRef.current);
     if (accepted.length > 0) {
-      setFiles((prev) => [...prev, ...accepted]);
+      filesRef.current = [...filesRef.current, ...accepted];
+      setFiles(filesRef.current);
       onAcceptedRef.current?.(accepted);
     }
     setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
   }, []);
 
   const removeFile = useCallback((index: number) => {
-    setFiles((prev) => prev.filter((_, i) => i !== index));
+    filesRef.current = filesRef.current.filter((_, i) => i !== index);
+    setFiles(filesRef.current);
     setAttachmentError(null);
     onRemovedRef.current?.();
   }, []);
 
   const replaceFiles = useCallback((incoming: File[]) => {
-    const { accepted, errors } = validateAttachments(incoming);
+    const { accepted, errors } = validateAttachments(incoming, policyRef.current);
+    filesRef.current = accepted;
     setFiles(accepted);
     setAttachmentError(errors.length > 0 ? errors.join("\n") : null);
   }, []);
 
-  const restoreFiles = useCallback((restored: File[]) => {
-    setFiles(restored);
+  const restoreFiles = useCallback((restored: File[] | ((current: File[]) => File[])) => {
+    filesRef.current = typeof restored === "function" ? restored(filesRef.current) : restored;
+    setFiles(filesRef.current);
   }, []);
 
   const onPaste = useCallback(
@@ -111,12 +124,14 @@ export function useComposerAttachments({
   const clearError = useCallback(() => setAttachmentError(null), []);
 
   const clear = useCallback(() => {
+    filesRef.current = [];
     setFiles([]);
     setAttachmentError(null);
   }, []);
 
   return {
     files,
+    accept: attachmentAccept(policy),
     attachmentError,
     addFiles,
     removeFile,

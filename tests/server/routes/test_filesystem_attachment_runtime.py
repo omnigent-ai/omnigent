@@ -86,3 +86,47 @@ def test_attachment_check_on_wrong_replica_keeps_retry_signal() -> None:
         )
     assert error.value.code == ErrorCode.WRONG_REPLICA
     router.host_is_on_another_replica.assert_called_once_with("host_remote")
+
+
+@pytest.mark.parametrize(
+    "host_general,runner_general", [(True, True), (True, False), (False, True), (False, False)]
+)
+async def test_generalized_files_require_both_connected_builds(
+    host_general, runner_general
+) -> None:
+    hosts = HostRegistry()
+    runners = TunnelRegistry()
+    capability = "generalized_filesystem_attachments"
+    hosts.register(
+        "host_test",
+        Mock(),
+        HostHelloFrame(
+            version="0.15.0",
+            frame_protocol_version=1,
+            name="host",
+            capabilities=[CAP_FILESYSTEM_ATTACHMENTS] + ([capability] if host_general else []),
+        ),
+        owner=None,
+    )
+    runners.register(
+        "runner_test",
+        Mock(),
+        HelloFrame(
+            runner_version="0.15.0",
+            frame_protocol_version=1,
+            capabilities=[CAP_FILESYSTEM_ATTACHMENTS] + ([capability] if runner_general else []),
+        ),
+    )
+    kwargs = {
+        "host_id": "host_test",
+        "runner_id": "runner_test",
+        "host_registry": hosts,
+        "tunnel_registry": runners,
+    }
+    require_filesystem_attachment_runtime(**kwargs)
+    if host_general and runner_general:
+        require_filesystem_attachment_runtime(filename="clip.mp4", **kwargs)
+    else:
+        with pytest.raises(OmnigentError, match="Update Omnigent") as error:
+            require_filesystem_attachment_runtime(filename="clip.mp4", **kwargs)
+        assert error.value.code == ErrorCode.CONFLICT

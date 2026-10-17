@@ -211,6 +211,7 @@ class ServerInfoResponse(BaseModel):
     # Owner configuration reads and conditional PATCH updates.
     agent_config_edit: bool = False
     branding: BrandingInfo
+    filesystem_attachment_policy: dict[str, Any]
 
 
 def _resolve_extension_state(
@@ -1512,12 +1513,15 @@ def create_app(
     )
 
     from omnigent.server.server_config import (
+        filesystem_attachment_policy,
         load_branding_snapshot,
         load_server_config,
         session_title_instructions,
     )
 
     resolved_server_config = load_server_config() if server_config is None else server_config
+    attachment_policy = filesystem_attachment_policy(resolved_server_config)
+    published_attachment_policy = attachment_policy.public_dict()
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
@@ -1922,6 +1926,7 @@ def create_app(
     app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
+    app.state.filesystem_attachment_policy = attachment_policy
     app.state.feature_flags = resolved_feature_flags
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
@@ -3160,6 +3165,7 @@ def create_app(
                 "agent_config_edit": agent_store.supports_config_edit
                 and artifact_store is not None,
                 "branding": branding_snapshot.config(),
+                "filesystem_attachment_policy": published_attachment_policy,
             }
         )
 

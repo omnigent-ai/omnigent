@@ -1,11 +1,33 @@
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 // Unit tests for useComposerAttachments — the shared attachment state behind
 // both composer surfaces. Exercised through the hook's public API so the
 // assertions pin behavior (which files attach, what the error reads, when
 // paste is claimed) rather than internal state wiring.
 
-import { act, renderHook } from "@testing-library/react";
+import { act, renderHook as rtlRenderHook } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { useComposerAttachments } from "./useComposerAttachments";
+
+const defaultAttachmentPolicy = {
+  allowed_extensions: [".zip", ".docx", ".xlsx", ".pptx", ".db", ".sqlite", ".sqlite3"],
+  denied_extensions: [],
+  max_bytes: 50 * 1024 * 1024,
+  max_files: 20,
+  max_total_bytes: 200 * 1024 * 1024,
+  harnesses: ["claude-native", "codex-native"],
+};
+function DefaultAttachmentProvider({ children }: { children: React.ReactNode }) {
+  return (
+    <CapabilitiesProvider
+      info={{ ...FALLBACK_SERVER_INFO, filesystem_attachment_policy: defaultAttachmentPolicy }}
+    >
+      {children}
+    </CapabilitiesProvider>
+  );
+}
+const renderHook: typeof rtlRenderHook = (callback, options) =>
+  rtlRenderHook(callback, { wrapper: DefaultAttachmentProvider, ...options });
 
 function textFile(name = "notes.txt"): File {
   return new File(["hello"], name, { type: "text/plain" });
@@ -312,5 +334,42 @@ describe("useComposerAttachments", () => {
     rerender({ initial: [pngFile(), videoFile()] });
 
     expect(result.current.files.map((f) => f.name)).toEqual(["notes.txt"]);
+  });
+});
+
+describe("server attachment policy", () => {
+  it("uses context policy and counts files across consecutive picks", () => {
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <CapabilitiesProvider
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          filesystem_attachment_policy: {
+            allowed_extensions: [".mp4"],
+            denied_extensions: [],
+            max_bytes: 100,
+            max_files: 1,
+            max_total_bytes: 100,
+            harnesses: ["claude-native"],
+          },
+        }}
+      >
+        {children}
+      </CapabilitiesProvider>
+    );
+    const { result } = renderHook(() => useComposerAttachments(), { wrapper });
+    const video = videoFile();
+    act(() => result.current.addFiles([video]));
+    expect(result.current.files).toEqual([video]);
+    act(() => result.current.addFiles([videoFile("second.mp4")]));
+    expect(result.current.files).toEqual([video]);
+    expect(result.current.attachmentError).toContain("1 files");
+    expect(result.current.accept).toContain(".mp4");
+  });
+  it("lets older servers decide unknown types without a picker filter", () => {
+    const { result } = rtlRenderHook(() => useComposerAttachments());
+    const video = videoFile();
+    act(() => result.current.addFiles([video]));
+    expect(result.current.files).toEqual([video]);
+    expect(result.current.accept).toBeUndefined();
   });
 });
