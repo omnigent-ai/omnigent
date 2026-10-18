@@ -7192,11 +7192,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       }));
       return;
     case "session_sandbox_status":
-      // Advance the managed-sandbox provisioning indicator. `ready`
-      // clears it — from then on the session looks like any
-      // host-bound session; `failed` retains the reason so the page
-      // explains why the sandbox never came up. `ready` also stamps the
-      // launch grace: the runner is up but its terminal is still coming.
+      // `ready` clears the launch indicator and starts the launch grace (the runner is
+      // up, its terminal not yet); `failed` keeps the reason so the page can explain
+      // why the sandbox never came up.
       applyToConversation(
         event.stage === "ready"
           ? { sandboxStatus: null, runnerLaunchedAt: Date.now() }

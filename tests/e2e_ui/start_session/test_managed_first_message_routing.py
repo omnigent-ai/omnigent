@@ -541,6 +541,15 @@ async def _drive_terminal_startup(rig: ManagedReplicas) -> None:
             await expect(starting).to_be_visible()
             await expect(terminal.get_by_role("button", name="Resume session")).to_have_count(0)
             await page.screenshot(path=str(rig.logs / "terminal-provisioning.png"))
+
+            # A freshly loaded tab learns about the launch from the session snapshot.
+            async with page.expect_response(
+                lambda response: "/health?session_ids=" in response.url
+            ):
+                await page.reload()
+            await page.get_by_test_id("view-mode-terminal").click()
+            await expect(starting).to_be_visible()
+            await expect(terminal.get_by_role("button", name="Resume session")).to_have_count(0)
         finally:
             for url in (rig.a, rig.b):
                 await client.post(f"{url}/__test/provision/release")
