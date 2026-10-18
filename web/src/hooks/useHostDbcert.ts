@@ -30,7 +30,11 @@ export function useHostDbcert(
   conversationId: string | null | undefined,
   hostId: string | null | undefined,
 ) {
-  const { data: hosts } = useHosts({ enabled: Boolean(conversationId && hostId) });
+  // Arclets are server-managed sandbox hosts, which the default host list hides.
+  const { data: hosts } = useHosts({
+    includeSandbox: true,
+    enabled: Boolean(conversationId && hostId),
+  });
   const host = hosts?.find((candidate) => candidate.host_id === hostId);
   const sessionId =
     conversationId && host?.status === "online" && isDbcertHost(host, readArcaHostId())

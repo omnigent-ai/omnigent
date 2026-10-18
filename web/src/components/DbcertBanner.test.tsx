@@ -7,11 +7,22 @@ import { readHostDbcertExpiry, startHostDbcertRefresh } from "@/lib/hostDbcert";
 const NOW = Date.UTC(2026, 9, 18, 21);
 const EXPIRED = Date.UTC(2026, 9, 18, 20, 8, 15);
 const RENEWED = Date.UTC(2026, 9, 19, 17);
+interface TestHost {
+  host_id: string;
+  name: string;
+  status: string;
+  sandbox_provider?: string;
+}
 const state = vi.hoisted(() => ({
-  hosts: [{ host_id: "arca", name: "jackson's arca", status: "online" }],
+  hosts: [{ host_id: "arca", name: "jackson's arca", status: "online" }] as TestHost[],
 }));
 
-vi.mock("@/hooks/useHosts", () => ({ useHosts: () => ({ data: state.hosts }) }));
+// Like the real hook, the host list hides sandbox hosts (Arclets) unless asked.
+vi.mock("@/hooks/useHosts", () => ({
+  useHosts: ({ includeSandbox = false }: { includeSandbox?: boolean } = {}) => ({
+    data: state.hosts.filter((host) => includeSandbox || !host.sandbox_provider),
+  }),
+}));
 vi.mock("@/hooks/useNow", () => ({
   useNowSelector: (select: (now: Date) => boolean) => select(new Date()),
 }));
@@ -49,7 +60,7 @@ describe("DbcertBanner", () => {
     renderBanner();
     await settle();
     expect(readHostDbcertExpiry).toHaveBeenCalledWith("conv");
-    expect(screen.getByText(/dbcert expired on jackson's arca/)).toBeTruthy();
+    expect(screen.getByText(/The dbcert on jackson's arca has expired/)).toBeTruthy();
     expect(screen.getByRole("button", { name: "Refresh dbcert" })).toBeTruthy();
   });
 
@@ -57,11 +68,27 @@ describe("DbcertBanner", () => {
     vi.mocked(readHostDbcertExpiry).mockResolvedValueOnce(RENEWED).mockResolvedValueOnce(null);
     renderBanner();
     await settle();
-    expect(screen.queryByText(/dbcert expired/)).toBeNull();
+    expect(screen.queryByText(/has expired/)).toBeNull();
     cleanup();
     renderBanner();
     await settle();
-    expect(screen.queryByText(/dbcert expired/)).toBeNull();
+    expect(screen.queryByText(/has expired/)).toBeNull();
+  });
+
+  it("warns on a managed Arclet, which is a sandbox host", async () => {
+    state.hosts = [
+      {
+        host_id: "arca",
+        name: "omnigent-arclet-891349936151385",
+        status: "online",
+        sandbox_provider: "arclet",
+      },
+    ];
+    renderBanner();
+    await settle();
+    expect(
+      screen.getByText(/The dbcert on omnigent-arclet-891349936151385 has expired/),
+    ).toBeTruthy();
   });
 
   it("never asks hosts that aren't an Arca box or Arclet", async () => {
@@ -81,7 +108,7 @@ describe("DbcertBanner", () => {
     expect(screen.getByText(/Finish the sign-in/)).toBeTruthy();
     expect(screen.getByRole("button", { name: "Refreshing…" })).toHaveProperty("disabled", true);
     await settle(4_000);
-    expect(screen.queryByText(/dbcert expired/)).toBeNull();
+    expect(screen.queryByText(/has expired/)).toBeNull();
   });
 
   it("points at Arca Companion when the host can't refresh", async () => {
@@ -116,15 +143,15 @@ describe("DbcertBanner", () => {
     await settle();
     expect(refreshDbcert).toHaveBeenCalledOnce();
     expect(startHostDbcertRefresh).not.toHaveBeenCalled();
-    expect(screen.queryByText(/dbcert expired/)).toBeNull();
+    expect(screen.queryByText(/has expired/)).toBeNull();
   });
 
   it("stays dismissed for the cert it was dismissed for", async () => {
     renderBanner();
     await settle();
     fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
-    expect(screen.queryByText(/dbcert expired/)).toBeNull();
+    expect(screen.queryByText(/has expired/)).toBeNull();
     await settle(60_000);
-    expect(screen.queryByText(/dbcert expired/)).toBeNull();
+    expect(screen.queryByText(/has expired/)).toBeNull();
   });
 });

@@ -33,7 +33,10 @@ export function DbcertBanner({
     >
       <AlertTriangleIcon className="size-4 shrink-0" aria-hidden="true" />
       <div className="min-w-0 flex-1">
-        <p>dbcert expired on {dbcert.hostName || "this host"}, so tools that need it will fail.</p>
+        <p>
+          The dbcert on {dbcert.hostName || "this host"} has expired. Certain internal tools will
+          fail until you refresh it.
+        </p>
         {running && (
           <p className="mt-0.5 opacity-80">Finish the sign-in in the browser tab that opened.</p>
         )}
