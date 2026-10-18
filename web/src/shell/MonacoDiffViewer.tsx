@@ -30,6 +30,11 @@ import type { FilePosition } from "./FileViewerContext";
 import { isFilePositionPending } from "./filePositionState";
 import type { monaco } from "./monacoSetup";
 import "./monacoCodeEditor.css";
+import {
+  attachAutomaticDiffRefinement,
+  INITIAL_DIFF_BUDGET_MS,
+  type DiffRefinementStatus,
+} from "./automaticDiffRefinement";
 
 // Monaco's find contribution isn't a public export, so we reach it by its
 // registered id and describe only the slice we drive: whether the find widget
@@ -155,6 +160,27 @@ export function MonacoDiffViewer({
   const originalModelRef = useRef<ReturnType<CodeEditorInstance["getModel"]>>(null);
   const modifiedModelRef = useRef<ReturnType<CodeEditorInstance["getModel"]>>(null);
   const [mounted, setMounted] = useState(false);
+  const [budgetState, setBudgetState] = useState({ hideWhitespace, value: INITIAL_DIFF_BUDGET_MS });
+  const diffBudget =
+    budgetState.hideWhitespace === hideWhitespace ? budgetState.value : INITIAL_DIFF_BUDGET_MS;
+  const [refinementStatus, setRefinementStatus] = useState<DiffRefinementStatus>("idle");
+  const refinementStartedRef = useRef(false);
+  useEffect(() => {
+    const editor = diffEditorRef.current;
+    if (!mounted || !editor) return;
+    if (!("getDiffComputationResult" in editor)) return;
+    const inspectExistingResult = !refinementStartedRef.current;
+    refinementStartedRef.current = true;
+    setRefinementStatus("idle");
+    setBudgetState({ hideWhitespace, value: INITIAL_DIFF_BUDGET_MS });
+    editor.updateOptions({ maxComputationTime: INITIAL_DIFF_BUDGET_MS });
+    return attachAutomaticDiffRefinement(
+      editor,
+      setRefinementStatus,
+      inspectExistingResult,
+      (value) => setBudgetState({ hideWhitespace, value }),
+    );
+  }, [mounted, hideWhitespace]);
   const cancelScrollRestoreRef = useRef<(() => void) | null>(null);
   useMonacoFilePosition({
     editorRef: modifiedEditorRef,
@@ -294,6 +320,7 @@ export function MonacoDiffViewer({
     return {
       readOnly: true, // modified side: view + select + comment, no editing
       originalEditable: false,
+      maxComputationTime: diffBudget,
       renderSideBySide: layout === "split",
       // Below `renderSideBySideInlineBreakpoint` (900px) Monaco collapses
       // side-by-side into inline — a legitimate constraint for a usable diff.
@@ -320,10 +347,24 @@ export function MonacoDiffViewer({
       // diff / GitHub) so only changed hunks + a few context lines are shown.
       hideUnchangedRegions: { enabled: true, contextLineCount: 3 },
     };
-  }, [layout, hideWhitespace, wrapLines]);
+  }, [layout, hideWhitespace, wrapLines, diffBudget]);
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="relative flex h-full flex-col">
+      <div
+        role="status"
+        className={
+          refinementStatus === "idle"
+            ? "sr-only"
+            : "pointer-events-none absolute bottom-2 right-2 z-10 max-w-[90%] rounded bg-background/95 px-3 py-1 text-ui text-muted-foreground shadow-sm"
+        }
+      >
+        {refinementStatus === "refining"
+          ? "Refining diff…"
+          : refinementStatus === "limited"
+            ? "Diff computation stopped early. Highlighting may include unchanged text."
+            : ""}
+      </div>
       <div className="relative min-h-0 flex-1">
         {loadError && (
           <div className="flex items-center justify-center p-8 text-destructive text-ui">
