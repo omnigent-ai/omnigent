@@ -13,9 +13,11 @@ passed. See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -895,6 +897,76 @@ def test_claude_trust_seeding_never_expands_runner_auth_secrets(
     assert env["CLAUDE_CONFIG_DIR"] == "cfg"
     assert (workspace / "cfg" / ".claude.json").is_file()
     assert not any(token in str(path) for path in tmp_path.rglob("*"))
+
+
+@pytest.mark.parametrize(
+    ("args", "launch_cwd", "expected_config_dir"),
+    [
+        (["CLAUDE_CONFIG_DIR=wrapped/claude", "claude"], "/work", "/work/wrapped/claude"),
+        # ``env -C`` moves Claude's cwd, so a relative dir resolves from there.
+        (
+            ["-C", "sub", "CLAUDE_CONFIG_DIR=wrapped/claude", "claude"],
+            "/work",
+            "/work/sub/wrapped/claude",
+        ),
+        # An unmodeled wrapper form could select any directory: advertise none.
+        (["-v", "CLAUDE_CONFIG_DIR=wrapped/claude", "claude"], "/work", None),
+        # Without the pane's cwd a relative dir has no anchor: advertise none.
+        (["CLAUDE_CONFIG_DIR=wrapped/claude", "claude"], None, None),
+        (["CLAUDE_CONFIG_DIR=/srv/claude", "claude"], None, "/srv/claude"),
+    ],
+    ids=[
+        "wrapper-env",
+        "wrapper-chdir",
+        "wrapper-unmodeled",
+        "no-pane-cwd-relative",
+        "no-pane-cwd-absolute",
+    ],
+)
+def test_publish_tmux_target_advertises_the_config_dir_the_pane_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    args: list[str],
+    launch_cwd: str | None,
+    expected_config_dir: str | None,
+) -> None:
+    """
+    ``tmux.json`` names the config dir of this pane's Claude, env wrapper included.
+
+    Injection reads ``keybindings.json`` from it, so a submit key moved off Enter
+    in the directory the wrapper selects is honored rather than the runner's own.
+
+    :param args: The ``env`` wrapper's arguments.
+    :param launch_cwd: The pane cwd the launch recorded, or ``None``.
+    :param expected_config_dir: The directory Claude reads its config from, or
+        ``None`` when the launch must not advertise one.
+    """
+    from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+    from omnigent.runner.native import orchestration
+    from tests.runner.helpers import make_test_terminal_instance
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "claude-native")
+    monkeypatch.setenv("HOME", "/home/runner")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/runner/claude")
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    instance.command = "env"
+    instance.args = args
+    instance.launch_cwd = launch_cwd
+    registry = SimpleNamespace(terminal_registry=SimpleNamespace(get=lambda *_args: instance))
+
+    orchestration._publish_tmux_target_for_bridge(
+        resource_registry=registry,
+        session_id="conv_abc123",
+        bridge_id="bridge_abc123",
+        terminal_name="claude",
+        session_key="main",
+    )
+
+    bridge_dir = claude_native_bridge.bridge_dir_for_bridge_id("bridge_abc123")
+    payload = json.loads((bridge_dir / "tmux.json").read_text(encoding="utf-8"))
+    assert payload["tmux_target"] == instance.tmux_target
+    assert payload.get("claude_config_dir") == expected_config_dir
 
 
 def test_claude_terminal_launch_cwd_uses_terminal_os_env_resolution(tmp_path: Path) -> None:

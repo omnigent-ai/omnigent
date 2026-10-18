@@ -21,7 +21,7 @@ import sys
 import time
 import urllib.parse
 import uuid
-from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
@@ -129,6 +129,25 @@ class _EnsureCommentRelay(Protocol):
         pass
 
 
+class _ClaudeLaunchSource(Protocol):
+    """What a Claude pane's environment is derived from: its spec or the live instance."""
+
+    @property
+    def command(self) -> str | None: ...
+
+    @property
+    def args(self) -> Sequence[str]: ...
+
+    @property
+    def env(self) -> Mapping[str, str]: ...
+
+    @property
+    def env_unset(self) -> Sequence[str]: ...
+
+    @property
+    def inherit_env(self) -> bool: ...
+
+
 def _publish_tmux_target_for_bridge(
     *,
     resource_registry: SessionResourceRegistry,
@@ -172,7 +191,35 @@ def _publish_tmux_target_for_bridge(
         bridge_dir_for_bridge_id(bridge_id),
         socket_path=instance.socket_path,
         tmux_target=instance.tmux_target,
+        config_dir=_claude_instance_config_dir(instance),
     )
+
+
+def _claude_instance_config_dir(instance: TerminalInstance) -> Path | None:
+    """
+    Return the Claude config dir a launched pane's process reads, if it is known.
+
+    Injection honors the keybindings there, so this follows the launch env and
+    cwd the way trust seeding does, ``env`` wrapper included. It yields ``None``
+    — and injection keeps the Enter submit — when the directory cannot be pinned
+    down: an ``env`` wrapper whose form is not modeled, or a relative directory
+    with no pane cwd to anchor it.
+
+    :param instance: The launched Claude terminal instance.
+    :returns: The config directory, or ``None`` when it cannot be resolved.
+    """
+    from omnigent.harnesses.claude_native.bridge import (
+        claude_config_dir,
+        claude_config_dir_is_relative,
+    )
+
+    env, modeled = _claude_terminal_launch_env_modeled(instance)
+    if not modeled:
+        return None
+    cwd = _claude_instance_launch_cwd(instance)
+    if cwd is None and claude_config_dir_is_relative(env):
+        return None
+    return claude_config_dir(cwd=cwd, env=env)
 
 
 # Background transcript-forwarder tasks for host-spawned claude-native and
@@ -7683,7 +7730,28 @@ def _claude_terminal_launch_cwd(spec: TerminalEnvSpec, parent_os_env: OSEnvSpec 
     return target
 
 
-def _claude_terminal_pre_wrapper_env(spec: TerminalEnvSpec) -> dict[str, str]:
+def _claude_instance_launch_cwd(instance: TerminalInstance) -> Path | None:
+    """
+    Return the directory a launched Claude pane's process runs in.
+
+    The pane's cwd with an ``env -C``/``--chdir`` wrapper directory applied the
+    way ``chdir(2)`` does, mirroring :func:`_claude_terminal_launch_cwd` for a
+    pane that already launched. ``None`` when the pane recorded no cwd: a
+    relative wrapper directory has nothing to anchor to then.
+
+    :param instance: The launched Claude terminal instance.
+    :returns: The resolved cwd, e.g. ``Path("/home/user/repo/sub")``, or ``None``.
+    """
+    if not instance.launch_cwd:
+        return None
+    cwd = Path(instance.launch_cwd)
+    chdir = env_wrapper_chdir(
+        instance.command or "", list(instance.args), _claude_terminal_pre_wrapper_env(instance)
+    )
+    return cwd if chdir is None else cwd / chdir
+
+
+def _claude_terminal_pre_wrapper_env(spec: _ClaudeLaunchSource) -> dict[str, str]:
     """
     Return the environment a Claude launch command starts with.
 
@@ -7692,7 +7760,7 @@ def _claude_terminal_pre_wrapper_env(spec: TerminalEnvSpec) -> dict[str, str]:
     and a UTF-8 locale default) before an ``env`` wrapper applies its own
     changes; ``env -S`` expands ``${NAME}`` from it.
 
-    :param spec: The Claude terminal launch spec.
+    :param spec: The Claude terminal launch spec, or its live instance.
     :returns: The pre-wrapper environment, e.g. ``{"HOME": "/home/user"}``.
     """
     return terminal_pane_environment(
@@ -7700,34 +7768,54 @@ def _claude_terminal_pre_wrapper_env(spec: TerminalEnvSpec) -> dict[str, str]:
     )
 
 
-def _claude_terminal_launch_env(spec: TerminalEnvSpec) -> dict[str, str]:
+def _claude_terminal_launch_env_modeled(
+    spec: _ClaudeLaunchSource,
+) -> tuple[dict[str, str], bool]:
     """
-    Return the environment the native Claude terminal process starts with.
+    Return the Claude pane's launch environment and whether its wrapper was modeled.
 
     Mirrors the pane launch: the runner environment (when inherited), the
     spec's overrides and removals, then the options and assignments of an
-    ``env`` wrapper command. Trust seeding uses it so the runner writes the
-    global config file this Claude process will read.
+    ``env`` wrapper command. An ``env`` wrapper form the parser does not model
+    leaves the pre-wrapper environment in place and is reported as unmodeled,
+    since the wrapper's own changes are unknown.
 
-    :param spec: The Claude terminal launch spec, e.g. one with
-        ``command="env"`` and ``args=["CLAUDE_CONFIG_DIR=/srv/claude", "claude"]``.
-    :returns: The effective environment, e.g.
-        ``{"HOME": "/home/user", "CLAUDE_CONFIG_DIR": "/srv/claude"}``.
+    :param spec: The Claude terminal launch spec, or its live instance, e.g.
+        one with ``command="env"`` and
+        ``args=["CLAUDE_CONFIG_DIR=/srv/claude", "claude"]``.
+    :returns: ``(environment, modeled)``, e.g.
+        ``({"HOME": "/home/user", "CLAUDE_CONFIG_DIR": "/srv/claude"}, True)``.
     """
     env = _claude_terminal_pre_wrapper_env(spec)
     wrapper = env_wrapper_environment(spec.command or "", list(spec.args), env)
-    if wrapper is None and Path(spec.command or "").name == "env":
-        _logger.info(
-            "Claude terminal env wrapper form is not modeled; trust seeding uses the "
-            "pre-wrapper environment"
-        )
-    if wrapper is not None:
-        if not wrapper.inherit:
-            env = {}
-        for key in wrapper.unset:
-            env.pop(key, None)
-        env.update(wrapper.variables)
-    return env
+    if wrapper is None:
+        if Path(spec.command or "").name == "env":
+            _logger.info(
+                "Claude terminal env wrapper form is not modeled; using the pre-wrapper "
+                "environment"
+            )
+            return env, False
+        return env, True
+    if not wrapper.inherit:
+        env = {}
+    for key in wrapper.unset:
+        env.pop(key, None)
+    env.update(wrapper.variables)
+    return env, True
+
+
+def _claude_terminal_launch_env(spec: _ClaudeLaunchSource) -> dict[str, str]:
+    """
+    Return the environment the native Claude terminal process starts with.
+
+    Trust seeding uses it so the runner writes the global config file this
+    Claude process will read; see :func:`_claude_terminal_launch_env_modeled`.
+
+    :param spec: The Claude terminal launch spec, or its live instance.
+    :returns: The effective environment, e.g.
+        ``{"HOME": "/home/user", "CLAUDE_CONFIG_DIR": "/srv/claude"}``.
+    """
+    return _claude_terminal_launch_env_modeled(spec)[0]
 
 
 def _publish_terminal_pending(

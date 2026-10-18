@@ -3251,6 +3251,13 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
         running = True
         socket_path = "/tmp/fake-claude.sock"
         tmux_target = "claude:0.0"
+        # Launch details the publish reads to advertise Claude's config dir.
+        command = "claude"
+        args: list[str] = []
+        env: dict[str, str] = {}
+        env_unset: list[str] = []
+        inherit_env = True
+        launch_cwd = "/tmp/fake-workspace"
 
     class _FakeTerminalRegistry:
         """Returns the live instance for any (session, terminal, key) lookup."""
