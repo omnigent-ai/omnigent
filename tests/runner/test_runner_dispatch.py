@@ -8352,6 +8352,12 @@ async def test_sys_session_create_requires_exactly_one_mode(
             id="read-timeout",
         ),
         pytest.param(
+            httpx.ConnectTimeout(""),
+            "sys_session_create timed out after 10 s (ConnectTimeout): "
+            "the request did not complete, so no child was created by it.",
+            id="connect-timeout",
+        ),
+        pytest.param(
             RuntimeError(""),
             "sys_session_create failed: RuntimeError",
             id="empty-error",
