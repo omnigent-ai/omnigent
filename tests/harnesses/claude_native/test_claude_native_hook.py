@@ -2687,6 +2687,58 @@ def test_reattach_auth_rejection_without_renewal(
         assert seen_auth == ["Bearer stale"], "a rejection before any held poll must not retry"
 
 
+def test_reattach_auth_lapse_retry_stops_at_deadline(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A parked prompt whose login is never renewed backs off, capped, until the deadline."""
+    floor = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S
+    clock = {"t": 0.0}
+    sleeps: list[float] = []
+
+    def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["t"] += seconds
+
+    monkeypatch.setattr(claude_native_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(claude_native_hook.time, "sleep", _sleep)
+    attempts = {"n": 0}
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            attempts["n"] += 1
+            req = httpx.Request("POST", url)
+            if attempts["n"] == 1:
+                clock["t"] += floor + 290.0
+                raise httpx.RemoteProtocolError("gateway severed the poll", request=req)
+            return httpx.Response(401, request=req)
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={"Authorization": "Bearer stale"},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+        reauth=lambda: None,
+    )
+
+    assert resp is None
+    assert clock["t"] >= claude_native_hook._PERMISSION_TIMEOUT_S
+    assert sleeps[:6] == [1.0, 2.0, 4.0, 8.0, 16.0, 30.0], sleeps[:6]
+    assert max(sleeps) == claude_native_hook._PERMISSION_RETRY_MAX_BACKOFF_S
+    assert "retry budget exhausted" in capsys.readouterr().err
+
+
 def test_reattach_fast_flapping_connection_is_hard_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
