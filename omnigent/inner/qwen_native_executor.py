@@ -83,7 +83,9 @@ class QwenNativeExecutor(Executor):
         """
         if self._ready:
             return
-        ready = await asyncio.to_thread(wait_for_ready, self._bridge_dir)
+        ready = await asyncio.to_thread(
+            wait_for_ready, self._bridge_dir, timeout_s=READY_TIMEOUT_S
+        )
         if ready:
             self._ready = True
             return
