@@ -1029,10 +1029,12 @@ async def test_relay_suppresses_disconnect_error_on_intentional_stop(
     genuine runner death takes. The Stop handler marks the session in
     ``_intentional_stop_sessions`` first, so the relay must resolve to a
     quiet ``idle`` (no ``runner_disconnected`` status, no persisted error
-    labels) rather than rendering "Error · runner_disconnected".
+    labels) rather than rendering "Error · runner_disconnected". The stopped
+    runtime takes its background terminals with it, so the tally clears too.
     """
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import BackgroundTaskInfo
 
     sessions_module._runner_relay_tasks.clear()
     gate = asyncio.Event()
@@ -1042,6 +1044,11 @@ async def test_relay_suppresses_disconnect_error_on_intentional_stop(
 
     collector = None
     try:
+        # A terminal that outlived the last turn is still counted at Stop.
+        sessions_module._session_background_task_count_cache[session_id] = 1
+        sessions_module._session_background_tasks_cache[session_id] = [
+            BackgroundTaskInfo(id="call_1", command="sleep 600")
+        ]
         # Simulate the Stop handler: mark the intentional teardown before
         # the tunnel drops.
         sessions_module._intentional_stop_sessions[session_id] = "runner_intentional_stop"
@@ -1063,6 +1070,10 @@ async def test_relay_suppresses_disconnect_error_on_intentional_stop(
         assert event.get("type") == "session.status"
         assert event.get("status") == "idle"
         assert event.get("error") is None
+        assert event.get("background_task_count") == 0
+        assert "background_tasks" not in event
+        assert session_id not in sessions_module._session_background_task_count_cache
+        assert session_id not in sessions_module._session_background_tasks_cache
 
         # The marker is one-shot: consumed by the disconnect handler.
         assert session_id not in sessions_module._intentional_stop_sessions
@@ -1093,6 +1104,8 @@ async def test_relay_suppresses_disconnect_error_on_intentional_stop(
                 await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
+        sessions_module._session_background_task_count_cache.pop(session_id, None)
+        sessions_module._session_background_tasks_cache.pop(session_id, None)
         session_stream.close(session_id)
 
 
@@ -1854,7 +1867,9 @@ async def test_relay_stays_quiet_when_runner_leaves_an_idle_session(
     unexpectedly" banner over a transcript where nothing had been
     interrupted. Scripts a completed turn (``running`` then ``idle``) before
     the drop and asserts the relay publishes no failure and persists no
-    error labels — the disconnect surfaces through liveness instead.
+    error labels — the disconnect surfaces through liveness instead. The
+    turn-end ``idle`` carries no background count; the runner's zero count
+    after its required terminal closes clears the tally.
     """
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
@@ -1868,10 +1883,12 @@ async def test_relay_stays_quiet_when_runner_leaves_an_idle_session(
     frames = [
         'data: {"type": "session.status", "status": "running"}\n\n',
         'data: {"type": "session.status", "status": "idle"}\n\n',
+        'data: {"type": "session.status", "status": "idle", "background_task_count": 0}\n\n',
     ]
     fake_runner = _ScriptedThenDropRunnerClient(frames, gate)
     store = _RecordingLabelStore()
     session_id = "1e2d3c4b5a69788796a5b4c3d2e1f0a9"
+    sessions_module._session_background_task_count_cache[session_id] = 1
 
     collector = None
     try:
@@ -1891,12 +1908,18 @@ async def test_relay_stays_quiet_when_runner_leaves_an_idle_session(
         # publishes nothing and awaits nothing, so the relay task can finish
         # before the collector's pump is ever scheduled.
         statuses: list[dict[str, Any]] = []
-        while len([e for e in statuses if e.get("type") == "session.status"]) < 2:
+        while len([e for e in statuses if e.get("type") == "session.status"]) < 3:
             statuses.append(await asyncio.wait_for(collector.queue.get(), timeout=_TASK_TIMEOUT_S))
-        assert [e.get("status") for e in statuses if e.get("type") == "session.status"] == [
-            "running",
-            "idle",
+        assert [
+            (e.get("status"), e.get("background_task_count"))
+            for e in statuses
+            if e.get("type") == "session.status"
+        ] == [
+            ("running", None),
+            ("idle", None),
+            ("idle", 0),
         ], f"expected only the scripted turn edges, saw {statuses}"
+        assert session_id not in sessions_module._session_background_task_count_cache
 
         # The session stays idle: no failed edge for the sidebar badge, and
         # no durable labels for the snapshot to project as a last_task_error
@@ -1925,6 +1948,7 @@ async def test_relay_stays_quiet_when_runner_leaves_an_idle_session(
                 await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
+        sessions_module._session_background_task_count_cache.pop(session_id, None)
         session_stream.close(session_id)
 
 

@@ -4621,6 +4621,9 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
         )
         # The session reached idle (turn completed) before the pane vanished.
         resource_registry._last_session_status[conv_id] = "idle"
+        resource_registry._session_status_publisher(conv_id, "idle", None)
+        _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+        _drain_session_event_queue(_session_event_queues_ref.get(parent_id))
         on_exit = callbacks.get("on_exit")
         assert callable(on_exit)
         on_exit()
@@ -4662,6 +4665,12 @@ async def test_required_terminal_exit_while_idle_does_not_fail_session(tmp_path:
     ] == []
     assert parent_events == []
     assert parent_inbox.empty()
+    # Background work died with the pane, so the final idle clears its tally.
+    assert {
+        "type": "session.status",
+        "status": "idle",
+        "background_task_count": 0,
+    } in queued_events
     # The harness subprocess is still released — the terminal is gone.
     assert pm.released == [conv_id]
 
@@ -4787,7 +4796,11 @@ async def test_required_terminal_clean_quit_publishes_idle_not_failed(
         "resource_type": "terminal",
         "session_id": conv_id,
     } in queued_events
-    assert {"type": "session.status", "status": "idle"} in queued_events
+    assert {
+        "type": "session.status",
+        "status": "idle",
+        "background_task_count": 0,
+    } in queued_events
     # ...but no spurious failure card renders — the user quit normally.
     assert [
         event
@@ -4863,7 +4876,11 @@ async def test_required_terminal_voluntary_exit_publishes_idle_not_failed() -> N
         "resource_type": "terminal",
         "session_id": conv_id,
     } in queued_events
-    assert {"type": "session.status", "status": "idle"} in queued_events
+    assert {
+        "type": "session.status",
+        "status": "idle",
+        "background_task_count": 0,
+    } in queued_events
     # No spurious failure card — the user quit normally.
     assert [
         event

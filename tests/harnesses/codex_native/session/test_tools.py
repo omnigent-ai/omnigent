@@ -537,6 +537,87 @@ def test_forwarder_posts_codex_web_search_tool_call() -> None:
     assert posted[1]["data"]["item_data"]["output"] == "python latest stable version"
 
 
+_EMBEDDED_RESOURCE = {
+    "type": "resource",
+    "resource": {"uri": "file:///notes.md", "mimeType": "text/markdown", "text": "# Notes"},
+}
+
+
+@pytest.mark.parametrize(
+    ("status", "result", "error", "output"),
+    [
+        (
+            "completed",
+            {"content": [{"type": "text", "text": '{"scheduled_tasks": []}'}]},
+            None,
+            '{"scheduled_tasks": []}',
+        ),
+        ("failed", None, {"message": "server disconnected"}, "server disconnected"),
+        (
+            "completed",
+            {"content": [_EMBEDDED_RESOURCE]},
+            None,
+            json.dumps(_EMBEDDED_RESOURCE),
+        ),
+    ],
+    ids=["completed", "failed", "embedded-resource"],
+)
+def test_forwarder_posts_codex_mcp_tool_call(
+    tmp_path: Path,
+    status: str,
+    result: dict[str, Any] | None,
+    error: dict[str, str] | None,
+    output: str,
+) -> None:
+    """
+    A Codex ``mcpToolCall`` shows as a tool card while running, as the TUI shows it.
+
+    The item shapes match a real app-server capture of an Omnigent ``sys_*`` call.
+    """
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
+    posted: list[dict[str, Any]] = []
+    state = codex_native_forwarder._CodexForwarderState()
+    started_item = {
+        "type": "mcpToolCall",
+        "id": "exec-mcp-1",
+        "server": "omnigent",
+        "tool": "sys_scheduled_task_list",
+        "status": "inProgress",
+        "arguments": {"limit": 5},
+        "result": None,
+        "error": None,
+    }
+    completed_item = {**started_item, "status": status, "result": result, "error": error}
+
+    async def run() -> None:
+        async with _recording_forwarder_client(posted) as client:
+            for method, item in (
+                ("item/started", started_item),
+                ("item/completed", completed_item),
+            ):
+                await codex_native_forwarder._handle_event(
+                    client,
+                    **_forwarder_context(client, tmp_path),
+                    event={
+                        "method": method,
+                        "params": {"threadId": "thread_123", "turnId": "turn_123", "item": item},
+                    },
+                    forwarder_state=state,
+                )
+
+    asyncio.run(run())
+
+    assert [payload["data"]["item_type"] for payload in posted] == [
+        "function_call",
+        "function_call_output",
+    ]
+    call = posted[0]["data"]["item_data"]
+    assert call["name"] == "mcp__omnigent__sys_scheduled_task_list"
+    assert call["call_id"] == "exec-mcp-1"
+    assert json.loads(call["arguments"]) == {"limit": 5}
+    assert posted[1]["data"]["item_data"] == {"call_id": "exec-mcp-1", "output": output}
+
+
 def test_forwarder_drops_codex_tool_item_missing_required_field(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
