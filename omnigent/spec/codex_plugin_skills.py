@@ -104,9 +104,11 @@ def discover_codex_plugin_skills(
                 )
                 continue
             for spec in specs:
-                name = f"{namespace}:{spec.name}"
-                if filter_names is None or spec.name in filter_names or name in filter_names:
-                    out.append(replace(spec, name=name))
+                # Codex keys plugin skills by frontmatter name, not directory.
+                base = spec.display_name or spec.name
+                name = f"{namespace}:{base}"
+                if filter_names is None or base in filter_names or name in filter_names:
+                    out.append(replace(spec, name=name, display_name=None))
             for detail in skipped:
                 _log.warning("Plugin %r: skipped skill: %s", namespace, detail)
     return out

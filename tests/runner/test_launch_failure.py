@@ -10,12 +10,26 @@ from omnigent.runner.launch_failure import (
     classify_native_turn_error,
     classify_terminal_failure,
     describe_failure_code,
+    diagnose_client_update_required,
+    diagnose_codex_compaction_model_failure,
+    diagnose_codex_model_rejection,
+    diagnose_model_unavailable,
 )
 
 # The tail Claude Code prints when refusing --dangerously-skip-permissions as
 # root — the exact scenario a root container hits.
 _ROOT_REFUSAL_OUTPUT = (
     "--dangerously-skip-permissions cannot be run with root privileges for security reasons"
+)
+
+# Claude Code's StopFailure text when the AI gateway cancels its upstream call.
+_GATEWAY_499_OUTPUT = 'API Error: 499 {"error_code":"CANCELLED","message":""}'
+
+# Claude Code's StopFailure text when its version predates the selected model.
+_CLIENT_UPDATE_OUTPUT = (
+    'API Error: 400 {"message":"Claude Code 2.1.217 does not support this model; '
+    "version 2.1.280 or newer is required. Run 'claude update', or update the Claude "
+    'desktop app, then try again."}'
 )
 
 
@@ -190,6 +204,40 @@ def test_rate_limit_text_does_not_override_specific_failure_codes(code: str) -> 
     assert classify_native_turn_error(code, "HTTP 429: rate limit exceeded") == code
 
 
+_CONTENT_LENGTH_REJECTION = (
+    '{"error_code":"BAD_REQUEST","message":"Server received a request which '
+    "exceeds maximum allowed content length. RequestSize(bytes): 33967957, "
+    'Limit(bytes): 33554432"}'
+)
+
+
+@pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        _CONTENT_LENGTH_REJECTION,
+        (
+            "Server received a request which exceeds maximum allowed content "
+            "length. RequestSize(bytes): 33967957, Limit(bytes): 33554432"
+        ),
+    ],
+)
+def test_classifies_content_length_cap_rejection_as_context_overflow(
+    code: str, message: str
+) -> None:
+    assert classify_native_turn_error(code, message) == "context_length_exceeded"
+
+
+def test_content_length_text_without_sizes_stays_generic() -> None:
+    message = "Server received a request which exceeds maximum allowed content length."
+    assert classify_native_turn_error("native_turn_error", message) == "native_turn_error"
+
+
+@pytest.mark.parametrize("code", ["codex_reauth_required", "workspace_missing"])
+def test_content_length_text_does_not_override_specific_failure_codes(code: str) -> None:
+    assert classify_native_turn_error(code, _CONTENT_LENGTH_REJECTION) == code
+
+
 @pytest.mark.parametrize(
     "code",
     # Budget detection runs before the early-return guard, so it applies to
@@ -249,10 +297,43 @@ def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:
         "status_code: 504 Gateway Timeout",
         "API Error: 529",
         "The model is overloaded. Please retry your request.",
+        # The gateway's cancelled upstream call: Claude Code retries 503s, never 499.
+        _GATEWAY_499_OUTPUT,
+        "API Error: 499",
+        "API Error: Request rejected (499) · CANCELLED",
+        'unexpected status 499 Client Closed Request: {"error_code": "CANCELLED","message":""}',
+        '{"error_code":"CANCELLED","message":""}',
     ],
 )
 def test_classifies_transient_upstream_errors(code: str, message: str) -> None:
     assert classify_native_turn_error(code, message) == "transient_upstream_error"
+
+
+@pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        # User interrupts and client-side aborts are not gateway failures.
+        "API Error: Request was aborted.",
+        "Request was aborted.",
+        "[Request interrupted by user]",
+        "[Request interrupted by user for tool use]",
+        "The operation was aborted",
+        "Turn cancelled by the user",
+        "Interrupted by user",
+        # Only a 3-digit 499 status or the CANCELLED envelope counts.
+        "Request rejected (4990)",
+        "API Error: 4991",
+        'API Error: 400 {"error_code":"INVALID_PARAMETER_VALUE","message":"query cancelled"}',
+    ],
+)
+def test_interrupts_and_aborts_are_not_transient(code: str, message: str) -> None:
+    assert classify_native_turn_error(code, message) == code
+
+
+@pytest.mark.parametrize("code", ["workspace_missing", "codex_reauth_required"])
+def test_gateway_499_does_not_override_specific_failure_codes(code: str) -> None:
+    assert classify_native_turn_error(code, _GATEWAY_499_OUTPUT) == code
 
 
 @pytest.mark.parametrize(
@@ -277,6 +358,247 @@ def test_429_still_classifies_as_rate_limit_not_transient() -> None:
     )
 
 
+@pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        _CLIENT_UPDATE_OUTPUT,
+        "inner executor error: " + _CLIENT_UPDATE_OUTPUT,
+        "Claude Code 2.1.263 does not support this model; version 2.1.280 or newer is required",
+        "does not support this model; version 3.0.0 or newer is required",
+    ],
+)
+def test_classifies_client_update_required(code: str, message: str) -> None:
+    assert classify_native_turn_error(code, message) == "client_update_required"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "API Error: 400 INVALID_PARAMETER_VALUE: This model does not support image input.",
+        "Claude Code 2.1.217 does not support this feature; version 2.1.280 or newer is required",
+        "There's an issue with the selected model. It may not exist.",
+        "Node.js 22.13.0 or newer is required",
+    ],
+)
+def test_other_unsupported_model_errors_are_not_client_update(message: str) -> None:
+    assert classify_native_turn_error("native_turn_error", message) == "native_turn_error"
+    assert diagnose_client_update_required(message) is None
+
+
+@pytest.mark.parametrize("code", ["workspace_missing", "codex_reauth_required"])
+def test_client_update_text_does_not_override_specific_failure_codes(code: str) -> None:
+    assert classify_native_turn_error(code, _CLIENT_UPDATE_OUTPUT) == code
+
+
+def test_client_update_diagnosis_names_both_versions_and_the_fix() -> None:
+    diagnosis = diagnose_client_update_required(_CLIENT_UPDATE_OUTPUT)
+
+    assert diagnosis is not None
+    assert diagnosis.title == "Claude Code needs an update"
+    assert "2.1.217" in diagnosis.cause
+    assert "version 2.1.280 or newer" in diagnosis.cause
+    assert diagnosis.remediation is not None
+    assert "`claude update`" in diagnosis.remediation
+    assert "on the host" in diagnosis.remediation
+    assert diagnosis.category is ErrorCategory.CONFIG
+
+
+def test_client_update_diagnosis_without_installed_version_still_names_required() -> None:
+    diagnosis = diagnose_client_update_required(
+        "does not support this model; version 3.0.0 or newer is required"
+    )
+
+    assert diagnosis is not None
+    assert diagnosis.cause == (
+        "Claude Code on the host doesn't support this model; version 3.0.0 or newer is required."
+    )
+
+
+def test_client_update_diagnosis_ignores_unrelated_errors() -> None:
+    assert diagnose_client_update_required(_GATEWAY_499_OUTPUT) is None
+    assert diagnose_client_update_required("") is None
+
+
+@pytest.mark.parametrize(
+    "model", ["system.ai.gpt-6-1-sol", "openai/example-model", "future-model-id"]
+)
+def test_codex_model_rejection_explains_how_to_fix_configuration(model: str) -> None:
+    message = f"The '{model}' model is not supported when using Codex with a ChatGPT account."
+    diagnosis = diagnose_codex_model_rejection(message)
+
+    assert diagnosis is not None
+    assert diagnosis.title == "Model unavailable with ChatGPT login"
+    assert diagnosis.cause == message
+    assert diagnosis.remediation is not None
+    assert "model picker or /model" in diagnosis.remediation
+    assert "another provider, configure it for Codex" in diagnosis.remediation
+    assert "start a new session" in diagnosis.remediation
+    assert diagnosis.category is ErrorCategory.CONFIG
+    assert classify_native_turn_error("codex_turn_error", message) == "codex_turn_error"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "",
+        "The model is not supported by this provider.",
+        "Your ChatGPT account has hit its usage limit.",
+        "401 Unauthorized: please log in to your ChatGPT account.",
+        _CLIENT_UPDATE_OUTPUT,
+    ],
+)
+def test_codex_model_rejection_ignores_unrelated_errors(message: str) -> None:
+    assert diagnose_codex_model_rejection(message) is None
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "There's an issue with the selected model (anthropic/claude-opus-4-8). "
+        "It may not exist or you may not have access to it.",
+        "inner executor error: There's an issue with the selected model "
+        "(openai/example-model). It may not exist or you may not have access to it.",
+        "There's an issue with the selected model. It may not exist.",
+        # Anthropic's not-found body, forwarded verbatim by Pi.
+        'Pi model error: 404 {"type":"error","error":{"type":"not_found_error",'
+        '"message":"model: anthropic/claude-opus-4-8"}}',
+        '404 {"type":"error","error":{"type":"invalid_request_error",'
+        '"message": "model: claude-opus-4-8"}}',
+        # OpenAI's rejection of an unknown or inaccessible model id.
+        '404 {"error":{"message":"The model `gpt-5-nano` does not exist or you do not have '
+        'access to it.","type":"invalid_request_error","param":null,"code":"model_not_found"}}',
+        '{"error":{"message":"unknown model","code":"model_not_found"}}',
+        "The model `gpt-5-nano` does not exist or you do not have access to it.",
+    ],
+)
+def test_model_unavailable_explains_how_to_recover(message: str) -> None:
+    diagnosis = diagnose_model_unavailable(message)
+
+    assert diagnosis is not None
+    assert diagnosis.title == "Model unavailable"
+    assert diagnosis.cause == message.strip()
+    assert diagnosis.remediation is not None
+    assert "model picker" in diagnosis.remediation
+    assert "/model" in diagnosis.remediation
+    assert "different model" in diagnosis.remediation
+    assert "access this model" in diagnosis.remediation
+    assert diagnosis.category is ErrorCategory.CONFIG
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "",
+        # A plain 404 is not necessarily a model mismatch; leave it unlabeled.
+        "API Error: Request rejected (404) · model not found",
+        "API Error: Request rejected (401) · UNAUTHENTICATED",
+        "API Error: Request rejected (403) · PERMISSION_DENIED",
+        "API Error: 429 rate limit exceeded",
+        "The AI gateway refused this turn because a spending budget is exhausted.",
+        "The 'future-model' model is not supported when using Codex with a ChatGPT account.",
+        _CLIENT_UPDATE_OUTPUT,
+        # A 404 that does not name a model (e.g. a wrong base URL path).
+        'Pi model error: 404 {"type":"error","error":{"type":"not_found_error",'
+        '"message":"Not Found"}}',
+        # Other provider statuses mentioning the model stay unlabeled.
+        'Pi model error: 401 {"type":"error","error":{"type":"authentication_error",'
+        '"message":"invalid x-api-key"}}',
+        'Pi model error: 400 {"type":"error","error":{"type":"invalid_request_error",'
+        '"message":"model: claude-opus-4-8 does not support the messages API"}}',
+        'Pi model error: 429 {"type":"error","error":{"type":"rate_limit_error",'
+        '"message":"model: claude-opus-4-8 is rate limited"}}',
+        # The same prose about another resource is not a model mismatch.
+        "Project abc does not exist or you do not have access to it.",
+    ],
+)
+def test_model_unavailable_ignores_unrelated_errors(message: str) -> None:
+    assert diagnose_model_unavailable(message) is None
+
+
+_COMPACTION_PREFIX = (
+    "Codex compacts this conversation on the previous model, gpt-6-astra, "
+    "before switching to gpt-6-1-sol"
+)
+
+
+@pytest.mark.parametrize(
+    ("code", "title", "cause_start", "remediation_start", "category"),
+    [
+        (
+            "budget_exhausted",
+            "gpt-6-astra is over its AI gateway budget",
+            "The AI gateway refused a compaction request on gpt-6-astra: its budget is exhausted.",
+            "Fork this session",
+            ErrorCategory.USER,
+        ),
+        (
+            "codex_turn_error",
+            "Codex can't compact on gpt-6-astra",
+            "gpt-6-astra rejected a compaction request. Codex retries it every turn",
+            "Fork this session",
+            ErrorCategory.UPSTREAM,
+        ),
+        (
+            "rate_limit_exceeded",
+            "Codex can't compact on gpt-6-astra right now",
+            f"{_COMPACTION_PREFIX}, and that model is temporarily unavailable.",
+            "Retry later",
+            ErrorCategory.UPSTREAM,
+        ),
+        (
+            "transient_upstream_error",
+            "Codex can't compact on gpt-6-astra right now",
+            f"{_COMPACTION_PREFIX}, and that model is temporarily unavailable.",
+            "Retry later",
+            ErrorCategory.UPSTREAM,
+        ),
+    ],
+)
+def test_codex_compaction_model_failure_names_both_models_and_the_way_out(
+    code: str, title: str, cause_start: str, remediation_start: str, category: ErrorCategory
+) -> None:
+    diagnosis = diagnose_codex_compaction_model_failure(
+        code, compaction_model="system.ai.gpt-6-astra", selected_model="system.ai.gpt-6-1-sol"
+    )
+
+    assert diagnosis.title == title
+    assert diagnosis.cause.startswith(cause_start)
+    assert "gpt-6-1-sol" in diagnosis.cause
+    assert diagnosis.remediation is not None
+    assert diagnosis.remediation.startswith(remediation_start)
+    assert "fork" in diagnosis.remediation.lower()
+    assert "continue on gpt-6-1-sol" in diagnosis.remediation
+    # Only a budget can be raised; the other failures clear on their own or not at all.
+    assert ("raise that budget" in diagnosis.remediation) is (code == "budget_exhausted")
+    assert diagnosis.category is category
+
+
+@pytest.mark.parametrize("code", ["budget_exhausted", "codex_turn_error", "rate_limit_exceeded"])
+def test_codex_compaction_model_failure_cause_fits_its_label(code: str) -> None:
+    """A reloaded card keeps the whole cause, even for long model names."""
+    from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
+
+    diagnosis = diagnose_codex_compaction_model_failure(
+        code,
+        compaction_model=f"system.ai.{'p' * 40}",
+        selected_model=f"system.ai.{'s' * 40}",
+    )
+
+    assert len(diagnosis.cause) <= LABEL_VALUE_MAX_LEN
+
+
+def test_compaction_model_failure_code_survives_its_budget_text() -> None:
+    """A reloaded card keeps the code whose budget text names the previous model's limit."""
+    message = 'unexpected status 403 Forbidden: Budget "example" has reached its limit of $100.'
+
+    assert classify_native_turn_error("codex_turn_error", message) == "budget_exhausted"
+    assert (
+        classify_native_turn_error("codex_compaction_model_failed", message)
+        == "codex_compaction_model_failed"
+    )
+
+
 @pytest.mark.parametrize(
     ("code", "expected_substring"),
     [
@@ -288,10 +610,12 @@ def test_429_still_classifies_as_rate_limit_not_transient() -> None:
         ("context_length_exceeded", "context window"),
         ("rate_limit_exceeded", "You can retry this turn"),
         ("transient_upstream_error", "temporary error"),
+        ("client_update_required", "too old for the selected model"),
         ("budget_exhausted", "budget"),
         ("databricks_sign_in_pending", "Databricks sign-in"),
         ("agent_startup_pending", "still starting"),
         ("codex_thread_not_started", "never ran"),
+        ("codex_compaction_model_failed", "previous model"),
     ],
 )
 def test_describe_failure_code_known(code: str, expected_substring: str) -> None:

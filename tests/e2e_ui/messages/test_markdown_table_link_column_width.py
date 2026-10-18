@@ -37,6 +37,7 @@ _LINK = '[data-streamdown="link"]'
 
 # The short link whose column used to collapse.
 _SHORT_LINK_TEXT = "#3090"
+_DESCRIPTIVE_PR_TEXT = "Fix the rendering of markdown tables and code blocks on narrow screens"
 
 # Rendered as its own link text, and too long to fit one line in a cell.
 _LONG_URL = (
@@ -63,6 +64,11 @@ def _row(num: str, title: str, author: str, waiting: str) -> str:
 _MESSAGE_TEXT = "\n".join(
     [
         "Here are the pull requests still waiting on review:",
+        "",
+        f"See [{_DESCRIPTIVE_PR_TEXT}](https://github.com/acme/app/pull/42) before merging.",
+        "",
+        "See [**Fix** the rendering of markdown tables and code blocks on narrow screens]"
+        "(https://github.com/acme/app/pull/42) before merging.",
         "",
         "| # | PR | Author | Waiting | Link |",
         "| --- | --- | --- | --- | --- |",
@@ -171,3 +177,47 @@ def test_table_fullscreen_control_expands_and_shrinks(
     dialog.get_by_role("button", name="Exit fullscreen", exact=True).click()
     expect(dialog).to_have_count(0)
     expect(inline_table).to_be_visible()
+
+
+@pytest.mark.parametrize("width", [375, 900])
+@pytest.mark.parametrize("theme", ["light", "dark"])
+def test_descriptive_pr_link_wraps_with_surrounding_prose(
+    page: Page,
+    table_session: tuple[str, str],
+    width: int,
+    theme: str,
+) -> None:
+    """Plain and formatted PR labels flow with their sentence at any width."""
+    base_url, session_id = table_session
+    page.set_viewport_size({"width": width, "height": 900})
+    page.add_init_script(f"localStorage.setItem('web-theme', '{theme}')")
+    page.goto(f"{base_url}/c/{session_id}")
+    links = page.get_by_role("link", name=_DESCRIPTIVE_PR_TEXT, exact=True)
+    expect(links).to_have_count(2)
+    for link in links.all():
+        expect(link).to_be_visible()
+        layout = link.evaluate("""el => {
+          const range = document.createRange();
+          range.selectNodeContents(el.parentElement.firstChild);
+          const lead = range.getBoundingClientRect();
+          const boxes = [...el.getClientRects()];
+          const icon = el.querySelector('svg').getBoundingClientRect();
+          const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+          let text;
+          while ((text = walker.nextNode()) && !text.textContent.trim()) {}
+          range.setStart(text, 0);
+          range.setEnd(text, 3);
+          const firstWord = range.getBoundingClientRect();
+          return {
+            leadingTop: lead.top,
+            firstLinkTop: boxes[0].top,
+            lineBoxes: boxes.length,
+            iconTop: icon.top,
+            firstWordTop: firstWord.top,
+          };
+        }""")
+        assert abs(layout["leadingTop"] - layout["firstLinkTop"]) < 2, layout
+        assert abs(layout["iconTop"] - layout["firstWordTop"]) < 4, layout
+        if width == 375:
+            assert layout["lineBoxes"] > 1, layout
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth + 1")

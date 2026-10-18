@@ -90,6 +90,21 @@ describe("sandboxProviderOptions", () => {
 });
 
 describe("resolveServerInfo sandbox_providers", () => {
+  it.each([undefined, null, "", "manage", 2, true])(
+    "defaults an absent or invalid public ceiling %s to Read",
+    async (value) => {
+      expect((await probe({ public_sharing_max_level: value })).public_sharing_max_level).toBe(
+        "read",
+      );
+    },
+  );
+
+  it("recognizes an explicit public Edit ceiling", async () => {
+    expect((await probe({ public_sharing_max_level: "edit" })).public_sharing_max_level).toBe(
+      "edit",
+    );
+  });
+
   it("keeps the provider list from the probe", async () => {
     // Regression: the probe rebuilds ServerInfo field by field, so a
     // forgotten field is dropped before any component sees it.
@@ -159,6 +174,17 @@ describe("resolveServerInfo archive_worktree_cleanup", () => {
 
   it("is off for an older server that omits it", async () => {
     expect((await probe({})).archive_worktree_cleanup).toBe(false);
+  });
+});
+
+describe("resolveServerInfo request_managed_sandbox_host_id", () => {
+  it.each([
+    [true, true],
+    [undefined, false],
+    ["true", false],
+  ])("parses %s strictly as %s", async (advertised, expected) => {
+    const parsed = await probe({ request_managed_sandbox_host_id: advertised });
+    expect(parsed.request_managed_sandbox_host_id).toBe(expected);
   });
 });
 
@@ -232,4 +258,29 @@ describe("resolveServerInfo branding", () => {
     const malformed = await probe({ branding: "Acme" });
     expect(malformed.branding).toBeNull();
   });
+});
+
+describe("custom agents settings capability", () => {
+  it.each([undefined, false, "true", true])(
+    "parses agent_config_edit strictly: %s",
+    async (edit) => {
+      expect((await probe({ agent_config_edit: edit })).agent_config_edit).toBe(edit === true);
+    },
+  );
+  it.each([undefined, false, "true", true])("parses agent_detail strictly: %s", async (detail) => {
+    const parsed = await probe({ agent_detail: detail });
+    expect(parsed.agent_detail).toBe(detail === true);
+  });
+
+  it.each([undefined, false, "true", true])(
+    "requires a boolean install capability: %s",
+    async (install) => {
+      const parsed = await probe({
+        features: { custom_agents_settings_ui: true },
+        agent_install: install,
+      });
+      const { customAgentsSettingsEnabled } = await import("./capabilities");
+      expect(customAgentsSettingsEnabled(parsed)).toBe(install === true);
+    },
+  );
 });

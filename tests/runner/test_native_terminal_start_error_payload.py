@@ -4,7 +4,7 @@ The runner builds every native-terminal-start failure payload through
 ``_native_terminal_start_error_payload``. A deleted/rebound session agent is a
 session-lifecycle condition, not a terminal-startup defect: it must surface a
 distinct ``session_agent_missing`` code with a client-safe remedy message,
-while any other cause keeps the generic ``native_terminal_start_failed``
+while unclassified causes keep the generic ``native_terminal_start_failed``
 startup-defect code. These are fast, layer-local guards for that split.
 """
 
@@ -21,7 +21,8 @@ import pytest
 
 from omnigent.debug_logging import record_to_row
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.inner.terminal import TerminalInstance
+from omnigent.harnesses.codex_native.launch_args import CodexTransportArgsError
+from omnigent.inner.terminal import TerminalInstance, TmuxUnavailableError
 from omnigent.runner.native import orchestration
 from omnigent.runner.native.orchestration import (
     _NATIVE_TERMINAL_START_FAILED_CODE,
@@ -64,7 +65,14 @@ def test_missing_session_agent_classified_as_lifecycle_condition() -> None:
     assert payload["error_id"] == match.group(1)
 
 
-def test_other_causes_keep_generic_startup_failure_code() -> None:
+@pytest.mark.parametrize(
+    "cause",
+    [
+        RuntimeError("tmux server exited before the pane was ready"),
+        FileNotFoundError("missing executable"),
+    ],
+)
+def test_other_causes_keep_generic_startup_failure_code(cause: Exception) -> None:
     """A non-lifecycle cause keeps the generic startup-defect code.
 
     The reclassification is scoped to the missing-agent lifecycle condition;
@@ -72,7 +80,7 @@ def test_other_causes_keep_generic_startup_failure_code() -> None:
     ``native_terminal_start_failed`` terminal-startup defect.
     """
     payload = _native_terminal_start_error_payload(
-        RuntimeError("tmux server exited before the pane was ready"),
+        cause,
         "Claude",
         session_id="conv_1",
     )
@@ -91,6 +99,12 @@ def test_other_causes_keep_generic_startup_failure_code() -> None:
             OmnigentError("agent gone", code=ErrorCode.SESSION_AGENT_MISSING),
             "user",
         ),
+        (
+            OmnigentError("workspace gone", code=ErrorCode.WORKSPACE_MISSING),
+            "user",
+        ),
+        (TmuxUnavailableError("tmux is not installed or not on PATH."), "config"),
+        (CodexTransportArgsError("app-server"), "config"),
     ],
 )
 def test_start_failure_log_row_is_blocking_with_derived_category(
@@ -234,6 +248,146 @@ def test_codex_early_exit_diagnostic_failure_preserves_exit_cause(
     read_output.assert_called_once_with()
 
 
+def test_outdated_pi_cli_surfaces_its_actionable_message() -> None:
+    """An outdated Pi CLI shows the upgrade message, not the log pointer.
+
+    The raise site composes a client-safe message (installed version, floor,
+    upgrade command); the payload must carry it verbatim so the person sees
+    the remedy instead of "see the runner log".
+    """
+    from omnigent.harnesses.pi_native.main import PiNativeCliOutdatedError
+
+    remedy = (
+        "The installed Pi CLI (0.83.0) is older than the minimum Omnigent "
+        "supports (0.84.2). Upgrade with: npm install -g "
+        "@earendil-works/pi-coding-agent, then start the session again."
+    )
+    payload = _native_terminal_start_error_payload(
+        PiNativeCliOutdatedError(remedy), "Pi", session_id="conv_1"
+    )
+
+    assert payload["code"] == _NATIVE_TERMINAL_START_FAILED_CODE
+    assert remedy in payload["message"]
+    assert "see the runner log" not in payload["message"]
+    assert _ERROR_ID_RE.search(payload["message"]) is not None
+
+
+@pytest.mark.parametrize(
+    ("exc", "runtime_name"),
+    [
+        (
+            TmuxUnavailableError(
+                "tmux 3.2 is too old; managed terminals require tmux 3.3 or newer"
+            ),
+            "Claude",
+        ),
+        (CodexTransportArgsError("app-server"), "Codex"),
+    ],
+)
+def test_host_setup_error_surfaces_its_remedy(
+    exc: Exception, runtime_name: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A known setup error shows how to fix it in the session."""
+    payload = _native_terminal_start_error_payload(exc, runtime_name, session_id="conv_1")
+
+    assert payload["code"] == ErrorCode.HARNESS_NOT_CONFIGURED
+    assert str(exc) in payload["message"]
+    assert "see the runner log" not in payload["message"]
+    assert _ERROR_ID_RE.search(payload["message"]) is not None
+
+    response = _native_terminal_start_error_response(exc, runtime_name, session_id="conv_1")
+    assert response.status_code == 412
+    assert json.loads(response.body)["error"]["code"] == ErrorCode.HARNESS_NOT_CONFIGURED
+    assert not any(record.exc_info for record in caplog.records)
+
+
+def test_claude_early_exit_surfaces_classified_diagnosis(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A non-Codex runtime's exit-at-spawn is classified like Codex's.
+
+    The exit status and captured output ride on the exception for every
+    runtime, so a Claude terminal whose CLI reports missing credentials must
+    surface the shared diagnosis instead of the generic log pointer — without
+    echoing the raw pane text.
+    """
+    monkeypatch.setenv("OMNIGENT_HARNESS_STDERR_ENABLED", "1")
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "terminal.sock",
+        private_dir=tmp_path,
+        command="claude",
+    )
+    instance._remember_exit_status("1 1")
+    monkeypatch.setattr(instance, "last_exit_text", lambda: "Not logged in · Please run /login")
+
+    payload = _native_terminal_start_error_payload(
+        TerminalExitedDuringLaunch(instance), "Claude", session_id="conv_1"
+    )
+
+    message = payload["message"]
+    assert "Agent isn't signed in" in message
+    assert "no valid credentials" in message
+    assert "/login" in message
+    assert "Native Claude terminal failed to start" not in message
+    assert "see the runner log" not in message
+    # The diagnosis is rendered, never the raw pane text.
+    assert "Not logged in" not in message
+    assert _ERROR_ID_RE.search(message) is not None
+
+
+def test_pi_early_exit_without_match_falls_back_to_exit_summary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An unclassified exit keeps the runtime's exit summary plus gated output."""
+    monkeypatch.setenv("OMNIGENT_HARNESS_STDERR_ENABLED", "1")
+    instance = TerminalInstance(
+        name="pi",
+        session_key="main",
+        socket_path=tmp_path / "terminal.sock",
+        private_dir=tmp_path,
+        command="pi",
+    )
+    instance._remember_exit_status("1 3")
+    monkeypatch.setattr(instance, "last_exit_text", lambda: "some unrecognized pane text")
+
+    payload = _native_terminal_start_error_payload(
+        TerminalExitedDuringLaunch(instance), "Pi", session_id="conv_1"
+    )
+
+    message = payload["message"]
+    assert "Pi terminal exited with status 3 before becoming available." in message
+    assert "Pi startup terminal output:\nsome unrecognized pane text" in message
+    assert "Native Pi terminal failed to start" not in message
+
+
+def test_claude_early_exit_output_gated_when_capture_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With stderr capture disabled, a non-Codex exit reads no pane output."""
+    monkeypatch.delenv("OMNIGENT_HARNESS_STDERR_ENABLED", raising=False)
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "terminal.sock",
+        private_dir=tmp_path,
+        command="claude",
+    )
+    instance._remember_exit_status("1 1")
+    read_output = Mock(side_effect=AssertionError("capture is disabled"))
+    monkeypatch.setattr(instance, "last_exit_text", read_output)
+
+    payload = _native_terminal_start_error_payload(
+        TerminalExitedDuringLaunch(instance), "Claude", session_id="conv_1"
+    )
+
+    message = payload["message"]
+    assert "Claude terminal exited with status 1 before becoming available." in message
+    assert "startup terminal output:" not in message
+    read_output.assert_not_called()
+
+
 def test_unrelated_omnigent_error_is_not_treated_as_missing_agent() -> None:
     """An ``OmnigentError`` with a different code is not reclassified.
 
@@ -249,26 +403,37 @@ def test_unrelated_omnigent_error_is_not_treated_as_missing_agent() -> None:
     assert "agent no longer exists" not in payload["message"]
 
 
-@pytest.mark.parametrize("missing_agent", [False, True])
+@pytest.mark.parametrize(
+    "lifecycle_code",
+    [None, ErrorCode.SESSION_AGENT_MISSING, ErrorCode.WORKSPACE_MISSING],
+)
 def test_startup_failure_diagnostics_belong_to_failing_child(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    missing_agent: bool,
+    lifecycle_code: ErrorCode | None,
 ) -> None:
     """A shared runner's parent must not receive a child's startup failure evidence."""
     monkeypatch.setattr(orchestration, "runner_primary_session_id", lambda: "parent-session")
     private_detail = "private launch configuration"
-    if missing_agent:
-        exc = OmnigentError(private_detail, code=ErrorCode.SESSION_AGENT_MISSING)
+    if lifecycle_code is not None:
+        exc = OmnigentError(private_detail, code=lifecycle_code)
     else:
         exc = RuntimeError(private_detail)
         exc.__cause__ = httpx.ReadTimeout("private upstream URL")
 
+    events: list[dict[str, object]] = []
     with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
         payload = _publish_native_terminal_start_error(
-            lambda _session_id, _event: None, "child-session", "Codex", exc
+            lambda _session_id, event: events.append(event), "child-session", "Codex", exc
         )
 
+    assert len(events) == 1
+    context = events[0]["failure_context"]
+    assert isinstance(context, dict)
+    assert context["failure_id"] == payload["error_id"]
+    assert context["failure_source"] == "native_terminal_start"
+    assert context["exception_type"] == type(exc).__name__
+    assert private_detail not in str(context)
     record = next(r for r in caplog.records if payload["error_id"] in r.getMessage())
     row = record_to_row(record, source="runner")
     assert row["session_id"] == "child-session"
@@ -281,7 +446,7 @@ def test_startup_failure_diagnostics_belong_to_failing_child(
     assert attributes["exception_type"] == type(exc).__name__
     assert private_detail not in str(attributes)
     assert private_detail not in payload["message"]
-    if missing_agent:
+    if lifecycle_code is not None:
         assert row["stack_trace"] is None
     else:
         assert attributes["exception_cause_type"] == "ReadTimeout"
@@ -291,17 +456,17 @@ def test_startup_failure_diagnostics_belong_to_failing_child(
         assert "(cause ReadTimeout)" in payload["message"]
 
 
-def test_ensure_response_for_a_removed_agent_is_410() -> None:
-    """A removed agent is the session's state, not a runner failure: 410, the status
-    of ``session_agent_missing`` (as for a fork of it). Other failures stay 500."""
+@pytest.mark.parametrize("code", [ErrorCode.SESSION_AGENT_MISSING, ErrorCode.WORKSPACE_MISSING])
+def test_ensure_response_for_a_removed_session_resource_is_410(code: ErrorCode) -> None:
+    """A removed session resource is a lifecycle condition, not a runner failure."""
     removed = _native_terminal_start_error_response(
-        OmnigentError("agent gone", code=ErrorCode.SESSION_AGENT_MISSING),
-        "Claude",
-        session_id="conv_1",
+        OmnigentError("resource gone", code=code), "Claude", session_id="conv_1"
     )
     assert removed.status_code == 410
-    assert json.loads(removed.body)["error"]["code"] == ErrorCode.SESSION_AGENT_MISSING
+    assert json.loads(removed.body)["error"]["code"] == code
 
+
+def test_ensure_response_for_other_failure_is_500() -> None:
     other = _native_terminal_start_error_response(
         OmnigentError("boom", code=ErrorCode.INTERNAL_ERROR), "Claude", session_id="conv_1"
     )

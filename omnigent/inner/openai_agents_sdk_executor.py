@@ -17,8 +17,10 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 import subprocess
 import time
+import traceback
 from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Sequence
 from dataclasses import dataclass
 from types import ModuleType
@@ -26,9 +28,11 @@ from typing import Any, Literal, Protocol, TypeAlias, cast
 
 import httpx
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.errors import is_context_length_exceeded as _is_context_length_exceeded
 from omnigent.models import model_catalog
+from omnigent.process_logging import redact_log_text
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.reasoning_effort import OPENAI_AGENTS_EFFORTS, validate_effort
@@ -407,6 +411,20 @@ def _ensure_agents_sdk() -> ModuleType:
         ) from exc
 
 
+def _normalize_databricks_host(host: str) -> str:
+    """Normalize a Databricks workspace host URL for equality comparison.
+
+    Strips scheme, trailing slash, and case so hosts from different
+    sources (env override vs. profile config) compare correctly.
+    """
+    normalized = host.strip().lower()
+    for prefix in ("https://", "http://"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :]
+            break
+    return normalized.rstrip("/")
+
+
 def _get_openai_async_client(
     profile: str | None = None,
     api_key: str | None = None,
@@ -478,10 +496,30 @@ def _get_openai_async_client(
                 "HARNESS_OPENAI_AGENTS_GATEWAY_AUTH_COMMAND."
             )
         host = host_override.rstrip("/")
+        gateway_auth: httpx.Auth
+        if IS_WINDOWS:
+            # The generated auth command is a POSIX sh script and Windows has no
+            # ``sh``; mint the profile's token in-process with the Databricks SDK.
+            if not profile:
+                raise OSError(
+                    "OpenAIAgentsSDKExecutor gateway auth on Windows requires a "
+                    "Databricks profile (no 'sh' available to run the auth command)."
+                )
+            from .databricks_executor import _resolve_databricks_auth
+
+            gateway_auth, resolved_host = _resolve_databricks_auth(profile)
+            if _normalize_databricks_host(resolved_host) != _normalize_databricks_host(host):
+                raise OSError(
+                    f"Databricks profile {profile!r} resolves to workspace host "
+                    f"{resolved_host!r}, which does not match the gateway host "
+                    f"{host_override!r}. Use a profile for the gateway's workspace."
+                )
+        else:
+            gateway_auth = _ShellCommandBearerAuth(databricks_auth_command)
         return AsyncOpenAI(
             base_url=base_url_override,
             api_key=_OPENAI_KEY_PLACEHOLDER,
-            http_client=httpx.AsyncClient(auth=_ShellCommandBearerAuth(databricks_auth_command)),
+            http_client=httpx.AsyncClient(auth=gateway_auth),
             **retry_kwargs,
         )
 
@@ -616,17 +654,35 @@ class _ShellCommandBearerAuth(httpx.Auth):
 
         :param request: The outgoing httpx request.
         :yields: The request with the auth header set.
-        :raises RuntimeError: When the command fails or prints no token.
+        :raises DatabricksAuthError: When ``sh`` is not on PATH or the command
+            fails or prints no token. Any other exception raised here is
+            collapsed by the OpenAI SDK into an opaque ``APIConnectionError``.
         """
+        from .databricks_executor import DatabricksAuthError
+
+        sh = shutil.which("sh")
+        if sh is None:
+            raise DatabricksAuthError(
+                "Databricks gateway auth command needs `sh` on PATH to mint a gateway "
+                "token, but no `sh` was found. Install a POSIX shell or add it to PATH."
+            )
         result = subprocess.run(
-            ["sh", "-c", self._command],
+            [sh, "-c", self._command],
             check=False,
             capture_output=True,
             text=True,
         )
         token = result.stdout.strip()
         if result.returncode != 0 or not token:
-            raise RuntimeError("Databricks auth command failed to return a bearer token.")
+            logger.error(
+                "Databricks gateway auth command failed (exit %d): %s",
+                result.returncode,
+                redact_log_text(result.stderr.strip()) or "<no stderr>",
+            )
+            raise DatabricksAuthError(
+                "Databricks gateway auth command failed to return a gateway token "
+                f"(exit {result.returncode}); its error output is in the harness log."
+            )
         request.headers["Authorization"] = f"Bearer {token}"
         yield request
 
@@ -829,7 +885,7 @@ def _build_reasoning_model_settings(effort: str | None) -> dict[str, object]:
 
 
 def _is_databricks_openai_client(client: AsyncOpenAIClient) -> bool:
-    """Return whether *client* targets a Databricks AI Gateway base URL."""
+    """Return whether *client* targets a Databricks Unity Gateway base URL."""
     return "/ai-gateway/" in str(getattr(client, "base_url", ""))
 
 
@@ -954,6 +1010,81 @@ def _wrap_client_for_reasoning_models(client: AsyncOpenAIClient) -> AsyncOpenAIC
     # and any Pydantic frozen-instance guard on the client class.
     object.__setattr__(client, "chat", _ReasoningBlockFilterChat(client.chat))
     return client
+
+
+def _is_plain_json(value: object) -> bool:
+    """Return whether *value* is acyclic JSON: scalars, lists, and str-keyed dicts.
+
+    A cycle returns ``False``, so the caller falls back to the client's normal
+    path; a node shared by two parents is fine, as it is for ``json.dumps``.
+    """
+    on_path: set[int] = set()
+    stack: list[tuple[object, bool]] = [(value, False)]
+    while stack:
+        node, leaving = stack.pop()
+        if leaving:
+            on_path.discard(id(node))
+            continue
+        if isinstance(node, (dict, list)):
+            if id(node) in on_path:
+                return False
+            on_path.add(id(node))
+            stack.append((node, True))
+            if isinstance(node, dict):
+                if not all(isinstance(key, str) for key in node):
+                    return False
+                stack.extend((item, False) for item in node.values())
+            else:
+                stack.extend((item, False) for item in node)
+        elif node is not None and not isinstance(node, (str, int, float, bool)):
+            return False
+    return True
+
+
+def _history_via_extra_body(kwargs: dict[str, Any], field: str) -> dict[str, Any]:
+    """Move the plain-JSON history list *field* into ``extra_body``.
+
+    The client merges ``extra_body`` into the request body as-is, after its
+    type-driven param transform, so the request JSON is unchanged.
+
+    :param kwargs: Keyword arguments for a ``create`` call.
+    :param field: History parameter, ``"input"`` or ``"messages"``.
+    :returns: Rewritten kwargs, or *kwargs* itself when the value is not a
+        plain-JSON list or ``extra_body`` already sets *field*.
+    """
+    value = kwargs.get(field)
+    extra = kwargs.get("extra_body")
+    if not isinstance(value, list) or not value:
+        return kwargs
+    if extra is not None and (not isinstance(extra, dict) or field in extra):
+        return kwargs
+    if not _is_plain_json(value):
+        return kwargs
+    return {**kwargs, field: [], "extra_body": {**(extra or {}), field: value}}
+
+
+def _skip_history_transform(resource: object, field: str) -> None:
+    """Route *resource*'s ``create`` history list around the client's param transform.
+
+    The openai client walks every request param through ``transform`` on each
+    call, ~0.2 ms per history item, so a 400-item session spends ~85 ms per
+    turn before the request is sent. The Responses and Chat Completions param
+    types declare no aliases or formats, so for the plain JSON the Agents SDK
+    builds that walk changes nothing. Shadowing ``create`` on the instance also
+    covers ``with_streaming_response`` / ``with_raw_response``, which wrap it.
+
+    :param resource: ``client.responses`` or ``client.chat.completions``.
+    :param field: History parameter, ``"input"`` or ``"messages"``.
+    """
+    create = getattr(resource, "create", None)
+    if not callable(create) or getattr(create, "_skips_history_transform", False):
+        return
+
+    def _create(*args: Any, **kwargs: Any) -> Any:  # type: ignore[explicit-any]
+        return create(*args, **_history_via_extra_body(kwargs, field))
+
+    _create._skips_history_transform = True  # type: ignore[attr-defined]
+    object.__setattr__(resource, "create", _create)
 
 
 def _count_output_items(new_items: Sequence[object]) -> int:
@@ -1098,6 +1229,11 @@ class OpenAIAgentsSDKExecutor(Executor):
                 model=model,
             )
         )
+        if client is None:
+            # An injected client stays as the caller built it.
+            _skip_history_transform(getattr(raw_client, "responses", None), "input")
+            _chat = getattr(raw_client, "chat", None)
+            _skip_history_transform(getattr(_chat, "completions", None), "messages")
         # Wrap the chat.completions path to strip list-type delta.content
         # (reasoning blocks emitted by models like Kimi K2).  The SDK's
         # ChatCmplStreamHandler validates delta as str; list input raises
@@ -1755,8 +1891,19 @@ class OpenAIAgentsSDKExecutor(Executor):
                     logger.error("OpenAIAgentsSDKExecutor: auth failed: %s", auth_msg)
                     yield ExecutorError(message=auth_msg)
                 else:
-                    logger.error("OpenAIAgentsSDKExecutor: run failed: %s", exc)
-                    yield ExecutorError(message=f"OpenAI Agents SDK error: {exc}")
+                    # The OpenAI SDK collapses any transport or auth-hook failure
+                    # into a bare "Connection error."; surface what caused it.
+                    # Cause type is safe for users; full (redacted) detail and
+                    # traceback go to the log only — never via raw exc_info.
+                    cause = exc.__cause__ or exc.__context__
+                    safe_detail = f"{exc} ({type(cause).__name__})" if cause else str(exc)
+                    log_detail = f"{exc} ({type(cause).__name__}: {cause})" if cause else str(exc)
+                    logger.error(
+                        "OpenAIAgentsSDKExecutor: run failed: %s\n%s",
+                        redact_log_text(log_detail),
+                        redact_log_text(traceback.format_exc()),
+                    )
+                    yield ExecutorError(message=f"OpenAI Agents SDK error: {safe_detail}")
                 return
             finally:
                 # If the outer generator was aclose'd before the

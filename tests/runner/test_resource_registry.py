@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
-from collections.abc import Sequence
+import threading
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -589,6 +591,36 @@ async def _observe_native_with_fake_poller(
     return callbacks, statuses, pollers, registry
 
 
+async def _observe_native_with_real_poller(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    session_id: str,
+) -> tuple[Callable[[], None], list[str], SessionResourceRegistry, Path]:
+    """Observe a Claude terminal with a real poller and caller-written status file."""
+    config_dir = tmp_path / "claude"
+    status_file = config_dir / "sessions" / "123.json"
+    status_file.parent.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "bridges"
+    )
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(session_id, {})[("claude", "main")] = instance
+    watcher = Mock()
+    monkeypatch.setattr(instance, "start_idle_watcher_thread", watcher)
+    monkeypatch.setattr(instance, "pane_pid_sync", lambda: 123)
+    statuses: list[str] = []
+    registry.set_session_status_publisher(
+        lambda _sid, status, _reason=None: statuses.append(status)
+    )
+    await registry.observe_required_terminal(
+        session_id, "claude", "main", instance, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
+    )
+    return watcher.call_args.kwargs["on_tick"], statuses, registry, status_file
+
+
 @pytest.mark.asyncio
 async def test_claude_native_wires_status_poller_tick(tmp_path: Path) -> None:
     """The claude-native watcher is wired with an ``on_tick`` that drives
@@ -708,6 +740,97 @@ async def test_hook_status_resyncs_watcher_dedup(tmp_path: Path) -> None:
     await asyncio.sleep(0)
     assert statuses == ["running", "running"]
     del callbacks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "poll_before_stop", [False, True], ids=["busy-read-after-stop", "busy-read-before-stop"]
+)
+async def test_queued_turn_republishes_running_after_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, poll_before_stop: bool
+) -> None:
+    """A prior turn's Stop must not leave a queued turn reported as idle."""
+    session_id = "conv_queued_status"
+    on_tick, statuses, registry, status_file = await _observe_native_with_real_poller(
+        tmp_path, monkeypatch, session_id
+    )
+    record = {
+        "pid": 123,
+        "sessionId": "claude-queued-status",
+        "kind": "interactive",
+        "status": "busy",
+        "statusUpdatedAt": 1000,
+    }
+    status_file.write_text(json.dumps(record), encoding="utf-8")
+    initial_mtime_ns = status_file.stat().st_mtime_ns
+
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+    assert registry.session_turn_is_active(session_id)
+
+    # The queued turn overwrites idle before the real poller gets another tick.
+    for status, updated_at in [("idle", 2000), ("busy", 3000)]:
+        status_file.write_text(
+            json.dumps({**record, "status": status, "statusUpdatedAt": updated_at}),
+            encoding="utf-8",
+        )
+    next_mtime_ns = initial_mtime_ns + 1_000_000_000
+    os.utime(status_file, ns=(next_mtime_ns, next_mtime_ns))
+    if poll_before_stop:
+        on_tick()
+        await asyncio.sleep(0)
+        assert statuses == ["running"]
+
+    # The forwarder posts the previous turn's Stop directly to the server.
+    registry.note_external_session_status(session_id, "idle")
+    assert not registry.session_turn_is_active(session_id)
+
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running", "running"]
+    assert registry.session_turn_is_active(session_id)
+
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running", "running"]
+
+    # The queued turn's own Stop and idle file still produce one completion.
+    registry.note_external_session_status(session_id, "idle")
+    status_file.write_text(
+        json.dumps({**record, "status": "idle", "statusUpdatedAt": 4000}),
+        encoding="utf-8",
+    )
+    final_mtime_ns = next_mtime_ns + 1_000_000_000
+    os.utime(status_file, ns=(final_mtime_ns, final_mtime_ns))
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running", "running"]
+    assert not registry.session_turn_is_active(session_id)
+
+
+@pytest.mark.asyncio
+async def test_failed_hook_does_not_republish_stale_running_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed turn stays failed while its busy status file catches up."""
+    session_id = "conv_failed_status"
+    on_tick, statuses, registry, status_file = await _observe_native_with_real_poller(
+        tmp_path, monkeypatch, session_id
+    )
+    status_file.write_text(
+        json.dumps({"kind": "interactive", "sessionId": "claude-failed-status", "status": "busy"}),
+        encoding="utf-8",
+    )
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    registry.note_external_session_status(session_id, "failed")
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+    assert not registry.session_turn_is_active(session_id)
 
 
 @pytest.mark.asyncio
@@ -1265,6 +1388,68 @@ async def test_cleanup_session_closes_primary_env(
         assert not reg.has_primary_env("conv_1")
     finally:
         os.environ.pop("OMNIGENT_RUNNER_OS_ENV_ROOT", None)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_session_primary_close_is_off_loop_and_cancellation_safe() -> None:
+    """Primary environment cleanup finishes after repeated cancellation."""
+    reg = SessionResourceRegistry()
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    heartbeat_ran_while_blocked = asyncio.Event()
+
+    class _BlockingEnvironment(_FakeOSEnvironment):
+        def close(self) -> None:
+            started.set()
+            assert release.wait(timeout=2.0)
+            self._closed = True
+            finished.set()
+
+    environment = _BlockingEnvironment(
+        spec=OSEnvSpec(type="caller_process", cwd="/tmp", sandbox=OSEnvSandboxSpec(type="none")),
+        cwd=Path("/tmp"),
+    )
+    reg._primary_envs["conv_blocked_cleanup"] = environment
+
+    async def heartbeat() -> None:
+        while not finished.is_set():
+            if started.is_set():
+                heartbeat_ran_while_blocked.set()
+                return
+            await asyncio.sleep(0.01)
+
+    heartbeat_task: asyncio.Task[None] | None = None
+    cleanup_task: asyncio.Task[None] | None = None
+    watchdog = threading.Thread(
+        target=lambda: (release.wait(timeout=2.0), release.set()),
+        name="test-resource-cleanup-watchdog",
+        daemon=True,
+    )
+    watchdog.start()
+    try:
+        heartbeat_task = asyncio.create_task(heartbeat())
+        cleanup_task = asyncio.create_task(reg.cleanup_session("conv_blocked_cleanup"))
+        await asyncio.wait_for(heartbeat_ran_while_blocked.wait(), timeout=1.0)
+        cleanup_task.cancel()
+        await asyncio.sleep(0)
+        cleanup_task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await cleanup_task
+    finally:
+        release.set()
+        if cleanup_task is not None and not cleanup_task.done():
+            cleanup_task.cancel()
+        if heartbeat_task is not None and not heartbeat_task.done():
+            heartbeat_task.cancel()
+        await asyncio.gather(cleanup_task, heartbeat_task, return_exceptions=True)
+        watchdog.join(timeout=1.0)
+
+    assert finished.is_set()
+    assert environment._closed
+    assert not reg.has_primary_env("conv_blocked_cleanup")
+    assert heartbeat_ran_while_blocked.is_set()
 
 
 # ── Phase 4: cleanup endpoint tests ─────────────────────────────

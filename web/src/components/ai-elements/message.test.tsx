@@ -1,6 +1,8 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { setEmbedRoot } from "@/lib/host";
+import { MermaidPreview } from "@/shell/MermaidPreview";
+import { Reasoning, ReasoningContent } from "./reasoning";
 import { Message, MessageAction, MessageActions, MessageContent, MessageResponse } from "./message";
 
 const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
@@ -144,6 +146,79 @@ describe("MessageResponse", () => {
 
     expect(container.firstElementChild).toHaveClass("wrap-anywhere", "math-config-a");
   });
+});
+
+describe.each([true, false])("Mermaid fullscreen (embedded=%s)", (embedded) => {
+  const source = "flowchart LR\n  Alpha --> Beta";
+  const markdown = `\`\`\`mermaid\n${source}\n\`\`\``;
+
+  it.each([
+    ["chat", () => <MessageResponse>{markdown}</MessageResponse>],
+    ["preview/editor", () => <MermaidPreview source={source} />],
+    [
+      "reasoning",
+      () => (
+        <Reasoning open>
+          <ReasoningContent>{markdown}</ReasoningContent>
+        </Reasoning>
+      ),
+    ],
+  ])(
+    "opens and dismisses the diagram from %s",
+    async (_surface, content) => {
+      vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
+      // jsdom has no SVG layout; keep the real Mermaid renderer and supply its measurements.
+      const originalGetBBox = Object.getOwnPropertyDescriptor(SVGElement.prototype, "getBBox");
+      Object.defineProperty(SVGElement.prototype, "getBBox", {
+        configurable: true,
+        value: () => ({ x: 0, y: 0, width: 100, height: 40 }),
+      });
+      const root = document.createElement("div");
+      root.className = "omnigent-app";
+      document.body.appendChild(root);
+      setEmbedRoot(embedded ? root : null);
+      try {
+        const { container } = render(content(), { container: root });
+        await waitFor(
+          () => {
+            expect(container.querySelector('svg[id^="mermaid-"]')).not.toBeNull();
+          },
+          { timeout: 10_000 },
+        );
+        const svg = container.querySelector('svg[id^="mermaid-"]')!;
+        expect(svg.textContent).toContain("Alpha");
+        expect(screen.getAllByTitle("View fullscreen")).toHaveLength(1);
+        fireEvent.click(screen.getByTitle("View fullscreen"));
+        const exit = screen.getByTitle("Exit fullscreen");
+        const overlay = exit.parentElement!;
+        expect(overlay.parentElement).toBe(embedded ? root : document.body);
+        expect(overlay.querySelector('svg[id^="mermaid-"]')?.outerHTML).toBe(svg.outerHTML);
+        fireEvent.click(exit);
+        expect(screen.queryByTitle("Exit fullscreen")).toBeNull();
+        fireEvent.click(screen.getByTitle("View fullscreen"));
+        fireEvent.keyDown(window, { key: "Escape" });
+        expect(screen.queryByTitle("Exit fullscreen")).toBeNull();
+      } finally {
+        cleanup();
+        root.remove();
+        if (originalGetBBox)
+          Object.defineProperty(SVGElement.prototype, "getBBox", originalGetBBox);
+        else delete (SVGElement.prototype as { getBBox?: unknown }).getBBox;
+      }
+    },
+    15_000,
+  );
+});
+
+it("preserves ordinary code fences in reasoning", () => {
+  const { container } = render(
+    <Reasoning open>
+      <ReasoningContent>{"```text\nplain code\n```"}</ReasoningContent>
+    </Reasoning>,
+  );
+  expect(container.querySelector('[data-streamdown="code-block"]')).toHaveTextContent("plain code");
+  expect(screen.queryByTitle("View fullscreen")).toBeNull();
+  expect(screen.queryByRole("button", { name: "Toggle word wrap" })).toBeNull();
 });
 
 describe("MessageResponse table fullscreen", () => {

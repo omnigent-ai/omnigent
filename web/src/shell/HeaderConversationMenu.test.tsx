@@ -11,6 +11,8 @@ import { setOmnigentHostConfig } from "@/lib/host";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
+import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import { toast } from "sonner";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 
@@ -22,6 +24,7 @@ const mocks = vi.hoisted(() => ({
     icon?: string | null;
   }[],
   togglePinned: vi.fn(),
+  togglePinnedAsync: vi.fn(() => Promise.resolve({})),
   rename: vi.fn(),
   moveToProject: vi.fn(),
   archive: vi.fn(),
@@ -42,7 +45,10 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => {
   return {
     ...actual,
     useProjects: () => ({ data: mocks.projects }),
-    useTogglePinnedConversation: () => ({ mutate: mocks.togglePinned }),
+    useTogglePinnedConversation: () => ({
+      mutate: mocks.togglePinned,
+      mutateAsync: mocks.togglePinnedAsync,
+    }),
     useRenameConversation: () => ({ mutate: mocks.rename, isPending: false }),
     useMoveToProject: () => ({ mutate: mocks.moveToProject }),
     useArchiveConversation: () => ({ mutate: mocks.archive }),
@@ -135,6 +141,19 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("HeaderConversationMenu", () => {
+  it("keeps an unsupported Fork visible without opening its dialog", () => {
+    renderMenu({ forkDisabledReason: "Forking this sandbox session is not supported yet." });
+    openMenu();
+    const fork = screen.getByTestId("header-fork-conversation");
+    expect(fork).toHaveAttribute("aria-disabled", "true");
+    expect(fork).toHaveAttribute("aria-describedby");
+    expect(fork).toHaveAccessibleDescription("Forking this sandbox session is not supported yet.");
+    fireEvent.click(fork);
+    fireEvent.keyDown(fork, { key: "Enter" });
+    expect(mocks.fork).not.toHaveBeenCalled();
+    expect(fork).toBeInTheDocument();
+  });
+
   it("exposes an accessible trigger and the established action order", () => {
     renderMenu();
     const trigger = screen.getByRole("button", { name: "Conversation actions" });
@@ -182,6 +201,32 @@ describe("HeaderConversationMenu", () => {
     openMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Mark as unread" }));
     expect(mocks.markUnread).toHaveBeenCalledWith("conv-1", 1_700_000_100);
+  });
+
+  it("unpins with an Undo that re-pins at the previous pin value", async () => {
+    renderMenu({
+      conversation: { ...CONVERSATION, labels: { [PINNED_LABEL_KEY]: "1700000000123" } },
+    });
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Unpin" }));
+    expect(mocks.togglePinnedAsync).toHaveBeenCalledWith({ id: "conv-1", pinned: false });
+    await waitFor(() =>
+      expect(toast).toHaveBeenCalledWith(
+        "Unpinned session",
+        expect.objectContaining({ description: "Quarterly planning" }),
+      ),
+    );
+
+    const action = vi.mocked(toast).mock.calls.at(-1)?.[1]?.action as unknown as {
+      onClick: () => void;
+    };
+    action.onClick();
+    expect(mocks.togglePinnedAsync).toHaveBeenLastCalledWith({
+      id: "conv-1",
+      pinned: true,
+      pinnedAt: 1700000000123,
+    });
   });
 
   it("downloads the transcript as <session-id>.jsonl from Export", async () => {

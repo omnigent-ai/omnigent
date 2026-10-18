@@ -2,6 +2,7 @@ import { queryOptions, useQuery } from "@tanstack/react-query";
 import { useRef } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
+import { ApiError } from "@/lib/sessionsApi";
 
 /**
  * One worktree of a repository, as returned by
@@ -29,6 +30,54 @@ export interface HostWorktree {
   detached: boolean;
   /** Unix epoch seconds of the worktree HEAD commit. Missing on older hosts. */
   updated_at?: number | null;
+}
+
+/** Windows drive-letter absolute path, e.g. ``C:\repo`` / ``C:/repo``. */
+const WINDOWS_ABS_PATH = /^[A-Za-z]:[/\\]/;
+
+/**
+ * Canonicalize a path for comparison, mirroring the backend boundary check in
+ * `_workspace_validation._is_subpath_of`: when either side is a Windows
+ * absolute path, treat ``\`` as a separator and drive-letter case as
+ * insignificant; on POSIX keep case and treat ``\`` as a legal filename char.
+ * Trailing separators are dropped so they never affect identity.
+ */
+function canonicalizePath(path: string, windows: boolean): string {
+  const canon = windows ? path.replace(/\\/g, "/").toLowerCase() : path;
+  return canon.replace(/\/+$/, "");
+}
+
+type MatchKind = { kind: "exact" | "contains"; length: number } | { kind: "none" };
+
+/** How ``workspace`` relates to a worktree ``root``, platform-aware. */
+function matchKind(root: string, workspace: string): MatchKind {
+  const windows = WINDOWS_ABS_PATH.test(root) || WINDOWS_ABS_PATH.test(workspace);
+  const r = canonicalizePath(root, windows);
+  const w = canonicalizePath(workspace, windows);
+  if (w === r) return { kind: "exact", length: r.length };
+  // Boundary-aware containment: `/a/foo` is not under `/a/fo` (prefix collision).
+  if (w.startsWith(`${r}/`)) return { kind: "contains", length: r.length };
+  return { kind: "none" };
+}
+
+/**
+ * The worktree whose root contains ``workspace`` — exact match, else the
+ * deepest root ``workspace`` sits under (a workspace bound to a subdir of a
+ * worktree). ``null`` when nothing contains it. Path comparison is
+ * platform-aware (see {@link matchKind}).
+ */
+export function matchWorktree(worktrees: HostWorktree[], workspace: string): HostWorktree | null {
+  let best: HostWorktree | null = null;
+  let bestLength = -1;
+  for (const wt of worktrees) {
+    const match = matchKind(wt.path, workspace);
+    if (match.kind === "exact") return wt;
+    if (match.kind === "contains" && match.length > bestLength) {
+      best = wt;
+      bestLength = match.length;
+    }
+  }
+  return best;
 }
 
 interface VerifiedGitWorktreeCache {
@@ -113,10 +162,17 @@ export async function fetchHostWorktrees(
     if (/not a git (?:repo|repository)/i.test(text)) return [];
   }
   if (!res.ok) {
-    throw new Error(`host worktrees fetch failed: HTTP ${res.status}`);
+    throw new ApiError(`host worktrees fetch failed: HTTP ${res.status}`, res.status, null);
   }
   const body = (await res.json()) as HostWorktreesResponse;
   return body.data;
+}
+
+// A 400 is the host's answer for this path (git failed or timed out there), so
+// retrying only multiplies that timeout. Other failures keep the default retries.
+function shouldRetryHostWorktrees(failureCount: number, error: Error): boolean {
+  if (error instanceof ApiError && error.status === 400) return false;
+  return failureCount < 3;
 }
 
 /** Shared query options for single-path and batched recent-workspace reads. */
@@ -125,6 +181,7 @@ export function hostWorktreesQueryOptions(hostId: string, repoPath: string) {
     queryKey: ["host-worktrees", hostId, repoPath] as const,
     queryFn: () => fetchHostWorktrees(hostId, repoPath),
     staleTime: 5_000,
+    retry: shouldRetryHostWorktrees,
   });
 }
 

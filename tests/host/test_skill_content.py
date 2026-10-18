@@ -80,7 +80,8 @@ def test_installed_skill_identity_survives_collisions_and_invocation_filters(
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     claude = tmp_path / ".claude"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude))
-    plain = claude / "skills" / "plain"
+    # The directory, not the frontmatter, is a skill's identity.
+    plain = claude / "skills" / "toolkit:lint"
     plain.mkdir(parents=True)
     (plain / "SKILL.md").write_text("---\nname: toolkit:lint\ndescription: Plain\n---\nplain body")
     installs = {}
@@ -106,7 +107,7 @@ def test_installed_skill_identity_survives_collisions_and_invocation_filters(
         bodies = set()
         for entry in plugin["skill_entries"]:
             ids.add(entry["id"])
-            result = read_skill_content("claude-native", "toolkit:lint", entry["id"])
+            result = read_skill_content("claude-native", f"toolkit:{entry['name']}", entry["id"])
             bodies.add(result["content"])
             assert str(tmp_path) not in json.dumps(result)
         assert bodies == {

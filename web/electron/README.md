@@ -140,7 +140,10 @@ tries silent renewal. Missing credentials, failed renewal, unavailable OAuth,
 and cancellation lead to the shell's connect/retry screen—not embedded workspace
 SSO. Failed connections stay blocked through the selector handoff so a late login
 redirect cannot replace it. Connect reuses stored credentials and opens the
-system browser only when they can't sign in. To use another account, choose
+system browser only when they can't sign in. Credentials are stored per
+workspace, so an account URL that names its workspace (`?o=<workspace id>`)
+reuses the credentials of the workspace it reached last time; without `?o=` it
+runs the account sign-in and workspace picker. To use another account, choose
 **Server → Sign Out of Server** (or **Sign out of <workspace>** in the server
 picker at the bottom of the sidebar, on servers whose web app includes it): it
 forgets the stored OAuth token, clears DBAUTH, and returns every window on that
@@ -151,7 +154,10 @@ links use stored credentials without opening a browser automatically.
 When the workspace is briefly unreachable (a VPN reconnecting after wake, an IP
 access list refusing this network, or HTTP 5xx/429), the window keeps its page
 under a **Reconnecting to Databricks…** overlay and retries every 5s for a minute,
-then every 10s for another. Cancel, or running out of retries, returns to the
+then every 10s for another. After that, an unreachable or IP-blocked workspace
+keeps retrying every minute until it answers; HTTP 5xx/429 stops there. Attempts
+wait while the Mac is offline without counting, and waking or unlocking the Mac
+starts the 5s retries over. Cancel, or running out of retries, returns to the
 setup page with the reason.
 
 For the packaged macOS app, explicitly roll back to embedded Databricks sign-in:
@@ -225,9 +231,20 @@ node --test --test-name-pattern='interactive OAuth cancellation' web/electron/te
 
 ### Databricks authentication diagnostics
 
-Run `just electron-dev` from a terminal and retain the `[omnigent] databricks`
-lines. For a packaged build, launch the app's executable from a terminal to see
-its stdout/stderr. No extra logging flag is required.
+For a customer report, reproduce the problem and choose **Server → Export
+Diagnostics…**. This works in packaged builds without Developer Mode or a
+terminal. It saves a bounded JSON Lines file (current log plus two rotated
+files, up to 3 MiB) from Electron's per-user logs directory, including desktop
+connection and authentication milestones. On macOS the directory is under
+`~/Library/Logs/Omnigent/` (or `Omnigent Dev` for development). This is an
+application log, **not** the macOS Unified Log or a collection of system-wide
+logs. The export excludes renderer console, CLI/server output, cookies and token
+stores; it does not include server-side diagnostics. The native Server menu is
+available even if the app is stuck on the connect screen.
+
+For development, `just electron-dev` still prints `[omnigent] databricks`
+lines in the terminal. Launching a packaged executable from a terminal also
+shows its stdout/stderr. No extra logging flag is required.
 
 The logs identify the selected mode, public OAuth client ID, requested scopes,
 whether a client secret is configured (not its value), token-exchange status,
@@ -237,7 +254,13 @@ Tokens, cookie values, client secrets, authorization codes, PKCE verifiers, full
 callback URLs, and raw response bodies are not logged. Token and account-API
 requests never follow redirects, so a 3xx from those endpoints is reported as a
 failure rather than carrying the grant or bearer to another destination. Workspace and client IDs
-are still deployment metadata; redact those before sharing logs publicly.
+are still deployment metadata; review and redact those before sharing logs
+publicly. The exported file records only approved fields (origin, phase,
+outcome, selected error codes, HTTP status and request ID), rather than copying
+all terminal output. OIDC diagnostics distinguish existing sessions, silent
+refresh, browser sign-in, token exchange and rejection/recovery. If an auth
+failure needs server-side context, correlate its request ID with the server's
+logs separately.
 
 - `bridge response` with `phase: 'session-create'` means the status came from
   `/auth/session/create` itself, before following a redirect.
@@ -313,8 +336,8 @@ sign-in has a passkey step), then `just electron-dev`:
    (the cookie is renewed silently).
 5. **Invalidate Cached Refresh Token**, then **Simulate Session Expiry**, then
    reload: the connect screen says "Sign in to <host> to continue."
-6. Sign out from the app's settings: the connect screen says "You're signed out
-   of <host>." Relaunching doesn't sign you back in.
+6. Sign out from the app's settings: the connect screen opens without a message.
+   Relaunching doesn't sign you back in.
 7. An accounts-mode server and `http://localhost:6767` (header mode) still sign
    in exactly as before.
 
@@ -469,6 +492,78 @@ sequenceDiagram
     S-->>A: result JSON (or clean timeout)
 ```
 
+### Manual previews with Companion
+
+To preview an app running on a remote development host (such as Arca), use
+Companion or another external forwarding tool to make its port available on
+your desktop machine. Companion is an external prerequisite for the Arca-to-Mac
+workflow; Omnigent does not establish or verify forwarding or resolve local
+port collisions.
+
+1. Ask the agent to start the app on the remote host and report its URL.
+2. Use Companion to forward the app's port to your Mac. Check the actual
+   forwarded address: the local port may differ from the remote port.
+3. In the Omnigent desktop app, open the session's Workspace **+** menu and
+   choose **Browser**. Type the forwarded URL, for example
+   `http://localhost:5273/`, in the address bar and press Enter. Here
+   `localhost` is the desktop machine, not the agent's remote host.
+4. Hide and reopen the Workspace, or switch tabs or sessions and return.
+   The existing page is retained without navigating or reloading it. Closing
+   the Browser tab destroys that view; opening a new tab does not restore it.
+
+If the page is unreachable, check that the app is still running and that the
+forwarded URL reaches the intended app in your Mac's regular browser. Check
+Companion's forwarding and local port selection separately. Normal TLS, CORS,
+authentication, and local-network permission rules still apply. This pane is
+desktop-only; it is not available in the plain web UI.
+
+For local or unrecognized hosts, `browser_navigate` keeps its restrictions on
+localhost and private addresses, even after you open a page manually.
+A manually opened page in the session's
+agent browser view remains available to existing agent inspection and
+interaction, including navigation caused by interacting with the page. Manual
+opening is therefore not a read-only boundary for that view. The user-created
+Browser tab opened through **+** > **Browser** is separate from the agent relay
+and is not targeted by the session's agent browser actions.
+
+### Agent previews on Arca
+
+On a Databricks-managed server with internal desktop features enabled, an
+Arca session's agent can open and inspect an app through Companion forwarding
+using the existing browser tools and tool approval or autoapproval policy.
+Provide the actual forwarded URL to the agent; its local port may differ from
+the app's remote port. Omnigent does not establish or verify forwarding or
+prove that the local endpoint belongs to the Arca host.
+
+The desktop captures the remote daemon's exact host ID during its existing
+Arca connect flow, including when the daemon is already running. Only a
+source session on that host, or a subagent inheriting that host, is eligible.
+An older CLI or an unrecognized, failed, or missing identity leaves localhost
+navigation denied; the remembered host-picker label alone does not grant it.
+Eligibility is scoped to the selected server/workspace, not all sessions on
+a Databricks server.
+
+After restarting the desktop, launch-time auto-connect restores this identity
+for users who opted into it. Otherwise, the first loopback preview request with
+a remembered Arca host offers the shell-owned reconnect console and returns the
+denial immediately; nothing runs until the user confirms, and the agent retries
+after recovery finishes. Concurrent retries share the same prompt or run.
+Opted-in recovery stays silent only when the remembered and source hosts match;
+a mismatch requires consent and is offered only when the host list identifies
+the source as Arca, so an incorrect remembered host can be recaptured and
+corrected without prompting from sandbox sessions. Both paths verify that the
+captured host ID matches the source session. Consent or auto-connect opt-in, the
+captured identity check, and the agent-context gate remain the trust boundaries. A decline briefly
+suppresses repeat prompts, while failed runs remain retryable. **Run on Arca** is
+hidden for an online remembered host only when the desktop advertises preview
+recovery; older shells keep the action visible.
+
+The exception covers HTTP(S) `localhost`, `127.0.0.1`, and `[::1]`, including
+redirects and links that would open a new window (which stay in the same pane).
+Other loopback addresses, private-network and metadata destinations, and
+non-web schemes remain restricted. Existing tool approvals are unchanged;
+whether a tool call asks for approval depends on the harness and its policy.
+
 ### Local network permission
 
 Sites in the embedded pane can ask for **local network access**, including
@@ -533,7 +628,7 @@ against its local Chromium, and the result is posted back.
 - `src/browserIpc.js` — the whole `ipcMain.handle('omnigent:browser-*')` surface,
   extracted out of `main.js` so that file stays bounded:
   `open-or-navigate`, `set-active`, `resize`, `screenshot`
-  (`capturePage().toPNG()` → base64), `execute`, `has-view`, `close`, plus the
+  (`capturePage().toPNG()` → base64), `perform-action`, `has-view`, `close`, plus the
   toolbar handlers `go-back`, `go-forward`, `reload`, and `open-devtools`
   (toggle, docked bottom), plus the design-mode handlers
   `enable-design-mode` / `disable-design-mode` / `signal-design-result`
@@ -574,7 +669,7 @@ bounds sync. Without this signal the pane would gate itself off forever and the
 embedded browser would stay invisible. (`browserViewRegistry.test.js` locks the
 create-signal → setActive → attached transition.)
 
-**Toolbar.** When a view is attached, `BrowserPane` renders a user-facing
+**Toolbar.** Even before a page is opened, `BrowserPane` renders a user-facing
 toolbar above the page: back / forward / reload, a DevTools toggle, and an
 editable URL bar (Enter navigates; the typed value is normalized to add a
 scheme — a dotless host like `localhost` gets `http://`, everything else
@@ -607,16 +702,34 @@ console listener is stored on the registry entry
 `close()` detaches it on teardown. Electron-only (needs `executeJavaScript` +
 the native view); no server flag.
 
-**JS trust boundary (important):** `omnigent:browser-execute` runs
-arbitrary JS in the child view via `executeJavaScript(js, true)`. It is exposed
-to the SPA **only for the relay's own fixed templates** (the DOM-snapshot walk,
-and the click / type element resolvers) — there is deliberately **no
-agent-facing generic `evaluate`**. This keeps the _agent_ boundary: the agent
-picks elements by `ref`/`selector` and supplies text, but never ships a raw JS
-string that main will run. (It does not, and is not intended to, defend against
-XSS _within_ the visited page — that page runs its own scripts in its own
-sandboxed view regardless.) Preserve this when extending the bridge: add typed,
-argument-shaped actions, not a passthrough JS channel.
+All renderer IPC navigation uses the same URL policy, including the URL bar.
+A renderer's `agent: false` flag does not exempt a tab from address checks.
+Main-owned Arca preview eligibility still applies. Other internal sites must be
+opened in a separate browser; this also keeps later redirects in these tabs
+under the same policy.
+
+**JS trust boundary:** `omnigent:browser-perform-action` accepts only snapshot,
+click and type requests. Main validates their arguments and builds fixed scripts,
+without granting a synthetic user gesture. Clipboard, popup and other
+gesture-gated page APIs still require native user interaction.
+
+**Desktop/UI transition (through v0.20).** Desktop and the served UI can upgrade
+in either order. An updated UI prefers `browserPerformAction`; on a pre-typed
+v0.18 desktop it sends only the fixed v0.18 action templates through the existing
+`browserExecute` bridge. Older desktops retain their existing execution behavior
+until upgraded. An updated desktop also accepts a v0.18 UI: its legacy adapter
+recognizes the complete snapshot/click/type templates, extracts only JSON data,
+validates the same argument limits, and reconstructs the action in main. It never
+evaluates the submitted script. Other scripts are rejected with an update message.
+
+Both adapters are deprecated for removal in v0.21. Update desktop and server UI
+before that release. The supported combinations during this transition are:
+
+| Desktop | Served UI | Action transport                                         |
+| ------- | --------- | -------------------------------------------------------- |
+| Updated | Updated   | Typed actions                                            |
+| Updated | v0.18     | Validated legacy templates → typed actions in main       |
+| v0.18   | Updated   | Fixed v0.18 templates through the older desktop's bridge |
 
 **Availability.** The pane is always on in this build — this shell machinery
 activates the moment a `browser.action_request` arrives (the agent-side
@@ -680,7 +793,16 @@ Local packages use the `ai.omnigent.desktop-dev` app ID and the **Omnigent Dev**
 name; output lands in `electron/dist-dev/` (the DMG is named
 `Omnigent Dev-<version>-<arch>.dmg`). They keep their own app data and do not
 install production desktop updates. `build:mac:release` retains
-`ai.omnigent.desktop`, **Omnigent**, and `electron/dist/`.
+`ai.omnigent.desktop`, **Omnigent**, and `electron/dist/`. For the full
+cross-platform publishing and update-feed checklist, see [the desktop release
+runbook](RELEASING.md).
+
+macOS apps, including unpackaged development, default to V2 onboarding only when the MDM preference
+`databricksInternalFeaturesEnabled` is `true`, for both new and existing profiles.
+Public macOS users and Windows/Linux keep the legacy
+default. The setup-page switch still persists an explicit choice on every
+platform, and `OMNIGENT_SERVER_SELECTOR_V2=1` forces V2 regardless of the saved
+choice. A saved server still reconnects on launch.
 
 Unpackaged `pnpm start` / `just electron-dev` runs inside Electron's own macOS
 bundle, but reads local preferences from `ai.omnigent.desktop-dev` explicitly

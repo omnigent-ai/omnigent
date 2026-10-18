@@ -12,6 +12,30 @@ const assert = require("node:assert/strict");
 const { isAgentNavigationAllowed } = require("../src/browserUrlPolicy");
 
 describe("browserUrlPolicy — agent navigation allowlist", () => {
+  it("allows only canonical loopback destinations with Arca eligibility", () => {
+    for (const host of ["localhost", "127.0.0.1", "[::1]"]) {
+      assert.equal(
+        isAgentNavigationAllowed(`http://${host}:5173/`, { allowLocalhost: true }).ok,
+        true,
+      );
+      assert.equal(isAgentNavigationAllowed(`https://${host}/`, { allowLocalhost: true }).ok, true);
+      assert.equal(isAgentNavigationAllowed(`http://${host}/`).ok, false);
+    }
+    for (const url of [
+      "http://app.localhost",
+      "http://127.2.3.4",
+      "http://0.0.0.0",
+      "http://[::]",
+      "http://169.254.169.254",
+      "http://10.0.0.1",
+      "http://172.16.0.1",
+      "http://192.168.1.1",
+      "file:///tmp/a",
+      "data:text/html,test",
+    ]) {
+      assert.equal(isAgentNavigationAllowed(url, { allowLocalhost: true }).ok, false, url);
+    }
+  });
   it("allows ordinary public http(s) URLs", () => {
     for (const url of [
       "https://example.com/",

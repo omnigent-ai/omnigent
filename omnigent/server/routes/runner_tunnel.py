@@ -22,7 +22,7 @@ import time
 import weakref
 from collections.abc import Awaitable, Callable, Mapping
 from ipaddress import ip_address
-from typing import TypedDict, cast
+from typing import cast
 
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
@@ -30,6 +30,10 @@ from starlette.websockets import WebSocketState
 from omnigent.debug_logging import debug_event
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+from omnigent.runner.transports.ws_tunnel.diagnostics import (
+    TunnelDiagnosticAttrs,
+    silence_source,
+)
 from omnigent.runner.transports.ws_tunnel.frames import (
     EVENT_INGEST_CAPABILITY,
     EventAckFrame,
@@ -48,6 +52,7 @@ from omnigent.server import managed_host_keepalive, session_live_state, shutdown
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.tunnel_handshake import receive_tunnel_hello
 
 _logger = logging.getLogger(__name__)
 
@@ -56,6 +61,8 @@ PING_INTERVAL_S = 30.0
 PING_MISS_THRESHOLD = 3
 RUNNER_ID_MISMATCH_CLOSE_CODE = 4004
 _RUNNER_RECOVERY_SLOW_SEC = 30.0
+# WebSocket close codes a runner sends on purpose: 1000 normal, 1001 going away.
+_CLEAN_CLOSE_CODES = frozenset({1000, 1001})
 
 # Lifetime of a managed runner's minted owner bearer (POST
 # /v1/runners/{id}/token). Short by design: the runner re-mints on demand
@@ -64,7 +71,7 @@ _RUNNER_RECOVERY_SLOW_SEC = 30.0
 _MANAGED_RUNNER_TOKEN_TTL_S = 1800
 
 
-class _TunnelConnectionAttrs(TypedDict):
+class _TunnelConnectionAttrs(TunnelDiagnosticAttrs):
     """Debug-log attributes joining a tunnel row to one runner connection.
 
     :param runner_id: Runner the tunnel belongs to.
@@ -480,7 +487,7 @@ def create_runner_tunnel_router(
 
         def _connection_attrs() -> _TunnelConnectionAttrs:
             now = time.time()
-            return {
+            attrs: _TunnelConnectionAttrs = {
                 "runner_id": runner_id,
                 "ended_by": ended_by,
                 "connection_id": session.hello.connection_id if session is not None else None,
@@ -488,13 +495,27 @@ def create_runner_tunnel_router(
                     round(now - session.connected_at, 3) if session is not None else None
                 ),
                 "last_frame_age_s": (
-                    round(now - session.last_frame_at, 3) if session is not None else None
+                    round(time.monotonic() - session.last_frame_monotonic, 3)
+                    if session is not None
+                    else None
                 ),
             }
+            if session is not None:
+                return {**attrs, **session.diagnostics.snapshot()}
+            return attrs
+
+        def _report_diagnostics() -> None:
+            _logger.warning(
+                "Runner %s tunnel scheduling or send delay",
+                runner_id,
+                extra=debug_event("runner_tunnel_health", **_connection_attrs()),
+            )
 
         try:
             # 3. Receive hello frame.
-            raw = await ws.receive_text()
+            raw = await receive_tunnel_hello(ws, peer_kind="runner", peer_id=runner_id)
+            if raw is None:
+                return
             frame = decode_frame(raw)
             if not isinstance(frame, HelloFrame):
                 await ws.close(code=4001, reason="expected hello frame")
@@ -518,6 +539,13 @@ def create_runner_tunnel_router(
             #    rejected) before ``accept()`` above, so runner-binding
             #    checks can enforce ownership.
             session = registry.register(runner_id, ws, frame, owner=tunnel_owner)
+            session.diagnostics.settings.update(
+                tunnel_side="server",
+                app_ping_interval_s=PING_INTERVAL_S,
+                app_silence_timeout_s=PING_INTERVAL_S * PING_MISS_THRESHOLD,
+                protocol_keepalive_source="unavailable_from_asgi",
+            )
+            session.diagnostics.frame_received()
             _logger.info(
                 "Runner %s connected (version=%s, harnesses=%s)",
                 runner_id,
@@ -529,113 +557,123 @@ def create_runner_tunnel_router(
                     runner_id=runner_id,
                     version=frame.runner_version,
                     connection_id=frame.connection_id,
+                    **session.diagnostics.snapshot(),
                 ),
             )
 
-            # 6. Start tunnel helper tasks. The sender task is the
-            # only code path that writes to the Starlette WebSocket;
-            # request-side callers enqueue frames through the registry.
-            # These start BEFORE ``on_runner_connect`` fires so the
-            # hook can perform real tunnel I/O — without the sender
-            # loop running, any ``WSTunnelTransport``-backed request
-            # the hook makes would deadlock on its response future.
-            sender_task = asyncio.create_task(
-                _sender_loop(ws, session),
-                name=f"tunnel-sender:{runner_id}",
-            )
-            ping_task = asyncio.create_task(
-                _ping_loop(ws, session, runner_id, registry),
-                name=f"tunnel-ping:{runner_id}",
-            )
-            keepalive_task = asyncio.create_task(
-                _keepalive_loop(runner_id),
-                name=f"tunnel-keepalive:{runner_id}",
-            )
-            receive_task = asyncio.create_task(
-                _receive_loop(ws, session, runner_id, registry),
-                name=f"tunnel-receive:{runner_id}",
-            )
-
-            owned.extend((sender_task, ping_task, keepalive_task, receive_task))
-
-            if EVENT_INGEST_CAPABILITY in frame.capabilities and callable(
-                getattr(ws.app.state, "runner_event_ingest", None)
+            async with session.diagnostics.monitoring(
+                _report_diagnostics, connection_id=frame.connection_id
             ):
-                await registry.send_text(session, encode_frame(EventReadyFrame()))
-
-            if on_runner_connect is not None:
-                owned.append(
-                    asyncio.create_task(
-                        _run_connect_hook(on_runner_connect, session),
-                        name=f"tunnel-recovery:{runner_id}",
-                    )
+                # 6. Start tunnel helper tasks. The sender task is the
+                # only code path that writes to the Starlette WebSocket;
+                # request-side callers enqueue frames through the registry.
+                # These start BEFORE ``on_runner_connect`` fires so the
+                # hook can perform real tunnel I/O — without the sender
+                # loop running, any ``WSTunnelTransport``-backed request
+                # the hook makes would deadlock on its response future.
+                sender_task = asyncio.create_task(
+                    _sender_loop(ws, session),
+                    name=f"tunnel-sender:{runner_id}",
+                )
+                ping_task = asyncio.create_task(
+                    _ping_loop(ws, session, runner_id, registry),
+                    name=f"tunnel-ping:{runner_id}",
+                )
+                keepalive_task = asyncio.create_task(
+                    _keepalive_loop(runner_id),
+                    name=f"tunnel-keepalive:{runner_id}",
+                )
+                receive_task = asyncio.create_task(
+                    _receive_loop(ws, session, runner_id, registry),
+                    name=f"tunnel-receive:{runner_id}",
                 )
 
-            done, _pending = await asyncio.wait(
-                {sender_task, ping_task, receive_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            # Every helper that had finished, by role: a server-declared
-            # ping timeout may or may not already carry the peer's close.
-            ended_by = ",".join(sorted(t.get_name().split(":", 1)[0] for t in done))
-            for task in done:
-                task_name = task.get_name()
-                if task.cancelled():
-                    _logger.warning(
-                        "Tunnel helper task cancelled for runner %s: %s",
-                        runner_id,
-                        task_name,
+                owned.extend((sender_task, ping_task, keepalive_task, receive_task))
+
+                if EVENT_INGEST_CAPABILITY in frame.capabilities and callable(
+                    getattr(ws.app.state, "runner_event_ingest", None)
+                ):
+                    await registry.send_text(session, encode_frame(EventReadyFrame()))
+
+                if on_runner_connect is not None:
+                    owned.append(
+                        asyncio.create_task(
+                            _run_connect_hook(on_runner_connect, session),
+                            name=f"tunnel-recovery:{runner_id}",
+                        )
                     )
-                    continue
-                task_error = task.exception()
-                if task_error is None:
-                    _logger.warning(
-                        "Tunnel helper task ended for runner %s: %s",
-                        runner_id,
-                        task_name,
-                    )
-                    continue
-                if isinstance(task_error, WebSocketDisconnect):
-                    shutdown_state.note_tunnel_close_code(getattr(task_error, "code", None))
-                    _logger.warning(
-                        "Tunnel helper task disconnected for runner %s: %s (code=%s, reason=%r)",
-                        runner_id,
-                        task_name,
-                        getattr(task_error, "code", None),
-                        getattr(task_error, "reason", None),
-                    )
-                else:
-                    _logger.warning(
-                        "Tunnel helper task failed for runner %s: %s",
-                        runner_id,
-                        task_name,
-                        exc_info=(
-                            type(task_error),
-                            task_error,
-                            task_error.__traceback__,
-                        ),
-                    )
-                raise task_error
-            # Server-initiated closes may end a helper without a peer reply.
-            # Emit the same event shape as the WebSocketDisconnect path.
-            _logger.info(
-                "Runner %s tunnel closed (%s ended; code=%s, reason=%r)",
-                runner_id,
-                ended_by,
-                session.close_code,
-                session.close_reason,
-                extra=debug_event(
-                    "runner_tunnel",
-                    phase="disconnected",
-                    code=session.close_code,
-                    reason=session.close_reason,
-                    **_connection_attrs(),
-                ),
-            )
+
+                done, _pending = await asyncio.wait(
+                    {sender_task, ping_task, receive_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                # Every helper that had finished, by role: a server-declared
+                # ping timeout may or may not already carry the peer's close.
+                ended_by = ",".join(sorted(t.get_name().split(":", 1)[0] for t in done))
+                for task in done:
+                    task_name = task.get_name()
+                    if task.cancelled():
+                        _logger.warning(
+                            "Tunnel helper task cancelled for runner %s: %s",
+                            runner_id,
+                            task_name,
+                        )
+                        continue
+                    task_error = task.exception()
+                    if task_error is None:
+                        _logger.warning(
+                            "Tunnel helper task ended for runner %s: %s",
+                            runner_id,
+                            task_name,
+                        )
+                        continue
+                    if isinstance(task_error, WebSocketDisconnect):
+                        shutdown_state.note_tunnel_close_code(getattr(task_error, "code", None))
+                        _logger.warning(
+                            "Tunnel helper task disconnected for runner %s: %s "
+                            "(code=%s, reason=%r)",
+                            runner_id,
+                            task_name,
+                            getattr(task_error, "code", None),
+                            getattr(task_error, "reason", None),
+                        )
+                    else:
+                        _logger.warning(
+                            "Tunnel helper task failed for runner %s: %s",
+                            runner_id,
+                            task_name,
+                            exc_info=(
+                                type(task_error),
+                                task_error,
+                                task_error.__traceback__,
+                            ),
+                        )
+                    raise task_error
+                # Server-initiated closes may end a helper without a peer reply.
+                # Emit the same event shape as the WebSocketDisconnect path.
+                _logger.info(
+                    "Runner %s tunnel closed (%s ended; code=%s, reason=%r)",
+                    runner_id,
+                    ended_by,
+                    session.close_code,
+                    session.close_reason,
+                    extra=debug_event(
+                        "runner_tunnel",
+                        phase="disconnected",
+                        code=session.close_code,
+                        reason=session.close_reason,
+                        **_connection_attrs(),
+                    ),
+                )
 
         except WebSocketDisconnect as exc:
             shutdown_state.note_tunnel_close_code(getattr(exc, "code", None))
-            _logger.warning(
+            if session is not None:
+                session.peer_close_reason = getattr(exc, "reason", None) or None
+            close_code = getattr(exc, "code", None)
+            # A normal or going-away close (idle shutdown, host restart) is expected.
+            _logger.log(
+                logging.INFO if close_code in _CLEAN_CLOSE_CODES else logging.WARNING,
                 "Runner %s websocket disconnected (code=%s, reason=%r)",
                 runner_id,
                 getattr(exc, "code", None),
@@ -659,7 +697,7 @@ def create_runner_tunnel_router(
                 task.cancel()
             await asyncio.gather(*owned, return_exceptions=True)
             if session is not None:
-                registry.deregister(runner_id, session)
+                registry.deregister(runner_id, session, retire=False)
                 if on_runner_disconnect is not None:
                     try:
                         await on_runner_disconnect(runner_id, session)
@@ -719,11 +757,12 @@ async def _sender_loop(ws: WebSocket, session: RunnerSession) -> None:
         raced it.
     """
     while True:
-        data = await session.outbound_queue.get()
-        if data is None:
+        frame = await session.outbound_queue.get()
+        if frame is None:
             return
+        session.diagnostics.dequeued(frame)
         try:
-            await ws.send_text(data)
+            await session.diagnostics.send(ws.send_text, frame.data, app_ping_ts=frame.app_ping_ts)
         except RuntimeError:
             if ws.application_state is WebSocketState.DISCONNECTED:
                 # The ping loop or registry retirement closed the socket
@@ -846,6 +885,7 @@ async def _receive_loop(
             raw = await _receive_tunnel_text(ws, runner_id)
             if not registry.mark_frame_seen(session):
                 return
+            session.diagnostics.frame_received()
             if raw is None:
                 continue
             try:
@@ -875,6 +915,7 @@ async def _receive_loop(
                 task.add_done_callback(finished)
                 continue
             if isinstance(resp_frame, PongFrame):
+                session.diagnostics.app_pong_received(resp_frame.ts)
                 # Any frame (including pong) renews the tunnel's liveness.
                 _logger.debug(
                     "runner %s tunnel keepalive: pong rtt=%dms",
@@ -955,9 +996,15 @@ async def _ping_loop(
         if elapsed is None:
             return
         if elapsed > PING_INTERVAL_S * PING_MISS_THRESHOLD:
-            # Runner tunnel went silent past the liveness window: the runner or
-            # its network died, blocking sessions on it until it reconnects.
-            _logger.warning(
+            # Runner tunnel went silent past the liveness window. A sleeping or
+            # offline machine is the usual peer cause and reconnects on its own;
+            # whether a turn was lost is logged per session by the disconnect
+            # decision. A stall of this server's own loop is a server fault.
+            diagnostics = session.diagnostics.snapshot()
+            source = silence_source(elapsed, diagnostics)
+            local_stall = source == "local_event_loop"
+            _logger.log(
+                logging.WARNING if local_stall else logging.INFO,
                 "Runner %s missed %d ping intervals (%.0fs since last frame); declaring dead",
                 runner_id,
                 PING_MISS_THRESHOLD,
@@ -968,9 +1015,13 @@ async def _ping_loop(
                     connection_id=session.hello.connection_id,
                     connection_age_s=round(time.time() - session.connected_at, 3),
                     silent_s=round(elapsed, 3),
-                    error_category=ErrorCategory.RUNNER.value,
-                    error_impact=ErrorImpact.BLOCKING.value,
+                    silence_source=source,
+                    error_category=(
+                        ErrorCategory.SERVER.value if local_stall else ErrorCategory.RUNNER.value
+                    ),
+                    error_impact=ErrorImpact.TRANSIENT.value,
                     error_phase=ErrorPhase.UNKNOWN.value,
+                    **diagnostics,
                 ),
             )
             registry.record_close(session, code=4003, reason="ping timeout")
@@ -985,9 +1036,11 @@ async def _ping_loop(
         # inherits this handler's workspace scope via copy_context.
         session_live_state.touch_runner_liveness([runner_id])
         try:
+            ping_ts = int(time.time() * 1000)
             await registry.send_text(
                 session,
-                encode_frame(PingFrame(ts=int(time.time() * 1000))),
+                encode_frame(PingFrame(ts=ping_ts)),
+                app_ping_ts=ping_ts,
             )
         except Exception:  # noqa: BLE001 -- any send failure ends the ping loop cleanly.
             return

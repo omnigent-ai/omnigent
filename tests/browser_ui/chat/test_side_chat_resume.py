@@ -1,4 +1,4 @@
-"""Browser-contract proof for a sealed side-chat Resume flow."""
+"""Browser-contract proof for side-chat sending and Resume flows."""
 
 from __future__ import annotations
 
@@ -10,6 +10,41 @@ from typing import Any
 from playwright.sync_api import Page, Route, expect
 
 from tests.browser_ui.chat.session_contract import ChatSessionContract, list_payload
+
+
+def test_runnerless_side_chat_sends_from_its_direct_url(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """Chat-only side-chat ancestry does not require a coding workspace."""
+    chat = chat_session_contract
+    source_id = "browser-side-parent"
+    chat.update_session(
+        host_id=None,
+        runner_id=None,
+        workspace=None,
+        runner_online=True,
+        host_online=False,
+        labels={"omnigent.side_chat": "1", "omnigent.side_chat.source_id": source_id},
+    )
+    chat.set_health(runner_online=True, host_online=False)
+    source = {**chat._session(), "id": source_id, "labels": {}}
+    chat.contract.json(f"/v1/sessions/{source_id}", source)
+
+    page.goto(chat.url)
+    composer = page.get_by_label("Message the agent")
+    expect(composer).to_be_visible()
+    prompt = "Continue this side chat without a workspace."
+    composer.fill(prompt)
+    page.get_by_role("button", name="Send", exact=True).click()
+
+    expect(composer).to_have_value("")
+    expect(page.get_by_role("dialog")).to_have_count(0)
+    assert len(chat.event_posts) == 1
+    event = chat.event_posts[0]["body"]
+    assert event["type"] == "message"
+    assert event["data"]["content"] == [{"type": "input_text", "text": prompt}]
+    assert chat.session_patches == []
 
 
 def test_side_chat_resume_conflict_refetches_metadata_and_seals_pane(

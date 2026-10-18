@@ -40,6 +40,7 @@ from omnigent.entities.session_resources import (
     terminal_resource_id,
     terminal_resource_view,
 )
+from omnigent.inner.async_utils import run_sync_cleanup
 from omnigent.inner.sandbox import contained_realpath, containment_prefix
 from omnigent.inner.terminal_lifecycle import lifecycle_log_attributes
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
@@ -475,7 +476,7 @@ class SessionResourceRegistry:
         self._codex_skills_dirs: dict[str, tempfile.TemporaryDirectory[str]] = {}
         self._terminal_roles: dict[tuple[str, str], str] = {}
         self._terminal_lifecycles: dict[tuple[str, str], TerminalLifecycle] = {}
-        self._is_alive_cache: TTLCache[str, bool] = TTLCache(
+        self._is_alive_cache: TTLCache[str, TerminalInstance] = TTLCache(
             maxsize=_IS_ALIVE_CACHE_MAX,
             ttl=_IS_ALIVE_CACHE_TTL_S,
         )
@@ -507,10 +508,8 @@ class SessionResourceRegistry:
         # which the turn-start hook also writes — deduping against that one
         # would swallow the turn's real ``running``.
         self._published_session_status: dict[str, tuple[str, str | None]] = {}
-        # Live claude-native status-file pollers, per session. Held so a
-        # reconnect can re-arm them (see :meth:`resync_session_statuses`) — the
-        # poller keeps its own edge/mtime baselines on the watcher thread, and
-        # clearing the registry's baseline alone would leave those intact.
+        # Per-session pollers need re-arming after reconnects or forwarded
+        # idle statuses because they keep their own edge/mtime baselines.
         self._status_pollers: dict[str, SessionStatusPoller] = {}
         # Optional callback invoked on the event loop when a watched terminal
         # disappears unexpectedly. The callback receives the terminal's
@@ -634,9 +633,14 @@ class SessionResourceRegistry:
             return True
 
     def _sync_status_edge(self, session_id: str, status: str) -> None:
-        """Adopt an externally-published *status* as the dedup baseline."""
+        """Adopt an external status and re-arm its file poller after idle."""
         with self._lock:
             self._published_session_status[session_id] = (status, None)
+            poller = self._status_pollers.get(session_id)
+        # A queued turn can hide the idle file edge. Re-arm only for idle so a
+        # stale busy file cannot clear a forwarded failure.
+        if status == "idle" and poller is not None:
+            poller.resync()
 
     def resync_session_statuses(self) -> None:
         """Re-arm every status source so it republishes what it already sent.
@@ -707,11 +711,10 @@ class SessionResourceRegistry:
         clean shutdown, while ``running`` / ``waiting`` still classify a later
         exit as mid-turn.
 
-        Also adopts *status* as the watcher's dedup baseline. The forwarder
-        publishes these edges directly to the server, so without this the
-        watcher would still believe its own last edge is live and swallow the
-        next turn's ``running`` as a duplicate — leaving the session stuck on
-        the hook's ``idle`` with no working indicator for the whole turn.
+        Also adopts *status* as the watcher's dedup baseline and re-arms its
+        status-file poller after ``idle``. The forwarder publishes directly
+        to the server, so both caches must catch up or they can swallow the
+        next turn's ``running`` as a duplicate, leaving it on the hook's ``idle``.
 
         :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
         :param status: External native status, e.g. ``"running"`` or ``"idle"``.
@@ -865,7 +868,8 @@ class SessionResourceRegistry:
 
         The ``is_alive()`` subprocess probe is cached for a short TTL
         so rapid polling from web clients does not fork a ``tmux
-        has-session`` process on every request.
+        has-session`` process on every request. The result belongs to the
+        probed instance; a replacement at the same resource id needs its own probe.
 
         :param session_id: Session/conversation identifier.
         :param terminal_id: Opaque terminal resource id,
@@ -886,12 +890,12 @@ class SessionResourceRegistry:
 
             cache_key = f"{session_id}:{terminal_id}"
             cached = self._is_alive_cache.get(cache_key)
-            if cached is not None:
-                return terminal_resource_view(session_id, entry) if cached else None
+            if cached is entry.instance:
+                return terminal_resource_view(session_id, entry)
 
             alive = await entry.instance.is_alive()
             if alive:
-                self._is_alive_cache[cache_key] = True
+                self._is_alive_cache[cache_key] = entry.instance
             else:
                 self._is_alive_cache.pop(cache_key, None)
                 return None
@@ -2078,7 +2082,11 @@ class SessionResourceRegistry:
 
         if primary is not None:
             try:
-                primary.close()
+                await run_sync_cleanup(
+                    primary.close,
+                    component="runner_primary_os_env",
+                    session_id=session_id,
+                )
             except Exception:
                 _logger.exception(
                     "Error closing primary env for session=%s",

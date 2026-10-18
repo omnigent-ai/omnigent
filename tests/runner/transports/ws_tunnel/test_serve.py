@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 import ssl
+import threading
 import time
 from dataclasses import dataclass
 from types import SimpleNamespace, TracebackType
@@ -29,7 +30,9 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
 from omnigent.runner.transports.ws_tunnel import serve as serve_module
+from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
+    RUNNER_IDLE_SHUTDOWN_CLOSE_REASON,
     PingFrame,
     RequestCancelFrame,
     RequestFrame,
@@ -348,13 +351,15 @@ async def test_serve_tunnel_fails_loud_on_protocol_rejection(
 
     monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
 
-    with pytest.raises(RuntimeError, match="runner tunnel rejected"):
+    with pytest.raises(RuntimeError, match="runner tunnel rejected") as exc_info:
         await serve_tunnel(
             _noop_app,
             server_url="http://127.0.0.1:8000",
             runner_id="runner_bad_protocol",
             runner_version="0.1.0",
         )
+    # A protocol mismatch is not a credential problem.
+    assert not isinstance(exc_info.value, serve_module.RunnerTunnelAuthRejectedError)
 
 
 @pytest.mark.asyncio
@@ -407,7 +412,7 @@ async def test_serve_tunnel_fails_loud_on_http_auth_rejection(
     monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
     monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
 
-    with pytest.raises(RuntimeError, match="HTTP 401"):
+    with pytest.raises(serve_module.RunnerTunnelAuthRejectedError, match="HTTP 401"):
         await serve_tunnel(
             _noop_app,
             server_url="https://example.databricksapps.com",
@@ -417,6 +422,375 @@ async def test_serve_tunnel_fails_loud_on_http_auth_rejection(
         )
 
     assert attempt == _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_no_credential_error_after_streak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated 401s on bearer-less upgrades end in the no-credential error.
+
+    The streak is kept so a transient mint failure still gets re-minted on retry.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent.runner.transports.ws_tunnel.serve import (
+        _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS,
+    )
+
+    monkeypatch.delenv("OMNIGENT_WRAPPER_COMMAND", raising=False)
+    attempt = 0
+
+    async def _serve_once(app: Any, *, auth_token: str | None = None, **_kwargs: Any) -> None:
+        """Raise 401 the way the front door answers an unauthenticated upgrade.
+
+        :param app: Runner ASGI app.
+        :param auth_token: Bearer token (expected ``None``).
+        :raises InvalidStatus: Always with 401.
+        """
+        del app
+        assert auth_token is None
+        nonlocal attempt
+        attempt += 1
+        raise InvalidStatus(Response(401, "Unauthorized", [], b""))
+
+    async def _sleep(_delay: float) -> None:
+        """No-op sleep.
+
+        :param _delay: Reconnect delay (unused).
+        """
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+
+    with pytest.raises(serve_module.RunnerTunnelAuthRejectedError) as exc_info:
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://ws.cloud.databricks.com/api/2.0/omnigent?o=123",
+            runner_id="runner_no_credential",
+            runner_version="0.1.0",
+            auth_token_factory=lambda: None,
+        )
+
+    message = str(exc_info.value)
+    assert attempt == _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+    assert message.startswith(serve_module.RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX)
+    assert "login https://ws.cloud.databricks.com/omnigent?o=123` " in message
+
+
+class _SignInFactory:
+    """Token factory whose credential source reports a pending interactive sign-in."""
+
+    def __init__(self, pending_calls: int, *, token: str | None) -> None:
+        """
+        :param pending_calls: Calls that report the sign-in as still pending.
+        :param token: What later calls return once it is no longer pending.
+        """
+        self._pending_calls = pending_calls
+        self._token = token
+        self.calls = 0
+        self.sign_in_pending = pending_calls > 0
+
+    def __call__(self) -> str | None:
+        self.calls += 1
+        self.sign_in_pending = self.calls <= self._pending_calls
+        return None if self.sign_in_pending else self._token
+
+
+def _clock_advanced_by_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Drive ``serve_tunnel``'s clock from its own sleeps; return the recorded delays."""
+    now = [1000.0]
+    sleeps: list[float] = []
+
+    async def _sleep(delay: float) -> None:
+        sleeps.append(delay)
+        now[0] += delay
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(
+        serve_module, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": _sleep})
+    )
+    monkeypatch.setattr(
+        serve_module, "time", SimpleNamespace(**{**vars(time), "monotonic": lambda: now[0]})
+    )
+    return sleeps
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_waits_for_a_pending_sign_in_then_connects(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """A never-connected runner polls a pending sign-in instead of upgrading without a token."""
+    from omnigent.runner.identity import RUNNER_CONNECT_MARKER_ENV_VAR, sign_in_pending_marker_path
+
+    marker = tmp_path / "runner.connected"
+    monkeypatch.setenv(RUNNER_CONNECT_MARKER_ENV_VAR, str(marker))
+    factory = _SignInFactory(pending_calls=4, token="tok-after-sign-in")
+    upgrades: list[str | None] = []
+
+    async def _serve_once(app: Any, *, auth_token: str | None = None, **kwargs: Any) -> None:
+        del app
+        upgrades.append(auth_token)
+        kwargs["on_connected"]()
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    sleeps = _clock_advanced_by_sleep(monkeypatch)
+
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://ws.cloud.databricks.com/api/2.0/omnigent",
+            runner_id="runner_sign_in_wait",
+            runner_version="0.1.0",
+            auth_token_factory=factory,
+        )
+
+    # No unauthenticated upgrade while pending: the first one carries the new token.
+    assert upgrades == ["tok-after-sign-in"]
+    assert len(sleeps) == 4
+    assert not sign_in_pending_marker_path(marker).exists()
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_refreshes_when_sign_in_finishes_after_the_token_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resolved sign-in supplies its new token before the first upgrade."""
+
+    class _ResolvingSignIn:
+        calls = 0
+
+        def __call__(self) -> str | None:
+            self.calls += 1
+            return None if self.calls <= 2 else "tok-after-sign-in"
+
+        @property
+        def sign_in_pending(self) -> bool:
+            return self.calls < 2
+
+    upgrades: list[str | None] = []
+
+    async def _serve_once(app: Any, *, auth_token: str | None = None, **_kwargs: Any) -> None:
+        del app
+        upgrades.append(auth_token)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    sleeps = _clock_advanced_by_sleep(monkeypatch)
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://server.example.test",
+            runner_id="runner_sign_in_resolves",
+            runner_version="0.1.0",
+            auth_token_factory=_ResolvingSignIn(),
+        )
+
+    assert upgrades == ["tok-after-sign-in"]
+    assert len(sleeps) == 1
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_keeps_a_token_when_the_sign_in_flag_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A broken optional status accessor must not prevent an authenticated upgrade."""
+
+    class _BrokenSignInFlag:
+        def __call__(self) -> str | None:
+            return "tok-live"
+
+        @property
+        def sign_in_pending(self) -> bool:
+            raise RuntimeError("credential source unavailable")
+
+    upgrades: list[str | None] = []
+
+    async def _serve_once(app: Any, *, auth_token: str | None = None, **_kwargs: Any) -> None:
+        del app
+        upgrades.append(auth_token)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://server.example.test",
+            runner_id="runner_sign_in_flag_broken",
+            runner_version="0.1.0",
+            auth_token_factory=_BrokenSignInFlag(),
+        )
+
+    assert upgrades == ["tok-live"]
+    assert "sign_in_pending read failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_fails_once_the_sign_in_is_no_longer_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sign-in that stops being pending without a token fails like any missing credential."""
+    from omnigent.runner.transports.ws_tunnel.serve import _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+
+    factory = _SignInFactory(pending_calls=2, token=None)
+    attempts = 0
+
+    async def _serve_once(app: Any, **_kwargs: Any) -> None:
+        del app
+        nonlocal attempts
+        attempts += 1
+        raise InvalidStatus(Response(401, "Unauthorized", [], b""))
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    _clock_advanced_by_sleep(monkeypatch)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://ws.cloud.databricks.com/api/2.0/omnigent",
+            runner_id="runner_sign_in_required",
+            runner_version="0.1.0",
+            auth_token_factory=factory,
+        )
+
+    assert str(exc_info.value).startswith(serve_module.RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX)
+    assert attempts == _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_bounds_the_wait_for_a_pending_sign_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sign-in still pending at the budget fails the launch as before."""
+    from omnigent.runner.transports.ws_tunnel.serve import (
+        _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS,
+        _SIGN_IN_PENDING_POLL_INTERVAL_S,
+        _SIGN_IN_PENDING_WAIT_S,
+    )
+
+    factory = _SignInFactory(pending_calls=10_000, token=None)
+    attempts = 0
+
+    async def _serve_once(app: Any, **_kwargs: Any) -> None:
+        del app
+        nonlocal attempts
+        attempts += 1
+        raise InvalidStatus(Response(401, "Unauthorized", [], b""))
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    sleeps = _clock_advanced_by_sleep(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="no credential available"):
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://ws.cloud.databricks.com/api/2.0/omnigent",
+            runner_id="runner_sign_in_timeout",
+            runner_version="0.1.0",
+            auth_token_factory=factory,
+        )
+
+    polls = [delay for delay in sleeps if delay == _SIGN_IN_PENDING_POLL_INTERVAL_S]
+    assert sum(polls) == _SIGN_IN_PENDING_WAIT_S
+    assert attempts == _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
+
+
+class _ContendedSignInFactory:
+    """Token factory whose ``sign_in_pending`` waits on a lock a concurrent mint holds."""
+
+    def __init__(self) -> None:
+        self.flag_requested = threading.Event()
+        self.mint_finished = threading.Event()
+        self.loop_stayed_free = False
+
+    def __call__(self) -> str | None:
+        return None
+
+    @property
+    def sign_in_pending(self) -> bool:
+        self.flag_requested.set()
+        # The mint finishes from the event loop, so it can only do so while the loop is free.
+        self.loop_stayed_free = self.mint_finished.wait(timeout=2.0)
+        return False
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_reads_sign_in_pending_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flag read stuck behind the factory lock must not stall the runner's event loop."""
+    factory = _ContendedSignInFactory()
+
+    async def _serve_once(app: Any, **_kwargs: Any) -> None:
+        del app
+        raise asyncio.CancelledError
+
+    async def _finish_mint_once_the_flag_is_read() -> None:
+        while not factory.flag_requested.is_set():
+            await asyncio.sleep(0.01)
+        factory.mint_finished.set()
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    mint = asyncio.create_task(_finish_mint_once_the_flag_is_read())
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await serve_tunnel(
+                _noop_app,
+                server_url="https://ws.cloud.databricks.com/api/2.0/omnigent",
+                runner_id="runner_sign_in_flag_off_loop",
+                runner_version="0.1.0",
+                auth_token_factory=factory,
+            )
+    finally:
+        mint.cancel()
+        await asyncio.gather(mint, return_exceptions=True)
+
+    assert factory.loop_stayed_free
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_reauth_hint_uses_wrapper_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``OMNIGENT_WRAPPER_COMMAND`` names the wrapper CLI in the login hint.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", "isaac omni")
+
+    async def _serve_once(app: Any, **_kwargs: Any) -> None:
+        """Raise 401.
+
+        :param app: Runner ASGI app.
+        :raises InvalidStatus: Always with 401.
+        """
+        del app
+        raise InvalidStatus(Response(401, "Unauthorized", [], b""))
+
+    async def _sleep(_delay: float) -> None:
+        """No-op sleep.
+
+        :param _delay: Reconnect delay (unused).
+        """
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"run `isaac omni login https://example.databricksapps\.com` to re-authenticate",
+    ):
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://example.databricksapps.com",
+            runner_id="runner_env_hint",
+            runner_version="0.1.0",
+            auth_token="tok-expired",
+        )
 
 
 def test_websocket_auth_redirect_url_detects_https_redirect() -> None:
@@ -552,13 +926,61 @@ async def test_serve_tunnel_fails_loud_on_auth_redirect(
     message = str(exc_info.value)
     # The standard rejection prefix is preserved so
     # ``_entry.main`` recognizes the failure as the fatal class
-    # and exits via ``SystemExit(1)`` instead of re-raising.
+    # and exits instead of re-raising; the type marks it as a sign-in problem.
+    assert isinstance(exc_info.value, serve_module.RunnerTunnelAuthRejectedError)
     assert "runner tunnel rejected by server" in message
     # The actual redirect target shows up so the user can see
     # what the server is asking for.
     assert login_url in message
     # User-actionable next step.
     assert "omnigent setup" in message
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_auth_redirect_hint_uses_wrapper_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``OMNIGENT_WRAPPER_COMMAND`` names the wrapper CLI in the redirect hints.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", "isaac omni")
+
+    async def _serve_once(app: Any, **_kwargs: Any) -> None:
+        """Redirect every upgrade to the OAuth login page.
+
+        :param app: Runner ASGI app.
+        :raises InvalidURI: Always, carrying the OAuth target.
+        """
+        del app
+        raise InvalidURI(
+            "https://example.databricks.com/oidc/oauth2/v2.0/authorize", "scheme isn't ws or wss"
+        )
+
+    async def _sleep(_delay: float) -> None:
+        """No-op sleep.
+
+        :param _delay: Reconnect delay (unused).
+        """
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://example.databricksapps.com",
+            runner_id="runner_redirect_env_hint",
+            runner_version="0.1.0",
+        )
+
+    message = str(exc_info.value)
+    assert message.startswith(serve_module.RUNNER_TUNNEL_REJECTION_PREFIX)
+    # Both hints name the wrapper the user actually runs, not the naked binary.
+    assert "`isaac omni login https://example.databricksapps.com` to re-authenticate" in message
+    assert "run `isaac omni setup` to configure credentials" in message
+    assert "`omnigent " not in message
 
 
 @pytest.mark.asyncio
@@ -703,9 +1125,11 @@ async def test_serve_tunnel_replaces_rejected_host_bootstrap_token(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("keepalive", [(17.0, 41.0), (None, None)], ids=["enabled", "disabled"])
 async def test_serve_tunnel_once_sends_bearer_header(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    keepalive: tuple[float | None, float | None],
 ) -> None:
     """Authenticated remote tunnels pass the bearer on the WS handshake.
 
@@ -735,6 +1159,8 @@ async def test_serve_tunnel_once_sends_bearer_header(
     class _FakeWS(_CleanCloseWS):
         """WebSocket stub that accepts hello then closes the connection."""
 
+        # Deliberately differ from the requested defaults: read the connection.
+        ping_interval, ping_timeout = keepalive
         # What a real connection retains after the peer's clean 1001 close.
         close_code = 1001
         close_reason = "server shutdown"
@@ -831,6 +1257,10 @@ async def test_serve_tunnel_once_sends_bearer_header(
     assert attributes["attempt"] == 1
     assert attributes["pid"] == os.getpid()
     assert attributes["downtime_s"] is None
+    assert attributes["protocol_keepalive_source"] == "websockets_connection"
+    assert attributes["protocol_ping_interval_s"] == keepalive[0]
+    assert attributes["protocol_ping_timeout_s"] == keepalive[1]
+    assert attributes["last_sent_frame_age_s"] >= 0
     sent = captured["sent"]
     assert isinstance(sent, str)
     assert json.loads(sent)["connection_id"] == attributes["connection_id"]
@@ -950,6 +1380,194 @@ class _CleanCloseCtx:
 
     async def __aexit__(self, *_exc: object) -> bool:
         return False
+
+
+async def test_runner_retry_row_retains_application_heartbeat_observations(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    import websockets
+
+    class HeartbeatWS(_CleanCloseWS):
+        ping_interval = 30.0
+        ping_timeout = 90.0
+        close_code = 1000
+        close_reason = ""
+
+        def __init__(self) -> None:
+            super().__init__(1000)
+            self.received_ping = False
+
+        async def recv(self) -> str:
+            if not self.received_ping:
+                self.received_ping = True
+                return encode_frame(PingFrame(ts=123))
+            return await super().recv()
+
+    attempts = 0
+
+    @contextlib.asynccontextmanager
+    async def connect(_url, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts > 1:
+            raise asyncio.CancelledError
+        yield HeartbeatWS()
+
+    monkeypatch.setattr(websockets, "connect", connect)
+    monkeypatch.setattr(serve_module, "_INITIAL_RECONNECT_DELAY_S", 0.001)
+    caplog.set_level(logging.INFO, logger=serve_module.__name__)
+    with pytest.raises(asyncio.CancelledError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner-diag",
+            runner_version="0.1.0",
+        )
+    connected = next(
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_connected"
+    )
+    closed = next(
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "runner_tunnel_disconnected"
+    )
+    assert closed["connection_id"] == connected["connection_id"]
+    assert closed["tunnel_side"] == "runner"
+    assert closed["protocol_ping_timeout_s"] == 90.0
+    assert closed["last_app_ping_received_age_s"] >= 0
+    assert closed["last_app_pong_sent_age_s"] >= 0
+    assert closed["last_app_pong_received_age_s"] is None
+    assert closed["sends_in_flight"] == 0
+    assert closed["send_errors"] == 0
+
+
+async def test_runner_close_freezes_pending_response_send(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Cancelling dispatch tasks during disconnect cannot hide an outstanding send."""
+    import websockets
+
+    from omnigent.runner.transports.ws_tunnel import diagnostics as diagnostics_module
+
+    monkeypatch.setattr(diagnostics_module, "_SAMPLE_INTERVAL_S", 0.005)
+    monkeypatch.setattr(diagnostics_module, "_SLOW_OPERATION_S", 0.01)
+    send_entered = asyncio.Event()
+    error = ConnectionClosedError(Close(1011, "keepalive ping timeout"), None, None)
+
+    class BlockedWS(_CleanCloseWS):
+        async def send(self, data: str) -> None:
+            if json.loads(data)["kind"] == "response.head":
+                send_entered.set()
+                await asyncio.Future()
+
+        async def recv(self) -> str:
+            if not send_entered.is_set():
+                if not hasattr(self, "requested"):
+                    self.requested = True
+                    return encode_frame(
+                        RequestFrame(id="req-1", method="GET", path="/", headers={})
+                    )
+                await send_entered.wait()
+            while not any(
+                getattr(record, "event_name", None) == "runner_tunnel_health"
+                for record in caplog.records
+            ):
+                await asyncio.sleep(0.001)
+            raise error
+
+    @contextlib.asynccontextmanager
+    async def connect(_url, **_kwargs):
+        yield BlockedWS()
+
+    async def app(_scope, _receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    monkeypatch.setattr(websockets, "connect", connect)
+    diagnostics = TunnelDiagnostics()
+    tasks_before = asyncio.all_tasks()
+    with pytest.raises(ConnectionClosedError) as raised:
+        await asyncio.wait_for(
+            _serve_tunnel_once(
+                app,
+                tunnel_url="ws://127.0.0.1:8000/v1/runners/runner-diag/tunnel",
+                server_url="http://127.0.0.1:8000",
+                runner_id="runner-diag",
+                runner_version="0.1.0",
+                connection_id="conn-blocked-response",
+                diagnostics=diagnostics,
+            ),
+            timeout=2,
+        )
+    assert raised.value is error
+    snapshot = diagnostics.snapshot()
+    assert snapshot["sends_in_flight"] == 1
+    assert snapshot["oldest_tracked_send_age_s"] >= 0
+    assert snapshot["last_received_frame_age_s"] >= 0
+    health = next(
+        record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_tunnel_health"
+    )
+    assert health["connection_id"] == "conn-blocked-response"
+    assert health["tunnel_side"] == "runner"
+    assert asyncio.all_tasks() == tasks_before
+
+
+@pytest.mark.parametrize("graceful_shutdown", [False, True])
+async def test_runner_cancelled_pong_send_keeps_heartbeat_and_send_timings(
+    monkeypatch: pytest.MonkeyPatch, graceful_shutdown: bool
+) -> None:
+    import websockets
+
+    pong_started = asyncio.Event()
+
+    class BlockedPongWS(_CleanCloseWS):
+        async def send(self, data: str) -> None:
+            if json.loads(data)["kind"] == "pong":
+                pong_started.set()
+                await asyncio.Future()
+
+        async def recv(self) -> str:
+            return encode_frame(PingFrame(ts=123))
+
+    @contextlib.asynccontextmanager
+    async def connect(_url, **_kwargs):
+        yield BlockedPongWS()
+
+    monkeypatch.setattr(websockets, "connect", connect)
+    now = 100.0
+    diagnostics = TunnelDiagnostics(clock=lambda: now)
+    tasks_before = asyncio.all_tasks()
+    task = asyncio.create_task(
+        _serve_tunnel_once(
+            _noop_app,
+            tunnel_url="ws://127.0.0.1:8000/v1/runners/runner-diag/tunnel",
+            server_url="http://127.0.0.1:8000",
+            runner_id="runner-diag",
+            runner_version="0.1.0",
+            diagnostics=diagnostics,
+            shutdown_event=asyncio.Event() if graceful_shutdown else None,
+        )
+    )
+    try:
+        await asyncio.wait_for(pong_started.wait(), timeout=2)
+        now += 6
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    snapshot = diagnostics.snapshot()
+    assert snapshot["last_app_ping_received_age_s"] == 6.0
+    assert snapshot["last_app_pong_sent_age_s"] is None
+    assert snapshot["send_cancellations"] == 1
+    assert snapshot["last_send_outcome"] == "cancelled"
+    assert snapshot["send_duration_max_s"] == 6.0
+    assert asyncio.all_tasks() == tasks_before
 
 
 @pytest.mark.asyncio
@@ -1078,37 +1696,34 @@ async def test_graceful_drain_bounded_when_task_never_finishes(
             await task
 
 
-@pytest.mark.asyncio
-async def test_serve_tunnel_once_graceful_shutdown_returns_and_closes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Setting the shutdown event ends the read loop and closes the socket.
+class _ShutdownFakeWS:
+    """Fake tunnel socket whose ``recv`` blocks forever and records closes."""
 
-    Drives the real ``_serve_tunnel_once`` with a fake WS whose ``recv`` blocks
-    forever. When the shutdown event fires, the loop must cancel the pending
-    recv, run the drain hook, return cleanly, and let the context manager close
-    the connection — the clean end-of-stream that replaces an abrupt drop.
-    """
+    def __init__(self) -> None:
+        self.closed = False
+        self.close_frames: list[tuple[int, str]] = []
+        self.receiving = asyncio.Event()
+
+    async def send(self, data: str) -> None:
+        del data
+
+    async def recv(self) -> str:
+        self.receiving.set()
+        await asyncio.Event().wait()
+        raise AssertionError("recv should have been cancelled")  # pragma: no cover
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        self.close_frames.append((code, reason))
+
+
+def _install_shutdown_fake_ws(monkeypatch: pytest.MonkeyPatch) -> _ShutdownFakeWS:
+    """Route ``websockets.connect`` to one :class:`_ShutdownFakeWS`."""
     import websockets
 
-    shutdown_event = asyncio.Event()
-    drain_calls: list[str] = []
-
-    class _FakeWS:
-        def __init__(self) -> None:
-            self.closed = False
-
-        async def send(self, data: str) -> None:
-            del data
-
-        async def recv(self) -> str:
-            await asyncio.Event().wait()
-            raise AssertionError("recv should have been cancelled")  # pragma: no cover
-
-    ws = _FakeWS()
+    ws = _ShutdownFakeWS()
 
     class _Ctx:
-        async def __aenter__(self) -> _FakeWS:
+        async def __aenter__(self) -> _ShutdownFakeWS:
             return ws
 
         async def __aexit__(self, *_exc: object) -> None:
@@ -1120,6 +1735,23 @@ async def test_serve_tunnel_once_graceful_shutdown_returns_and_closes(
 
     monkeypatch.setattr(websockets, "connect", _fake_connect)
     monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _server_url: None)
+    return ws
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_once_graceful_shutdown_returns_and_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Setting the shutdown event ends the read loop and closes the socket.
+
+    Drives the real ``_serve_tunnel_once`` with a fake WS whose ``recv`` blocks
+    forever. When the shutdown event fires, the loop must cancel the pending
+    recv, run the drain hook, return cleanly, and close the connection with the
+    idle-shutdown reason the server uses to settle the runner's sessions.
+    """
+    shutdown_event = asyncio.Event()
+    drain_calls: list[str] = []
+    ws = _install_shutdown_fake_ws(monkeypatch)
 
     # Pre-arm the shutdown so the very first recv() race resolves to shutdown
     # (recv blocks forever). Deterministic — no real-time sleep to lose to load.
@@ -1139,7 +1771,38 @@ async def test_serve_tunnel_once_graceful_shutdown_returns_and_closes(
     )
 
     assert drain_calls == ["drained"]
+    assert ws.close_frames == [(1000, RUNNER_IDLE_SHUTDOWN_CLOSE_REASON)]
     assert ws.closed is True
+
+
+@pytest.mark.asyncio
+async def test_serve_tunnel_once_cancelled_shutdown_omits_idle_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A signal-driven stop cancels the tunnel without attesting idle work.
+
+    SIGTERM and host stops cancel the tunnel task instead of setting the idle
+    shutdown event, so their close must not carry the idle-shutdown reason.
+    """
+    ws = _install_shutdown_fake_ws(monkeypatch)
+    task = asyncio.create_task(
+        _serve_tunnel_once(
+            _noop_app,
+            tunnel_url="wss://acme.databricks.com/v1/runners/r/tunnel",
+            server_url="https://acme.databricks.com",
+            runner_id="r",
+            runner_version="0.1.0",
+            auth_token="tok",
+            shutdown_event=asyncio.Event(),
+        )
+    )
+    await asyncio.wait_for(ws.receiving.wait(), timeout=5.0)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert ws.closed is True
+    assert ws.close_frames == []
 
 
 @pytest.mark.asyncio
@@ -2928,3 +3591,32 @@ async def test_serve_tunnel_keeps_escalating_after_brief_connection(
     # Attempt 3 (brief_drop): connected for 2 s < 5 s; no reset → sleep 2.0
     # Attempt 4 (stop): CancelledError before sleep
     assert sleeps == [0.5, 1.0, 2.0]
+
+
+@pytest.mark.asyncio
+async def test_pending_sign_in_cancellation_clears_launch_marker(tmp_path, monkeypatch) -> None:
+    from omnigent.runner.identity import RUNNER_CONNECT_MARKER_ENV_VAR, sign_in_pending_marker_path
+
+    marker = tmp_path / "runner.connected"
+    monkeypatch.setenv(RUNNER_CONNECT_MARKER_ENV_VAR, str(marker))
+    task = asyncio.create_task(
+        serve_tunnel(
+            _noop_app,
+            server_url="http://synthetic.invalid",
+            runner_id="runner-owned",
+            runner_version="0.1",
+            auth_token_factory=_SignInFactory(pending_calls=10_000, token=None),
+        )
+    )
+    try:
+        async with asyncio.timeout(1):
+            while not sign_in_pending_marker_path(marker).exists():
+                await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not sign_in_pending_marker_path(marker).exists()
+        assert not marker.exists()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

@@ -3,8 +3,8 @@ import {
   anchorOccurrence,
   BRIDGE_MSG,
   BRIDGE_SOURCE,
-  buildBridgeScript,
   findAnchorInSource,
+  HTML_COMMENT_BRIDGE_RUNTIME,
   injectCommentBridge,
   parseBridgeMessage,
 } from "./htmlCommentBridge";
@@ -15,57 +15,90 @@ import {
 
 describe("injectCommentBridge", () => {
   const NONCE = "test-nonce-123";
+  const LOADER_URL = "https://app.example/assets/html-comment-bridge.js";
 
+  // The prepared head carries its own <script> (same-page anchors), so the
+  // bridge script is located by its nonce.
   it("injects the bridge script before </body> when present", () => {
     const html = "<html><head></head><body><p>hi</p></body></html>";
-    const out = injectCommentBridge(html, NONCE);
-    const scriptAt = out.indexOf("<script>");
+    const out = injectCommentBridge(html, NONCE, LOADER_URL);
+    const scriptAt = out.indexOf(`data-omni-nonce="${NONCE}"`);
     const bodyCloseAt = out.indexOf("</body>");
     expect(scriptAt).toBeGreaterThan(-1);
     expect(scriptAt).toBeLessThan(bodyCloseAt);
-    expect(out).toContain(NONCE);
   });
 
   it("falls back to before </html> when there is no body", () => {
     const html = "<html><head></head><p>hi</p></html>";
-    const out = injectCommentBridge(html, NONCE);
-    expect(out.indexOf("<script>")).toBeLessThan(out.indexOf("</html>"));
+    const out = injectCommentBridge(html, NONCE, LOADER_URL);
+    const scriptAt = out.indexOf(`data-omni-nonce="${NONCE}"`);
+    expect(scriptAt).toBeGreaterThan(-1);
+    expect(scriptAt).toBeLessThan(out.indexOf("</html>"));
   });
 
   it("appends to a bare fragment with no body/html", () => {
-    const out = injectCommentBridge("<p>just a fragment</p>", NONCE);
-    // prepareHtmlPreviewDoc prepends <base> for a bare fragment; the bridge is
-    // then appended at the end since there's no </body>/</html> to inject before.
+    const out = injectCommentBridge("<p>just a fragment</p>", NONCE, LOADER_URL);
+    // prepareHtmlPreviewDoc prepends its head markup for a bare fragment; the
+    // bridge is then appended at the end since there's no </body>/</html> to
+    // inject before.
     expect(out).toContain("<p>just a fragment</p>");
     const fragAt = out.indexOf("<p>just a fragment</p>");
-    expect(out.indexOf("<script>")).toBeGreaterThan(fragAt);
+    expect(out.indexOf(`data-omni-nonce="${NONCE}"`)).toBeGreaterThan(fragAt);
   });
 
   it("preserves the prepared <base target=_blank> link behavior", () => {
-    const out = injectCommentBridge("<html><head></head><body></body></html>", NONCE);
+    const out = injectCommentBridge("<html><head></head><body></body></html>", NONCE, LOADER_URL);
     expect(out).toContain('<base target="_blank">');
   });
 
   it("includes the highlight style for the Custom Highlight ranges", () => {
-    const out = injectCommentBridge("<body></body>", NONCE);
+    const out = injectCommentBridge("<body></body>", NONCE, LOADER_URL);
     expect(out).toContain("::highlight(omni-comment)");
     expect(out).toContain("::highlight(omni-comment-active)");
   });
 
-  it("substitutes the nonce, source tag, and message types into the script", () => {
-    const script = buildBridgeScript(NONCE);
-    expect(script).toContain(NONCE);
-    expect(script).toContain(BRIDGE_SOURCE);
-    expect(script).toContain(BRIDGE_MSG.selection);
-    // Placeholders must be fully replaced.
-    expect(script).not.toContain("__OMNI_NONCE__");
-    expect(script).not.toContain("__OMNI_TYPES__");
+  it("loads the static runtime externally for a no-inline CSP", () => {
+    const out = injectCommentBridge("<body></body>", NONCE, LOADER_URL);
+    expect(out).toContain(`src="${LOADER_URL}"`);
+    expect(out).toContain(`data-omni-nonce="${NONCE}"`);
+    expect(out).not.toContain(HTML_COMMENT_BRIDGE_RUNTIME);
   });
 
-  it("produces a syntactically valid script (guards template-literal escaping)", () => {
-    // The script body is a template literal; regex/backslash content in it can
-    // silently break parsing. new Function throws on a syntax error.
-    expect(() => new Function(buildBridgeScript(NONCE))).not.toThrow();
+  it("injects the same runtime inline without a network dependency", () => {
+    const out = injectCommentBridge("<body></body>", NONCE);
+    expect(out).toContain(`<script data-omni-nonce="${NONCE}" data-omni-protocol=`);
+    expect(out).toContain(HTML_COMMENT_BRIDGE_RUNTIME);
+    expect(out).not.toContain("<script src=");
+  });
+
+  it("keeps the inline runtime body free of closing script tags", () => {
+    expect(HTML_COMMENT_BRIDGE_RUNTIME).not.toMatch(/<\/script/i);
+  });
+
+  it("escapes runtime URLs and nonces as HTML attributes", () => {
+    const out = injectCommentBridge(
+      "<body></body>",
+      "nonce&\"'<>value",
+      'https://app.example/a?x=1&y="2"\'<>',
+    );
+    expect(out).toContain('src="https://app.example/a?x=1&amp;y=&quot;2&quot;&#39;&lt;&gt;"');
+    expect(out).toContain('data-omni-nonce="nonce&amp;&quot;&#39;&lt;&gt;value"');
+  });
+
+  it("passes protocol constants to the runtime as data", () => {
+    const out = injectCommentBridge("<body></body>", NONCE, LOADER_URL);
+    const doc = new DOMParser().parseFromString(out, "text/html");
+    const script = doc.querySelector(`script[data-omni-nonce="${NONCE}"]`);
+    expect(JSON.parse(script?.getAttribute("data-omni-protocol") ?? "")).toEqual({
+      source: BRIDGE_SOURCE,
+      types: BRIDGE_MSG,
+    });
+    expect(HTML_COMMENT_BRIDGE_RUNTIME).not.toMatch(/\b(?:eval|Function)\s*\(/);
+    expect(HTML_COMMENT_BRIDGE_RUNTIME).toContain("script instanceof HTMLScriptElement");
+  });
+
+  it("ships a syntactically valid classic script", () => {
+    expect(() => new Function(HTML_COMMENT_BRIDGE_RUNTIME)).not.toThrow();
   });
 });
 

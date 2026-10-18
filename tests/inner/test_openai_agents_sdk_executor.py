@@ -32,10 +32,12 @@ from omnigent.inner.executor import (
 )
 from omnigent.inner.openai_agents_sdk_executor import (
     OpenAIAgentsSDKExecutor,
+    _history_via_extra_body,
     _normalize_content_blocks_for_chat,
     _normalize_responses_items_for_chat,
     _ReasoningBlockFilterStream,
     _sanitize_replay_item,
+    _skip_history_transform,
     _wrap_client_for_reasoning_models,
 )
 from omnigent.llms.errors import is_context_length_exceeded as _is_context_length_exceeded
@@ -419,6 +421,207 @@ def test_wrap_client_non_streaming_create_not_wrapped() -> None:
 
     result = _run(_run_inner())
     assert isinstance(result, _FakeResult)
+
+
+_HISTORY = [
+    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Say hello."}]},
+    {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "Hello!", "annotations": []}],
+    },
+    {"type": "function_call", "call_id": "c1", "name": "grep", "arguments": '{"q": "x"}'},
+    {"type": "function_call_output", "call_id": "c1", "output": "found"},
+    {
+        "type": "reasoning",
+        "id": "rs_1",
+        "summary": [{"type": "summary_text", "text": "Thinking."}],
+        "encrypted_content": "opaque",
+    },
+    {
+        "type": "message",
+        "role": "user",
+        "content": [
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "auto"},
+            {
+                "type": "input_file",
+                "filename": "a.txt",
+                "file_data": "data:text/plain;base64,aGk=",
+            },
+        ],
+    },
+] * 5
+
+
+def _cyclic_item() -> dict:
+    item: dict = {"type": "message", "role": "user", "content": []}
+    item["content"].append(item)
+    return item
+
+
+def test_history_via_extra_body_moves_plain_history() -> None:
+    """A plain-JSON history list rides in ``extra_body``, merged with any existing keys."""
+    moved = _history_via_extra_body({"model": "m", "input": _HISTORY}, "input")
+    assert moved == {"model": "m", "input": [], "extra_body": {"input": _HISTORY}}
+
+    merged = _history_via_extra_body({"input": _HISTORY, "extra_body": {"seed": 1}}, "input")
+    assert merged["extra_body"] == {"seed": 1, "input": _HISTORY}
+
+    shared = {"type": "input_text", "text": "same block"}
+    dag = [{"type": "message", "role": "user", "content": [shared, shared]}]
+    assert _history_via_extra_body({"input": dag}, "input")["extra_body"] == {"input": dag}
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"input": "plain string prompt"},
+        {"input": []},
+        {"input": [{"type": "message", "content": object()}]},
+        {"input": [{1: "non-str key"}]},
+        {"input": [_cyclic_item()]},
+        {"input": _HISTORY, "extra_body": {"input": ["caller wins"]}},
+        {"input": _HISTORY, "extra_body": "not a mapping"},
+    ],
+)
+def test_history_via_extra_body_leaves_other_calls_alone(kwargs: dict) -> None:
+    """Anything but a plain-JSON list the caller has not already overridden goes the normal way."""
+    assert _history_via_extra_body(kwargs, "input") is kwargs
+
+
+def test_skip_history_transform_sends_identical_request_json() -> None:
+    """Every SDK call path sends the same JSON body with and without the bypass."""
+    import json
+
+    from openai import AsyncOpenAI
+
+    bodies: list[dict] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        if request.url.path.endswith("/chat/completions"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "c",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "m",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "hi"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, content=b"data: [DONE]\n\n"
+        )
+
+    def _client(bypass: bool) -> AsyncOpenAI:
+        client = AsyncOpenAI(
+            api_key="k",
+            base_url="http://bench/v1",
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(_handler)),
+        )
+        if bypass:
+            _skip_history_transform(client.responses, "input")
+            _skip_history_transform(client.chat.completions, "messages")
+        return client
+
+    messages = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}] * 5
+
+    async def _send(client: AsyncOpenAI, path: str) -> dict:
+        bodies.clear()
+        kwargs = {"model": "m", "input": _HISTORY, "stream": True, "extra_body": {"seed": 7}}
+        try:
+            if path == "streaming":
+                async with client.responses.with_streaming_response.create(**kwargs) as resp:
+                    await resp.read()
+            elif path == "create":
+                stream = await client.responses.create(**kwargs)
+                await stream.close()
+            else:
+                await client.chat.completions.create(model="m", messages=messages)
+        finally:
+            await client.close()
+        return bodies[-1]
+
+    for path in ("streaming", "create", "chat"):
+        assert _run(_send(_client(True), path)) == _run(_send(_client(False), path)), path
+
+
+def test_executor_skips_history_transform_only_on_its_own_client() -> None:
+    """The executor's own client gets the bypass; an injected client is left as built."""
+    from openai import AsyncOpenAI
+
+    owned = AsyncOpenAI(api_key="k", base_url="http://bench/v1")
+    with patch(
+        "omnigent.inner.openai_agents_sdk_executor._get_openai_async_client",
+        return_value=owned,
+    ):
+        owning = OpenAIAgentsSDKExecutor()
+    assert getattr(owned.responses.create, "_skips_history_transform", False)
+    assert getattr(owned.chat.completions.create, "_skips_history_transform", False)
+    _run(owning.close())
+
+    injected = AsyncOpenAI(api_key="k", base_url="http://bench/v1")
+    OpenAIAgentsSDKExecutor(client=injected)
+    assert not getattr(injected.responses.create, "_skips_history_transform", False)
+    _run(injected.close())
+
+
+def _transform_annotations(param_type: object) -> list[str]:
+    """Return every ``PropertyInfo`` alias/format reachable from *param_type*."""
+    import typing_extensions
+    from openai._utils._transform import PropertyInfo
+
+    found: list[str] = []
+    seen: set[int] = set()
+    stack = [param_type]
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        for meta in getattr(node, "__metadata__", ()):
+            if isinstance(meta, PropertyInfo) and (meta.alias or meta.format):
+                found.append(f"{meta.alias or meta.format} in {node}")
+        if typing_extensions.is_typeddict(node):
+            stack.extend(typing_extensions.get_type_hints(node, include_extras=True).values())
+        stack.extend(typing_extensions.get_args(node))
+        origin = typing_extensions.get_origin(node)
+        if origin is not None:
+            stack.append(origin)
+    return found
+
+
+def test_create_param_types_have_no_transform_annotations() -> None:
+    """The history bypass is only lossless while the param types rename/format nothing.
+
+    If an ``openai`` upgrade adds an alias or format anywhere under these
+    types, the client's transform would change the body and the bypass would
+    skip that change; this fails first.
+    """
+    from typing import Annotated, TypedDict
+
+    from openai._utils._transform import PropertyInfo
+    from openai.types.chat import completion_create_params
+    from openai.types.responses import response_create_params
+
+    class _Inner(TypedDict):
+        name: Annotated[str, PropertyInfo(alias="Name")]
+
+    class _Outer(TypedDict):
+        items: list[_Inner] | str
+
+    assert _transform_annotations(_Outer), "walker must see a nested alias"
+    assert _transform_annotations(response_create_params.ResponseCreateParamsStreaming) == []
+    assert _transform_annotations(completion_create_params.CompletionCreateParamsStreaming) == []
 
 
 class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
@@ -1627,8 +1830,10 @@ def test_get_openai_client_host_override_uses_ucode_auth_command(monkeypatch):
     import httpx
 
     import omnigent.inner.databricks_executor as db_exec
+    import omnigent.inner.openai_agents_sdk_executor as oa_exec
     from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
 
+    monkeypatch.setattr(oa_exec, "IS_WINDOWS", False)
     monkeypatch.setenv("OPENAI_API_KEY", "should-not-be-used")
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.setattr(
@@ -1656,6 +1861,112 @@ def test_get_openai_client_host_override_uses_ucode_auth_command(monkeypatch):
     assert captured["base_url"] == "https://example.databricks.com/ai-gateway/codex/v1"
     assert captured["api_key"] != "should-not-be-used"
     assert isinstance(captured["http_client"], httpx.AsyncClient)
+
+
+def test_get_openai_client_host_override_mints_profile_token_on_windows(monkeypatch):
+    """Windows has no ``sh`` for the ucode auth command, so the profile mints in-process.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import httpx
+
+    import omnigent.inner.databricks_executor as db_exec
+    import omnigent.inner.openai_agents_sdk_executor as oa_exec
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    sdk_auth = httpx.Auth()
+    monkeypatch.setattr(oa_exec, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        db_exec,
+        "_resolve_databricks_auth",
+        lambda profile: (sdk_auth, "https://example.databricks.com"),
+    )
+
+    captured: dict[str, Any] = {}
+
+    class _StubAsyncOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    import openai as _openai_mod
+
+    with patch.object(_openai_mod, "AsyncOpenAI", _StubAsyncOpenAI, create=True):
+        _get_openai_async_client(
+            profile="DEV",
+            host_override="https://example.databricks.com/",
+            base_url_override="https://example.databricks.com/ai-gateway/codex/v1",
+            databricks_auth_command="printf token",
+        )
+
+    assert captured["base_url"] == "https://example.databricks.com/ai-gateway/codex/v1"
+    assert captured["http_client"].auth is sdk_auth
+
+
+def test_get_openai_client_host_override_windows_profile_host_mismatch_raises(monkeypatch):
+    """Windows profile pointing at a different workspace than the gateway host must fail loud.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import httpx
+
+    import omnigent.inner.databricks_executor as db_exec
+    import omnigent.inner.openai_agents_sdk_executor as oa_exec
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    sdk_auth = httpx.Auth()
+    monkeypatch.setattr(oa_exec, "IS_WINDOWS", True)
+    monkeypatch.setattr(
+        db_exec,
+        "_resolve_databricks_auth",
+        lambda profile: (sdk_auth, "https://other.databricks.com"),
+    )
+
+    called: dict[str, Any] = {}
+
+    class _StubAsyncOpenAI:
+        def __init__(self, **kwargs):
+            called["constructed"] = True
+
+    import openai as _openai_mod
+
+    with patch.object(_openai_mod, "AsyncOpenAI", _StubAsyncOpenAI, create=True):
+        with pytest.raises(OSError, match=r"other\.databricks\.com") as exc_info:
+            _get_openai_async_client(
+                profile="DEV",
+                host_override="https://example.databricks.com/",
+                base_url_override="https://example.databricks.com/ai-gateway/codex/v1",
+                databricks_auth_command="printf token",
+            )
+
+    message = str(exc_info.value)
+    assert "example.databricks.com" in message
+    assert "DEV" in message
+    assert "constructed" not in called
+
+
+def test_get_openai_client_host_override_windows_without_profile_raises(monkeypatch):
+    """Windows with no profile must fail loud instead of shelling out to a nonexistent 'sh'.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    import omnigent.inner.openai_agents_sdk_executor as oa_exec
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+
+    monkeypatch.setattr(oa_exec, "IS_WINDOWS", True)
+
+    class _ExplodingShellAuth:
+        def __init__(self, *_a, **_kw):
+            raise AssertionError("_ShellCommandBearerAuth constructed on Windows")
+
+    monkeypatch.setattr(oa_exec, "_ShellCommandBearerAuth", _ExplodingShellAuth)
+
+    with pytest.raises(OSError, match="Databricks profile"):
+        _get_openai_async_client(
+            profile=None,
+            host_override="https://example.databricks.com/",
+            base_url_override="https://example.databricks.com/ai-gateway/codex/v1",
+            databricks_auth_command="printf token",
+        )
 
 
 def test_get_openai_client_host_override_requires_base_url(monkeypatch):
@@ -1699,7 +2010,7 @@ def test_get_openai_client_api_key_falls_back_to_env_base_url(monkeypatch):
 
     Regression for the residual gateway 401 (continuation-turn daemon
     spawns): the api_key is frequently a gateway credential (e.g. a
-    Databricks AI Gateway PAT detected from ``OPENAI_API_KEY``), and the
+    Databricks Unity Gateway PAT detected from ``OPENAI_API_KEY``), and the
     companion base_url can be dropped on the daemon → runner → harness
     propagation chain (the spec-auth bake omits it when ``OPENAI_BASE_URL``
     is absent at materialization time; a reused local daemon may predate the
@@ -2079,6 +2390,74 @@ def test_run_turn_auth_error_yields_actionable_message(monkeypatch):
         f"Raw SDK exception text leaked into the user-facing error message: "
         f"{error_events[0].message!r}. This means auth_msg is using "
         f"str(exc.__cause__) instead of str(exc)."
+    )
+
+
+def test_run_turn_generic_error_redacts_cause_from_user_message(monkeypatch, caplog):
+    """A secret in the cause's text must not leak into the user-visible ExecutorError.
+
+    Transport failures collapse into a bare "Connection error."; the
+    underlying cause can carry raw header values (e.g. a Bearer token).
+    The type name is safe to show; the cause's text is not, even though
+    it's still logged (redacted).
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param caplog: Pytest log capture fixture.
+    """
+    import io
+    import logging
+
+    secret = "fake-bearer-token-0123456789abcdef"
+    cause = ValueError(f"Illegal header value b'Bearer {secret}'")
+    outer = RuntimeError("Connection error.")
+    outer.__cause__ = cause
+
+    _FakeRunner.last_calls = []
+    _FakeRunner.next_result = _FakeResult(events=[], exception=outer)
+
+    # A real handler + formatter renders any attached exc_info traceback,
+    # which record.getMessage() alone would not reveal.
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(name)s %(message)s"))
+    sdk_logger = logging.getLogger("omnigent.inner.openai_agents_sdk_executor")
+    sdk_logger.addHandler(handler)
+
+    executor = OpenAIAgentsSDKExecutor(client=object())
+    try:
+        with patch(
+            "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+            return_value=_fake_agents_sdk(),
+        ):
+            with caplog.at_level(logging.ERROR):
+                events = _run(
+                    _collect(
+                        executor.run_turn(
+                            messages=[{"role": "user", "content": "hi"}],
+                            tools=[],
+                            system_prompt="",
+                            config=ExecutorConfig(),
+                        )
+                    )
+                )
+    finally:
+        sdk_logger.removeHandler(handler)
+
+    error_events = [e for e in events if isinstance(e, ExecutorError)]
+    assert len(error_events) == 1, (
+        f"Expected exactly 1 ExecutorError, got {len(error_events)}. Events: {events!r}"
+    )
+    message = error_events[0].message
+    assert secret not in message, f"Secret leaked into user-facing message: {message!r}"
+    assert "ValueError" in message, f"Expected cause type name in message, got: {message!r}"
+    assert "Connection error." in message
+
+    formatted = stream.getvalue()
+    assert "run failed" in formatted, f"Expected run-failure log line, got: {formatted!r}"
+    assert "Traceback" in formatted, f"Expected redacted traceback in log, got: {formatted!r}"
+    assert secret not in formatted, f"Secret leaked into emitted log output: {formatted!r}"
+    assert all(record.exc_info is None for record in caplog.records), (
+        "Raw exc_info must not be attached; it bypasses redaction"
     )
 
 
@@ -3226,3 +3605,122 @@ def test_no_compaction_item_no_compaction_event() -> None:
         assert len(compaction_events) == 0
 
     _run(_t())
+
+
+def test_gateway_turn_without_sh_reports_the_auth_failure(monkeypatch, tmp_path):
+    """A gateway turn on a host with no ``sh`` must name the auth failure.
+
+    The bearer-token hook launches the ucode auth command through ``sh``;
+    native Windows has none, and the OpenAI SDK wraps the resulting
+    ``FileNotFoundError`` into an opaque ``APIConnectionError``. The turn
+    may still fail, but not as "Connection error.".
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Empty directory used as the entire ``PATH``.
+    """
+    import json
+    import subprocess
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from omnigent.spec.types import RetryPolicy
+
+    class _RejectToken(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            body = json.dumps({"error": {"message": "bad token"}}).encode()
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args: object) -> None:
+            return
+
+    gateway = ThreadingHTTPServer(("127.0.0.1", 0), _RejectToken)
+    threading.Thread(target=gateway.serve_forever, daemon=True).start()
+    monkeypatch.setenv("PATH", str(tmp_path))
+    with pytest.raises(FileNotFoundError):
+        subprocess.run(["sh", "-c", "true"], check=False)
+
+    executor = OpenAIAgentsSDKExecutor(
+        model="databricks-gpt-6-astra",
+        gateway_host=f"http://127.0.0.1:{gateway.server_port}",
+        base_url_override=f"http://127.0.0.1:{gateway.server_port}/v1",
+        gateway_auth_command="printf %s mock-token",
+        retry_policy=RetryPolicy(max_retries=0),
+    )
+    try:
+        events = _run(
+            _collect(
+                executor.run_turn(
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools=[],
+                    system_prompt="",
+                    config=ExecutorConfig(),
+                )
+            )
+        )
+        _run(executor.close())
+    finally:
+        gateway.shutdown()
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert errors, f"expected the turn to report its failure, got {events!r}"
+    for error in errors:
+        assert "Connection error." not in error.message, (
+            f"the missing `sh` surfaced as the SDK's opaque connection error: {error.message!r}"
+        )
+        assert "sh" in error.message or "token" in error.message.lower(), error.message
+
+
+def _shell_auth_flow(command: str):
+    """Start the shell bearer hook's auth flow for one request.
+
+    :param command: Shell command the hook runs to print a token.
+    :returns: The ``auth_flow`` generator, positioned before its first step.
+    """
+    from omnigent.inner.openai_agents_sdk_executor import _ShellCommandBearerAuth
+
+    request = httpx.Request("POST", "http://gateway.test/v1/responses")
+    return _ShellCommandBearerAuth(command).auth_flow(request)
+
+
+def test_shell_command_bearer_auth_sets_bearer_header():
+    """A command that prints a token yields the request with that bearer."""
+    request = next(_shell_auth_flow("printf %s minted-token"))
+
+    assert request.headers["Authorization"] == "Bearer minted-token"
+
+
+def test_shell_command_bearer_auth_reports_missing_sh(monkeypatch, tmp_path):
+    """Without ``sh`` on PATH the hook raises the auth error the executor surfaces.
+
+    A raw ``FileNotFoundError`` would be collapsed by the OpenAI SDK into
+    ``APIConnectionError("Connection error.")``.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Empty directory used as the entire ``PATH``.
+    """
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    with pytest.raises(DatabricksAuthError, match="`sh`"):
+        next(_shell_auth_flow("printf %s minted-token"))
+
+
+def test_shell_command_bearer_auth_reports_failed_command(caplog):
+    """A failing auth command raises the surfaced auth error and logs its stderr.
+
+    :param caplog: Pytest log capture fixture.
+    """
+    import logging
+
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.inner.openai_agents_sdk_executor"):
+        with pytest.raises(DatabricksAuthError, match=r"exit 3"):
+            next(_shell_auth_flow("echo 'no cached OAuth token' >&2; exit 3"))
+
+    assert "no cached OAuth token" in caplog.text

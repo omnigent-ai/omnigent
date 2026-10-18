@@ -537,6 +537,144 @@ async def test_ensure_local_codex_resume_rollout_synthesizes_omnigent_history(
     )
 
 
+def _replayed_function_calls(arguments: str) -> list[dict[str, Any]]:
+    """Rebuild a rollout holding one call with ``arguments`` and its output."""
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            {
+                "id": "fc_patch",
+                "response_id": "codex_turn_1",
+                "type": "function_call",
+                "name": "apply_patch",
+                "arguments": arguments,
+                "call_id": "call_patch",
+            },
+            {
+                "id": "fco_patch",
+                "response_id": "codex_turn_1",
+                "type": "function_call_output",
+                "call_id": "call_patch",
+                "output": "delete /workspace/fixtures/big.json",
+            },
+        ],
+        session_id="conv_codex",
+        external_session_id="019e96aa-0be2-7343-8d3b-6f914d60936b",
+        cwd=Path("/workspace"),
+        model_provider="omnigent_databricks",
+        cli_version="0.154.0",
+    )
+    return [
+        record["payload"]
+        for record in records
+        if record["type"] == "response_item"
+        and record["payload"]["type"] in ("function_call", "function_call_output")
+    ]
+
+
+def test_rollout_records_replay_oversized_function_call_arguments_as_a_stub() -> None:
+    """
+    A call too large for the Responses API replays as a stub, paired with its output.
+
+    The apply_patch mirror carries a deleted file's whole content, so a rebuilt
+    thread would resend arguments over the API's 1,048,576-character limit and
+    every later request in the session would fail.
+    """
+    arguments = json.dumps(
+        {
+            "changes": [
+                {
+                    "path": "/workspace/fixtures/big.json",
+                    "kind": {"type": "delete"},
+                    "diff": "x" * 1_200_000,
+                }
+            ]
+        }
+    )
+
+    call, output = _replayed_function_calls(arguments)
+
+    assert call["name"] == "apply_patch"
+    assert call["call_id"] == "call_patch"
+    assert json.loads(call["arguments"]) == {
+        "omitted": f"{len(arguments)} characters of arguments, too large to replay"
+    }
+    assert output["type"] == "function_call_output"
+    assert output["call_id"] == "call_patch"
+
+
+def test_rollout_records_replay_arguments_at_the_limit_verbatim() -> None:
+    """Arguments exactly at the replay cap are kept as written."""
+    prefix = '{"command":"'
+    suffix = '"}'
+    filler = "a" * (codex_native._MAX_REPLAYED_ARGUMENTS_CHARS - len(prefix) - len(suffix))
+    arguments = prefix + filler + suffix
+    assert len(arguments) == codex_native._MAX_REPLAYED_ARGUMENTS_CHARS
+
+    call, _output = _replayed_function_calls(arguments)
+
+    assert call["arguments"] == arguments
+
+
+def test_rollout_records_keep_function_call_namespace() -> None:
+    """Replay keeps a tool call's namespace; default-namespace calls stay bare."""
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            {
+                "id": "fc_sleep",
+                "response_id": "codex_turn_1",
+                "type": "function_call",
+                "name": "sleep",
+                "namespace": "container",
+                "arguments": '{"seconds":2}',
+                "call_id": "call_sleep",
+            },
+            {
+                "id": "fco_sleep",
+                "response_id": "codex_turn_1",
+                "type": "function_call_output",
+                "call_id": "call_sleep",
+                "output": "slept",
+            },
+            {
+                "id": "fc_shell",
+                "response_id": "codex_turn_1",
+                "type": "function_call",
+                "name": "shell",
+                "arguments": '{"command":"ls"}',
+                "call_id": "call_shell",
+            },
+        ],
+        session_id="conv_codex",
+        external_session_id="019e96aa-0be2-7343-8d3b-6f914d60936b",
+        cwd=Path("/workspace"),
+        model_provider="omnigent_databricks",
+        cli_version="0.154.0",
+    )
+
+    calls = [
+        record["payload"]
+        for record in records
+        if record["type"] == "response_item" and record["payload"]["type"] == "function_call"
+    ]
+    assert calls == [
+        {
+            "type": "function_call",
+            "name": "sleep",
+            "namespace": "container",
+            "arguments": '{"seconds":2}',
+            "call_id": "call_sleep",
+            "id": "fc_sleep",
+        },
+        {
+            "type": "function_call",
+            "name": "shell",
+            "arguments": '{"command":"ls"}',
+            "call_id": "call_shell",
+            "id": "fc_shell",
+        },
+    ]
+
+
 @pytest.mark.asyncio
 async def test_ensure_local_codex_resume_rollout_refreshes_existing_from_server(
     tmp_path: Path,
@@ -991,3 +1129,62 @@ def test_mint_codex_thread_id_is_uuidv7() -> None:
     parsed = _uuid.UUID(minted)
     assert parsed.version == 7
     assert codex_native._CODEX_THREAD_ID_RE.fullmatch(minted)
+
+
+def test_rollout_records_replay_parallel_tool_outputs_in_call_order() -> None:
+    """Outputs of parallel calls that finished out of order replay in call order."""
+
+    def call(call_id: str) -> dict[str, Any]:
+        return {
+            "id": f"fc_{call_id}",
+            "response_id": "codex_turn_1",
+            "type": "function_call",
+            "name": "exec_command",
+            "arguments": f'{{"cmd":"run {call_id}"}}',
+            "call_id": call_id,
+        }
+
+    def output(call_id: str) -> dict[str, Any]:
+        return {
+            "id": f"fco_{call_id}",
+            "response_id": "codex_turn_1",
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": f"{call_id} done",
+        }
+
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            call("call_a"),
+            call("call_b"),
+            output("call_b"),
+            output("call_orphan"),
+            output("call_a"),
+            {
+                "id": "msg_1",
+                "response_id": "codex_turn_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "both finished"}],
+            },
+        ],
+        session_id="conv_codex",
+        external_session_id="019e96aa-0be2-7343-8d3b-6f914d60936b",
+        cwd=Path("/workspace"),
+        model_provider="omnigent_databricks",
+        cli_version="0.154.0",
+    )
+
+    replayed = [
+        (record["payload"]["type"], record["payload"].get("call_id"))
+        for record in records
+        if record["type"] == "response_item"
+    ]
+    assert replayed == [
+        ("function_call", "call_a"),
+        ("function_call", "call_b"),
+        ("function_call_output", "call_a"),
+        ("function_call_output", "call_b"),
+        ("function_call_output", "call_orphan"),
+        ("message", None),
+    ]

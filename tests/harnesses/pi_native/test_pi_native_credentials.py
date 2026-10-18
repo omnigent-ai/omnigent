@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import shutil
 import stat
+import subprocess
+import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 import pytest
 
+from omnigent.harnesses.pi_native import auth_command
 from omnigent.harnesses.pi_native import credentials as creds
+from omnigent.inner._proc import process_alive
 
 
 @pytest.fixture(autouse=True)
@@ -158,10 +166,10 @@ def test_key_provider_resolves_to_inline_family() -> None:
 def test_inline_databricks_gateway_enumerates_all_families(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An inline gateway on a Databricks AI Gateway surfaces every family.
+    """An inline gateway on a Databricks Unity Gateway surfaces every family.
 
     The web UI's credential flow writes a single-family ``openai-gateway`` when
-    the Databricks AI Gateway is entered for Codex, and pins it as Pi's default
+    the Databricks Unity Gateway is entered for Codex, and pins it as Pi's default
     when nothing else serves Pi. Pi must not be capped to that one family: the
     gateway fronts a workspace serving Claude, GPT and Gemini, so the resolver
     enumerates the workspace and exposes all of them — Claude on Pi's native
@@ -824,6 +832,59 @@ def test_write_models_config_is_owner_only(tmp_path: Path) -> None:
     assert written["providers"]["omnigent"]["apiKey"] == "sk-secret"
 
 
+@pytest.mark.parametrize(
+    ("command", "kind", "token"),
+    [
+        ("printf 'private-token' | tr a-z A-Z", "ok", "PRIVATE-TOKEN"),
+        ("printf private-token; echo private-error >&2; exit 7", "failed_exit", ""),
+        ("printf '  '", "empty", ""),
+        ("printf '\\377'", "invalid_output", ""),
+        ("sleep 20", "timeout", ""),
+        ("", "invalid_command", ""),
+    ],
+)
+def test_generated_token_command_reports_only_safe_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str, kind: str, token: str
+) -> None:
+    if os.name != "posix" or shutil.which("node") is None:
+        pytest.skip("the native Pi token wrapper requires POSIX and Node")
+    if kind == "timeout":
+        monkeypatch.setattr(auth_command, "AUTH_TIMEOUT_MS", 500)
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="http://localhost/v1",
+        api="openai-completions",
+        model="mock-auth",
+        api_key="!" + command,
+        auth_header=True,
+    )
+    rendered = provider.to_models_config()
+    agent = tmp_path / "agent with spaces"
+    written = json.loads(creds.write_pi_models_config(agent, provider, rendered).read_text())
+    assert rendered["providers"]["omnigent"]["apiKey"] == "!" + command
+    wrapped = written["providers"]["omnigent"]["apiKey"]
+    assert "private-token" not in wrapped
+    result = subprocess.run(
+        wrapped[1:],
+        shell=True,
+        capture_output=True,
+        text=True,
+        timeout=12,
+        env={**os.environ, "OMNIGENT_PI_NATIVE_PID": "123"},
+    )
+    assert result.returncode == (0 if kind == "ok" else 1)
+    assert result.stdout == token
+    assert result.stderr == ""
+    auth_dir = agent / auth_command.AUTH_DIR_NAME
+    status = next(auth_dir.glob("*.result.json"))
+    payload = json.loads(status.read_text())
+    assert payload["kind"] == kind
+    assert payload["piPid"] == 123
+    assert "private-" not in status.read_text()
+    for file in auth_dir.iterdir():
+        assert stat.S_IMODE(file.stat().st_mode) == 0o600
+
+
 def test_provider_launch_returns_env_and_args(tmp_path: Path) -> None:
     """pi_native_provider_launch writes config and returns the env + CLI args."""
     provider = creds.PiProviderConfig(
@@ -1354,7 +1415,7 @@ def _cli_config_databricks_config() -> dict[str, object]:
                 "default": True,
                 "cli": "codex",
                 "model_provider": "Databricks",
-                "display_name": "Databricks AI Gateway",
+                "display_name": "Databricks Unity Gateway",
             },
         }
     }
@@ -1371,7 +1432,7 @@ _DATABRICKS_CODEX_CONFIG = """
 model_provider = "Databricks"
 
 [model_providers.Databricks]
-name = "Databricks AI Gateway"
+name = "Databricks Unity Gateway"
 base_url = "https://1965859176160743.ai-gateway.cloud.databricks.com/codex/v1"
 wire_api = "responses"
 
@@ -1491,7 +1552,7 @@ def _codex_config_with_base_url(base_url: str) -> str:
 model_provider = "Databricks"
 
 [model_providers.Databricks]
-name = "Databricks AI Gateway"
+name = "Databricks Unity Gateway"
 base_url = "{base_url}"
 wire_api = "responses"
 
@@ -1504,7 +1565,7 @@ timeout_ms = 5000
 
 # Look-alike base URLs from the security finding: each embeds the "databricks"
 # and "ai-gateway" substrings somewhere in scheme+host+path, defeating the old
-# substring scan, but NONE is a real Databricks AI Gateway host. Routing any of
+# substring scan, but NONE is a real Databricks Unity Gateway host. Routing any of
 # them would leak the workspace bearer token to an attacker-controlled host.
 _LOOKALIKE_GATEWAY_URLS = [
     # "ai-gateway" + "databricks" labels, but the real host is evil.test.
@@ -1592,7 +1653,7 @@ def _cli_config_databricks_pinned_pi() -> dict[str, object]:
                 "default": ["openai", "pi"],
                 "cli": "codex",
                 "model_provider": "Databricks",
-                "display_name": "Databricks AI Gateway",
+                "display_name": "Databricks Unity Gateway",
             },
         }
     }
@@ -1690,7 +1751,7 @@ args = ["%s", "sk-static"]
     ],
 )
 def test_is_databricks_ai_gateway_url_accepts_real_hosts(gateway_url: str) -> None:
-    """The hardened detector accepts genuine Databricks AI Gateway hosts."""
+    """The hardened detector accepts genuine Databricks Unity Gateway hosts."""
     assert creds._is_databricks_ai_gateway_url(gateway_url) is True
 
 
@@ -1717,7 +1778,7 @@ def test_is_databricks_ai_gateway_url_rejects_lookalikes(gateway_url: str) -> No
 def test_workspace_url_for_dedicated_gateway_uses_profile(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A dedicated AI Gateway origin is not itself a workspace API host."""
+    """A dedicated Unity Gateway origin is not itself a workspace API host."""
     from omnigent.runtime.credentials import databricks as db_creds_mod
 
     def resolve(profile: str | None) -> db_creds_mod.WorkspaceCreds:
@@ -1833,7 +1894,7 @@ def test_databricks_prefixed_override_normalized_for_inline_anthropic() -> None:
 
     The spec's ``executor.model`` may be a Databricks-gateway id
     (``databricks-claude-opus-4-7``). That prefix only routes through the
-    Databricks AI Gateway; an inline vendor-direct provider (here a
+    Databricks Unity Gateway; an inline vendor-direct provider (here a
     key-kind ``api.anthropic.com``) cannot route it. The resolver must
     mechanically strip the prefix so the rendered ``models.json`` selects the
     bare ``claude-opus-4-7`` id the endpoint understands.
@@ -2210,7 +2271,7 @@ def test_vendor_namespaced_claude_id_is_not_split() -> None:
 def test_gateway_override_keeps_databricks_prefix_for_anthropic_family() -> None:
     """A ``databricks-`` override on a gateway-kind provider is sent verbatim.
 
-    A gateway fronting the Databricks AI Gateway is addressed by the prefixed
+    A gateway fronting the Databricks Unity Gateway is addressed by the prefixed
     endpoint name; stripping yields an id the endpoint answers 404 for. The
     family-default path already passed it through — the override path must
     agree.
@@ -2317,7 +2378,7 @@ def test_cli_config_databricks_registers_gpt_provider(
 ) -> None:
     """A cli-config provider fetches the model list via the real workspace URL.
 
-    The AI gateway hostname is NOT the workspace hostname (stripping
+    The Unity Gateway hostname is NOT the workspace hostname (stripping
     ``ai-gateway.`` produces NXDOMAIN). The fix resolves workspace credentials
     from ~/.databrickscfg (DEFAULT profile) and calls /api/2.0/serving-endpoints
     against the real workspace, so GPT and other non-Claude models appear in
@@ -2357,7 +2418,7 @@ def test_cli_config_databricks_registers_gpt_provider(
     cfg = provider.to_models_config()
     openai_entry = cfg["providers"].get("omnigent-openai")
     assert openai_entry is not None, "omnigent-openai provider missing from models.json"
-    # Uses the AI Gateway codex URL (supports tools); the REAL workspace hostname
+    # Uses the Unity Gateway codex URL (supports tools); the REAL workspace hostname
     # from databrickscfg fixes the NXDOMAIN issue for dedicated-subdomain gateways.
     assert (
         openai_entry["baseUrl"]
@@ -3810,3 +3871,66 @@ def test_curated_tier_alias_resolves_before_bracket_strip() -> None:
     assert provider is not None
     assert provider.model == "GLM-5.3"
     assert [entry["id"] for entry in provider.extra_models] == ["GLM-5.3", "GLM-5.3-Flash"]
+
+
+@pytest.mark.parametrize("outcome", ["timeout", "cancelled", "shell_parent", "output_limit", "ok"])
+def test_native_token_helper_reaps_its_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    if os.name == "nt" or shutil.which("node") is None:
+        pytest.skip("POSIX process-group cleanup requires Node")
+    if outcome in ("timeout", "shell_parent"):
+        monkeypatch.setattr(auth_command, "AUTH_TIMEOUT_MS", 2_000)
+    pid_file = tmp_path / "descendant.pid"
+    helper = "import os,sys,time; open(sys.argv[1],'w').write(str(os.getpid())); time.sleep(30)"
+    if outcome == "output_limit":
+        helper = helper.replace(
+            "time.sleep(30)",
+            "sys.stdout.write('x' * (1024 * 1024 + 1)); sys.stdout.flush(); time.sleep(30)",
+        )
+    command = shlex.join([sys.executable, "-c", helper, str(pid_file)])
+    if outcome == "ok":
+        command += (
+            f" >/dev/null & while [ ! -f {shlex.quote(str(pid_file))} ]; do sleep 0.02; done;"
+            " printf private-token"
+        )
+    else:
+        command += "; true"
+    wrapped = auth_command.wrap_auth_command(tmp_path, "omnigent", command)
+    status = next((tmp_path / auth_command.AUTH_DIR_NAME).glob("auth-*.json"))
+    status = status.with_name(status.name + ".result.json")
+    status.write_text(json.dumps({"kind": "stale"}))
+    if outcome == "shell_parent":
+        process = subprocess.Popen(wrapped[1:] + "; true", shell=True, stdout=subprocess.PIPE)
+    else:
+        process = subprocess.Popen(shlex.split(wrapped[1:]), stdout=subprocess.PIPE)
+    started = time.monotonic()
+    try:
+        deadline = time.monotonic() + 4
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert pid_file.exists()
+        if outcome in ("cancelled", "shell_parent"):
+            assert not status.exists(), "a running helper must clear the previous result"
+            process.terminate()
+        stdout, _ = process.communicate(timeout=12)
+        if outcome == "shell_parent":
+            assert process.returncode != 0
+            assert time.monotonic() - started < 6
+        else:
+            assert process.returncode == (0 if outcome == "ok" else 1)
+        assert stdout == (b"private-token" if outcome == "ok" else b"")
+        pid = int(pid_file.read_text())
+        deadline = time.monotonic() + 2
+        while process_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not process_alive(pid)
+        kind = json.loads(status.read_text())["kind"]
+        if outcome == "shell_parent":
+            assert kind in ("timeout", "cancelled")
+        else:
+            assert kind == outcome
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=4)

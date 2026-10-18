@@ -166,7 +166,7 @@ export function buildInventoryContext(
       const gateway = host.gateway_inference?.[id] === true;
       context.credentials.push({
         harness,
-        source: gateway ? "Databricks AI Gateway" : "Signed in",
+        source: gateway ? "Databricks Unity Gateway" : "Signed in",
       });
     }
     const { plain, plugins } = splitPluginSkills(skillsByHarness[harness] ?? []);

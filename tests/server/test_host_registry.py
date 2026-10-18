@@ -286,15 +286,17 @@ def test_mark_frame_seen_refreshes_current_connection() -> None:
     """
     Verify that a frame on the live connection refreshes its liveness.
 
-    The ping loop reads last_frame_at to decide whether a host is
+    The ping loop reads last_frame_monotonic to decide whether a host is
     dead, so a real frame must move it forward.
     """
     registry = HostRegistry()
     conn = registry.register("host_seen", FakeWebSocket(), _make_hello(), owner="bob")
     conn.last_frame_at = 0.0
+    conn.last_frame_monotonic = 0.0
 
     assert registry.mark_frame_seen(conn) is True
     assert conn.last_frame_at > 0.0
+    assert conn.last_frame_monotonic > 0.0
 
 
 def test_mark_frame_seen_rejects_superseded_connection() -> None:
@@ -400,7 +402,9 @@ def test_send_text_enqueues_frame() -> None:
 
     # Frame should be on the outbound queue.
     frame = conn.outbound_queue.get_nowait()
-    assert frame == '{"kind": "host.launch_runner"}'
+    assert frame is not None
+    assert frame.data == '{"kind": "host.launch_runner"}'
+    assert conn.diagnostics.snapshot()["outbound_queue_depth"] == 1
 
 
 def test_send_text_raises_if_connection_replaced() -> None:
@@ -463,8 +467,8 @@ def test_same_host_id_isolated_across_workspaces() -> None:
     # send_text routes to the right workspace's tunnel (no "replaced" error).
     registry.send_text(conn_a, "a")
     registry.send_text(conn_b, "b")
-    assert conn_a.outbound_queue.get_nowait() == "a"
-    assert conn_b.outbound_queue.get_nowait() == "b"
+    assert conn_a.outbound_queue.get_nowait().data == "a"
+    assert conn_b.outbound_queue.get_nowait().data == "b"
 
     # Deregister is workspace-scoped: removing A leaves B live.
     with workspace_scope(111):

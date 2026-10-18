@@ -24,6 +24,7 @@ from omnigent.runner.session_init_protocol import (
     RunnerSessionInitSnapshot,
     parse_runner_session_init_envelope,
 )
+from omnigent.util import http_retry
 
 
 @pytest.fixture(autouse=True)
@@ -45,6 +46,7 @@ def retry_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     # assertion (no recovery) rather than erroring in setup when run against a
     # tree that predates the retry hook.
     monkeypatch.setattr(_orchestration, "_launch_config_retry_sleep", _fake_sleep, raising=False)
+    monkeypatch.setattr(http_retry.random, "uniform", lambda low, high: low)
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8123")
     return slept
 
@@ -52,8 +54,16 @@ def retry_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 class _Resp:
     """Minimal stand-in for an httpx response carrying a fixed status + payload."""
 
-    def __init__(self, status_code: int, payload: Any, *, json_raises: bool = False) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        payload: Any,
+        *,
+        json_raises: bool = False,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.status_code = status_code
+        self.headers = httpx.Headers(headers)
         self._payload = payload
         self._json_raises = json_raises
 
@@ -199,7 +209,12 @@ async def test_launch_config_reads_the_metadata_only_snapshot(
 
     assert client.urls == ["/v1/sessions/conv_1"]
     assert client.params == [
-        {"include_items": "false", "include_liveness": "false", "include_usage": "false"}
+        {
+            "include_items": "false",
+            "include_liveness": "false",
+            "include_usage": "false",
+            "include_live_status": "false",
+        }
     ]
 
 
@@ -245,6 +260,7 @@ async def test_native_metadata_reads_skip_usage_aggregation(
         "include_items": "false",
         "include_liveness": "false",
         "include_usage": "false",
+        "include_live_status": "false",
     }
     assert requests[0].extensions["timeout"]["read"] == 20.0
 
@@ -423,7 +439,15 @@ async def test_transient_timeout_recovers_on_retry(retry_sleeps: list[float]) ->
     assert client.calls == 2, "Should retry once after the transient read timeout."
     assert (
         client.params
-        == [{"include_items": "false", "include_liveness": "false", "include_usage": "false"}] * 2
+        == [
+            {
+                "include_items": "false",
+                "include_liveness": "false",
+                "include_usage": "false",
+                "include_live_status": "false",
+            }
+        ]
+        * 2
     )
     assert retry_sleeps == [pytest.approx(0.5)], "One backoff sleep before the retry."
 
@@ -453,12 +477,15 @@ async def test_retryable_status_recovers_on_retry(retry_sleeps: list[float]) -> 
 
 
 @pytest.mark.asyncio
-async def test_non_retryable_status_fails_without_retry(retry_sleeps: list[float]) -> None:
-    """A non-retryable status (404) fails on the first attempt without consuming retries."""
-    client = _SequenceClient([_Resp(404, None)])
-    with pytest.raises(RuntimeError, match="returned 404"):
+@pytest.mark.parametrize("status", [401, 403, 404])
+async def test_non_retryable_status_fails_without_retry(
+    retry_sleeps: list[float], status: int
+) -> None:
+    """Permanent request rejections fail without consuming retries."""
+    client = _SequenceClient([_Resp(status, None)])
+    with pytest.raises(RuntimeError, match=f"returned {status}"):
         await _codex_native_launch_config(session_id="conv_1", server_client=client)
-    assert client.calls == 1, "A 404 is a hard error, not a transient blip."
+    assert client.calls == 1
     assert retry_sleeps == [], "No backoff on a non-retryable status."
 
 
@@ -517,3 +544,66 @@ async def test_client_side_launch_config_failure_stays_unattributed() -> None:
     with pytest.raises(RuntimeError) as info:
         await _codex_native_launch_config(session_id="conv_1", server_client=client)
     assert not isinstance(info.value, OmnigentError)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reader",
+    [
+        pytest.param(_orchestration._codex_native_launch_config, id="codex"),
+        pytest.param(_orchestration._pi_native_launch_config, id="pi"),
+        pytest.param(_orchestration._kiro_native_launch_config, id="kiro"),
+        pytest.param(_orchestration._opencode_native_launch_config, id="opencode"),
+    ],
+)
+async def test_rate_limit_honors_retry_after(
+    retry_sleeps: list[float], reader: Callable[..., Awaitable[Any]]
+) -> None:
+    client = _SequenceClient(
+        [
+            _Resp(429, None, headers={"Retry-After": "3"}),
+            _Resp(200, {"workspace": "/tmp/repo"}),
+        ]
+    )
+
+    cfg = await reader(session_id="conv_1", server_client=client)
+
+    assert cfg.workspace.name == "repo"
+    assert client.calls == 2
+    assert retry_sleeps == [3.0]
+
+
+@pytest.mark.asyncio
+async def test_retry_after_is_not_reused_after_transport_failure(
+    retry_sleeps: list[float],
+) -> None:
+    client = _SequenceClient(
+        [
+            _Resp(429, None, headers={"Retry-After": "3"}),
+            httpx.ReadTimeout("slow"),
+            _Resp(200, {"workspace": "/tmp/repo"}),
+        ]
+    )
+
+    cfg = await _codex_native_launch_config(session_id="conv_1", server_client=client)
+
+    assert cfg.workspace.name == "repo"
+    assert client.calls == 3
+    assert retry_sleeps == [3.0, 1.0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("retry_after", "attempts", "delays"),
+    [("3", 3, [3.0, 3.0]), ("3600", 1, [])],
+)
+async def test_persistent_rate_limit_stops_within_budget(
+    retry_sleeps: list[float], retry_after: str, attempts: int, delays: list[float]
+) -> None:
+    client = _SequenceClient([_Resp(429, None, headers={"Retry-After": retry_after})] * 3)
+
+    with pytest.raises(OmnigentError, match="GET /v1/sessions returned 429"):
+        await _codex_native_launch_config(session_id="conv_1", server_client=client)
+
+    assert client.calls == attempts
+    assert retry_sleeps == delays
