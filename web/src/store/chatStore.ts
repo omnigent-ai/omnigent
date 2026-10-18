@@ -7209,6 +7209,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           exact: true,
         });
         void queryClient?.invalidateQueries({ queryKey: ["hosts"] });
+        // Before host binding, the agent exposes the server's fallback shells.
+        void queryClient?.invalidateQueries({
+          queryKey: ["session-agent", event.conversationId],
+          exact: true,
+        });
       }
       return;
     case "session_mcp_startup": {
