@@ -181,9 +181,7 @@ vi.mock("./FilesPanel", () => ({
   ),
 }));
 vi.mock("./FileViewer", () => ({
-  // frameless=true → the inline desktop viewer (always open when rendered).
-  // frameless=false/absent → the mobile push-panel (open prop controls visibility).
-  // Use different testids so tests can target the one they care about.
+  // One frameless viewer moves between desktop and mobile layouts.
   FileViewer: ({
     open,
     path,
@@ -3508,11 +3506,8 @@ describe("AppShell URL sync — file param", () => {
 
     renderShell("/c/conv_abc?file=README.md");
 
-    // Viewer must be open and pointing at the file from the URL.
-    // file-viewer = mobile push-panel (md:hidden); file-viewer-inline = desktop inline.
-    // Failure: the conversationId effect did not read searchParams.get("file")
-    // and call setSelectedFilePath with it.
-    const pushPanel = screen.getByTestId("file-viewer");
+    const pushPanel = screen.getByTestId("file-viewer-inline");
+    expect(screen.queryByTestId("file-viewer")).toBeNull();
     expect(pushPanel).toHaveAttribute("data-state", "open");
     expect(pushPanel).toHaveAttribute("data-path", "README.md");
   });
@@ -3599,8 +3594,7 @@ describe("AppShell URL sync — file param", () => {
 
     renderShell("/c/conv_abc?file=README.md&diff=1&comment=c1");
 
-    // Scope to mobile push-panel to avoid ambiguity with the inline frameless viewer.
-    const pushPanel = screen.getByTestId("file-viewer");
+    const pushPanel = screen.getByTestId("file-viewer-inline");
     expect(pushPanel).toHaveAttribute("data-state", "open");
 
     fireEvent.click(within(pushPanel).getByRole("button", { name: /file-viewer: close/i }));
