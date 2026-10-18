@@ -15,7 +15,6 @@ from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
     CLAUDE_FRAMEWORK_CONTEXT_FILE,
     REQUEST_SESSION_ID_ENV_VAR,
-    SWITCH_MODEL_DIALOG_HINT,
     ClaudeMessageNotAccepted,
     ClaudePromptTimeout,
     ClaudeSignInPending,
@@ -24,7 +23,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeUserPromptPending,
     TmuxSessionNotAdvertised,
     cancellable_injection,
-    inject_slash_command,
+    inject_model_command,
     inject_user_message,
     is_auth_slash_command,
     kill_session,
@@ -231,18 +230,14 @@ class ClaudeNativeExecutor(Executor):
                     context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
                     context_path.unlink(missing_ok=True)
                     if wanted_model_arg is not None:
-                        # Accepted trade-off: ``/model <id>`` also saves the
-                        # pick as the person's global default for new Claude
-                        # sessions. Runs to completion before the message
-                        # inject below (same lock), so its confirm Enter can't
-                        # race the message.
+                        # Runs to completion before the message inject below
+                        # (same lock), so its confirm Enter can't race the
+                        # message.
                         await self._inject(
                             partial(
-                                inject_slash_command,
+                                inject_model_command,
                                 self._bridge_dir,
-                                command=f"/model {wanted_model_arg}",
-                                auto_confirm=True,
-                                confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+                                model_arg=wanted_model_arg,
                             )
                         )
                         # Track the routed id, not the alias: the next turn's

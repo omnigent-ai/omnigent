@@ -1217,7 +1217,7 @@ def build_native_controls(
             SWITCH_MODEL_DIALOG_HINT,
             bridge_dir_for_bridge_id,
             confirm_dialog_if_open,
-            inject_slash_command,
+            inject_model_command,
             read_claude_status_model,
             read_model_env,
             read_model_picker_values,
@@ -1292,20 +1292,10 @@ def build_native_controls(
                     ),
                 },
             )
-        command = f"/model {model_arg}"
         baseline = await asyncio.to_thread(read_claude_status_model, bridge_dir)
         try:
-            # Accepted trade-off: ``/model <id>`` also saves the pick as the
-            # person's global default in ``~/.claude/settings.json``. Driving
-            # the interactive picker instead avoided that write but needed
-            # ~35s of fragile tmux automation, so the write stands.
             await asyncio.to_thread(
-                inject_slash_command,
-                bridge_dir,
-                command=command,
-                timeout_s=1.0,
-                auto_confirm=True,
-                confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+                inject_model_command, bridge_dir, model_arg=model_arg, timeout_s=1.0
             )
         except (RuntimeError, ValueError) as exc:
             return JSONResponse(

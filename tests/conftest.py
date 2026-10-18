@@ -394,6 +394,33 @@ def _isolate_codex_native_state(
     monkeypatch.setenv("OMNIGENT_CODEX_NATIVE_STATE_DIR", str(state_dir))
 
 
+@pytest.fixture(autouse=True)
+def _isolate_claude_user_settings(
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    """
+    Point claude-native's default-model restore at a tmp ``settings.json``.
+
+    ``inject_model_command`` reads, and may rewrite, the ``model`` key of
+    Claude Code's user ``settings.json`` around every ``/model`` it types.
+    Without this, any test that reaches it would touch the developer's real
+    ``~/.claude/settings.json``. The save wait is zeroed too: a fake pane
+    that saves does so before the helper looks, and one that never saves
+    would otherwise hold every test for the full wait.
+
+    :param tmp_path_factory: Pytest's session-scoped temp factory.
+    :param monkeypatch: Pytest monkeypatch fixture; restores both at teardown.
+    :returns: The tmp settings path, e.g. ``<tmp>/claude-user-settings0/settings.json``.
+    """
+    from omnigent.harnesses.claude_native import bridge
+
+    settings = tmp_path_factory.mktemp("claude-user-settings") / "settings.json"
+    monkeypatch.setattr(bridge, "claude_user_settings_path", lambda: settings)
+    monkeypatch.setattr(bridge, "_DEFAULT_MODEL_SAVE_WAIT_S", 0.0)
+    return settings
+
+
 @pytest.fixture()
 def claude_managed_settings() -> None:
     """Opt back in to the host's real Claude Code managed-settings chain.
