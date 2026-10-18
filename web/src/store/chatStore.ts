@@ -4911,6 +4911,21 @@ function dropEphemeralInFlightBlocks(
 const RECONNECT_BACKFILL_MAX_PAGES = 4;
 
 /**
+ * Launch stages are not replayed, so a launch last seen in flight takes a snapshot's
+ * stage; one that settled unseen starts the runner grace a live `ready` would.
+ */
+function launchSnapshotPatch(
+  session: Session,
+  state: Pick<ConversationState, "sandboxStatus">,
+): Partial<Pick<ConversationState, "sandboxStatus" | "runnerLaunchedAt">> {
+  if (state.sandboxStatus === null || state.sandboxStatus.stage === "failed") return {};
+  const sandboxStatus = session.sandboxStatus ?? null;
+  return sandboxStatus === null
+    ? { sandboxStatus, runnerLaunchedAt: Date.now() }
+    : { sandboxStatus };
+}
+
+/**
  * Session-snapshot state every reconnect path recovers: `sessionStatus`,
  * token/context/cost counters, the MCP startup band, and — when the turn
  * ended during the gap —
@@ -4933,13 +4948,8 @@ function reconnectStatusPatch(
   const patch: Partial<ChatState> = {
     sessionStatus: session.status,
     ...mcpStartupSnapshotPatch(session, s, launchBeforeFetch),
+    ...launchSnapshotPatch(session, s),
   };
-  // Launch stages are not replayed, so a launch last seen in flight takes the
-  // snapshot's stage; a `ready` sent while this stream was down settles it here.
-  if (s.sandboxStatus !== null && s.sandboxStatus.stage !== "failed") {
-    patch.sandboxStatus = session.sandboxStatus ?? null;
-    if (patch.sandboxStatus === null) patch.runnerLaunchedAt = Date.now();
-  }
   // Recover the background-shell tally across the gap too, so the spinner
   // returns to "N background tasks still running" rather than vanishing on reconnect.
   patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
@@ -4995,6 +5005,22 @@ function reconnectStatusPatch(
     patch.status = "streaming";
   }
   return patch;
+}
+
+/**
+ * Re-read only a launch's stage, on screen or not. Live events that leave the launch
+ * alone can't void the read; a launch update that lands during it wins instead.
+ */
+async function reconcileLaunchStatus(id: string, set: Setter, get: Getter): Promise<void> {
+  const before = get().sandboxStatus;
+  let session: Session;
+  try {
+    session = await getSessionSlim(id);
+  } catch {
+    return;
+  }
+  if (isConversationDisposed(id)) return;
+  set((s) => (s.sandboxStatus === before ? launchSnapshotPatch(session, s) : {}));
 }
 
 /**
@@ -5627,14 +5653,17 @@ export async function startStreamPump(
     for (const timer of catchupTimers) window.clearTimeout(timer);
     catchupTimers = [];
   };
-  // Re-read status at each catch-up delay while `due()` holds, replacing any prior burst.
-  const scheduleStatusCatchup = (due: () => boolean): void => {
+  // Re-read at each catch-up delay, replacing any prior burst: the full status if asked
+  // (on screen only) and, while a launch shows, its stage on screen or not.
+  const scheduleStatusCatchup = (withStatus: boolean): void => {
     if (typeof window === "undefined") return;
     clearCatchupTimers();
     catchupTimers = RECONNECT_STATUS_CATCHUP_DELAYS_MS.map((delayMs) =>
       window.setTimeout(() => {
-        if (controller.signal.aborted || isConversationDisposed(id) || !due()) return;
-        runGuardedStatusReconcile();
+        if (controller.signal.aborted || isConversationDisposed(id)) return;
+        if (withStatus) runGuardedStatusReconcile();
+        const launch = get().sandboxStatus;
+        if (launch !== null && launch.stage !== "failed") void reconcileLaunchStatus(id, set, get);
       }, delayMs),
     );
   };
@@ -5840,14 +5869,11 @@ export async function startStreamPump(
           // settles shortly after reconnect clears in seconds. Guarded +
           // idempotent, and scoped to the active conversation by
           // reconcileActiveSessionStatus itself.
-          scheduleStatusCatchup(() => true);
+          scheduleStatusCatchup(true);
         } else {
           // A launch's `ready` sent before this first open subscribed is in no snapshot
-          // read yet, so re-read over the next ~20 s while the launch still shows.
-          scheduleStatusCatchup(() => {
-            const launch = get().sandboxStatus;
-            return launch !== null && launch.stage !== "failed";
-          });
+          // read yet, so re-read its stage over the next ~20 s while it still shows.
+          scheduleStatusCatchup(false);
         }
         let reason = await pumpPromise;
 
