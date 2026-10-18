@@ -511,3 +511,68 @@ def test_workspace_rail_preserves_outer_top_inset(
         f"workspace rail top {rail_top}px vs header bottom {header_bottom}px "
         "— expected the rail to extend beside the header"
     )
+
+
+def test_shell_inventory_refreshes_after_provisioning(
+    page: Page, terminal_session: tuple[str, str]
+) -> None:
+    """A cached server fallback must give way to the ready host's shell inventory."""
+    base_url, session_id = terminal_session
+    ready = False
+
+    def agent_inventory(route):
+        response = route.fetch()
+        body = response.json()
+        body["terminals"] = ["zsh"] if ready else ["bash"]
+        route.fulfill(response=response, json=body)
+
+    page.route(
+        re.compile(rf"/v1/sessions/{re.escape(session_id)}/agent(?:\?|$)"),
+        agent_inventory,
+    )
+    # Isolate the provisioning event from unrelated host-list notifications.
+    page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
+    page.add_init_script(
+        """
+        (() => {
+          const originalFetch = window.fetch.bind(window);
+          window.fetch = (input, init) => {
+            const url = typeof input === "string" ? input : input.url;
+            if (url.includes("/stream")) {
+              const stream = new ReadableStream({
+                start(controller) {
+                  window.emitSandboxReady = (id) => {
+                    const data = JSON.stringify({
+                      conversation_id: id, stage: "ready", error: null
+                    });
+                    controller.enqueue(new TextEncoder().encode(
+                      "event: session.sandbox_status\\ndata: " + data + "\\n\\n"
+                    ));
+                  };
+                }
+              });
+              return Promise.resolve(new Response(stream, {
+                headers: {"Content-Type": "text/event-stream"}
+              }));
+            }
+            return originalFetch(input, init);
+          };
+        })();
+        """
+    )
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+    rail.get_by_role("button", name="Open new").click()
+    expect(page.get_by_role("menuitem", name="Shell (bash)", exact=True)).to_be_visible()
+    page.keyboard.press("Escape")
+    page.wait_for_function("typeof window.emitSandboxReady === 'function'")
+
+    ready = True
+    page.evaluate("(id) => window.emitSandboxReady(id)", session_id)
+    rail.get_by_role("button", name="Open new").click()
+    expect(page.get_by_role("menuitem", name="Shell (zsh)", exact=True)).to_be_visible()
+    page.get_by_role("menuitem", name="Shell (zsh)", exact=True).click()
+    expect(rail.get_by_role("button", name=re.compile(r"^Close zsh · u-"))).to_be_visible(
+        timeout=60_000
+    )

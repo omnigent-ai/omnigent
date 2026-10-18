@@ -25,6 +25,7 @@ import httpx
 import pytest
 from playwright.async_api import async_playwright, expect
 
+from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from tests.e2e_ui.conftest import _find_free_port, configure_mock_llm, set_fallback_mock_llm
 from tests.e2e_ui.start_session._managed_replica_server import terminate
 from tests.e2e_ui.start_session.test_start_session import _run_in_fresh_loop
@@ -46,8 +47,18 @@ class ManagedReplicas:
 
 
 @pytest.fixture
-def managed_replicas(tmp_path: Path, mock_llm_server_url: str) -> Iterator[ManagedReplicas]:
-    """Start isolated product replicas, the real host launcher and a keyed ingress."""
+def managed_replicas(
+    request: pytest.FixtureRequest, tmp_path: Path, mock_llm_server_url: str
+) -> Iterator[ManagedReplicas]:
+    """
+    Start isolated product replicas, the real host launcher and a keyed ingress.
+
+    Indirect param ``(strip_host_id, legacy_host)``: whether the ingress strips
+    the create's chosen host id, as for a client that doesn't choose one, and
+    whether the sandbox host keys by its id regardless of the launch (default
+    neither).
+    """
+    strip_host_id, legacy_host = getattr(request, "param", (False, False))
     ports = {role: _find_free_port() for role in ("a", "b", "ingress", "ui")}
     urls = {role: f"http://127.0.0.1:{port}" for role, port in ports.items()}
     config = tmp_path / "config"
@@ -111,6 +122,8 @@ def managed_replicas(tmp_path: Path, mock_llm_server_url: str) -> Iterator[Manag
                     urls["a"],
                     "--replica-b",
                     urls["b"],
+                    *(["--strip-host-id"] if strip_host_id else []),
+                    *(["--legacy-host"] if legacy_host else []),
                 ]
                 cwd, process_env = _REPO_ROOT, env
             with log_path.open("w") as log:
@@ -145,11 +158,18 @@ def managed_replicas(tmp_path: Path, mock_llm_server_url: str) -> Iterator[Manag
 
 
 @pytest.mark.timeout(300)
+@pytest.mark.parametrize("managed_replicas", [(True, True)], indirect=True)
 def test_managed_first_message_rebinds_live_stream_across_replicas(
     managed_replicas: ManagedReplicas,
     mock_llm_server_url: str,
 ) -> None:
-    """Create and send through the UI; recover both POST and SSE without navigation."""
+    """
+    Create and send through the UI; recover both POST and SSE without navigation.
+
+    The create carries no host id, so the message and stream start on the
+    default replica, while the host keys by its own id as an older sandbox
+    does.
+    """
     configure_mock_llm(
         mock_llm_server_url,
         [{"text": _REPLY, "stream": True, "block": True}],
@@ -240,6 +260,12 @@ async def _drive(rig: ManagedReplicas, model_url: str) -> None:
             snapshot = (await client.get(rig.a + session_path)).json()
             assert snapshot["host_id"] is None and snapshot["runner_id"] is None
             await expect(page.get_by_test_id("runner-starting-indicator")).to_be_visible()
+            # The unbound sandbox is launching; the composer must not report a missing host.
+            host_chip = page.get_by_test_id("composer-host-select")
+            await expect(host_chip).to_have_attribute(
+                "aria-label", "Host Modal Sandbox, Provisioning sandbox"
+            )
+            await expect(host_chip.locator(".lucide-monitor-cloud")).to_be_visible()
 
             # Keep the real keyless stream healthy across an actual heartbeat;
             # timeout-based stale-stream recovery must not be what fixes this.
@@ -300,6 +326,10 @@ async def _drive(rig: ManagedReplicas, model_url: str) -> None:
             (await client.post(f"{model_url}/gate/release")).raise_for_status()
             await expect(assistant.filter(has_text=_FOLLOWUP_REPLY)).to_be_visible(timeout=20_000)
             await expect(page.get_by_test_id("runner-starting-indicator")).to_have_count(0)
+            await expect(host_chip).to_have_attribute(
+                "aria-label", "Host Modal Sandbox, online", timeout=20_000
+            )
+            await expect(host_chip.locator(".lucide-monitor-cloud")).to_be_visible()
             rows = (await client.get(network_url)).json()
             assert len(streams(rows)) == stream_count
             assert len(posts(rows)) == 3
@@ -329,4 +359,198 @@ async def _drive(rig: ManagedReplicas, model_url: str) -> None:
             await page.context.tracing.stop(path=str(rig.logs / "trace.zip"))
             await client.post(f"{rig.a}/__test/provision/release")
             await client.post(f"{model_url}/gate/release")
+            await browser.close()
+
+
+_SHARDED_PROMPT = "Confirm this managed message went straight to the host replica."
+_SHARDED_REPLY = "The managed message reached the host replica first try."
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize(
+    ("managed_replicas", "keyed"),
+    [((False, False), True), ((True, False), False)],
+    indirect=["managed_replicas"],
+)
+def test_managed_create_lands_on_its_hosts_replica(
+    managed_replicas: ManagedReplicas,
+    mock_llm_server_url: str,
+    keyed: bool,
+) -> None:
+    """
+    A create with a chosen host id keys everything by it from the start; one
+    without (an older client) stays on the default replica, where the host it
+    launches connects too. Either way the first message lands on the first try.
+    """
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": _SHARDED_REPLY, "stream": True, "block": True}],
+        key="managed-sharded-routing",
+        match=_SHARDED_PROMPT,
+    )
+    _run_in_fresh_loop(_drive_sharded(managed_replicas, mock_llm_server_url, keyed=keyed))
+
+
+async def _drive_sharded(rig: ManagedReplicas, model_url: str, *, keyed: bool) -> None:
+    async with (
+        async_playwright() as playwright,
+        httpx.AsyncClient(timeout=10, trust_env=False) as client,
+    ):
+        browser = await playwright.chromium.launch()
+        page = await browser.new_page(viewport={"width": 1440, "height": 960})
+        network_url = f"{rig.ingress}/__test/network"
+        try:
+            await page.goto(rig.ui)
+            await expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible()
+            agents = (await client.get(f"{rig.a}/v1/agents")).json()["data"]
+            agent_id = next(agent["id"] for agent in agents if agent["name"] == "routing_probe")
+            await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id(f"new-chat-landing-agent-{agent_id}").click()
+            await page.get_by_test_id("new-chat-landing-input").fill(_SHARDED_PROMPT)
+            await expect(page.get_by_test_id("new-chat-landing-submit")).to_be_enabled()
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            # The page URL can still name the optimistic chat; the create's
+            # response carries the server's session id.
+            def created(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+                return next(
+                    (
+                        row
+                        for row in rows
+                        if row["path"] == "/v1/sessions"
+                        and row["method"] == "POST"
+                        and row["status"] is not None
+                        and row["closed"]
+                    ),
+                    None,
+                )
+
+            def posts(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                create = created(rows)
+                if create is None:
+                    return []
+                events_path = f"/v1/sessions/{json.loads(create['body'])['id']}/events"
+                return [
+                    row
+                    for row in rows
+                    if row["path"] == events_path
+                    and json.loads(row["request"])["type"] == "message"
+                ]
+
+            rows = await _poll(client, network_url, lambda rows: bool(posts(rows)))
+            create = created(rows)
+            assert create is not None
+            session_prefix = f"/v1/sessions/{json.loads(create['body'])['id']}"
+            replica, replica_url = ("b", rig.b) if keyed else ("a", rig.a)
+            host_id = json.loads(create["request"]).get("host_id")
+            assert create["replica"] == replica and create["key"] == host_id
+            assert create["status"] == 201
+            labels = json.loads(create["body"])["labels"]
+            assert labels.get("omnigent.sandbox.requested_host_id") == host_id
+            if keyed:
+                assert host_id is not None and re.fullmatch(r"[0-9a-f]{32}", host_id)
+            # The message waits on the launch on the replica that will hold the
+            # host's tunnel, instead of failing over from another replica.
+            assert posts(rows)[0]["key"] == host_id and posts(rows)[0]["replica"] == replica
+
+            # The create launched there, so that replica holds the provisioning gate.
+            (await client.post(f"{replica_url}/__test/provision/release")).raise_for_status()
+            rows = await _poll(
+                client,
+                network_url,
+                lambda rows: posts(rows)[0]["status"] == 202,
+                timeout=90,
+            )
+            assert len(posts(rows)) == 1, "the first message was re-sent"
+            snapshot = (await client.get(replica_url + session_prefix)).json()
+            assert snapshot["host_id"] and snapshot["runner_id"]
+            state = (
+                await client.get(
+                    f"{replica_url}/__test/state", params={"host_id": snapshot["host_id"]}
+                )
+            ).json()
+            assert state["host_local"] is True, "the host connected to another replica"
+            if keyed:
+                assert snapshot["host_id"] == host_id
+            await _poll(client, f"{model_url}/gate/pending", lambda body: body["pending"])
+            (await client.post(f"{model_url}/gate/release")).raise_for_status()
+            assistant = page.locator('[data-testid="message-bubble"][data-role="assistant"]')
+            await expect(assistant.filter(has_text=_SHARDED_REPLY)).to_be_visible(timeout=20_000)
+
+            if keyed:
+                rows = (await client.get(network_url)).json()
+                session_rows = [row for row in rows if row["path"].startswith(session_prefix)]
+                assert session_rows
+                assert all(row["key"] == host_id for row in session_rows), session_rows
+                assert not [row for row in rows if '"wrong_replica"' in row["body"]], (
+                    "a request reached a replica without the host's tunnel"
+                )
+        finally:
+            rows = (await client.get(network_url)).json()
+            (rig.logs / "network.json").write_text(json.dumps(rows, indent=2))
+            await page.screenshot(path=str(rig.logs / "final.png"))
+            for url in (rig.a, rig.b):
+                await client.post(f"{url}/__test/provision/release")
+            await client.post(f"{model_url}/gate/release")
+            await browser.close()
+
+
+# The web's cold-boot grace for a fresh session (STARTING_GRACE_S in useSessionLiveness.ts).
+_COLD_BOOT_GRACE_S = 45
+
+
+@pytest.mark.timeout(300)
+def test_terminal_view_stays_starting_while_sandbox_provisions(
+    managed_replicas: ManagedReplicas,
+) -> None:
+    """
+    A terminal-first session keeps its Terminal view on "Starting up…" through a
+    provision that outlasts the cold-boot grace, instead of offering Resume.
+    """
+    _run_in_fresh_loop(_drive_terminal_startup(managed_replicas))
+
+
+async def _drive_terminal_startup(rig: ManagedReplicas) -> None:
+    async with (
+        async_playwright() as playwright,
+        httpx.AsyncClient(timeout=10, trust_env=False) as client,
+    ):
+        browser = await playwright.chromium.launch()
+        page = await browser.new_page(viewport={"width": 1440, "height": 960})
+        try:
+            await page.goto(rig.ui)
+            agents = (await client.get(f"{rig.a}/v1/agents")).json()["data"]
+            agent_id = next(a["id"] for a in agents if a["name"] == CLAUDE_NATIVE_AGENT_NAME)
+            await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id(f"new-chat-landing-agent-{agent_id}").click()
+            await page.get_by_test_id("new-chat-landing-input").fill("Hey")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+            await expect(page).to_have_url(re.compile(r"/c/[a-f0-9]+"), timeout=30_000)
+            session_path = f"/v1/sessions/{page.url.rsplit('/', 1)[-1]}"
+            await page.get_by_test_id("view-mode-terminal").click()
+            terminal = page.locator('[data-testid="main-terminal-view"][data-visible="true"]')
+            starting = terminal.get_by_test_id("terminal-starting-up")
+            await expect(starting).to_be_visible()
+
+            # The keyed create provisions on B; outlast the grace plus a liveness poll.
+            created_at = (await client.get(rig.b + session_path)).json()["created_at"]
+            await asyncio.sleep(max(0.0, created_at + _COLD_BOOT_GRACE_S + 15 - time.time()))
+            snapshot = (await client.get(rig.b + session_path)).json()
+            assert snapshot["sandbox_status"]["stage"] == "provisioning"
+            assert snapshot["runner_id"] is None
+            await expect(starting).to_be_visible()
+            await expect(terminal.get_by_role("button", name="Resume session")).to_have_count(0)
+            await page.screenshot(path=str(rig.logs / "terminal-provisioning.png"))
+
+            # A freshly loaded tab learns about the launch from the session snapshot.
+            async with page.expect_response(
+                lambda response: "/health?session_ids=" in response.url
+            ):
+                await page.reload()
+            await page.get_by_test_id("view-mode-terminal").click()
+            await expect(starting).to_be_visible()
+            await expect(terminal.get_by_role("button", name="Resume session")).to_have_count(0)
+        finally:
+            for url in (rig.a, rig.b):
+                await client.post(f"{url}/__test/provision/release")
             await browser.close()

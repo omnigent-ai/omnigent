@@ -10876,6 +10876,59 @@ async def test_on_proxy_stream_end_spares_superseded_response() -> None:
         app.state.active_turns.pop(conv, None)
 
 
+@pytest.mark.parametrize("replacement", ["none", "task", "stream", "finished"])
+@pytest.mark.asyncio
+async def test_interrupt_cleanup_is_scoped_to_turn_generation(replacement: str) -> None:
+    """An old cancellation cannot consume the replacement's interrupt marker."""
+    conv = "conv_cancel_generation"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    started = asyncio.Event()
+    successor = asyncio.create_task(asyncio.Event().wait())
+
+    async def old_turn() -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            app.state.active_turns.pop(conv, None)
+            if replacement != "none":
+                app.state.begin_turn_slot(conv)
+                if replacement == "task":
+                    app.state.active_turns[conv] = successor
+                elif replacement == "finished":
+                    app.state.active_turns.pop(conv, None)
+                # A second interrupt belongs to this newly bound generation.
+                app.state.interrupted_sessions.add(conv)
+
+    target = asyncio.create_task(old_turn())
+    await started.wait()
+    app.state.begin_turn_slot(conv)
+    app.state.active_turns[conv] = target
+    try:
+        async with _recovery_runner_client(app) as http:
+            response = await http.post(f"/v1/sessions/{conv}/events", json={"type": "interrupt"})
+            assert response.status_code == 204, response.text
+
+        assert target.cancelled()
+        assert (conv in app.state.interrupted_sessions) is (replacement != "none")
+        if replacement == "task":
+            assert app.state.active_turns[conv] is successor
+        elif replacement == "stream":
+            assert conv in app.state.active_turns and app.state.active_turns[conv] is None
+        else:
+            assert conv not in app.state.active_turns
+    finally:
+        for task in (target, successor):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        app.state.active_turns.pop(conv, None)
+
+
 @pytest.mark.asyncio
 async def test_resync_ownership_gate_ignores_superseded_delivery_failure() -> None:
     """BLOCKING-2: a delayed verdict-delivery failure must not cancel a newer turn."""
@@ -10907,6 +10960,65 @@ async def test_resync_ownership_gate_ignores_superseded_delivery_failure() -> No
             and ev["error"].get("code") == "runner_turn_context_desync"
         ), ev
     app.state.active_turns.pop(conv, None)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("replaced", [False, True])
+@pytest.mark.asyncio
+async def test_interrupt_client_lookup_preserves_turn_ownership(
+    stream: bool, replaced: bool
+) -> None:
+    """A delayed harness lookup must not send the old interrupt to new work."""
+    conv = "conv_interrupt_lookup_owner"
+    original = asyncio.create_task(asyncio.Event().wait())
+    successor = asyncio.create_task(asyncio.Event().wait())
+
+    class InterruptClient(_RecoveryScriptedHarnessClient):
+        async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+            if json.get("type") == "interrupt":
+                task = app.state.active_turns.get(conv)
+                if isinstance(task, asyncio.Task):
+                    task.cancel()
+                else:
+                    app.state.on_proxy_stream_end(conv)
+            return await super().post(url, json=json, timeout=timeout)
+
+    class DelayedProcessManager(_RecoveryFakeProcessManager):
+        async def get_client(
+            self, conversation_id: str, harness: str, env: Any = None
+        ) -> _RecoveryScriptedHarnessClient:
+            if replaced:
+                app.state.on_proxy_stream_end(conv)
+                app.state.begin_turn_slot(conv)
+                app.state.active_turns[conv] = successor
+            return await super().get_client(conversation_id, harness, env)
+
+    harness = InterruptClient([])
+    app = create_runner_app(
+        process_manager=DelayedProcessManager(harness),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    app.state.begin_turn_slot(conv)
+    if not stream:
+        app.state.active_turns[conv] = original
+    try:
+        async with _recovery_runner_client(app) as http:
+            response = await http.post(f"/v1/sessions/{conv}/events", json={"type": "interrupt"})
+            assert response.status_code == 204, response.text
+
+        assert successor.cancelling() == 0
+        if replaced:
+            assert app.state.active_turns.get(conv) is successor
+            assert harness.patched_events == []
+        else:
+            assert harness.patched_events == [{"type": "interrupt"}]
+            assert conv not in app.state.active_turns
+    finally:
+        for task in (original, successor):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        app.state.active_turns.pop(conv, None)
 
 
 @pytest.mark.asyncio
@@ -13050,11 +13162,16 @@ _SIGNED_IN_SCREENS = {
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("harness", ["codex-native", "claude-native"])
+@pytest.mark.parametrize(
+    ("harness", "rotated"),
+    [("codex-native", False), ("codex-native", True), ("claude-native", False)],
+    ids=["codex-native", "codex-native-rotated", "claude-native"],
+)
 async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     harness: str,
+    rotated: bool,
 ) -> None:
     """
     A turn that failed on a pending Databricks sign-in is followed by one "signed in" notice.
@@ -13063,15 +13180,21 @@ async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
     prompt is on screen nothing is posted. Once the prompt is gone and the
     agent can take a message (Codex has published its bridge state, Claude Code
     shows its composer), one neutral notice lands in the transcript so the
-    person knows the sign-in worked and can resend.
+    person knows the sign-in worked and can resend. A rotated Codex session's
+    launch publishes its state in its bridge-id label's directory.
     """
     from omnigent.harnesses.codex_native import bridge as codex_bridge
+    from omnigent.runner.native import orchestration as native_orchestration
     from omnigent.terminals import TerminalRegistry
     from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
     conv = f"conv_signin_{harness.replace('-', '_')}"
     monkeypatch.setattr(sign_in_watch, "_SIGN_IN_WATCH_INTERVAL_S", 0.01)
     monkeypatch.setattr(codex_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    bridge_dir = codex_bridge.bridge_dir_for_bridge_id(conv)
+    if rotated:
+        bridge_dir = codex_bridge.bridge_dir_for_bridge_id("conv_signin_rotated_from")
+        monkeypatch.setitem(native_orchestration._AUTO_CODEX_BRIDGE_DIRS, conv, bridge_dir)
 
     class _RecordingServerClient(NullServerClient):
         def __init__(self) -> None:
@@ -13092,7 +13215,7 @@ async def test_sign_in_pending_failure_posts_a_notice_once_the_agent_is_ready(
         if harness == "codex-native":
             # Thread discovery publishes the bridge state as the TUI starts a thread.
             codex_bridge.write_bridge_state(
-                codex_bridge.bridge_dir_for_bridge_id(conv),
+                bridge_dir,
                 codex_bridge.CodexNativeBridgeState(
                     session_id=conv,
                     socket_path="ws://127.0.0.1:1",

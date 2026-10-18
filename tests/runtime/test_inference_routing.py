@@ -518,7 +518,7 @@ def test_child_dispatch_keeps_bound_provider_model_ids_literal() -> None:
         )
 
 
-def test_pi_mixed_shortlist_registers_each_models_wire() -> None:
+def _pi_mixed_shortlist_profile() -> dict[str, object]:
     profile = _profile()
     profile["inference"] = {
         "harnesses": {
@@ -529,7 +529,11 @@ def test_pi_mixed_shortlist_registers_each_models_wire() -> None:
             }
         }
     }
-    with inference_config_scope(profile):
+    return profile
+
+
+def test_pi_mixed_shortlist_registers_each_models_wire() -> None:
+    with inference_config_scope(_pi_mixed_shortlist_profile()):
         provider = resolve_pi_native_provider()
     assert provider is not None
     rendered = provider.to_models_config()["providers"]
@@ -537,6 +541,38 @@ def test_pi_mixed_shortlist_registers_each_models_wire() -> None:
     assert [row["id"] for row in rendered["omnigent"]["models"]] == ["claude-primary"]
     assert rendered["omnigent-openai"]["api"] == "openai-responses"
     assert [row["id"] for row in rendered["omnigent-openai"]["models"]] == ["gpt-primary"]
+
+
+@pytest.mark.parametrize(
+    ("selection", "model", "api"),
+    [
+        ("omnigent/claude-primary", "claude-primary", "anthropic-messages"),
+        ("omnigent-openai/gpt-primary", "gpt-primary", "openai-responses"),
+        ("gpt-primary", "gpt-primary", "openai-responses"),
+        (None, "claude-primary", "anthropic-messages"),
+    ],
+)
+def test_pi_bound_accepts_managed_picker_selection(
+    selection: str | None, model: str, api: str
+) -> None:
+    """A persisted picker value (``omnigent/<model>``) resumes against the allowlist."""
+    with inference_config_scope(_pi_mixed_shortlist_profile()):
+        provider = resolve_pi_native_provider(model=selection)
+    assert provider is not None
+    assert provider.inference_bound
+    assert provider.model == model
+    assert provider.api == api
+
+
+@pytest.mark.parametrize(
+    "selection", ["omnigent/unlisted", "omnigent-openai/unlisted", "other/claude-primary"]
+)
+def test_pi_bound_rejects_unlisted_or_unmanaged_picker_selection(selection: str) -> None:
+    with (
+        inference_config_scope(_pi_mixed_shortlist_profile()),
+        pytest.raises(OmnigentError, match="configured model list"),
+    ):
+        resolve_pi_native_provider(model=selection)
 
 
 def test_acp_override_uses_selected_agents_inference_binding(tmp_path: Path) -> None:

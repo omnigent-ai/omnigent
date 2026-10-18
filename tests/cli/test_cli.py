@@ -1067,6 +1067,7 @@ def test_codex_args_no_config_is_cli_args_only(
             "app-server",
         ),
         (["--remote", "ws://127.0.0.1:7101"], "--remote"),
+        (["--remote=ws://127.0.0.1:7101"], "--remote"),
     ],
 )
 def test_codex_cli_rejects_runner_owned_transport_args(

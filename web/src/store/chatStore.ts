@@ -130,6 +130,7 @@ import { uploadFile } from "@/lib/filesApi";
 import { attachmentKey } from "@/lib/attachments";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
+import { fetchHarnessCatalog, type HarnessCatalog } from "@/lib/agentLabels";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
 import { codexPlanModeFromSession, isCodexNativeSession } from "@/lib/codexPlanMode";
@@ -150,7 +151,10 @@ import {
   isSystemUserContent,
   taskNotificationMarkerContent,
 } from "@/lib/systemMessage";
-import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
+import {
+  isNativeTerminalSession as isNativeTerminalSessionFn,
+  nativeCodingAgentForHarness,
+} from "@/lib/nativeCodingAgents";
 import type { StoredReplyDraft } from "@/lib/replyDraft";
 import { toast } from "sonner";
 
@@ -981,7 +985,8 @@ export interface ConversationState {
    * is in flight, so it would otherwise read as idle `runner_asleep` and
    * show nothing at all. Feeds `useSessionLiveness` as a `starting` nudge
    * and self-expires after `STARTING_GRACE_S`. `null` when no such launch
-   * is outstanding.
+   * is outstanding. Also stamped when the session's managed sandbox reports
+   * `ready`: its runner is up, but its terminal is not created yet.
    */
   runnerLaunchedAt: number | null;
   /**
@@ -1864,6 +1869,53 @@ export function consumePendingInitialPrompt(conversationId: string): PendingInit
   if (prompt === undefined) return null;
   pendingInitialPrompts.delete(conversationId);
   return prompt;
+}
+
+const HARNESS_CATALOG_QUERY = {
+  queryKey: ["harness-labels"] as const,
+  queryFn: fetchHarnessCatalog,
+  staleTime: 30_000,
+};
+
+/**
+ * Resolve the SDK harness's declared family from the same catalog as the picker.
+ * Use cached data immediately and refresh stale entries in the background.
+ * Native harnesses keep their wrapper-label gate; no cache still awaits discovery.
+ */
+async function effortFamilyForSession(
+  session: { harness?: string | null } | null | undefined,
+): Promise<string | null> {
+  if (queryClient === null || !session?.harness) return null;
+  if (nativeCodingAgentForHarness(session.harness)) return null;
+  let catalog: HarnessCatalog | undefined;
+  try {
+    catalog = await queryClient.ensureQueryData({
+      ...HARNESS_CATALOG_QUERY,
+      revalidateIfStale: true,
+    });
+  } catch {
+    catalog = queryClient.getQueryData<HarnessCatalog>(HARNESS_CATALOG_QUERY.queryKey);
+  }
+  return catalog?.effortFamilies[session.harness] ?? null;
+}
+
+/**
+ * Synchronous variant for the hydration path: the declared family from the
+ * catalog already in cache, or ``undefined`` when no catalog has loaded yet.
+ * Never awaits — the transcript must not wait on ``/v1/harnesses``. When the
+ * catalog is absent it is prefetched in the background for the next lookup.
+ */
+function cachedEffortFamilyForSession(
+  session: { harness?: string | null } | null | undefined,
+): string | null | undefined {
+  if (queryClient === null || !session?.harness) return null;
+  if (nativeCodingAgentForHarness(session.harness)) return null;
+  const catalog = queryClient.getQueryData<HarnessCatalog>(HARNESS_CATALOG_QUERY.queryKey);
+  if (catalog === undefined) {
+    void queryClient.prefetchQuery(HARNESS_CATALOG_QUERY);
+    return undefined;
+  }
+  return catalog.effortFamilies[session.harness] ?? null;
 }
 
 export const useChatStore = create<ChatState>((_rootSet, get) => ({
@@ -3123,7 +3175,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         });
         // Harness has no effort control: undo the optimistic session-scoped write
         // so this conversation doesn't claim an effort the server will never hold.
-        if (!supportsEffortControl(session)) {
+        // SDK harnesses carry no wrapper label, so resolve their declared effort
+        // family to recognize that they do take a ``reasoning_effort`` override.
+        if (!supportsEffortControl(session, await effortFamilyForSession(session))) {
           setterFor(conversationId)({ sessionReasoningEffort: null });
           return;
         }
@@ -4357,7 +4411,13 @@ async function bindStream(
     const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
     snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
 
-    const canApplyEffort = supportsEffortControl(session);
+    // The session row's reasoning_effort is the server's truth; the harness
+    // catalog only gates whether a control is shown. Read the family from cache
+    // so hydration never waits on /v1/harnesses, and keep the server's value
+    // when no catalog has loaded yet rather than blanking a real setting.
+    const cachedFamily = cachedEffortFamilyForSession(session);
+    const canApplyEffort =
+      cachedFamily === undefined ? true : supportsEffortControl(session, cachedFamily);
     const effectiveEffort = canApplyEffort ? (session.reasoningEffort ?? null) : null;
 
     const snapshotBlocks = itemsToBlocks(items);
@@ -7132,13 +7192,32 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       }));
       return;
     case "session_sandbox_status":
-      // Advance the managed-sandbox provisioning indicator. `ready`
-      // clears it — from then on the session looks like any
-      // host-bound session; `failed` retains the reason so the page
-      // explains why the sandbox never came up.
-      applyToConversation({
-        sandboxStatus: event.stage === "ready" ? null : { stage: event.stage, error: event.error },
-      });
+      // `ready` clears the launch indicator and starts the launch grace (the runner is
+      // up, its terminal not yet); `failed` keeps the reason so the page can explain
+      // why the sandbox never came up.
+      applyToConversation(
+        event.stage === "ready"
+          ? { sandboxStatus: null, runnerLaunchedAt: Date.now() }
+          : { sandboxStatus: { stage: event.stage, error: event.error, provider: event.provider } },
+      );
+      // The sandbox host is bound before its runner starts; refetch the binding and a
+      // host list cached before that host registered, so the composer can name it.
+      if (event.stage === "connecting" || event.stage === "ready") {
+        void queryClient?.invalidateQueries({
+          queryKey: ["session", event.conversationId],
+          exact: true,
+        });
+        void queryClient?.invalidateQueries({ queryKey: ["hosts"] });
+        // Cancel pre-binding requests too: invalidation alone reuses an initial fetch.
+        void queryClient?.cancelQueries({
+          queryKey: ["session-agent", event.conversationId],
+          exact: true,
+        });
+        void queryClient?.invalidateQueries({
+          queryKey: ["session-agent", event.conversationId],
+          exact: true,
+        });
+      }
       return;
     case "session_mcp_startup": {
       // Mirror the harness's per-MCP-server startup map while the round

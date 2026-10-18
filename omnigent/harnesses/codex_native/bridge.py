@@ -17,7 +17,7 @@ from collections.abc import Callable, Iterator, Mapping, MutableMapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import tomllib
 
@@ -197,6 +197,23 @@ class CodexNativeBridgeState:
     cwd: str | None = None
 
 
+@dataclass(frozen=True)
+class CodexNativeBridgeStateRead:
+    """One state-file observation, with content-free evidence when unavailable."""
+
+    state: CodexNativeBridgeState | None
+    status: Literal[
+        "ready",
+        "missing",
+        "not_file",
+        "unreadable",
+        "invalid_encoding",
+        "invalid_json",
+        "invalid_state",
+    ]
+    os_errno: int | None = None
+
+
 def bridge_dir_for_bridge_id(bridge_id: str) -> Path:
     """
     Return the bridge directory for a native Codex bridge id.
@@ -256,7 +273,7 @@ def prune_orphaned_bridge_dirs() -> int:
     A runner restart is a normal Codex resume boundary, so owner death alone
     cannot imply that the local rollout is disposable. Keep the whole bridge
     for 7 days after its latest bridge preparation or rollout activity, then
-    remove it intact.
+    remove it intact. A bridge with no owner marker gets the same 7 days.
     Explicit session deletion remains immediate. Global maintenance calls this via
     ``native_bridge_common.reap_orphaned_native_bridge_dirs`` at startup.
 
@@ -269,15 +286,38 @@ def prune_orphaned_bridge_dirs() -> int:
 
 
 def _codex_orphan_retention_expired(bridge_dir: Path) -> bool:
-    """Return whether a dead-owner Codex bridge has been inactive for 7 days."""
+    """Return whether a dead-owner or unmarked Codex bridge has been inactive for 7 days.
+
+    An unmarked dir qualifies only if it holds bridge artifacts (``bridge.json``
+    or ``codex-home``), which keeps siblings that share this root such as the
+    process-owner locks and standalone launch state. Its latest top-level write
+    stands in for the missing marker timestamp.
+    """
     activity_cutoff = time.time() - _ORPHAN_RETENTION_SECONDS
     owner_marker = bridge_dir / native_bridge_common.OWNER_PID_FILENAME
     try:
         if owner_marker.stat().st_mtime > activity_cutoff:
             return False
+    except FileNotFoundError:
+        try:
+            if not (
+                (bridge_dir / _MCP_CONFIG_FILE).exists()
+                or codex_home_for_bridge_dir(bridge_dir).exists()
+            ):
+                return False
+            if bridge_dir.stat().st_mtime > activity_cutoff or any(
+                child.lstat().st_mtime > activity_cutoff for child in bridge_dir.iterdir()
+            ):
+                return False
+        except OSError:
+            return False
     except OSError:
         return False
+    return _codex_rollouts_inactive_since(bridge_dir, activity_cutoff)
 
+
+def _codex_rollouts_inactive_since(bridge_dir: Path, activity_cutoff: float) -> bool:
+    """Return whether no rollout under *bridge_dir* was written after the cutoff."""
     sessions_dir = bridge_dir / "codex-home" / "sessions"
     try:
         sessions_mode = sessions_dir.stat().st_mode
@@ -1475,17 +1515,28 @@ def read_bridge_state(bridge_dir: Path) -> CodexNativeBridgeState | None:
     Read shared native Codex bridge state.
 
     :param bridge_dir: Native Codex bridge directory.
-    :returns: Parsed state, or ``None`` when no state exists.
+    :returns: Parsed state, or ``None`` when state is unavailable or malformed.
     """
+    return read_bridge_state_result(bridge_dir).state
+
+
+def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
+    """Read state once so failure diagnostics describe the delivery decision."""
     path = bridge_dir / _STATE_FILE
-    if not path.is_file():
-        return None
     try:
+        if not stat.S_ISREG(path.stat().st_mode):
+            return CodexNativeBridgeStateRead(None, "not_file")
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
+    except FileNotFoundError as exc:
+        return CodexNativeBridgeStateRead(None, "missing", exc.errno)
+    except OSError as exc:
+        return CodexNativeBridgeStateRead(None, "unreadable", exc.errno)
+    except UnicodeDecodeError:
+        return CodexNativeBridgeStateRead(None, "invalid_encoding")
+    except json.JSONDecodeError:
+        return CodexNativeBridgeStateRead(None, "invalid_json")
     if not isinstance(raw, dict):
-        return None
+        return CodexNativeBridgeStateRead(None, "invalid_state")
     session_id = raw.get("session_id")
     socket_path = raw.get("socket_path")
     thread_id = raw.get("thread_id")
@@ -1502,17 +1553,20 @@ def read_bridge_state(bridge_dir: Path) -> CodexNativeBridgeState | None:
         or not isinstance(codex_home, str)
         or not codex_home
     ):
-        return None
+        return CodexNativeBridgeStateRead(None, "invalid_state")
     parsed_active_turn_id = (
         active_turn_id if isinstance(active_turn_id, str) and active_turn_id else None
     )
-    return CodexNativeBridgeState(
-        session_id=session_id,
-        socket_path=socket_path,
-        thread_id=thread_id,
-        codex_home=codex_home,
-        active_turn_id=parsed_active_turn_id,
-        cwd=cwd if isinstance(cwd, str) and cwd else None,
+    return CodexNativeBridgeStateRead(
+        CodexNativeBridgeState(
+            session_id=session_id,
+            socket_path=socket_path,
+            thread_id=thread_id,
+            codex_home=codex_home,
+            active_turn_id=parsed_active_turn_id,
+            cwd=cwd if isinstance(cwd, str) and cwd else None,
+        ),
+        "ready",
     )
 
 

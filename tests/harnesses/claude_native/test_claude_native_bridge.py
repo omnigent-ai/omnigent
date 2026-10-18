@@ -796,6 +796,90 @@ def test_record_hook_event_first_event_bootstraps_identity(tmp_path: Path) -> No
     assert read_claude_session_id(bridge_dir) == "claude-session"
 
 
+@pytest.mark.parametrize("updated_file", ["hook_identity", "model_vocabulary"])
+def test_bridge_writers_preserve_concurrent_identity_and_model_updates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, updated_file: str
+) -> None:
+    """A delayed writer must not replace another writer's newer bridge metadata."""
+    from tests.budgets import budget
+
+    bridge_dir = prepare_bridge_dir("conv_old", workspace=tmp_path)
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "native_old",
+            "transcript_path": str(tmp_path / "old.jsonl"),
+        },
+    )
+    claude_native_bridge.record_model_vocabulary(
+        bridge_dir, launch_env=None, launch_model="model_old"
+    )
+    watched_path = bridge_dir / (
+        "state.json" if updated_file == "hook_identity" else "bridge.json"
+    )
+    first_read = threading.Event()
+    update_attempted = threading.Event()
+    update_finished = threading.Event()
+    writer_context = threading.local()
+    original_read = claude_native_bridge._read_json_file
+
+    def read_with_delayed_writer(path: Path) -> dict[str, Any]:
+        result = original_read(path)
+        if path == watched_path and getattr(writer_context, "delay", False):
+            writer_context.delay = False
+            first_read.set()
+            assert update_attempted.wait(timeout=budget(3.0))
+            # Expected to time out under correct locking: this bounded window only
+            # lets a buggy unlocked write complete and clobber state (final asserts).
+            update_finished.wait(timeout=0.5)
+        return result
+
+    monkeypatch.setattr(claude_native_bridge, "_read_json_file", read_with_delayed_writer)
+
+    def delayed_write() -> None:
+        writer_context.delay = True
+        if updated_file == "hook_identity":
+            record_hook_event(bridge_dir, {"hook_event_name": "Stop", "session_id": "native_old"})
+        else:
+            claude_native_bridge.write_active_session_id(bridge_dir, "conv_new")
+
+    def newer_write() -> None:
+        assert first_read.wait(timeout=budget(3.0))
+        update_attempted.set()
+        try:
+            if updated_file == "hook_identity":
+                record_hook_event(
+                    bridge_dir,
+                    {
+                        "hook_event_name": "SessionStart",
+                        "session_id": "native_new",
+                        "transcript_path": str(tmp_path / "new.jsonl"),
+                    },
+                )
+            else:
+                claude_native_bridge.record_model_vocabulary(
+                    bridge_dir, launch_env=None, launch_model="model_new"
+                )
+        finally:
+            update_finished.set()
+
+    with ThreadPoolExecutor(max_workers=2) as writers:
+        delayed = writers.submit(delayed_write)
+        newer = writers.submit(newer_write)
+        delayed.result(timeout=budget(6.0))
+        newer.result(timeout=budget(6.0))
+
+    if updated_file == "hook_identity":
+        assert read_claude_session_id(bridge_dir) == "native_new"
+        assert read_transcript_path(bridge_dir) == tmp_path / "new.jsonl"
+        assert read_seen_claude_session_ids(bridge_dir) == {"native_old", "native_new"}
+        assert count_hook_events(bridge_dir) == 3
+    else:
+        assert claude_native_bridge.read_active_session_id(bridge_dir) == "conv_new"
+        assert read_launch_model(bridge_dir) == "model_new"
+
+
 def test_read_assistant_text_since_parses_claude_jsonl(tmp_path: Path) -> None:
     """
     Transcript parsing returns only assistant text after the cursor.
@@ -2157,9 +2241,10 @@ def test_read_transcript_items_since_ignores_observed_status_records(tmp_path: P
 
     The local transcript audit found status/UI records such as
     ``queue-operation``, ``branch-update``, ``progress``,
-    ``pr-link``, and non-prompt attachments alongside normal
-    message records. They must not show up as chat items or reset
-    the active response id for following assistant output.
+    ``pr-link``, non-prompt attachments, and ``api-request-blob``
+    request copies alongside normal message records. They must not
+    show up as chat items or reset the active response id for
+    following assistant output, even when they carry a ``message``.
     """
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text(
@@ -2214,6 +2299,23 @@ def test_read_transcript_items_since_ignores_observed_status_records(tmp_path: P
                 ),
                 json.dumps(
                     {
+                        "type": "api-request-blob",
+                        "hash": "blob-1",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "<system-reminder>\nProject instructions.\n"
+                                    "</system-reminder>",
+                                },
+                                {"type": "text", "text": "Run sleep 1."},
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
                         "type": "user",
                         "uuid": "tool-result-1",
                         "parentUuid": "assistant-tool-1",
@@ -2251,7 +2353,7 @@ def test_read_transcript_items_since_ignores_observed_status_records(tmp_path: P
         agent_name="claude-native-ui",
     )
 
-    assert cursor == 8, "cursor should advance past ignored status/UI records"
+    assert cursor == 9, "cursor should advance past ignored status/UI records"
     assert [item.item_type for item in items] == [
         "function_call",
         "function_call_output",
@@ -4291,13 +4393,14 @@ def test_inject_user_message_pastes_content_then_submits(
     monkeypatch.setattr("subprocess.run", _fake_run)
     inject_user_message(bridge_dir, content=content)
 
-    # CSI-u Ctrl+A, Ctrl+K (clear), load-buffer, paste-buffer, Enter — fewer than 5
-    # means a delivery step was dropped.
-    assert len(captured) == 5, (
-        f"Expected 5 tmux calls (CSI-u Ctrl+A, Ctrl+K, load-buffer, paste-buffer, Enter), "
-        f"got {len(captured)}."
+    # Space (refocus), CSI-u Ctrl+A, Ctrl+K (clear), load-buffer, paste-buffer,
+    # Enter — fewer than 6 means a delivery step was dropped.
+    assert len(captured) == 6, (
+        f"Expected 6 tmux calls (Space, CSI-u Ctrl+A, Ctrl+K, load-buffer, "
+        f"paste-buffer, Enter), got {len(captured)}."
     )
-    clear_home, clear_kill, load, paste, submit = captured
+    refocus, clear_home, clear_kill, load, paste, submit = captured
+    assert refocus[-4:] == ["send-keys", "-t", "claude:0.0", "Space"]
     assert clear_home[3:8] == _LEAVE_COPY_MODE
     assert clear_home[-4:] == ["-l", "-t", "claude:0.0", "\x1b[97;5u"]
     assert clear_kill[-4:] == ["-l", "-t", "claude:0.0", "\x1b[107;5u"]
@@ -4806,11 +4909,12 @@ def test_inject_user_message_waits_for_claude_prompt_before_typing(
     assert capture_calls["n"] >= 3, (
         f"Expected >=3 capture-pane polls before the prompt rendered, got {capture_calls['n']}."
     )
-    assert len(send_keys) == 5, (
-        f"Expected 5 tmux calls (CSI-u Ctrl+A, Ctrl+K, load-buffer, paste-buffer, Enter), "
-        f"got {len(send_keys)}."
+    assert len(send_keys) == 6, (
+        f"Expected 6 tmux calls (Space, CSI-u Ctrl+A, Ctrl+K, load-buffer, "
+        f"paste-buffer, Enter), got {len(send_keys)}."
     )
-    clear_home, clear_kill, load, paste, submit = send_keys
+    refocus, clear_home, clear_kill, load, paste, submit = send_keys
+    assert refocus[-1] == "Space"
     assert clear_home[-4:] == ["-l", "-t", "claude:0.0", "\x1b[97;5u"]
     assert clear_kill[-4:] == ["-l", "-t", "claude:0.0", "\x1b[107;5u"]
     # The paste fires after the gate via the buffer path. The exact
@@ -5519,14 +5623,15 @@ def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
     monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
-    # Three keystroke calls in order: C-u (clear), literal paste, Enter.
-    # 2 = C-u was dropped (draft can concatenate); 4+ = duplicated send.
+    # Four keystroke calls in order: Space (refocus), C-u (clear), literal
+    # paste, Enter. A missing C-u lets the draft concatenate; 5+ = duplicated send.
     # capture-pane calls (the delivery-verification polls) are not keystrokes.
     keystrokes = [cmd for cmd in captured if "send-keys" in cmd]
-    assert len(keystrokes) == 3, (
-        f"Expected 3 tmux send-keys calls (C-u + paste + Enter), got {len(keystrokes)}."
+    assert len(keystrokes) == 4, (
+        f"Expected 4 tmux send-keys calls (Space + C-u + paste + Enter), got {len(keystrokes)}."
     )
-    clear, paste, submit = keystrokes
+    refocus, clear, paste, submit = keystrokes
+    assert refocus[-1] == "Space"
     assert clear == [
         "tmux",
         "-S",
@@ -5696,6 +5801,22 @@ def test_cycleable_permission_modes_match_the_server_patch_vocabulary() -> None:
     ), "Bridge cycleable modes and the Sessions API's accepted modes must match."
 
 
+def test_readable_permission_modes_match_the_server_read_back_vocabulary() -> None:
+    """
+    Every footer the bridge can read is a mode the Sessions API accepts back.
+
+    The forwarder posts the parsed footer as ``external_permission_mode_change``;
+    a mode readable here but unknown there is rejected on every poll.
+    """
+    from omnigent.server.routes._sessions.common import (
+        _CLAUDE_NATIVE_READABLE_PERMISSION_MODES,
+    )
+
+    assert set(claude_native_bridge._PERMISSION_MODE_FOOTERS) == set(
+        _CLAUDE_NATIVE_READABLE_PERMISSION_MODES
+    ), "Bridge readable footers and the Sessions API's read-back modes must match."
+
+
 class _FakeModeCycleTmux:
     """
     Stand-in tmux whose pane renders Claude's permission-mode footer.
@@ -5728,6 +5849,7 @@ class _FakeModeCycleTmux:
         "plan": "⏸ plan mode on (shift+tab to cycle)",
         "auto": "⏵⏵ auto mode on (shift+tab to cycle)",
         "bypassPermissions": "⏵⏵ bypass permissions on (shift+tab to cycle)",
+        "dontAsk": "⏵⏵ don't ask on (shift+tab to cycle)",
     }
 
     def run(self, cmd: list[str], **kwargs: object) -> object:
@@ -5912,6 +6034,39 @@ def test_set_permission_mode_leaves_a_bypass_launched_pane(
     assert fake.presses == presses, f"Expected {presses} presses, got {fake.presses}."
 
 
+@pytest.mark.parametrize(
+    ("target", "presses"),
+    [("default", 1), ("acceptEdits", 2), ("plan", 3)],
+)
+def test_set_permission_mode_leaves_a_dont_ask_launched_pane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+    presses: int,
+) -> None:
+    """
+    A session launched into don't-ask can still be switched to a cycle mode.
+
+    Like bypass, don't-ask is launch-only and not a switch target, but its
+    ``don't ask on`` footer must read as the current mode so the cycler has
+    a starting point. From don't-ask the TUI cycles don't ask → manual →
+    accept edits → plan and never returns to don't-ask.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    fake = _FakeModeCycleTmux(["dontAsk", "default", "acceptEdits", "plan"], start="dontAsk")
+    monkeypatch.setattr("subprocess.run", fake.run)
+
+    got = claude_native_bridge.set_permission_mode(bridge_dir, mode=target, timeout_s=5.0)
+
+    assert got == target
+    assert fake.presses == presses, f"Expected {presses} presses, got {fake.presses}."
+
+
 @pytest.mark.parametrize("bad_mode", ["dontAsk", "bypassPermissions", "", "nonsense"])
 def test_set_permission_mode_rejects_non_cycleable_modes(
     tmp_path: Path,
@@ -6032,6 +6187,18 @@ def test_permission_mode_from_pane_ignores_a_mode_named_in_the_transcript() -> N
     )
 
     assert claude_native_bridge._permission_mode_from_pane(pane) == "default"
+
+
+def test_permission_mode_from_pane_reads_a_dont_ask_footer() -> None:
+    """The launch-only don't-ask footer reads as the current mode, like bypass."""
+    pane = (
+        "────────────────────────────────────────\n"
+        "❯ \n"
+        "────────────────────────────────────────\n"
+        "  ⏵⏵ don't ask on (shift+tab to cycle)\n"
+    )
+
+    assert claude_native_bridge._permission_mode_from_pane(pane) == "dontAsk"
 
 
 def test_permission_mode_from_pane_returns_none_without_a_footer() -> None:
@@ -10532,6 +10699,21 @@ _SETTINGS_PANEL_PANE = """\
    Type to filter · Enter/↓ to select · ↑ to tabs · Esc to clear
 """
 
+# The details panel of a background shell, opened from the task indicator
+# below the input box. It replaces the input box, and its footer joins the
+# keys that close it into one hint: "Esc/Enter/Space to close".
+_TASK_DETAILS_PANE = """\
+⏺ Started the build in the background.
+──────────────────────────────
+  Shell details
+  Status:   running
+  Runtime:  4m 12s
+  Command:  make test
+  Output:
+  No output available
+  ← to go back · Esc/Enter/Space to close · x to stop
+"""
+
 # A sliver-height pane holding a multi-line draft: Claude Code renders the
 # box's opening rule and the draft's first row, then runs out of screen —
 # the closing rule never makes it on. The composer is live, so requiring
@@ -10653,6 +10835,7 @@ def test_a_model_switch_types_the_argument_form_and_confirms(
     )
 
     assert [args[-1] for args in sends] == [
+        "Space",
         "C-u",
         "/model databricks-claude-sonnet-5",
         "Enter",
@@ -10660,7 +10843,7 @@ def test_a_model_switch_types_the_argument_form_and_confirms(
         "Enter",
     ]
     # The id must go through literally, not as a tmux key name.
-    assert sends[1] == [
+    assert sends[2] == [
         "send-keys",
         "-l",
         "-t",
@@ -11017,7 +11200,7 @@ def test_a_swallowed_slash_submit_enter_is_retried_while_the_draft_persists(
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
-    assert tails == ["C-u", "/effort high", "Enter", "Enter"], (
+    assert tails == ["Space", "C-u", "/effort high", "Enter", "Enter"], (
         f"Expected the swallowed submit Enter to be retried once; got {tails}."
     )
 
@@ -11058,7 +11241,7 @@ def test_a_slash_command_draft_that_never_renders_submits_blind(
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
     tails = [args[-1] for args in sends]
-    assert tails == ["C-u", "/effort high", "Enter"], (
+    assert tails == ["Space", "C-u", "/effort high", "Enter"], (
         f"An unverifiable draft must submit blind exactly once; got {tails}."
     )
 
@@ -11138,7 +11321,7 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         confirm_hint=claude_native_bridge.EFFORT_DIALOG_HINT,
     )
 
-    assert [args[-1] for args in sends] == ["C-u", "/effort high", "Enter", "Enter"]
+    assert [args[-1] for args in sends] == ["Space", "C-u", "/effort high", "Enter", "Enter"]
 
 
 @pytest.mark.parametrize(
@@ -11150,6 +11333,7 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         _SHELL_MODE_PANE,
         _REWIND_PANE,
         _SETTINGS_PANEL_PANE,
+        _TASK_DETAILS_PANE,
     ],
     ids=[
         "reverse-search",
@@ -11158,6 +11342,7 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         "shell-mode",
         "rewind",
         "settings-panel",
+        "task-details-panel",
     ],
 )
 def test_inject_user_message_restores_an_occupied_input_box_first(
@@ -11219,7 +11404,7 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
 
     tails = [cmd[-1] for cmd in captured]
     # Escape (dismiss the surface) must precede every delivery keystroke.
-    assert tails[:3] == ["Escape", "\x1b[97;5u", "\x1b[107;5u"], (
+    assert tails[:4] == ["Escape", "Space", "\x1b[97;5u", "\x1b[107;5u"], (
         f"Expected the occupying surface to be Escaped before the clear; got {tails}."
     )
     assert tails.count("Escape") == 1, f"One sighting, one Escape — got {tails.count('Escape')}."
@@ -11734,7 +11919,7 @@ def test_inject_slash_command_restores_an_occupied_input_box_first(
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
-    assert [args[-1] for args in sends] == ["Escape", "C-u", "/effort high", "Enter"]
+    assert [args[-1] for args in sends] == ["Escape", "Space", "C-u", "/effort high", "Enter"]
 
 
 def test_inject_slash_command_fails_loud_at_a_surface_escape_cannot_clear(
@@ -11809,7 +11994,7 @@ def test_a_torn_frame_after_a_hinted_surface_does_not_refuse_the_slash_command(
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
-    assert [args[-1] for args in sends] == ["C-u", "/effort high", "Enter"]
+    assert [args[-1] for args in sends] == ["Space", "C-u", "/effort high", "Enter"]
 
 
 def test_a_lowercase_escape_hint_still_marks_a_surface_dismissible(
@@ -11831,7 +12016,7 @@ def test_a_lowercase_escape_hint_still_marks_a_surface_dismissible(
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
 
-    assert [args[-1] for args in sends] == ["Escape", "C-u", "/compact", "Enter"]
+    assert [args[-1] for args in sends] == ["Escape", "Space", "C-u", "/compact", "Enter"]
 
 
 def test_a_single_frame_without_a_composer_does_not_draw_an_escape(
@@ -11858,7 +12043,7 @@ def test_a_single_frame_without_a_composer_does_not_draw_an_escape(
 
     tails = [args[-1] for args in sends]
     assert "Escape" not in tails, f"A one-frame sighting must not draw an Escape; got {tails}."
-    assert tails == ["C-u", "/effort high", "Enter"]
+    assert tails == ["Space", "C-u", "/effort high", "Enter"]
 
 
 def test_the_shortcuts_panel_is_not_treated_as_an_occupied_input(
@@ -11881,7 +12066,7 @@ def test_the_shortcuts_panel_is_not_treated_as_an_occupied_input(
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
-    assert [args[-1] for args in sends] == ["C-u", "/effort high", "Enter"]
+    assert [args[-1] for args in sends] == ["Space", "C-u", "/effort high", "Enter"]
 
 
 def test_claude_pane_ready_is_true_only_at_an_idle_input_box(

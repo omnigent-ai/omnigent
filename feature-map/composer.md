@@ -21,8 +21,9 @@ and steers messages while the agent is busy.
   configuration menu.
 - `host-tooltip`: hovering the host chip shows a tooltip styled like the pill's
   with Host and Status rows, hidden while the host menu is open. States:
-  connected, disconnected, asleep (resumable managed host), unknown, no host;
-  before launch also a selected sandbox and connecting.
+  connected, disconnected, asleep (resumable managed host), unknown, no host,
+  and a launching or failed sandbox with its stage; before launch also a
+  selected sandbox and connecting.
 - `model-picker`: lists the host's live model catalog, highlights the current
   model, and keeps the selection. Ctrl+Shift+M opens it in both composers.
   States: catalog loading, delayed catalog,
@@ -41,6 +42,11 @@ and steers messages while the agent is busy.
   selection and launch wait for success. States: connected, pending, cancelled,
   failed, popup blocked, Databricks workspace prompt, bearer token needed.
 - `slash-menu`: typing `/` opens commands and skills with keyboard navigation.
+  The main composer lists its full built-in set and the session's skills; a live
+  side chat offers a narrower menu — `/help` plus the session's skills. A built-in
+  such as `/help` is handled locally; a recognised skill routes through
+  `slash_command` so it runs on an in-process harness. A native terminal side
+  chat shows no menu and sends slash text to the vendor TUI.
 - `new-command`: `/new` opens a blank new-session composer in the same project;
   working-directory selection follows the project's defaults, not the old session.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
@@ -80,6 +86,13 @@ and steers messages while the agent is busy.
   it is connected; click it to open the host menu.
 - In configuration, open the model picker, the effort picker, or the permission
   mode menu.
+- For a custom `claude-sdk` or `codex` agent session, open configuration and
+  pick an effort rung; the ladder is the harness's declared family (anthropic
+  or openai) and the pick persists on the session. Changing effort after a
+  completed turn applies on the next conversational turn and keeps the history.
+  Claude SDK `/compact` still operates on the existing client's context.
+  `/effort default` restores the harness's default. This is the in-session
+  dial, distinct from the new-session composer's effort choice.
 - Press Ctrl+Shift+M (Ctrl on every platform) to open the model picker without
   the gear; press Ctrl+Shift+L to focus the message box.
 - For a Codex session, open the Terminal view and change effort there, then
@@ -180,7 +193,9 @@ Other connection providers alone do not enable the managed MCP picker.
 - **`host-tooltip`, in-session:**
   `tests/browser_ui/chat/test_composer_tooltips.py::test_host_chip_tooltip_names_the_host_and_matches_the_pill`
   (connected, menu suppression, same surface as the pill); disconnected and
-  asleep in `tests/e2e_ui/sessions/test_host_badge.py`.
+  asleep in `tests/e2e_ui/sessions/test_host_badge.py`; a provisioning sandbox
+  handing over to its connected host in
+  `tests/e2e_ui/start_session/test_managed_first_message_routing.py::test_managed_first_message_rebinds_live_stream_across_replicas`.
 - **`host-tooltip`, new-session composer:** no browser-level coverage; the web
   unit tests for the new-session dialog cover it. Manually: open the landing
   page, hover the host chip, and expect the same card as the pill's tooltip
@@ -201,6 +216,14 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/start_session/test_composer_transition.py::test_selected_model_survives_delayed_create`
 - **`effort-picker`, new-session composer:**
   `tests/e2e_ui/start_session/test_codex_effort_prelaunch.py::test_new_codex_session_gear_offers_reasoning_effort`
+- **`effort-picker`, SDK in-session composer:**
+  `tests/e2e_ui/chat/test_sdk_effort_dial.py::test_claude_sdk_session_offers_the_effort_dial`
+  covers selection, persistence and reload. The stale-catalog cases in
+  `web/src/store/chatStore.test.ts` cover saving while catalog refresh stalls.
+  The effort-transition cases in `tests/inner/test_claude_sdk_executor.py` and
+  `tests/inner/test_codex_executor.py` cover subsequent turns and default reset.
+  Manually, complete a turn, change effort, then send a follow-up; inspect the
+  mock provider request to confirm the new effort and prior conversation.
 - **`model-picker`, `effort-picker`, refused change:** the rollback cases in
   `web/src/store/chatStore.test.ts` and the composer case in
   `web/src/pages/ChatPage.composer.test.tsx` (`pnpm --dir web test`). A pick
@@ -257,7 +280,8 @@ Other connection providers alone do not enable the managed MCP picker.
   covers deleted projects with dangling session membership.
   No running agent is needed.
 - **`slash-menu`:**
-  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`
+  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`,
+  `tests/e2e_ui/chat/test_side_chat_slash_command.py::test_side_chat_slash_menu_and_skill_invocation`
 - **`attachments`:**
   `tests/browser_ui/chat/test_composer_attachments.py::test_attach_supported_files_and_remove`,
   `tests/browser_ui/chat/test_composer_attachments.py::test_file_dropped_on_the_transcript_attaches`,
@@ -267,8 +291,8 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_alt_enter_inserts_newline_in_both_composers`
 - **`list-formatting`, both composers:** no browser-level coverage; the list
   cases in `web/src/components/composer/ChatComposer.test.tsx`
-  (`pnpm --dir web test`). Manually: type `1.` then Space and expect `  1. `;
-  type an item, press Shift+Enter and expect `  2. ` on the next line; press
+  (`pnpm --dir web test`). Manually: type `1.` then Space and expect ` 1.`;
+  type an item, press Shift+Enter and expect ` 2.` on the next line; press
   Shift+Enter on the empty item and expect the marker removed. With Enter as
   the send gesture, plain Enter still sends a list; with Mod+Enter chosen,
   plain Enter continues it.
