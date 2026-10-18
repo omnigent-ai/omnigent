@@ -1530,6 +1530,8 @@ function sendLatchIsStranded(s: ChatState): boolean {
   if (s.sendLatchedAt === null || Date.now() - s.sendLatchedAt < SEND_CHAIN_MAX_WAIT_MS)
     return false;
   if (s.activeResponse?.state === "streaming") return false;
+  // A first message held through its sandbox's launch is waiting, not stuck.
+  if (nativeSandboxLaunching(s)) return false;
   return s.conversationId !== null && cachedConversationStatus(s.conversationId) === "idle";
 }
 
@@ -1615,14 +1617,25 @@ function enterSendChain(conversationId: string | null): {
       // has no timeout, so a POST whose connection dies never settles and its
       // link never releases. Past SEND_CHAIN_MAX_WAIT_MS the successor proceeds
       // anyway — only ordering degrades, versus a composer that queues forever.
+      // A prior send held through its sandbox's launch can outlast that bound.
+      const priorDone = priorSend.then(() => true);
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
-        await Promise.race([
-          priorSend,
-          new Promise<void>((resolve) => {
-            timer = setTimeout(resolve, SEND_CHAIN_MAX_WAIT_MS);
-          }),
-        ]);
+        for (;;) {
+          // oxlint-disable-next-line no-await-in-loop
+          const done = await Promise.race([
+            priorDone,
+            new Promise<boolean>((resolve) => {
+              timer = setTimeout(() => resolve(false), SEND_CHAIN_MAX_WAIT_MS);
+            }),
+          ]);
+          clearTimeout(timer);
+          const state =
+            conversationId === null
+              ? undefined
+              : conversationRegistry.peek(conversationId)?.getState();
+          if (done || state === undefined || !nativeSandboxLaunching(state)) return;
+        }
       } finally {
         if (timer !== undefined) clearTimeout(timer);
       }

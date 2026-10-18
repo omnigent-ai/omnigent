@@ -4085,6 +4085,50 @@ describe("chatStore — first message during native model startup", () => {
     ]);
   });
 
+  it("keeps a queued follow-up behind a first message held past the stranded-send bound", async () => {
+    harness = "codex-native";
+    sandboxStage = "provisioning";
+    seedConversationsCache([conv(sessionId, "idle")]);
+    vi.useFakeTimers();
+    begin();
+    await vi.advanceTimersByTimeAsync(0);
+    useChatStore.getState().enqueueMessage("follow-up", undefined);
+    await vi.advanceTimersByTimeAsync(4 * 60_000);
+    useChatStore.getState().maybeFlushQueuedHead();
+    reportSandbox("ready");
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(eventBodies().map((body) => body.data.content)).toEqual([
+      [{ type: "input_text", text: original }],
+    ]);
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["follow-up"]);
+  });
+
+  it("keeps a direct follow-up behind the held first message in the send chain", async () => {
+    harness = "codex-native";
+    sandboxStage = "provisioning";
+    // The first POST never settles, so only the send chain can order the follow-up.
+    const respond = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input, init) => {
+      const body = init?.method === "POST" ? JSON.parse(String(init.body ?? "{}")) : {};
+      if (String(input).endsWith("/events") && body.data?.content?.[0]?.text === original) {
+        return new Promise<Response>(() => {});
+      }
+      return respond(input, init);
+    });
+    vi.useFakeTimers();
+    begin();
+    await vi.advanceTimersByTimeAsync(0);
+    void useChatStore.getState().send("follow-up", "agent_xyz");
+    await vi.advanceTimersByTimeAsync(4 * 60_000);
+    reportSandbox("ready");
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(eventBodies().map((body) => body.data.content)).toEqual([
+      [{ type: "input_text", text: original }],
+    ]);
+  });
+
   it("abandons the waiting send when its conversation is disposed", async () => {
     begin();
     await settle();
