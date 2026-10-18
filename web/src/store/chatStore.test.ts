@@ -4233,6 +4233,30 @@ describe("chatStore — first message during native model startup", () => {
     expect(useChatStore.getState().queuedMessages).toEqual([queued[1]]);
   });
 
+  it("steers only the first queued message while a model is still starting", async () => {
+    // Claude holds a message until it reports its model; no sandbox launch involved.
+    begin();
+    await settle();
+    useChatStore.getState().stop();
+    await settle();
+    const queued = ["second", "third"].map((text, index) => ({
+      queueId: `q_model_${index}`,
+      stableId: `stable_model_${index}`,
+      text,
+      conversationId: sessionId,
+    }));
+    useChatStore.setState({ queuedMessages: queued });
+    useChatStore.getState().steerAllQueuedMessages(sessionId);
+    await settle();
+
+    expect(eventBodies()).toEqual([]);
+    expect(useChatStore.getState().pendingUserMessages).toMatchObject([
+      { initialDraft: { text: "second" } },
+    ]);
+    expect(useChatStore.getState().queuedMessages).toEqual([queued[1]]);
+    expect(useChatStore.getState().blocks.filter((b) => b.type === "error")).toEqual([]);
+  });
+
   it("hands a held-time send with its own error handler back to it", async () => {
     harness = "codex-native";
     sandboxStage = "provisioning";

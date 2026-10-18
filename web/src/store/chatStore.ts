@@ -1429,6 +1429,15 @@ function nativeSandboxLaunching(state: ConversationState): boolean {
 // past the time any launch is allowed to take.
 const SANDBOX_LAUNCH_MAX_WAIT_MS = 20 * 60_000;
 
+/** Whether a message sent now is held locally for startup rather than posted. */
+function wouldHoldSend(state: ConversationState): boolean {
+  return (
+    modelSelectionPending(state) ||
+    nativeSandboxLaunching(state) ||
+    (state.sessionModelSeeded && state.sessionHarness === null)
+  );
+}
+
 /**
  * Keep the draft local while native model startup or a model switch is pending,
  * or while a native session's sandbox launches.
@@ -2124,8 +2133,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (own.length === 0) return;
     const state = setterForState(conversationId);
     if (state !== null && holdsInitialDraft(state)) return;
-    // During a CLI sandbox launch the first one is held; the rest stay queued behind it.
-    if (state !== null && nativeSandboxLaunching(state)) {
+    // When the first one will be held for startup, the rest stay queued behind it.
+    if (state !== null && wouldHoldSend(state)) {
       s.steerMessage(own[0]!.queueId);
       return;
     }
@@ -2473,11 +2482,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       opts?.reusePendingTempId != null
         ? targetState?.pendingUserMessages.find((p) => p.tempId === opts.reusePendingTempId)
             ?.initialDraft
-        : !skipPendingBubble &&
-            targetState &&
-            (modelSelectionPending(targetState) ||
-              nativeSandboxLaunching(targetState) ||
-              (targetState.sessionModelSeeded && targetState.sessionHarness === null))
+        : !skipPendingBubble && targetState && wouldHoldSend(targetState)
           ? { text, files: files ?? [] }
           : undefined;
     // Non-native sends persist at POST time, so only a native session leaves
