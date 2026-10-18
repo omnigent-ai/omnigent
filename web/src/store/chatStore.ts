@@ -2441,13 +2441,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Nothing may overtake a first message still held for startup: queue behind it.
     if (
       !compacts &&
-      opts?.reusePendingTempId == null &&
+      !opts?.reusePendingTempId &&
       targetState !== null &&
       holdsInitialDraft(targetState)
     ) {
       const target = pinnedId ?? get().conversationId;
       if (opts?.onError !== undefined) {
-        // A queued send's handler puts the original entry back in its place.
+        // Callers with their own failure handling take the message back, e.g. the queue.
         opts.onError("This session is still starting. Try again once it has started.");
       } else if (!opensSideChat && target === get().conversationId) {
         get().enqueueMessage(text, files, opts?.replyDraft);
