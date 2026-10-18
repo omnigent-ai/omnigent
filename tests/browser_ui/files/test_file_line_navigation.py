@@ -327,6 +327,29 @@ def _seed_citation_file(
     )
 
 
+def test_markdown_code_block_creation_keeps_caret(
+    page: Page, seeded_session: BrowserSession
+) -> None:
+    """A newly mounted React code block keeps typing in its editable source."""
+    path = "src/notes.md"
+    _mock_markdown_files(page, seeded_session, {path: "```python\noriginal\n```\n\nTail\n"})
+    viewer = _open_viewer(page, seeded_session, path, {"diffActive": False})
+    editor = viewer.locator(".tiptap")
+    editor.locator("p").last.click()
+    page.keyboard.press("Home")
+    page.keyboard.press("Shift+End")
+    page.keyboard.type("```python")
+    page.keyboard.press("Enter")
+    blocks = editor.locator(".tiptap-code-block")
+    expect(blocks).to_have_count(2)
+    page.keyboard.type("caret stays here")
+    page.keyboard.press("Enter")
+    page.keyboard.type("second line")
+    expect(blocks.last.locator("pre")).to_have_text("caret stays here\nsecond line")
+    expect(blocks.first.locator("pre")).to_have_text("original")
+    assert blocks.last.evaluate("el => el.contains(document.getSelection().anchorNode)")
+
+
 def test_diff_loads_in_parallel_with_workspace_metadata(
     page: Page, seeded_session: BrowserSession
 ) -> None:

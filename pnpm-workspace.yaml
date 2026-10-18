@@ -120,3 +120,6 @@ allowBuilds:
   protobufjs: true
   sharp: true
   workerd: true
+
+patchedDependencies:
+  '@tiptap/react@3.31.4': patches/@tiptap__react@3.31.4.patch
