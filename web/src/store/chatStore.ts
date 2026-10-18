@@ -5627,6 +5627,17 @@ export async function startStreamPump(
     for (const timer of catchupTimers) window.clearTimeout(timer);
     catchupTimers = [];
   };
+  // Re-read status at each catch-up delay while `due()` holds, replacing any prior burst.
+  const scheduleStatusCatchup = (due: () => boolean): void => {
+    if (typeof window === "undefined") return;
+    clearCatchupTimers();
+    catchupTimers = RECONNECT_STATUS_CATCHUP_DELAYS_MS.map((delayMs) =>
+      window.setTimeout(() => {
+        if (controller.signal.aborted || isConversationDisposed(id) || !due()) return;
+        runGuardedStatusReconcile();
+      }, delayMs),
+    );
+  };
   // Consecutive 404s only — reset on any non-404 outcome (success or a
   // different-status failure), so a 404 has to persist across attempts to
   // count toward the cap below.
@@ -5829,27 +5840,14 @@ export async function startStreamPump(
           // settles shortly after reconnect clears in seconds. Guarded +
           // idempotent, and scoped to the active conversation by
           // reconcileActiveSessionStatus itself.
-          if (typeof window !== "undefined") {
-            // Cancel any prior burst so recurring reconnects don't accumulate
-            // timers on the long-lived controller.
-            clearCatchupTimers();
-            catchupTimers = RECONNECT_STATUS_CATCHUP_DELAYS_MS.map((delayMs) =>
-              window.setTimeout(() => {
-                if (controller.signal.aborted || isConversationDisposed(id)) return;
-                runGuardedStatusReconcile();
-              }, delayMs),
-            );
-          }
-        } else if (typeof window !== "undefined") {
+          scheduleStatusCatchup(() => true);
+        } else {
           // A launch's `ready` sent before this first open subscribed is in no snapshot
-          // read yet, so re-read once the open settles if the launch still shows.
-          catchupTimers = [
-            window.setTimeout(() => {
-              if (controller.signal.aborted || isConversationDisposed(id)) return;
-              const launch = get().sandboxStatus;
-              if (launch !== null && launch.stage !== "failed") runGuardedStatusReconcile();
-            }, RECONNECT_STATUS_CATCHUP_DELAYS_MS[0]),
-          ];
+          // read yet, so re-read over the next ~20 s while the launch still shows.
+          scheduleStatusCatchup(() => {
+            const launch = get().sandboxStatus;
+            return launch !== null && launch.stage !== "failed";
+          });
         }
         let reason = await pumpPromise;
 

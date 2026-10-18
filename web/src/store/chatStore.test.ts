@@ -4077,13 +4077,13 @@ describe("chatStore — first message during native model startup", () => {
     begin();
     await vi.advanceTimersByTimeAsync(0);
     reportModel();
-    await vi.advanceTimersByTimeAsync(0);
+    // The 3 s re-read still sees the launch, as one dropped for a racing event would.
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(eventBodies()).toEqual([]);
 
     // A `ready` sent between the page's first snapshot and its stream subscribing.
     sandboxStage = null;
-    await vi.advanceTimersByTimeAsync(2_000);
-    expect(eventBodies()).toEqual([]);
-    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(5_000);
 
     expect(eventBodies()).toEqual([
       {
