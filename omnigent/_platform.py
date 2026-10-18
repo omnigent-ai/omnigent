@@ -163,11 +163,8 @@ def is_wsl() -> bool:
 #:   ``expanduser("~")`` resolve (the Windows analog of POSIX ``HOME``).
 #: - ``APPDATA`` / ``LOCALAPPDATA`` are where Windows apps (keyring, pip, npm,
 #:   …) keep per-user config and cache.
-#: - ``PROGRAMDATA``: Win32-OpenSSH resolves ``%ProgramData%\ssh`` at startup;
-#:   without it ssh / ssh-keygen / ssh-add exit 255 silently, breaking git over SSH.
-#: - ``PROGRAMFILES`` / ``PROGRAMFILES(X86)`` locate tools like MSVC's vswhere
-#:   (x86 first, then native); ``PROGRAMW6432`` is the 64-bit Program Files
-#:   path needed by 32-bit WOW64 children.
+#: - ``PROGRAMDATA``: Win32-OpenSSH reads ``%ProgramData%\ssh``; without it ssh,
+#:   ssh-keygen and ssh-add exit 255 silently, breaking git over SSH.
 #: - The rest let a Windows process and shell resolve binaries normally.
 #:
 #: All are path/identity constants, not credentials — consistent with POSIX
@@ -189,9 +186,6 @@ WINDOWS_ENV_PASSTHROUGH: tuple[str, ...] = (
     "APPDATA",
     "LOCALAPPDATA",
     "PROGRAMDATA",
-    "PROGRAMFILES",
-    "PROGRAMFILES(X86)",
-    "PROGRAMW6432",
 )
 
 

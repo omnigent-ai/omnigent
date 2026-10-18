@@ -568,7 +568,7 @@ def test_helper_env_keeps_systemroot_so_child_can_import_asyncio() -> None:
 
 
 @pytest.mark.parametrize("env_filter", ["agent", "runner", "helper"])
-def test_windows_program_paths_survive_env_filters(env_filter: str) -> None:
+def test_programdata_survives_env_filters(env_filter: str) -> None:
     from omnigent.host.connect import _build_runner_env
     from omnigent.inner.agent_env import clean_agent_env
     from omnigent.inner.os_env import build_helper_env
@@ -578,9 +578,6 @@ def test_windows_program_paths_survive_env_filters(env_filter: str) -> None:
         "PATH": r"C:\Windows\System32",
         "SYSTEMROOT": r"C:\Windows",
         "PROGRAMDATA": r"C:\ProgramData",
-        "PROGRAMFILES": r"C:\Program Files",
-        "PROGRAMFILES(X86)": r"C:\Program Files (x86)",
-        "PROGRAMW6432": r"C:\Program Files",
         "SOME_SECRET_TOKEN": "x",
     }
     if env_filter == "agent":
@@ -605,8 +602,7 @@ def test_windows_program_paths_survive_env_filters(env_filter: str) -> None:
         )
         env = build_helper_env(source, policy)
 
-    for name in ("PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432"):
-        assert env[name] == source[name]
+    assert env["PROGRAMDATA"] == source["PROGRAMDATA"]
     assert "SOME_SECRET_TOKEN" not in env
 
 
