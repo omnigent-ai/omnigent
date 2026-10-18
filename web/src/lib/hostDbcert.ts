@@ -1,16 +1,12 @@
 /**
  * dbcert on a session's host (Databricks-internal). Arca boxes and managed
  * Arclets hold a copy of the laptop's corp certificate, which Arca Companion
- * syncs; tools that call internal services fail once it expires. These
- * helpers read and renew it through the session's environment shell.
+ * syncs, and a laptop host has its own; tools that call internal services
+ * fail once it expires. These helpers read and renew it through the
+ * session's environment shell, on any host that has one.
  */
 
-import type { Host } from "@/hooks/useHosts";
-import { isArcaHost } from "@/lib/arcaHost";
 import { authenticatedFetch } from "@/lib/identity";
-
-/** Managed Arclet hosts are named `omnigent-arclet-<session>`. */
-const ARCLET_HOST_PREFIX = "omnigent-arclet-";
 
 /** Prints `notAfter=<date>` for the host's dbcert, or `none` without one. */
 export const DBCERT_EXPIRY_COMMAND =
@@ -20,10 +16,12 @@ export const DBCERT_EXPIRY_COMMAND =
  * Starts `dbcert` on the host and returns at once, because its browser sign-in
  * outlasts the server's shell-proxy timeout. On Arca, dbcert opens the sign-in
  * on the laptop through Arca Companion. `flock` stops a second click from
- * starting a second sign-in, and `timeout` ends an abandoned one.
+ * starting a second sign-in, and `timeout` ends an abandoned one. Exits 1 at
+ * once on hosts missing any of these tools (e.g. macOS), so the banner can
+ * point to Arca Companion instead of waiting out the timeout.
  */
 export const DBCERT_REFRESH_COMMAND =
-  'setsid flock -n "${TMPDIR:-/tmp}/omnigent-dbcert-refresh.lock" timeout 300 dbcert --caller-name omnigent </dev/null >/dev/null 2>&1 &';
+  'for c in dbcert setsid flock timeout; do command -v "$c" >/dev/null || exit 1; done; setsid flock -n "${TMPDIR:-/tmp}/omnigent-dbcert-refresh.lock" timeout 300 dbcert --caller-name omnigent </dev/null >/dev/null 2>&1 &';
 
 /** How long a host-side sign-in may take: the `timeout` above. */
 export const HOST_DBCERT_REFRESH_MS = 300_000;
@@ -31,14 +29,6 @@ export const HOST_DBCERT_REFRESH_MS = 300_000;
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 // openssl prints e.g. `notAfter=Oct 18 20:08:15 2026 GMT`, space-padding the day.
 const NOT_AFTER_RE = /^notAfter=([A-Z][a-z]{2}) +(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) (\d{4}) GMT$/;
-
-/** Whether *host* is an Arca box or a managed Arclet, which carry a dbcert. */
-export function isDbcertHost(
-  host: Pick<Host, "host_id" | "name">,
-  storedArcaHostId: string | null,
-): boolean {
-  return isArcaHost(host, storedArcaHostId) || host.name.startsWith(ARCLET_HOST_PREFIX);
-}
 
 /**
  * Parse {@link DBCERT_EXPIRY_COMMAND} output.

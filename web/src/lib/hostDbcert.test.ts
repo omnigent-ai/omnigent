@@ -3,7 +3,6 @@ import { authenticatedFetch } from "@/lib/identity";
 import {
   DBCERT_EXPIRY_COMMAND,
   DBCERT_REFRESH_COMMAND,
-  isDbcertHost,
   parseDbcertExpiry,
   readHostDbcertExpiry,
   startHostDbcertRefresh,
@@ -38,17 +37,6 @@ describe("parseDbcertExpiry", () => {
     expect(parseDbcertExpiry("none\n")).toBeNull();
     expect(parseDbcertExpiry("unable to load certificate")).toBeUndefined();
     expect(parseDbcertExpiry("notAfter=Foo 18 20:08:15 2026 GMT")).toBeUndefined();
-  });
-});
-
-describe("isDbcertHost", () => {
-  it("matches Arca boxes and managed Arclets only", () => {
-    expect(isDbcertHost({ host_id: "a", name: "jackson's arca" }, null)).toBe(true);
-    expect(isDbcertHost({ host_id: "b", name: "omnigent-arclet-891349936145720" }, null)).toBe(
-      true,
-    );
-    expect(isDbcertHost({ host_id: "c", name: "laptop" }, "c")).toBe(true);
-    expect(isDbcertHost({ host_id: "d", name: "laptop" }, null)).toBe(false);
   });
 });
 

@@ -4,7 +4,7 @@ import { useHostDbcert } from "@/hooks/useHostDbcert";
 import { cn } from "@/lib/utils";
 
 /**
- * Warns that the dbcert on this session's Arca or Arclet host has expired and
+ * Warns that the dbcert on this session's host has expired and
  * offers a one-click refresh (see `useHostDbcert`). Styled like
  * `StreamBudgetBanner` and stacked with it in a `FloatingBannerStack`.
  * Dismissable per expired certificate.

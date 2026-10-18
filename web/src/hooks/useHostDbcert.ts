@@ -1,10 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useHosts } from "@/hooks/useHosts";
 import { useNowSelector } from "@/hooks/useNow";
-import { readArcaHostId } from "@/lib/arcaHost";
+import { isDatabricksWorkspace } from "@/lib/host";
 import {
   HOST_DBCERT_REFRESH_MS,
-  isDbcertHost,
   readHostDbcertExpiry,
   startHostDbcertRefresh,
 } from "@/lib/hostDbcert";
@@ -22,7 +21,7 @@ const LAPTOP_SYNC_WAIT_MS = 2 * 60_000;
 export type DbcertRefreshPhase = "idle" | "running" | "failed";
 
 /**
- * Track the dbcert on the session's Arca or Arclet host and renew it. In the
+ * Track the dbcert on the session's host, if it has one, and renew it. In the
  * desktop app a refresh renews the laptop's dbcert, which Arca Companion copies
  * to every box; elsewhere it renews the host's own copy.
  */
@@ -30,16 +29,16 @@ export function useHostDbcert(
   conversationId: string | null | undefined,
   hostId: string | null | undefined,
 ) {
+  // dbcert is Databricks-internal, so only Databricks deployments ask hosts for one.
+  const onDatabricks = isDatabricksWorkspace();
   // Arclets are server-managed sandbox hosts, which the default host list hides.
   const { data: hosts } = useHosts({
     includeSandbox: true,
-    enabled: Boolean(conversationId && hostId),
+    enabled: onDatabricks && Boolean(conversationId && hostId),
   });
   const host = hosts?.find((candidate) => candidate.host_id === hostId);
   const sessionId =
-    conversationId && host?.status === "online" && isDbcertHost(host, readArcaHostId())
-      ? conversationId
-      : null;
+    onDatabricks && conversationId && host?.status === "online" ? conversationId : null;
   const [cert, setCert] = useState<{ sessionId: string; expiresAt: number } | null>(null);
   const expiresAt = cert?.sessionId === sessionId ? cert.expiresAt : null;
   const expired = useNowSelector((now) => expiresAt !== null && expiresAt <= now.getTime(), {

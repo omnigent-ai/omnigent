@@ -1,6 +1,8 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DbcertBanner } from "./DbcertBanner";
+import type * as HostModule from "@/lib/host";
+import { isDatabricksWorkspace } from "@/lib/host";
 import type * as HostDbcertModule from "@/lib/hostDbcert";
 import { readHostDbcertExpiry, startHostDbcertRefresh } from "@/lib/hostDbcert";
 
@@ -26,6 +28,10 @@ vi.mock("@/hooks/useHosts", () => ({
 vi.mock("@/hooks/useNow", () => ({
   useNowSelector: (select: (now: Date) => boolean) => select(new Date()),
 }));
+vi.mock("@/lib/host", async (importOriginal) => ({
+  ...(await importOriginal<typeof HostModule>()),
+  isDatabricksWorkspace: vi.fn(),
+}));
 vi.mock("@/lib/hostDbcert", async (importOriginal) => ({
   ...(await importOriginal<typeof HostDbcertModule>()),
   readHostDbcertExpiry: vi.fn(),
@@ -45,6 +51,7 @@ beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(NOW);
   state.hosts = [{ host_id: "arca", name: "jackson's arca", status: "online" }];
+  vi.mocked(isDatabricksWorkspace).mockReset().mockReturnValue(true);
   vi.mocked(readHostDbcertExpiry).mockReset().mockResolvedValue(EXPIRED);
   vi.mocked(startHostDbcertRefresh).mockReset().mockResolvedValue(true);
   delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
@@ -91,8 +98,15 @@ describe("DbcertBanner", () => {
     ).toBeTruthy();
   });
 
-  it("never asks hosts that aren't an Arca box or Arclet", async () => {
-    state.hosts = [{ host_id: "arca", name: "laptop", status: "online" }];
+  it("warns on any host with an expired dbcert, whatever its name", async () => {
+    state.hosts = [{ host_id: "arca", name: "ip-10-90-21-195", status: "online" }];
+    renderBanner();
+    await settle();
+    expect(screen.getByText(/The dbcert on ip-10-90-21-195 has expired/)).toBeTruthy();
+  });
+
+  it("never asks hosts outside a Databricks deployment", async () => {
+    vi.mocked(isDatabricksWorkspace).mockReturnValue(false);
     renderBanner();
     await settle();
     expect(readHostDbcertExpiry).not.toHaveBeenCalled();
