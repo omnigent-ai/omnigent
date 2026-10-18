@@ -49,6 +49,37 @@ def test_carries_only_recognized_omnigent_sys_tool_approvals() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("assignments", "expected"),
+    [
+        (['"approve"', '"auto"'], []),
+        (['"approve"', '"invented"'], []),
+        (['"prompt"', '"approve"'], [f'{_TOOL}="approve"']),
+        (['"approve"', '"prompt"'], [f'{_TOOL}="prompt"']),
+    ],
+)
+def test_later_assignment_of_the_same_key_wins(
+    assignments: list[str], expected: list[str]
+) -> None:
+    """Only the final Codex assignment for a tool decides what is carried."""
+    args = [arg for value in assignments for arg in ("-c", f"{_TOOL}={value}")]
+    assert codex_mcp_tool_approval_overrides(args) == expected
+
+
+@pytest.mark.parametrize(
+    "parent_assignment",
+    [
+        'mcp_servers.omnigent.tools.sys_session_send={approval_mode="prompt"}',
+        "mcp_servers.omnigent.tools={}",
+        'mcp_servers.omnigent={command="python"}',
+    ],
+)
+def test_later_parent_table_assignment_drops_earlier_approvals(parent_assignment: str) -> None:
+    """A parent-table override replaces the tool table, so no approval survives it."""
+    args = ["-c", f'{_TOOL}="approve"', "-c", parent_assignment]
+    assert codex_mcp_tool_approval_overrides(args) == []
+
+
 def test_no_implicit_approvals_when_args_are_empty_or_truncated() -> None:
     """A missing or empty launch set grants nothing."""
     assert codex_mcp_tool_approval_overrides(None) == []

@@ -3873,11 +3873,7 @@ def build_codex_native_server(
         pinned_model = codex_spawn_model(databricks.model) or databricks.model
     if extra_config_overrides:
         config_overrides.extend(extra_config_overrides)
-    # A persisted session can pre-approve Omnigent tools through Codex's MCP
-    # approval tables. The TUI reads those launch args directly, but this
-    # app-server only sees ``config_overrides``, so carry the explicit
-    # Omnigent approvals across or a web-driven orchestrator stops on a
-    # redundant approval prompt.
+    # The --remote TUI's launch args do not configure this app-server's MCP tools.
     config_overrides.extend(codex_mcp_tool_approval_overrides(terminal_launch_args))
     if bypass_sandbox:
         # Mirror the --remote TUI's --dangerously-bypass-approvals-and-sandbox
@@ -4812,7 +4808,7 @@ def codex_mcp_tool_approval_overrides(
     :returns: ``-c`` assignment strings for :func:`build_codex_native_server`.
     """
     args = canonical_codex_launch_args(terminal_launch_args or ())
-    overrides: list[str] = []
+    modes: dict[str, str | None] = {}
     index = 0
     while index < len(args):
         arg = args[index]
@@ -4827,14 +4823,17 @@ def codex_mcp_tool_approval_overrides(
         if assignment is not None:
             key, _, raw_value = assignment.partition("=")
             key = key.strip()
-            mode = _codex_config_string(raw_value)
-            if (
-                re.fullmatch(r"mcp_servers\.omnigent\.tools\.sys_[a-z_]+\.approval_mode", key)
-                and mode in {"approve", "prompt", "deny"}
-            ):
-                overrides.append(f"{key}={json.dumps(mode)}")
+            # Codex applies overrides in order: a later key or parent-table assignment wins.
+            for tracked_key in [tracked for tracked in modes if tracked.startswith(f"{key}.")]:
+                del modes[tracked_key]
+            if re.fullmatch(r"mcp_servers\.omnigent\.tools\.sys_[a-z_]+\.approval_mode", key):
+                modes[key] = _codex_config_string(raw_value)
         index += 1
-    return overrides
+    return [
+        f"{key}={json.dumps(mode)}"
+        for key, mode in modes.items()
+        if mode in {"approve", "prompt", "deny"}
+    ]
 
 
 def _codex_resume_permission_params(terminal_launch_args: Sequence[str] | None) -> CodexParams:
