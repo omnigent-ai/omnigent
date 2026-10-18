@@ -209,6 +209,24 @@ _SESSION_WRAPPER_LABEL_KEY = "omnigent.wrapper"
 _ASK_GATE_DELIVERY_READ_TIMEOUT_S: float = 86400.0
 _ASK_GATE_DELIVERY_TIMEOUT = httpx.Timeout(_ASK_GATE_DELIVERY_READ_TIMEOUT_S, connect=30.0)
 
+# Cover the default 150 s worktree RPC + 30 s host launch wait, while
+# reporting a timeout before the native relay's 300 s tool-call limit.
+_SESSION_CREATE_TIMEOUT = httpx.Timeout(240.0, connect=10.0)
+
+
+def _session_create_timeout_error(exc: httpx.TimeoutException) -> str:
+    """Error for a create whose outcome is unknown: the server may still finish it."""
+    return json.dumps(
+        {
+            "error": (
+                f"sys_session_create timed out after {_SESSION_CREATE_TIMEOUT.read:g} s "
+                f"({type(exc).__name__}). The child may still have been created; "
+                "check sys_session_list before retrying."
+            )
+        }
+    )
+
+
 # Read timeouts for the two MCP-proxy hops that carry a tool call back to the
 # runner (runner → Omnigent server → runner). ``sys_os_shell`` accepts caller-provided
 # timeouts, so these must sit above the runner's execution timeout rather than
@@ -3528,9 +3546,13 @@ async def _execute_session_create(
         reasoning_effort=args.get("reasoning_effort"),
     )
     try:
-        resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
+        resp = await server_client.post("/v1/sessions", json=body, timeout=_SESSION_CREATE_TIMEOUT)
+    except httpx.TimeoutException as exc:
+        return _session_create_timeout_error(exc)
     except Exception as exc:  # noqa: BLE001
-        return json.dumps({"error": f"sys_session_create failed: {exc}"})
+        return json.dumps(
+            {"error": f"sys_session_create failed: {str(exc) or type(exc).__name__}"}
+        )
     if resp.status_code == 404:
         return json.dumps({"error": "agent_not_found", "agent_id": agent_id})
     if resp.status_code in (401, 403):
@@ -3697,10 +3719,14 @@ async def _upload_config_bundle(
             "/v1/sessions",
             data={"metadata": json.dumps(metadata)},
             files={"bundle": (f"{source.name}.tar.gz", bundle_bytes, "application/gzip")},
-            timeout=60.0,
+            timeout=_SESSION_CREATE_TIMEOUT,
         )
+    except httpx.TimeoutException as exc:
+        return _session_create_timeout_error(exc)
     except Exception as exc:  # noqa: BLE001
-        return json.dumps({"error": f"sys_session_create failed: {exc}"})
+        return json.dumps(
+            {"error": f"sys_session_create failed: {str(exc) or type(exc).__name__}"}
+        )
     if resp.status_code in (401, 403):
         return json.dumps({"error": "access_denied", "config_path": config_path})
     if resp.status_code >= 400:
