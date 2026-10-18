@@ -4137,6 +4137,52 @@ describe("chatStore — first message during native model startup", () => {
     expect(sentTexts()).toEqual([original, "follow-up"]);
   });
 
+  it.each(["send now", "steer all", "direct send"] as const)(
+    "keeps a follow-up (%s) behind a held first message whose upload is slow",
+    async (entry) => {
+      harness = "codex-native";
+      sandboxStage = "provisioning";
+      const file = new File(["notes"], "notes.txt", { type: "text/plain" });
+      const respond = fetchMock.getMockImplementation()!;
+      let releaseUpload!: () => void;
+      fetchMock.mockImplementation((input, init) => {
+        if (String(input).endsWith("/resources/files")) {
+          return new Promise<Response>((resolve) => {
+            releaseUpload = () => resolve(mockResponse({ id: "file_uploaded" }));
+          });
+        }
+        return respond(input, init);
+      });
+      const sentTexts = () =>
+        eventBodies().map(
+          (body) =>
+            (body.data.content as { type: string; text?: string }[]).find(
+              (block) => block.type === "input_text",
+            )?.text,
+        );
+      vi.useFakeTimers();
+      begin([file]);
+      await vi.advanceTimersByTimeAsync(0);
+      if (entry === "direct send") {
+        void useChatStore.getState().send("follow-up", "agent_xyz");
+      } else {
+        useChatStore.getState().enqueueMessage("follow-up", undefined);
+        const [queued] = useChatStore.getState().queuedMessages;
+        if (entry === "send now") useChatStore.getState().steerMessage(queued!.queueId);
+        else useChatStore.getState().steerAllQueuedMessages(sessionId);
+      }
+      // Past the send chain's own bound, then the first message starts uploading.
+      await vi.advanceTimersByTimeAsync(4 * 60_000);
+      reportSandbox("ready");
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(sentTexts()).toEqual([]);
+
+      releaseUpload();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(sentTexts()).toEqual([original, "follow-up"]);
+    },
+  );
+
   it("abandons the waiting send when its conversation is disposed", async () => {
     begin();
     await settle();

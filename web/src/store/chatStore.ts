@@ -409,6 +409,39 @@ export function holdsInitialDraft(state: Pick<ConversationState, "pendingUserMes
 }
 
 /**
+ * Wait until no message sent before `tempId` is still held for startup.
+ *
+ * The send chain gives up on a prior send after SEND_CHAIN_MAX_WAIT_MS, which a
+ * startup hold can outlast; waiting here first makes that bound count from the
+ * earlier message's dispatch, whichever path this send came from.
+ */
+function waitForEarlierHeldMessages(conversationId: string | null, tempId: string): Promise<void> {
+  const earlierHeld = (): boolean => {
+    const state =
+      conversationId === null ? undefined : conversationRegistry.peek(conversationId)?.getState();
+    if (state === undefined) return false;
+    const own = state.pendingUserMessages.findIndex((message) => message.tempId === tempId);
+    const earlier =
+      own === -1 ? state.pendingUserMessages : state.pendingUserMessages.slice(0, own);
+    return holdsInitialDraft({ pendingUserMessages: earlier });
+  };
+  if (!earlierHeld()) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => {
+      unsubscribe();
+      unsubscribeDisposed();
+      resolve();
+    };
+    const unsubscribe = conversationRegistry.subscribe((id) => {
+      if (id === conversationId && !earlierHeld()) done();
+    });
+    const unsubscribeDisposed = conversationRegistry.subscribeDisposed((id) => {
+      if (id === conversationId) done();
+    });
+  });
+}
+
+/**
  * Hydrate a client-only conversation onto its real server id once
  * `createSession` returns: rekey the registry entry (carrying the optimistic
  * bubble), the send chain, and the sidebar row from `tempConvId` to `realId`;
@@ -2535,6 +2568,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
     inFlightSends.set(stableId, false);
     try {
+      await waitForEarlierHeldMessages(submitConversationId, tempId);
       await waitForPrior();
       if (initialDraft && !initialSendPending()) return;
       // `rekey` runs INSIDE the call, the moment `createSession` returns and
@@ -2832,6 +2866,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     let postedSessionId: string | null = null;
 
     try {
+      await waitForEarlierHeldMessages(submitConversationId, tempId);
       await waitForPrior();
       // See `send`: rekey inside the call, before the new id is visible.
       const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);

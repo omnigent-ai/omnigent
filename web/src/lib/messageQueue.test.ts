@@ -57,6 +57,8 @@ describe("shouldQueueSend", () => {
     // idle edge during startup must not let a later send overtake it either.
     expect(shouldQueueSend("conv_a", "streaming", "idle", [], true, false, true)).toBe(true);
     expect(shouldQueueSend("conv_a", "idle", "idle", [], false, false, true)).toBe(true);
+    // A native /side forks the agent's thread, which doesn't exist yet either.
+    expect(shouldQueueSend("conv_a", "streaming", "idle", [], false, true, true)).toBe(true);
   });
 
   it("sends directly for a /side command even while busy or with a queued message", () => {

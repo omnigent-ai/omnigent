@@ -14,9 +14,9 @@ export function shouldQueueSend(
   holdsFirstMessage = false,
 ): boolean {
   if (conversationId === null) return false;
+  if (holdsFirstMessage) return true;
   if (opensSideChat) return false;
   const hasQueued = queuedMessages.some((m) => m.conversationId === conversationId);
-  if (holdsFirstMessage) return true;
   if (alwaysSteer) return hasQueued;
   const isBusy = status === "streaming" || sessionStatus === "running";
   return isBusy || hasQueued;
