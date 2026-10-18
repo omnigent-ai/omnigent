@@ -19,7 +19,7 @@ import {
   sortConversations,
   STATUS_BUCKETS,
   statusBucket,
-  updatedBucket,
+  dateBucket,
 } from "./sidebarNav";
 
 function conversation(
@@ -696,18 +696,18 @@ describe("statusBucket", () => {
   });
 });
 
-describe("updatedBucket", () => {
+describe("dateBucket", () => {
   const now = new Date(2026, 8, 30, 10, 0);
   const at = (date: Date) => date.getTime() / 1000;
   it("buckets by local calendar day", () => {
-    expect(updatedBucket(at(new Date(2026, 8, 30, 0, 0)), now)).toBe("Today");
-    expect(updatedBucket(at(new Date(2026, 8, 29, 23, 59)), now)).toBe("Yesterday");
-    expect(updatedBucket(at(new Date(2026, 8, 29, 0, 0)), now)).toBe("Yesterday");
-    expect(updatedBucket(at(new Date(2026, 8, 28, 23, 59)), now)).toBe("Previous 7 days");
-    expect(updatedBucket(at(new Date(2026, 8, 23, 0, 0)), now)).toBe("Previous 7 days");
-    expect(updatedBucket(at(new Date(2026, 8, 22, 23, 59)), now)).toBe("Previous 30 days");
-    expect(updatedBucket(at(new Date(2026, 7, 31, 0, 0)), now)).toBe("Previous 30 days");
-    expect(updatedBucket(at(new Date(2026, 7, 30, 23, 59)), now)).toBe("Older");
+    expect(dateBucket(at(new Date(2026, 8, 30, 0, 0)), now)).toBe("today");
+    expect(dateBucket(at(new Date(2026, 8, 29, 23, 59)), now)).toBe("yesterday");
+    expect(dateBucket(at(new Date(2026, 8, 29, 0, 0)), now)).toBe("yesterday");
+    expect(dateBucket(at(new Date(2026, 8, 28, 23, 59)), now)).toBe("in the last 7 days");
+    expect(dateBucket(at(new Date(2026, 8, 23, 0, 0)), now)).toBe("in the last 7 days");
+    expect(dateBucket(at(new Date(2026, 8, 22, 23, 59)), now)).toBe("in the last 30 days");
+    expect(dateBucket(at(new Date(2026, 7, 31, 0, 0)), now)).toBe("in the last 30 days");
+    expect(dateBucket(at(new Date(2026, 7, 30, 23, 59)), now)).toBe("earlier");
   });
 });
 
@@ -736,6 +736,14 @@ describe("groupConversations", () => {
     expect(groups.map((g) => [g.title, g.conversations.map((c) => c.id)])).toEqual([
       ["Working", ["a"]],
       ["Done", ["b"]],
+    ]);
+  });
+
+  it("retains an empty Working group in status order", () => {
+    const done = conversation("done", "Done", new Date(2026, 0, 1));
+    expect(groupConversations([done], () => "Done", STATUS_BUCKETS, "Working")).toEqual([
+      { title: "Working", conversations: [] },
+      { title: "Done", conversations: [done] },
     ]);
   });
 });

@@ -9,8 +9,9 @@ state the native runtime needs to resume.
 
 Every bridge dir carries an ``owner.pid`` marker naming the process that
 prepared it. The marker is refreshed on every turn's bridge prep. The sweep
-considers dirs whose owner is provably dead while leaving live and unmarked
-dirs alone; harnesses may apply an additional retention policy.
+considers dirs whose owner is provably dead while leaving live dirs alone;
+harnesses may apply an additional retention policy, which also decides
+whether an unmarked dir is reclaimable.
 
 This module factors the marker write and the per-root sweep so all five
 harnesses share one implementation (the per-harness modules only supply their
@@ -105,16 +106,18 @@ def prune_orphaned_dirs(
     preparation, so cleanup either finishes before preparation begins or skips
     the actively prepared directory. The final marker reread remains as a
     conservative guard against uncoordinated marker writers.
-    Dirs with no marker (or an unparseable one) are left untouched: they are
-    either from an older version or not ours.
+    A dir with no marker predates the marker or never had a bridge prepared,
+    so there is no owner to prove dead: it is removed only when *should_prune*
+    accepts it, and kept when the harness has no retention policy. A dir with
+    an unparseable marker is always kept.
 
     Reuses ``inner/terminal.py:_process_alive`` as the liveness predicate.
 
     :param bridge_root: The harness's bridge root, e.g.
         ``~/.omnigent/codex-native``.
     :param should_prune: Optional harness-specific eligibility predicate called
-        only after the owner is proven dead. ``None`` removes every dead-owner
-        directory.
+        once the owner is proven dead or the marker is missing. ``None`` removes
+        every dead-owner directory and keeps every unmarked one.
     :returns: The number of orphaned bridge dirs removed.
     """
     if not bridge_root.exists():
@@ -130,11 +133,16 @@ def prune_orphaned_dirs(
             if not acquired:
                 continue
             marker = entry / OWNER_PID_FILENAME
+            pid: int | None
             try:
                 pid = int(marker.read_text(encoding="utf-8").strip())
+            except FileNotFoundError:
+                pid = None
             except (OSError, ValueError):
                 continue
-            if _process_alive(pid):
+            if pid is None and should_prune is None:
+                continue
+            if pid is not None and _process_alive(pid):
                 continue
             if should_prune is not None:
                 try:
@@ -144,11 +152,16 @@ def prune_orphaned_dirs(
                     continue
                 if not eligible:
                     continue
+            confirmed_pid: int | None
             try:
                 confirmed_pid = int(marker.read_text(encoding="utf-8").strip())
+            except FileNotFoundError:
+                confirmed_pid = None
             except (OSError, ValueError):
                 continue
-            if confirmed_pid != pid or _process_alive(confirmed_pid):
+            if confirmed_pid != pid or (
+                confirmed_pid is not None and _process_alive(confirmed_pid)
+            ):
                 continue
             cache_dir = attachment_cache_dir(entry)
             shutil.rmtree(entry, ignore_errors=True)

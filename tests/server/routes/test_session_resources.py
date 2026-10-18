@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import threading
@@ -4734,7 +4735,30 @@ async def test_relay_dedupes_duplicate_error_persistence_but_forwards_live_frame
 
 
 @pytest.mark.asyncio
-async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error() -> None:
+@pytest.mark.parametrize(
+    "failure_context",
+    [
+        pytest.param(None, id="legacy"),
+        pytest.param("malformed", id="malformed-context"),
+        pytest.param(
+            {
+                "failure_id": "err_synthetic_startup",
+                "failure_source": "native_terminal_start",
+                "exception_type": "RuntimeError",
+                "exception_cause_type": "FileNotFoundError",
+                "native_launch_os_errno": 2,
+                "native_launch_os_errno_name": "ENOENT",
+                "origin": "forged",
+                "exception_message": "private launch path",
+            },
+            id="structured-context",
+        ),
+    ],
+)
+async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error(
+    caplog: pytest.LogCaptureFixture,
+    failure_context: object,
+) -> None:
     """Definitive native terminal failure consumes the user message quickly.
 
     The Omnigent server first asks the runner to ensure the native terminal.
@@ -4755,7 +4779,10 @@ async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error
                     "error": {
                         "code": "native_terminal_start_failed",
                         "message": "Native Claude requires the 'claude' CLI on PATH.",
-                    }
+                    },
+                    **(
+                        {"failure_context": failure_context} if failure_context is not None else {}
+                    ),
                 },
             )
         }
@@ -4797,6 +4824,18 @@ async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error
     assert len(errors) == 1
     assert errors[0].data.code == "native_terminal_start_failed"
     assert errors[0].data.message == "Native Claude requires the 'claude' CLI on PATH."
+    [record] = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "session_turn_failed"
+    ]
+    assert record.attributes["origin"] == "native_terminal_boot_failed"
+    if isinstance(failure_context, dict):
+        assert record.attributes["failure_id"] == failure_context["failure_id"]
+        assert record.attributes["exception_cause_type"] == "FileNotFoundError"
+        assert record.attributes["native_launch_os_errno"] == "2"
+        assert record.attributes["native_launch_os_errno_name"] == "ENOENT"
+        assert "private launch path" not in str(record.attributes)
+    else:
+        assert "failure_id" not in record.attributes
 
 
 @pytest.mark.asyncio
@@ -7616,6 +7655,89 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
         assert attrs["item_id"] == consumed[0]["data"]["item_id"]
         assert attrs["response_id"] == message.response_id == "resp_fail"
         assert attrs["match_method"] == "input_stable_id"
+        assert attrs["cause_class"] == "rejected_before_handoff"
+        assert attrs["reason_code"] == "databricks_sign_in_pending"
+        assert attrs["lifecycle_response_id"] == "resp_fail"
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_turnless_setup_failure_settles_by_stable_id_without_a_second_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    pending_inputs.reset_for_tests()
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    pending_id = pending_inputs.record(
+        session_id,
+        [{"type": "input_text", "text": "set up the worktree"}],
+        created_by="alice@example.com",
+        stable_id=stable_id,
+    )
+    next_pending = pending_inputs.record(
+        session_id,
+        [{"type": "input_text", "text": "then run the tests"}],
+        stable_id="8a4b0d2f6c3e5a7b9d1f2e3c4b5a6d7e",
+    )
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        session_stream, "publish", lambda _session_id, event: published.append(event)
+    )
+    store = _ConversationStore()
+    client = _ScriptedStreamingRunnerClient(
+        [
+            _sse_frame(
+                {
+                    "type": "response.failed",
+                    "input_stable_id": stable_id,
+                    "response": {
+                        "status": "failed",
+                        "error": {
+                            "code": "runner_error",
+                            "message": "turn setup failed",
+                            "undelivered": True,
+                        },
+                    },
+                    "error": {
+                        "code": "runner_error",
+                        "message": "turn setup failed",
+                        "undelivered": True,
+                    },
+                }
+            ),
+            _sse_frame(
+                {
+                    "type": "session.status",
+                    "status": "failed",
+                    "error": {"code": "runner_error", "message": "turn setup failed"},
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    try:
+        await _relay_runner_stream(session_id, client, store)  # type: ignore[arg-type]
+
+        assert [item.type for item in store.appended_items] == ["message"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == [
+            next_pending
+        ]
+        consumed = [event for event in published if event.get("type") == "session.input.consumed"]
+        assert [event["data"]["cleared_pending_id"] for event in consumed] == [pending_id]
+        assert not [event for event in published if event.get("type") == "response.failed"]
+        failed = [
+            event
+            for event in published
+            if event.get("type") == "session.status" and event.get("status") == "failed"
+        ]
+        assert [(event["error"]["code"], event.get("response_id")) for event in failed] == [
+            ("runner_error", None)
+        ]
     finally:
         pending_inputs.reset_for_tests()
 
@@ -7722,6 +7844,118 @@ async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
         assert [item.type for item in store.appended_items] == ["message", "error", "message"]
         assert store.appended_items[-1].data.content == next_content
         assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        await adapter.on_shutdown()
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirror(
+    tmp_path: Path,
+) -> None:
+    """A pre-delivery refusal must not be reported again as a missing message.
+
+    Claude refuses web ``/login`` before touching the terminal. If that failure
+    is not marked undelivered, the input stays pending. The next successful
+    message's transcript mirror skips it and persists a second error with code
+    ``native_prompt_not_recorded``.
+    """
+    from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
+    from omnigent.runtime import pending_inputs
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.routes.sessions import (
+        _persist_external_conversation_item,
+        _relay_runner_stream,
+    )
+    from omnigent.server.schemas import CreateResponseRequest
+
+    pending_inputs.reset_for_tests()
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    store = _ConversationStore()
+    conversation = store.get_conversation(session_id)
+    assert conversation is not None
+    first_stable_id = "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"
+    later_stable_id = "2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b"
+    auth_content = [{"type": "input_text", "text": "/login"}]
+    later_content = [{"type": "input_text", "text": "continue after login"}]
+    first_pending = pending_inputs.record(
+        session_id,
+        auth_content,
+        created_by="alice@example.com",
+        stable_id=first_stable_id,
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: ClaudeNativeExecutor(tmp_path))
+    context = TurnContext(
+        response_id="resp_login_refused",
+        event_queue=asyncio.Queue(),
+        cancelled=asyncio.Event(),
+    )
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            await adapter.run_turn(
+                CreateResponseRequest(model="claude", input=auth_content),
+                context,
+            )
+        refusal = adapter._build_error_detail(raised.value).model_dump(exclude_none=True)
+        failed_turn = _ScriptedStreamingRunnerClient(
+            [
+                _sse_frame(
+                    {
+                        "type": "response.in_progress",
+                        "response": {"id": "resp_login_refused", "model": "claude"},
+                    }
+                ),
+                _sse_frame(
+                    {
+                        "type": "response.failed",
+                        "input_stable_id": first_stable_id,
+                        "response": {
+                            "id": "resp_login_refused",
+                            "model": "claude",
+                            "error": refusal,
+                        },
+                    }
+                ),
+                "data: [DONE]\n\n",
+            ]
+        )
+        await _relay_runner_stream(session_id, failed_turn, store)  # type: ignore[arg-type]
+
+        later_pending = pending_inputs.record(
+            session_id,
+            later_content,
+            created_by="alice@example.com",
+            stable_id=later_stable_id,
+        )
+        await _persist_external_conversation_item(
+            session_id,
+            conversation,
+            SessionEventInput(
+                type="external_conversation_item",
+                data={
+                    "item_type": "message",
+                    "item_data": {"role": "user", "content": later_content},
+                    "response_id": "native_later_turn",
+                    "source_id": "claude:later:0",
+                },
+            ),
+            store,  # type: ignore[arg-type]
+        )
+
+        missing_errors = [
+            (item.data.code, item.data.message)
+            for item in store.appended_items
+            if item.type == "error" and item.data.code == "native_prompt_not_recorded"
+        ]
+        assert missing_errors == [], (
+            "generated 'Web message missing from native transcript': the refused input "
+            f"{first_pending} stayed pending and was reported missing when the later mirror "
+            f"settled {later_pending}; persisted={missing_errors}"
+        )
+        assert refusal.get("undelivered") is True
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == []
+        assert later_pending not in pending_inputs.pending_ids(session_id)
     finally:
         await adapter.on_shutdown()
         pending_inputs.reset_for_tests()
@@ -9343,6 +9577,76 @@ async def test_claude_native_slash_command_drains_its_queued_entry_under_either_
 
         assert [item.type for item in store.appended_items] == ["slash_command"]
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [older]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_top_level_local_command_echo_drains_its_queued_entry(
+    tmp_path: Path,
+) -> None:
+    """A ``/model`` Claude records as a top-level ``local_command`` settles its web entry.
+
+    Only the matching entry drains: an older message and a different queued
+    command keep waiting for their own mirrors.
+    """
+    from omnigent.harnesses.claude_native.bridge import read_transcript_items_since
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "system",
+                "subtype": "local_command",
+                "uuid": "model-echo",
+                "content": (
+                    "<command-name>/model</command-name>"
+                    "<command-message>model</command-message>"
+                    "<command-args>example-model</command-args>"
+                ),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+    assert len(items) == 1
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    older = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
+    pending_inputs.record(sid, [{"type": "input_text", "text": "/model example-model"}])
+    later = pending_inputs.record(sid, [{"type": "input_text", "text": "/effort high"}])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": items[0].item_type,
+            "item_data": items[0].data,
+            "response_id": items[0].response_id,
+            "source_id": items[0].source_id,
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["slash_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            older,
+            later,
+        ]
     finally:
         pending_inputs.reset_for_tests()
 

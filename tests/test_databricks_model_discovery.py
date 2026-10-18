@@ -312,7 +312,7 @@ def test_family_shim_warns_and_delegates_to_the_catalog() -> None:
     assert families == {"opus": "system.ai.claude-opus-5"}
 
 
-def _discover_codex(model_services: list[dict[str, str]]) -> tuple[str, ...]:
+def _discover_codex(model_services: list[dict[str, object]]) -> tuple[str, ...]:
     """Run codex discovery against a canned ``system.ai`` model-services page."""
     from omnigent.models.databricks_model_discovery import discover_databricks_codex_models
 
@@ -327,7 +327,14 @@ def _discover_codex(model_services: list[dict[str, str]]) -> tuple[str, ...]:
     )
 
 
-def test_discover_codex_models_filters_non_codex_and_ranks_curated_first() -> None:
+@pytest.mark.parametrize(
+    "api_types",
+    [None, ["codex/v1/responses"], ["codex/v1/responses", "openai/v1/responses"]],
+    ids=["legacy", "codex-route", "both-routes"],
+)
+def test_discover_codex_models_filters_non_codex_and_ranks_curated_first(
+    api_types: list[str] | None,
+) -> None:
     """Codex discovery keeps only codex-servable ids, curated catalog first.
 
     The listing says what a workspace *can* serve, not which to launch on:
@@ -335,16 +342,19 @@ def test_discover_codex_models_filters_non_codex_and_ranks_curated_first() -> No
     versioned GPT ids newest-first, then the rest — and non-codex families
     (Claude) are dropped entirely.
     """
-    servable = _discover_codex(
-        [
-            {"name": "model-services/system.ai.gpt-5-5"},
-            {"name": "model-services/system.ai.gpt-5-6-luna"},
-            {"name": "model-services/system.ai.gpt-5-6-sol"},
-            {"name": "model-services/system.ai.gpt-6-1"},
-            {"name": "model-services/system.ai.kimi-k2"},
-            {"name": "model-services/system.ai.claude-opus-5"},
-        ]
-    )
+    services: list[dict[str, object]] = [
+        {"name": "model-services/system.ai.gpt-5-5"},
+        {"name": "model-services/system.ai.gpt-5-6-luna"},
+        {"name": "model-services/system.ai.gpt-5-6-sol"},
+        {"name": "model-services/system.ai.gpt-6-1"},
+        {"name": "model-services/system.ai.kimi-k2"},
+        {"name": "model-services/system.ai.glm-9"},
+        {"name": "model-services/system.ai.claude-opus-5"},
+    ]
+    if api_types is not None:
+        for service in services:
+            service["supported_api_types"] = api_types
+    servable = _discover_codex(services)
 
     assert servable == (
         # Curated (cheapest-safe-first) beats a newer non-curated generation.
@@ -355,6 +365,7 @@ def test_discover_codex_models_filters_non_codex_and_ranks_curated_first() -> No
         "system.ai.gpt-6-1",
         # Codex-compatible but unversioned, last.
         "system.ai.kimi-k2",
+        "system.ai.glm-9",
     )
 
 

@@ -1398,12 +1398,13 @@ describe("session.terminal_pending (FLAT envelope)", () => {
 });
 
 describe("session.sandbox_status (FLAT envelope)", () => {
-  it("lifts conversation_id, stage, and error", () => {
+  it("lifts conversation_id, stage, error, and provider", () => {
     const out = parse("session.sandbox_status", {
       type: "session.sandbox_status",
       conversation_id: "conv_abc",
       stage: "cloning",
       error: null,
+      provider: "arclet",
     });
     expect(out).toHaveLength(1);
     const ev = out[0] as SessionSandboxStatusEvent;
@@ -1411,6 +1412,7 @@ describe("session.sandbox_status (FLAT envelope)", () => {
     expect(ev.conversationId).toBe("conv_abc");
     expect(ev.stage).toBe("cloning");
     expect(ev.error).toBeNull();
+    expect(ev.provider).toBe("arclet");
   });
 
   it("carries the failure reason on stage=failed", () => {

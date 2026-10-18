@@ -2,7 +2,7 @@
 
 ``auth.mode == "oidc"`` promises the native loopback sign-in, so the
 desktop can rely on ``POST /auth/native-token`` existing without a probe.
-``auth.native_redirect_uris`` tells the iOS app its redirect is accepted.
+``auth.native_redirect_uris`` tells each mobile app its redirect is accepted.
 """
 
 from __future__ import annotations
@@ -91,7 +91,10 @@ async def test_oidc_manifest_names_mode_and_cookie(
     assert manifest.json()["auth"] == {
         "mode": "oidc",
         "session_cookie": cookie,
-        "native_redirect_uris": ["ai.omnigent.ios:/oauth/callback"],
+        "native_redirect_uris": [
+            "ai.omnigent.android:/oauth/callback",
+            "ai.omnigent.ios:/oauth/callback",
+        ],
     }
     # The promised endpoint is mounted (a bad request, not a 404).
     assert exchange.status_code == 400
