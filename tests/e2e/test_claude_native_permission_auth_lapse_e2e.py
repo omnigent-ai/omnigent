@@ -1,18 +1,8 @@
-"""A held Claude permission prompt survives its hook's bearer lapsing.
+"""A held Claude permission prompt returns to the web after its bearer lapses.
 
-A Claude Code permission prompt can stay open for hours. The ``PermissionRequest``
-hook holds a long-poll for that time, and its bearer can expire before the human
-answers. If the hook cannot mint a replacement at that moment, it used to give
-up for good: the web card disappeared, and the prompt lived only in Claude's
-terminal even after the user signed in again.
-
-The server, runner, Claude CLI, tmux, and hooks all run normally against a
-real accounts-auth server. Only these are arranged:
-
-* the Anthropic responses are scripted;
-* the server's runner-token TTL is shortened so the bearer lapses in a minute;
-* the server is restarted to cut the held poll, as a deploy does;
-* the user's later sign-in is written the way ``omnigent login`` stores it.
+Real server (accounts auth), runner, Claude CLI, tmux, and hooks. Arranged:
+scripted Anthropic responses, a 60s runner-token TTL, a server restart to cut
+the held poll, and a sign-in stored the way ``omnigent login`` stores it.
 """
 
 from __future__ import annotations
@@ -297,8 +287,6 @@ def test_permission_prompt_returns_to_web_after_bearer_lapse(
     print(f"Permission auth-lapse logs: {tmp_path}", flush=True)
 
     server = _AccountsServer(tmp_path)
-    server.start()
-    owner_token = _login(server.url)["token"]
     binding_token = secrets.token_urlsafe(32)
     runner_id = token_bound_runner_id(binding_token)
     # The runner has no user credential: like a managed launch, it mints
@@ -334,6 +322,8 @@ def test_permission_prompt_returns_to_web_after_bearer_lapse(
     tmux: list[str] | None = None
     target = ""
     try:
+        server.start()
+        owner_token = _login(server.url)["token"]
         with httpx.Client(
             base_url=server.url,
             headers={
