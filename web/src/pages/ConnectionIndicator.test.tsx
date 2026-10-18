@@ -134,6 +134,18 @@ describe("ConnectionIndicator", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
+  it("says the session is stopped after an explicit stop — unlike the silent runner_asleep", () => {
+    renderWithContext({ kind: "stopped" }, null);
+    const band = screen.getByTestId("stopped-indicator");
+    expect(band).toHaveTextContent(/session stopped/i);
+    expect(band).toHaveTextContent(/send a message to start it again/i);
+  });
+
+  it("shows the stopped band for terminal-first sessions too", () => {
+    renderWithContext({ kind: "stopped" }, makeCtx());
+    expect(screen.getByTestId("stopped-indicator")).toBeInTheDocument();
+  });
+
   it("shows the passive Connecting… band for a non-terminal-first starting session", () => {
     // A freshly-created regular session whose runner is spinning up gets a
     // muted, non-interactive heartbeat — NOT a banner, NOT a button.

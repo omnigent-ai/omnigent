@@ -4,7 +4,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
 import type { Session } from "@/lib/types";
 import { ApiError } from "@/lib/sessionsApi";
@@ -46,6 +46,7 @@ import {
 import { PINNED_LABEL_KEY, PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "@/shell/sidebarNav";
+import { recordRelaunch, useStoppedSessions } from "@/store/stoppedSessions";
 
 vi.mock("./useSessionUpdatesConnected", () => ({ useSessionUpdatesConnected: vi.fn() }));
 
@@ -744,6 +745,19 @@ describe("useStopAndDeleteConversation cache eviction", () => {
     const rendered = renderHook(() => useStopAndDeleteConversation(), { wrapper });
     return { queryClient, rendered };
   }
+
+  it("drops the session's confirmed-stop marker along with its caches", async () => {
+    onTestFinished(() => useStoppedSessions.setState({ stoppedAt: {}, relaunchSeq: {} }));
+    useStoppedSessions.setState({ stoppedAt: { conv_x: Date.now(), conv_other: Date.now() } });
+    const { rendered } = seedAndDelete();
+
+    rendered.result.current.mutate({ id: "conv_x" });
+    await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
+
+    const { stoppedAt } = useStoppedSessions.getState();
+    expect(stoppedAt.conv_x).toBeUndefined();
+    expect(stoppedAt.conv_other).toEqual(expect.any(Number));
+  });
 
   it("removes the deleted row from every cached list variant in place", async () => {
     const { queryClient, rendered } = seedAndDelete();
@@ -2061,6 +2075,60 @@ describe("fetchPinnedConversations filter-honored detection", () => {
 });
 
 describe("useStopSession invalidation", () => {
+  beforeEach(() => {
+    useStoppedSessions.setState({ stoppedAt: {}, relaunchSeq: {} });
+  });
+
+  it('records the confirmed stop so the open view can say "stopped"', async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ queued: false }));
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+
+    const { result } = renderHook(() => useStopSession(), { wrapper });
+    result.current.mutate("conv_x");
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(useStoppedSessions.getState().stoppedAt.conv_x).toEqual(expect.any(Number));
+  });
+
+  it("does NOT record a stop the server rejected", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 503 }));
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+
+    const { result } = renderHook(() => useStopSession(), { wrapper });
+    result.current.mutate("conv_x");
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    expect(useStoppedSessions.getState().stoppedAt.conv_x).toBeUndefined();
+  });
+
+  it("does not re-mark a session a send relaunched while the stop was in flight", async () => {
+    // Stop completes server-side, a message relaunches the session, and the Stop
+    // response arrives last — the late marker captured at stop time must back off.
+    fetchMock.mockImplementationOnce(() => {
+      recordRelaunch("conv_x");
+      return Promise.resolve(mockResponse({ queued: false }));
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+
+    const { result } = renderHook(() => useStopSession(), { wrapper });
+    result.current.mutate("conv_x");
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(useStoppedSessions.getState().stoppedAt.conv_x).toBeUndefined();
+  });
+
   it("invalidates the conversations list AND the per-session snapshot", async () => {
     // The endpoint answers POST /v1/sessions/{id}/events → {queued:false}.
     fetchMock.mockResolvedValueOnce(mockResponse({ queued: false }));
@@ -2355,6 +2423,10 @@ describe("useBulkStopSessions", () => {
       expect(JSON.parse(init.body as string)).toEqual({ type: "stop_session", data: {} });
     }
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
+    // Each stopped session's own snapshot must be refreshed too, or a stale
+    // per-session read clobbers the now-stopped state in the header merge.
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["session", "conv_a"] });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["session", "conv_b"] });
   });
 
   it("throws with failed ids when some stops fail", async () => {
@@ -2373,6 +2445,24 @@ describe("useBulkStopSessions", () => {
       succeeded: ["conv_a"],
       total: 2,
     });
+  });
+
+  it("records stop markers only for the sessions whose stop landed", async () => {
+    useStoppedSessions.setState({ stoppedAt: {}, relaunchSeq: {} });
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ queued: false }))
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 503 }));
+
+    const { invalidateSpy, rendered } = renderBulkStopHook();
+    rendered.result.current.mutate(["conv_a", "conv_b"]);
+    await waitFor(() => expect(rendered.result.current.isError).toBe(true));
+
+    const { stoppedAt } = useStoppedSessions.getState();
+    expect(stoppedAt.conv_a).toEqual(expect.any(Number));
+    expect(stoppedAt.conv_b).toBeUndefined();
+    // Only the session that actually stopped gets its snapshot invalidated.
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["session", "conv_a"] });
+    expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["session", "conv_b"] });
   });
 });
 

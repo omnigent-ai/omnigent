@@ -68,6 +68,7 @@ import {
   updateProjectConfig as apiUpdateProjectConfig,
 } from "@/lib/projectsApi";
 import { releaseConversation, useChatStore } from "@/store/chatStore";
+import { clearSessionStopped, markSessionStopped, relaunchSeqOf } from "@/store/stoppedSessions";
 import type { Session } from "@/lib/types";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import { markConversationSeen } from "./useUnseenConversations";
@@ -1220,6 +1221,7 @@ export function useStopAndDeleteConversation() {
       showToast(deleteFailedToast(context?.label, err), { duration: 0 });
     },
     onSuccess: (_data, { id }) => {
+      clearSessionStopped(id);
       finalizeDeletedConversations(queryClient, [id]);
     },
   });
@@ -1281,12 +1283,19 @@ export function useLeaveSession() {
  * header merges snapshot fields over the list row (snapshot winning),
  * so a snapshot left stale at the pre-stop state would clobber the
  * now-stopped state and the header's Stop gate would lag.
+ *
+ * Records the confirmed stop in memory so the open view can distinguish
+ * an explicit stop from an idle-asleep runner.
  */
 export function useStopSession() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => stopSession(id),
-    onSuccess: (_data, id) => {
+    // Capture the relaunch sequence at stop time so a message that relaunches
+    // the session while this stop is in flight suppresses the late marker.
+    onMutate: (id) => ({ relaunchSeq: relaunchSeqOf(id) }),
+    onSuccess: (_data, id, context) => {
+      markSessionStopped(id, context?.relaunchSeq);
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["session", id] });
     },
@@ -1510,6 +1519,7 @@ export function useBulkDeleteConversations() {
     },
     onMutate: ({ ids }) => paintConversationsDeleted(queryClient, ids),
     onSuccess: (_data, { ids }) => {
+      for (const id of ids) clearSessionStopped(id);
       finalizeDeletedConversations(queryClient, ids);
     },
     onError: (error, { ids }, snapshot) => {
@@ -1519,6 +1529,7 @@ export function useBulkDeleteConversations() {
       const failed = bulk ? bulk.failed : [...ids];
       const succeeded = bulk ? bulk.succeeded : [];
       restoreDeletedConversations(queryClient, snapshot, failed, succeeded);
+      for (const id of succeeded) clearSessionStopped(id);
       if (succeeded.length > 0) finalizeDeletedConversations(queryClient, succeeded);
       showToast(
         failed.length === 1
@@ -1539,12 +1550,21 @@ export function useBulkStopSessions() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async (ids: string[]) => {
+      // Capture each session's relaunch sequence before stopping so a concurrent
+      // relaunch suppresses that session's late marker (see useStopSession).
+      const seqAtStop = new Map(ids.map((id) => [id, relaunchSeqOf(id)]));
       const results = await Promise.allSettled(ids.map((id) => stopSession(id)));
       const succeeded: string[] = [];
       const failed: string[] = [];
       for (let i = 0; i < results.length; i++) {
         if (results[i].status === "fulfilled") succeeded.push(ids[i]);
         else failed.push(ids[i]);
+      }
+      for (const id of succeeded) {
+        markSessionStopped(id, seqAtStop.get(id));
+        // Mirror useStopSession: a stale per-session snapshot would otherwise
+        // clobber the now-stopped state in the header merge.
+        void queryClient.invalidateQueries({ queryKey: ["session", id] });
       }
       if (failed.length > 0) {
         throw new BulkConversationMutationError("stop", {

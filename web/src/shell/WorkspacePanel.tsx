@@ -134,8 +134,8 @@ function WorkspaceTabTooltip({
 //
 // The "Shell" item also reflects the session's liveness so opening a shell on
 // a disconnected session isn't a silent 502:
-//   - online / wakeable (runner_asleep, host_asleep, starting): the item stays
-//     enabled — the server transparently reconnects the runner on create (see
+//   - online / wakeable (runner_asleep, stopped, host_asleep, starting): the
+//     item stays enabled — the server transparently reconnects on create (see
 //     `ensure_runner_connected`). While the create is in flight on a wakeable
 //     session it reads "Reconnecting…" with a spinner, since the cold wake can
 //     take tens of seconds.
@@ -153,6 +153,7 @@ function shellConnectState(liveness: SessionLiveness | undefined): ShellConnectS
     case "local_stranded":
       return "offline";
     case "runner_asleep":
+    case "stopped":
     case "host_asleep":
     case "starting":
       return "wakeable";

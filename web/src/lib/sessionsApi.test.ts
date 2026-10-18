@@ -32,6 +32,7 @@ import {
 } from "./sessionsApi";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "./backgroundSessionTitlesPreferences";
 import { getSessionHost, setSessionHost } from "./sessionHost";
+import { markSessionStopped, useStoppedSessions } from "@/store/stoppedSessions";
 
 function mockJsonResponse(
   body: unknown,
@@ -582,6 +583,12 @@ describe("createSideChat", () => {
     labels: { "omnigent.side_chat": "1", "omnigent.side_chat.source_id": source.id },
   };
 
+  afterEach(() => {
+    // Reset here, not after each assertion, so a thrown assertion can't leak a
+    // stop marker into the next test.
+    useStoppedSessions.setState({ stoppedAt: {}, relaunchSeq: {} });
+  });
+
   it.each(["worktree-from-another-machine", "main", null])(
     "relaunches a stopped parent and reuses its runner without requiring saved branch %s",
     async (gitBranch) => {
@@ -714,6 +721,51 @@ describe("createSideChat", () => {
 
     await expect(createSideChat(source.id)).rejects.toThrow("This session is disconnected.");
     expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("clears the parent's stop marker once it relaunches for the side chat", async () => {
+    // A generic side chat never passes through the composer that would clear
+    // the marker, so the parent would otherwise stay labeled "Session stopped"
+    // while actually relaunching.
+    markSessionStopped(source.id);
+    fetchMock
+      .mockResolvedValueOnce(mockJsonResponse({ ...source, runner_online: false }))
+      .mockResolvedValueOnce(mockJsonResponse({ recovered: true, recovery: "runner_relaunched" }))
+      .mockResolvedValueOnce(mockJsonResponse({ ...source, runner_online: true }))
+      .mockResolvedValueOnce(mockJsonResponse(fork))
+      .mockResolvedValueOnce(mockJsonResponse({ ...fork, runner_id: source.runner_id }));
+
+    await expect(createSideChat(source.id)).resolves.toEqual({ childSessionId: fork.id });
+
+    expect(useStoppedSessions.getState().stoppedAt[source.id]).toBeUndefined();
+  });
+
+  it("keeps the parent's stop marker when the relaunch does not recover", async () => {
+    // Recovery failed and the runner is still offline, so the parent is
+    // genuinely stopped: the band must stay up rather than vanish on a
+    // relaunch that never took effect.
+    markSessionStopped(source.id);
+    fetchMock
+      .mockResolvedValueOnce(mockJsonResponse({ ...source, runner_online: false }))
+      .mockResolvedValueOnce(mockJsonResponse({ recovered: false }))
+      .mockResolvedValueOnce(mockJsonResponse({ ...source, runner_online: false }));
+
+    await expect(createSideChat(source.id)).rejects.toThrow("This session is disconnected.");
+
+    expect(useStoppedSessions.getState().stoppedAt[source.id]).toEqual(expect.any(Number));
+  });
+
+  it("leaves an online parent's stop marker alone (no relaunch, cleared on send)", async () => {
+    markSessionStopped(source.id);
+    fetchMock
+      .mockResolvedValueOnce(mockJsonResponse(source))
+      .mockResolvedValueOnce(mockJsonResponse(fork))
+      .mockResolvedValueOnce(mockJsonResponse({ ...fork, runner_id: source.runner_id }));
+
+    await expect(createSideChat(source.id)).resolves.toEqual({ childSessionId: fork.id });
+
+    // No relaunch happened here, so this path must not touch the marker.
+    expect(useStoppedSessions.getState().stoppedAt[source.id]).toEqual(expect.any(Number));
   });
 });
 

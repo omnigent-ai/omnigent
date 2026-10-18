@@ -790,39 +790,45 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     window.localStorage.removeItem("omnigent:preferred-shell");
   });
 
-  it("keeps Shell enabled on a wakeable session — the server reconnects on create", async () => {
-    // A runner merely asleep (host up) is reconnected transparently by the
-    // server on create, so the item stays clickable and launches as normal.
-    declaresShell();
-    const mutate = vi.fn();
-    useCreateTerminalMock.mockReturnValue({
-      mutate,
-      isPending: false,
-      isError: false,
-    } as unknown as ReturnType<typeof useCreateTerminal>);
+  it.each<SessionLiveness>([{ kind: "runner_asleep" }, { kind: "stopped" }])(
+    "keeps Shell enabled on a wakeable $kind session — the server reconnects on create",
+    async (liveness) => {
+      // A runner merely asleep or explicitly stopped (host up) is reconnected
+      // transparently by the server on create, so the item stays clickable.
+      declaresShell();
+      const mutate = vi.fn();
+      useCreateTerminalMock.mockReturnValue({
+        mutate,
+        isPending: false,
+        isError: false,
+      } as unknown as ReturnType<typeof useCreateTerminal>);
 
-    renderWorkspace({ liveness: { kind: "runner_asleep" } });
+      renderWorkspace({ liveness });
 
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
-    const shell = await screen.findByRole("menuitem", { name: /shell/i });
-    expect(shell).not.toHaveAttribute("aria-disabled", "true");
-    fireEvent.click(shell);
-    expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
-  });
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+      const shell = await screen.findByRole("menuitem", { name: /shell/i });
+      expect(shell).not.toHaveAttribute("aria-disabled", "true");
+      fireEvent.click(shell);
+      expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
+    },
+  );
 
-  it("shows 'Reconnecting…' while a create is in flight on a wakeable session", async () => {
-    declaresShell();
-    useCreateTerminalMock.mockReturnValue({
-      mutate: vi.fn(),
-      isPending: true,
-      isError: false,
-    } as unknown as ReturnType<typeof useCreateTerminal>);
+  it.each<SessionLiveness>([{ kind: "host_asleep" }, { kind: "stopped" }])(
+    "shows 'Reconnecting…' while a create is in flight on a wakeable $kind session",
+    async (liveness) => {
+      declaresShell();
+      useCreateTerminalMock.mockReturnValue({
+        mutate: vi.fn(),
+        isPending: true,
+        isError: false,
+      } as unknown as ReturnType<typeof useCreateTerminal>);
 
-    renderWorkspace({ liveness: { kind: "host_asleep" } });
+      renderWorkspace({ liveness });
 
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
-    expect(await screen.findByRole("menuitem", { name: /reconnecting/i })).toBeInTheDocument();
-  });
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+      expect(await screen.findByRole("menuitem", { name: /reconnecting/i })).toBeInTheDocument();
+    },
+  );
 
   it("disables Shell and labels it Offline when the session can't be reconnected from the web", async () => {
     // host_offline / local_stranded need a CLI reconnect — the browser can't

@@ -566,6 +566,15 @@ export function computeShiftSelectRange(
   return visibleIds.slice(start, end + 1);
 }
 
+/** Acknowledge a stop even when its session is not open. */
+function showStoppedToast(label: string) {
+  showToast(
+    <span>
+      Stopped <span className="font-medium">{label}</span> — sending a message starts it again
+    </span>,
+  );
+}
+
 /** Stable empty array for the pinned-conversations fallback (referential
     equality keeps dependent memos from re-firing while the query loads). */
 const EMPTY_CONVERSATIONS: Conversation[] = [];
@@ -5558,10 +5567,11 @@ function ConversationRowImpl({
                 data-testid="stop-session-confirm"
                 onClick={() => {
                   // Close now and stop in the background — keeping the modal open
-                  // for the whole kill blocks the rest of the sidebar. A failure
+                  // for the whole kill blocks the rest of the sidebar. The outcome
                   // surfaces as a toast since the dialog is already gone.
                   setStopOpen(false);
                   stopSession.mutate(conversation.id, {
+                    onSuccess: () => showStoppedToast(label),
                     onError: (err) => {
                       const detail = err instanceof Error && err.message ? `: ${err.message}` : "";
                       showToast(`Couldn't stop the session${detail}`);
