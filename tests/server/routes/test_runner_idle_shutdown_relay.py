@@ -128,8 +128,9 @@ class _DropRunnerClient:
 
 
 class _LabelStore:
-    def __init__(self) -> None:
+    def __init__(self, *conversations: Conversation) -> None:
         self.labels: dict[str, dict[str, str]] = {}
+        self._conversations = {conv.id: conv for conv in conversations}
 
     def set_labels(self, conversation_id: str, updates: dict[str, str]) -> None:
         self.labels.setdefault(conversation_id, {}).update(updates)
@@ -137,8 +138,8 @@ class _LabelStore:
     def get_runner_liveness(self, conversation_id: str) -> None:
         return None
 
-    def get_conversation(self, conversation_id: str) -> None:
-        return None
+    def get_conversation(self, conversation_id: str) -> Conversation | None:
+        return self._conversations.get(conversation_id)
 
 
 @pytest.mark.parametrize("idle_shutdown", [True, False])
@@ -152,13 +153,21 @@ async def test_relay_settles_an_idle_shut_down_runners_session_instead_of_failin
     caplog.set_level(logging.INFO)
     sessions._runner_relay_tasks.clear()
     session_id = "0123456789abcdef0123456789abcdef"
+    conversation = Conversation(
+        id=session_id,
+        root_conversation_id=session_id,
+        created_at=0,
+        updated_at=0,
+        runner_id=_RUNNER,
+        live_status="running",
+    )
     gate = asyncio.Event()
     try:
         handle = await sessions._ensure_runner_relay_ready(
             session_id,
             _RUNNER,
             _DropRunnerClient(gate),  # type: ignore[arg-type]
-            conversation_store=_LabelStore(),  # type: ignore[arg-type]
+            conversation_store=_LabelStore(conversation),  # type: ignore[arg-type]
         )
         assert handle is not None
         sessions._session_status_cache[session_id] = "running"
