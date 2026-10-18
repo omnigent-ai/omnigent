@@ -4934,6 +4934,12 @@ function reconnectStatusPatch(
     sessionStatus: session.status,
     ...mcpStartupSnapshotPatch(session, s, launchBeforeFetch),
   };
+  // Launch stages are not replayed, so a launch last seen in flight takes the
+  // snapshot's stage; a `ready` sent while this stream was down settles it here.
+  if (s.sandboxStatus !== null && s.sandboxStatus.stage !== "failed") {
+    patch.sandboxStatus = session.sandboxStatus ?? null;
+    if (patch.sandboxStatus === null) patch.runnerLaunchedAt = Date.now();
+  }
   // Recover the background-shell tally across the gap too, so the spinner
   // returns to "N background tasks still running" rather than vanishing on reconnect.
   patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;

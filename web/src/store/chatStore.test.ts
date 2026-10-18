@@ -4047,6 +4047,30 @@ describe("chatStore — first message during native model startup", () => {
     },
   );
 
+  it("sends the held message when a reconnect shows the launch ended while the stream was down", async () => {
+    sandboxStage = "connecting";
+    begin();
+    await settle();
+    reportModel();
+    await settle();
+    expect(eventBodies()).toEqual([]);
+
+    // `ready` is not replayed: one sent while the stream reconnects (re-addressing
+    // to the host's replica) only shows up in the reconnect snapshot.
+    sandboxStage = null;
+    closeOpenEmptyStreams();
+
+    await vi.waitFor(() =>
+      expect(eventBodies()).toEqual([
+        {
+          type: "message",
+          data: expect.objectContaining({ content: [{ type: "input_text", text: original }] }),
+        },
+      ]),
+    );
+    expect(useChatStore.getState().sandboxStatus).toBeNull();
+  });
+
   it("restores the draft if the sandbox launch never reports an end", async () => {
     harness = "codex-native";
     sandboxStage = "provisioning";
