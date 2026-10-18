@@ -2458,19 +2458,25 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (opts?.onError !== undefined) {
         // Callers with their own failure handling take the message back, e.g. the queue.
         opts.onError("This session is still starting. Try again once it has started.");
-      } else if (!opensSideChat && target === get().conversationId) {
-        get().enqueueMessage(text, files, opts?.replyDraft);
       } else if (target !== null) {
-        setterFor(target)({
-          failedSendDraft: {
-            conversationId: target,
-            text,
-            files: files ?? [],
-            stableId,
-            serverRefused: false,
-            ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
-          },
-        });
+        // Queue it behind the held message, in the session it was meant for.
+        queueSeq += 1;
+        const queuedFor = target === get().conversationId ? get() : setterForState(target);
+        const queuedAgentId = queuedFor?.boundAgentId ?? agentId;
+        setActive((s) => ({
+          queuedMessages: [
+            ...s.queuedMessages,
+            {
+              queueId: `q_${queueSeq}`,
+              text,
+              stableId,
+              conversationId: target,
+              agentId: queuedAgentId,
+              ...(files && files.length > 0 ? { files } : {}),
+              ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+            },
+          ],
+        }));
       }
       return;
     }

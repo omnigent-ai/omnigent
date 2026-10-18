@@ -4209,53 +4209,36 @@ describe("chatStore — first message during native model startup", () => {
     expect(onError).toHaveBeenCalledWith(expect.stringContaining("still starting"));
   });
 
-  it("steers only the first queued message during a launch, keeping the rest in place", async () => {
-    harness = "codex-native";
-    sandboxStage = "provisioning";
-    begin();
-    await settle();
-    useChatStore.getState().stop();
-    await settle();
-    const queued = ["second", "third"].map((text, index) => ({
-      queueId: `q_launch_${index}`,
-      stableId: `stable_launch_${index}`,
-      text,
-      conversationId: sessionId,
-    }));
-    useChatStore.setState({ queuedMessages: queued });
-    useChatStore.getState().steerAllQueuedMessages(sessionId);
-    await settle();
+  it.each(["a sandbox launch", "a model start"] as const)(
+    "steers only the first queued message while %s holds sends, keeping the rest in place",
+    async (cause) => {
+      // Claude holds a message until it reports its model, with or without a launch.
+      if (cause === "a sandbox launch") {
+        harness = "codex-native";
+        sandboxStage = "provisioning";
+      }
+      begin();
+      await settle();
+      useChatStore.getState().stop();
+      await settle();
+      const queued = ["second", "third"].map((text, index) => ({
+        queueId: `q_held_${index}`,
+        stableId: `stable_held_${index}`,
+        text,
+        conversationId: sessionId,
+      }));
+      useChatStore.setState({ queuedMessages: queued });
+      useChatStore.getState().steerAllQueuedMessages(sessionId);
+      await settle();
 
-    expect(eventBodies()).toEqual([]);
-    expect(useChatStore.getState().pendingUserMessages).toMatchObject([
-      { initialDraft: { text: "second" } },
-    ]);
-    expect(useChatStore.getState().queuedMessages).toEqual([queued[1]]);
-  });
-
-  it("steers only the first queued message while a model is still starting", async () => {
-    // Claude holds a message until it reports its model; no sandbox launch involved.
-    begin();
-    await settle();
-    useChatStore.getState().stop();
-    await settle();
-    const queued = ["second", "third"].map((text, index) => ({
-      queueId: `q_model_${index}`,
-      stableId: `stable_model_${index}`,
-      text,
-      conversationId: sessionId,
-    }));
-    useChatStore.setState({ queuedMessages: queued });
-    useChatStore.getState().steerAllQueuedMessages(sessionId);
-    await settle();
-
-    expect(eventBodies()).toEqual([]);
-    expect(useChatStore.getState().pendingUserMessages).toMatchObject([
-      { initialDraft: { text: "second" } },
-    ]);
-    expect(useChatStore.getState().queuedMessages).toEqual([queued[1]]);
-    expect(useChatStore.getState().blocks.filter((b) => b.type === "error")).toEqual([]);
-  });
+      expect(eventBodies()).toEqual([]);
+      expect(useChatStore.getState().pendingUserMessages).toMatchObject([
+        { initialDraft: { text: "second" } },
+      ]);
+      expect(useChatStore.getState().queuedMessages).toEqual([queued[1]]);
+      expect(useChatStore.getState().blocks.filter((b) => b.type === "error")).toEqual([]);
+    },
+  );
 
   it("hands a held-time send with its own error handler back to it", async () => {
     harness = "codex-native";
@@ -4275,7 +4258,7 @@ describe("chatStore — first message during native model startup", () => {
     expect(useChatStore.getState().queuedMessages).toEqual([]);
   });
 
-  it("keeps the text of a pinned send to another held session that has no handler", async () => {
+  it("queues a pinned send to another held session that has no handler", async () => {
     harness = "codex-native";
     sandboxStage = "provisioning";
     begin();
@@ -4296,10 +4279,10 @@ describe("chatStore — first message during native model startup", () => {
     await settle();
 
     expect(eventBodies()).toEqual([]);
-    expect(conversationRegistry.peek("conv_child")?.getState().failedSendDraft).toMatchObject({
-      conversationId: "conv_child",
-      text: "child second",
-    });
+    expect(useChatStore.getState().queuedMessages).toMatchObject([
+      { conversationId: "conv_child", text: "child second" },
+    ]);
+    expect(conversationRegistry.peek("conv_child")?.getState().failedSendDraft).toBeNull();
   });
 
   it("abandons the waiting send when its conversation is disposed", async () => {
