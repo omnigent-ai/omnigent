@@ -172,8 +172,9 @@ class _NativeMessage:
 
     :param text: Aggregate delta text, e.g. ``"Let me check that."``.
     :param last_index: Highest chunk ``index`` accumulated so far, e.g.
-        ``4``. Used to reject repeated chunks and included in reconnect
-        replay events for wire-shape fidelity.
+        ``4``. A chunk below it arrived late and is not re-broadcast live;
+        it is also included in reconnect replay events for wire-shape
+        fidelity. Repeats are rejected through ``chunks``.
     :param chunks: Indexed chunk text keyed by ``index``, e.g.
         ``{0: "Let me ", 1: "check that."}``. Kept so chunks arriving out
         of index order still reassemble into ``text`` in order.
