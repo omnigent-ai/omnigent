@@ -108,7 +108,7 @@
     "zustand": "^5.0.12"
   },
   "devDependencies": {
-    "@storybook/react-vite": "^10.5.9",
+    "@storybook/react-vite": "^10.6.1",
     "@tailwindcss/vite": "^4.2.4",
     "@testing-library/dom": "^10.4.1",
     "@testing-library/jest-dom": "^6.9.1",
@@ -119,7 +119,7 @@
     "@types/react-dom": "^19.2.3",
     "@types/three": "0.185.1",
     "@vitejs/plugin-react": "^6.0.1",
-    "@vitest/coverage-v8": "^4.1.8",
+    "@vitest/coverage-v8": "^4.1.11",
     "ai": "^6.0.169",
     "ai-elements": "^1.9.0",
     "fake-indexeddb": "^6.2.5",
@@ -128,10 +128,10 @@
     "oxlint": "^1.62.0",
     "postcss": "^8.5.23",
     "prettier": "^3.8.3",
-    "storybook": "^10.5.9",
+    "storybook": "^10.6.1",
     "tailwindcss": "^4.2.4",
     "typescript": "~6.0.2",
     "vite": "^8.0.10",
-    "vitest": "^4.1.5"
+    "vitest": "^4.1.11"
   }
 }
