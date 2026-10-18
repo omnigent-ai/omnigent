@@ -4420,6 +4420,43 @@ def test_forge_config_paths_survive_daemon_and_runner_hops(
 
 
 @pytest.mark.parametrize("server_url", [None, "https://example.databricksapps.com"])
+def test_temp_dir_names_survive_daemon_and_runner_hops(
+    monkeypatch: pytest.MonkeyPatch, server_url: str | None
+) -> None:
+    """TEMP / TMP reach the runner through both hops; an unrelated secret does not.
+
+    Windows harnesses read them for GetTempPath; without them they fall back to
+    the user profile folder.
+    """
+    from omnigent.cli import _build_host_daemon_env
+
+    monkeypatch.delenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", raising=False)
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+    monkeypatch.setenv("TEMP", r"D:\scratch\temp")
+    monkeypatch.setenv("TMP", r"D:\scratch\tmp")
+    monkeypatch.setenv("UNRELATED_SECRET_TOKEN", "must-not-forward")
+
+    daemon_env = _build_host_daemon_env(server_url=server_url)
+    # A foreground host spawns runners from its own env, a daemon from its filtered one.
+    runner_envs = [
+        _build_runner_env(
+            base,
+            server_url=server_url or "http://localhost:8000",
+            runner_id="runner_abc",
+            binding_token="tok",
+            workspace="/ws",
+            parent_pid=42,
+        )
+        for base in (dict(os.environ), daemon_env)
+    ]
+
+    for env in (daemon_env, *runner_envs):
+        assert env["TEMP"] == r"D:\scratch\temp"
+        assert env["TMP"] == r"D:\scratch\tmp"
+        assert "UNRELATED_SECRET_TOKEN" not in env
+
+
+@pytest.mark.parametrize("server_url", [None, "https://example.databricksapps.com"])
 @pytest.mark.parametrize("setting", [None, "1", "0"])
 async def test_harness_stderr_opt_in_survives_daemon_and_runner_hops(
     monkeypatch: pytest.MonkeyPatch,
