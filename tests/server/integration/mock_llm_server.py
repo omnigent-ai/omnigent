@@ -1226,6 +1226,9 @@ async def create_message(
 
     req_model = parsed.get("model") if isinstance(parsed, dict) else None
     echo_model = req_model if isinstance(req_model, str) and req_model else "mock-model"
+    # Claude Code 2.1.280+ re-issues a refused turn only when the refused
+    # response carries this header.
+    refusal_headers = {"x-cc-tender-quilt": "1"} if qr.refusal_category is not None else None
     if isinstance(parsed, dict) and not parsed.get("stream", False):
         content: list[dict] = []
         stop_reason = "end_turn"
@@ -1265,7 +1268,8 @@ async def create_message(
                 "stop_sequence": None,
                 "usage": {"input_tokens": 10, **(qr.usage or {}), "output_tokens": output_tokens},
                 **extra,
-            }
+            },
+            headers=refusal_headers,
         )
     if qr.refusal_category is not None:
         sse_body = anthropic_sse_refusal_response(model=echo_model, category=qr.refusal_category)
@@ -1285,6 +1289,7 @@ async def create_message(
     return StreamingResponse(
         paced_sse(sse_body, qr.chunk_delay),
         media_type="text/event-stream",
+        headers=refusal_headers,
     )
 
 
