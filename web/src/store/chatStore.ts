@@ -5840,6 +5840,16 @@ export async function startStreamPump(
               }, delayMs),
             );
           }
+        } else if (typeof window !== "undefined") {
+          // A launch's `ready` sent before this first open subscribed is in no snapshot
+          // read yet, so re-read once the open settles if the launch still shows.
+          catchupTimers = [
+            window.setTimeout(() => {
+              if (controller.signal.aborted || isConversationDisposed(id)) return;
+              const launch = get().sandboxStatus;
+              if (launch !== null && launch.stage !== "failed") runGuardedStatusReconcile();
+            }, RECONNECT_STATUS_CATCHUP_DELAYS_MS[0]),
+          ];
         }
         let reason = await pumpPromise;
 

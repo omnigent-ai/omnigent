@@ -4071,6 +4071,29 @@ describe("chatStore — first message during native model startup", () => {
     expect(useChatStore.getState().sandboxStatus).toBeNull();
   });
 
+  it("sends the held message soon after load when the launch ended before the stream subscribed", async () => {
+    sandboxStage = "connecting";
+    vi.useFakeTimers();
+    begin();
+    await vi.advanceTimersByTimeAsync(0);
+    reportModel();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // A `ready` sent between the page's first snapshot and its stream subscribing.
+    sandboxStage = null;
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(eventBodies()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(eventBodies()).toEqual([
+      {
+        type: "message",
+        data: expect.objectContaining({ content: [{ type: "input_text", text: original }] }),
+      },
+    ]);
+    expect(useChatStore.getState().sandboxStatus).toBeNull();
+  });
+
   it("restores the draft if the sandbox launch never reports an end", async () => {
     harness = "codex-native";
     sandboxStage = "provisioning";
