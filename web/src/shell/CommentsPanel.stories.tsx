@@ -80,8 +80,10 @@ const meta = {
     now,
   },
   decorators: [
+    // `@container/viewer` stands in for the FileViewer so the panel renders
+    // its side-by-side layout, as it does beside a wide viewer.
     (Story) => (
-      <div className="flex h-[600px] w-[900px] justify-end overflow-hidden rounded-lg border bg-muted/20 [&>div]:!w-[360px]">
+      <div className="@container/viewer flex h-[600px] w-[900px] justify-end overflow-hidden rounded-lg border bg-muted/20 [&>div]:!w-[360px]">
         <Story />
       </div>
     ),

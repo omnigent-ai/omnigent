@@ -42,12 +42,16 @@ describe("panelSizePreferences", () => {
         pushPanelWidthPx: 700,
         inlinePanelWidthPx: -1,
         commentsPanelWidthPx: "wide",
+        commentsPanelHeightPx: 300,
       }),
     );
 
-    // The valid push-panel width is retained while invalid sibling fields are
-    // dropped, proving one bad field does not poison the whole record.
-    expect(readPanelSizePreferences()).toEqual({ pushPanelWidthPx: 700 });
+    // The valid sizes are retained while invalid sibling fields are dropped,
+    // proving one bad field does not poison the whole record.
+    expect(readPanelSizePreferences()).toEqual({
+      pushPanelWidthPx: 700,
+      commentsPanelHeightPx: 300,
+    });
     expect(readPanelSizePreference("inlinePanelWidthPx")).toBeNull();
   });
 });
