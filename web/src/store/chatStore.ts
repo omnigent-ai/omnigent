@@ -399,12 +399,13 @@ export function beginLocalConversation(
 
 /** Whether a temporary conversation still owns its unsent first message. */
 export function hasPendingLocalMessage(tempConvId: string): boolean {
-  return (
-    conversationRegistry
-      .peek(tempConvId)
-      ?.getState()
-      .pendingUserMessages.some((message) => message.initialDraft !== undefined) ?? false
-  );
+  const state = conversationRegistry.peek(tempConvId)?.getState();
+  return state !== undefined && holdsInitialDraft(state);
+}
+
+/** Whether a first message is still held for startup; nothing queued may overtake it. */
+export function holdsInitialDraft(state: Pick<ConversationState, "pendingUserMessages">): boolean {
+  return state.pendingUserMessages.some((message) => message.initialDraft !== undefined);
 }
 
 /**
@@ -1530,8 +1531,6 @@ function sendLatchIsStranded(s: ChatState): boolean {
   if (s.sendLatchedAt === null || Date.now() - s.sendLatchedAt < SEND_CHAIN_MAX_WAIT_MS)
     return false;
   if (s.activeResponse?.state === "streaming") return false;
-  // A first message held through its sandbox's launch is waiting, not stuck.
-  if (nativeSandboxLaunching(s)) return false;
   return s.conversationId !== null && cachedConversationStatus(s.conversationId) === "idle";
 }
 
@@ -1617,25 +1616,14 @@ function enterSendChain(conversationId: string | null): {
       // has no timeout, so a POST whose connection dies never settles and its
       // link never releases. Past SEND_CHAIN_MAX_WAIT_MS the successor proceeds
       // anyway — only ordering degrades, versus a composer that queues forever.
-      // A prior send held through its sandbox's launch can outlast that bound.
-      const priorDone = priorSend.then(() => true);
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
-        for (;;) {
-          // oxlint-disable-next-line no-await-in-loop
-          const done = await Promise.race([
-            priorDone,
-            new Promise<boolean>((resolve) => {
-              timer = setTimeout(() => resolve(false), SEND_CHAIN_MAX_WAIT_MS);
-            }),
-          ]);
-          clearTimeout(timer);
-          const state =
-            conversationId === null
-              ? undefined
-              : conversationRegistry.peek(conversationId)?.getState();
-          if (done || state === undefined || !nativeSandboxLaunching(state)) return;
-        }
+        await Promise.race([
+          priorSend,
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, SEND_CHAIN_MAX_WAIT_MS);
+          }),
+        ]);
       } finally {
         if (timer !== undefined) clearTimeout(timer);
       }
@@ -2162,7 +2150,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // sub-agents) outlives it, so the server accepts a new turn immediately —
     // mirror `shouldQueueSend`. Only the local send lifecycle (`streaming`) and
     // an actively `running` turn gate the flush. No agent → nothing to send to.
-    if (s.conversationId === null || s.boundAgentId === null || s.sessionStatus === "running") {
+    if (
+      s.conversationId === null ||
+      s.boundAgentId === null ||
+      s.sessionStatus === "running" ||
+      holdsInitialDraft(s)
+    ) {
       return;
     }
     if (s.status === "streaming") {
@@ -2229,6 +2222,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (statusById.get(conversationId) !== "idle") continue;
       // The sidebar can still say idle while a compact control starts.
       const local = setterForState(conversationId);
+      if (local !== null && holdsInitialDraft(local)) continue;
       if (
         local?.sessionHarness === "codex-native" ||
         local?.sessionHarness === "claude-sdk" ||

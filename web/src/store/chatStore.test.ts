@@ -4104,10 +4104,11 @@ describe("chatStore — first message during native model startup", () => {
     expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["follow-up"]);
   });
 
-  it("keeps a direct follow-up behind the held first message in the send chain", async () => {
+  it("releases a queued follow-up only once the dispatched first message itself stalls", async () => {
     harness = "codex-native";
     sandboxStage = "provisioning";
-    // The first POST never settles, so only the send chain can order the follow-up.
+    seedConversationsCache([conv(sessionId, "idle")]);
+    // The first POST never settles once the sandbox is up.
     const respond = fetchMock.getMockImplementation()!;
     fetchMock.mockImplementation((input, init) => {
       const body = init?.method === "POST" ? JSON.parse(String(init.body ?? "{}")) : {};
@@ -4116,17 +4117,24 @@ describe("chatStore — first message during native model startup", () => {
       }
       return respond(input, init);
     });
+    const sentTexts = () =>
+      eventBodies().map((body) => (body.data.content as { text?: string }[])[0]?.text);
     vi.useFakeTimers();
     begin();
     await vi.advanceTimersByTimeAsync(0);
-    void useChatStore.getState().send("follow-up", "agent_xyz");
-    await vi.advanceTimersByTimeAsync(4 * 60_000);
+    useChatStore.getState().enqueueMessage("follow-up", undefined);
+    await vi.advanceTimersByTimeAsync(359_000);
     reportSandbox("ready");
+    await vi.advanceTimersByTimeAsync(2_000);
+    useChatStore.getState().maybeFlushQueuedHead();
     await vi.advanceTimersByTimeAsync(0);
+    expect(sentTexts()).toEqual([original]);
 
-    expect(eventBodies().map((body) => body.data.content)).toEqual([
-      [{ type: "input_text", text: original }],
-    ]);
+    // The stranded-send bound counts from the dispatch, not from the hold.
+    await vi.advanceTimersByTimeAsync(180_000);
+    useChatStore.getState().maybeFlushQueuedHead();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sentTexts()).toEqual([original, "follow-up"]);
   });
 
   it("abandons the waiting send when its conversation is disposed", async () => {
@@ -17845,6 +17853,31 @@ describe("chatStore — background cross-session flush", () => {
     // One POST to conv_bg (FIFO head only); its head left the queue, tail stays.
     expect(eventPosts()).toEqual([{ id: "conv_bg", text: "bg-first" }]);
     expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["bg-second"]);
+  });
+
+  it("does not flush a non-active conversation whose first message is still held", async () => {
+    // Its row reads idle while the first message waits locally for startup.
+    seedConversationsCache([conv("conv_active", "running"), conv("conv_bg", "idle")]);
+    conversationRegistry.acquire("conv_bg").setState({
+      pendingUserMessages: [
+        {
+          tempId: "pend_held",
+          content: [{ type: "input_text", text: "held" }],
+          initialDraft: { text: "held", files: [] },
+          createdAtS: 0,
+        },
+      ],
+    });
+    useChatStore.setState({
+      conversationId: "conv_active",
+      queuedMessages: [{ queueId: "q_1", text: "behind", conversationId: "conv_bg" }],
+    });
+
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+
+    expect(eventPosts()).toEqual([]);
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["behind"]);
   });
 
   it("does not flush a non-active conversation that is not idle", async () => {
