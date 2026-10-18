@@ -4137,51 +4137,55 @@ describe("chatStore — first message during native model startup", () => {
     expect(sentTexts()).toEqual([original, "follow-up"]);
   });
 
-  it.each(["send now", "steer all", "direct send"] as const)(
-    "keeps a follow-up (%s) behind a held first message whose upload is slow",
-    async (entry) => {
+  it.each([
+    ["send now", "stop"],
+    ["send now", "failed launch"],
+    ["steer all", "stop"],
+    ["steer all", "failed launch"],
+    ["steer all", "ready"],
+  ] as const)(
+    "keeps a follow-up queued through %s while the first message is held, then %s",
+    async (entry, outcome) => {
       harness = "codex-native";
       sandboxStage = "provisioning";
-      const file = new File(["notes"], "notes.txt", { type: "text/plain" });
-      const respond = fetchMock.getMockImplementation()!;
-      let releaseUpload!: () => void;
-      fetchMock.mockImplementation((input, init) => {
-        if (String(input).endsWith("/resources/files")) {
-          return new Promise<Response>((resolve) => {
-            releaseUpload = () => resolve(mockResponse({ id: "file_uploaded" }));
-          });
-        }
-        return respond(input, init);
-      });
+      const queuedTexts = () => useChatStore.getState().queuedMessages.map((m) => m.text);
       const sentTexts = () =>
-        eventBodies().map(
-          (body) =>
-            (body.data.content as { type: string; text?: string }[]).find(
-              (block) => block.type === "input_text",
-            )?.text,
-        );
-      vi.useFakeTimers();
-      begin([file]);
-      await vi.advanceTimersByTimeAsync(0);
-      if (entry === "direct send") {
-        void useChatStore.getState().send("follow-up", "agent_xyz");
-      } else {
-        useChatStore.getState().enqueueMessage("follow-up", undefined);
-        const [queued] = useChatStore.getState().queuedMessages;
-        if (entry === "send now") useChatStore.getState().steerMessage(queued!.queueId);
-        else useChatStore.getState().steerAllQueuedMessages(sessionId);
-      }
-      // Past the send chain's own bound, then the first message starts uploading.
-      await vi.advanceTimersByTimeAsync(4 * 60_000);
-      reportSandbox("ready");
-      await vi.advanceTimersByTimeAsync(1_000);
-      expect(sentTexts()).toEqual([]);
+        eventBodies().map((body) => (body.data.content as { text?: string }[])[0]?.text);
+      begin();
+      await settle();
+      useChatStore.getState().enqueueMessage("follow-up", undefined);
+      const [queued] = useChatStore.getState().queuedMessages;
+      if (entry === "send now") useChatStore.getState().steerMessage(queued!.queueId);
+      else useChatStore.getState().steerAllQueuedMessages(sessionId);
+      await settle();
+      expect(queuedTexts()).toEqual(["follow-up"]);
 
-      releaseUpload();
-      await vi.advanceTimersByTimeAsync(100);
-      expect(sentTexts()).toEqual([original, "follow-up"]);
+      if (outcome === "stop") useChatStore.getState().stop();
+      else if (outcome === "failed launch") reportSandbox("failed", "quota exceeded");
+      else reportSandbox("ready");
+      await settle();
+
+      // However the hold ends, the follow-up is still queued: never lost, never sent first.
+      expect(queuedTexts()).toEqual(["follow-up"]);
+      expect(sentTexts()).toEqual(outcome === "ready" ? [original] : []);
+      if (outcome !== "ready") {
+        expect(useChatStore.getState().failedSendDraft).toMatchObject({ text: original });
+      }
     },
   );
+
+  it("queues a direct send behind a first message still held for startup", async () => {
+    harness = "codex-native";
+    sandboxStage = "provisioning";
+    begin();
+    await settle();
+    void useChatStore.getState().send("follow-up", "agent_xyz");
+    await settle();
+
+    expect(eventBodies()).toEqual([]);
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["follow-up"]);
+    expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
+  });
 
   it("abandons the waiting send when its conversation is disposed", async () => {
     begin();
