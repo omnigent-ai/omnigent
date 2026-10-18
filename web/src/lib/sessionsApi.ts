@@ -1163,7 +1163,8 @@ export async function getSession(sessionId: string): Promise<Session> {
  * cannot delay opening the conversation. The returned `Session` has
  * `items: []` and `usageIncluded: false`; callers needing a full snapshot
  * use `getSession`. Older servers ignore the params, include usage, and
- * need no separate usage request.
+ * need no separate usage request. It also asks for the uncollapsed
+ * `waiting` status, which the chat surface treats as a finished turn.
  *
  * NOTE: keep all consumers of a given react-query key (`["session", id]`)
  * on the SAME variant — mixing full and slim under one key would let a
@@ -1188,6 +1189,7 @@ export async function getSessionSlim(
     include_items: "false",
     include_liveness: "false",
     include_usage: "false",
+    include_waiting_status: "true",
   });
   if (options.refreshState === true) params.set("refresh_state", "true");
   const res = await authenticatedFetch(

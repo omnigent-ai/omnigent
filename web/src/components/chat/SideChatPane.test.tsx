@@ -452,6 +452,50 @@ describe("side-chat interrupt", () => {
   });
 });
 
+describe("generic side chat waiting on a worker it started", () => {
+  it("sends a typed follow-up like the main composer instead of offering only Stop", async () => {
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: "claude-sdk",
+      sessionStatus: "waiting",
+      activeResponse: { responseId: "resp_side_turn", state: "completed", error: null },
+    });
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "While the worker runs: what is 2 + 2?" } });
+
+    expect(screen.queryByTestId("side-chat-interrupt")).toBeNull();
+    expect(screen.getByRole("button", { name: "Send side question" })).toBeEnabled();
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(send).toHaveBeenCalledExactlyOnceWith(
+        "While the worker runs: what is 2 + 2?",
+        "agent_side",
+        undefined,
+        { pinnedConversationId: childId },
+      ),
+    );
+    expect(sessionsApi.interrupt).not.toHaveBeenCalled();
+  });
+
+  it("keeps showing the worker's progress and locks again for a live turn", () => {
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: "claude-sdk",
+      sessionStatus: "waiting",
+      activeResponse: { responseId: "resp_side_turn", state: "completed", error: null },
+    });
+    renderPane(<SideChatPane childId={childId} />);
+
+    expect(screen.getByTestId("working-indicator")).toHaveTextContent("Working…");
+    expect(screen.queryByTestId("side-chat-interrupt")).toBeNull();
+
+    act(() => conversationRegistry.acquire(childId).setState({ sessionStatus: "running" }));
+
+    expect(screen.getByTestId("side-chat-interrupt")).toBeInTheDocument();
+    expect(screen.queryByTestId("side-chat-send")).toBeNull();
+  });
+});
+
 describe("seeded /side question survives an unmount before the child binds", () => {
   // Switching rail tabs (or crossing the mobile breakpoint) unmounts this pane.
   // The question must not die with it: it stays in the store until the send

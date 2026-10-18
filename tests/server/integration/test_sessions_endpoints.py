@@ -1118,6 +1118,34 @@ async def test_list_sessions_reflects_relay_status_cache(
         sessions_module._session_status_cache.pop(session["id"], None)
 
 
+@pytest.mark.parametrize(
+    ("query", "expected_status"),
+    [("", "running"), ("?include_waiting_status=true", "waiting")],
+)
+async def test_get_session_reports_waiting_only_when_requested(
+    client: httpx.AsyncClient,
+    query: str,
+    expected_status: str,
+) -> None:
+    """``GET /v1/sessions/{id}`` keeps ``waiting`` collapsed unless the caller opts in.
+
+    Headless clients keep polling a ``running`` snapshot until sub-agents
+    finish; the web client opts in because it treats ``waiting`` as turn end.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    sessions_module._session_status_cache[session["id"]] = "waiting"
+    try:
+        resp = await client.get(f"/v1/sessions/{session['id']}{query}")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == expected_status
+    finally:
+        sessions_module._session_status_cache.pop(session["id"], None)
+
+
 async def test_list_sessions_rolls_up_busy_child_status(
     client: httpx.AsyncClient,
     db_uri: str,

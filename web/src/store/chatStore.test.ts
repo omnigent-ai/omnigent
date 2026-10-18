@@ -6189,7 +6189,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(useChatStore.getState().sessionStatus).toBe("running");
     });
 
-    it("accepts the live-only 'waiting' state (snapshot can't carry it)", () => {
+    it("accepts the 'waiting' state", () => {
       handleSessionEvent({
         type: "session_status",
         conversationId: "conv_abc",
@@ -6197,6 +6197,40 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       });
       expect(useChatStore.getState().sessionStatus).toBe("waiting");
     });
+
+    it.each([
+      { snapshotStatus: "running" as const, expectedStatus: "streaming" },
+      { snapshotStatus: "waiting" as const, expectedStatus: "idle" },
+    ])(
+      "maps a $snapshotStatus snapshot to composer status $expectedStatus",
+      async ({ snapshotStatus, expectedStatus }) => {
+        seedSession("conv_snapshot_status", [userMessage("resp_done", "start a worker")]);
+        fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+          const url = typeof input === "string" ? input : input.toString();
+          if (url.startsWith("/v1/sessions/conv_snapshot_status?") && !init?.method) {
+            // Like the server, report waiting only to callers that opt in.
+            const query = new URL(url, "http://test.local").searchParams;
+            const reportsWaiting = query.get("include_waiting_status") === "true";
+            return mockResponse({
+              id: "conv_snapshot_status",
+              agent_id: "agent_xyz",
+              status: snapshotStatus === "waiting" && !reportsWaiting ? "running" : snapshotStatus,
+              active_response_id: "resp_done",
+              created_at: 0,
+              items: [],
+              labels: {},
+            });
+          }
+          return defaultFetchHandler(input, init);
+        });
+
+        await useChatStore.getState().switchTo("conv_snapshot_status");
+
+        const state = useChatStore.getState();
+        expect(state.sessionStatus).toBe(snapshotStatus);
+        expect(state.status).toBe(expectedStatus);
+      },
+    );
 
     it.each([
       {

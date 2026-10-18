@@ -2088,10 +2088,10 @@ class SessionResponse(BaseModel):
         ``"idle"`` (no loop running), ``"running"`` (loop
         executing), ``"waiting"`` (loop parked on background
         work / sub-agents), or ``"failed"`` (terminal failure).
-        Current read paths collapse ``"waiting"`` -> ``"running"``
-        before building this snapshot; the literal stays a superset
-        of what the runtime can produce so a server that forwards
-        the raw status never 500s on serialization.
+        Read paths collapse ``"waiting"`` -> ``"running"`` unless
+        ``GET /sessions/{id}`` is called with
+        ``include_waiting_status=true``, which reports ``"waiting"``
+        as-is for clients that treat it as a finished turn.
     :param background_task_count: Background shells (claude-native) still
         running as of the last status edge, so a reload re-shows "N shells
         still running" even though the session has settled to ``"idle"``.

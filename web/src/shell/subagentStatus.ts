@@ -140,7 +140,9 @@ export function sessionStatus(
   lastTaskError?: { code: string; message: string } | null,
 ): AgentStatus {
   if (status === "launching") return { activity: "launching", label: "Launching" };
-  if (status === "running") return { activity: "working", label: "Working" };
+  // `waiting`: the turn ended but sub-agents it started are still working.
+  if (status === "running" || status === "waiting")
+    return { activity: "working", label: "Working" };
   if (status === "failed") {
     // A runner disconnect/exit collapses the snapshot to ``failed`` but
     // preserves the cause in ``lastTaskError.code`` — branch on it before

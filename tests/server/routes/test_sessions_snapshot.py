@@ -643,6 +643,42 @@ async def test_session_snapshot_existing_failure_survives_runner_exit(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cached", [False, True], ids=["persisted", "cached"])
+@pytest.mark.parametrize("live_status", ["running", "waiting"])
+async def test_session_snapshot_reports_waiting_only_when_requested(
+    monkeypatch: pytest.MonkeyPatch, cached: bool, live_status: str
+) -> None:
+    """Only an opted-in read tells a turn that ended on running sub-agents from a live turn."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = "5b2f0c7d9e1a4b3c8d6e2f1a0b9c8d7e"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="synthetic-agent",
+        live_status=None if cached else live_status,
+    )
+    store = _ConversationStore([], conversations={session_id: conv})
+    _use_runner_client(monkeypatch, None)
+    if cached:
+        monkeypatch.setitem(sessions_module._session_status_cache, session_id, live_status)
+    else:
+        monkeypatch.delitem(sessions_module._session_status_cache, session_id, raising=False)
+
+    default = await _get_session_snapshot(store, session_id)  # type: ignore[arg-type]
+    opted_in = await _get_session_snapshot(
+        store,  # type: ignore[arg-type]
+        session_id,
+        include_waiting_status=True,
+    )
+
+    assert default.status == "running"
+    assert opted_in.status == live_status
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("owner_matches", [True, False], ids=["same_runner", "replacement_runner"])
 async def test_session_snapshot_scopes_existing_failure_to_owning_runner(
     monkeypatch: pytest.MonkeyPatch, owner_matches: bool

@@ -8027,7 +8027,7 @@
             "type": "boolean"
           },
           "status": {
-            "description": "Session lifecycle status. One of `\"idle\"` (no loop running), `\"running\"` (loop executing), `\"waiting\"` (loop parked on background work / sub-agents), or `\"failed\"` (terminal failure). Current read paths collapse `\"waiting\"` -> `\"running\"` before building this snapshot; the literal stays a superset of what the runtime can produce so a server that forwards the raw status never 500s on serialization.",
+            "description": "Session lifecycle status. One of `\"idle\"` (no loop running), `\"running\"` (loop executing), `\"waiting\"` (loop parked on background work / sub-agents), or `\"failed\"` (terminal failure). Read paths collapse `\"waiting\"` -> `\"running\"` unless `GET /sessions/{id}` is called with `include_waiting_status=true`, which reports `\"waiting\"` as-is for clients that treat it as a finished turn.",
             "enum": [
               "idle",
               "running",
@@ -13147,6 +13147,17 @@
             "schema": {
               "default": true,
               "title": "Include Usage",
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "When `True`, report `\"waiting\"` (turn ended while sub-agents still run) instead of collapsing it to `\"running\"`. The web client opts in because it treats `waiting` as a finished turn; other clients keep the default.",
+            "in": "query",
+            "name": "include_waiting_status",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Waiting Status",
               "type": "boolean"
             }
           }

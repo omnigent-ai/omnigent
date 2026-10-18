@@ -12926,6 +12926,7 @@ async def _get_session_snapshot(
     viewer_id: str | None = None,
     request: Request | None = None,
     include_usage: bool = True,
+    include_waiting_status: bool = False,
 ) -> SessionResponse:
     """
     Read a full session snapshot from the store.
@@ -12967,6 +12968,10 @@ async def _get_session_snapshot(
     :param include_usage: When ``False``, skip subtree usage aggregation and
         return unknown usage with ``usage_included=False``. Launch metadata
         does not need usage; display clients can fetch it separately.
+    :param include_waiting_status: When ``True``, report the relay's
+        ``"waiting"`` status (turn ended, sub-agents still running) instead
+        of collapsing it to ``"running"``. Clients that treat ``waiting`` as
+        a finished turn opt in; the default keeps the collapsed contract.
     :param refresh_state: When ``True``, clear runner-backed snapshot
         overlays for this session before building the response. Browser
         reloads use this so a refresh re-reads current live-session
@@ -13038,7 +13043,9 @@ async def _get_session_snapshot(
     # A server recycle clears this cache while the persisted relay status survives.
     # Prefer it because native injection can finish before an external harness turn,
     # making the runner's generic active-turn probe report a false ``idle``.
-    status = _session_status_from_cache(session_id, conv.live_status)
+    status: Literal["idle", "running", "waiting", "failed"] = _session_status_from_cache(
+        session_id, conv.live_status
+    )
     if status == "idle":
         # Cache miss (or truly idle): either the server restarted, or the
         # relay has not yet published the first ``"running"`` event for a
@@ -13058,6 +13065,10 @@ async def _get_session_snapshot(
                 is not None
             ):
                 status = _session_status_from_cache(session_id)
+    if include_waiting_status and status == "running":
+        cached_status = _session_status_cache.get(session_id)
+        if (conv.live_status if cached_status is None else cached_status) == "waiting":
+            status = "waiting"
     # last_total_tokens and last_task_error come from the context-tokens
     # label written by the forwarder (tasks table has been removed).
     last_total_tokens: int | None = None

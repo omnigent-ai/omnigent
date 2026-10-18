@@ -57,6 +57,7 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { isNativeTerminalSession } from "@/lib/nativeCodingAgents";
 import { usesNativeSideChatFork } from "@/lib/sideChat";
+import { isTurnBlockingSend } from "@/lib/messageQueue";
 import { parentIdFromLabels } from "@/lib/sessionHost";
 import { serializeReplyDraft } from "@/lib/replyDraft";
 import { interrupt } from "@/lib/sessionsApi";
@@ -247,6 +248,9 @@ export function SideChatPane({
   const lastAssistantIndex = liveCandidateAssistantIndex(bubbles);
   const showsWorking =
     !readOnly && (starting || computeIsTurnActive(sessionStatus, state.status === "streaming"));
+  const composerBusy = usesNativeSideChatFork(sessionHarness)
+    ? showsWorking
+    : !readOnly && (starting || isTurnBlockingSend(state.status, sessionStatus));
   // Native interruption needs an observed turn; local streaming can start before one exists.
   const interruptReady =
     !usesNativeSideChatFork(sessionHarness) || activeResponse?.state === "streaming";
@@ -349,7 +353,7 @@ export function SideChatPane({
               agentId={boundAgentId}
               responseId={activeResponse?.responseId}
               interruptReady={interruptReady}
-              busy={showsWorking}
+              busy={composerBusy}
               pending={pending}
               starting={starting}
               onStart={onStart ? startSideChat : undefined}

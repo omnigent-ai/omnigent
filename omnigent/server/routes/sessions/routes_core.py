@@ -1371,6 +1371,7 @@ def register_core_routes(
         include_live_status: bool = Query(default=True),
         refresh_state: bool = Query(default=False),
         include_usage: bool = Query(default=True),
+        include_waiting_status: bool = Query(default=False),
     ) -> SessionResponse:
         """
         Return a session snapshot: identity, status, and committed
@@ -1406,6 +1407,10 @@ def register_core_routes(
             stale AP-process caches. Browser reload/bind requests use
             this to recover from fixed bugs without restarting the AP
             server.
+        :param include_waiting_status: When ``True``, report ``"waiting"``
+            (turn ended while sub-agents still run) instead of collapsing it
+            to ``"running"``. The web client opts in because it treats
+            ``waiting`` as a finished turn; other clients keep the default.
         :returns: The matching :class:`SessionResponse`.
         :raises OmnigentError: 404 if no session exists.
         """
@@ -1430,6 +1435,7 @@ def register_core_routes(
             include_items=include_items,
             include_live_status=include_live_status,
             include_usage=include_usage,
+            include_waiting_status=include_waiting_status,
             runner_exit_reports=runner_exit_reports,
             refresh_state=refresh_state,
             host_store=getattr(request.app.state, "host_store", None),

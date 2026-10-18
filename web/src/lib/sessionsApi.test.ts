@@ -1105,7 +1105,7 @@ describe("getSession", () => {
 
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(fetchMock.mock.calls[0][0]).toBe(
-      "/v1/sessions/conv_abc?include_items=false&include_liveness=false&include_usage=false",
+      "/v1/sessions/conv_abc?include_items=false&include_liveness=false&include_usage=false&include_waiting_status=true",
     );
     expect(session.agentId).toBe("agent_xyz");
     expect(session.items).toEqual([]);
@@ -1129,7 +1129,7 @@ describe("getSession", () => {
 
     expect(fetchMock).toHaveBeenCalledOnce();
     expect(fetchMock.mock.calls[0][0]).toBe(
-      "/v1/sessions/conv_abc?include_items=false&include_liveness=false&include_usage=false&refresh_state=true",
+      "/v1/sessions/conv_abc?include_items=false&include_liveness=false&include_usage=false&include_waiting_status=true&refresh_state=true",
     );
   });
 
