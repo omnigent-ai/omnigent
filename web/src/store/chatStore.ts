@@ -1414,19 +1414,31 @@ function nativeSandboxLaunching(state: ConversationState): boolean {
   );
 }
 
+// Restores a draft held through a launch whose end never reaches this tab; well
+// past the time any launch is allowed to take.
+const SANDBOX_LAUNCH_MAX_WAIT_MS = 20 * 60_000;
+
 /**
  * Keep the draft local while native model startup or a model switch is pending,
  * or while a native session's sandbox launches.
  */
 function waitForInitialDispatch(conversationId: string, tempId: string): Promise<boolean> {
   return new Promise((resolve, reject) => {
+    // One deadline at a time: the launch's while the sandbox starts, then the model's.
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let deadline: "launch" | "model" | undefined;
     const finish = (ready: boolean, error?: Error) => {
       clearTimeout(timer);
       unsubscribe();
       unsubscribeDisposed();
       if (error) reject(error);
       else resolve(ready);
+    };
+    const expireAfter = (phase: "launch" | "model", ms: number, message: string) => {
+      if (deadline === phase) return;
+      clearTimeout(timer);
+      deadline = phase;
+      timer = setTimeout(() => finish(false, new Error(message)), ms);
     };
     const check = () => {
       const entry = conversationRegistry.peek(conversationId);
@@ -1442,9 +1454,7 @@ function waitForInitialDispatch(conversationId: string, tempId: string): Promise
           false,
           state.conversationLoadError ?? new Error("Session failed before the message was sent."),
         );
-      } else if (!modelSelectionPending(state) && !nativeSandboxLaunching(state)) {
-        finish(true);
-      } else if (state.sandboxStatus?.stage === "failed") {
+      } else if (state.isNativeTerminalSession && state.sandboxStatus?.stage === "failed") {
         const reason = state.sandboxStatus.error;
         finish(
           false,
@@ -1452,18 +1462,20 @@ function waitForInitialDispatch(conversationId: string, tempId: string): Promise
             `The session's managed sandbox failed to launch${reason ? `: ${reason}` : "."}`,
           ),
         );
-      } else if (state.sandboxStatus !== null) {
+      } else if (!modelSelectionPending(state) && !nativeSandboxLaunching(state)) {
+        finish(true);
+      } else if (nativeSandboxLaunching(state)) {
         // The model can only start once the sandbox is up.
-        clearTimeout(timer);
-        timer = undefined;
+        expireAfter(
+          "launch",
+          SANDBOX_LAUNCH_MAX_WAIT_MS,
+          "The sandbox did not finish launching. Please retry the message.",
+        );
       } else {
-        timer ??= setTimeout(
-          () =>
-            finish(
-              false,
-              new Error("The model did not finish starting. Please retry the message."),
-            ),
+        expireAfter(
+          "model",
           SEND_CHAIN_MAX_WAIT_MS,
+          "The model did not finish starting. Please retry the message.",
         );
       }
     };

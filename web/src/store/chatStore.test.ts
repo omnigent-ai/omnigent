@@ -4020,24 +4020,47 @@ describe("chatStore — first message during native model startup", () => {
     );
   });
 
-  it("restores the draft with the reason when the sandbox launch fails", async () => {
+  it.each(["claude-native", "codex-native"])(
+    "restores the %s draft with the reason when the sandbox launch fails",
+    async (nativeHarness) => {
+      harness = nativeHarness;
+      sandboxStage = "provisioning";
+      begin();
+      await settle();
+      reportSandbox("failed", "quota exceeded");
+      await settle();
+
+      expect(eventBodies()).toEqual([]);
+      expect(useChatStore.getState()).toMatchObject({
+        status: "idle",
+        pendingUserMessages: [],
+        failedSendDraft: { conversationId: sessionId, text: original, files: [] },
+      });
+      expect(useChatStore.getState().blocks).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: "error",
+            message: "The session's managed sandbox failed to launch: quota exceeded",
+          }),
+        ]),
+      );
+    },
+  );
+
+  it("restores the draft if the sandbox launch never reports an end", async () => {
+    harness = "codex-native";
     sandboxStage = "provisioning";
+    vi.useFakeTimers();
     begin();
-    await settle();
-    reportSandbox("failed", "quota exceeded");
-    await settle();
+    await vi.advanceTimersByTimeAsync(20 * 60_000);
 
     expect(eventBodies()).toEqual([]);
-    expect(useChatStore.getState()).toMatchObject({
-      status: "idle",
-      pendingUserMessages: [],
-      failedSendDraft: { conversationId: sessionId, text: original, files: [] },
-    });
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({ text: original });
     expect(useChatStore.getState().blocks).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           type: "error",
-          message: "The session's managed sandbox failed to launch: quota exceeded",
+          message: expect.stringContaining("sandbox did not finish launching"),
         }),
       ]),
     );
