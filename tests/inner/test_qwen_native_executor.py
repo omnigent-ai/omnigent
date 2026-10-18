@@ -8,10 +8,12 @@ starts, so the executor must wait for qwen to be ready before the first append.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
+from omnigent.harnesses.qwen_native.bridge import input_file_path
 from omnigent.inner import qwen_native_executor as qne
 from omnigent.inner.executor import ExecutorError, TurnComplete
 
@@ -144,15 +146,63 @@ async def test_ensure_ready_does_not_latch_on_timeout(
         qne, "submit_user_message", lambda _b, *, content: submitted.append(content)
     )
     ex = qne.QwenNativeExecutor(bridge_dir=tmp_path)
-    async for _ in ex.run_turn([{"role": "user", "content": "a"}], [], ""):
-        pass
-    async for _ in ex.run_turn([{"role": "user", "content": "b"}], [], ""):
-        pass
+    first = [e async for e in ex.run_turn([{"role": "user", "content": "a"}], [], "")]
+    second = [e async for e in ex.run_turn([{"role": "user", "content": "b"}], [], "")]
     # On timeout the gate is NOT latched — it re-checks each turn (qwen is almost
-    # certainly up by the next one) — yet still submits best-effort both times.
+    # certainly up by the next one) — and each timed-out turn fails instead of
+    # submitting a line qwen's input watcher would skip.
     assert ready_calls["n"] == 2
-    assert submitted == ["a", "b"]
+    assert [type(e) for e in first + second] == [ExecutorError, ExecutorError]
+    assert submitted == []
     assert ex._ready is False
+
+
+async def test_run_turn_readiness_timeout_fails_without_submitting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(qne, "wait_for_ready", lambda *a, **k: False)
+    ex = qne.QwenNativeExecutor(bridge_dir=tmp_path)
+    events = [e async for e in ex.run_turn([{"role": "user", "content": "hello"}], [], "")]
+    # Exactly one ExecutorError, no TurnComplete, and no submit line on disk: the
+    # turn failed loudly instead of the message being silently dropped.
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+    assert "the message was not sent" in events[0].message
+    in_file = input_file_path(tmp_path)
+    assert not in_file.exists() or "submit" not in in_file.read_text(encoding="utf-8")
+    assert ex._ready is False
+
+
+async def test_enqueue_session_message_readiness_timeout_appends_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(qne, "wait_for_ready", lambda *a, **k: False)
+    ex = qne.QwenNativeExecutor(bridge_dir=tmp_path)
+    assert await ex.enqueue_session_message("main", "steer") is False
+    in_file = input_file_path(tmp_path)
+    assert not in_file.exists() or "submit" not in in_file.read_text(encoding="utf-8")
+
+
+async def test_run_turn_submits_after_earlier_readiness_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ready = iter([False, True])
+    monkeypatch.setattr(qne, "wait_for_ready", lambda *a, **k: next(ready))
+    ex = qne.QwenNativeExecutor(bridge_dir=tmp_path)
+    first = [e async for e in ex.run_turn([{"role": "user", "content": "a"}], [], "")]
+    assert len(first) == 1
+    assert isinstance(first[0], ExecutorError)
+    second = [e async for e in ex.run_turn([{"role": "user", "content": "b"}], [], "")]
+    # The next turn re-checks readiness and, once qwen is up, submits normally.
+    assert len(second) == 1
+    assert isinstance(second[0], TurnComplete)
+    lines = [
+        json.loads(line)
+        for line in input_file_path(tmp_path).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert lines == [{"type": "submit", "text": "b"}]
+    assert ex._ready is True
 
 
 async def test_ensure_ready_is_latched_across_turns(
