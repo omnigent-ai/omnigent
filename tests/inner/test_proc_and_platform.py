@@ -567,6 +567,49 @@ def test_helper_env_keeps_systemroot_so_child_can_import_asyncio() -> None:
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.parametrize("env_filter", ["agent", "runner", "helper"])
+def test_windows_program_paths_survive_env_filters(env_filter: str) -> None:
+    from omnigent.host.connect import _build_runner_env
+    from omnigent.inner.agent_env import clean_agent_env
+    from omnigent.inner.os_env import build_helper_env
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    source = {
+        "PATH": r"C:\Windows\System32",
+        "SYSTEMROOT": r"C:\Windows",
+        "PROGRAMDATA": r"C:\ProgramData",
+        "PROGRAMFILES": r"C:\Program Files",
+        "PROGRAMFILES(X86)": r"C:\Program Files (x86)",
+        "PROGRAMW6432": r"C:\Program Files",
+        "SOME_SECRET_TOKEN": "x",
+    }
+    if env_filter == "agent":
+        env = clean_agent_env(source=source)
+    elif env_filter == "runner":
+        env = _build_runner_env(
+            base_env=source,
+            server_url="http://x",
+            runner_id="r1",
+            binding_token="t",
+            workspace=".",
+            parent_pid=os.getpid(),
+        )
+    else:
+        policy = SandboxPolicy(
+            backend_type="none",
+            active=True,
+            read_roots=None,
+            write_roots=[],
+            write_files=[],
+            allow_network=True,
+        )
+        env = build_helper_env(source, policy)
+
+    for name in ("PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432"):
+        assert env[name] == source[name]
+    assert "SOME_SECRET_TOKEN" not in env
+
+
 @pytest.mark.windows_only
 def test_parent_death_watchdog_does_not_false_fire_on_windows() -> None:
     # Regression: on Windows os.getppid() does not match the spawner (the venv
