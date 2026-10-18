@@ -6964,7 +6964,10 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
     });
 
     it("advances the provisioning indicator through launch stages", () => {
-      useChatStore.setState({ sandboxStatus: { stage: "provisioning", error: null } });
+      useChatStore.setState({
+        sandboxStatus: { stage: "provisioning", error: null },
+        runnerLaunchedAt: null,
+      });
       handleSessionEvent({
         type: "session_sandbox_status",
         conversationId: "conv_abc",
@@ -6977,12 +6980,18 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         error: null,
         provider: "arclet",
       });
+      expect(useChatStore.getState().runnerLaunchedAt).toBeNull();
     });
 
-    it("clears the indicator on ready", () => {
+    it("clears the indicator on ready and starts the launch grace", () => {
       // `ready` means the session now looks like any host-bound
-      // session — retaining the status would strand the banner on.
-      useChatStore.setState({ sandboxStatus: { stage: "connecting", error: null } });
+      // session — retaining the status would strand the banner on. Its
+      // runner is up but has not created its terminal yet.
+      useChatStore.setState({
+        sandboxStatus: { stage: "connecting", error: null },
+        runnerLaunchedAt: null,
+      });
+      const before = Date.now();
       handleSessionEvent({
         type: "session_sandbox_status",
         conversationId: "conv_abc",
@@ -6990,6 +6999,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         error: null,
       });
       expect(useChatStore.getState().sandboxStatus).toBeNull();
+      expect(useChatStore.getState().runnerLaunchedAt).toBeGreaterThanOrEqual(before);
     });
 
     it("retains the failure reason on failed", () => {

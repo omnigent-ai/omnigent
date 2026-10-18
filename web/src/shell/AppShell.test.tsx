@@ -725,6 +725,7 @@ beforeEach(() => {
     terminalPending: false,
     sessionStatus: "idle",
     status: "idle",
+    sandboxStatus: null,
   });
 });
 
@@ -1186,6 +1187,44 @@ describe("AppShell header", () => {
     fireEvent.click(screen.getByTestId("nav-session"));
 
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "true");
+  });
+
+  it("holds startup while the session's managed sandbox is still launching", () => {
+    // Provisioning outlasts the cold-boot grace, and the server reports a
+    // session with no runner yet as reachable, so only the launch status
+    // keeps the terminal from offering Resume.
+    runnerHealthState.runnerOnline = true;
+    mockConversations([
+      {
+        id: "conv_sandbox",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal" },
+        created_at: Math.floor(Date.now() / 1000) - 600,
+      },
+    ]);
+    useChatStore.setState({ sandboxStatus: { stage: "provisioning" } });
+
+    renderShell("/c/conv_sandbox");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "true");
+  });
+
+  it("releases startup once the managed sandbox launch fails", () => {
+    // A failed launch never brings a terminal; its failure band owns the view.
+    runnerHealthState.runnerOnline = true;
+    mockConversations([
+      {
+        id: "conv_sandbox_failed",
+        permission_level: null,
+        labels: { "omnigent.ui": "terminal" },
+        created_at: Math.floor(Date.now() / 1000) - 600,
+      },
+    ]);
+    useChatStore.setState({ sandboxStatus: { stage: "failed", error: "quota exceeded" } });
+
+    renderShell("/c/conv_sandbox_failed");
+
+    expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminal-starting-up", "false");
   });
 
   it("does not hold startup for a fresh chat-first session with an online runner", () => {
