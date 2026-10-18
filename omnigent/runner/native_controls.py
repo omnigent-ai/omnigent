@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import functools
 import logging
 import time
 import urllib.parse
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
+    from omnigent.harnesses.claude_native.bridge import DefaultModelSnapshot
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
     from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
@@ -71,14 +73,16 @@ _CLAUDE_MODEL_CONFIRM_TIMEOUT_S = 10.0
 _CLAUDE_MODEL_CONFIRM_POLL_S = 0.25
 
 
-# How long the detached watcher keeps answering a /model confirm dialog that
-# pops after the active turn settles (a mid-turn switch queues in the
-# composer), and how often it looks. Long turns are common; the watch is
-# cheap (one tmux capture per poll) and never types blind.
+# How long the detached watcher answers a /model confirm dialog that pops after
+# the active turn settles, and how often it looks; a busy pane extends the watch.
 _CLAUDE_MODEL_LATE_DIALOG_BUDGET_S = 1200.0
 
 
 _CLAUDE_MODEL_LATE_DIALOG_POLL_S = 2.0
+
+
+# How often the watcher keeps its queued switch's pending record from expiring.
+_CLAUDE_MODEL_PENDING_REFRESH_S = 300.0
 
 
 # Settle delay between keystrokes when driving Codex TUI popups. The
@@ -1167,6 +1171,9 @@ def build_native_controls(
         conv_id: str,
         bridge_dir: Path,
         expected: set[str],
+        *,
+        default_model_before: DefaultModelSnapshot,
+        model_arg: str,
     ) -> None:
         """Answer a ``/model`` confirm dialog that pops after the active turn.
 
@@ -1175,49 +1182,66 @@ def build_native_controls(
         injection's own watch and the request's confirm window. This watcher
         presses Enter ONLY when the model dialog is verifiably on screen
         (never blind), stops as soon as the statusLine reports one of the
-        expected spellings, and gives up quietly after its budget — the
-        persisted request and the forwarder's verbatim report remain the
-        authoritative record either way.
+        expected spellings, and gives up quietly once its budget has passed
+        and the pane has been idle for a confirm window — the persisted
+        request and the forwarder's verbatim report remain the authoritative
+        record either way. Claude saves the late switch as the user's default
+        model, so the watcher restores that default when it stops.
         """
         from omnigent.harnesses.claude_native.bridge import (
             SWITCH_MODEL_DIALOG_HINT,
             confirm_dialog_if_open,
+            keep_default_model_switch_pending,
             read_claude_status_model,
+            restore_default_model,
         )
 
-        deadline = time.monotonic() + _CLAUDE_MODEL_LATE_DIALOG_BUDGET_S
-        while time.monotonic() < deadline:
-            try:
-                current = await asyncio.to_thread(read_claude_status_model, bridge_dir)
-                if current and current in expected:
-                    return
-                await asyncio.to_thread(
-                    confirm_dialog_if_open, bridge_dir, hint=SWITCH_MODEL_DIALOG_HINT
-                )
-            except Exception:  # noqa: BLE001 — best-effort; the report reconciles
-                _logger.debug(
-                    "late model-dialog watch errored for session=%s",
-                    conv_id,
-                    exc_info=True,
-                    extra={"session_id": conv_id},
-                )
-                return
-            await asyncio.sleep(_CLAUDE_MODEL_LATE_DIALOG_POLL_S)
-        _logger.info(
-            "late model-dialog watch for session=%s ended without a confirmed switch",
-            conv_id,
-            extra={"session_id": conv_id},
-        )
+        try:
+            deadline = time.monotonic() + _CLAUDE_MODEL_LATE_DIALOG_BUDGET_S
+            next_refresh = time.monotonic() + _CLAUDE_MODEL_PENDING_REFRESH_S
+            while True:
+                if _native_pane_status.get(conv_id) in ("running", "waiting"):
+                    # The queued switch applies only after the turn ends, however long it runs.
+                    deadline = max(deadline, time.monotonic() + _CLAUDE_MODEL_CONFIRM_TIMEOUT_S)
+                if time.monotonic() >= deadline:
+                    break
+                if time.monotonic() >= next_refresh:
+                    await asyncio.to_thread(
+                        keep_default_model_switch_pending, bridge_dir, default_model_before
+                    )
+                    next_refresh = time.monotonic() + _CLAUDE_MODEL_PENDING_REFRESH_S
+                try:
+                    current = await asyncio.to_thread(read_claude_status_model, bridge_dir)
+                    if current and current in expected:
+                        return
+                    await asyncio.to_thread(
+                        confirm_dialog_if_open, bridge_dir, hint=SWITCH_MODEL_DIALOG_HINT
+                    )
+                except Exception:  # noqa: BLE001 — best-effort; the report reconciles
+                    # Keep watching: the queued save can still land and needs restoring.
+                    _logger.debug(
+                        "late model-dialog watch errored for session=%s",
+                        conv_id,
+                        exc_info=True,
+                        extra={"session_id": conv_id},
+                    )
+                await asyncio.sleep(_CLAUDE_MODEL_LATE_DIALOG_POLL_S)
+            _logger.info(
+                "late model-dialog watch for session=%s ended without a confirmed switch",
+                conv_id,
+                extra={"session_id": conv_id},
+            )
+        finally:
+            await asyncio.to_thread(
+                restore_default_model, bridge_dir, default_model_before, model_arg
+            )
 
     async def _handle_claude_native_model_change(
         conv_id: str,
         model: str | None,
     ) -> Response:
         from omnigent.harnesses.claude_native.bridge import (
-            SWITCH_MODEL_DIALOG_HINT,
             bridge_dir_for_bridge_id,
-            confirm_dialog_if_open,
-            inject_slash_command,
             read_claude_status_model,
             read_model_env,
             read_model_picker_values,
@@ -1292,29 +1316,6 @@ def build_native_controls(
                     ),
                 },
             )
-        command = f"/model {model_arg}"
-        baseline = await asyncio.to_thread(read_claude_status_model, bridge_dir)
-        try:
-            # Accepted trade-off: ``/model <id>`` also saves the pick as the
-            # person's global default in ``~/.claude/settings.json``. Driving
-            # the interactive picker instead avoided that write but needed
-            # ~35s of fragile tmux automation, so the write stands.
-            await asyncio.to_thread(
-                inject_slash_command,
-                bridge_dir,
-                command=command,
-                timeout_s=1.0,
-                auto_confirm=True,
-                confirm_hint=SWITCH_MODEL_DIALOG_HINT,
-            )
-        except (RuntimeError, ValueError) as exc:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "claude_native_model_failed",
-                    "detail": _client_safe_error_detail(exc, context="claude-native model change"),
-                },
-            )
         # Verify against the statusLine snapshot the forwarder already polls:
         # Claude rewrites it on every render, including right after ``/model``.
         # Expected spellings come from this session's own catalog rows (every
@@ -1332,68 +1333,190 @@ def build_native_controls(
                 row_model = row.get("model")
                 if isinstance(row_model, str) and row_model:
                     expected.add(row_model)
-        # A switch typed into a busy pane is queued; its turn may settle before the deadline.
-        was_busy = _native_pane_status.get(conv_id) in ("running", "waiting")
-        deadline = time.monotonic() + _CLAUDE_MODEL_CONFIRM_TIMEOUT_S
-        while True:
-            current = await asyncio.to_thread(read_claude_status_model, bridge_dir)
-            if current and (current in expected or (baseline and current != baseline)):
-                # The pane switched. When it landed somewhere other than the
-                # expected spelling, the forwarder's verbatim report is the
-                # truth the UI will settle on — the command still took effect.
-                return Response(status_code=204)
-            if baseline is None and current is None:
-                # No statusLine snapshot on either side of the injection: a
-                # live wrapper-managed pane writes one on every render, so
-                # this is a shape without the wrapper — the switch is
-                # unverifiable, not failed. Report success and leave the
-                # forwarder to reconcile the row.
-                _logger.warning(
-                    "claude-native model change for session=%s could not be verified: "
-                    "no statusLine snapshot",
-                    conv_id,
-                    extra={"session_id": conv_id},
+        baseline = await asyncio.to_thread(read_claude_status_model, bridge_dir)
+        reply: asyncio.Future[Response] = asyncio.get_running_loop().create_future()
+        # The switch owns restoring the user's default model, so it outlives a dropped request.
+        switch = asyncio.create_task(
+            _switch_claude_model(
+                conv_id,
+                bridge_dir,
+                model_arg=model_arg,
+                expected=expected,
+                baseline=baseline,
+                reply=reply,
+            ),
+            name=f"claude-model-switch-{conv_id}",
+        )
+        _model_dialog_watchers.add(switch)
+        switch.add_done_callback(_model_dialog_watchers.discard)
+        return await asyncio.shield(reply)
+
+    async def _switch_claude_model(
+        conv_id: str,
+        bridge_dir: Path,
+        *,
+        model_arg: str,
+        expected: set[str],
+        baseline: str | None,
+        reply: asyncio.Future[Response],
+    ) -> None:
+        """Type ``/model`` into the pane, confirm it, and settle *reply*.
+
+        Claude saves every switch as the user's default model; this task
+        restores it, including after a queued switch lands late, whether or
+        not the request is still waiting.
+        """
+        from omnigent.harnesses.claude_native.bridge import (
+            SWITCH_MODEL_DIALOG_HINT,
+            confirm_dialog_if_open,
+            defer_default_model_restore,
+            inject_model_command,
+            read_claude_status_model,
+            restore_default_model,
+        )
+
+        default_model_before: DefaultModelSnapshot | None = None
+        was_busy = False
+        try:
+            # A switch typed into a busy pane is queued; its turn may settle before the deadline.
+            was_busy = _native_pane_status.get(conv_id) in ("running", "waiting")
+            # Claude saves a queued switch only when the turn settles, so its restore waits.
+            restore_deferred = was_busy
+            try:
+                default_model_before = await asyncio.to_thread(
+                    inject_model_command,
+                    bridge_dir,
+                    model_arg=model_arg,
+                    timeout_s=1.0,
+                    defer_restore=restore_deferred,
                 )
-                return Response(status_code=204)
-            # The confirm dialog can render well after the injection's own
-            # short watch (a warm repaint, or a queued command surfacing) —
-            # answer it whenever it shows inside the window.
-            await asyncio.to_thread(
-                confirm_dialog_if_open, bridge_dir, hint=SWITCH_MODEL_DIALOG_HINT
+            except (RuntimeError, ValueError) as exc:
+                reply.set_result(
+                    JSONResponse(
+                        status_code=503,
+                        content={
+                            "error": "claude_native_model_failed",
+                            "detail": _client_safe_error_detail(
+                                exc, context="claude-native model change"
+                            ),
+                        },
+                    )
+                )
+                return
+            restore_landed_switch = functools.partial(
+                restore_default_model,
+                bridge_dir,
+                default_model_before,
+                model_arg,
+                wait_for_save=restore_deferred,
             )
-            if _native_pane_status.get(conv_id) in ("running", "waiting"):
-                was_busy = True
-            if time.monotonic() >= deadline:
-                break
-            await asyncio.sleep(_CLAUDE_MODEL_CONFIRM_POLL_S)
-        if was_busy:
-            # Mid-turn switch: Claude queues the typed command and applies it
-            # when the turn settles — its confirm dialog can pop minutes from
-            # now. Not a failure: answer success, keep a detached watcher on
-            # the late dialog, and let the forwarder's report settle the
-            # picker when the switch actually lands.
-            watcher = asyncio.create_task(
-                _watch_late_model_dialog(conv_id, bridge_dir, expected),
-                name=f"claude-model-dialog-{conv_id}",
-            )
-            _model_dialog_watchers.add(watcher)
-            watcher.add_done_callback(_model_dialog_watchers.discard)
+            deadline = time.monotonic() + _CLAUDE_MODEL_CONFIRM_TIMEOUT_S
+            while True:
+                current = await asyncio.to_thread(read_claude_status_model, bridge_dir)
+                if current and (current in expected or (baseline and current != baseline)):
+                    # The pane switched. When it landed somewhere other than the
+                    # expected spelling, the forwarder's verbatim report is the
+                    # truth the UI will settle on — the command still took effect.
+                    await asyncio.to_thread(restore_landed_switch)
+                    reply.set_result(Response(status_code=204))
+                    return
+                if baseline is None and current is None:
+                    # No statusLine snapshot on either side of the injection: a
+                    # live wrapper-managed pane writes one on every render, so
+                    # this is a shape without the wrapper — the switch is
+                    # unverifiable, not failed. Report success and leave the
+                    # forwarder to reconcile the row.
+                    _logger.warning(
+                        "claude-native model change for session=%s could not be verified: "
+                        "no statusLine snapshot",
+                        conv_id,
+                        extra={"session_id": conv_id},
+                    )
+                    await asyncio.to_thread(restore_landed_switch)
+                    reply.set_result(Response(status_code=204))
+                    return
+                # The confirm dialog can render well after the injection's own
+                # short watch (a warm repaint, or a queued command surfacing) —
+                # answer it whenever it shows inside the window.
+                await asyncio.to_thread(
+                    confirm_dialog_if_open, bridge_dir, hint=SWITCH_MODEL_DIALOG_HINT
+                )
+                if _native_pane_status.get(conv_id) in ("running", "waiting"):
+                    if not was_busy:
+                        # Typed while idle but queued: Claude saves it after the turn.
+                        default_model_before = await asyncio.to_thread(
+                            defer_default_model_restore,
+                            bridge_dir,
+                            default_model_before,
+                            model_arg,
+                        )
+                        restore_landed_switch = functools.partial(
+                            restore_default_model, bridge_dir, default_model_before, model_arg
+                        )
+                    was_busy = True
+                if time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(_CLAUDE_MODEL_CONFIRM_POLL_S)
+            if not was_busy:
+                await asyncio.to_thread(restore_landed_switch)
+                reply.set_result(
+                    JSONResponse(
+                        status_code=503,
+                        content={
+                            "error": "claude_native_model_unconfirmed",
+                            "detail": (
+                                f"the terminal did not confirm the switch to {model_arg} within "
+                                f"{_CLAUDE_MODEL_CONFIRM_TIMEOUT_S:.0f}s — a dialog may be open "
+                                "in the pane"
+                            ),
+                        },
+                    )
+                )
+                return
+            # Mid-turn switch: Claude applies it when the turn settles, so answer
+            # success and watch for the late confirm dialog.
             _logger.info(
                 "claude-native model change for session=%s is queued behind an active "
                 "turn; watching for the late confirm dialog",
                 conv_id,
                 extra={"session_id": conv_id},
             )
-            return Response(status_code=204)
-        return JSONResponse(
-            status_code=503,
-            content={
-                "error": "claude_native_model_unconfirmed",
-                "detail": (
-                    f"the terminal did not confirm the switch to {model_arg} within "
-                    f"{_CLAUDE_MODEL_CONFIRM_TIMEOUT_S:.0f}s — a dialog may be open in the pane"
-                ),
-            },
+            reply.set_result(Response(status_code=204))
+        except BaseException as exc:
+            try:
+                if default_model_before is not None:
+                    # A queued switch may still land, so its record stays for other switches.
+                    await asyncio.to_thread(
+                        functools.partial(
+                            restore_default_model,
+                            bridge_dir,
+                            default_model_before,
+                            model_arg,
+                            wait_for_save=False,
+                            keep_pending=True,
+                        )
+                    )
+            finally:
+                if not reply.done():
+                    reply.set_exception(exc)
+            if not isinstance(exc, Exception):
+                raise
+            # Nothing awaits this task; the request already got the error.
+            _logger.warning(
+                "claude-native model change for session=%s failed",
+                conv_id,
+                exc_info=exc,
+                extra={"session_id": conv_id},
+            )
+            # A queued switch can still land, so the watcher below keeps its restore.
+            if not was_busy or default_model_before is None:
+                return
+        await _watch_late_model_dialog(
+            conv_id,
+            bridge_dir,
+            expected,
+            default_model_before=default_model_before,
+            model_arg=model_arg,
         )
 
     async def _handle_cursor_native_model_change(

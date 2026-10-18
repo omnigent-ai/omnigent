@@ -468,10 +468,10 @@ def claude_settings_apart_from_the_model() -> str | None:
     """Return the developer's ``~/.claude/settings.json`` minus its ``model`` key.
 
     Routing writes nothing into the user's global Claude settings — hook
-    registration lives in the per-session bridge dir. Claude Code's own
-    response to ``/model <id>`` does rewrite the file's ``model`` key, which
-    is the accepted trade-off for the switch, so that one key is excluded and
-    everything else is compared before and after each claude CUJ.
+    registration lives in the per-session bridge dir. Claude Code rewrites
+    the file's ``model`` key itself (its ``/model <id>`` save, which the bridge
+    then restores, and its own alias migrations), so that one key is excluded
+    and everything else is compared before and after each claude CUJ.
 
     :returns: A canonical rendering of the remaining settings, or ``None``
         when the file does not exist.

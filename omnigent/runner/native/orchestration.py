@@ -8517,8 +8517,10 @@ async def _auto_create_claude_terminal(
     from omnigent.harnesses.claude_native.bridge import (
         BRIDGE_ID_LABEL_KEY,
         augment_claude_args,
+        claude_user_settings_path,
         ensure_claude_workspace_trusted,
         prepare_bridge_dir,
+        record_claude_user_settings_path,
         validate_claude_hook_interpreter_compatibility,
     )
     from omnigent.harnesses.claude_native.forwarder import reset_transcript_forward_state
@@ -9232,10 +9234,9 @@ async def _auto_create_claude_terminal(
     )
     # Seed trust and onboarding in the config selected by the terminal's launch environment.
     try:
-        ensure_claude_workspace_trusted(
-            _claude_terminal_launch_cwd(env_spec, agent_os_env),
-            env=_claude_terminal_launch_env(env_spec),
-        )
+        pane_cwd = _claude_terminal_launch_cwd(env_spec, agent_os_env)
+        pane_env = _claude_terminal_launch_env(env_spec)
+        ensure_claude_workspace_trusted(pane_cwd, env=pane_env)
     except BaseException as seed_error:
         # No forwarder owns the routers yet, so release the ones this launch started.
         # A ``None`` handle would shut down whichever router is registered now.
@@ -9261,6 +9262,19 @@ async def _auto_create_claude_terminal(
         if cancelled is not None:
             raise cancelled from seed_error
         raise
+    try:
+        await asyncio.to_thread(
+            record_claude_user_settings_path,
+            bridge_dir,
+            claude_user_settings_path(pane_cwd, pane_env),
+        )
+    except Exception:  # noqa: BLE001 - model switches fall back to the runner's settings path.
+        _logger.warning(
+            "Could not record the Claude settings path for session=%s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
     _logger.info(
         "Claude terminal tmux launch requested: session=%s command=%s args_count=%d "
         "env_keys=%s cwd=%s scrollback=%d",

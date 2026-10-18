@@ -13,12 +13,17 @@ passed. See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
 
 import pytest
 
+from omnigent.harnesses.claude_native.bridge import (
+    bridge_dir_for_bridge_id,
+    claude_user_settings_path,
+)
 from omnigent.harnesses.claude_native.main import (
     ClaudeNativeUcodeConfig,
     build_native_claude_terminal_env,
@@ -1110,6 +1115,8 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
 
     A launch-only ``CLAUDE_CONFIG_DIR`` (here from an ``env`` wrapper) must
     reach the seeder, and seeding must happen before the terminal launches.
+    The bridge records the settings file that config dir selects, so model
+    switches keep the user's default in the file this Claude saves to.
     """
     from unittest.mock import Mock
 
@@ -1126,6 +1133,11 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/runner/claude")
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted", record_seed
+    )
+    # The real lookup, which the autouse settings isolation replaces.
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.claude_user_settings_path",
+        claude_user_settings_path,
     )
     monkeypatch.setattr(
         "omnigent.harness_startup_config.resolve_harness_command", lambda *_a, **_k: "env"
@@ -1150,6 +1162,12 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
     assert env is not None
     assert env["CLAUDE_CONFIG_DIR"] == "/launch/claude"
     registry.launch_required_terminal.assert_awaited_once()
+    bridge_config = json.loads(
+        (bridge_dir_for_bridge_id("conv_seed_launch_env") / "bridge.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert bridge_config.get("claude_user_settings_path") == "/launch/claude/settings.json"
 
 
 @pytest.mark.parametrize(

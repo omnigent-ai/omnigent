@@ -18,8 +18,8 @@ What is scored:
   twice means the replay itself was routed again.
 * **The switch actually lands.** The apply layer types ``/model <id>``, so the
   pane must report the switch before the replay runs. Claude Code answers that
-  form by also rewriting the ``model`` key in the developer's own
-  ``~/.claude/settings.json`` — an accepted trade-off — so everything *else* in
+  form by also saving the ``model`` key in the developer's own
+  ``~/.claude/settings.json``, which the bridge restores; everything *else* in
   that file must be unchanged.
 * **One decision, one turn.** A leaked replay shows up as two user messages for
   one thing typed.
@@ -191,6 +191,6 @@ def test_claude_routes_the_first_typed_message_exactly_once(
     )
 
     assert claude_settings_apart_from_the_model() == settings_before, (
-        "~/.claude/settings.json changed beyond its `model` key — `/model <id>` "
-        "may move Claude Code's own default, nothing else"
+        "~/.claude/settings.json changed beyond its `model` key — only Claude's own "
+        "`/model <id>` save may touch the file, and the bridge restores that key"
     )

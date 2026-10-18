@@ -1019,21 +1019,15 @@ async def test_replay_switches_the_claude_pane_before_delivering(
     monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
     monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
     _mark(tmp_path)
-    switched: list[tuple[Path, str, bool]] = []
+    switched: list[tuple[Path, str]] = []
     client = _FakeServerClient()
 
-    def _inject(
-        bridge_dir: Path,
-        *,
-        command: str,
-        auto_confirm: bool = False,
-        confirm_hint: str | None = None,
-    ) -> None:
+    def _inject(bridge_dir: Path, *, model_arg: str) -> None:
         assert not client.posts, "the pane must be switched before the prompt lands"
-        switched.append((bridge_dir, command, auto_confirm))
+        switched.append((bridge_dir, model_arg))
 
     monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.inject_slash_command", _inject, raising=False
+        "omnigent.harnesses.claude_native.bridge.inject_model_command", _inject, raising=False
     )
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge.read_model_env",
@@ -1053,8 +1047,55 @@ async def test_replay_switches_the_claude_pane_before_delivering(
 
     # The vocabulary spelling, not the catalog id: ``/model`` rejects a bare
     # gateway id and silently keeps the old model.
-    assert switched == [(tmp_path, "/model sonnet", True)]
+    assert switched == [(tmp_path, "sonnet")]
     assert len(client.posts) == 1
+
+
+async def test_routed_claude_switch_keeps_the_users_default_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolate_claude_user_settings: Path,
+) -> None:
+    """
+    A routed switch applies to this session only.
+
+    Claude Code saves ``/model <name>`` as the user's default model in
+    ``settings.json``, so without the restore every routed session would
+    rewrite the model of every future Claude Code session.
+    """
+    monkeypatch.setattr(turn_routing, "REPLAY_MARKER_WAIT_S", 1.0)
+    monkeypatch.setattr(turn_routing, "REPLAY_POLL_S", 0.01)
+    _mark(tmp_path)
+    settings = _isolate_claude_user_settings
+    # Claude's own layout, which the restore must keep byte for byte.
+    original = json.dumps({"model": "opus", "note": "café"}, indent=2, ensure_ascii=False) + "\n"
+    settings.write_text(original, encoding="utf-8")
+    typed: list[str] = []
+
+    def _claude_pane(_bridge_dir: Path, *, command: str, **_kwargs: object) -> None:
+        """Type the command the way Claude Code 2.1 handles it: save it as the default."""
+        typed.append(command)
+        payload = json.loads(settings.read_text(encoding="utf-8"))
+        payload["model"] = command.removeprefix("/model ")
+        settings.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", "utf-8")
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.inject_slash_command", _claude_pane
+    )
+
+    await schedule_replay(
+        "conv_1",
+        prompt="What is 2+2?",
+        bridge_dir=tmp_path,
+        blocked_turn_id=None,
+        server_client=_FakeServerClient(),
+        harness="claude-native",
+        model="claude-sonnet-5-5",
+        idle=lambda _turn: True,
+    )
+
+    assert typed == ["/model claude-sonnet-5-5"]
+    assert settings.read_text(encoding="utf-8") == original
 
 
 async def test_replay_still_delivers_when_the_claude_switch_fails(
@@ -1067,18 +1108,12 @@ async def test_replay_still_delivers_when_the_claude_switch_fails(
     _mark(tmp_path)
     client = _FakeServerClient()
 
-    def _boom(
-        _bridge_dir: Path,
-        *,
-        command: str,
-        auto_confirm: bool = False,
-        confirm_hint: str | None = None,
-    ) -> None:
-        del command, auto_confirm, confirm_hint
+    def _boom(_bridge_dir: Path, *, model_arg: str) -> None:
+        del model_arg
         raise RuntimeError("tmux target is not advertised")
 
     monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.inject_slash_command", _boom, raising=False
+        "omnigent.harnesses.claude_native.bridge.inject_model_command", _boom, raising=False
     )
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge.read_model_env",
@@ -1114,7 +1149,7 @@ async def test_replay_skips_the_switch_for_an_unspeakable_model(
     _mark(tmp_path)
     client = _FakeServerClient()
     monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.inject_slash_command",
+        "omnigent.harnesses.claude_native.bridge.inject_model_command",
         lambda *a, **k: pytest.fail("must not touch the pane"),
         raising=False,
     )
@@ -1147,7 +1182,7 @@ async def test_replay_leaves_the_model_alone_for_codex(
     _mark(tmp_path)
     client = _FakeServerClient()
     monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.inject_slash_command",
+        "omnigent.harnesses.claude_native.bridge.inject_model_command",
         lambda *a, **k: pytest.fail("codex must not drive the claude pane"),
         raising=False,
     )
@@ -1208,7 +1243,7 @@ async def test_replay_skips_the_switch_when_the_pane_is_already_there(
         lambda _dir: "databricks-claude-sonnet-5",
     )
     monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge.inject_slash_command",
+        "omnigent.harnesses.claude_native.bridge.inject_model_command",
         lambda *a, **k: pytest.fail("no switch when the pane is already on it"),
         raising=False,
     )

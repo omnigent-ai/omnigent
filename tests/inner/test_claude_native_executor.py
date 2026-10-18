@@ -15,10 +15,12 @@ import pytest
 from omnigent.harnesses.claude_native import bridge as claude_bridge
 from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
+    SWITCH_MODEL_DIALOG_HINT,
     ClaudePromptTimeout,
     ClaudeSignInPending,
     ClaudeTerminalDialog,
     ClaudeTerminalExited,
+    DefaultModelLockTimeout,
     TmuxSessionNotAdvertised,
 )
 from omnigent.inner import claude_native_executor
@@ -33,6 +35,21 @@ _TINY_PNG_B64 = (
 )
 _TINY_PNG_DATA_URI = f"data:image/png;base64,{_TINY_PNG_B64}"
 _TINY_PNG_BYTES = base64.b64decode(_TINY_PNG_B64)
+
+
+def _model_inject(fake: Any) -> Any:
+    """Adapt a ``/model`` keystroke fake to ``inject_model_command``'s signature."""
+
+    def inject(bridge_dir: Path, *, model_arg: str, **kwargs: Any) -> None:
+        fake(
+            bridge_dir,
+            command=f"/model {model_arg}",
+            auto_confirm=True,
+            confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+            **kwargs,
+        )
+
+    return inject
 
 
 @pytest.mark.asyncio
@@ -1157,7 +1174,9 @@ async def test_run_turn_applies_routed_model_before_message_under_one_lock(
         "read_model_env",
         lambda _bridge: {"ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5"},
     )
-    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(
+        claude_native_executor, "inject_model_command", _model_inject(fake_inject_slash_command)
+    )
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
 
     executor = ClaudeNativeExecutor(bridge_dir)
@@ -1209,7 +1228,9 @@ async def test_run_turn_uses_the_custom_model_slot_id_verbatim(
             "ANTHROPIC_CUSTOM_MODEL_OPTION": "databricks-claude-sonnet-5",
         },
     )
-    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(
+        claude_native_executor, "inject_model_command", _model_inject(fake_inject_slash_command)
+    )
     monkeypatch.setattr(
         claude_native_executor,
         "inject_user_message",
@@ -1270,7 +1291,9 @@ async def test_run_turn_types_a_managed_picker_row_verbatim(
         "read_model_picker_values",
         lambda _bridge: ["system.ai.claude-opus-4-8[1m]", "system.ai.glm-5-3"],
     )
-    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(
+        claude_native_executor, "inject_model_command", _model_inject(fake_inject_slash_command)
+    )
     monkeypatch.setattr(
         claude_native_executor,
         "inject_user_message",
@@ -1332,7 +1355,9 @@ async def test_run_turn_skips_switch_for_untranslatable_model(
         "read_model_env",
         lambda _bridge: {"ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-4-8"},
     )
-    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(
+        claude_native_executor, "inject_model_command", _model_inject(fake_inject_slash_command)
+    )
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
 
     executor = ClaudeNativeExecutor(tmp_path / "bridge")
@@ -1374,10 +1399,8 @@ async def test_run_turn_skips_switch_when_the_family_pin_drifted(
     )
     monkeypatch.setattr(
         claude_native_executor,
-        "inject_slash_command",
-        lambda bridge_dir_arg, *, command, timeout_s=30.0, auto_confirm=False, confirm_hint=None: (
-            slash_calls.append(command)
-        ),
+        "inject_model_command",
+        _model_inject(lambda bridge_dir_arg, *, command, **_kwargs: slash_calls.append(command)),
     )
     monkeypatch.setattr(
         claude_native_executor,
@@ -1434,7 +1457,9 @@ async def test_run_turn_without_model_override_injects_message_only(
         del bridge_dir_arg, timeout_s
         msg_calls.append(content)
 
-    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(
+        claude_native_executor, "inject_model_command", _model_inject(fake_inject_slash_command)
+    )
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
 
     executor = ClaudeNativeExecutor(bridge_dir)
@@ -1493,7 +1518,9 @@ async def test_run_turn_skips_model_switch_when_already_on_that_model(
         "read_launch_model",
         lambda _bridge: "databricks-claude-opus-4-8",
     )
-    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(
+        claude_native_executor, "inject_model_command", _model_inject(fake_inject_slash_command)
+    )
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
 
     executor = ClaudeNativeExecutor(bridge_dir)
@@ -1553,7 +1580,9 @@ async def test_a_routed_first_message_switches_the_model_exactly_once(
         "read_claude_status_model",
         lambda _bridge: "claude-opus-4-8",
     )
-    monkeypatch.setattr(claude_native_executor, "inject_slash_command", fake_inject_slash_command)
+    monkeypatch.setattr(
+        claude_native_executor, "inject_model_command", _model_inject(fake_inject_slash_command)
+    )
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
 
     executor = ClaudeNativeExecutor(bridge_dir)
@@ -1657,20 +1686,32 @@ async def test_run_turn_keeps_the_pane_when_a_terminal_dialog_blocks_delivery(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        ClaudeTerminalDialog(
+            "Claude Code's input box is occupied by an overlay, so the command was not sent."
+        ),
+        DefaultModelLockTimeout("another Claude model switch is still running after 60s"),
+    ],
+    ids=["occupied_input_box", "model_switch_lock_busy"],
+)
 async def test_run_turn_reports_a_refused_routed_model_switch_as_undelivered(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    refusal: RuntimeError,
 ) -> None:
     """
-    A ``/model`` switch refused at an occupied input box fails the turn as undelivered.
+    A ``/model`` switch refused before typing fails the turn as undelivered.
 
-    ``inject_slash_command`` raises :class:`ClaudeTerminalDialog` instead of
-    typing into a surface Escape cannot clear (wrapper output before the
-    input box mounts, a hintless confirmation). The routed switch runs before
-    the message, so nothing has reached Claude Code: the message must not be
-    injected behind it, the pane stays alive for the person to clear the
-    surface, and the error is classified undelivered so the sender's queued
-    copy is settled rather than lost on reload.
+    The bridge raises :class:`ClaudeTerminalDialog` instead of typing into a
+    surface Escape cannot clear (wrapper output before the input box mounts,
+    a hintless confirmation), and :class:`DefaultModelLockTimeout` while
+    another session's switch holds the default-model lock. The routed switch
+    runs before the message, so nothing has reached Claude Code: the message
+    must not be injected behind it, the pane stays alive, and the error is
+    classified undelivered so the sender's queued copy is settled rather
+    than lost on reload.
     """
     monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
     bridge_dir = tmp_path / "bridge"
@@ -1678,12 +1719,9 @@ async def test_run_turn_reports_a_refused_routed_model_switch_as_undelivered(
     killed: list[Path] = []
 
     def refuse_slash_command(bridge_dir_arg: Path, *, command: str, **kwargs: object) -> None:
-        """Refuse the switch the way the bridge does at a surface Escape cannot clear."""
-        del bridge_dir_arg, kwargs
-        raise ClaudeTerminalDialog(
-            f"Claude Code's input box is occupied by an overlay, so the command was "
-            f"not sent ({command})."
-        )
+        """Refuse the switch the way the bridge does before typing it."""
+        del bridge_dir_arg, command, kwargs
+        raise refusal
 
     def record_message(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         """Record a message inject that must never happen."""
@@ -1696,7 +1734,9 @@ async def test_run_turn_reports_a_refused_routed_model_switch_as_undelivered(
         "read_model_env",
         lambda _bridge: {"ANTHROPIC_DEFAULT_SONNET_MODEL": "databricks-claude-sonnet-5"},
     )
-    monkeypatch.setattr(claude_native_executor, "inject_slash_command", refuse_slash_command)
+    monkeypatch.setattr(
+        claude_native_executor, "inject_model_command", _model_inject(refuse_slash_command)
+    )
     monkeypatch.setattr(claude_native_executor, "inject_user_message", record_message)
     monkeypatch.setattr(
         claude_native_executor,
@@ -1720,7 +1760,7 @@ async def test_run_turn_reports_a_refused_routed_model_switch_as_undelivered(
     assert len(events) == 1
     error = events[0]
     assert isinstance(error, ExecutorError)
-    assert "occupied by an overlay" in error.message
+    assert str(refusal) in error.message
     assert error.undelivered is True
 
 
@@ -1967,7 +2007,7 @@ async def test_cancelled_delivery_drains_worker_before_unlocking(
     monkeypatch.setattr(claude_bridge, "_capture_pane", capture)
     monkeypatch.setattr("subprocess.run", run)
     monkeypatch.setattr(claude_native_executor, "inject_user_message", inject)
-    monkeypatch.setattr(claude_native_executor, "inject_slash_command", inject)
+    monkeypatch.setattr(claude_native_executor, "inject_model_command", _model_inject(inject))
     monkeypatch.setattr(claude_native_executor, "kill_session", reap)
     executor = ClaudeNativeExecutor(tmp_path / "bridge")
     monkeypatch.setattr(
