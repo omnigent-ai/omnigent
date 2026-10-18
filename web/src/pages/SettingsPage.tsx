@@ -103,6 +103,7 @@ import {
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { KeyboardShortcutsList } from "@/components/KeyboardShortcutsDialog";
 import { changePassword, logout } from "@/lib/accountsApi";
+import { clearAllPersistedInitialPrompts } from "@/store/chatStore";
 import { withBasePath } from "@/lib/basePath";
 import {
   beginGithubConnect,
@@ -2499,6 +2500,10 @@ function AccountSection() {
   }, []);
 
   const onSignOut = useCallback(async () => {
+    // sessionStorage survives the hard navigation below, so drop any pending
+    // first-message recovery copy here or the next account to sign in on this
+    // browser could inherit and send the previous user's unsent message.
+    clearAllPersistedInitialPrompts();
     if (accountsEnabled) {
       // Accounts: clear the cookie via the JSON logout endpoint, then land on
       // the SPA login form.
