@@ -137,6 +137,8 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   Use the tests' approach (the harness's own transcript or program input)
   instead of reading the page.
 - "Starting up" and "stopped" look similar. Starting up offers no Resume action;
-  stopped does. Wait past startup before calling a terminal stopped.
+  stopped does. Wait past startup before calling a terminal stopped. A
+  cloud-sandbox session stays in Starting up until its sandbox is ready, which
+  can take minutes.
 - Tests that need a harness-specific or opt-in environment skip quietly without
   it. Check that the test ran, not only that the suite passed.

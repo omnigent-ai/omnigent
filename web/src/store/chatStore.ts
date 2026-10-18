@@ -985,7 +985,8 @@ export interface ConversationState {
    * is in flight, so it would otherwise read as idle `runner_asleep` and
    * show nothing at all. Feeds `useSessionLiveness` as a `starting` nudge
    * and self-expires after `STARTING_GRACE_S`. `null` when no such launch
-   * is outstanding.
+   * is outstanding. Also stamped when the session's managed sandbox reports
+   * `ready`: its runner is up, but its terminal is not created yet.
    */
   runnerLaunchedAt: number | null;
   /**
@@ -7194,13 +7195,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Advance the managed-sandbox provisioning indicator. `ready`
       // clears it — from then on the session looks like any
       // host-bound session; `failed` retains the reason so the page
-      // explains why the sandbox never came up.
-      applyToConversation({
-        sandboxStatus:
-          event.stage === "ready"
-            ? null
-            : { stage: event.stage, error: event.error, provider: event.provider },
-      });
+      // explains why the sandbox never came up. `ready` also stamps the
+      // launch grace: the runner is up but its terminal is still coming.
+      applyToConversation(
+        event.stage === "ready"
+          ? { sandboxStatus: null, runnerLaunchedAt: Date.now() }
+          : { sandboxStatus: { stage: event.stage, error: event.error, provider: event.provider } },
+      );
       // The sandbox host is bound before its runner starts; refetch the binding and a
       // host list cached before that host registered, so the composer can name it.
       if (event.stage === "connecting" || event.stage === "ready") {
