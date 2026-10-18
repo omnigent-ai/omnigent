@@ -4209,6 +4209,75 @@ describe("chatStore — first message during native model startup", () => {
     expect(onError).toHaveBeenCalledWith(expect.stringContaining("still starting"));
   });
 
+  it("steers only the first queued message during a launch, keeping the rest in place", async () => {
+    harness = "codex-native";
+    sandboxStage = "provisioning";
+    begin();
+    await settle();
+    useChatStore.getState().stop();
+    await settle();
+    const queued = ["second", "third"].map((text, index) => ({
+      queueId: `q_launch_${index}`,
+      stableId: `stable_launch_${index}`,
+      text,
+      conversationId: sessionId,
+    }));
+    useChatStore.setState({ queuedMessages: queued });
+    useChatStore.getState().steerAllQueuedMessages(sessionId);
+    await settle();
+
+    expect(eventBodies()).toEqual([]);
+    expect(useChatStore.getState().pendingUserMessages).toMatchObject([
+      { initialDraft: { text: "second" } },
+    ]);
+    expect(useChatStore.getState().queuedMessages).toEqual([queued[1]]);
+  });
+
+  it("hands a held-time send with its own error handler back to it", async () => {
+    harness = "codex-native";
+    sandboxStage = "provisioning";
+    begin();
+    await settle();
+    const onError = vi.fn();
+    void useChatStore.getState().send("second", "agent_xyz", undefined, {
+      stableId: "stable_second",
+      pinnedConversationId: sessionId,
+      onError,
+    });
+    await settle();
+
+    expect(onError).toHaveBeenCalledWith(expect.stringContaining("still starting"));
+    expect(eventBodies()).toEqual([]);
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
+  it("keeps the text of a pinned send to another held session that has no handler", async () => {
+    harness = "codex-native";
+    sandboxStage = "provisioning";
+    begin();
+    await settle();
+    conversationRegistry.acquire("conv_child").setState({
+      pendingUserMessages: [
+        {
+          tempId: "pend_child",
+          content: [{ type: "input_text", text: "child first" }],
+          initialDraft: { text: "child first", files: [] },
+          createdAtS: 0,
+        },
+      ],
+    });
+    void useChatStore.getState().send("child second", "agent_xyz", undefined, {
+      pinnedConversationId: "conv_child",
+    });
+    await settle();
+
+    expect(eventBodies()).toEqual([]);
+    expect(conversationRegistry.peek("conv_child")?.getState().failedSendDraft).toMatchObject({
+      conversationId: "conv_child",
+      text: "child second",
+    });
+  });
+
   it("abandons the waiting send when its conversation is disposed", async () => {
     begin();
     await settle();

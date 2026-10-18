@@ -2124,6 +2124,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (own.length === 0) return;
     const state = setterForState(conversationId);
     if (state !== null && holdsInitialDraft(state)) return;
+    // During a CLI sandbox launch the first one is held; the rest stay queued behind it.
+    if (state !== null && nativeSandboxLaunching(state)) {
+      s.steerMessage(own[0]!.queueId);
+      return;
+    }
     // SDK buffers compact; Pi interrupts and Codex requires idle.
     // Drain their prefix first so compaction cannot interrupt those messages.
     const compactIndex =
@@ -2440,10 +2445,23 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       targetState !== null &&
       holdsInitialDraft(targetState)
     ) {
-      if (!opensSideChat && (pinnedId === null || pinnedId === get().conversationId)) {
+      const target = pinnedId ?? get().conversationId;
+      if (opts?.onError !== undefined) {
+        // A queued send's handler puts the original entry back in its place.
+        opts.onError("This session is still starting. Try again once it has started.");
+      } else if (!opensSideChat && target === get().conversationId) {
         get().enqueueMessage(text, files, opts?.replyDraft);
-      } else {
-        opts?.onError?.("This session is still starting. Try again once it has started.");
+      } else if (target !== null) {
+        setterFor(target)({
+          failedSendDraft: {
+            conversationId: target,
+            text,
+            files: files ?? [],
+            stableId,
+            serverRefused: false,
+            ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+          },
+        });
       }
       return;
     }
