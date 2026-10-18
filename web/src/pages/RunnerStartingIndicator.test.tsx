@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { RunnerStartingIndicator } from "./ChatIndicators";
 import { useChatStore } from "@/store/chatStore";
@@ -7,11 +7,7 @@ import {
   type TerminalFirstContextValue,
 } from "@/shell/TerminalFirstContext";
 
-/**
- * Build a TerminalFirstContextValue with sensible defaults so each test
- * overrides only the fields it exercises. `terminalStartingUp` is the only
- * field this component reads — it defaults to false (steady state).
- */
+/** A native session whose terminal is absent, with no unrelated startup signal. */
 function makeCtx(overrides: Partial<TerminalFirstContextValue> = {}): TerminalFirstContextValue {
   return {
     isClaudeNative: true,
@@ -45,12 +41,106 @@ function renderWithContext(variant: "hero" | "row", ctx: TerminalFirstContextVal
 
 afterEach(() => {
   cleanup();
-  // The component reads sandboxStatus from the module-scoped store —
-  // reset it so a stage set in one test can't leak into the next.
-  useChatStore.setState({ sandboxStatus: null });
+  useChatStore.setState({
+    sandboxStatus: null,
+    sessionConfigPhase: null,
+    sessionConfigError: null,
+    pendingModelChange: null,
+  });
 });
 
 describe("RunnerStartingIndicator", () => {
+  it.each(["hero", "row"] as const)(
+    "%s: shows explicit recovery without a terminal context",
+    (variant) => {
+      useChatStore.setState({ sessionConfigPhase: "starting" });
+      renderWithContext(variant, null);
+
+      const indicator = screen.getByTestId("runner-starting-indicator");
+      expect(indicator).toHaveTextContent("Starting up…");
+      expect(indicator).toHaveAttribute("role", "status");
+      expect(indicator.querySelector(".animate-spin")).not.toBeNull();
+
+      act(() => useChatStore.setState({ sessionConfigPhase: "applying" }));
+      expect(screen.queryByTestId("runner-starting-indicator")).toBeNull();
+
+      act(() => useChatStore.setState({ sessionConfigPhase: null }));
+      expect(screen.queryByTestId("runner-starting-indicator")).toBeNull();
+    },
+  );
+
+  it.each(["hero", "row"] as const)(
+    "%s: keeps native startup visible through application and model confirmation",
+    (variant) => {
+      useChatStore.setState({ sessionConfigPhase: "starting" });
+      renderWithContext(variant, makeCtx());
+      expect(screen.getByTestId("runner-starting-indicator")).toHaveTextContent("Starting up…");
+
+      act(() => useChatStore.setState({ sessionConfigPhase: "applying" }));
+      expect(screen.getByTestId("runner-starting-indicator")).toHaveTextContent("Starting up…");
+
+      act(() => useChatStore.setState({ sessionConfigPhase: null, pendingModelChange: "sonnet" }));
+      expect(screen.getByTestId("runner-starting-indicator")).toHaveTextContent("Starting up…");
+
+      act(() => useChatStore.setState({ pendingModelChange: null }));
+      expect(screen.queryByTestId("runner-starting-indicator")).toBeNull();
+    },
+  );
+
+  it.each(["hero", "row"] as const)(
+    "%s: clears startup when the native terminal appears before configuration settles",
+    (variant) => {
+      useChatStore.setState({ sessionConfigPhase: "applying" });
+      const ctx = makeCtx();
+      const { rerender } = renderWithContext(variant, ctx);
+      expect(screen.getByTestId("runner-starting-indicator")).toHaveTextContent("Starting up…");
+
+      const tree = (terminalsAvailable: boolean) => (
+        <TerminalFirstContextProvider value={{ ...ctx, terminalsAvailable }}>
+          <RunnerStartingIndicator variant={variant} />
+        </TerminalFirstContextProvider>
+      );
+      rerender(tree(true));
+      expect(screen.queryByTestId("runner-starting-indicator")).toBeNull();
+
+      act(() => useChatStore.setState({ sessionConfigPhase: null, pendingModelChange: "sonnet" }));
+      rerender(tree(false));
+      expect(screen.getByTestId("runner-starting-indicator")).toHaveTextContent("Starting up…");
+      rerender(tree(true));
+      expect(screen.queryByTestId("runner-starting-indicator")).toBeNull();
+    },
+  );
+
+  it.each(["hero", "row"] as const)(
+    "%s: does not treat SDK configuration as native terminal startup",
+    (variant) => {
+      useChatStore.setState({ sessionConfigPhase: "applying" });
+      renderWithContext(variant, makeCtx({ isClaudeNative: false, isNativeWrapper: false }));
+      expect(screen.queryByTestId("runner-starting-indicator")).toBeNull();
+
+      act(() => useChatStore.setState({ sessionConfigPhase: null, pendingModelChange: "sonnet" }));
+      expect(screen.queryByTestId("runner-starting-indicator")).toBeNull();
+    },
+  );
+
+  it.each(["hero", "row"] as const)(
+    "%s: clears model/effort startup when recovery fails",
+    (variant) => {
+      useChatStore.setState({ sessionConfigPhase: "starting" });
+      renderWithContext(variant, null);
+      expect(screen.getByTestId("runner-starting-indicator")).toHaveTextContent("Starting up…");
+
+      act(() =>
+        useChatStore.setState({
+          sessionConfigPhase: null,
+          sessionConfigError: "Terminal failed to start",
+        }),
+      );
+
+      expect(screen.queryByTestId("runner-starting-indicator")).toBeNull();
+    },
+  );
+
   it.each(["hero", "row"] as const)(
     "%s: renders nothing for ordinary terminal startup",
     (variant) => {
@@ -125,6 +215,21 @@ describe("RunnerStartingIndicator", () => {
     expect(indicator).toHaveTextContent(/cloning repository/i);
     expect(indicator).not.toHaveTextContent(/starting up/i);
   });
+
+  it.each(["hero", "row"] as const)(
+    "%s: prefers sandbox progress while model/effort recovery is starting",
+    (variant) => {
+      useChatStore.setState({
+        sandboxStatus: { stage: "cloning", error: null },
+        sessionConfigPhase: "starting",
+      });
+      renderWithContext(variant, null);
+
+      const indicator = screen.getByTestId("runner-starting-indicator");
+      expect(indicator).toHaveTextContent(/cloning repository/i);
+      expect(indicator).not.toHaveTextContent(/starting up/i);
+    },
+  );
 
   it.each(["hero", "row"] as const)(
     "%s: renders nothing for a FAILED sandbox launch",
