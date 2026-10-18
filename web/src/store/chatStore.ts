@@ -1404,9 +1404,23 @@ function modelSelectionPending(state: ConversationState): boolean {
   );
 }
 
-/** Keep the draft local while native model startup or a model switch is pending. */
-function waitForModelSelection(conversationId: string, tempId: string): Promise<boolean> {
+// A native CLI can't take input until its sandbox is up, and a launch can take
+// minutes; the server holds a message for less than that.
+function nativeSandboxLaunching(state: ConversationState): boolean {
+  return (
+    state.isNativeTerminalSession &&
+    state.sandboxStatus !== null &&
+    state.sandboxStatus.stage !== "failed"
+  );
+}
+
+/**
+ * Keep the draft local while native model startup or a model switch is pending,
+ * or while a native session's sandbox launches.
+ */
+function waitForInitialDispatch(conversationId: string, tempId: string): Promise<boolean> {
   return new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const finish = (ready: boolean, error?: Error) => {
       clearTimeout(timer);
       unsubscribe();
@@ -1428,8 +1442,29 @@ function waitForModelSelection(conversationId: string, tempId: string): Promise<
           false,
           state.conversationLoadError ?? new Error("Session failed before the message was sent."),
         );
-      } else if (!modelSelectionPending(state)) {
+      } else if (!modelSelectionPending(state) && !nativeSandboxLaunching(state)) {
         finish(true);
+      } else if (state.sandboxStatus?.stage === "failed") {
+        const reason = state.sandboxStatus.error;
+        finish(
+          false,
+          new Error(
+            `The session's managed sandbox failed to launch${reason ? `: ${reason}` : "."}`,
+          ),
+        );
+      } else if (state.sandboxStatus !== null) {
+        // The model can only start once the sandbox is up.
+        clearTimeout(timer);
+        timer = undefined;
+      } else {
+        timer ??= setTimeout(
+          () =>
+            finish(
+              false,
+              new Error("The model did not finish starting. Please retry the message."),
+            ),
+          SEND_CHAIN_MAX_WAIT_MS,
+        );
       }
     };
     const unsubscribe = conversationRegistry.subscribe((id) => {
@@ -1438,11 +1473,6 @@ function waitForModelSelection(conversationId: string, tempId: string): Promise<
     const unsubscribeDisposed = conversationRegistry.subscribeDisposed((id) => {
       if (id === conversationId) finish(false);
     });
-    const timer = setTimeout(
-      () =>
-        finish(false, new Error("The model did not finish starting. Please retry the message.")),
-      SEND_CHAIN_MAX_WAIT_MS,
-    );
     check();
   });
 }
@@ -2380,6 +2410,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         : !skipPendingBubble &&
             targetState &&
             (modelSelectionPending(targetState) ||
+              nativeSandboxLaunching(targetState) ||
               (targetState.sessionModelSeeded && targetState.sessionHarness === null))
           ? { text, files: files ?? [] }
           : undefined;
@@ -2491,7 +2522,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // otherwise resolve that id, find an empty chain, and overtake this POST.
       const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
       postedSessionId = sessionId;
-      if (initialDraft && !(await waitForModelSelection(sessionId, tempId))) return;
+      if (initialDraft && !(await waitForInitialDispatch(sessionId, tempId))) return;
 
       if (compacts) {
         // Compact controls emit turn status edges, but no user
