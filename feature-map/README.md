@@ -87,6 +87,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 ## Features
 
+- [Markdown editor](./markdown-editor.md) defines the file-editor CUJ, fixed
+  before/after recordings, load probes, and complementary persistence checks.
+
 - [Custom agents](./custom-agents.md) covers Settings listing, creation, summary
   review, deletion, and capability gating.
 
