@@ -160,7 +160,8 @@ async def test_ensure_ready_does_not_latch_on_timeout(
 async def test_run_turn_readiness_timeout_fails_without_submitting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(qne, "wait_for_ready", lambda *a, **k: False)
+    waits: list[object] = []
+    monkeypatch.setattr(qne, "wait_for_ready", lambda *a, **k: waits.append(k["timeout_s"]))
     ex = qne.QwenNativeExecutor(bridge_dir=tmp_path)
     events = [e async for e in ex.run_turn([{"role": "user", "content": "hello"}], [], "")]
     # Exactly one ExecutorError, no TurnComplete, and no submit line on disk: the
@@ -168,6 +169,9 @@ async def test_run_turn_readiness_timeout_fails_without_submitting(
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
     assert "the message was not sent" in events[0].message
+    # The wait and the error text use the same bound.
+    assert waits == [qne.READY_TIMEOUT_S]
+    assert f"within {qne.READY_TIMEOUT_S:.0f}s" in events[0].message
     in_file = input_file_path(tmp_path)
     assert not in_file.exists() or "submit" not in in_file.read_text(encoding="utf-8")
     assert ex._ready is False
