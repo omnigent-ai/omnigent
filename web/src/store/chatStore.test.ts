@@ -4165,11 +4165,15 @@ describe("chatStore — first message during native model startup", () => {
       else reportSandbox("ready");
       await settle();
 
-      // However the hold ends, the follow-up is still queued: never lost, never sent first.
+      // The page drains the queue whenever the store settles (ChatPage's level-triggered
+      // flush); however the hold ended, that must neither lose the follow-up nor send it first.
+      useChatStore.getState().maybeFlushQueuedHead();
+      await settle();
       expect(queuedTexts()).toEqual(["follow-up"]);
       expect(sentTexts()).toEqual(outcome === "ready" ? [original] : []);
       if (outcome !== "ready") {
         expect(useChatStore.getState().failedSendDraft).toMatchObject({ text: original });
+        expect(useChatStore.getState().queuedMessages[0]?.requiresRetry).toBe(true);
       }
     },
   );
@@ -4185,6 +4189,24 @@ describe("chatStore — first message during native model startup", () => {
     expect(eventBodies()).toEqual([]);
     expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["follow-up"]);
     expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
+  });
+
+  it("turns away a pinned side chat while the first message is still held", async () => {
+    // A side chat forks the agent's thread, which doesn't exist until the first message lands.
+    harness = "codex-native";
+    sandboxStage = "provisioning";
+    vi.useFakeTimers();
+    begin();
+    await vi.advanceTimersByTimeAsync(0);
+    const onError = vi.fn();
+    void useChatStore.getState().send("/side what changed?", "agent_xyz", undefined, {
+      pinnedConversationId: sessionId,
+      onError,
+    });
+    await vi.advanceTimersByTimeAsync(4 * 60_000);
+
+    expect(eventBodies()).toEqual([]);
+    expect(onError).toHaveBeenCalledWith(expect.stringContaining("still starting"));
   });
 
   it("abandons the waiting send when its conversation is disposed", async () => {

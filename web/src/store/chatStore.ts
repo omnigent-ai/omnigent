@@ -408,6 +408,15 @@ export function holdsInitialDraft(state: Pick<ConversationState, "pendingUserMes
   return state.pendingUserMessages.some((message) => message.initialDraft !== undefined);
 }
 
+/** Keep a conversation's queued messages from sending until the user retries each one. */
+function suspendQueuedMessages(conversationId: string): void {
+  setActive((s) => ({
+    queuedMessages: s.queuedMessages.map((m) =>
+      m.conversationId === conversationId ? { ...m, requiresRetry: true } : m,
+    ),
+  }));
+}
+
 /**
  * Hydrate a client-only conversation onto its real server id once
  * `createSession` returns: rekey the registry entry (carrying the optimistic
@@ -2426,12 +2435,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
     // Nothing may overtake a first message still held for startup: queue behind it.
     if (
-      pinnedId === null &&
       !compacts &&
       opts?.reusePendingTempId == null &&
-      holdsInitialDraft(get())
+      targetState !== null &&
+      holdsInitialDraft(targetState)
     ) {
-      get().enqueueMessage(text, files, opts?.replyDraft);
+      if (!opensSideChat && (pinnedId === null || pinnedId === get().conversationId)) {
+        get().enqueueMessage(text, files, opts?.replyDraft);
+      } else {
+        opts?.onError?.("This session is still starting. Try again once it has started.");
+      }
       return;
     }
     if (opensSideChat) {
@@ -2694,6 +2707,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // (`failedSendDraft` is conversation-scoped); the composer reads whichever
       // conversation is active and guards on the id before restoring.
       const draftSessionId = postedSessionId ?? submitConversationId;
+      // A first message that never left the browser goes back to the composer;
+      // what was queued behind it waits for an explicit retry rather than going first.
+      if (initialDraft && !initialDispatched && draftSessionId !== null) {
+        suspendQueuedMessages(draftSessionId);
+      }
       // A coded error confirms refusal; a transport failure leaves delivery
       // unknown unless this retries a previously refused send.
       const answeredWithRefusal = err instanceof ApiError && err.code !== null;
@@ -2932,6 +2950,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         sendLatchedAt: null,
         failedSendDraft: { ...draft, conversationId: sessionId },
       });
+      // What was queued behind it must not go first; it waits for an explicit retry.
+      suspendQueuedMessages(sessionId);
       // A local follow-up must not prevent Interrupt from stopping earlier work.
       if (
         state.activeResponse?.state !== "streaming" &&

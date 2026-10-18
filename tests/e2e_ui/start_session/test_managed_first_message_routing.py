@@ -624,6 +624,8 @@ async def _drive_long_launch(
             await expect(user.filter(has_text=_NATIVE_PROMPT)).to_have_count(1)
             await expect(page.get_by_test_id("error-pill")).to_have_count(0)
             await expect(page.get_by_label("Message the agent")).to_have_value("")
+            # Still in the browser, not parked on the server.
+            assert not posts((await client.get(network_url)).json())
             await page.screenshot(path=str(rig.logs / "long-launch.png"))
             if not sends_once_ready:
                 return
