@@ -49,9 +49,14 @@ def _bridge_dir_lock(bridge_dir: Path) -> FileLock:
 
 
 @contextmanager
-def bridge_dir_preparation_lock(bridge_dir: Path) -> Iterator[None]:
-    """Prevent orphan cleanup while a runner prepares a bridge directory."""
-    with _bridge_dir_lock(bridge_dir):
+def bridge_dir_preparation_lock(bridge_dir: Path, *, timeout_s: float = -1) -> Iterator[None]:
+    """
+    Prevent orphan cleanup while a runner prepares a bridge directory.
+
+    :param timeout_s: Seconds to wait for the lock; ``-1`` waits indefinitely.
+    :raises filelock.Timeout: If the lock is still held after *timeout_s*.
+    """
+    with _bridge_dir_lock(bridge_dir).acquire(timeout=timeout_s):
         yield
 
 
