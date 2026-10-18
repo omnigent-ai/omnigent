@@ -27,6 +27,7 @@ from omnigent_slack.omnigent import (
     HostUnavailableError,
     OmnigentClient,
     OmnigentClientPool,
+    OmnigentError,
     RunnerUnavailableError,
     ServerUnreachableError,
     StreamInterruptedError,
@@ -39,6 +40,7 @@ from omnigent_slack.omnigent import (
     extract_policy_denied,
     extract_todos,
 )
+from omnigent_slack.resume import ResumeError, parse_resume, recap
 from omnigent_slack.setup import SetupFlow, host_unavailable_text
 from omnigent_slack.store import SQLiteStore
 from omnigent_slack.streaming import (
@@ -405,7 +407,12 @@ class SlackOmnigentService:
         # carries ``parent_user_id == <bot id>`` — which would wrongly refuse the
         # user's own message.
         parent_user_id = str(event.get("parent_user_id") or "")
-        if not key.is_dm and parent_user_id and parent_user_id != requester:
+        if (
+            not key.is_dm
+            and parent_user_id
+            and parent_user_id != requester
+            and parent_user_id != self._bot_user_id
+        ):
             self._logger.info(
                 "Ignoring reply from non-owner thread=%s parent=%s requester=%s",
                 key.display(),
@@ -413,6 +420,10 @@ class SlackOmnigentService:
                 requester,
             )
             await self._notifier.notify_non_owner(client, key, requester)
+            return
+
+        if text.split()[:1] and text.split()[0].lower() == "resume":
+            await self._resume(key=key, text=text, requester=requester, client=client)
             return
 
         # LOCAL concurrency guard: reserve the thread SYNCHRONOUSLY here (no await
@@ -581,6 +592,208 @@ class SlackOmnigentService:
             # turn's ``_run_turn_tracked`` finally owns the release from here on.
             if not spawned:
                 self._active_threads.discard(key)
+
+    async def handle_resume_command(self, command: dict[str, Any], client: Any) -> None:
+        """Slash commands have no message timestamp; create a root for replies."""
+        root = await client.chat_postMessage(
+            channel=command["channel_id"],
+            text="Continue an Omnigent session here.",
+        )
+        await self._resume(
+            key=ThreadKey(command["team_id"], command["channel_id"], root["ts"]),
+            text=command["text"],
+            requester=command["user_id"],
+            client=client,
+        )
+
+    async def _resume(
+        self,
+        *,
+        key: ThreadKey,
+        text: str,
+        requester: str,
+        client: Any,
+    ) -> None:
+        if key in self._active_threads:
+            await client.chat_postMessage(
+                channel=key.channel_id,
+                thread_ts=key.thread_ts,
+                text="This thread is busy. Wait for its current turn before resuming.",
+            )
+            return
+        self._active_threads.add(key)
+        try:
+            await self._resume_reserved(key=key, text=text, requester=requester, client=client)
+        finally:
+            self._active_threads.discard(key)
+
+    async def _resume_reserved(
+        self,
+        *,
+        key: ThreadKey,
+        text: str,
+        requester: str,
+        client: Any,
+    ) -> None:
+        async def post(message: str) -> None:
+            await client.chat_postMessage(
+                channel=key.channel_id,
+                thread_ts=key.thread_ts,
+                text=message,
+                mrkdwn=True,
+                unfurl_links=False,
+                unfurl_media=False,
+            )
+
+        rebind_reservations: set[ThreadKey] = set()
+
+        def reserve_previous(previous: ThreadKey) -> bool:
+            if previous in self._active_threads:
+                return False
+            self._active_threads.add(previous)
+            rebind_reservations.add(previous)
+            return True
+
+        try:
+            session_id, force = parse_resume(text, self._notifier._session_web_link("ID"))
+            omnigent = await self._pool.get(
+                self._server_url,
+                pack_user_key(key.team_id, requester),
+            )
+            snapshot = await omnigent.resume_snapshot(session_id)
+            destination = await self._store.get_session(key)
+            if destination and destination.owner_user_id != requester:
+                await self._notifier.notify_non_owner(client, key, requester)
+                return
+            host_id = snapshot.get("host_id")
+            host_type: HostType = (
+                "managed" if snapshot.get("host_type") == "managed" else "external"
+            )
+            outcome, previous = await self._store.bind_session(
+                key,
+                session_id,
+                str(snapshot.get("title") or session_id),
+                owner_user_id=requester,
+                host_id=host_id,
+                workspace=snapshot.get("workspace"),
+                host_type=host_type,
+                force=force,
+                reserve_previous=reserve_previous,
+            )
+            if outcome == "busy":
+                await post("The existing Slack thread is busy. Wait before moving its session.")
+                return
+            if outcome == "same":
+                await self._store.refresh_session_metadata(
+                    key,
+                    session_id,
+                    host_id=host_id,
+                    workspace=snapshot.get("workspace"),
+                    host_type=host_type,
+                )
+                await post(
+                    "This session is already connected here. Reply in this thread to continue."
+                )
+                if snapshot.get("runner_online") is True or snapshot.get("status") in (
+                    "running",
+                    "waiting",
+                ):
+                    return
+            if outcome == "conflict" and previous:
+                link = f"slack://channel?team={previous.team_id}&id={previous.channel_id}&message={previous.thread_ts}"
+                with contextlib.suppress(Exception):
+                    permalink = await client.chat_getPermalink(
+                        channel=previous.channel_id,
+                        message_ts=previous.thread_ts,
+                    )
+                    if isinstance(permalink.get("permalink"), str):
+                        link = permalink["permalink"]
+                await post(
+                    f"Already connected in <{link}|this Slack thread>. "
+                    f"To move it here, send `resume {session_id} --force` "
+                    f"after the Slack turn finishes."
+                )
+                return
+            if outcome not in ("bound", "same"):
+                await post(
+                    "Cannot bind here. Use a new thread and sign in as the session's Slack owner."
+                )
+                return
+            link = self._notifier._session_web_link(session_id)
+            if outcome == "bound":
+                await post(
+                    f"Session connected. <{link}|Open in Omnigent>\n"
+                    + recap(await omnigent.recent_messages(session_id))
+                )
+            if snapshot.get("status") in ("running", "waiting") or snapshot.get(
+                "pending_elicitations"
+            ):
+                await post(
+                    "The session is busy or awaiting an answer in Omnigent. "
+                    "No input was sent. Continue here after it finishes."
+                )
+                return
+            if snapshot.get("runner_online") is not True:
+                await post("Reconnecting the session's runner… No input will be sent.")
+                try:
+                    ready = await omnigent.recover_session(session_id)
+                    await self._store.refresh_session_metadata(
+                        key,
+                        session_id,
+                        host_id=ready.get("host_id"),
+                        workspace=ready.get("workspace"),
+                        host_type="managed" if ready.get("host_type") == "managed" else "external",
+                    )
+                except TimeoutError:
+                    await post(
+                        "Runner readiness timed out. Check the host in "
+                        "Omnigent, then repeat resume in this thread."
+                    )
+                    return
+                except AuthRequiredError:
+                    raise
+                except ServerUnreachableError:
+                    await post(
+                        "The Omnigent server could not be reached. "
+                        "Check the server and repeat resume."
+                    )
+                    return
+                except OmnigentError:
+                    if not host_id:
+                        await post(
+                            "No host is recorded. Reconnect this session's original runner "
+                            "in Omnigent, then repeat resume."
+                        )
+                        return
+                    if snapshot.get("host_online") is False and host_type == "external":
+                        await post(
+                            "The session's host is offline. Reconnect its original host to "
+                            "this bot's Omnigent server, then repeat resume."
+                        )
+                        return
+                    await post(
+                        "Runner recovery failed. The host may be offline or "
+                        "unavailable. Open Omnigent to inspect the host; "
+                        "reconnect it to this server, then retry."
+                    )
+                    return
+            await post(
+                "Ready. Reply in this thread to continue"
+                + (" (mention me in channels)." if not key.is_dm else ".")
+            )
+        except AuthRequiredError:
+            await post(
+                "Sign in with `/omnigent` using the Omnigent account that has "
+                "edit access, then retry resume."
+            )
+        except ResumeError as exc:
+            await post(str(exc))
+        except OmnigentError:
+            self._logger.exception("Resume failed thread=%s", key.display())
+            await post("Could not resume the session. Check Omnigent and try again.")
+        finally:
+            for previous in rebind_reservations:
+                self._active_threads.discard(previous)
 
     def _spawn_turn(self, turn: SlackTurn) -> None:
         """Run a reserved turn as a background task, tracked for shutdown.
