@@ -32,7 +32,7 @@ from omnigent.runner.identity import (
 from omnigent.sandbox.copy_on_write import SHARED_ENVIRONMENT_VAR, CopyOnWriteEnvironment
 from omnigent.util.json_types import JsonValue
 
-from ._proc import kill_tree, remember_process_group, spawn_kwargs
+from ._proc import kill_tree
 from .agent_env import strip_desktop_session_env
 from .async_utils import run_sync_on_thread
 from .credential_proxy import (
@@ -1806,13 +1806,12 @@ def _shell_impl(
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            **spawn_kwargs(),
         ) as proc:
-            remember_process_group(proc)
+            # The command stays in the helper's process group, so group teardown
+            # still reaches it; ``kill_tree`` walks the shell's own descendants.
             try:
                 stdout, stderr = proc.communicate(timeout=timeout)
             except subprocess.TimeoutExpired as exc:
-                # Kill the whole tree so shell children cannot outlive the timeout.
                 kill_tree(proc)
                 partial_stdout: object = exc.stdout
                 partial_stderr: object = exc.stderr
@@ -1835,6 +1834,10 @@ def _shell_impl(
                     "shell": shell_path,
                     "cwd": str(cwd),
                 }
+            except BaseException:
+                # Any other failure (an interrupt, say) must not leave the tree running.
+                kill_tree(proc)
+                raise
     except OSError as exc:
         return {"error": f"Failed to run shell command: {exc}"}
 
