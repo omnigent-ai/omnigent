@@ -828,6 +828,26 @@ def _post_hook_with_reattach(
                     resp.raise_for_status()
                     return resp
             except httpx.HTTPStatusError as exc:
+                if (
+                    reauth is not None
+                    and parked
+                    and _is_login_redirect_or_unauthorized(exc.response)
+                ):
+                    # A bearer the server accepted has lapsed and could not be
+                    # re-minted yet (e.g. the user must sign in again). Giving
+                    # up would leave the prompt in the terminal only, so back
+                    # off and re-mint again until the deadline.
+                    print(
+                        f"omnigent {hook_label} hook: Omnigent auth lapsed and "
+                        f"could not be renewed; retrying: {exc}",
+                        file=sys.stderr,
+                    )
+                    reauthed = False
+                    time.sleep(backoff_s)
+                    backoff_s = min(backoff_s * 2, _PERMISSION_RETRY_MAX_BACKOFF_S)
+                    if time.monotonic() >= deadline:
+                        return None
+                    continue
                 if exc.response.status_code < 500:
                     print(
                         f"omnigent {hook_label} hook: Omnigent request rejected: {exc}",
