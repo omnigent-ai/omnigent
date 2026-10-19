@@ -560,9 +560,10 @@ recovery; older shells keep the action visible.
 
 The exception covers HTTP(S) `localhost`, `127.0.0.1`, and `[::1]`, including
 redirects and links that would open a new window (which stay in the same pane).
-Other loopback addresses, private-network and metadata destinations, and
-non-web schemes remain restricted. Existing tool approvals are unchanged;
-whether a tool call asks for approval depends on the harness and its policy.
+Other loopback addresses, private-network and metadata destinations, hostnames
+that resolve to any of them, and non-web schemes remain restricted. Existing
+tool approvals are unchanged; whether a tool call asks for approval depends on
+the harness and its policy.
 
 ### Local network permission
 
@@ -621,6 +622,33 @@ against its local Chromium, and the result is posted back.
   http(s) target navigates the same view in place (still allowlist-checked on
   an agent-locked view), and right-click offers "Open Link in Browser" /
   "Copy Link Address".
+- `src/browserUrlPolicy.js` — the agent navigation policy: http(s) only, and
+  no loopback, private, link-local, metadata, or other non-public address in
+  any literal form (including IPv4-mapped and other IPv6 spellings). A
+  hostname is resolved through the view's Chromium session and refused if it
+  does not resolve or any address is non-public. `main.js` also applies the
+  policy to every document request (frames, `<object>`/`<embed>`) of an
+  agent-locked view through `webRequest`, covering redirects and in-place
+  window opens. Scripts, images, fetch/XHR, and WebSockets are outside this
+  guard and can still reach internal addresses; Electron 42 does not enforce
+  Chromium's Local Network Access checks here.
+  Those requests skip HTTP-cache reads so every response reports
+  the address Chromium connected to, and a response whose address is missing
+  or non-public (a DNS answer that changed after the check) is cancelled,
+  unless that address belongs to a configured proxy. Limits: that response
+  check runs after the request was sent, so it keeps the response from the
+  page but does not stop the request reaching the server. Pages restored from
+  the back-forward cache and navigations answered by a service worker make no
+  request these hooks see. Electron reports the connected IP but not its port
+  or whether a proxy was used, so when an internal proxy with a `DIRECT`
+  fallback is down and the destination rebinds to that proxy's IP, a direct
+  connection to another port there is accepted; failing closed would block
+  agent browsing through such proxies. For a proxied request, the reported IP
+  belongs to the proxy, not the destination it fetched; destination enforcement
+  therefore also depends on the proxy's own policy. Preflight still requires
+  successful local destination DNS, so proxy-only DNS configurations are not
+  supported. Classification conservatively excludes all of `2001::/23`,
+  including the global exceptions recognized by the Python policy.
 - `src/browserViewBounds.js` — converts the placeholder's renderer CSS pixels to
   window device-independent pixels (they diverge after `Cmd+/Cmd-` zoom).
 - `src/main.js` — instantiates one registry **per shell window** and injects it

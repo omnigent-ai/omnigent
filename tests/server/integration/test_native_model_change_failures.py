@@ -253,6 +253,9 @@ async def native_session(
         monkeypatch.setattr(claude_native, "stored_claude_catalog_rows", lambda _config: None)
         monkeypatch.setattr(claude_native, "claude_launch_catalog", AsyncMock(return_value=[]))
         monkeypatch.setattr(claude_bridge, "confirm_dialog_if_open", lambda *_a, **_k: False)
+        # No pane behind this bridge dir: the prompt wait ahead of the injection
+        # would only time out, so it passes at once as in the runner suite.
+        monkeypatch.setattr(claude_bridge, "wait_for_input_ready", lambda *_a, **_k: None)
         monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_CONFIRM_TIMEOUT_S", 0.05)
         monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_CONFIRM_POLL_S", 0.005)
     else:

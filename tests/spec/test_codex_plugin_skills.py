@@ -56,6 +56,15 @@ def codex_cli(monkeypatch: pytest.MonkeyPatch) -> Mock:
     return cli
 
 
+@pytest.fixture(autouse=True)
+def loaded_skills(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    query = Mock(return_value=[])
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.skill_discovery.loaded_codex_skills", query
+    )
+    return query
+
+
 def _discover(
     home: Path,
     skills_filter: str | list[str] = "all",
@@ -194,20 +203,116 @@ def test_plugin_inventory_uses_session_home_and_workspace(tmp_path: Path, codex_
 @pytest.mark.parametrize(
     "failure",
     [
+        None,
         FileNotFoundError(),
         subprocess.TimeoutExpired("codex", 5),
-        subprocess.CalledProcessError(2, "codex"),
+        subprocess.CalledProcessError(
+            1, "codex", stderr="failed to load configured marketplace snapshot(s)"
+        ),
     ],
+    ids=["cli-missing", "cli-unrunnable", "timeout", "nonzero-exit"],
 )
-def test_unavailable_plugin_inventory_keeps_standalone_skills(
-    tmp_path: Path, codex_cli: Mock, failure: Exception
+def test_unavailable_plugin_inventory_keeps_standalone_and_enabled_plugin_skills(
+    tmp_path: Path,
+    codex_cli: Mock,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception | None,
+    loaded_skills: Mock,
+) -> None:
+    codex_home = tmp_path / ".codex"
+    standalone = _skill(codex_home / "skills")
+    enabled = _skill(_plugin(codex_home) / "skills")
+    disabled = _skill(_plugin(codex_home, "disabled") / "skills")
+    _skill(_plugin(codex_home, "uninstalled") / "skills")
+    outside = _skill(tmp_path / "outside-cache", "outside-only")
+    escaped = _plugin(codex_home, "escape") / "skills"
+    escaped.symlink_to(outside.parent, target_is_directory=True)
+    loaded_skills.return_value = [
+        {"name": "toolkit:review", "path": str(enabled / "SKILL.md"), "enabled": True},
+        {"name": "disabled:review", "path": str(disabled / "SKILL.md"), "enabled": False},
+        {"name": "review", "path": str(standalone / "SKILL.md"), "enabled": True},
+        {"name": "outside-only", "path": str(outside / "SKILL.md"), "enabled": True},
+        {
+            "name": "escape:outside-only",
+            "path": str(escaped / outside.name / "SKILL.md"),
+            "enabled": True,
+        },
+    ]
+    if failure is None:
+        monkeypatch.setattr("omnigent.inner.codex_executor._find_codex_cli", lambda: None)
+    else:
+        codex_cli.side_effect = failure
+
+    expected = {"review": standalone}
+    if failure is not None:
+        expected["toolkit:review"] = enabled
+    assert _discover(tmp_path) == expected
+    if failure is None:
+        codex_cli.assert_not_called()
+        loaded_skills.assert_not_called()
+    else:
+        loaded_skills.assert_called_once_with("/test/codex", codex_home, codex_home)
+
+
+@pytest.mark.parametrize("skills_filter", ["all", ["selected"], ["toolkit:selected"]])
+def test_unavailable_inventory_uses_codex_selected_version_and_name(
+    tmp_path: Path, codex_cli: Mock, loaded_skills: Mock, skills_filter: str | list[str]
+) -> None:
+    codex_home = tmp_path / ".codex"
+    _skill(_plugin(codex_home, version="99.0.0") / "skills", "unused")
+    selected = _skill(_plugin(codex_home, version="local") / "skills", "directory-name")
+    hidden = _skill(selected.parent, "hidden", hidden=True)
+    loaded_skills.return_value = [
+        {"name": "toolkit:selected", "path": str(selected / "SKILL.md"), "enabled": True},
+        {"name": "toolkit:hidden", "path": str(hidden / "SKILL.md"), "enabled": True},
+    ]
+    codex_cli.side_effect = subprocess.CalledProcessError(1, "codex")
+
+    assert _discover(tmp_path, skills_filter) == {"toolkit:selected": selected}
+    assert _discover(tmp_path, ["missing"]) == {}
+
+
+@pytest.mark.parametrize("failure", [OSError(), TimeoutError(), RuntimeError(), ValueError()])
+def test_failed_loaded_skill_query_keeps_standalone_skills(
+    tmp_path: Path, codex_cli: Mock, loaded_skills: Mock, failure: Exception
 ) -> None:
     codex_home = tmp_path / ".codex"
     standalone = _skill(codex_home / "skills")
     _skill(_plugin(codex_home) / "skills")
-    codex_cli.side_effect = failure
+    codex_cli.side_effect = subprocess.CalledProcessError(1, "codex")
+    loaded_skills.side_effect = failure
 
     assert _discover(tmp_path) == {"review": standalone}
+
+
+def test_loaded_skill_query_uses_workspace_and_preserves_healthy_inventory(
+    tmp_path: Path, codex_cli: Mock, loaded_skills: Mock
+) -> None:
+    codex_home = tmp_path / ".codex"
+    _skill(_plugin(codex_home) / "skills")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ctx = SkillSourceContext((workspace,), tmp_path, "all", None, codex_home=codex_home)
+    assert len(resolve_harness_skills(ctx, "codex-native")) == 1
+    loaded_skills.assert_not_called()
+    codex_cli.side_effect = subprocess.CalledProcessError(1, "codex")
+    assert resolve_harness_skills(ctx, "codex-native") == []
+    loaded_skills.assert_called_once_with("/test/codex", codex_home, workspace)
+
+
+def test_loaded_skill_query_skips_unreadable_plugin(
+    tmp_path: Path, codex_cli: Mock, loaded_skills: Mock
+) -> None:
+    codex_home = tmp_path / ".codex"
+    good = _skill(_plugin(codex_home) / "skills")
+    bad = _skill(_plugin(codex_home, "bad") / "skills")
+    (bad / "SKILL.md").write_text("---\nname: [\n---\n")
+    loaded_skills.return_value = [
+        {"name": "bad:review", "path": str(bad / "SKILL.md"), "enabled": True},
+        {"name": "toolkit:review", "path": str(good / "SKILL.md"), "enabled": True},
+    ]
+    codex_cli.side_effect = subprocess.CalledProcessError(1, "codex")
+    assert _discover(tmp_path) == {"toolkit:review": good}
 
 
 @pytest.mark.parametrize("output", ["{", "[]", '{"installed": {}}', '{"installed": [null, {}]}'])

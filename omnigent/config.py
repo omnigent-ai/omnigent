@@ -4,11 +4,24 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from copy import deepcopy
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypeAlias
 
 import yaml
+
+from omnigent.preferences import (
+    PreferenceContext,
+    PreferenceKey,
+    PreferenceKind,
+    PreferenceLayer,
+    PreferenceScope,
+    ResolvedPreference,
+    preferences_from_config,
+    resolve_preferences,
+)
 
 _log = logging.getLogger(__name__)
 _cwd_missing_warned = False
@@ -98,7 +111,117 @@ def _merge_effective_config(
     return merged
 
 
-def load_effective_config(*, workspace: str | Path | None = None) -> _Config:
+@dataclass(frozen=True)
+class ResolvedConfig:
+    config: _Config
+    preferences: Mapping[PreferenceKey, ResolvedPreference] = field(default_factory=dict)
+
+
+def resolve_effective_config(
+    global_cfg: _Config,
+    local_cfg: _Config,
+    *,
+    preference_context: PreferenceContext | None = None,
+    preference_layers: Sequence[PreferenceLayer] = (),
+) -> ResolvedConfig:
+    """Resolve legacy config, or explicitly adopted workspace preferences.
+
+    Without a context, preserve legacy merging exactly. Supplying a context is
+    an explicit adoption boundary: global portable values are no longer inputs.
+    Callers must complete import/migration before opting in; this function does
+    not infer user intent from YAML or write resolved values back to it.
+
+    Project YAML remains an override, while commands, credentials, and unrelated
+    settings retain their existing merge rules. Plugin choices remain in the
+    provenance map for native adapters; they are not written into global YAML.
+    """
+    if preference_context is None:
+        if preference_layers:
+            raise ValueError("preference layers require an authenticated context")
+        return ResolvedConfig(_merge_effective_config(global_cfg, local_cfg))
+    if any(layer.scope == PreferenceScope.PROJECT for layer in preference_layers):
+        raise ValueError("project preferences must come from the selected project config")
+    project = PreferenceLayer(
+        PreferenceScope.PROJECT, preference_context.identity, preferences_from_config(local_cfg)
+    )
+    resolved = resolve_preferences(preference_context, (*preference_layers, project))
+    resolved = {
+        key: item
+        for key, item in resolved.items()
+        if item.source in (PreferenceScope.SESSION, PreferenceScope.PROJECT)
+        or not _project_masks_preference(local_cfg, key)
+    }
+    config = _without_portable_preferences(_merge_effective_config(global_cfg, local_cfg))
+    _apply_preferences(config, resolved)
+    return ResolvedConfig(config, resolved)
+
+
+def _project_masks_preference(cfg: _Config, key: PreferenceKey) -> bool:
+    """Apply explicit project replacements to lower scopes by canonical key."""
+    if key.kind == PreferenceKind.MODEL:
+        return key.name in cfg
+    if key.kind == PreferenceKind.PLUGIN or "harness" not in cfg:
+        return False
+    harness = cfg["harness"]
+    if not isinstance(harness, dict):
+        return True
+    if key.kind == PreferenceKind.HARNESS:
+        return "default" in harness
+
+    from omnigent.harness_aliases import canonicalize_harness
+
+    return any(
+        isinstance(name, str)
+        and name != "default"
+        and canonicalize_harness(name) == key.name
+        and (not isinstance(entry, dict) or "args" in entry)
+        for name, entry in harness.items()
+    )
+
+
+def _apply_preferences(
+    config: _Config, resolved: Mapping[PreferenceKey, ResolvedPreference]
+) -> None:
+    """Project requested values into the existing launch-config shape."""
+    for key, preference in resolved.items():
+        if key.kind == PreferenceKind.MODEL:
+            assert isinstance(key.name, str)
+            config[key.name] = preference.value
+        elif key.kind in (PreferenceKind.HARNESS, PreferenceKind.HARNESS_ARGS):
+            harness = config.setdefault("harness", {})
+            assert isinstance(harness, dict)
+            if key.kind == PreferenceKind.HARNESS:
+                harness["default"] = preference.value
+            else:
+                entry = harness.get(key.name)
+                entry = dict(entry) if isinstance(entry, dict) else {}
+                assert isinstance(preference.value, tuple)
+                entry["args"] = list(preference.value)
+                harness[key.name] = entry
+
+
+def _without_portable_preferences(cfg: _Config) -> _Config:
+    """Keep local-only settings without mutating either source dictionary."""
+    config = deepcopy(cfg)
+    for name in ("model", "opencode_model"):
+        config.pop(name, None)
+    harness = config.get("harness")
+    if isinstance(harness, dict):
+        harness.pop("default", None)
+        for entry in harness.values():
+            if isinstance(entry, dict):
+                entry.pop("args", None)
+    else:
+        config.pop("harness", None)
+    return config
+
+
+def load_effective_config(
+    *,
+    workspace: str | Path | None = None,
+    preference_context: PreferenceContext | None = None,
+    preference_layers: Sequence[PreferenceLayer] = (),
+) -> _Config:
     """Merge global and project config, with project values taking precedence.
 
     The ``harness`` mapping is deep-merged (per-harness sub-keys, local
@@ -108,7 +231,12 @@ def load_effective_config(*, workspace: str | Path | None = None) -> _Config:
     directory instead of the process cwd.
     """
     local_path = Path(workspace) / _LOCAL_CONFIG_RELPATH if workspace is not None else None
-    return _merge_effective_config(load_global_config(), load_local_config(local_path))
+    return resolve_effective_config(
+        load_global_config(),
+        load_local_config(local_path),
+        preference_context=preference_context,
+        preference_layers=preference_layers,
+    ).config
 
 
 def save_global_config(
@@ -204,6 +332,7 @@ __all__ = [
     "load_effective_config",
     "load_global_config",
     "load_local_config",
+    "resolve_effective_config",
     "save_global_config",
     "set_github_account_preference",
 ]
