@@ -11844,7 +11844,9 @@ def agent_add(source: str, yes: bool, list_only: bool, server: str | None) -> No
             _clone_github_source(clone_url, ref, checkout)
         except click.ClickException as exc:
             if not source.startswith(("github:", "https://")):
-                exc.message += f"\n(If {source!r} is a local path, it doesn't exist.)"
+                raise _agent_cli_error(
+                    f"{exc.message}\n(If {source!r} is a local path, it doesn't exist.)"
+                ) from None
             raise
         # The parser rejects `..`, so only a symlinked component can leave the subpath.
         root = checkout / subpath
