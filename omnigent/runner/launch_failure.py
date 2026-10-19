@@ -462,6 +462,8 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
         "Codex hit an error reloading the earlier transcript, so it started a fresh thread."
     ),
     "codex_turn_error": "Codex ran into an error during this turn.",
+    "codex_turn_rejected": "Codex rejected this message, so it wasn't sent.",
+    "input_too_large": "This message is longer than the agent accepts, so it wasn't sent.",
     CODEX_COMPACTION_MODEL_FAILED: (
         "Codex couldn't compact the conversation on the previous model, so this turn didn't run."
     ),

@@ -1191,8 +1191,9 @@ def _spill_oversized_text(
 
     Codex counts all of a turn's text against one limit, so the total matters,
     not any single block. A moved item becomes an ``[Attached file: ...]``
-    reference, as a binary attachment does. Text that cannot be written stays
-    inline, and Codex reports the overflow itself.
+    reference, as a binary attachment does. Text that cannot be written, or is
+    no longer than its reference, stays inline, and Codex reports the overflow
+    itself.
 
     :param items: Input items; a spilled item is replaced in place.
     :param inline: The inline text items by index in *items*.
@@ -1212,7 +1213,11 @@ def _spill_oversized_text(
         if path is None:
             continue
         reference = _attached_file_item(path)
-        total += len(str(reference["text"])) - len(entry.text)
+        saved = len(entry.text) - len(str(reference["text"]))
+        if saved <= 0:
+            # Largest first, so no smaller text could shrink the turn either.
+            return
+        total -= saved
         items[index] = reference
         _logger.info(
             "Codex native spilled oversized text to an attachment: kind=%s chars=%d",

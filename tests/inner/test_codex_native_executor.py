@@ -1425,6 +1425,22 @@ def test_turn_text_total_stays_under_the_limit_across_blocks(tmp_path: Path) -> 
     assert _text_chars(items) <= 900_000
 
 
+def test_text_shorter_than_its_file_reference_stays_inline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Spilling a block shorter than its reference would grow the turn, so spilling stops."""
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    monkeypatch.setattr(codex_native_executor, "_MAX_INLINE_TEXT_CHARS", 1_000)
+    blocks = [f"short block {index:03d} of many" for index in range(100)]
+
+    items = _content_to_input_items([_input_text(block) for block in blocks], tmp_path)
+
+    assert items == [{"type": "text", "text": block} for block in blocks]
+    cache = attachment_cache_dir(tmp_path)
+    assert not cache.exists() or len(list(cache.iterdir())) <= 1
+
+
 def test_text_file_and_message_text_share_the_turn_limit(tmp_path: Path) -> None:
     """An inlined text file counts toward the same limit as the message text."""
     from omnigent.inner.codex_native_executor import _content_to_input_items
