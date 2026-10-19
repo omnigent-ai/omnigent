@@ -26,6 +26,7 @@ from collections.abc import Iterator
 
 import httpx
 import pytest
+
 from tests.server.helpers import create_session_for_agent as _create_session
 from tests.server.helpers import create_test_agent
 from tests.server.helpers import policy_tool_call_request as _tool_call_request

@@ -731,7 +731,7 @@ async def test_reserved_state_is_written_only_after_approval(
     conversation_store: SqlAlchemyConversationStore, verdict: str
 ) -> None:
     from omnigent.runtime.policies.approval import _await_elicitation
-    from tests.runtime.policies.test_approval import _Recorder, _accepting_park
+    from tests.runtime.policies.test_approval import _accepting_park, _Recorder
 
     key = "subagent_cost_ask_approved_usd"
     policy = _state_writing_policy("budget", {key: 1}, action="ASK")

@@ -348,7 +348,9 @@ def test_install_copilot_sdk_runs_command_then_rechecks(
     monkeypatch.setattr(copilot_auth, "copilot_sdk_installed", lambda: state["installed"])
 
     assert install_copilot_sdk() is True
-    assert calls == [[extra_install.sys.executable, "-P", "-m", "pip", "install", "omnigent[copilot]"]]
+    assert calls == [
+        [extra_install.sys.executable, "-P", "-m", "pip", "install", "omnigent[copilot]"]
+    ]
 
 
 def test_install_copilot_sdk_false_on_spawn_failure(monkeypatch: pytest.MonkeyPatch) -> None:
