@@ -2720,6 +2720,39 @@ describe("Composer shared visible controls", () => {
     await waitFor(() => expect(setApproval).toHaveBeenCalledWith("full-access"));
   });
 
+  it.each([
+    { permissionLevel: 2, enabled: false },
+    { permissionLevel: 3, enabled: false },
+    { permissionLevel: 4, enabled: true },
+  ])(
+    "lets only the owner change the permission mode (level $permissionLevel)",
+    ({ permissionLevel, enabled }) => {
+      useChatStore.setState({
+        conversationId: "owner-only-permissions",
+        codexApprovalMode: "ask-for-approval",
+      });
+      const setApproval = vi
+        .spyOn(useChatStore.getState(), "setCodexApprovalMode")
+        .mockResolvedValue(undefined);
+      renderWithTooltips(
+        <Composer {...composerProps({ showCodexApprovalMode: true, permissionLevel })} />,
+      );
+      const chip = screen.getByTestId("composer-permission-chip");
+      if (enabled) {
+        expect(chip).toBeEnabled();
+        return;
+      }
+      expect(chip).toBeDisabled();
+      expect(chip).toHaveAttribute(
+        "title",
+        "Only the session owner can change the permission mode",
+      );
+      fireEvent.keyDown(chip, { key: "ArrowDown" });
+      expect(screen.queryByTestId("composer-permission-option-full-access")).toBeNull();
+      expect(setApproval).not.toHaveBeenCalled();
+    },
+  );
+
   it("doesn't offer Read Only as a codex runtime switch", () => {
     useChatStore.setState({
       conversationId: "codex-no-read-only",
