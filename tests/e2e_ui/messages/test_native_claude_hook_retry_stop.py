@@ -26,6 +26,7 @@ def test_hook_refusal_sends_one_enter_and_keeps_delivery_unconfirmed(
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
     monkeypatch: pytest.MonkeyPatch,
+    claude_managed_settings: None,
 ) -> None:
     workspaces = ui_fixtures._REPO_ROOT / ".omnigent" / "e2e-hook-workspaces"
     workspaces.mkdir(parents=True, exist_ok=True)

@@ -41,6 +41,7 @@ def native_claude_dont_ask_session(
     live_server: str,
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
+    claude_managed_settings: None,
 ) -> Iterator[tuple[str, str]]:
     """A real Claude CLI launched into ``dontAsk`` against the mock provider."""
     with native_claude_mock_session_context(

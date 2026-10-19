@@ -40,6 +40,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests.e2e.conftest import get_mock_requests
 from tests.e2e_ui.conftest import _server_state, reset_mock_llm, set_fallback_mock_llm
 
 # Reuse the custom-agent suite's helpers — both surfaces render from the same
@@ -185,6 +186,25 @@ def test_native_claude_message_render_parity(
     # --- Assert all three properties over every turn. ---
     _assert_no_duplicate_render(page, user_markers, assistant_tokens)
     _assert_transcript_parity(base_url, session_id, user_markers, assistant_tokens)
+
+    # A live model can echo these reply tokens too; prove our prompts reached the mock.
+    user_texts: list[str] = []
+    for captured in get_mock_requests(mock_llm_server_url, key=_CLAUDE_MOCK_MODEL):
+        for message in captured.get("messages", []):
+            if message.get("role") != "user":
+                continue
+            content = message.get("content", [])
+            if isinstance(content, str):
+                user_texts.append(content)
+            else:
+                user_texts.extend(
+                    block["text"] for block in content if block.get("type") == "text"
+                )
+    for user_marker in user_markers:
+        assert any(user_marker in text for text in user_texts), (
+            f"Mock received no {_CLAUDE_MOCK_MODEL} user prompt containing {user_marker}; "
+            "rendered replies alone do not prove mock routing"
+        )
     _log.info("all turns verified: render parity + no-duplicate-render + transcript parity")
 
 
