@@ -54,9 +54,7 @@ const _PARK_REATTACH_MIN_ELAPSED_MS = _PARK_ATTEMPT_TIMEOUT_MS - 5_000;
 // fail-open. The brief inter-round sleep means this bounds wall-time too.
 const _MAX_RAW_ASK_ROUNDS = 50;
 
-// Budget for the route-turn call on a TUI-typed first prompt. The server's own
-// routing call is capped at 5s and its relay hop at 6s (see
-// omnigent/runner/turn_routing.py), so 8s leaves room for that hop to fail open.
+// Allow the 5s routing call and 6s relay to fail open before the 8s client deadline.
 const _ROUTE_TURN_TIMEOUT_MS = 8_000;
 // Reason surfaced when the tool-call gate cannot obtain a usable verdict and
 // fails CLOSED. PHASE_TOOL_CALL is the sole enforcement point for a native
@@ -1165,18 +1163,8 @@ async function applyModelChange(pi, config, ctx, modelId) {
 }
 
 /**
- * Ask Omnigent Smart Routing which model a TUI-typed prompt should run on.
- *
- * The pi-native sibling of the claude/codex ``UserPromptSubmit`` route-turn
- * hooks. Composer (web) messages are routed server-side before they reach the
- * inbox; a prompt typed straight into the Pi TUI is invisible to that gate, so
- * the ``input`` handler calls the same server decision seam here. Unlike those
- * harnesses Pi needs no block-and-replay: ``input`` runs before the turn binds
- * its model, so the switch is applied inline and the prompt proceeds.
- *
- * Advisory and fail-open: any transport error, timeout, or non-2xx verdict
- * returns ``null`` and the prompt runs on the current model.
- *
+ * Route native TUI input before Pi binds its model; composer input is routed upstream.
+ * Errors and timeouts return null, preserving the current model.
  * @returns {Promise<{action: string, model?: string, terminal?: boolean} | null>}
  */
 async function routeTurn(config, prompt, model) {
@@ -2064,10 +2052,7 @@ module.exports = function (pi) {
         }
       },
       (model) => {
-        // Remember the in-flight switch: a routed composer turn queues its
-        // model_change right before the message, and setModel only commits
-        // after an async auth check, so the ``input`` handler awaits this
-        // before the message's turn binds its model.
+        // Await the composer's async model switch before input binds the turn's model.
         pendingModelChange = applyModelChange(pi, config, latestContext, model);
         return pendingModelChange;
       },
@@ -2305,11 +2290,8 @@ module.exports = function (pi) {
       pendingModelChange = null;
       await pending.catch(() => {});
     }
-    // Route a TUI-typed prompt (web messages arrive as source "extension" and
-    // were already routed server-side). Route-once: stop asking after the
-    // server says the decision is final, so later prompts cost no round trip.
-    // A failed call also stops asking: an unreachable server would otherwise
-    // add the full timeout to every prompt for the rest of the session.
+    // Route TUI input once. Stop after a final decision or failure so later
+    // prompts do not repeatedly wait for an unreachable server.
     if (!turnRoutingDone && event.source !== "extension" && !text.startsWith("/")) {
       const decision = await routeTurn(config, text, modelReference(ctx && ctx.model));
       if (!decision || decision.terminal || decision.action === "route") {
