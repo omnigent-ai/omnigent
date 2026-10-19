@@ -683,6 +683,8 @@ class SqlConversationMetadata(OmnigentBase):
     # Last relay-observed turn status (enum_codecs.SESSION_LIVE_STATUS);
     # NULL means no relay has ever reported on this session.
     live_status: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    # Epoch ms the writer observed live_status; stamped writes apply newest-wins.
+    live_status_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Outstanding elicitation (approval-prompt) count; NULL = never written.
     pending_elicitation_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # First-class project membership. Relates to projects.id; no DB FK
