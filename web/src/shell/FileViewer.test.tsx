@@ -185,6 +185,7 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOptionalCommentSender } from "@/hooks/CommentSenderContext";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import { prepareDiffEditor } from "./MonacoDiffViewer";
+import { useFileContent } from "@/hooks/useFileContent";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { classifyAndRemapComments, FileViewer } from "./FileViewer";
@@ -230,6 +231,7 @@ interface RenderProps {
   mobileOverlay?: boolean;
   position?: { line: number; column?: number };
   open?: boolean;
+  mediaActive?: boolean;
   path?: string;
   /**
    * Initial URL search string (without leading "?"), e.g. "diff=1" or
@@ -257,6 +259,7 @@ function viewerTree({
   mobileOverlay,
   position,
   open = false,
+  mediaActive,
   path = "file1.py",
   initialSearch = "",
   onClose = vi.fn(),
@@ -274,6 +277,7 @@ function viewerTree({
           mobileOverlay={mobileOverlay}
           position={position}
           open={open}
+          mediaActive={mediaActive}
           conversationId="conv_1"
           path={path}
           onClose={onClose}
@@ -1981,6 +1985,30 @@ describe("FileViewer Escape closes the active tab", () => {
   });
 });
 
+describe("FileViewer video files", () => {
+  it("skips capped content and diff reads and suppresses diff controls", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+      data: {
+        available: true,
+        data: [
+          {
+            path: "demo.webm",
+            name: "demo.webm",
+            bytes: 100,
+            modified_at: null,
+            status: "created",
+          },
+        ],
+      },
+    } as ReturnType<typeof useWorkspaceChangedFiles>);
+    renderViewer({ open: true, path: "demo.webm" });
+    expect(useFileContent).toHaveBeenCalledWith("conv_1", null);
+    expect(useFileDiff).toHaveBeenCalledWith("conv_1", null, { requested: false });
+    expect(screen.queryByRole("button", { name: "Show diff" })).toBeNull();
+  });
+});
+
 describe("FileViewer 3D model files", () => {
   // Models render through CodeViewer's <ModelViewer> like images: they always
   // resolve to the source surface and have no diff representation, so the diff
@@ -2138,7 +2166,7 @@ describe("file position navigation", () => {
       guard = next;
       return unregister;
     });
-    function GuardedViewer() {
+    function GuardedViewer({ mediaActive = true }: { mediaActive?: boolean }) {
       const contextValue = useMemo(
         () => ({
           openFile: vi.fn(),
@@ -2153,13 +2181,16 @@ describe("file position navigation", () => {
       );
       return (
         <FileViewerContext.Provider value={contextValue}>
-          {viewerTree({ open: true, path: "file1.md" })}
+          {viewerTree({ open: true, mediaActive, path: "file1.md" })}
         </FileViewerContext.Provider>
       );
     }
-    const { unmount } = render(<GuardedViewer />);
+    const { rerender, unmount } = render(<GuardedViewer />);
     const draft = screen.getByRole("textbox", { name: "Draft text" });
     fireEvent.change(draft, { target: { value: "Unsaved draft" } });
+    // Opening the Files drawer hides the rail but must keep its dirty guard registered.
+    rerender(<GuardedViewer mediaActive={false} />);
+    expect(unregister).not.toHaveBeenCalled();
     const navigate = vi.fn();
     act(() => guard!("file2.md", { line: 12 }, navigate));
     expect(navigate).not.toHaveBeenCalled();

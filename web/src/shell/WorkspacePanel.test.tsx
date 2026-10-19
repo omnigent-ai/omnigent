@@ -22,7 +22,19 @@ import { WorkspacePanel } from "./WorkspacePanel";
 // show) so we can prove which child mounted without dragging in Monaco / hook
 // stacks / xterm.
 vi.mock("./FileViewer", () => ({
-  FileViewer: ({ path }: { path: string }) => <div data-testid="file-viewer-stub">{path}</div>,
+  FileViewer: ({
+    path,
+    open,
+    mediaActive,
+  }: {
+    path: string;
+    open: boolean;
+    mediaActive: boolean;
+  }) => (
+    <div data-testid="file-viewer-stub" data-open={open} data-media-active={mediaActive}>
+      {path}
+    </div>
+  ),
 }));
 vi.mock("./FilesPanel", () => ({
   // Echo the fixed scope so tests can prove the Files tab renders the tree
@@ -441,6 +453,12 @@ describe("WorkspacePanel open-file tabs", () => {
 });
 
 describe("WorkspacePanel content area", () => {
+  it("keeps the file editor open while disabling media in the collapsed rail", () => {
+    renderWorkspace({ open: false, selectedFilePath: "notes.md" });
+    expect(screen.getByTestId("file-viewer-stub")).toHaveAttribute("data-open", "true");
+    expect(screen.getByTestId("file-viewer-stub")).toHaveAttribute("data-media-active", "false");
+  });
+
   it("renders the FileViewer for the active path (not the scope panel)", () => {
     renderWorkspace({
       openFiles: ["src/App.tsx"],
