@@ -33,6 +33,7 @@ import { AGENT_BROWSER_TAB_ID } from "@/hooks/useBrowserTabs";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
+import { writePinnedWorkspaceTabs } from "@/lib/workspaceTabPreferences";
 
 const runnerHealthState = vi.hoisted(() => ({
   runnerOnline: undefined as boolean | undefined,
@@ -3127,6 +3128,132 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "false");
   });
+
+  it("opens and closes unpinned pages through + when every page is unpinned", () => {
+    writePinnedWorkspaceTabs([]);
+    mockConversations([{ id: "conv_unpinned", permission_level: null }]);
+    renderShell("/c/conv_unpinned");
+
+    expect(screen.getByText("Open a Workspace tab from the + menu.")).toBeInTheDocument();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Changes" }));
+    expect(screen.getByRole("tab", { name: "Changes" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "true");
+    expect(readSessionWorkspaceState("conv_unpinned").openPanels).toEqual(["changes"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Close Changes" }));
+    expect(screen.queryByRole("tab", { name: "Changes" })).toBeNull();
+    expect(screen.getByText("Open a Workspace tab from the + menu.")).toBeInTheDocument();
+    expect(readSessionWorkspaceState("conv_unpinned").rightRailTab).toBeNull();
+  });
+
+  it("selects a pinned page when its workspace becomes available", () => {
+    writePinnedWorkspaceTabs(["files"]);
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false },
+      isLoading: false,
+    } as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_waiting_workspace", permission_level: null }]);
+    renderShell("/c/conv_waiting_workspace", undefined, { rerenderable: true });
+    expect(screen.getByText("Open a Workspace tab from the + menu.")).toBeInTheDocument();
+
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true },
+      isLoading: false,
+    } as ReturnType<typeof useWorkspaceEnvironment>);
+    fireEvent.click(screen.getByTestId("rerender-shell"));
+    expect(screen.getByRole("tab", { name: "Files" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("selects an available open page when the active workspace page becomes unavailable", () => {
+    writePinnedWorkspaceTabs(["files"]);
+    writeSessionWorkspaceState("conv_workspace_unavailable", {
+      rightRailTab: "changes",
+      openPanels: ["changes", "subagents"],
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true },
+      isLoading: false,
+    } as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_workspace_unavailable", permission_level: null }]);
+    renderShell("/c/conv_workspace_unavailable", undefined, { rerenderable: true });
+    expect(screen.getByRole("tab", { name: "Changes" })).toHaveAttribute("aria-selected", "true");
+
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false },
+      isLoading: false,
+    } as ReturnType<typeof useWorkspaceEnvironment>);
+    fireEvent.click(screen.getByTestId("rerender-shell"));
+
+    expect(screen.getByRole("tab", { name: "Agents" })).toHaveAttribute("aria-selected", "true");
+    expect(readSessionWorkspaceState("conv_workspace_unavailable").rightRailTab).toBe("subagents");
+  });
+
+  it("restores unpinned page tabs across session switches and reloads", () => {
+    writePinnedWorkspaceTabs(["files"]);
+    writeSessionWorkspaceState("conv_to", {
+      rightRailTab: "changes",
+      openPanels: ["changes", "subagents"],
+    });
+    mockConversations([
+      { id: "conv_from", permission_level: null },
+      { id: "conv_to", permission_level: null },
+    ]);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const first = render(
+      sessionShellTree(queryClient, "/c/conv_from", <SessionNavButton to="/c/conv_to" />),
+    );
+    fireEvent.click(screen.getByTestId("nav-session"));
+    expect(screen.getByRole("tab", { name: "Changes" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("button", { name: "Close Agents" })).toBeInTheDocument();
+    expect(readSessionWorkspaceState("conv_from").openPanels ?? []).toEqual([]);
+    expect(readSessionWorkspaceState("conv_to").rightRailTab).toBe("changes");
+
+    first.unmount();
+    renderShell("/c/conv_to");
+    expect(screen.getByRole("tab", { name: "Changes" })).toHaveAttribute("aria-selected", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Close Changes" }));
+    expect(screen.getByRole("tab", { name: "Agents" })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("opens an unpinned Agents page from an explicit panel link", () => {
+    writePinnedWorkspaceTabs([]);
+    mockConversations([{ id: "conv_agents_link", permission_level: null }]);
+    renderShell("/c/conv_agents_link?panel=agents");
+
+    expect(screen.getByRole("tab", { name: "Agents" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("button", { name: "Close Agents" })).toBeInTheDocument();
+  });
+
+  it.each([false, true])(
+    "closes a linked file with all pages unpinned (existing page: %s)",
+    (hasOpenPage) => {
+      writePinnedWorkspaceTabs([]);
+      if (hasOpenPage)
+        writeSessionWorkspaceState("conv_file_link", {
+          rightRailTab: "subagents",
+          openPanels: ["subagents"],
+        });
+      mockConversations([{ id: "conv_file_link", permission_level: null }]);
+      renderShell("/c/conv_file_link?file=README.md");
+
+      expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
+      expect(screen.queryByRole("tab", { name: "Files" })).toBeNull();
+      fireEvent.click(
+        within(screen.getByTestId("file-viewer-inline")).getByRole("button", {
+          name: /file-viewer: close/i,
+        }),
+      );
+      if (hasOpenPage) {
+        expect(screen.getByRole("tab", { name: "Agents" })).toHaveAttribute(
+          "aria-selected",
+          "true",
+        );
+      } else {
+        expect(screen.getByText("Open a Workspace tab from the + menu.")).toBeInTheDocument();
+      }
+    },
+  );
 
   it("preserves a remembered Browser soft tab when the outgoing Files tab becomes unavailable", () => {
     vi.stubGlobal("omnigentDesktop", {

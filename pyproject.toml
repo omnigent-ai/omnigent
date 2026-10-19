@@ -36,7 +36,7 @@ dependencies = [
     # Keep this cap until the websockets<15 compatibility pin can be lifted.
     "openai>=1.0,<2.45",
     # >=14: the `e2b` extra's SDK (>=2.26) needs rich>=14 (was >=13,<14).
-    "rich>=14,<15",
+    "rich>=14,<16",
     "prompt_toolkit>=3.0,<4",
     "mcp>=1.0,<2",
     "starlette>=1.0.1,<2",
@@ -69,7 +69,7 @@ dependencies = [
     # omnigent deps (runtime, spec, server, persistent terminal, etc.).
     "alembic>=1.0,<2",
     "anyio>=4.0,<5",
-    "cachetools>=5.0,<7",
+    "cachetools>=5.0,<8",
     "filelock>=3.0",
     # _HostGroup (omnigent/cli.py) rewrites a leading positional server URL
     # into `--server` before Click parses it, so it no longer depends on
@@ -99,12 +99,12 @@ dependencies = [
     "claude-agent-sdk>=0.1.62",
     "openai-agents>=0.0.17",
     "PyJWT[crypto]>=2.8,<3",
-    "argon2-cffi>=23.1,<24",
+    "argon2-cffi>=23.1,<26",
     # PEP 440 version comparison for the update check / `omni upgrade`
     # (omnigent/update_check.py, omnigent/cli.py): compares the installed
     # version against the latest PyPI release. Previously only a
     # transitive dep; pinned here now that we import it directly.
-    "packaging>=23,<26",
+    "packaging>=23,<27",
     # CA root bundle for client TLS verification (omnigent/tls.py,
     # omnigent/inner/egress/ca.py). Required as a real fallback on uv /
     # python-build-standalone interpreters whose OpenSSL has no default cert

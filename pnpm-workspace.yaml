@@ -56,8 +56,6 @@ overrides:
   # KaTeX 0.18.11 was accidentally published with breaking changes.
   'katex@0.18.11': 0.18.10
   mermaid: 11.16.1
-  # Keep react-pdf's API and the separately bundled worker on the same version.
-  pdfjs-dist: 4.10.38
   tar: 7.5.21
   'node-gyp>undici': 6.28.0
   'undici@>=7.0.0 <8.0.0': 7.29.0
