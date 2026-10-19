@@ -27,6 +27,7 @@ def select_scope(files: list[dict], *, reason: str = "") -> dict[str, str]:
     ui = "full" if full or "javascript" in scopes else "sidecar" if "sidecar" in scopes else "none"
     return {
         "backend": str(full).lower(),
+        "e2e": str(full or "javascript" in scopes).lower(),
         "omnidev": str(full or "omnidev" in scopes).lower(),
         "sidecar": str(full or "sidecar" in scopes).lower(),
         "ui": ui,

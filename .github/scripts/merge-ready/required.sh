@@ -11,6 +11,9 @@ REQUIRED=(
   "Pre-commit checks"
   "Docker build"
   "CI scope"
+  "CI result"
+  "UI scope"
+  "E2E UI result"
   "Rust tests (omnidev)"
   "Pytest (codex-parity)"
   "Pytest (runtime-harnesses)"
@@ -55,6 +58,9 @@ REQUIRED=(
 ALLOW_SKIP=(
   "Docker build"
   "CI scope"
+  "CI result"
+  "UI scope"
+  "E2E UI result"
   "Rust tests (omnidev)"
   "Pytest (codex-parity)"
   "Pytest (runtime-harnesses)"
@@ -98,6 +104,16 @@ ALLOW_SKIP=(
 
 is_allow_skip() { printf '%s\n' "${ALLOW_SKIP[@]}" | grep -qxF "$1"; }
 
+# A result check may be absent on older workflows, but must run once its
+# selection job is present. An explicit skipped result is never green.
+scope_for_result() {
+  case "$1" in
+    "CI result") echo "CI scope" ;;
+    "E2E UI result") echo "UI scope" ;;
+    *) echo "" ;;
+  esac
+}
+
 # Maps an ALLOW_SKIP check to the workflow that produces it, so
 # evaluate-checks.sh can tell a genuine skip (a CI Pytest shard path-skip, or a
 # draft/path-ignored run) from a check that is merely absent because its
@@ -105,7 +121,8 @@ is_allow_skip() { printf '%s\n' "${ALLOW_SKIP[@]}" | grep -qxF "$1"; }
 workflow_for() {
   case "$1" in
     "Docker build")          echo "Docker build" ;;
-    "CI scope"|"Rust tests (omnidev)") echo "CI" ;;
+    "CI scope"|"CI result"|"Rust tests (omnidev)") echo "CI" ;;
+    "UI scope"|"E2E UI result") echo "E2E UI Tests" ;;
     "Pytest ("*)             echo "CI" ;;
     "E2E Tests (shard "*)    echo "E2E Tests" ;;
     "E2E UI Tests (shard "*) echo "E2E UI Tests" ;;

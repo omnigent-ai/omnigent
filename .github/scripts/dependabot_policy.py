@@ -332,7 +332,7 @@ def npm_changes(read, files: set[str], policy: dict) -> dict:
         [{"name": n, "version": v} for n, v in added.items()],
         "pnpm-lock.yaml",
         "pnpm",
-        ["ci.yml", "lint.yml", "web-tests.yml", "e2e-ui.yml", "docker-build.yml"],
+        ["ci.yml", "lint.yml", "web-tests.yml", "e2e.yml", "e2e-ui.yml", "docker-build.yml"],
         ["Pre-commit checks", "web test", "Browser Contract UI", "Docker build"],
     )
 

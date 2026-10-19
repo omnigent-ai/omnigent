@@ -924,6 +924,22 @@ def test_pre_selection_heads_can_finish_their_full_ci(tmp_path, expanded_update)
     assert any(call[:2] == ["pr", "merge"] for call in calls), process.stdout
 
 
+@pytest.mark.parametrize("expanded_update", ["npm"], indirect=True)
+@pytest.mark.parametrize("result", ["success", "failure", "skipped", "pending", "missing"])
+def test_npm_requires_server_e2e_consumers(tmp_path, expanded_update, result):
+    _ecosystem, api = expanded_update
+    jobs = api["routes"][f"{PREFIX}/actions/runs/15/jobs?per_page=100&page=1"]["jobs"]
+    if result == "missing":
+        jobs.clear()
+    else:
+        jobs[0]["conclusion"] = None if result == "pending" else result
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert any(call[:2] == ["pr", "merge"] for call in calls) == (result == "success"), (
+        process.stdout
+    )
+
+
 @pytest.fixture
 def evaluate_fixture(policy_module, expanded_update, monkeypatch):
     _ecosystem, api = expanded_update

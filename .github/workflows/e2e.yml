@@ -102,7 +102,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
-          RUN_TESTS: ${{ steps.scope.outputs.backend }}
+          RUN_TESTS: ${{ steps.scope.outputs.e2e }}
           NUM_SHARDS: "4"
         run: bash .github/scripts/ci/e2e-shard-matrix.sh
 

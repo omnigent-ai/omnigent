@@ -544,6 +544,27 @@ jobs:
           path: artifacts/
           retention-days: 14
 
+  result:
+    name: CI result
+    if: always()
+    needs: [scope, pytest, stores-postgres, stores-cockroachdb, stores-mysql, omnidev, codex-parity]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require successful test selection
+        env:
+          SELECTION_RESULT: ${{ needs.scope.result }}
+        run: test "$SELECTION_RESULT" = success
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          sparse-checkout: .github/scripts/ci
+          persist-credentials: false
+      - name: Require selected consumer results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+        run: python3 .github/scripts/ci/require_results.py ci
+
   coverage-report:
     name: Coverage report
     # Combines per-shard coverage into a coverage-summary artifact. Runs in the

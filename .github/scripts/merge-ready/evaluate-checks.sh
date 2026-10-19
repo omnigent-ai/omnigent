@@ -2,16 +2,19 @@
 # Iterates `REQUIRED` (defined in required.sh) against the actual
 # check-runs on the PR head SHA. When GitHub has multiple check-runs
 # with the same name on the same SHA (for example after re-running PR
-# Template on an edited description), the newest run wins.
+# Template on an edited description), the highest check-run ID wins, including
+# queued retries without timestamps.
 # Each check counts as green when:
 #   - conclusion=success, OR
-#   - conclusion=skipped AND name is in ALLOW_SKIP, OR
+#   - conclusion=skipped AND name is in ALLOW_SKIP and isn't a result check, OR
 #   - the check is missing AND name is in ALLOW_SKIP AND its owning
 #     workflow either never ran for this SHA (path-ignored), or its
 #     newest run succeeded (the absent check was conditionally excluded
 #     from that run's job matrix), or its newest run was skipped (the
 #     whole workflow was gated off, e.g. a fork/draft PR) — see
 #     workflow_run_outcome.
+# Result checks must be present once their selection job exists; only older
+# workflow versions may omit them.
 #
 # A missing ALLOW_SKIP check is NOT green only while its workflow's
 # newest run is still in flight / cancelled / failed: the check could
@@ -33,7 +36,7 @@ HERE=$(dirname "$0")
 source "$HERE/required.sh"
 
 CHECKS=$(gh api "repos/$REPO/commits/$SHA/check-runs" --paginate \
-  --jq '.check_runs[] | "\(.name)\t\(.status)\t\(.conclusion // "null")\t\(.completed_at // .started_at // "")"')
+  --jq '.check_runs[] | "\(.name)\t\(.status)\t\(.conclusion // "null")\t\(.id)"')
 
 # Per-workflow run state for this SHA (one row per run:
 # name<TAB>status<TAB>conclusion<TAB>created_at). Used to classify a
@@ -80,8 +83,15 @@ workflow_run_outcome() {
 FAIL=0
 FAILED_LINES=""
 for n in "${REQUIRED[@]}"; do
-  ROW=$(echo "$CHECKS" | awk -F'\t' -v n="$n" '$1 == n {print}' | sort -t $'\t' -k4,4 | tail -n 1)
+  ROW=$(echo "$CHECKS" | awk -F'\t' -v n="$n" '$1 == n {print}' | sort -t $'\t' -k4,4n | tail -n 1)
+  scope=$(scope_for_result "$n")
   if [[ -z "$ROW" ]]; then
+    if [[ -n "$scope" ]] && echo "$CHECKS" | awk -F'\t' -v n="$scope" '$1 == n {found=1} END {exit !found}'; then
+      echo "MISSING : $n  (selection job '$scope' requires an executed result check)"
+      FAILED_LINES+="- \`$n\` (selection ran; waiting for its result check)"$'\n'
+      FAIL=1
+      continue
+    fi
     if is_allow_skip "$n"; then
       wf=$(workflow_for "$n")
       outcome="none"
@@ -109,7 +119,7 @@ for n in "${REQUIRED[@]}"; do
     echo "NOT GREEN: $n  (status=$STATUS, conclusion=$CONCL)"
     FAILED_LINES+="- \`$n\` (still running, status=$STATUS)"$'\n'
     FAIL=1
-  elif [[ "$CONCL" == "skipped" ]] && is_allow_skip "$n"; then
+  elif [[ "$CONCL" == "skipped" && -z "$scope" ]] && is_allow_skip "$n"; then
     echo "OK      : $n  (skipped via path filter)"
   elif [[ "$CONCL" != "success" ]]; then
     echo "NOT GREEN: $n  (status=$STATUS, conclusion=$CONCL)"

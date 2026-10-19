@@ -73,7 +73,7 @@ jobs:
   # yields an EMPTY matrix -> zero shard jobs -> no skipped placeholder check.
   # Shared with e2e.yml via e2e-shard-matrix.sh (only NUM_SHARDS differs).
   setup:
-    name: setup
+    name: UI scope
     needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -489,3 +489,24 @@ jobs:
               echo "- 📜 server.log: _no artifact uploaded (glob matched nothing)_"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  result:
+    name: E2E UI result
+    if: always()
+    needs: [setup, build-sidecar, browser-contract, e2e-ui]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require successful test selection
+        env:
+          SELECTION_RESULT: ${{ needs.setup.result }}
+        run: test "$SELECTION_RESULT" = success
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          sparse-checkout: .github/scripts/ci
+          persist-credentials: false
+      - name: Require selected consumer results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+        run: python3 .github/scripts/ci/require_results.py ui

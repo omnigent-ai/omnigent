@@ -2,8 +2,11 @@ name: Dependency CI scope
 description: Select affected consumers for isolated dependency changes, otherwise run full CI.
 outputs:
   backend:
-    description: Run Python, server E2E and harness integration tests.
+    description: Run Python and harness integration tests.
     value: ${{ steps.scope.outputs.backend }}
+  e2e:
+    description: Run server E2E, including workspace lockfile regression guards.
+    value: ${{ steps.scope.outputs.e2e }}
   omnidev:
     description: Build and test the Rust development supervisor.
     value: ${{ steps.scope.outputs.omnidev }}

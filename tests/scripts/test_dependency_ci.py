@@ -65,29 +65,31 @@ def run_selection(tmp_path, repo, head, merge, *, event_name="pull_request"):
 
 
 @pytest.mark.parametrize(
-    ("paths", "backend", "omnidev", "sidecar", "ui"),
+    ("paths", "backend", "e2e", "omnidev", "sidecar", "ui"),
     [
-        ([OMNIDEV], False, True, False, "none"),
-        ([SIDECAR], False, False, True, "sidecar"),
-        ([OMNIDEV, SIDECAR], False, True, True, "sidecar"),
-        ([HOOKS], False, False, False, "none"),
-        (["pnpm-lock.yaml", "web/package.json"], False, False, False, "full"),
-        ([OMNIDEV, "pnpm-lock.yaml"], False, True, False, "full"),
-        ([SIDECAR, HOOKS], False, False, True, "sidecar"),
-        ([SIDECAR, "uv.lock"], True, True, True, "full"),
-        (["omnigent/runner/app.py"], True, True, True, "full"),
+        ([OMNIDEV], False, False, True, False, "none"),
+        ([SIDECAR], False, False, False, True, "sidecar"),
+        ([OMNIDEV, SIDECAR], False, False, True, True, "sidecar"),
+        ([HOOKS], False, False, False, False, "none"),
+        (["pnpm-lock.yaml"], False, True, False, False, "full"),
+        (["pnpm-lock.yaml", "web/package.json"], False, True, False, False, "full"),
+        ([OMNIDEV, "pnpm-lock.yaml"], False, True, True, False, "full"),
+        ([SIDECAR, HOOKS], False, False, False, True, "sidecar"),
+        ([SIDECAR, "uv.lock"], True, True, True, True, "full"),
+        (["omnigent/runner/app.py"], True, True, True, True, "full"),
         (
             [".github/actions/setup-harness-cli/locks/codex/package-lock.json"],
             True,
             True,
             True,
+            True,
             "full",
         ),
-        ([".github/workflows/ci.yml"], True, True, True, "full"),
+        ([".github/workflows/ci.yml"], True, True, True, True, "full"),
     ],
 )
 def test_merge_diff_selects_union_and_drives_existing_matrices(
-    tmp_path, merged_repo, paths, backend, omnidev, sidecar, ui
+    tmp_path, merged_repo, paths, backend, e2e, omnidev, sidecar, ui
 ):
     repo, git = merged_repo
     for name in paths:
@@ -104,13 +106,17 @@ def test_merge_diff_selects_union_and_drives_existing_matrices(
     checkout = tmp_path / "checkout"
     subprocess.run(["git", "clone", "-q", "--depth=2", repo.as_uri(), str(checkout)], check=True)
     scope = run_selection(tmp_path, checkout, head, merge)
-    assert {key: scope[key] for key in ("backend", "omnidev", "sidecar", "ui")} == {
+    assert {key: scope[key] for key in ("backend", "e2e", "omnidev", "sidecar", "ui")} == {
         "backend": str(backend).lower(),
+        "e2e": str(e2e).lower(),
         "omnidev": str(omnidev).lower(),
         "sidecar": str(sidecar).lower(),
         "ui": ui,
     }
-    for script in ("e2e-shard-matrix.sh", "integration-matrix.sh"):
+    for script, selected in (
+        ("e2e-shard-matrix.sh", e2e),
+        ("integration-matrix.sh", backend),
+    ):
         output = tmp_path / script
         subprocess.run(
             ["bash", str(CI / script)],
@@ -118,13 +124,13 @@ def test_merge_diff_selects_union_and_drives_existing_matrices(
                 os.environ,
                 GITHUB_OUTPUT=str(output),
                 EVENT_NAME="pull_request",
-                RUN_TESTS=scope["backend"],
+                RUN_TESTS=str(selected).lower(),
                 NUM_SHARDS="4",
             ),
             check=True,
         )
         matrix = json.loads(output.read_text().split("=", 1)[1])
-        assert bool(matrix["include"]) == backend
+        assert bool(matrix["include"]) == selected
 
 
 @pytest.mark.parametrize(
@@ -163,7 +169,7 @@ def test_unknown_or_non_pr_input_keeps_full_coverage(tmp_path, merged_repo, faul
         "b" * 40 if fault == "wrong_merge" else merge,
         event_name=fault if fault in {"push", "schedule", "workflow_dispatch"} else "pull_request",
     )
-    assert scope["backend"] == scope["omnidev"] == scope["sidecar"] == "true"
+    assert scope["backend"] == scope["e2e"] == scope["omnidev"] == scope["sidecar"] == "true"
     assert scope["ui"] == "full"
 
 
@@ -186,6 +192,13 @@ def test_workflows_connect_selection_to_jobs():
         assert "needs.scope.outputs.backend == 'true'" in jobs[name]["if"]
     for name, output in (("omnidev", "omnidev"), ("codex-parity", "sidecar")):
         assert f"needs.scope.outputs.{output} == 'true'" in jobs[name]["if"]
+    for name, output in (("e2e", "e2e"), ("integration", "backend")):
+        matrix = next(
+            step
+            for step in workflows[name]["jobs"]["setup"]["steps"]
+            if step.get("id") == "matrix"
+        )
+        assert matrix["env"]["RUN_TESTS"] == "${{ steps.scope.outputs." + output + " }}"
     ui = workflows["e2e-ui"]["jobs"]
     shard = next(step for step in ui["setup"]["steps"] if step.get("id") == "matrix")
     assert "steps.scope.outputs.ui == 'sidecar'" in shard["env"]["NUM_SHARDS"]
@@ -193,16 +206,56 @@ def test_workflows_connect_selection_to_jobs():
     run = next(step for step in ui["e2e-ui"]["steps"] if step.get("name") == "Run UI e2e tests")
     assert run["env"]["UI_SCOPE"] == "${{ needs.setup.outputs.ui }}"
     assert "--ui-codex-sidecar-only" in run["run"]
+    for workflow, selection, result_name, suite in (
+        (workflows["ci"], "scope", "CI result", "ci"),
+        (workflows["e2e-ui"], "setup", "E2E UI result", "ui"),
+    ):
+        result = workflow["jobs"]["result"]
+        assert result["name"] == result_name
+        assert result["if"] == "always()"
+        test_jobs = set(workflow["jobs"]) - {"gate", selection, "result", "coverage-report"}
+        assert set(result["needs"]) == test_jobs | {selection}
+        # Reject a failed security/selection prerequisite before checking out PR code.
+        guard = result["steps"][0]
+        assert guard["env"]["SELECTION_RESULT"] == "${{ needs." + selection + ".result }}"
+        for status in ("success", "failure", "skipped", "cancelled"):
+            process = subprocess.run(
+                ["bash", "-e", "-c", guard["run"]],
+                env=dict(os.environ, SELECTION_RESULT=status),
+                check=False,
+            )
+            assert (process.returncode == 0) == (status == "success")
+        assert "checkout@" in result["steps"][1]["uses"]
+        validate = result["steps"][-1]
+        assert validate["env"]["NEEDS"] == "${{ toJSON(needs) }}"
+        assert validate["run"] == f"python3 .github/scripts/ci/require_results.py {suite}"
 
 
 @pytest.mark.parametrize(
-    "fault", ["none", "omnidev", "parity", "ui", "scope", "queued", "cancelled", "setup"]
+    "fault",
+    [
+        "none",
+        "omnidev",
+        "parity",
+        "ui",
+        "scope",
+        "queued",
+        "cancelled",
+        "setup",
+        "skipped_result",
+        "missing_result",
+        "old_workflows",
+        "queued_retry",
+    ],
 )
 def test_merge_gate_waits_for_selected_rust_checks(tmp_path, fault):
     checks = {
         "DCO": ("completed", "success"),
         "Pre-commit checks": ("completed", "success"),
         "CI scope": ("completed", "success"),
+        "CI result": ("completed", "success"),
+        "UI scope": ("completed", "success"),
+        "E2E UI result": ("completed", "success"),
         "Rust tests (omnidev)": ("completed", "success"),
         "Pytest (codex-parity)": ("completed", "success"),
         "E2E UI Tests (shard 0/2)": ("completed", "success"),
@@ -222,25 +275,60 @@ def test_merge_gate_waits_for_selected_rust_checks(tmp_path, fault):
         run_status, conclusion = "in_progress", "null"
     elif fault in {"cancelled", "setup"}:
         conclusion = "cancelled" if fault == "cancelled" else "failure"
+    elif fault == "skipped_result":
+        checks["CI result"] = ("completed", "skipped")
+    elif fault == "missing_result":
+        del checks["E2E UI result"]
+    elif fault == "old_workflows":
+        for name in ("CI scope", "CI result", "UI scope", "E2E UI result", "Rust tests (omnidev)"):
+            del checks[name]
     api = {
-        "checks": "\n".join(
-            f"{name}\t{status}\t{result}\t2026-10-19T10:00:00Z"
-            for name, (status, result) in checks.items()
-        ),
-        "runs": "\n".join(
-            f"{name}\t{run_status}\t{conclusion}\t2026-10-19T10:00:00Z"
-            for name in ("CI", "E2E Tests", "E2E UI Tests", "Integration Tests")
-        ),
+        "checks": {
+            "check_runs": [
+                {
+                    "id": index,
+                    "name": name,
+                    "status": status,
+                    "conclusion": result,
+                    "completed_at": "2026-10-19T10:00:00Z",
+                }
+                for index, (name, (status, result)) in enumerate(checks.items(), start=1)
+            ]
+        },
+        "runs": {
+            "workflow_runs": [
+                {
+                    "name": name,
+                    "status": run_status,
+                    "conclusion": conclusion,
+                    "created_at": "2026-10-19T10:00:00Z",
+                }
+                for name in ("CI", "E2E Tests", "E2E UI Tests", "Integration Tests")
+            ]
+        },
     }
+    if fault == "queued_retry":
+        api["checks"]["check_runs"].append(
+            {
+                "id": 100,
+                "name": "Pytest (codex-parity)",
+                "status": "queued",
+                "conclusion": None,
+                "started_at": None,
+                "completed_at": None,
+            }
+        )
     fixtures = tmp_path / "api.json"
     fixtures.write_text(json.dumps(api))
     gh = tmp_path / "gh"
     gh.write_text(
         f"#!{sys.executable}\n"
-        "import json, os, sys\n"
+        "import json, os, subprocess, sys\n"
         "from pathlib import Path\n"
         "api = json.loads(Path(os.environ['TEST_GATE_API']).read_text())\n"
-        "print(api['checks' if '/check-runs' in sys.argv[2] else 'runs'])\n"
+        "response = api['checks' if '/check-runs' in sys.argv[2] else 'runs']\n"
+        "subprocess.run(['jq', '-r', sys.argv[sys.argv.index('--jq')+1]], "
+        "input=json.dumps(response), text=True, check=True)\n"
     )
     gh.chmod(0o755)
     process = subprocess.run(
@@ -257,4 +345,6 @@ def test_merge_gate_waits_for_selected_rust_checks(tmp_path, fault):
         capture_output=True,
         timeout=30,
     )
-    assert (process.returncode == 0) == (fault == "none"), process.stdout + process.stderr
+    assert (process.returncode == 0) == (fault in {"none", "old_workflows"}), (
+        process.stdout + process.stderr
+    )
