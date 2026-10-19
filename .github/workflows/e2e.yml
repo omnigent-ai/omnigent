@@ -78,26 +78,34 @@ jobs:
   # Shard matrix (e2e-shard-matrix.sh, shared with e2e-ui.yml). Fork PRs run by
   # default; draft PRs resolve to an empty matrix.
   setup:
-    name: setup
+    name: E2E scope
     needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
+      e2e: ${{ steps.scope.outputs.e2e }}
+      dependency: ${{ steps.scope.outputs.dependency }}
     steps:
       - name: Check out CI scripts
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # Triggering ref (not main): the script must exist on it, and it
           # only shards tests -- no secrets exposure, so the PR's copy is fine.
-          sparse-checkout: .github/scripts/ci
+          fetch-depth: 2
+          sparse-checkout: |
+            .github/scripts/ci
+            .github/actions/dependency-ci-scope
           persist-credentials: false
+      - id: scope
+        uses: ./.github/actions/dependency-ci-scope
       - name: Compute shard matrix
         id: matrix
         env:
           EVENT_NAME: ${{ github.event_name }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
-          NUM_SHARDS: "4"
+          RUN_TESTS: ${{ steps.scope.outputs.e2e }}
+          NUM_SHARDS: ${{ steps.scope.outputs.dependency == 'true' && '2' || '4' }}
         run: bash .github/scripts/ci/e2e-shard-matrix.sh
 
   e2e:
@@ -125,7 +133,7 @@ jobs:
       - name: Checkout
         # The default is the PR merge commit for pull_request and the workflow
         # ref for schedule/dispatch, keeping checked-out code in its cache scope.
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       # Steps below are shared verbatim with server-compat.yml's backcompat-e2e
       # job via the composite action, so the two never drift. server_version
@@ -133,6 +141,7 @@ jobs:
       - name: Run e2e suite
         uses: ./.github/actions/e2e-run
         with:
+          dependency_smoke: ${{ needs.setup.outputs.dependency }}
           shard_id: ${{ matrix.shard_id }}
           num_shards: ${{ matrix.num_shards }}
           parallelism: ${{ github.event.inputs.parallelism || '2' }}

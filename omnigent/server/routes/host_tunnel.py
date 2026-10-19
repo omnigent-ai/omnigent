@@ -699,9 +699,9 @@ async def _sender_loop(ws: WebSocket, conn: HostConnection) -> None:
         try:
             await conn.diagnostics.send(ws.send_text, frame.data, app_ping_ts=frame.app_ping_ts)
         except RuntimeError:
-            if ws.application_state is WebSocketState.DISCONNECTED:
-                # The ping loop or registry retirement closed the socket
-                # concurrently; the disconnect is already logged there.
+            if WebSocketState.DISCONNECTED in (ws.application_state, ws.client_state):
+                # A local close (ping timeout, retire) or the peer's close won the
+                # race; the receive helper or closer reports the disconnect.
                 _logger.debug("Host %s send raced a concurrent close", conn.host_id)
                 conn.sender_end_reason = "send_after_close"
                 return

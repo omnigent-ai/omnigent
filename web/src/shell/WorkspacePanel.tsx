@@ -65,6 +65,7 @@ import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./
 import { WorkspaceTabsScroller } from "./WorkspaceTabsScroller";
 import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
+import { ResponsiveViewerSlot } from "./ResponsiveViewerSlot";
 import { PullRequestPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
 import { SubagentsPanel } from "./SubagentsPanel";
@@ -675,6 +676,8 @@ interface WorkspacePanelProps {
   /** Active file path, or null when the Files tab shows a scope view. */
   selectedFilePath: string | null;
   filePosition?: FilePosition;
+  mobileFileTarget?: HTMLElement | null;
+  onMobileFileClose?: () => void;
   /** Ordered list of open file tabs, shown as a strip in the Files panel. */
   openFiles: string[];
   /** Open a file in the inline viewer (adds/activates its tab). */
@@ -772,6 +775,8 @@ function WorkspacePanelImpl({
   rootSessionId,
   selectedFilePath,
   filePosition,
+  mobileFileTarget = null,
+  onMobileFileClose,
   openFiles,
   openFileViewer,
   onCloseFile,
@@ -1065,6 +1070,15 @@ function WorkspacePanelImpl({
     browserFallbackTab,
     onRightRailTabChange,
   ]);
+  // Whether the picker's current interaction came from the pointer or the
+  // keyboard; decides whether closing it hands focus back to the trigger.
+  const pickerInputRef = useRef<"pointer" | "keyboard">("keyboard");
+  const markPickerPointer = useCallback(() => {
+    pickerInputRef.current = "pointer";
+  }, []);
+  const markPickerKeyboard = useCallback(() => {
+    pickerInputRef.current = "keyboard";
+  }, []);
   const panelLabels = {
     files: "Files",
     changes: "Changes",
@@ -1430,7 +1444,11 @@ function WorkspacePanelImpl({
             />
           )}
           {/* The picker and fullscreen toggle form the trailing control group. */}
-          <DropdownMenu>
+          <DropdownMenu
+            onOpenChange={(isOpen) => {
+              if (isOpen) markPickerKeyboard();
+            }}
+          >
             <WorkspaceTabTooltip label="Select panel" className="ml-auto pl-1">
               <DropdownMenuTrigger asChild>
                 <Button
@@ -1445,7 +1463,21 @@ function WorkspacePanelImpl({
                 </Button>
               </DropdownMenuTrigger>
             </WorkspaceTabTooltip>
-            <DropdownMenuContent align="end" className="max-w-[min(32rem,calc(100vw-2rem))]">
+            <DropdownMenuContent
+              align="end"
+              className="max-w-[min(32rem,calc(100vw-2rem))]"
+              onPointerDown={markPickerPointer}
+              // A press that began on the trigger selects on release, with no
+              // pointerdown inside the menu.
+              onPointerUp={markPickerPointer}
+              onPointerDownOutside={markPickerPointer}
+              onKeyDown={markPickerKeyboard}
+              // Restoring focus after a mouse pick reopens the trigger's tooltip and
+              // leaves it hanging; keyboard picks keep Radix's focus restore.
+              onCloseAutoFocus={(event) => {
+                if (pickerInputRef.current === "pointer") event.preventDefault();
+              }}
+            >
               <SuppressBrowserView />
               <DropdownMenuLabel>Panels</DropdownMenuLabel>
               {panelOptions.map((option) => (
@@ -1506,20 +1538,22 @@ function WorkspacePanelImpl({
               autoFocus={autoFocusSelectedTerminal}
             />
           ) : selectedFilePath !== null ? (
-            <FileViewer
-              viewport="desktop"
-              frameless
-              open
-              conversationId={conversationId}
-              path={selectedFilePath}
-              position={filePosition}
-              onClose={onShowScopeView}
-              onCloseTab={handleCloseTab}
-              onNavigateTo={openFileViewer}
-              permissionLevel={permissionLevel}
-              onCommentsOpenChange={onCommentsOpenChange}
-              sort={filesPanelSort}
-            />
+            <ResponsiveViewerSlot mobile={isMobile} mobileTarget={mobileFileTarget}>
+              <FileViewer
+                mobileOverlay={isMobile}
+                frameless
+                open
+                conversationId={conversationId}
+                path={selectedFilePath}
+                position={filePosition}
+                onClose={isMobile && onMobileFileClose ? onMobileFileClose : onShowScopeView}
+                onCloseTab={isMobile && onMobileFileClose ? onMobileFileClose : handleCloseTab}
+                onNavigateTo={openFileViewer}
+                permissionLevel={permissionLevel}
+                onCommentsOpenChange={onCommentsOpenChange}
+                sort={filesPanelSort}
+              />
+            </ResponsiveViewerSlot>
           ) : sideChatSelected && !isMobile ? (
             // A side chat: a forked child conversation streamed here in its own
             // scoped surface, beside the still-active main chat. Phones show it

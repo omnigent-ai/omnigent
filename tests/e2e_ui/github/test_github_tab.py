@@ -219,6 +219,51 @@ def test_github_tab_shows_summary_checks_and_file_tree(
     expect(rail.get_by_role("listitem", name="alice: Approved")).to_be_visible()
 
 
+@pytest.mark.parametrize("entry", ["rail", "composer-desktop", "composer-mobile"])
+def test_pr_diff_retry_keeps_associations(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
+) -> None:
+    base_url, session_id = seeded_session
+    _stub_github(page, pr_count=2)
+    failed = True
+
+    def diff(route: Route) -> None:
+        if failed:
+            route.fulfill(
+                status=400, json={"error": {"message": "GitHub could not load the PR diff."}}
+            )
+        else:
+            route.fulfill(json=_PR_DIFF)
+
+    page.route(re.compile(r"/resources/github/diff(?:\?|$)"), diff)
+    mobile = entry == "composer-mobile"
+    page.set_viewport_size({"width": 390 if mobile else 1280, "height": 900})
+    page.goto(f"{base_url}/c/{session_id}")
+    panel = (
+        page.get_by_test_id("github-panel-drawer")
+        if mobile
+        else page.get_by_role("complementary", name="Workspace")
+    )
+    if entry == "rail":
+        open_right_rail(page)
+        panel.get_by_role("tab", name="Pull Requests").click()
+    else:
+        page.get_by_test_id("composer-pr-link").click()
+    panel.get_by_role("tablist", name="Pull request", exact=True).get_by_role(
+        "tab", name="Changes", exact=True
+    ).click()
+    expect(panel.get_by_role("alert")).to_have_text("GitHub could not load the PR diff.")
+    expect(panel.get_by_role("combobox", name="Session pull request")).to_be_visible()
+    expect(panel.get_by_text("No changes vs base.")).to_have_count(0)
+    page.screenshot(path=str(tmp_path / f"pr-retry-{entry}-error.png"))
+    failed = False
+    panel.get_by_role("button", name="Refresh", exact=True).click()
+    expect(panel.get_by_role("alert")).to_have_count(0)
+    expect(panel.locator("diffs-container")).to_have_count(1)
+    expect(panel.get_by_role("combobox", name="Session pull request")).to_be_visible()
+    page.screenshot(path=str(tmp_path / f"pr-retry-{entry}-recovered.png"))
+
+
 @pytest.mark.parametrize(
     "viewport_width",
     [1280, pytest.param(390, marks=pytest.mark.browser_context_args(has_touch=True))],

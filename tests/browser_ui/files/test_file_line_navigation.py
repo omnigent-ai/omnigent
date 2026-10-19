@@ -327,6 +327,28 @@ def _seed_citation_file(
     )
 
 
+def test_markdown_code_block_creation_keeps_caret(
+    page: Page, seeded_session: BrowserSession
+) -> None:
+    """A newly mounted React code block keeps typing in its editable source."""
+    path = "src/notes.md"
+    _mock_markdown_files(page, seeded_session, {path: "```python\noriginal\n```\n\nTail\n"})
+    viewer = _open_viewer(page, seeded_session, path, {"diffActive": False})
+    editor = viewer.locator(".tiptap")
+    editor.get_by_text("Tail", exact=True).dblclick()
+    page.wait_for_function("window.getSelection()?.toString() === 'Tail'")
+    page.keyboard.type("```python")
+    page.keyboard.press("Enter")
+    blocks = editor.locator(".tiptap-code-block")
+    expect(blocks).to_have_count(2)
+    page.keyboard.type("caret stays here")
+    page.keyboard.press("Enter")
+    page.keyboard.type("second line")
+    expect(blocks.last.locator("pre")).to_have_text("caret stays here\nsecond line")
+    expect(blocks.first.locator("pre")).to_have_text("original")
+    assert blocks.last.evaluate("el => el.contains(document.getSelection().anchorNode)")
+
+
 def test_diff_loads_in_parallel_with_workspace_metadata(
     page: Page, seeded_session: BrowserSession
 ) -> None:
@@ -375,10 +397,10 @@ def test_diff_loads_in_parallel_with_workspace_metadata(
 
 
 @pytest.mark.parametrize("initial_width", [1600, 390])
-def test_diff_computes_once_per_viewport(
+def test_diff_computes_once_across_viewports(
     page: Page, seeded_session: BrowserSession, initial_width: int
 ) -> None:
-    """Only the visible responsive viewer mounts Monaco and computes the diff."""
+    """Resizing keeps one Monaco instance and reuses its computed diff."""
     _seed_citation_file(page, seeded_session)
     page.add_init_script(
         """(() => {
@@ -410,14 +432,18 @@ def test_diff_computes_once_per_viewport(
     page.set_viewport_size({"width": initial_width, "height": 1000})
     base_url, session_id = seeded_session
     page.goto(f"{base_url}/c/{session_id}?file={_FILE_PATH}&diff=1")
+    expect(page.locator(".monaco-diff-editor")).to_have_count(1, timeout=30_000)
+    page.locator(".monaco-diff-editor").evaluate("el => window.originalDiffEditor = el")
 
     other_width = 390 if initial_width == 1600 else 1600
-    for expected_count, width in enumerate((initial_width, other_width, initial_width), 1):
+    expected_count = 1
+    for width in (initial_width, other_width, initial_width):
         page.set_viewport_size({"width": width, "height": 1000})
         # Count all editors, including CSS-hidden ones.
         editors = page.locator(".monaco-diff-editor")
         expect(editors).to_have_count(1, timeout=30_000)
         expect(editors).to_be_visible()
+        assert editors.evaluate("el => el === window.originalDiffEditor")
         try:
             page.wait_for_function(
                 """count => window.diffComputations.length >= count &&
@@ -432,6 +458,11 @@ def test_diff_computes_once_per_viewport(
             )
         assert page.evaluate("window.diffComputations.length") == expected_count
         expect(page).to_have_url(re.compile(r"[?&]diff=1(?:&|$)"))
+
+    page.set_viewport_size({"width": 390, "height": 1000})
+    page.get_by_role("button", name="Close file viewer", exact=True).click()
+    expect(page.get_by_test_id("file-viewer")).to_have_count(0)
+    expect(page).not_to_have_url(re.compile(r"[?&](file|diff)="))
 
 
 @pytest.mark.parametrize("layout", ["split", "unified"])
@@ -562,6 +593,19 @@ def test_citation_preserves_offline_markdown_draft_with_diff_preference(
     editor.fill("Unsaved offline Markdown draft")
     expect(viewer.get_by_text("Runner offline — changes save", exact=False)).to_be_visible()
     assert not writes, "An offline draft must not trigger a save"
+    editor.evaluate("el => window.originalMarkdownEditor = el")
+    for width in (600, 1600):
+        page.set_viewport_size({"width": width, "height": 1000})
+        expect(page.get_by_test_id("file-viewer")).to_have_count(1)
+        expect(editor).to_be_visible()
+        expect(editor).to_have_text("Unsaved offline Markdown draft")
+        assert editor.evaluate("el => el === window.originalMarkdownEditor")
+        assert not writes
+        if width == 600:
+            viewer.get_by_role("button", name="Close file viewer", exact=True).click()
+            dialog = page.get_by_role("dialog", name="Unsaved changes")
+            dialog.get_by_role("button", name="Keep editing", exact=True).click()
+            expect(editor).to_have_text("Unsaved offline Markdown draft")
 
     page.get_by_role("button", name="Markdown line", exact=True).click()
     dialog = page.get_by_role("dialog", name="Unsaved changes")
@@ -748,10 +792,63 @@ def test_comment_navigation_supersedes_citation(
     page.wait_for_function(_CENTERED_LINE, arg={"text": _AFTER_LINES[99]})
 
 
+@pytest.mark.parametrize("initial_width", [1600, 390])
+@pytest.mark.parametrize("defer_viewport", [False, True], ids=["immediate", "after-css"])
+def test_markdown_comment_draft_survives_responsive_layouts(
+    page: Page, seeded_session: BrowserSession, initial_width: int, defer_viewport: bool
+) -> None:
+    """Moving the viewer preserves an unsubmitted comment and its selection."""
+    if defer_viewport:
+        # Let CSS hide the old layout before React receives the new viewport.
+        page.add_init_script("""
+            const matchMedia = window.matchMedia.bind(window);
+            const query = '(max-width: 767.98px)';
+            const media = matchMedia(query);
+            let matches = media.matches;
+            const deferred = new EventTarget();
+            Object.defineProperty(deferred, 'matches', {get: () => matches});
+            media.addEventListener('change', event => {
+                requestAnimationFrame(() => requestAnimationFrame(() => {
+                    matches = event.matches;
+                    deferred.dispatchEvent(new Event('change'));
+                }));
+            });
+            window.matchMedia = value => value === query ? deferred : matchMedia(value);
+        """)
+    path = "src/notes.md"
+    _mock_markdown_files(page, seeded_session, {path: "A paragraph to review.\n"})
+    page.set_viewport_size({"width": initial_width, "height": 1000})
+    base_url, session_id = seeded_session
+    page.goto(f"{base_url}/c/{session_id}?file={path}")
+    viewer = page.get_by_test_id("file-viewer")
+    expect(viewer).to_have_count(1)
+    editor = viewer.locator(".tiptap")
+    expect(editor).to_be_visible()
+    editor.get_by_text("A paragraph to review.", exact=True).dblclick(position={"x": 20, "y": 5})
+    page.wait_for_function("window.getSelection()?.toString() === 'paragraph'")
+    page.get_by_role("button", name="Add comment", exact=True).click()
+    expect(viewer.get_by_text("Selection: paragraph", exact=True)).to_be_visible()
+    draft = viewer.get_by_placeholder("Add a comment", exact=False)
+    draft.fill("Keep this unsubmitted review")
+    draft.evaluate("el => el.setSelectionRange(5, 9, 'backward')")
+    editor.evaluate("el => window.originalMarkdownEditor = el")
+    for width in (390 if initial_width == 1600 else 1600, initial_width):
+        page.set_viewport_size({"width": width, "height": 1000})
+        expect(viewer).to_have_count(1)
+        expect(viewer).to_be_visible()
+        expect(draft).to_be_visible()
+        expect(draft).to_have_value("Keep this unsubmitted review")
+        expect(draft).to_be_focused()
+        assert draft.evaluate(
+            "el => [el.selectionStart, el.selectionEnd, el.selectionDirection]"
+        ) == [5, 9, "backward"]
+        assert editor.evaluate("el => el === window.originalMarkdownEditor")
+
+
 def test_markdown_diff_url_stays_stable_across_responsive_layouts(
     page: Page, seeded_session: BrowserSession
 ) -> None:
-    """Hidden responsive viewers must not undo the visible viewer's diff choice."""
+    """The same viewer keeps its diff choice when moving between layouts."""
     base_url, session_id = seeded_session
     path = "src/notes.md"
     before, after = "# Notes\nBefore\n", "# Notes\nAfter\n"
@@ -789,16 +886,12 @@ def test_markdown_diff_url_stays_stable_across_responsive_layouts(
         }"""
     )
     transitions: list[str | None] = []
-    for width, enabled in ((1600, True), (600, True), (600, False), (1600, False)):
+    for width, enabled in ((1600, True), (600, False), (600, True), (1600, False)):
         page.set_viewport_size({"width": width, "height": 1000})
         label = "Show diff" if enabled else "Exit diff view"
         expect(viewer.get_by_role("button", name=label, exact=True)).to_be_visible()
         diff_url = re.compile(r"[?&]diff=1(?:&|$)")
-        # Each viewer retains its own mode. On resize the URL follows the newly
-        # visible viewer once, then each click makes exactly one transition.
-        before_click = None if enabled else "1"
-        if (transitions[-1] if transitions else None) != before_click:
-            transitions.append(before_click)
+        expect(page.get_by_test_id("file-viewer")).to_have_count(1)
         if enabled:
             expect(page).not_to_have_url(diff_url)
         else:
