@@ -145,6 +145,20 @@ class _QueuedClaudeSetting:
     # Set once the prompt is answered; a newer pick then waits for this switch.
     applying: bool = False
     budget: _ClaudeControlDeadline | None = None
+    # Set while not applying (waiting, waiting again, or done), so a newer pick can stop waiting.
+    idle: asyncio.Event = dataclasses.field(default_factory=asyncio.Event)
+
+    def __post_init__(self) -> None:
+        self.idle.set()
+        self.task.add_done_callback(lambda _task: self.idle.set())
+
+    def start_applying(self) -> None:
+        self.applying = True
+        self.idle.clear()
+
+    def wait_again(self) -> None:
+        self.applying, self.budget = False, None
+        self.idle.set()
 
     def cancel(self) -> None:
         self.task.cancel()
@@ -1209,7 +1223,14 @@ def build_native_controls(
         if queued is None:
             return
         if queued.applying:
-            await asyncio.wait({queued.task}, timeout=deadline.remaining_s())
+            # Done typing, or back to waiting on another prompt: either way it no longer races.
+            idle = asyncio.ensure_future(queued.idle.wait())
+            await asyncio.wait(
+                {queued.task, idle},
+                timeout=deadline.remaining_s(),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            idle.cancel()
         queued.cancel()
 
     async def _cancel_claude_settings_after_prompt(conv_id: str) -> None:
@@ -1272,7 +1293,7 @@ def build_native_controls(
                             )
                             return
                         await asyncio.sleep(_CLAUDE_SETTINGS_AFTER_PROMPT_POLL_S)
-                    queued.applying = True
+                    queued.start_applying()
                     await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
                     # The request's budget is long spent; the switch gets one of its own.
                     queued.budget = _ClaudeControlDeadline()
@@ -1281,7 +1302,7 @@ def build_native_controls(
                         return
                     except ClaudeUserPromptPending:
                         # Another prompt opened first; wait for that answer too.
-                        queued.applying, queued.budget = False, None
+                        queued.wait_again()
             except Exception:  # noqa: BLE001 — best-effort; the forwarder's report reconciles
                 _logger.warning(
                     "claude-native %s change for session=%s failed after the prompt was answered",

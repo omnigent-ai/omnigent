@@ -26,6 +26,7 @@ from omnigent.harnesses.qwen_native import bridge as qwen_native_bridge
 from omnigent.runner import create_runner_app, native_controls
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
+from tests._helpers.polling import poll_until_async
 from tests.runner.conftest import (
     _build_app_for_spec,
     _drain_session_event_queue,
@@ -2247,13 +2248,6 @@ def _patch_settings_behind_prompt(
     return commands
 
 
-async def _wait_for_commands(commands: list[str], count: int) -> None:
-    for _ in range(300):
-        if len(commands) >= count:
-            return
-        await asyncio.sleep(0.01)
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("event", "command", "wait_refuses"),
@@ -2286,7 +2280,7 @@ async def test_events_settings_change_waits_for_a_pending_prompt_then_applies(
         await asyncio.sleep(0.05)
         assert commands == []
         prompt_open[0] = False
-        await _wait_for_commands(commands, 1)
+        await poll_until_async(lambda: commands, timeout_s=3)
         await asyncio.sleep(0.05)
     assert commands == [command]
 
@@ -2351,7 +2345,7 @@ async def test_events_newer_model_pick_replaces_one_waiting_for_a_prompt(
             )
             assert resp.status_code == 204, resp.text
         prompt_open[0] = False
-        await _wait_for_commands(commands, 1)
+        await poll_until_async(lambda: commands, timeout_s=3)
         await asyncio.sleep(0.05)
     assert commands == ["/model sonnet"]
 
@@ -2420,16 +2414,54 @@ async def test_events_settings_change_waits_again_when_a_second_prompt_opens(
         resp = await client.post(url, json={"type": "effort_change", "effort": "high"})
         assert resp.status_code == 204, resp.text
         prompt_open[0] = False
-        for _ in range(300):
-            if not second_prompt[0]:
-                break
-            await asyncio.sleep(0.01)
+        await poll_until_async(lambda: not second_prompt[0], timeout_s=3)
         await asyncio.sleep(0.05)
         assert prompt_open[0], "the second prompt should be open"
         assert commands == []
         prompt_open[0] = False
-        await _wait_for_commands(commands, 1)
+        await poll_until_async(lambda: commands, timeout_s=3)
     assert commands == ["/effort high"]
+
+
+@pytest.mark.asyncio
+async def test_events_newer_pick_stops_waiting_when_the_queued_switch_meets_a_second_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newer pick waiting on a typing switch is queued, not failed, when it waits again."""
+    prompt_open = [True]
+    commands = _patch_settings_behind_prompt(monkeypatch, prompt_open)
+    # A short budget makes a newer pick that waits it out fail fast.
+    monkeypatch.setattr(native_controls, "_CLAUDE_CONTROL_BUDGET_S", 3.0)
+    queued_typing, release = threading.Event(), threading.Event()
+    inject = claude_native_bridge.inject_slash_command
+
+    def _second_prompt_while_queued_types(bridge_dir: Any, *, command: str, **kwargs: Any) -> None:
+        if command == "/effort high" and not prompt_open[0]:
+            queued_typing.set()
+            release.wait(5)
+            prompt_open[0] = True  # the next permission opens before the switch lands
+        inject(bridge_dir, command=command, **kwargs)
+
+    monkeypatch.setattr(
+        claude_native_bridge, "inject_slash_command", _second_prompt_while_queued_types
+    )
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    url = f"/v1/sessions/{_PROMPT_SESSION_ID}/events"
+    async with _runner_client(app) as client:
+        await _create_prompt_session(client)
+        resp = await client.post(url, json={"type": "effort_change", "effort": "high"})
+        assert resp.status_code == 204, resp.text
+        prompt_open[0] = False
+        assert await asyncio.to_thread(queued_typing.wait, 5)
+        asyncio.get_running_loop().call_later(0.2, release.set)
+        resp = await client.post(url, json={"type": "effort_change", "effort": "low"})
+        # Queued behind the second prompt rather than failed after waiting out its budget.
+        assert resp.status_code == 204, resp.text
+        assert commands == []
+        prompt_open[0] = False
+        await poll_until_async(lambda: commands, timeout_s=3)
+        await asyncio.sleep(0.05)
+    assert commands == ["/effort low"]
 
 
 @pytest.mark.asyncio
@@ -2454,7 +2486,7 @@ async def test_events_unsupported_model_pick_keeps_the_queued_one(
         assert resp.status_code == 503, resp.text
         assert resp.json()["error"] == "claude_native_model_unsupported"
         prompt_open[0] = False
-        await _wait_for_commands(commands, 1)
+        await poll_until_async(lambda: commands, timeout_s=3)
     assert commands == ["/model opus"]
 
 
@@ -2485,7 +2517,7 @@ async def test_events_settings_change_survives_a_failed_prompt_check(
         await asyncio.sleep(0.05)
         assert failures == [0]
         prompt_open[0] = False
-        await _wait_for_commands(commands, 1)
+        await poll_until_async(lambda: commands, timeout_s=3)
     assert commands == ["/effort high"]
 
 
@@ -2558,7 +2590,7 @@ async def test_events_settings_change_answered_after_the_request_budget_still_ap
         # The person takes longer to answer than the whole request was allowed.
         clock.sleep(native_controls._CLAUDE_CONTROL_BUDGET_S + 1)
         prompt_open[0] = False
-        await _wait_for_commands(commands, 1)
+        await poll_until_async(lambda: commands, timeout_s=3)
     assert commands == ["/effort high"]
 
 

@@ -38,6 +38,7 @@ from omnigent.server.routes.sessions import routes_core
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
 from omnigent.terminals.registry import TerminalRegistry
+from tests._helpers.polling import poll_until_async
 from tests.runner.conftest import (
     _FakeProcessManager,
     _ScriptedHarnessClient,
@@ -402,11 +403,9 @@ async def test_claude_pending_prompt_holds_model_pick_without_answering_it(
         session.requested_model
     )
     assert session.errors == []
-    for _ in range(100):
-        if any("dropped" in record.getMessage() for record in caplog.records):
-            break
-        await asyncio.sleep(0.01)
-    assert any("dropped" in record.getMessage() for record in caplog.records)
+    await poll_until_async(
+        lambda: any("dropped" in record.getMessage() for record in caplog.records), timeout_s=3
+    )
     # Nothing was ever typed into the open question or permission prompt.
     assert sent == []
     assert session.claude is not None
