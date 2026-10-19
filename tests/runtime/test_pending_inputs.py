@@ -1054,3 +1054,66 @@ def test_interrupted_entries_expire_with_the_ttl(monkeypatch: pytest.MonkeyPatch
 
     clock["t"] = 1000.0 + pending_inputs._TTL_S + 0.1
     assert pending_inputs.pending_ids("conv_a") == []
+
+
+@pytest.mark.parametrize(
+    ("typed", "name", "arguments"),
+    [
+        ("/alpha /beta hello  there", "alpha", "hello there"),
+        ("/alpha /beta hello there", "plugin:beta", "hello there"),
+        ("/plugin:alpha /beta /gamma", "alpha", ""),
+    ],
+)
+def test_stacked_command_echo_drains_the_typed_entry(
+    typed: str, name: str, arguments: str
+) -> None:
+    """Either echo of a stacked command settles its entry and names the echoes still due."""
+    older = pending_inputs.record("conv_x", [{"type": "input_text", "text": "on its way"}])
+    stacked = pending_inputs.record("conv_x", [{"type": "input_text", "text": typed}])
+
+    drained, remaining = pending_inputs.resolve_stacked_command("conv_x", name, arguments)
+
+    assert drained.matched is not None and drained.matched.pending_id == stacked
+    assert drained.match_method == "stacked_command"
+    assert [entry.pending_id for entry in drained.skipped] == [older]
+    assert pending_inputs._command_short_name(name) not in remaining
+    assert len(remaining) == len(typed.split("/")) - 2
+
+
+@pytest.mark.parametrize(
+    ("typed", "name", "arguments"),
+    [
+        ("/alpha hello there", "alpha", "hello there"),
+        ("/alpha /beta hello there", "alpha", "goodbye"),
+        ("/alpha /beta hello there", "gamma", "hello there"),
+        ("/alpha /tmp/notes.txt", "alpha", ""),
+        ("please /alpha /beta hello", "alpha", "hello"),
+    ],
+)
+def test_stacked_command_echo_leaves_unrelated_entries_queued(
+    typed: str, name: str, arguments: str
+) -> None:
+    """Only a text that opens with two or more commands and carries the same arguments matches."""
+    pending_inputs.record("conv_x", [{"type": "input_text", "text": typed}])
+
+    drained, remaining = pending_inputs.resolve_stacked_command("conv_x", name, arguments)
+
+    assert drained.matched is None
+    assert remaining == []
+    assert len(pending_inputs.snapshot_for("conv_x")) == 1
+
+
+def test_expected_stacked_expansion_is_claimed_once_and_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A due echo is claimed once by name and arguments, and stops being due after the TTL."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+    pending_inputs.expect_stacked_expansions("conv_x", ["beta", "gamma"], "hello  there")
+
+    assert not pending_inputs.consume_stacked_expansion("conv_x", "beta", "other")
+    assert pending_inputs.consume_stacked_expansion("conv_x", "plugin:beta", "hello there")
+    assert not pending_inputs.consume_stacked_expansion("conv_x", "beta", "hello there")
+
+    clock["t"] += pending_inputs._STACKED_EXPANSION_TTL_S + 1
+    assert not pending_inputs.consume_stacked_expansion("conv_x", "gamma", "hello there")

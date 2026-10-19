@@ -893,6 +893,137 @@ def resolve_matching_text(
         )
 
 
+# Claude Code runs ``/a /b args`` as two command echoes, ``/a args`` and
+# ``/b args``. After the first echo settles the typed entry, the remaining
+# echoes are expected for this long and must not drain other queued input.
+_STACKED_EXPANSION_TTL_S = 30.0
+_STACKED_COMMAND_TOKEN_RE = re.compile(r"/[A-Za-z0-9][\w.:-]*")
+
+# conversation_id → [(command short name, collapsed arguments, expiry)].
+_stacked_expansions: WorkspaceScopedCache[str, list[tuple[str, str, float]]] = (
+    WorkspaceScopedCache()
+)
+
+
+def _command_short_name(name: str) -> str:
+    """Drop a plugin qualifier: Claude may record ``/simplify`` as ``/<plugin>:simplify``."""
+    return name.lstrip("/").rpartition(":")[2]
+
+
+def _stacked_command_parts(text: str) -> tuple[list[str], str] | None:
+    """
+    Split a typed stacked command into its command short names and shared arguments.
+
+    :param text: Whitespace-collapsed queued text, e.g. ``"/alpha /beta hello"``.
+    :returns: ``(["alpha", "beta"], "hello")``, or ``None`` unless the text
+        opens with at least two commands.
+    """
+    tokens = text.split(" ")
+    names: list[str] = []
+    for token in tokens:
+        if _STACKED_COMMAND_TOKEN_RE.fullmatch(token) is None:
+            break
+        names.append(_command_short_name(token))
+    if len(names) < 2:
+        return None
+    return names, " ".join(tokens[len(names) :])
+
+
+def resolve_stacked_command(
+    conversation_id: str, name: str, arguments: str, *, hold: bool = False
+) -> tuple[MatchedDrain, list[str]]:
+    """
+    Drain the queued stacked command one of whose command echoes was mirrored.
+
+    Only the first matching echo drains the entry. The caller registers the
+    other commands with :func:`expect_stacked_expansions` once the echo lands.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param name: Mirrored command name, e.g. ``"alpha"`` or ``"plugin:alpha"``.
+    :param arguments: Mirrored command arguments, e.g. ``"hello there"``.
+    :param hold: As for :func:`resolve_matching_text`.
+    :returns: The drain (no match when no queued text is such a stacked
+        command) and the short names of the commands still to be echoed.
+    """
+    short_name = _command_short_name(name)
+    needle_arguments = _collapse_whitespace(arguments)
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        entries = _pending.get(conversation_id)
+        if entries is None:
+            return MatchedDrain(matched=None, skipped=[]), []
+        ordered = [(pid, entry) for pid, entry in entries.items() if not entry.held]
+        for index, (matched_id, matched_entry) in enumerate(ordered):
+            parts = _stacked_command_parts(
+                _collapse_whitespace(_content_text(matched_entry.content))
+            )
+            if parts is None:
+                continue
+            names, typed_arguments = parts
+            if typed_arguments != needle_arguments or short_name not in names:
+                continue
+            skipped_entries = ordered[:index][:_MAX_ENTRIES_PER_CONVERSATION]
+            for pending_id, entry in [*skipped_entries, (matched_id, matched_entry)]:
+                if hold:
+                    entry.held = True
+                else:
+                    entries.pop(pending_id, None)
+            if not entries:
+                _pending.pop(conversation_id, None)
+            remaining = list(names)
+            remaining.remove(short_name)
+            return (
+                MatchedDrain(
+                    matched=_drained_input(matched_entry),
+                    match_method="stacked_command",
+                    skipped=[_drained_input(entry) for _pid, entry in skipped_entries],
+                ),
+                remaining,
+            )
+    return MatchedDrain(matched=None, skipped=[]), []
+
+
+def expect_stacked_expansions(conversation_id: str, names: Iterable[str], arguments: str) -> None:
+    """
+    Remember the command echoes still due from a settled stacked command.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param names: Command short names still to be echoed, e.g. ``["beta"]``.
+    :param arguments: The arguments every echo of the command carries.
+    """
+    expires_at = _now() + _STACKED_EXPANSION_TTL_S
+    collapsed = _collapse_whitespace(arguments)
+    with _lock:
+        due = _stacked_expansions.setdefault(conversation_id, [])
+        due.extend((name, collapsed, expires_at) for name in names)
+
+
+def consume_stacked_expansion(conversation_id: str, name: str, arguments: str) -> bool:
+    """
+    Claim a command echo that belongs to an already-settled stacked command.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param name: Mirrored command name, e.g. ``"beta"`` or ``"plugin:beta"``.
+    :param arguments: Mirrored command arguments.
+    :returns: ``True`` when the echo was expected, so it settles no queued input.
+    """
+    key = (_command_short_name(name), _collapse_whitespace(arguments))
+    now = _now()
+    with _lock:
+        due = [entry for entry in _stacked_expansions.get(conversation_id, []) if entry[2] > now]
+        for index, (due_name, due_arguments, _expires_at) in enumerate(due):
+            if (due_name, due_arguments) == key:
+                del due[index]
+                break
+        else:
+            index = -1
+        if due:
+            _stacked_expansions[conversation_id] = due
+        else:
+            _stacked_expansions.pop(conversation_id, None)
+        return index >= 0
+
+
 def has_pending(conversation_id: str) -> bool:
     """
     Report whether a session still holds an un-consumed message.
@@ -1097,3 +1228,4 @@ def reset_for_tests() -> None:
     """
     with _lock:
         _pending.clear()
+        _stacked_expansions.clear()
