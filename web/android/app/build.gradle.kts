@@ -54,7 +54,7 @@ fun quotedBuildConfig(value: String): String =
 
 android {
     namespace = "ai.omnigent.android"
-    compileSdk = 36
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "ai.omnigent.android"
