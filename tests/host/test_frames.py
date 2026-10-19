@@ -756,6 +756,7 @@ def test_launch_runner_frame_round_trip() -> None:
         binding_token="secret_token_xyz",
         workspace="/Users/corey/projects/frontend",
         session_id="conv_abc123",
+        superseded_runner_id="runner_previous",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostLaunchRunnerFrame)
@@ -763,6 +764,7 @@ def test_launch_runner_frame_round_trip() -> None:
     assert decoded.binding_token == "secret_token_xyz"
     assert decoded.workspace == "/Users/corey/projects/frontend"
     assert decoded.session_id == "conv_abc123"
+    assert decoded.superseded_runner_id == "runner_previous"
 
 
 def test_launch_runner_preserves_the_full_saved_inference_profile() -> None:
@@ -1096,6 +1098,7 @@ def test_launch_runner_frame_legacy_payload_decodes_harness_none() -> None:
     assert isinstance(decoded, HostLaunchRunnerFrame)
     assert decoded.session_id is None
     assert decoded.harness is None
+    assert decoded.superseded_runner_id is None
 
 
 def test_launch_runner_result_frame_error_code_round_trip() -> None:

@@ -2043,12 +2043,20 @@ class HostProcess:
         # the exit as intentional); the SIGTERM/SIGKILL round itself is
         # detached so a stop that waits out its 5s grace cannot
         # head-of-line block other sessions' launches on this host.
-        if frame.session_id:
+        # The server names the runner it unbound. A runner launched for this
+        # session but rebound elsewhere (a /clear replacement) stays alive.
+        if frame.superseded_runner_id is not None:
+            previous = self._runners.get(frame.superseded_runner_id)
+            superseded = [(frame.superseded_runner_id, previous)] if previous is not None else []
+        elif frame.session_id:
             superseded = [
                 (rid, handle)
                 for rid, handle in self._runners.items()
                 if handle.session_id == frame.session_id
             ]
+        else:
+            superseded = []
+        if frame.session_id:
             for rid, handle in superseded:
                 self._runners.pop(rid, None)
                 handle.stop_requested = True

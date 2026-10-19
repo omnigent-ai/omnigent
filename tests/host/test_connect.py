@@ -8191,6 +8191,60 @@ async def test_handle_launch_supersedes_previous_runner_for_same_session(
     _cleanup_host(host)
 
 
+@pytest.mark.parametrize("named", [True, False], ids=["bound-runner", "unbound-after-clear"])
+async def test_handle_launch_supersedes_only_the_runner_the_server_names(
+    tmp_path: Path, named: bool
+) -> None:
+    """A runner rebound to a /clear replacement survives a relaunch of its old session."""
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        return original_popen(
+            ["sleep", "30"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        first = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_a",
+                binding_token="tok_named_a",
+                workspace=str(workspace),
+                session_id="conv_cleared",
+            )
+        )
+        first_handle = host._runners[first.runner_id]
+        second = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_b",
+                binding_token="tok_named_b",
+                workspace=str(workspace),
+                session_id="conv_cleared",
+                superseded_runner_id=first.runner_id if named else "",
+            )
+        )
+
+    assert second.runner_id in host._runners
+    if named:
+        assert first.runner_id not in host._runners
+        for _ in range(70):
+            if first_handle.proc.poll() is not None:
+                break
+            await asyncio.sleep(0.1)
+        assert first_handle.proc.poll() is not None
+    else:
+        assert first.runner_id in host._runners
+        assert first_handle.proc.poll() is None
+    _cleanup_host(host)
+
+
 async def test_handle_launch_leaves_other_sessions_runners_alone(
     tmp_path: Path,
 ) -> None:

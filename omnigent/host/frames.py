@@ -286,6 +286,10 @@ class HostLaunchRunnerFrame:
         :data:`HARNESS_NOT_CONFIGURED_ERROR_CODE` when not.
         ``None`` (older server, or no resolvable harness) skips
         the check — fail open.
+    :param superseded_runner_id: Runner the session was bound to before
+        this launch, which the host stops once the new one is alive.
+        ``""`` means none; ``None`` (older server) falls back to
+        superseding every runner launched for ``session_id``.
     """
 
     request_id: str
@@ -294,6 +298,7 @@ class HostLaunchRunnerFrame:
     session_id: str | None = None
     harness: str | None = None
     inference_config: dict[str, Any] | None = None
+    superseded_runner_id: str | None = None
 
 
 @dataclass
@@ -1429,6 +1434,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "session_id": frame.session_id,
                 "harness": frame.harness,
                 "inference_config": frame.inference_config,
+                "superseded_runner_id": frame.superseded_runner_id,
             }
         )
     if isinstance(frame, HostLaunchRunnerResultFrame):
@@ -2346,6 +2352,7 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
         session_id=_optional_nullable_str(msg, "session_id"),
         harness=_optional_nullable_str(msg, "harness"),
         inference_config=inference_config,
+        superseded_runner_id=_optional_nullable_str(msg, "superseded_runner_id"),
     )
 
 

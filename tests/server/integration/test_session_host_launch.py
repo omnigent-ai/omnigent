@@ -3933,6 +3933,9 @@ async def test_relaunch_stops_the_superseded_runner(
         f"the stop must target the SUPERSEDED runner {original_runner_id!r}, "
         f"got {stop_frame.runner_id!r}"
     )
+    # The host supersedes only the runner named here, not every runner it
+    # once launched for this session.
+    assert launch_frame.superseded_runner_id == original_runner_id
 
 
 async def test_concurrent_relaunches_are_single_flight(

@@ -22,6 +22,8 @@ from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.errors import ErrorCode
 from omnigent.harnesses.claude_native.bridge import (
+    _BACKGROUND_TASK_FORWARD_LIMIT,
+    _INTERRUPT_MARKER_PREFIX,
     BRIDGE_ID_LABEL_KEY,
     OBSERVER_HOOK_STDERR_FILE,
     BtwOverlay,
@@ -31,6 +33,7 @@ from omnigent.harnesses.claude_native.bridge import (
     HookReadResult,
     TranscriptReadResult,
     _display_text,
+    _normalize_background_task,
     _transcript_items_from_entry,
     compute_transcript_cumulative_cost,
     read_active_session_id,
@@ -123,6 +126,9 @@ _MAX_SEEN_DELTA_KEYS = 5000
 # Seconds without transcript activity before reporting an idle observation.
 # This heuristic does not establish that the sub-agent has completed.
 _SUBAGENT_IDLE_THRESHOLD_S = 5.0
+# A quiet child with an unanswered tool call is usually inside a long tool
+# (``sleep``, a build), not done. Claude Code caps a Bash call at 10 minutes.
+_SUBAGENT_OPEN_TOOL_IDLE_THRESHOLD_S = 600.0
 
 # Meta-file glob inside ``~/.claude/projects/<encoded>/<session>/subagents/``.
 # One per Claude Task-tool subagent; appears alongside the matching
@@ -637,6 +643,8 @@ class SubagentEntry:
         means no observation has been handled yet.
     :param delivery_error: Durable reason the mirrored transcript is
         incomplete. After inactivity it reports ``failed`` instead of idle.
+    :param open_call_ids: Forwarded tool calls with no forwarded output
+        yet. While any is open, a lull is not reported as idle.
     """
 
     subagent_id: str
@@ -647,6 +655,7 @@ class SubagentEntry:
     last_activity_ts: float | None = None
     last_status: str | None = None
     delivery_error: str | None = None
+    open_call_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -907,6 +916,33 @@ class _ForwardDedupeState:
     # ``[System: scheduled prompt fired]`` marker (see the bridge parser).
     pending_settled_response_id: str | None = None
     settled_response_id: str | None = None
+    # Turn announced as running from the transcript. Claude's status file stays
+    # ``busy`` while a background agent lives, so it never reports these turns.
+    woken_running_response_id: str | None = None
+    # Turn still awaiting its ``Stop`` when the transcript opened the next one.
+    # The hook can land a poll after the new turn's first item, and that Stop
+    # belongs to this turn, not the one now current.
+    unstopped_response_id: str | None = None
+    # Turn a late ``Stop`` left idle whose ``running`` re-announce awaits a retry.
+    pending_reopen_response_id: str | None = None
+    # Turns ended without a ``Stop`` (Esc, a hook-blocked prompt); bounded.
+    ended_without_stop: tuple[str, ...] = ()
+    # Opening items of the newest transcript turn and of the newest one whose
+    # ``Stop`` was read. A quick turn's ``Stop`` can be read before its
+    # transcript lines; it then belongs to the next turn to open.
+    newest_turn_source_id: str | None = None
+    stopped_turn_source_id: str | None = None
+    stop_ahead_of_transcript: bool = False
+    # Background shells: the last ``Stop`` count, plus shells launched since.
+    # An interrupted turn fires no ``Stop``, so launches carry the tally.
+    stop_background_task_count: int = 0
+    background_task_ids_since_stop: frozenset[str] = frozenset()
+    # Shell detail matching that tally: a launch republishes it, since the
+    # server replaces its cached detail with each positive count.
+    background_tasks: tuple[dict[str, object], ...] = ()
+    # ``(call_id, input)`` of recent ``run_in_background`` Bash calls, so a
+    # launch can name its shell; bounded.
+    background_bash_calls: tuple[tuple[str, dict[str, object]], ...] = ()
     # Failed cost posts are retried by this long-running poll loop. Without a
     # retry gate, an edge 429 turns the poll interval into a request storm and
     # prevents the limiter from recovering.
@@ -1426,12 +1462,12 @@ async def forward_claude_transcript_to_session(
                         session_id = rotation
                         state = None
                         hook_state = None
-                        # After a /clear or /fork the parent now resolves
-                        # to a new ``<session_uuid>/subagents/`` directory
-                        # on disk, so old sub-agent entries are dead. Drop
-                        # them; the watcher will rediscover any new ones
-                        # under the rotated session's dir.
-                        subagent_state = SubagentForwardState(subagents={})
+                        # Claude keeps running background sub-agents across
+                        # /clear and writes their rest under the new session's
+                        # ``subagents/`` dir; finished ones are dropped.
+                        subagent_state = _subagents_surviving_clear(
+                            await asyncio.to_thread(_read_subagent_forward_state, bridge_dir)
+                        )
                         await _write_subagent_forward_state_async(bridge_dir, subagent_state)
                         item_retries = _PostRetryTracker()
                         status_retries = _PostRetryTracker()
@@ -1568,7 +1604,7 @@ async def forward_claude_transcript_to_session(
                             # ``running`` edge. The transcript forwarder ran just
                             # above, so ``state.current_response_id`` is the active
                             # turn's id.
-                            response_id=state.current_response_id,
+                            response_id=dedupe.unstopped_response_id or state.current_response_id,
                             diagnostic_health=diagnostic_health,
                         )
                         # Deferred ``/compact``-refusal dismissal: runs AFTER
@@ -1726,6 +1762,27 @@ def _subagents_dir_for_transcript(transcript_path: Path) -> Path:
     return transcript_path.parent / transcript_path.stem / "subagents"
 
 
+def _subagents_surviving_clear(state: SubagentForwardState) -> SubagentForwardState:
+    """
+    Keep the sub-agents still running when the parent session is cleared.
+
+    Their transcript continues in a new file under the replacement
+    session's ``subagents/`` dir, so the cursor restarts at its start;
+    ``seen_source_ids`` still dedupes. Their child rows stay under the
+    cleared session, and the idle heuristic settles them once they finish.
+
+    :param state: Sub-agent cursor map from before the clear.
+    :returns: Map holding only the live, bound sub-agents.
+    """
+    return SubagentForwardState(
+        subagents={
+            subagent_id: replace(entry, byte_offset=0)
+            for subagent_id, entry in state.subagents.items()
+            if entry.child_conversation_id and entry.last_status not in ("idle", "failed")
+        }
+    )
+
+
 def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
     """
     Read the sub-agent forwarder's durable cursor map.
@@ -1786,6 +1843,11 @@ def _read_subagent_forward_state(bridge_dir: Path) -> SubagentForwardState:
             delivery_error=(
                 row.get("delivery_error") if isinstance(row.get("delivery_error"), str) else None
             ),
+            open_call_ids=tuple(
+                call_id for call_id in row.get("open_call_ids") or () if isinstance(call_id, str)
+            )
+            if isinstance(row.get("open_call_ids"), list)
+            else (),
         )
     return SubagentForwardState(subagents=entries)
 
@@ -1809,6 +1871,7 @@ def _write_subagent_forward_state(bridge_dir: Path, state: SubagentForwardState)
                 "last_activity_ts": entry.last_activity_ts,
                 "last_status": entry.last_status,
                 "delivery_error": entry.delivery_error,
+                "open_call_ids": list(entry.open_call_ids),
             }
             for entry in state.subagents.values()
         },
@@ -2451,10 +2514,18 @@ async def _forward_one_subagent(
                     delivered = True
                 completed_items.append(pending_item)
         had_item = had_item or delivered
+        open_call_ids = list(new_entry.open_call_ids)
         for pending_item in completed_items:
             source_id = pending_item.item.source_id
             seen.add(source_id)
             seen_source_ids.append(source_id)
+            call_id = pending_item.item.data.get("call_id")
+            if isinstance(call_id, str) and call_id:
+                if pending_item.item.item_type == "function_call":
+                    if call_id not in open_call_ids:
+                        open_call_ids.append(call_id)
+                elif pending_item.item.item_type == "function_call_output":
+                    open_call_ids = [open_id for open_id in open_call_ids if open_id != call_id]
         completed_offsets = [
             pending_item.checkpoint_after
             for pending_item in completed_items
@@ -2465,6 +2536,7 @@ async def _forward_one_subagent(
             byte_offset=max(completed_offsets, default=new_entry.byte_offset),
             seen_source_ids=_bounded_seen_source_ids(seen_source_ids),
             last_activity_ts=now if delivered else new_entry.last_activity_ts,
+            open_call_ids=tuple(open_call_ids),
         )
         await checkpoint.put(new_entry)
         if stop_after_batch:
@@ -2477,7 +2549,12 @@ async def _forward_one_subagent(
     elif (
         not delivery_pending
         and new_entry.last_activity_ts is not None
-        and now - new_entry.last_activity_ts > _SUBAGENT_IDLE_THRESHOLD_S
+        and now - new_entry.last_activity_ts
+        > (
+            _SUBAGENT_OPEN_TOOL_IDLE_THRESHOLD_S
+            if new_entry.open_call_ids
+            else _SUBAGENT_IDLE_THRESHOLD_S
+        )
     ):
         # A transcript lull is an idle observation, not an authoritative
         # completion: the child may still be in a long-running tool call.
@@ -4073,6 +4150,9 @@ async def _forward_available_status_events(
     """
     if compaction_retry_tracker is None:
         compaction_retry_tracker = retry_tracker
+    await _reopen_turn_after_late_stop(
+        client, session_id=session_id, dedupe=dedupe, retry_tracker=retry_tracker
+    )
     result = await asyncio.to_thread(_read_hook_events_for_state, bridge_dir, state)
     # Read all session ids ever pinned to this bridge so a rotation race
     # (batch spans the old id's StopFailure and the new SessionStart)
@@ -4498,11 +4578,42 @@ async def _forward_available_status_events(
             )
             return durable
         retry_tracker.clear(retry_key)
+        if status == "idle" and record.background_task_count is not None:
+            dedupe.stop_background_task_count = record.background_task_count
+            dedupe.background_task_ids_since_stop = frozenset()
+            dedupe.background_tasks = tuple(record.background_tasks or ())
+        # A late Stop re-attributed to an earlier turn must not leave the turn
+        # already announced as running looking idle.
+        reattributed = (
+            dedupe.unstopped_response_id is not None
+            and dedupe.unstopped_response_id == response_id
+        )
+        reopen = dedupe.woken_running_response_id if reattributed else None
+        if not reattributed:
+            newest = dedupe.newest_turn_source_id
+            if newest is not None and newest != dedupe.stopped_turn_source_id:
+                dedupe.stopped_turn_source_id = newest
+            elif response_id is None or response_id in {
+                dedupe.settled_response_id,
+                dedupe.pending_settled_response_id,
+                *dedupe.ended_without_stop,
+            }:
+                # The newest transcript turn already ended: this Stop's lines
+                # are not read yet.
+                dedupe.stop_ahead_of_transcript = True
+        dedupe.woken_running_response_id = None
+        dedupe.unstopped_response_id = None
+        dedupe.pending_reopen_response_id = None
+        if status == "idle" and reopen is not None and reopen != response_id:
+            dedupe.pending_reopen_response_id = reopen
+            await _reopen_turn_after_late_stop(
+                client, session_id=session_id, dedupe=dedupe, retry_tracker=retry_tracker
+            )
         if response_id is not None:
             # The turn ended — record its id as a pending settle so a later
             # assistant entry still inheriting it is marked as a scheduled
             # wake (see _promote_pending_settle and the bridge parser).
-            dedupe.pending_settled_response_id = response_id
+            await _record_pending_settle(bridge_dir, dedupe, response_id)
         durable = next_durable
         await _write_hook_state_async(bridge_dir, durable)
     durable = HookForwardState(
@@ -4512,6 +4623,61 @@ async def _forward_available_status_events(
     )
     await _write_hook_state_async(bridge_dir, durable)
     return durable
+
+
+async def _record_pending_settle(
+    bridge_dir: Path, dedupe: _ForwardDedupeState, response_id: str
+) -> None:
+    """
+    Record an ended turn's pending settle, on disk before its ``Stop`` is passed.
+
+    The hook cursor won't re-read the ``Stop`` after a restart, and a lost
+    settle leaves the turn looking unstopped when the next one opens.
+
+    :param bridge_dir: Native Claude bridge directory.
+    :param dedupe: Mutable per-session dedupe/latch state.
+    :param response_id: Response id of the turn the ``Stop`` ended.
+    :returns: None.
+    """
+    dedupe.pending_settled_response_id = response_id
+    state = await asyncio.to_thread(_read_forward_state, bridge_dir)
+    if state is not None and state.pending_settled_response_id != response_id:
+        await _write_forward_state_async(
+            bridge_dir, replace(state, pending_settled_response_id=response_id)
+        )
+
+
+async def _reopen_turn_after_late_stop(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    dedupe: _ForwardDedupeState,
+    retry_tracker: _PostRetryTracker,
+) -> None:
+    """
+    Re-announce as running the turn a late ``Stop`` for an earlier turn idled.
+
+    Its opening item is already consumed, so this edge is kept and retried
+    until it posts, the turn ends, or a newer turn opens.
+
+    :param client: Omnigent API client.
+    :param session_id: Session being forwarded.
+    :param dedupe: Mutable per-session dedupe/latch state.
+    :param retry_tracker: Retry/backoff state for hook status posts.
+    """
+    reopen = dedupe.pending_reopen_response_id
+    if reopen is None:
+        return
+    if await _post_transcript_status(
+        client,
+        session_id=session_id,
+        retry_tracker=retry_tracker,
+        retry_key=f"late-stop-reopen:{reopen}",
+        status="running",
+        response_id=reopen,
+    ):
+        dedupe.pending_reopen_response_id = None
+        dedupe.woken_running_response_id = reopen
 
 
 async def _ensure_state_for_transcript(
@@ -4655,6 +4821,269 @@ def _promote_pending_settle(
         return False
     dedupe.settled_response_id = pending
     dedupe.pending_settled_response_id = None
+    return True
+
+
+def _user_text(item: ClaudeTranscriptItem) -> str | None:
+    """Return a user message item's text, or ``None`` for other items."""
+    if item.item_type != "message" or item.data.get("role") != "user":
+        return None
+    content = item.data.get("content")
+    if not isinstance(content, list):
+        return ""
+    return " ".join(
+        str(block.get("text") or "") for block in content if isinstance(block, dict)
+    ).strip()
+
+
+# Dedupe fields ``_track_unstopped_turn`` derives from a transcript batch.
+_TURN_TRACKING_FIELDS = (
+    "unstopped_response_id",
+    "ended_without_stop",
+    "newest_turn_source_id",
+    "stopped_turn_source_id",
+    "stop_ahead_of_transcript",
+)
+
+
+def _track_unstopped_turn(
+    items: list[ClaudeTranscriptItem],
+    seen: set[str],
+    dedupe: _ForwardDedupeState,
+    *,
+    previous_response_id: str | None,
+) -> set[str]:
+    """
+    Remember the turn whose ``Stop`` is still due when a new turn opens.
+
+    :param items: Transcript items read this poll.
+    :param seen: Source ids already forwarded.
+    :param dedupe: Mutable per-session dedupe/latch state.
+    :param previous_response_id: Active turn before this batch, if any.
+    :returns: Source ids of items read after their turn already ended.
+    """
+    ended = list(dedupe.ended_without_stop)
+    after_end: set[str] = set()
+    active = previous_response_id
+    for item in items:
+        if item.source_id in seen:
+            continue
+        text = _user_text(item)
+        if text is not None and text.startswith(_INTERRUPT_MARKER_PREFIX):
+            # Esc ends the turn without a Stop; the marker has its own id.
+            ended += [rid for rid in (active, item.response_id) if rid and rid not in ended]
+            dedupe.stopped_turn_source_id = dedupe.newest_turn_source_id
+        if (
+            item.response_id != active
+            and item.opens_turn
+            and item.source_id != dedupe.newest_turn_source_id
+        ):
+            newest = dedupe.newest_turn_source_id
+            if (
+                active is not None
+                and (newest is None or newest != dedupe.stopped_turn_source_id)
+                and active not in ended
+                and active not in {dedupe.settled_response_id, dedupe.pending_settled_response_id}
+                and dedupe.unstopped_response_id is None
+            ):
+                dedupe.unstopped_response_id = active
+            dedupe.newest_turn_source_id = item.source_id
+            if dedupe.stop_ahead_of_transcript:
+                # A Stop read before this turn's lines has already ended it.
+                dedupe.stopped_turn_source_id = item.source_id
+                dedupe.stop_ahead_of_transcript = False
+        newest = dedupe.newest_turn_source_id
+        if newest is not None and newest == dedupe.stopped_turn_source_id:
+            after_end.add(item.source_id)
+        active = item.response_id
+    dedupe.ended_without_stop = tuple(ended[-16:])
+    return after_end
+
+
+async def _announce_transcript_edges(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    items: list[ClaudeTranscriptItem],
+    seen: set[str],
+    dedupe: _ForwardDedupeState,
+    after_end: set[str],
+    retry_tracker: _PostRetryTracker,
+) -> bool:
+    """
+    Post, in transcript order, the turn edges Claude's status file cannot report.
+
+    The file stays ``busy`` for as long as a background agent is alive, so a
+    turn the bridge opens after an earlier one ended (a prompt, a task
+    notification, a scheduled wake, a sub-agent hand-back) is announced as
+    running here; its ``Stop`` posts idle. An Esc fires no ``Stop``, so an
+    announced turn that ends in an interrupt is closed here, and a background
+    shell launch publishes the tally the next ``Stop`` would have reported.
+    Items of the settled or pending-settled turn are its tail, and nothing read
+    after its turn's ``Stop`` is announced: that ``Stop`` already counted it.
+
+    :param client: Omnigent API client.
+    :param session_id: Session being forwarded.
+    :param items: Transcript items read this poll.
+    :param seen: Source ids already forwarded.
+    :param dedupe: Mutable per-session dedupe/latch state.
+    :param after_end: Source ids of items read after their turn ended.
+    :param retry_tracker: Retry/backoff state for the edge posts.
+    :returns: ``False`` while an edge awaits a retry; its items must wait too.
+    """
+    finished = {dedupe.settled_response_id, dedupe.pending_settled_response_id}
+    for item in items:
+        _remember_background_bash_call(item, dedupe)
+        if item.source_id in seen:
+            continue
+        text = _user_text(item)
+        if text is not None and text.startswith(_INTERRUPT_MARKER_PREFIX):
+            # Esc ended the turn awaiting a re-announce; it shows idle already.
+            dedupe.pending_reopen_response_id = None
+        task_id = item.background_task_id
+        count = None
+        tasks = None
+        if (
+            text is not None
+            and text.startswith(_INTERRUPT_MARKER_PREFIX)
+            and dedupe.woken_running_response_id is not None
+        ):
+            status, response_id = "idle", dedupe.woken_running_response_id
+        elif (
+            # Some turn has ended, so the status file may no longer report starts.
+            finished != {None}
+            and item.opens_turn
+            and item.response_id not in finished
+            and item.response_id != dedupe.woken_running_response_id
+            and item.source_id not in after_end
+        ):
+            status, response_id = "running", item.response_id
+        elif (
+            task_id is not None
+            and task_id not in dedupe.background_task_ids_since_stop
+            and item.response_id not in finished
+            and item.source_id not in after_end
+        ):
+            status, response_id = "running", item.response_id
+            count = (
+                dedupe.stop_background_task_count + len(dedupe.background_task_ids_since_stop) + 1
+            )
+            tasks = [*dedupe.background_tasks, _launched_background_task(item, task_id, dedupe)]
+        else:
+            continue
+        if not await _post_transcript_status(
+            client,
+            session_id=session_id,
+            retry_tracker=retry_tracker,
+            retry_key=f"transcript-status:{item.source_id}",
+            status=status,
+            response_id=response_id,
+            background_task_count=count,
+            background_tasks=tasks[-_BACKGROUND_TASK_FORWARD_LIMIT:] if tasks else None,
+        ):
+            return False
+        if task_id is not None and count is not None:
+            dedupe.background_task_ids_since_stop |= {task_id}
+            dedupe.background_tasks = tuple(tasks or ())
+        else:
+            dedupe.woken_running_response_id = response_id if status == "running" else None
+            dedupe.pending_reopen_response_id = None
+    return True
+
+
+_BACKGROUND_BASH_CALL_LIMIT = 16
+
+
+def _remember_background_bash_call(
+    item: ClaudeTranscriptItem, dedupe: _ForwardDedupeState
+) -> None:
+    """Record a ``run_in_background`` Bash call's input for its later launch result."""
+    if item.item_type != "function_call" or item.data.get("name") != "Bash":
+        return
+    call_id = item.data.get("call_id")
+    raw_arguments = item.data.get("arguments")
+    if not isinstance(call_id, str) or not isinstance(raw_arguments, str):
+        return
+    try:
+        arguments = json.loads(raw_arguments)
+    except ValueError:
+        return
+    if not isinstance(arguments, dict):
+        return
+    if arguments.get("run_in_background") is not True:
+        return
+    calls = [entry for entry in dedupe.background_bash_calls if entry[0] != call_id]
+    calls.append((call_id, arguments))
+    dedupe.background_bash_calls = tuple(calls[-_BACKGROUND_BASH_CALL_LIMIT:])
+
+
+def _launched_background_task(
+    item: ClaudeTranscriptItem, task_id: str, dedupe: _ForwardDedupeState
+) -> dict[str, object]:
+    """Build the ``Stop``-style detail entry for a shell a Bash result launched."""
+    call_id = item.data.get("call_id")
+    arguments = next((args for cid, args in dedupe.background_bash_calls if cid == call_id), {})
+    raw = {
+        "id": task_id,
+        "type": "shell",
+        "status": "running",
+        "description": arguments.get("description"),
+        "command": arguments.get("command"),
+    }
+    return _normalize_background_task(raw) or {"id": task_id}
+
+
+async def _post_transcript_status(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    retry_tracker: _PostRetryTracker,
+    retry_key: str,
+    status: str,
+    response_id: str,
+    background_task_count: int | None = None,
+    background_tasks: list[dict[str, object]] | None = None,
+) -> bool:
+    """
+    Post a transcript-derived status edge, holding its items for a retry on failure.
+
+    :param client: Omnigent API client.
+    :param session_id: Session being forwarded.
+    :param retry_tracker: Retry/backoff state shared with the item posts.
+    :param retry_key: Stable key for this edge, e.g. ``"turn:abc:0:message:running"``.
+    :param status: Status to post, e.g. ``"running"``.
+    :param response_id: Turn the edge belongs to.
+    :param background_task_count: Background-shell tally, when it changed.
+    :param background_tasks: Detail for every shell in that tally.
+    :returns: ``False`` when the edge must be retried before its items forward.
+    """
+    if retry_tracker.retry_delay_s(retry_key) is not None:
+        return False
+    try:
+        await post_external_session_status(
+            client,
+            session_id=session_id,
+            status=status,
+            response_id=response_id,
+            background_task_count=background_task_count,
+            background_tasks=background_tasks,
+        )
+    except httpx.HTTPError as exc:
+        decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
+        _logger.warning(
+            "Failed to post a transcript status edge; session=%s status=%s "
+            "attempt=%s dropped=%s http_status=%s",
+            session_id,
+            status,
+            decision.attempts,
+            decision.exhausted,
+            _http_status_for_log(exc),
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        # A rejected edge is dropped; the next Stop reports the turn's end.
+        return decision.exhausted
+    retry_tracker.clear(retry_key)
     return True
 
 
@@ -4912,7 +5341,11 @@ async def _forward_available_items(
     ):
         dedupe.pending_settled_response_id = state.pending_settled_response_id
     result = await asyncio.to_thread(
-        _read_transcript_items_for_state, state, agent_name, dedupe.settled_response_id
+        _read_transcript_items_for_state,
+        state,
+        agent_name,
+        dedupe.settled_response_id,
+        dedupe.pending_settled_response_id,
     )
     items = result.items
     if not items:
@@ -4934,15 +5367,29 @@ async def _forward_available_items(
     current_response_id = result.current_response_id
     seen_source_ids = list(state.seen_source_ids)
     seen = set(seen_source_ids)
-    # This function publishes no session status. Claude's own
-    # ``sessions/<pid>.json`` owns the running/idle badge (see
-    # :mod:`omnigent.harnesses.claude_native.status_file`), and it reports the turn ending
-    # the moment Claude settles. A status edge derived from the transcript can
-    # only fire once a poll has parsed assistant output, so it lands *after* the
-    # file's ``idle`` on a short turn and re-asserts ``running`` on a session
-    # that already finished — the user sees idle → running → idle. Items carry
-    # their own ``response_id`` (see :func:`_post_external_conversation_item`),
-    # so the transcript's job here is items, not status.
+    # Claude's own ``sessions/<pid>.json`` owns the running/idle badge (see
+    # :mod:`omnigent.harnesses.claude_native.status_file`). The transcript only
+    # posts the edges that file cannot report: a turn opened after a settled one
+    # (the file stays busy while a background agent lives), an interrupt, and a
+    # background-shell launch.
+    untracked = replace(dedupe)
+    after_end = _track_unstopped_turn(
+        items, seen, dedupe, previous_response_id=state.current_response_id
+    )
+    if not await _announce_transcript_edges(
+        client,
+        session_id=session_id,
+        items=items,
+        seen=seen,
+        dedupe=dedupe,
+        after_end=after_end,
+        retry_tracker=retry_tracker,
+    ):
+        # Hold the batch so the edge is retried before its items are consumed;
+        # the retry tracks the batch's turns afresh.
+        for name in _TURN_TRACKING_FIELDS:
+            setattr(dedupe, name, getattr(untracked, name))
+        return state
     updated = (
         state
         if state.current_response_id == current_response_id
@@ -5396,6 +5843,7 @@ def _read_transcript_items_for_state(
     state: TranscriptForwardState,
     agent_name: str,
     settled_response_id: str | None = None,
+    stopped_response_id: str | None = None,
 ) -> TranscriptReadResult:
     """
     Read transcript items using the best cursor available in ``state``.
@@ -5404,6 +5852,8 @@ def _read_transcript_items_for_state(
     :param agent_name: Agent/model name to stamp on mirrored output.
     :param settled_response_id: Active turn-settle latch — assistant
         output inheriting this id parses as a scheduled wake.
+    :param stopped_response_id: Turn whose ``Stop`` arrived but has not
+        settled; a sub-agent hand-back after it opens a new turn.
     :returns: Transcript items and updated cursors. States without a
         byte offset are migrated by one line-cursor compatibility scan.
     """
@@ -5414,6 +5864,7 @@ def _read_transcript_items_for_state(
             agent_name=agent_name,
             current_response_id=state.current_response_id,
             settled_response_id=settled_response_id,
+            stopped_response_id=stopped_response_id,
         )
     return read_transcript_items_from_offset(
         state.transcript_path,
@@ -5422,6 +5873,7 @@ def _read_transcript_items_for_state(
         agent_name=agent_name,
         current_response_id=state.current_response_id,
         settled_response_id=settled_response_id,
+        stopped_response_id=stopped_response_id,
     )
 
 
