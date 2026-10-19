@@ -67,6 +67,7 @@ from omnigent.inner.executor import (
 from omnigent.inner.native_attachments import (
     FRAMEWORK_NOTICE_BLOCK_TYPE,
     attachment_reference_line,
+    codex_framework_notice_text,
     codex_resize_metadata_path,
     materialize_attachment,
     parse_data_uri,
@@ -494,6 +495,8 @@ class CodexNativeExecutor(Executor):
     :param bridge_dir: Optional bridge directory override. ``None``
         reads :data:`CODEX_NATIVE_BRIDGE_DIR_ENV_VAR`.
     """
+
+    reads_framework_notices = True
 
     def __init__(self, bridge_dir: Path | None = None) -> None:
         self._bridge_dir = bridge_dir or _bridge_dir_from_env()
@@ -1000,13 +1003,20 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
         return [{"type": "text", "text": content}] if content else []
     if isinstance(content, list):
         items: list[dict[str, object]] = []
+        deferred_notices: list[str] = []
         for raw_block in content:
             block = _json_object(raw_block)
             if block is None:
                 continue
             block_type = block.get("type")
             if block_type == FRAMEWORK_NOTICE_BLOCK_TYPE:
-                _apply_resize_notice_to_latest_image(items, block.get("source_metadata"))
+                notice_text = block.get("text")
+                if isinstance(notice_text, str):
+                    wrapped = codex_framework_notice_text(notice_text, bridge_dir)
+                    if wrapped is not None:
+                        deferred_notices.append(wrapped)
+                else:
+                    _apply_resize_notice_to_latest_image(items, block.get("source_metadata"))
                 continue
             if block_type in {"input_text", "text"}:
                 text = block.get("text")
@@ -1032,6 +1042,8 @@ def _content_to_input_items(content: object, bridge_dir: Path) -> list[dict[str,
                 file_item = _file_block_to_input_item(block, bridge_dir)
                 if file_item is not None:
                     items.append(file_item)
+        # Notices follow the user's own input.
+        items.extend({"type": "text", "text": notice} for notice in deferred_notices)
         return items
     if content is None:
         return []

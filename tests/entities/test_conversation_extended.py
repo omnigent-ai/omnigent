@@ -1,7 +1,7 @@
 """Extended tests for conversation entity types not covered by existing tests.
 
 Covers: ErrorData, CompactionData, NativeToolData, ResourceEventData,
-TerminalCommandData, NON_CONTENT_ITEM_TYPES, ITEM_TYPE_TO_DATA_CLS,
+TerminalCommandData, CodeRunData, NON_CONTENT_ITEM_TYPES, ITEM_TYPE_TO_DATA_CLS,
 _validate_type_matches_data, and Conversation field defaults.
 """
 
@@ -14,8 +14,10 @@ import pytest
 from pydantic import ValidationError
 
 from omnigent.entities.conversation import (
+    CODE_RUN_OUTPUT_MAX_CHARS,
     ITEM_TYPE_TO_DATA_CLS,
     NON_CONTENT_ITEM_TYPES,
+    CodeRunData,
     CompactionData,
     Conversation,
     ConversationItem,
@@ -378,6 +380,82 @@ def test_terminal_command_invalid_kind() -> None:
         TerminalCommandData(kind="unknown")  # type: ignore[arg-type]
 
 
+# ── CodeRunData ───────────────────────────────────────
+
+
+def _finished_run(output: list[dict[str, str]]) -> dict[str, Any]:
+    return {
+        "run_id": "run_1",
+        "phase": "finished",
+        "status": "exited",
+        "exit_code": 0,
+        "duration_ms": 12,
+        "output": output,
+        "truncated": False,
+    }
+
+
+def test_code_run_started() -> None:
+    data = CodeRunData(
+        run_id="run_1",
+        phase="started",
+        message_id="msg_1",
+        block_hash="abc",
+        language="bash",
+        command="ls",
+        timeout=60,
+        started_at=1753900000,
+    )
+    assert data.approved_by is None
+    assert data.status is None
+
+
+def test_code_run_finished_round_trips_through_parse() -> None:
+    raw = _finished_run([{"stream": "stdout", "text": "hi\n"}, {"stream": "stderr", "text": "w"}])
+    data = parse_item_data("code_run", raw)
+    assert isinstance(data, CodeRunData)
+    assert [(segment.stream, segment.text) for segment in data.output] == [
+        ("stdout", "hi\n"),
+        ("stderr", "w"),
+    ]
+    assert parse_item_data("code_run", data.model_dump()) == data
+
+
+def test_code_run_phase_requires_its_fields() -> None:
+    with pytest.raises(ValidationError, match="command"):
+        CodeRunData(run_id="run_1", phase="started")
+    with pytest.raises(ValidationError, match="status"):
+        CodeRunData(run_id="run_1", phase="finished")
+
+
+@pytest.mark.parametrize("omitted", ["output", "truncated"])
+def test_code_run_finished_requires_output_and_truncated(omitted: str) -> None:
+    raw = _finished_run([])
+    del raw[omitted]
+    with pytest.raises(ValidationError, match=omitted):
+        CodeRunData.model_validate(raw)
+
+
+def test_code_run_finished_accepts_empty_output() -> None:
+    data = CodeRunData.model_validate(_finished_run([]))
+    assert data.output == []
+    assert data.truncated is False
+
+
+def test_code_run_rejects_unknown_status_and_stream() -> None:
+    with pytest.raises(ValidationError):
+        CodeRunData.model_validate({**_finished_run([]), "status": "crashed"})
+    with pytest.raises(ValidationError):
+        CodeRunData.model_validate(_finished_run([{"stream": "stdin", "text": "x"}]))
+
+
+def test_code_run_rejects_output_over_cap() -> None:
+    at_cap = [{"stream": "stdout", "text": "x" * CODE_RUN_OUTPUT_MAX_CHARS}]
+    CodeRunData.model_validate(_finished_run(at_cap))
+    with pytest.raises(ValidationError, match="100000"):
+        CodeRunData.model_validate(_finished_run([*at_cap, {"stream": "stderr", "text": "y"}]))
+
+
 # ── NON_CONTENT_ITEM_TYPES ───────────────────────────
 
 
@@ -390,6 +468,7 @@ def test_non_content_item_types_complete() -> None:
         "routing_decision",
         "slash_command",
         "terminal_command",
+        "code_run",
     }
     assert expected == NON_CONTENT_ITEM_TYPES
 
@@ -414,6 +493,7 @@ def test_item_type_map_covers_all_types() -> None:
         "routing_decision",
         "slash_command",
         "terminal_command",
+        "code_run",
     }
     assert set(ITEM_TYPE_TO_DATA_CLS.keys()) == expected_types
 

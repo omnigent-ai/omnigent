@@ -19,7 +19,7 @@ import re
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -486,6 +486,8 @@ class SessionResourceRegistry:
         # the runner can emit a ``session.terminal.activity`` SSE event.
         # Set by the runner via :meth:`set_terminal_activity_publisher`.
         self._terminal_activity_publisher: Callable[[str, str], None] | None = None
+        # Set by the runner via :meth:`set_code_run_stopper`.
+        self._code_run_stopper: Callable[[str], Awaitable[None]] | None = None
         # Optional callback ``(session_id, status) -> None`` invoked (on
         # the event loop) when the claude-native *agent* terminal's pane
         # crosses an activity/idle edge, so the runner can emit a
@@ -537,6 +539,13 @@ class SessionResourceRegistry:
         :param publisher: Callable ``(session_id, terminal_id) -> None``.
         """
         self._terminal_activity_publisher = publisher
+
+    def set_code_run_stopper(self, stopper: Callable[[str], Awaitable[None]]) -> None:
+        """Install the callback that stops a session's code runs on cleanup.
+
+        :param stopper: Coroutine function ``(session_id) -> None``.
+        """
+        self._code_run_stopper = stopper
 
     def set_session_status_publisher(
         self,
@@ -2056,6 +2065,11 @@ class SessionResourceRegistry:
         :param session_id: Session/conversation identifier.
         """
         self._take_session_status_memo(session_id)
+        if self._code_run_stopper is not None:
+            try:
+                await self._code_run_stopper(session_id)
+            except Exception:
+                _logger.exception("Error stopping code runs for session=%s", session_id)
         with self._lock:
             self._session_activity_epoch.pop(session_id, None)
             primary = self._primary_envs.pop(session_id, None)

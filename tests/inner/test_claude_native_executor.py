@@ -2120,3 +2120,42 @@ async def test_run_turn_ignores_missing_tmux_during_timeout_reap(
 
     assert isinstance(events[0], ExecutorError)
     assert events[0].message == "terminal did not become ready"
+
+
+@pytest.mark.asyncio
+async def test_code_run_notice_reaches_claude_through_the_prompt_hook(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A text-only message keeps its notice out of the typed prompt."""
+    import io
+    import json
+    import sys
+
+    from omnigent.harnesses.claude_native import hook as claude_native_hook
+    from omnigent.inner.native_attachments import framework_text_notice_block
+    from omnigent.runtime.harnesses._executor_adapter import (
+        _extract_user_text,
+        _translate_input_to_messages,
+    )
+
+    content = [
+        {"type": "input_text", "text": "why did it fail?"},
+        framework_text_notice_block("run summary"),
+    ]
+    sent: list[dict[str, Any]] = []
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", _stub_inject(sent))
+    executor = ClaudeNativeExecutor(tmp_path)
+
+    messages = _translate_input_to_messages(content, keep_notices=executor.reads_framework_notices)
+    async for _ in executor.run_turn(messages, [], ""):
+        pass
+
+    assert sent[0]["content"] == "why did it fail?"
+    assert _extract_user_text(content, keep_notices=True) == content
+    hook_stdout = io.StringIO()
+    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
+    monkeypatch.setattr(sys, "stdout", hook_stdout)
+    assert claude_native_hook.main(["framework-context", "--bridge-dir", str(tmp_path)]) == 0
+    output = json.loads(hook_stdout.getvalue())
+    assert output["hookSpecificOutput"]["additionalContext"] == "run summary"

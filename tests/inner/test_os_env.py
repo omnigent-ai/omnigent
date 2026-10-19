@@ -7,6 +7,7 @@ import base64
 import io
 import os
 import shutil
+import time
 import tracemalloc
 from pathlib import Path
 
@@ -14,10 +15,12 @@ import pytest
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.os_env import (
+    CallerProcessOSEnvironment,
     _child_shell_env,
     _project_root,
     _read_impl,
     _shell_impl,
+    _shell_stream_impl,
     build_helper_env,
     create_os_environment,
 )
@@ -515,3 +518,139 @@ def test_shell_command_does_not_see_omnigent_project_root(
     out = result.get("stdout", "")
     assert project_entry in out
     assert str(_project_root()) not in out
+
+
+# ---------------------------------------------------------------------------
+# shell_stream: the streaming helper op behind chat code runs.
+# ---------------------------------------------------------------------------
+
+
+def _none_env(cwd: Path) -> CallerProcessOSEnvironment:
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(cwd), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert isinstance(os_env, CallerProcessOSEnvironment)
+    return os_env
+
+
+def _stream(
+    os_env: CallerProcessOSEnvironment,
+    command: str,
+    *,
+    language: str = "shell",
+    timeout: int = 30,
+    stop_after: str | None = None,
+) -> tuple[dict[str, object], list[tuple[str, str]]]:
+    chunks: list[tuple[str, str]] = []
+
+    def on_output(stream: str, text: str) -> None:
+        chunks.append((stream, text))
+        if stop_after is not None and stop_after in text:
+            os_env.stop_shell_stream()
+
+    result = asyncio.run(
+        os_env.shell_stream(command, language=language, timeout=timeout, on_output=on_output)
+    )
+    return dict(result), chunks
+
+
+def _pid_alive(pid: int) -> bool:
+    """Whether *pid* still runs; a killed orphan is gone once init reaps it."""
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+            stat = Path(f"/proc/{pid}/stat")
+            if stat.exists() and stat.read_text().rsplit(")", 1)[1].split()[0] == "Z":
+                return False
+        except (ProcessLookupError, FileNotFoundError):
+            return False
+        time.sleep(0.05)
+    return True
+
+
+def test_shell_stream_emits_stdout_and_stderr_in_arrival_order(tmp_path: Path) -> None:
+    os_env = _none_env(tmp_path)
+    try:
+        result, chunks = _stream(os_env, "echo out; sleep 0.2; echo err >&2; sleep 0.2; echo done")
+    finally:
+        os_env.close()
+    assert result == {"exit_code": 0, "timed_out": False, "truncated": False}
+    assert [stream for stream, _ in chunks] == ["stdout", "stderr", "stdout"]
+    assert "".join(text for _, text in chunks) == "out\nerr\ndone\n"
+
+
+def test_shell_stream_reports_nonzero_exit(tmp_path: Path) -> None:
+    os_env = _none_env(tmp_path)
+    try:
+        result, _ = _stream(os_env, "exit 3")
+    finally:
+        os_env.close()
+    assert result["exit_code"] == 3
+
+
+@pytest.mark.parametrize(
+    ("language", "code", "expected"),
+    [
+        ("python", "import sys\nprint(sys.argv)\n", "['-']\n"),
+        pytest.param(
+            "node",
+            "console.log(process.argv.length)\n",
+            "2\n",
+            marks=pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH"),
+        ),
+    ],
+)
+def test_shell_stream_feeds_code_to_interpreter_stdin(
+    tmp_path: Path, language: str, code: str, expected: str
+) -> None:
+    os_env = _none_env(tmp_path)
+    try:
+        result, chunks = _stream(os_env, code, language=language)
+    finally:
+        os_env.close()
+    assert result["exit_code"] == 0, chunks
+    assert "".join(text for _, text in chunks) == expected
+
+
+def test_shell_stream_timeout_kills_the_process_group(tmp_path: Path) -> None:
+    os_env = _none_env(tmp_path)
+    try:
+        result, _ = _stream(os_env, "sleep 30 & echo $! > child.pid; wait", timeout=1)
+    finally:
+        os_env.close()
+    assert result["timed_out"] is True
+    assert result["exit_code"] is None
+    child_pid = int((tmp_path / "child.pid").read_text())
+    assert not _pid_alive(child_pid)
+
+
+def test_shell_stream_stop_kills_the_process_group(tmp_path: Path) -> None:
+    os_env = _none_env(tmp_path)
+    started = time.monotonic()
+    try:
+        result, _ = _stream(
+            os_env, "sleep 30 & echo $! > child.pid; echo ready; wait", stop_after="ready"
+        )
+    finally:
+        os_env.close()
+    assert time.monotonic() - started < 10
+    assert result == {"exit_code": None, "timed_out": False, "truncated": False}
+    child_pid = int((tmp_path / "child.pid").read_text())
+    assert not _pid_alive(child_pid)
+
+
+def test_shell_stream_caps_streamed_output(tmp_path: Path) -> None:
+    chunks: list[str] = []
+    result = _shell_stream_impl(
+        command="head -c 5000 /dev/zero | tr '\\0' x",
+        language="shell",
+        timeout=30,
+        shell_path=shutil.which("bash") or "/bin/sh",
+        cwd=tmp_path,
+        max_output=1000,
+        control=io.StringIO(),
+        emit=lambda line: chunks.append(line["text"]),
+    )
+    assert result == {"exit_code": 0, "timed_out": False, "truncated": True}
+    assert "".join(chunks) == "x" * 1000

@@ -29,8 +29,10 @@ from omnigent.harnesses.claude_native.bridge import (
     prepare_bridge_dir,
 )
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+from omnigent.harnesses.codex_native import forwarder as codex_forwarder
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
+from omnigent.inner.native_attachments import codex_framework_notice_text
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import (
     ResolvedSpec,
@@ -855,6 +857,10 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
             if rotated:
                 assert not session_dir.exists()
             return
+        # The previous launch's executor sent a code-run notice that Codex has
+        # not echoed yet; its record must survive into the relaunched bridge.
+        sent_notice = codex_framework_notice_text("Run of a bash block: completed.", bridge_dir)
+        assert sent_notice is not None
         terminal_view = await _auto_create_codex_terminal(
             session_id,
             _FakeResourceRegistry(),  # type: ignore[arg-type]
@@ -974,6 +980,22 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     assert spawn_env is not None
     executor_dir = Path(spawn_env[codex_native_bridge.CODEX_NATIVE_BRIDGE_DIR_ENV_VAR])
     assert codex_native_bridge.read_bridge_state(executor_dir) == bridge_state
+    # The relaunched forwarder stores Codex's echo of either executor's notice
+    # without it, so the saved user message stays as typed.
+    resent_notice = codex_framework_notice_text("Run of a bash block: failed.", executor_dir)
+    echo: dict[str, object] = {
+        "type": "userMessage",
+        "content": [
+            {"type": "text", "text": "why?"},
+            {"type": "text", "text": sent_notice},
+            {"type": "text", "text": resent_notice},
+        ],
+    }
+    token = codex_forwarder._dead_letter_dir.set(forward_calls[0]["bridge_dir"])
+    try:
+        assert codex_forwarder._user_message_text(echo) == "why?"
+    finally:
+        codex_forwarder._dead_letter_dir.reset(token)
     # Resume state is published before the configured wrapper starts, so the
     # executor never needs a startup-timeout marker for this path.
     assert codex_native_bridge.read_bridge_startup_timeout(bridge_dir) is None

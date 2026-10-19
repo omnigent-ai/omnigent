@@ -44,6 +44,8 @@ from omnigent.entities import (
     TerminalCommandData,
 )
 from omnigent.entities.conversation import (
+    KIRO_NATIVE_PROMPT_NOT_RECORDED,
+    NATIVE_PROMPT_NOT_RECORDED,
     FunctionCallData,
     FunctionCallOutputData,
     parse_item_data,
@@ -112,6 +114,7 @@ from omnigent.runtime import (
     pending_inputs,
 )
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.runtime.code_run_context import has_unfinished_runs, with_code_run_notice
 from omnigent.runtime.policies.approval import (
     build_elicitation_request_event,
     resolve_ask_timeout,
@@ -123,7 +126,7 @@ from omnigent.runtime.policies.builder import (
     load_session_usage,
 )
 from omnigent.runtime.policies.engine import PolicyEngine
-from omnigent.runtime.workflow import _find_spec_by_name
+from omnigent.runtime.workflow import _find_spec_by_name, fetch_all_items
 from omnigent.server import session_live_state, shutdown_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -150,6 +153,7 @@ from omnigent.server.bundles import (
     validate_agent_bundle,
 )
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
+from omnigent.server.feature_flags import Feature
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
     MANAGED_REPO_LABEL_KEY,
@@ -240,6 +244,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_terminal_pending_cache,
     get_caps,
     get_server_runner_router,
+    server_feature_enabled,
     session_stream,
     set_server_runner_router,
 )
@@ -267,6 +272,7 @@ from omnigent.server.routes._sessions.helpers import (
     _devin_subagent_labels_from_body,
     _emit_server_routing_decision,
     _error_item_from_sse,
+    _external_item_stable_id,
     _extract_claude_native_runner_failure,
     _extract_persistent_item_from_sse,
     _extract_user_text_for_routing,
@@ -3183,12 +3189,7 @@ def _new_external_conversation_item(
                 code=ErrorCode.INVALID_INPUT,
             )
         item = item.model_copy(
-            update={
-                "stable_id": uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"omnigent-external-item:{session_id}:{source_id.strip()}",
-                ).hex
-            }
+            update={"stable_id": _external_item_stable_id(session_id, source_id)}
         )
     return item
 
@@ -3459,7 +3460,7 @@ def _build_skipped_native_items(
         return []
     if _is_kiro_native_session(conv):
         harness_key = "kiro"
-        code = "kiro_native_prompt_not_recorded"
+        code = KIRO_NATIVE_PROMPT_NOT_RECORDED
         message = (
             "Kiro did not accept this web message into its structured session "
             "transcript. The native terminal may have shown the underlying error."
@@ -3468,7 +3469,7 @@ def _build_skipped_native_items(
         native_agent = _native_coding_agent_for_session(conv)
         display_name = native_agent.display_name if native_agent is not None else "The agent"
         harness_key = "native"
-        code = "native_prompt_not_recorded"
+        code = NATIVE_PROMPT_NOT_RECORDED
         message = (
             f"{display_name} never recorded this message in its transcript before "
             "accepting a later one, so it was not delivered. The native terminal may "
@@ -6097,6 +6098,90 @@ def _build_native_terminal_message_event(
     return event
 
 
+_CODE_RUN_LISTING_TIMEOUT_S = 5.0
+
+# Native harnesses whose executors deliver text framework notices.
+_CODE_RUN_NOTICE_NATIVE_HARNESSES = frozenset({"claude-native", "codex-native"})
+
+
+async def _active_code_run_ids(
+    runner_client: httpx.AsyncClient, session_id: str
+) -> frozenset[str]:
+    """
+    Return the run ids the runner reports as running, empty when unreachable.
+
+    :param runner_client: The session's runner client.
+    :param session_id: Session id, e.g. ``"conv_abc123"``.
+    :returns: Active run ids, e.g. ``frozenset({"run_abc"})``.
+    """
+    try:
+        response = await runner_client.get(
+            f"/v1/sessions/{session_id}/code-runs",
+            params={"status": "running"},
+            timeout=_CODE_RUN_LISTING_TIMEOUT_S,
+        )
+        runs = response.json().get("data", []) if response.status_code == 200 else []
+    except (httpx.HTTPError, ConnectionError, ValueError, AttributeError):
+        return frozenset()
+    return frozenset(
+        run["run_id"]
+        for run in runs
+        if isinstance(run, dict) and isinstance(run.get("run_id"), str)
+    )
+
+
+async def _with_code_run_notice(
+    content: object,
+    conversation_store: ConversationStore,
+    runner_client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    exclude_item_id: str | None = None,
+) -> object:
+    """
+    Append the code-run notice to forwarded user content, when there is one.
+
+    Only the forwarded copy carries the notice; the stored item stays as
+    typed. Sessions without a ``code_run`` item pay one indexed lookup.
+
+    :param content: Forwarded message content, a string or block list.
+    :param conversation_store: Store holding the session's items.
+    :param runner_client: The session's runner client, asked which runs
+        are still going.
+    :param session_id: Session id, e.g. ``"conv_abc123"``.
+    :param exclude_item_id: Id of the message being sent when it is
+        already persisted, so it does not count as the previous message.
+    :returns: *content* with a text framework notice block appended, or
+        *content* unchanged when there is nothing to report.
+    """
+    if not server_feature_enabled(Feature.CODE_BLOCK_RUN):
+        return content
+    try:
+        probe = await asyncio.to_thread(
+            conversation_store.list_items, session_id, limit=1, type="code_run"
+        )
+        if not probe.data:
+            return content
+        items = await asyncio.to_thread(fetch_all_items, conversation_store, session_id)
+    except Exception:  # noqa: BLE001
+        # The message matters more than the notice: deliver it without one.
+        _logger.warning(
+            "Code-run notice lookup failed for session=%s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return content
+    api_items = [item.to_api_dict() for item in items if item.id != exclude_item_id]
+    # Only a started run without a finished item needs the runner's view.
+    active_run_ids = (
+        await _active_code_run_ids(runner_client, session_id)
+        if has_unfinished_runs(api_items)
+        else frozenset()
+    )
+    return with_code_run_notice(content, api_items, active_run_ids=active_run_ids)
+
+
 async def _forward_native_terminal_message(
     runner_client: httpx.AsyncClient,
     session_id: str,
@@ -6107,6 +6192,7 @@ async def _forward_native_terminal_message(
     model_override: str | None = None,
     input_delivery: Mapping[str, object] | None = None,
     agent_revision: str | None = None,
+    conversation_store: ConversationStore | None = None,
 ) -> None:
     """
     Forward one Omnigent web-chat message to the native terminal harness.
@@ -6132,6 +6218,8 @@ async def _forward_native_terminal_message(
         ``None`` when routing did not pick a model.
     :param input_delivery: Queued input identifiers and original enqueue time.
     :param agent_revision: Effective spec revision used to invalidate runner caches.
+    :param conversation_store: Store to read code runs from for the
+        code-run notice; ``None`` sends the message without one.
     :returns: None.
     :raises HTTPException: 502 when the runner or harness rejects
         the injection request.
@@ -6186,6 +6274,10 @@ async def _forward_native_terminal_message(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
+    if conversation_store is not None and harness in _CODE_RUN_NOTICE_NATIVE_HARNESSES:
+        event["content"] = await _with_code_run_notice(
+            event.get("content"), conversation_store, runner_client, session_id
+        )
     try:
         resp = await runner_client.post(
             f"/v1/sessions/{session_id}/events",
@@ -6823,6 +6915,15 @@ async def _forward_event_to_runner(
                     exc_info=True,
                     extra={"session_id": session_id},
                 )
+
+    if body.type == "message" and forwarded_data.get("role") == "user":
+        forwarded_data["content"] = await _with_code_run_notice(
+            forwarded_data.get("content"),
+            conversation_store,
+            runner_client,
+            session_id,
+            exclude_item_id=persisted_items[0].id,
+        )
 
     # Flatten SessionEventInput {type, data} into the runner's
     # discriminated-union shape {type, ...data_fields}. The runner's
@@ -7947,6 +8048,7 @@ async def _dispatch_session_event_to_runner_impl(
                 ),
                 input_delivery=input_delivery,
                 agent_revision=agent_revision,
+                conversation_store=conversation_store,
             )
             forwarded = True
             if pending_id is not None:

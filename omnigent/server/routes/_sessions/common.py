@@ -46,6 +46,7 @@ from omnigent.harness_plugins import (
     harness_capabilities,
 )
 from omnigent.runner.routing import RunnerRouter
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
@@ -1020,6 +1021,7 @@ def get_server_runner_router() -> RunnerRouter | None:
 # pre-launch source) via a background task that carries no FastAPI request,
 # so it reads the registry from this module-level global.
 _server_host_registry: HostRegistry | None = None
+_server_feature_flags: FeatureFlags | None = None
 
 
 def host_interactive_shells_for_request(
@@ -1059,6 +1061,24 @@ def set_server_host_registry(host_registry: HostRegistry | None) -> None:
 def get_server_host_registry() -> HostRegistry | None:
     """Return the registry stashed by :func:`set_server_host_registry`."""
     return _server_host_registry
+
+
+def set_server_feature_flags(feature_flags: FeatureFlags | None) -> None:
+    """Stash the server's release-feature snapshot for code without a request.
+
+    Called once from ``create_app``; message forwarding reads it to decide
+    whether to attach the code-run notice.
+
+    :param feature_flags: The resolved snapshot, or ``None`` for all off.
+    :returns: None.
+    """
+    global _server_feature_flags
+    _server_feature_flags = feature_flags
+
+
+def server_feature_enabled(feature: Feature) -> bool:
+    """Whether *feature* is on in the snapshot :func:`set_server_feature_flags` stashed."""
+    return _server_feature_flags is not None and _server_feature_flags.enabled(feature)
 
 
 __all__ = [
@@ -1256,6 +1276,8 @@ __all__ = [
     "get_server_host_registry",
     "get_server_runner_router",
     "host_interactive_shells_for_request",
+    "server_feature_enabled",
+    "set_server_feature_flags",
     "set_server_host_registry",
     "set_server_runner_router",
 ]

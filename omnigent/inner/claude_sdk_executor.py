@@ -1580,6 +1580,8 @@ class ClaudeSDKExecutor(Executor):
     providers are another (base URL + auth command supplied directly).
     """
 
+    reads_framework_notices = True
+
     def __init__(
         self,
         *,

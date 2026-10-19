@@ -3198,3 +3198,22 @@ def test_interrupt_reraises_unrelated_rejections(
     assert state is not None and state.active_turn_id == "turn_active", (
         f"an unexplained rejection must not clear the recorded turn; bridge={state!r}"
     )
+
+
+def test_text_notice_is_sent_as_a_tagged_text_item_after_the_user_text(tmp_path: Path) -> None:
+    from omnigent.inner.codex_native_executor import CodexNativeExecutor, _content_to_input_items
+    from omnigent.inner.native_attachments import framework_text_notice_block
+
+    content = [{"type": "input_text", "text": "why?"}, framework_text_notice_block("run summary")]
+
+    assert CodexNativeExecutor.reads_framework_notices is True
+    first = _content_to_input_items(content, tmp_path)
+    second = _content_to_input_items(content, tmp_path)
+    assert first[0] == {"type": "text", "text": "why?"}
+    assert first[1]["type"] == "text"
+    notice = first[1]["text"]
+    assert isinstance(notice, str)
+    assert notice.startswith("<omnigent-framework-notice id=")
+    assert "run summary" in notice
+    # Each sent notice carries its own nonce.
+    assert first[1]["text"] != second[1]["text"]

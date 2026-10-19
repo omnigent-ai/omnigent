@@ -263,6 +263,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _wait_for_host_reconnect,
     ensure_runner_connected,
 )
+from omnigent.server.routes.sessions.routes_code_runs import code_run_snapshot_events
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
     ConversationDeleted,
@@ -3254,6 +3255,15 @@ def register_events_routes(
                             events.append({"type": "session.resource.created", "resource": item})
                 except Exception:
                     _logger.debug("snapshot: terminals failed for %s", session_id, exc_info=True)
+                try:
+                    events.extend(
+                        await asyncio.wait_for(
+                            code_run_snapshot_events(request, runner_client, session_id),
+                            timeout=_SNAPSHOT_RUNNER_TIMEOUT_S,
+                        )
+                    )
+                except Exception:
+                    _logger.debug("snapshot: code runs failed for %s", session_id, exc_info=True)
             # Tell the client to (re)fetch the changed-files list rather
             # than fetching it here (avoids a second runner round-trip).
             events.append(

@@ -470,6 +470,11 @@ def framework_notice_block(source_metadata: Mapping[str, object]) -> dict[str, o
     return {"type": FRAMEWORK_NOTICE_BLOCK_TYPE, "source_metadata": dict(source_metadata)}
 
 
+def framework_text_notice_block(text: str) -> dict[str, object]:
+    """Build transient model context that carries its own text."""
+    return {"type": FRAMEWORK_NOTICE_BLOCK_TYPE, "text": text}
+
+
 def framework_notices(content: object) -> list[str]:
     """Extract transient framework notices from structured content."""
     if not isinstance(content, list):
@@ -478,7 +483,9 @@ def framework_notices(content: object) -> list[str]:
     for block in content:
         if not isinstance(block, dict) or block.get("type") != FRAMEWORK_NOTICE_BLOCK_TYPE:
             continue
-        text = resize_notice(block.get("source_metadata"))
+        text = block.get("text")
+        if not isinstance(text, str):
+            text = resize_notice(block.get("source_metadata"))
         if text:
             notices.append(text)
     return notices
@@ -507,6 +514,47 @@ def expand_framework_notices(messages: list[dict[str, Any]]) -> list[dict[str, A
         if visible_content or not content:
             result.append({**message, "content": visible_content})
     return result
+
+
+# Codex has no hidden per-turn context, so a text notice rides as a tagged
+# input item. The executor records each exact text it sends, and the forwarder
+# drops only a recorded text when storing the echoed user message, so neither
+# user text nor run output can spoof or escape the wrapper.
+_CODEX_SENT_NOTICES_DIR = "codex_sent_framework_notices"
+
+
+def _codex_sent_notice_path(bridge_dir: Path, text: str) -> Path:
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return bridge_dir / _CODEX_SENT_NOTICES_DIR / digest
+
+
+def codex_framework_notice_text(text: str, bridge_dir: Path) -> str | None:
+    """
+    Wrap a framework notice for a Codex input item and record it as sent.
+
+    :param text: Notice text, e.g. a code-run summary.
+    :param bridge_dir: Session bridge directory shared with the forwarder.
+    :returns: The wrapped text, or ``None`` when it could not be recorded
+        (sending it unrecorded would store it in the user's message).
+    """
+    wrapped = (
+        f'<omnigent-framework-notice id="{uuid.uuid4().hex}">\n{text}\n'
+        "</omnigent-framework-notice>"
+    )
+    path = _codex_sent_notice_path(bridge_dir, wrapped)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # ponytail: records are never pruned; one small file per notice sent.
+        path.touch()
+    except OSError:
+        _logger.warning("Could not record a Codex framework notice; not sending it", exc_info=True)
+        return None
+    return wrapped
+
+
+def is_sent_codex_framework_notice(text: str, bridge_dir: Path) -> bool:
+    """Whether *text* is exactly a notice :func:`codex_framework_notice_text` sent."""
+    return _codex_sent_notice_path(bridge_dir, text).exists()
 
 
 def codex_resize_metadata_path(path: Path, source_metadata: object) -> Path:

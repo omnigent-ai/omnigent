@@ -78,6 +78,8 @@ class ClaudeNativeExecutor(Executor):
         reads :data:`BRIDGE_DIR_ENV_VAR` from the harness spawn env.
     """
 
+    reads_framework_notices = True
+
     def __init__(self, bridge_dir: Path | None = None) -> None:
         self._bridge_dir = bridge_dir or _bridge_dir_from_env()
         self._request_session_id = _request_session_id_from_env()

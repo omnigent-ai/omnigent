@@ -1148,6 +1148,8 @@ def _is_empty_turn(
 class OpenAIAgentsSDKExecutor(Executor):
     """Execute turns using the OpenAI Agents SDK."""
 
+    reads_framework_notices = True
+
     def __init__(
         self,
         *,

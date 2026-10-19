@@ -647,6 +647,10 @@ class Executor:
     Subclass this and implement ``run_turn`` for each backend.
     """
 
+    # True when the executor takes framework notice blocks out of the user's
+    # text itself; others receive text-only messages with notices joined in.
+    reads_framework_notices: bool = False
+
     async def run_turn(
         self,
         messages: list[Message],  # noqa: ARG002 — abstract method signature; subclasses implement

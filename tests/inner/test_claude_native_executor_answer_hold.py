@@ -175,3 +175,41 @@ async def test_stopping_a_held_turn_keeps_the_pane(
     assert pane.kills == 0
     assert pane.deliveries == 1
     assert pane.delivered == []
+
+
+@pytest.mark.asyncio
+async def test_a_held_message_keeps_its_code_run_notice_for_one_delivery(
+    pane: _Pane, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The notice waits with the message and is offered to Claude's hook once, on delivery."""
+    from omnigent.inner.native_attachments import framework_text_notice_block
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    context_path = bridge_dir / claude_native_executor.CLAUDE_FRAMEWORK_CONTEXT_FILE
+    context_at_delivery: list[str | None] = []
+    inject = pane.inject_user_message
+
+    def _inject(bridge: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        context_at_delivery.append(
+            context_path.read_text(encoding="utf-8") if context_path.exists() else None
+        )
+        inject(bridge, content=content, timeout_s=timeout_s)
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", _inject)
+    executor = ClaudeNativeExecutor(bridge_dir)
+    message = {
+        "role": "user",
+        "content": [
+            {"type": "input_text", "text": "hello from the web"},
+            framework_text_notice_block("run summary"),
+        ],
+    }
+
+    events = [event async for event in executor.run_turn([message], [], "")]
+
+    assert events == [TurnComplete(response=None)]
+    assert pane.delivered == ["hello from the web"]
+    # Each attempt offers the notice once; the refused one types nothing, so
+    # Claude's hook only reads it for the delivered message.
+    assert context_at_delivery == ["run summary", "run summary"]
