@@ -57,10 +57,10 @@ from omnigent.cli_native import register_native_commands as _register_native_com
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
 from omnigent.cli_sandbox import sandbox as _sandbox_group
 from omnigent.config import (
-    _merge_effective_config,
     global_config_path,
     load_global_config,
     load_local_config,
+    resolve_effective_config,
 )
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.daemon_lifecycle import (
@@ -829,13 +829,13 @@ def _load_effective_config() -> dict[str, Any]:  # type: ignore[explicit-any]
     always wins so per-repo settings override user defaults.
 
     The ``harness`` mapping is deep-merged (per-harness sub-keys, local
-    winning per-field) via :func:`omnigent.config._merge_effective_config`
+    winning per-field) via :func:`omnigent.config.resolve_effective_config`
     so a project's per-harness overrides augment — rather than replace —
     the user's global ones. Every other key is a shallow replace.
 
     :returns: Merged config dict.
     """
-    return _merge_effective_config(_load_global_config(), _load_local_config())
+    return resolve_effective_config(_load_global_config(), _load_local_config()).config
 
 
 def _peek_default_agent_harness(target: str) -> str | None:
