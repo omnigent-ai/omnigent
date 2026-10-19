@@ -84,7 +84,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
-          RUN_TESTS: ${{ steps.scope.outputs.backend }}
+          RUN_TESTS: ${{ steps.scope.outputs.integration }}
         run: bash .github/scripts/ci/integration-matrix.sh
 
   integration:

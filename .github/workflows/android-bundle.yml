@@ -28,8 +28,12 @@ permissions:
   contents: read
 
 jobs:
+  gate:
+    uses: ./.github/workflows/security-gate.yml
+
   build:
     name: Build unsigned AAB
+    needs: gate
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -52,7 +56,7 @@ jobs:
 
       - name: Build release AAB
         run: |
-          ./gradlew bundleRelease --no-daemon --console=plain \
+          ./gradlew testDebugUnitTest bundleRelease --no-daemon --console=plain \
             "-PversionCode=${{ inputs.version-code }}" \
             "-PversionName=${{ inputs.version-name }}"
 

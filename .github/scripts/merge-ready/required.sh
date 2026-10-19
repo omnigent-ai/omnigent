@@ -10,6 +10,11 @@ REQUIRED=(
   "DCO"
   "Pre-commit checks"
   "Docker build"
+  "Web scope"
+  "Web result"
+  "Docker scope"
+  "Docker result"
+  "Build unsigned AAB"
   "CI scope"
   "CI result"
   "UI scope"
@@ -32,6 +37,8 @@ REQUIRED=(
   "Pytest (stores)"
   "Pytest (misc)"
   "Pytest (databricks)"
+  "E2E Tests (shard 0/2)"
+  "E2E Tests (shard 1/2)"
   "E2E Tests (shard 0/4)"
   "E2E Tests (shard 1/4)"
   "E2E Tests (shard 2/4)"
@@ -57,6 +64,11 @@ REQUIRED=(
 
 ALLOW_SKIP=(
   "Docker build"
+  "Web scope"
+  "Web result"
+  "Docker scope"
+  "Docker result"
+  "Build unsigned AAB"
   "CI scope"
   "CI result"
   "UI scope"
@@ -79,6 +91,8 @@ ALLOW_SKIP=(
   "Pytest (stores)"
   "Pytest (misc)"
   "Pytest (databricks)"
+  "E2E Tests (shard 0/2)"
+  "E2E Tests (shard 1/2)"
   "E2E Tests (shard 0/4)"
   "E2E Tests (shard 1/4)"
   "E2E Tests (shard 2/4)"
@@ -108,6 +122,8 @@ is_allow_skip() { printf '%s\n' "${ALLOW_SKIP[@]}" | grep -qxF "$1"; }
 # selection job is present. An explicit skipped result is never green.
 scope_for_result() {
   case "$1" in
+    "Web result") echo "Web scope" ;;
+    "Docker result") echo "Docker scope" ;;
     "CI result") echo "CI scope" ;;
     "E2E UI result") echo "UI scope" ;;
     *) echo "" ;;
@@ -120,7 +136,9 @@ scope_for_result() {
 # workflow is still queued or re-running.
 workflow_for() {
   case "$1" in
-    "Docker build")          echo "Docker build" ;;
+    "Web scope"|"Web result") echo "web Tests" ;;
+    "Build unsigned AAB") echo "Android Bundle" ;;
+    "Docker scope"|"Docker result"|"Docker build")          echo "Docker build" ;;
     "CI scope"|"CI result"|"Rust tests (omnidev)") echo "CI" ;;
     "UI scope"|"E2E UI result") echo "E2E UI Tests" ;;
     "Pytest ("*)             echo "CI" ;;

@@ -56,9 +56,28 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  gate:
+    uses: ./.github/workflows/security-gate.yml
+
+  scope:
+    name: Windows scope
+    needs: gate
+    runs-on: ubuntu-latest
+    outputs:
+      windows: ${{ steps.scope.outputs.windows }}
+      dependency: ${{ steps.scope.outputs.dependency }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - id: scope
+        uses: ./.github/actions/dependency-ci-scope
+
   windows-smoke:
     name: Windows smoke + unit
-    if: ${{ !github.event.pull_request.draft }}
+    needs: scope
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.windows == 'true' }}
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -102,6 +121,7 @@ jobs:
           -p no:cacheprovider -q
 
       - name: Broader unit sweep (non-blocking)
+        if: needs.scope.outputs.dependency != 'true'
         continue-on-error: true
         run: >-
           uv run pytest tests/inner tests/runtime/harnesses

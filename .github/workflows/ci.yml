@@ -58,7 +58,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
+      dependency: ${{ steps.scope.outputs.dependency }}
       backend: ${{ steps.scope.outputs.backend }}
+      database: ${{ steps.scope.outputs.database }}
+      python_matrix: ${{ steps.scope.outputs.python_matrix }}
       omnidev: ${{ steps.scope.outputs.omnidev }}
       sidecar: ${{ steps.scope.outputs.sidecar }}
     steps:
@@ -80,112 +83,7 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - group: runtime-harnesses
-            paths: tests/runtime/harnesses
-            dist: worksteal
-          - group: runtime-policies
-            paths: tests/runtime/policies
-          - group: runtime-core
-            paths: >-
-              tests/runtime
-              --ignore=tests/runtime/harnesses
-              --ignore=tests/runtime/policies
-            dist: worksteal
-          - group: inner-rest
-            paths: tests/inner
-          - group: tools
-            paths: tests/tools tests/test_errors.py
-          - group: repl-sdk
-            paths: tests/frontends tests/repl tests/terminals
-          # Isolates the park-on-future elicitation/permission/policy files so a
-          # wedge there stalls one small job, not the whole server shard.
-          - group: server-approvals
-            paths: >-
-              tests/server/integration/test_sessions_permission_request_hook.py
-              tests/server/integration/test_sessions_elicitation_resolve_url.py
-              tests/server/integration/test_sessions_policy_evaluate.py
-            workers: "4"
-          # worksteal: the biggest file would otherwise pin one worker past the
-          # shard's balanced wall time. server/conftest fixtures are function-scoped.
-          - group: server-integration
-            paths: >-
-              tests/server/integration
-              --ignore=tests/server/integration/test_sessions_permission_request_hook.py
-              --ignore=tests/server/integration/test_sessions_elicitation_resolve_url.py
-              --ignore=tests/server/integration/test_sessions_policy_evaluate.py
-            workers: "4"
-            dist: worksteal
-          # Historical name; stays in merge-ready's REQUIRED list.
-          - group: server-rest
-            paths: tests/server --ignore=tests/server/integration tests/onboarding
-            workers: "4"
-          - group: spec-llms
-            paths: tests/spec tests/llms
-          # Integration journey tests with mock LLM (no API key).
-          # workers=0 (serial): session-scoped live_server + mock_llm_server
-          # fixtures spawn subprocesses that must share one mock server;
-          # xdist workers would each create their own session fixtures.
-          - group: integration-mock
-            paths: tests/integration
-            workers: "0"
-          # Carved out of misc: runner + stores were ~68% of misc's cpu and
-          # under loadfile a single 500s+ file (test_app_sessions_native) pinned
-          # one worker and set the whole misc wall time. worksteal fans each
-          # dir's tests across workers (biggest single test is ~40s / ~5s, so
-          # the floor drops from ~500s to ~100s). Both dirs' conftests are
-          # function-scoped, so splitting a file across workers is safe.
-          - group: runner-app
-            paths: tests/runner
-            dist: worksteal
-          - group: stores
-            paths: tests/stores
-            dist: worksteal
-          # Catch-all so new top-level tests/<dir>/ are covered automatically.
-          # worksteal keeps the biggest remaining file (the benchmark smoke
-          # test, ~58s) from re-pinning one worker as this catch-all grows.
-          - group: misc
-            paths: >-
-              tests
-              --ignore=tests/e2e
-              --ignore=tests/integration
-              --ignore=tests/runtime
-              --ignore=tests/inner
-              --ignore=tests/tools
-              --ignore=tests/test_errors.py
-              --ignore=tests/frontends
-              --ignore=tests/repl
-              --ignore=tests/terminals
-              --ignore=tests/server
-              --ignore=tests/onboarding
-              --ignore=tests/spec
-              --ignore=tests/llms
-              --ignore=tests/codex_parity
-              --ignore=tests/runner
-              --ignore=tests/stores
-            dist: worksteal
-          # Databricks-coupled tests (Lakebase token engine, psycopg, the
-          # router's ambient workspace-credential chain). This is the only lane
-          # that installs the `databricks` extra; the @pytest.mark.databricks
-          # marker keeps these tests off the lean lanes (which run
-          # -m "not databricks") and selects them here. Paths carrying marked
-          # tests must be listed here or those tests run nowhere.
-          - group: databricks
-            paths: tests/db tests/deploy tests/server/test_smart_routing.py
-            extra: databricks
-            markexpr: databricks
-          # Slack integration (integrations/slack). Its tests live outside the
-          # top-level tests/ tree and import the decoupled `omnigent_slack`
-          # package, so this lane installs the `slack` extra to pull it in. The
-          # tests are run from the repo root on purpose: they rely on the root
-          # pyproject's `asyncio_mode = auto` (rootdir resolution), and
-          # coverage of the omnigent package is a no-op here (the code under
-          # test is omnigent_slack, not omnigent) — harmless, kept for a
-          # uniform pytest step.
-          - group: slack
-            paths: integrations/slack/tests
-            extra: slack
+      matrix: ${{ fromJSON(needs.scope.outputs.python_matrix) }}
 
     steps:
       - name: Check out repo
@@ -235,6 +133,7 @@ jobs:
         shell: bash
         env:
           PYTHONFAULTHANDLER: "1"
+          DEPENDENCY: ${{ needs.scope.outputs.dependency }}
           PYTEST_PROGRESS_LOG_DIR: artifacts/progress
           OMNIGENT_TOKEN_USAGE_JSON: artifacts/tokens-${{ matrix.group }}.json
           # Outside the repo: coverage.py's transient `.coverage.*` files
@@ -261,7 +160,7 @@ jobs:
               --junitxml=artifacts/pytest-${{ matrix.group }}.xml \
               --cov=omnigent --cov-report= \
               -v --tb=long --showlocals --log-level=INFO -r a \
-              || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
+              || { rc=$?; [ "$rc" -eq 5 ] && [ "$DEPENDENCY" != "true" ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
 
       - name: Stage coverage data for upload
         if: always()
@@ -288,7 +187,7 @@ jobs:
   stores-postgres:
     name: Pytest (stores-postgres)
     needs: scope
-    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.backend == 'true' }}
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.database == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -336,7 +235,7 @@ jobs:
   stores-cockroachdb:
     name: Pytest (stores-crdb-${{ matrix.crdb_version }})
     needs: scope
-    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.backend == 'true' }}
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.database == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -385,7 +284,7 @@ jobs:
   stores-mysql:
     name: Pytest (stores-mysql)
     needs: scope
-    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.backend == 'true' }}
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.database == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -574,8 +473,8 @@ jobs:
     # Only runs when every pytest shard passed: a failed shard drops its covered
     # lines from the combine, so coverage off partial data would be misleading —
     # and a red run gets re-run anyway, re-triggering this.
-    needs: pytest
-    if: ${{ success() && !github.event.pull_request.draft }}
+    needs: [pytest, scope]
+    if: ${{ success() && !github.event.pull_request.draft && needs.scope.outputs.dependency != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

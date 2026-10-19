@@ -9,29 +9,38 @@ import sys
 
 
 def validate_results(suite: str, needs: dict, *, draft: bool) -> None:
-    selection_job = "scope" if suite == "ci" else "setup"
+    selection_job = "setup" if suite == "ui" else "scope"
     selection = needs[selection_job]
     if selection["result"] != "success":
         raise ValueError("Test selection did not succeed")
     outputs = selection["outputs"]
     if suite == "ci":
-        if any(outputs[key] not in {"true", "false"} for key in ("backend", "omnidev", "sidecar")):
+        if any(
+            outputs[key] not in {"true", "false"}
+            for key in ("backend", "database", "omnidev", "sidecar")
+        ):
             raise ValueError("Invalid CI selection outputs")
         selected = dict.fromkeys(
-            ("pytest", "stores-postgres", "stores-cockroachdb", "stores-mysql"),
-            outputs["backend"] == "true",
+            ("stores-postgres", "stores-cockroachdb", "stores-mysql"),
+            outputs["database"] == "true",
         )
+        selected["pytest"] = outputs["backend"] == "true"
         selected.update(
             {"omnidev": outputs["omnidev"] == "true", "codex-parity": outputs["sidecar"] == "true"}
         )
     elif suite == "ui":
-        if outputs["ui"] not in {"full", "sidecar", "none"}:
+        if outputs["ui"] not in {"full", "dependency", "sidecar", "none"}:
             raise ValueError("Invalid UI selection output")
         selected = {
             "build-sidecar": outputs["ui"] != "none",
             "e2e-ui": outputs["ui"] != "none",
-            "browser-contract": outputs["ui"] == "full",
+            "browser-contract": outputs["ui"] in {"full", "dependency"},
         }
+    elif suite in {"web", "docker"}:
+        jobs = {"web-test": "web", "ios": "ios"} if suite == "web" else {"build": "docker"}
+        if any(outputs[key] not in {"true", "false"} for key in jobs.values()):
+            raise ValueError("Invalid consumer selection outputs")
+        selected = {job: outputs[key] == "true" for job, key in jobs.items()}
     else:
         raise ValueError(f"Unknown test suite: {suite}")
     failures = []

@@ -75,3 +75,37 @@ def test_missing_sidecar_prerequisite_fails_selected_run(sidecar_suite):
     result = sidecar_suite.runpytest_subprocess("--ui-codex-sidecar-only")
     assert result.ret == pytest.ExitCode.TESTS_FAILED
     result.stdout.fnmatch_lines(["*Selected sidecar test skipped:*Codex CLI unavailable*"])
+
+
+def test_dependency_ui_reuses_compatibility_journeys_and_sidecar_consumers(sidecar_suite):
+    sidecar_suite.makepyfile(
+        test_compat="""
+        import pytest
+
+        @pytest.mark.compat_smoke
+        def test_protocol_journey():
+            pass
+
+        def test_broad_regression():
+            pass
+    """
+    )
+    result = sidecar_suite.runpytest_subprocess("--ui-dependency-smoke")
+    result.assert_outcomes(passed=3, deselected=2)
+
+
+@pytest.mark.parametrize("fault", ["skip", "empty"])
+def test_required_dependency_suite_cannot_pass_without_execution(sidecar_suite, fault):
+    sidecar_suite.makepyfile("""
+        import pytest
+
+        def test_required():
+            pytest.skip("Prerequisite unavailable")
+    """)
+    args = ["-p", "tests._helpers.required_tests"]
+    if fault == "empty":
+        args += ["-k", "no_matching_test"]
+    result = sidecar_suite.runpytest_subprocess(*args)
+    assert result.ret == (
+        pytest.ExitCode.TESTS_FAILED if fault == "skip" else pytest.ExitCode.NO_TESTS_COLLECTED
+    )

@@ -79,7 +79,7 @@ jobs:
         # Compose capability extras with lint tooling instead of duplicating
         # runtime dependencies in the repository-only lint group.
         run: |
-          uv sync --locked --group lint \
+          uv sync --locked --group lint --group test \
             --extra hindsight \
             --extra nimble \
             --extra s3 \
@@ -135,6 +135,9 @@ jobs:
           echo "${KTLINT_SHA256}  /tmp/ktlint" | sha256sum -c
           chmod +x /tmp/ktlint
           sudo mv /tmp/ktlint /usr/local/bin/ktlint
+
+      - name: Check locked dependency regression guards
+        run: uv run --no-sync pytest tests/e2e/test_lockfile_vulnerable_pins.py -q --reruns 0 -p tests._helpers.required_tests
 
       - name: Run formatting, lint, and type checks
         run: uv run pre-commit run --all-files --show-diff-on-failure

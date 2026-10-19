@@ -26,9 +26,12 @@ on:
     # bakes the SPA, so a web-only PR can still break the build).
     paths:
       - 'deploy/docker/Dockerfile'
+      - 'deploy/docker/Dockerfile.ubi'
+      - 'deploy/docker/Dockerfile.prebuilt'
       - 'deploy/docker/Dockerfile.dockerignore'
       - 'deploy/docker/entrypoint.py'
       - 'deploy/cloudflare/**'
+      - 'deploy/hf-spaces/Dockerfile'
       - 'omnigent/**'
       - 'web/**'
       - 'sdks/**'
@@ -53,35 +56,63 @@ jobs:
   gate:
     uses: ./.github/workflows/security-gate.yml
 
+  scope:
+    name: Docker scope
+    needs: gate
+    runs-on: ubuntu-latest
+    outputs:
+      docker: ${{ steps.scope.outputs.docker }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - id: scope
+        uses: ./.github/actions/dependency-ci-scope
+
   build:
     name: Docker build
-    needs: gate
+    needs: scope
     # Draft PRs skip the build (ready_for_review re-fires the workflow), matching
     # the pytest job in ci.yml.
-    if: ${{ !github.event.pull_request.draft }}
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.docker == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           fetch-depth: 0
 
-      - name: Detect Cloudflare container changes
+      - name: Detect container consumers
         id: cloudflare
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           changed=false
+          hf=false
+          ubi=false
+          prebuilt=false
           while IFS= read -r file; do
             case "$file" in
-              deploy/cloudflare/*|pnpm-lock.yaml|pnpm-workspace.yaml|.github/workflows/docker-build.yml)
+              .github/workflows/docker-build.yml)
                 changed=true
-                break
+                hf=true
+                ubi=true
+                prebuilt=true
                 ;;
+              deploy/cloudflare/*|pnpm-lock.yaml|pnpm-workspace.yaml)
+                changed=true
+                ;;
+              deploy/hf-spaces/Dockerfile) hf=true ;;
+              deploy/docker/Dockerfile.ubi) ubi=true ;;
+              deploy/docker/Dockerfile.prebuilt) prebuilt=true ;;
             esac
           done < <(git diff --name-only "$BASE_SHA" HEAD)
           echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "hf=$hf" >> "$GITHUB_OUTPUT"
+          echo "ubi=$ubi" >> "$GITHUB_OUTPUT"
+          echo "prebuilt=$prebuilt" >> "$GITHUB_OUTPUT"
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
@@ -117,3 +148,59 @@ jobs:
       - name: Cloudflare Worker and container dry-run
         if: steps.cloudflare.outputs.changed == 'true'
         run: pnpm --dir deploy/cloudflare exec wrangler deploy --dry-run
+
+      - name: Build and smoke-test the Cloudflare image
+        if: steps.cloudflare.outputs.changed == 'true'
+        run: |
+          docker build -t omnigent-cloudflare:dependency -f deploy/cloudflare/Dockerfile deploy/cloudflare
+          docker run --rm omnigent-cloudflare:dependency omnigent --help
+
+      - name: Build and smoke-test the Hugging Face image
+        if: steps.cloudflare.outputs.hf == 'true'
+        run: |
+          docker build -t omnigent-hf:dependency -f deploy/hf-spaces/Dockerfile deploy/hf-spaces
+          docker run --rm omnigent-hf:dependency omnigent --help
+
+      - name: Build and smoke-test the prebuilt image wrapper
+        if: steps.cloudflare.outputs.prebuilt == 'true'
+        run: |
+          docker build -t omnigent-prebuilt:dependency -f deploy/docker/Dockerfile.prebuilt .
+          docker run --rm omnigent-prebuilt:dependency omnigent --help
+
+      - name: Build UBI server image
+        if: steps.cloudflare.outputs.ubi == 'true'
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.ubi
+          push: false
+          load: true
+          tags: omnigent-ubi:dependency
+          cache-from: type=gha,scope=ubi
+          cache-to: type=gha,scope=ubi,mode=max
+          provenance: false
+
+      - name: UBI CLI smoke
+        if: steps.cloudflare.outputs.ubi == 'true'
+        run: docker run --rm omnigent-ubi:dependency omnigent --help
+
+  result:
+    name: Docker result
+    if: always()
+    needs: [scope, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require successful test selection
+        env:
+          SELECTION_RESULT: ${{ needs.scope.result }}
+        run: test "$SELECTION_RESULT" = success
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          sparse-checkout: .github/scripts/ci
+          persist-credentials: false
+      - name: Require selected consumer results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+        run: python3 .github/scripts/ci/require_results.py docker

@@ -321,6 +321,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     :param parser: The pytest option parser.
     """
     parser.addoption(
+        "--ui-dependency-smoke",
+        action="store_true",
+        default=False,
+        help="Run compatibility smoke journeys and all Codex sidecar consumers.",
+    )
+    parser.addoption(
         "--ui-codex-sidecar-only",
         action="store_true",
         help="Run consumers of the Codex Responses sidecar before splitting into shards.",
@@ -437,8 +443,14 @@ def pytest_collection_modifyitems(
     consumers. ``trylast`` lets repo-wide known-failure marking tag items first;
     markers travel with the items the slice keeps.
     """
-    if config.getoption("--ui-codex-sidecar-only"):
-        selected = [item for item in items if "mocked_native_codex_session" in item.fixturenames]
+    dependency = config.getoption("--ui-dependency-smoke")
+    if config.getoption("--ui-codex-sidecar-only") or dependency:
+        selected = [
+            item
+            for item in items
+            if "mocked_native_codex_session" in item.fixturenames
+            or (dependency and item.get_closest_marker("compat_smoke") is not None)
+        ]
         if not selected:
             raise pytest.UsageError("No Codex sidecar consumers collected")
         config.hook.pytest_deselected(items=[item for item in items if item not in selected])
@@ -2357,7 +2369,10 @@ def pytest_runtest_makereport(
     The ``context`` behind ``page`` otherwise outlives the session fixtures' teardown."""
     outcome = yield
     report = outcome.get_result()
-    if item.config.getoption("--ui-codex-sidecar-only") and report.skipped:
+    if (
+        item.config.getoption("--ui-codex-sidecar-only")
+        or item.config.getoption("--ui-dependency-smoke")
+    ) and report.skipped:
         report.outcome = "failed"
         report.longrepr = f"Selected sidecar test skipped: {report.longrepr}"
     if call.when == "call" and _recording_requested(item):
