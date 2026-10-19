@@ -28,7 +28,7 @@ from typing import Any
 import pytest
 
 from omnigent.runtime.prompt import SUBAGENT_WAKE_NOTICE_SHAPE
-from omnigent.spec import AgentSpec
+from omnigent.spec import AgentSpec, BuiltinToolConfig, ExecutorSpec, ToolsConfig
 from omnigent.tools.builtins.async_inbox import (
     SysCallAsyncTool,
     SysCancelAsyncTool,
@@ -308,6 +308,37 @@ def test_async_enabled_false_does_not_register() -> None:
     names = manager.get_tool_names()
     assert SysCallAsyncTool.name() not in names
     assert SysReadInboxTool.name() not in names
+    assert SysCancelAsyncTool.name() not in names
+
+
+@pytest.mark.parametrize(
+    "spec_kwargs",
+    [
+        {"tools": ToolsConfig(agents=["researcher"])},
+        {
+            "tools": ToolsConfig(builtins=[BuiltinToolConfig(name="web_fetch")]),
+            # web_fetch builds its researcher from the parent's harness.
+            "executor": ExecutorSpec(config={"harness": "pi"}),
+        },
+        {"spawn": True},
+    ],
+    ids=["declared-agents", "web-fetch", "spawn"],
+)
+def test_async_enabled_false_with_dispatch_still_registers_inbox(
+    spec_kwargs: dict[str, Any],
+) -> None:
+    """
+    ``async: false`` keeps ``sys_read_inbox`` for a dispatching spec.
+
+    A spec that can dispatch sub-agents receives their results through
+    its inbox, so suppressing the one drain would strand them. The rest
+    of the async namespace stays under the kill-switch.
+    """
+    spec = AgentSpec(spec_version=1, async_enabled=False, **spec_kwargs)
+    manager = ToolManager(spec=spec)
+    names = manager.get_tool_names()
+    assert SysReadInboxTool.name() in names
+    assert SysCallAsyncTool.name() not in names
     assert SysCancelAsyncTool.name() not in names
 
 
