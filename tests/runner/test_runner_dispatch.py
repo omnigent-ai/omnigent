@@ -8616,6 +8616,190 @@ async def test_sys_session_get_info_maps_error_statuses(
     assert info["session_id"] == "conv_missing"
 
 
+_ROUTE_SESSION_HEX = "0123456789abcdef0123456789abcdef"
+_ROUTE_CALLER_ID = "conv_route_caller"
+_ROUTE_ESCAPING_TARGETS = [
+    pytest.param("../hosts", id="dot-segment-escape"),
+    pytest.param(f"{_ROUTE_SESSION_HEX}/items", id="extra-path-segment"),
+    pytest.param(f"{_ROUTE_SESSION_HEX}%2Fitems", id="encoded-slash"),
+    pytest.param(f"{_ROUTE_SESSION_HEX}?include_items=true", id="query-injection"),
+]
+
+
+def _session_tool_request(
+    tool_name: str, target: str, workspace: Path
+) -> tuple[str, dict[str, Any]]:
+    """Arguments and extra ``execute_tool`` kwargs that address *target* via *tool_name*."""
+    if tool_name == "sys_session_share":
+        return (
+            json.dumps({"session_id": target, "user_id": "alice@example.com"}),
+            {
+                "agent_spec": AgentSpec(
+                    spec_version=1, agent_session_sharing=SharePolicy.NON_PUBLIC
+                )
+            },
+        )
+    if tool_name in ("sys_session_get_history", "sys_session_close"):
+        return json.dumps({"conversation_id": target}), {}
+    if tool_name == "sys_agent_download":
+        return json.dumps({"session_id": target}), {"runner_workspace": workspace}
+    if tool_name == "sys_session_send":
+        return (
+            json.dumps({"session_id": target, "args": "hello"}),
+            {"session_inbox": asyncio.Queue()},
+        )
+    if tool_name == "sys_cancel_task":
+        return (
+            json.dumps({"task_id": target}),
+            {"session_inbox": asyncio.Queue(), "session_async_tasks": {}},
+        )
+    return json.dumps({"session_id": target}), {}
+
+
+def _tool_error(output: str) -> str | None:
+    """The error a tool reported, as ``Error: ...`` text or a JSON ``error`` field."""
+    if output.startswith("Error:"):
+        return output
+    try:
+        parsed = json.loads(output)
+    except json.JSONDecodeError:
+        return output
+    return parsed.get("error") if isinstance(parsed, dict) else None
+
+
+def _expected_rejection(tool_name: str, target: str) -> str:
+    """The error each tool reports for an identifier that is not one route segment."""
+    rule = "a single session identifier (letters, digits, '-' or '_')"
+    if tool_name == "sys_session_send":
+        return f"Error: sys_session_send 'session_id' must be {rule}; got {target!r}"
+    if tool_name == "sys_cancel_task":
+        return f"Error: no in-flight task with task_id {target}"
+    arg = (
+        "conversation_id"
+        if tool_name in ("sys_session_get_history", "sys_session_close")
+        else "session_id"
+    )
+    return f"{tool_name} requires '{arg}' to be {rule}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "sys_session_get_info",
+        "sys_session_share",
+        "sys_session_get_history",
+        "sys_session_close",
+        "sys_agent_get",
+        "sys_agent_download",
+        "sys_session_send",
+        "sys_cancel_task",
+    ],
+)
+@pytest.mark.parametrize("target", _ROUTE_ESCAPING_TARGETS)
+async def test_session_tools_reject_route_escaping_identifiers_before_any_request(
+    tool_name: str,
+    target: str,
+    tmp_path: Path,
+) -> None:
+    """
+    A model-supplied id that is not one route segment must be refused before
+    any URL is built: ``../hosts`` would otherwise become ``GET /v1/hosts``.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requests: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(f"{request.method} {request.url.raw_path.decode()}")
+        return httpx.Response(200, json={"hosts": []})
+
+    arguments, extra = _session_tool_request(tool_name, target, tmp_path)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_server_handler),
+            base_url="http://server",
+        ) as server_client:
+            output = await execute_tool(
+                tool_name=tool_name,
+                arguments=arguments,
+                server_client=server_client,
+                conversation_id=_ROUTE_CALLER_ID,
+                **extra,
+            )
+    finally:
+        subagent_work._session_inboxes_ref.pop(_ROUTE_CALLER_ID, None)
+
+    assert requests == [], f"{tool_name} forwarded identifier {target!r} to the server: {requests}"
+    assert _tool_error(output) == _expected_rejection(tool_name, target), output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", _ROUTE_ESCAPING_TARGETS)
+async def test_rest_cancel_async_fallback_rejects_route_escaping_handle(target: str) -> None:
+    """The REST ``sys_cancel_async`` fallback checks ``handle_id`` like the dispatched tools."""
+    from omnigent.runner.tool_dispatch import _execute_rest_tool
+
+    requests: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(f"{request.method} {request.url.raw_path.decode()}")
+        return httpx.Response(202)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await _execute_rest_tool("sys_cancel_async", {"handle_id": target}, server_client)
+
+    assert requests == [], requests
+    assert output == f"Error: no in-flight task with handle_id {target}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "target",
+    [
+        pytest.param(_ROUTE_SESSION_HEX, id="bare-hex"),
+        pytest.param("01234567-89ab-cdef-0123-456789abcdef", id="dashed"),
+        pytest.param(f"conv_{_ROUTE_SESSION_HEX}", id="legacy-conv-prefix"),
+        pytest.param("opaque-ID_123", id="opaque-token"),
+    ],
+)
+async def test_sys_session_get_info_accepts_supported_identifier_spellings(target: str) -> None:
+    """Supported spellings and other opaque route-safe tokens reach ``GET /v1/sessions/{id}``."""
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    requested_paths: list[str] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        return httpx.Response(
+            200,
+            json={
+                "id": _ROUTE_SESSION_HEX,
+                "status": "idle",
+                "updated_at": 7,
+                "runner_id": None,
+                "pending_elicitations": [],
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": target}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+        )
+
+    assert requested_paths == [f"/v1/sessions/{target}"]
+    assert json.loads(output)["session_id"] == _ROUTE_SESSION_HEX
+
+
 @pytest.mark.asyncio
 async def test_sys_session_share_defaults_to_caller_and_puts_grant() -> None:
     """
