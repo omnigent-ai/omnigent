@@ -102,12 +102,14 @@ def test_markdown_editor_review_journey(page: Page, seeded_session: BrowserSessi
         expect(editor).to_be_visible()
         expect(editor.locator("pre").last).to_contain_text("journey edit")
 
-    editor.get_by_role("heading", name="Markdown editor journey", exact=True).click()
-    page.keyboard.press("Control+Home")
-    page.keyboard.press("ArrowDown")
-    page.keyboard.press("Home")
-    page.keyboard.press("Control+Shift+ArrowRight")
+    # Select the review anchor directly, without racing focus reconciliation
+    # against a burst of cursor-navigation keys.
+    editor.get_by_text(
+        "Review this document before sharing the implementation plan.", exact=True
+    ).dblclick(position={"x": 10, "y": 10})
+    page.wait_for_function("window.getSelection()?.toString() === 'Review'")
     page.get_by_role("button", name="Add comment", exact=True).click()
+    expect(viewer.get_by_text("Selection: Review", exact=True)).to_be_visible()
     draft = viewer.get_by_placeholder("Add a comment", exact=False)
     draft.fill("Please review this example before sharing.")
     expect(draft).to_have_value("Please review this example before sharing.")

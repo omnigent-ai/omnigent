@@ -46,7 +46,8 @@ starts at `direct-link` and performs these actions in order:
 4. Find the edited text and verify exactly one match.
 5. Switch through Source, Preview, and Edit, retaining the changed text.
 6. Resize from desktop to phone and back, retaining the saved content.
-7. Select text and start an unsubmitted comment; end with its text focused.
+7. Double-click "Review" in the first paragraph, verify the comment anchors to
+   that word, and start an unsubmitted comment; end with its text focused.
 
 The fixture is
 [markdown_editor_journey.md](../tests/browser_ui/files/markdown_editor_journey.md).
