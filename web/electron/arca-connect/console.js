@@ -11,6 +11,15 @@ const terminalEl = document.getElementById("terminal");
 const statusEl = document.getElementById("status");
 const confirmBtn = document.getElementById("confirm");
 const cancelBtn = document.getElementById("cancel");
+const footerEl = document.querySelector("footer");
+
+/** Height the page needs, even while a too-short window clips it. */
+function contentHeight() {
+  // A clipped full-height body leaves its bottom padding out of scrollHeight.
+  const paddingBottom = parseFloat(getComputedStyle(document.body).paddingBottom) || 0;
+  const footerBottom = footerEl.getBoundingClientRect().bottom + window.scrollY;
+  return Math.max(document.documentElement.scrollHeight, Math.ceil(footerBottom + paddingBottom));
+}
 
 let resizeFrame = null;
 function resizeToContent() {
@@ -18,7 +27,7 @@ function resizeToContent() {
   resizeFrame = requestAnimationFrame(() => {
     resizeFrame = null;
     window.arcaConnect.resizeToContent({
-      height: document.documentElement.scrollHeight,
+      height: contentHeight(),
       phase: document.body.dataset.phase,
     });
   });
