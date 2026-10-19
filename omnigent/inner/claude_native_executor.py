@@ -13,23 +13,23 @@ from pathlib import Path
 
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
-    CLAUDE_FRAMEWORK_CONTEXT_FILE,
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
     ClaudeMessageNotAccepted,
     ClaudePromptTimeout,
+    ClaudeSessionInactive,
     ClaudeSignInPending,
     ClaudeTerminalDialog,
     ClaudeTerminalExited,
     ClaudeUserPromptPending,
     TmuxSessionNotAdvertised,
+    active_session_accepts_input,
     cancellable_injection,
     has_pending_user_prompt,
     inject_slash_command,
     inject_user_message,
     is_auth_slash_command,
     kill_session,
-    read_active_session_id,
     read_claude_status_model,
     read_launch_model,
     read_model_env,
@@ -132,6 +132,8 @@ class ClaudeNativeExecutor(Executor):
             return False
         try:
             async with self._inject_lock:
+                if not _session_is_active(self._bridge_dir, self._request_session_id):
+                    return False
                 await self._inject_prompt(text, framework_notices(content))
         except RuntimeError:
             return False
@@ -146,8 +148,7 @@ class ClaudeNativeExecutor(Executor):
     ) -> None:
         """Apply a routed ``/model`` switch, then inject the message, in one lock hold."""
         async with self._inject_lock:
-            context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
-            context_path.unlink(missing_ok=True)
+            self._require_active_session()
             if wanted_model_arg is not None:
                 # Accepted trade-off: ``/model <id>`` also saves the
                 # pick as the person's global default for new Claude
@@ -166,6 +167,7 @@ class ClaudeNativeExecutor(Executor):
                 # Track the routed id, not the alias: the next turn's
                 # comparison is against what routing asked for.
                 self._applied_model = wanted_model
+            self._require_active_session()
             await self._inject_prompt(text, notices)
 
     async def _wait_for_answer(self, deadline: float) -> bool:
@@ -197,15 +199,15 @@ class ClaudeNativeExecutor(Executor):
 
     async def _inject_prompt(self, text: str, notices: list[str]) -> None:
         """Inject user text with one-shot context while holding the injection lock."""
-        context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
-        context_path.unlink(missing_ok=True)
-        if notices:
-            context_path.write_text("\n\n".join(notices), encoding="utf-8")
-        try:
-            await self._inject(partial(inject_user_message, self._bridge_dir, content=text))
-        except BaseException:
-            context_path.unlink(missing_ok=True)
-            raise
+        await self._inject(
+            partial(
+                inject_user_message,
+                self._bridge_dir,
+                content=text,
+                expected_session_id=self._request_session_id,
+                framework_notices=notices,
+            )
+        )
 
     async def run_turn(
         self,
@@ -241,13 +243,10 @@ class ClaudeNativeExecutor(Executor):
             :meth:`_wait_for_answer`), then the message is delivered.
         """
         del tools, system_prompt
-        if not _session_is_active(self._bridge_dir, self._request_session_id):
-            yield ExecutorError(
-                message=(
-                    "Claude native session is no longer active after /clear; "
-                    "open the latest conversation and retry."
-                )
-            )
+        try:
+            self._require_active_session()
+        except ClaudeSessionInactive as exc:
+            yield ExecutorError(message=str(exc), undelivered=True)
             return
         text = _latest_user_text(messages, self._bridge_dir)
         notices = _latest_framework_notices(messages)
@@ -309,6 +308,9 @@ class ClaudeNativeExecutor(Executor):
                         if not await self._wait_for_answer(answer_deadline):
                             raise
                         wanted_model_arg = self._model_command_arg(wanted_model)
+        except ClaudeSessionInactive as exc:
+            yield ExecutorError(message=str(exc), undelivered=True)
+            return
         except ClaudeTerminalExited as exc:
             # Claude Code exits 0 on /quit or a closed window. The turn still
             # fails, but the person's own teardown is not a defect; a pane that
@@ -391,6 +393,11 @@ class ClaudeNativeExecutor(Executor):
             yield ExecutorError(message=describe_exception(exc))
             return
         yield TurnComplete(response=None)
+
+    def _require_active_session(self) -> None:
+        """Reject input before handoff when a native reset changed the pane's owner."""
+        if not _session_is_active(self._bridge_dir, self._request_session_id):
+            raise ClaudeSessionInactive()
 
     async def _inject(self, operation: Callable[[], None]) -> None:
         """Drain cancelled delivery workers before releasing the pane's injection lock."""
@@ -565,12 +572,10 @@ def _session_is_active(bridge_dir: Path, request_session_id: str | None) -> bool
     :param request_session_id: Omnigent session id from
         :data:`REQUEST_SESSION_ID_ENV_VAR`, e.g. ``"conv_abc123"``.
         ``None`` preserves old harness spawns that lack the guard env.
-    :returns: ``True`` when injection is allowed.
+    :returns: ``True`` when injection is allowed; ``False`` once another
+        conversation owns the pane or while a ``/clear`` rotation is in flight.
     """
-    if request_session_id is None:
-        return True
-    active_session_id = read_active_session_id(bridge_dir)
-    return active_session_id is None or active_session_id == request_session_id
+    return active_session_accepts_input(bridge_dir, request_session_id)
 
 
 def _latest_user_text(messages: list[Message], bridge_dir: Path) -> str:

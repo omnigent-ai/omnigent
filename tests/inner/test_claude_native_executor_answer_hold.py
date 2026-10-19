@@ -38,9 +38,15 @@ class _Pane:
         self.kills = 0
 
     def inject_user_message(
-        self, bridge_dir: Path, *, content: str, timeout_s: float = 30.0
+        self,
+        bridge_dir: Path,
+        *,
+        content: str,
+        timeout_s: float = 30.0,
+        expected_session_id: str | None = None,
+        framework_notices: list[str] | None = None,
     ) -> None:
-        del bridge_dir, timeout_s
+        del bridge_dir, timeout_s, expected_session_id, framework_notices
         self.deliveries += 1
         if self.refusals:
             refusal = ClaudeUserPromptPending(_REFUSAL)
