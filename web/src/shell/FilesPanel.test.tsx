@@ -8,6 +8,7 @@ import {
   type WorkspaceFile,
   PathUnreachableError,
   useWorkspaceAllFiles,
+  useWorkspaceAsleep,
   useWorkspaceChangedFiles,
   useWorkspaceDirectories,
   useWorkspaceDirectory,
@@ -32,6 +33,7 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
   // panel makes, so stubbing it would test a fiction.
   ...(await importOriginal<typeof WorkspaceChangedFilesModule>()),
   useWorkspaceAllFiles: vi.fn(),
+  useWorkspaceAsleep: vi.fn(),
   useWorkspaceChangedFiles: vi.fn(),
   useWorkspaceDirectory: vi.fn(),
   // The tree fetches expanded lazy dirs centrally via the plural hook; default
@@ -71,6 +73,7 @@ vi.mock("@/hooks/useSession", () => ({
 }));
 
 const useAllFilesMock = vi.mocked(useWorkspaceAllFiles);
+const useAsleepMock = vi.mocked(useWorkspaceAsleep);
 const useChangedFilesMock = vi.mocked(useWorkspaceChangedFiles);
 const useDirectoryMock = vi.mocked(useWorkspaceDirectory);
 const useDirectoriesMock = vi.mocked(useWorkspaceDirectories);
@@ -137,6 +140,10 @@ function changedFilesResult(files: WorkspaceChangedFile[] = []) {
   } as unknown as ReturnType<typeof useWorkspaceChangedFiles>;
 }
 
+function unloadedResult() {
+  return { data: undefined, error: null, isError: false, isLoading: false } as unknown;
+}
+
 function directoryResult(files: WorkspaceFile[] = []) {
   return {
     data: files,
@@ -192,6 +199,7 @@ function renderPanel({
   isSearchTruncated = false,
   reachable = null,
   onFileSelect = vi.fn(),
+  listsLoaded = true,
 }: {
   conversationId: string;
   flatView?: boolean;
@@ -209,9 +217,19 @@ function renderPanel({
     roots: { path: string; access: string; origin: string }[];
   } | null;
   onFileSelect?: (path: string) => void;
+  /** False: both list queries are disabled and hold no data (nothing could serve them). */
+  listsLoaded?: boolean;
 }) {
-  useAllFilesMock.mockReturnValue(allFilesResult(files));
-  useChangedFilesMock.mockReturnValue(changedFilesResult(changedFiles));
+  useAllFilesMock.mockReturnValue(
+    listsLoaded
+      ? allFilesResult(files)
+      : (unloadedResult() as ReturnType<typeof useWorkspaceAllFiles>),
+  );
+  useChangedFilesMock.mockReturnValue(
+    listsLoaded
+      ? changedFilesResult(changedFiles)
+      : (unloadedResult() as ReturnType<typeof useWorkspaceChangedFiles>),
+  );
   useDirectoryMock.mockReturnValue(directoryResult());
   useEnvironmentMock.mockReturnValue(environmentResult(workingDir, reachable));
   useSearchMock.mockReturnValue(
@@ -242,6 +260,7 @@ function renderPanel({
 
 beforeEach(() => {
   useAllFilesMock.mockReset();
+  useAsleepMock.mockReturnValue(false);
   useChangedFilesMock.mockReset();
   useDirectoryMock.mockReset();
   useDirectoriesMock.mockClear();
@@ -382,6 +401,28 @@ describe("FilesPanel hidden-files toggle icon", () => {
     const toggle = screen.getByRole("button", { name: "Show hidden files" });
     expect(toggle.querySelector(".lucide-eye")).not.toBeNull();
     expect(toggle.querySelector(".lucide-eye-off")).toBeNull();
+  });
+});
+
+describe("FilesPanel on an asleep sandbox", () => {
+  it.each([true, false])(
+    "says the agent is asleep instead of an empty workspace (flatView=%s)",
+    (flatView) => {
+      useAsleepMock.mockReturnValue(true);
+      renderPanel({ conversationId: "conv_asleep", flatView, files: [], listsLoaded: false });
+
+      expect(screen.getByText("Agent is asleep")).toBeInTheDocument();
+      expect(screen.queryByText("No files in workspace")).not.toBeInTheDocument();
+      expect(screen.queryByText("No workspace changes yet")).not.toBeInTheDocument();
+    },
+  );
+
+  it("keeps showing a list cached before the sandbox slept", () => {
+    useAsleepMock.mockReturnValue(true);
+    renderPanel({ conversationId: "conv_asleep", files: [file("README.md")] });
+
+    expect(screen.getByText("README.md")).toBeInTheDocument();
+    expect(screen.queryByText("Agent is asleep")).not.toBeInTheDocument();
   });
 });
 
