@@ -14,7 +14,14 @@ export function refreshScopeWindow(
   const windowSize =
     current?.windowSize ?? Math.max(limit, current?.pages.flatMap((page) => page.data).length ?? 0);
   if (windowSize <= limit || !incoming.has_more) {
-    return { pages: [incoming], pageParams: [undefined], windowSize };
+    // The server breaks timestamp ties differently; sort so a refresh cannot
+    // undo the order appendScopePage produced. The cursor stays the server's.
+    const rows = [...incoming.data].sort(compare);
+    return {
+      pages: [{ ...incoming, data: rows, first_id: rows[0]?.id ?? null }],
+      pageParams: [undefined],
+      windowSize,
+    };
   }
   const previous = current?.pages.flatMap((page) => page.data) ?? [];
   const incomingTail = incoming.data.at(-1);

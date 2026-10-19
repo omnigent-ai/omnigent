@@ -516,8 +516,12 @@ def register_core_routes(
         # Seed the launch-progress indicator before the background task
         # starts, so the first GET snapshot (the Web UI navigates to the
         # session page immediately after this 201) already carries the
-        # "provisioning" stage.
-        _publish_sandbox_status(session_id, "provisioning")
+        # "provisioning" stage and the provider being launched.
+        _publish_sandbox_status(
+            session_id,
+            "provisioning",
+            provider=sandbox_provider or sandbox_config.default.provider,
+        )
         launch_task = asyncio.create_task(
             _run_managed_launch(
                 session_id=session_id,

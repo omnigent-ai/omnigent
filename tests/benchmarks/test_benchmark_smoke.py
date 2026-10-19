@@ -1319,6 +1319,46 @@ def test_sigterm_mid_run_leaves_no_processes(tmp_path: Path) -> None:
                 child.kill()
 
 
+# Swallows the first cancellation the way anyio inside httpx can, then expects a retry.
+_SWALLOWING_RUN = """
+import argparse, asyncio, os, signal, sys
+from dev.benchmarks.omnigent import run as bench_run
+
+async def fake_run_benchmark(args, *, teardown_started=None):
+    os.kill(os.getpid(), signal.SIGTERM)
+    swallowed = False
+    try:
+        while True:
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                if swallowed:
+                    raise
+                swallowed = True
+    finally:
+        if teardown_started is not None:
+            teardown_started.set()
+
+bench_run.run_benchmark = fake_run_benchmark
+signal.alarm(20)
+sys.exit(bench_run.main([]))
+"""
+
+
+@pytest.mark.skipif(not hasattr(signal, "alarm"), reason="SIGTERM loop handlers are POSIX-only")
+def test_sigterm_retries_a_cancellation_a_library_swallowed() -> None:
+    """One SIGTERM still unwinds the run when the first cancel never surfaces."""
+    result = subprocess.run(
+        [sys.executable, "-c", _SWALLOWING_RUN],
+        cwd=Path(bench_run.__file__).resolve().parents[3],
+        env=bench_child_environ(),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 128 + signal.SIGTERM, result.stdout + result.stderr
+
+
 class _CliStubEnv:
     """The slice of BenchEnvironment the cli_startup journey uses."""
 

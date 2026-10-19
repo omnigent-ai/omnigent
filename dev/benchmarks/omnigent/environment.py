@@ -343,6 +343,7 @@ class BenchEnvironment:
         harness: str = _DEFAULT_HARNESS,
         model: str = _DEFAULT_MODEL,
         network_delay_ms: float = 0.0,
+        teardown_started: asyncio.Event | None = None,
     ) -> None:
         # with_host is additive over with_runner: the boot runner still serves
         # the warm journeys, and the host daemon additionally lets the cold-start
@@ -359,6 +360,8 @@ class BenchEnvironment:
         self.host_id = ""
         self.host_workspace = ""
         self.client: httpx.AsyncClient | None = None
+        # Set when __aexit__ begins, so a SIGTERM retry knows to stop cancelling.
+        self._teardown_started = teardown_started
 
         self._tmp = Path("/tmp") / f"omni-bench-{uuid.uuid4().hex[:8]}"
         # TMPDIR for bench subprocesses, so their terminal sockets can be swept.
@@ -424,6 +427,8 @@ class BenchEnvironment:
         return self
 
     async def __aexit__(self, *exc: object) -> None:
+        if self._teardown_started is not None:
+            self._teardown_started.set()
         if self.client is not None:
             await self.client.aclose()
         self._sampler_stop.set()

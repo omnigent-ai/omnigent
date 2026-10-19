@@ -21,8 +21,9 @@ and steers messages while the agent is busy.
   configuration menu.
 - `host-tooltip`: hovering the host chip shows a tooltip styled like the pill's
   with Host and Status rows, hidden while the host menu is open. States:
-  connected, disconnected, asleep (resumable managed host), unknown, no host;
-  before launch also a selected sandbox and connecting.
+  connected, disconnected, asleep (resumable managed host), unknown, no host,
+  and a launching or failed sandbox with its stage; before launch also a
+  selected sandbox and connecting.
 - `model-picker`: lists the host's live model catalog, highlights the current
   model, and keeps the selection. Ctrl+Shift+M opens it in both composers.
   States: catalog loading, delayed catalog,
@@ -192,7 +193,9 @@ Other connection providers alone do not enable the managed MCP picker.
 - **`host-tooltip`, in-session:**
   `tests/browser_ui/chat/test_composer_tooltips.py::test_host_chip_tooltip_names_the_host_and_matches_the_pill`
   (connected, menu suppression, same surface as the pill); disconnected and
-  asleep in `tests/e2e_ui/sessions/test_host_badge.py`.
+  asleep in `tests/e2e_ui/sessions/test_host_badge.py`; a provisioning sandbox
+  handing over to its connected host in
+  `tests/e2e_ui/start_session/test_managed_first_message_routing.py::test_managed_first_message_rebinds_live_stream_across_replicas`.
 - **`host-tooltip`, new-session composer:** no browser-level coverage; the web
   unit tests for the new-session dialog cover it. Manually: open the landing
   page, hover the host chip, and expect the same card as the pill's tooltip

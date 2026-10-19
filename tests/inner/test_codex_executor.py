@@ -168,7 +168,9 @@ class _FakeProcess:
         self.stderr = _FakePipe()
         self.returncode: int | None = None
         self.terminated = False
-        self.pid = 12345
+        # Above Linux's PID_MAX_LIMIT (2**22), so the real terminate_tree these
+        # tests reach can never signal a live process on the test machine.
+        self.pid = 2**22 + 1
 
     def terminate(self) -> None:
         self.terminated = True
