@@ -39,8 +39,8 @@ export function readDefaultWorkspaceTab(): DefaultWorkspaceTab {
   }
 }
 
-/** Explicit default choices update existing chats; automatic pin fallbacks preserve selections. */
-export function writeDefaultWorkspaceTab(value: DefaultWorkspaceTab, resetSelections = true): void {
+/** Apply a changed default to existing chats; subsequent manual tab choices are remembered. */
+export function writeDefaultWorkspaceTab(value: DefaultWorkspaceTab): void {
   if (typeof window === "undefined") return;
   try {
     const normalized = normalizeDefaultWorkspaceTab(value);
@@ -50,7 +50,7 @@ export function writeDefaultWorkspaceTab(value: DefaultWorkspaceTab, resetSelect
     } else {
       window.localStorage.setItem(STORAGE_KEY, normalized);
     }
-    if (resetSelections && normalized !== previous) resetSessionWorkspaceTabSelections();
+    if (normalized !== previous) resetSessionWorkspaceTabSelections();
   } catch {
     // localStorage quota or access errors shouldn't break settings.
   }
@@ -62,10 +62,7 @@ export function readPinnedWorkspaceTabs(): DefaultWorkspaceTab[] {
     const raw = window.localStorage.getItem(PINNED_WORKSPACE_TABS_STORAGE_KEY);
     if (raw !== null) {
       const value: unknown = JSON.parse(raw);
-      if (
-        Array.isArray(value) &&
-        value.every((tab) => typeof tab === "string" && isDefaultWorkspaceTab(tab))
-      ) {
+      if (Array.isArray(value)) {
         return defaultWorkspaceTabs.filter((tab) => value.includes(tab));
       }
     }

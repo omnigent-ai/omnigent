@@ -156,11 +156,7 @@ export function applyImportedSettings(imported: ExportedSettings): number {
   const nextPins = readPinnedWorkspaceTabs();
   const removedPins = previousPins.filter((tab) => !nextPins.includes(tab));
   unpinSessionWorkspaceTabs(removedPins);
-  const pinsChanged = previousPins.join() !== nextPins.join();
-  if (
-    previousDefault !== readDefaultWorkspaceTab() &&
-    (!pinsChanged || nextPins.includes(previousDefault))
-  ) {
+  if (previousDefault !== readDefaultWorkspaceTab()) {
     resetSessionWorkspaceTabSelections();
   }
   return count;

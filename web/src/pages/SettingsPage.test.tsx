@@ -638,7 +638,7 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:default-workspace-tab")).toBe("subagents");
   });
 
-  it("seeds the default Workspace tab from storage", () => {
+  it("seeds the preferred Workspace tab and restores it when repinned", () => {
     localStorage.setItem("omnigent:default-workspace-tab", "changes");
     renderPage("/settings/appearance");
 
@@ -651,6 +651,17 @@ describe("SettingsPage", () => {
         name: "Sidebar preview: Changes, Files, Pull Requests, Agents pinned.",
       }),
     ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Pin Changes" }));
+    expect(screen.getByTestId("workspace-tab-default-files")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(localStorage.getItem("omnigent:default-workspace-tab")).toBe("changes");
+    fireEvent.click(screen.getByRole("button", { name: "Pin Changes" }));
+    expect(screen.getByTestId("workspace-tab-default-changes")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
   });
 
   it("lets every workspace page be unpinned, remembers the choice, and selects a pinned default", () => {
@@ -692,7 +703,7 @@ describe("SettingsPage", () => {
     expect(
       screen.getByRole("img", { name: "Sidebar preview: Changes pinned." }),
     ).toBeInTheDocument();
-    expect(localStorage.getItem("omnigent:default-workspace-tab")).toBe("changes");
+    expect(localStorage.getItem("omnigent:default-workspace-tab")).toBeNull();
     expect(readSessionWorkspaceState("file")).toEqual({
       openFiles: ["README.md"],
       selectedFilePath: "README.md",

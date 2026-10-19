@@ -43,13 +43,18 @@ describe("workspaceTabPreferences — read/write", () => {
     expect(readPinnedWorkspaceTabs()).toEqual(defaultWorkspaceTabs);
   });
 
-  it.each(["invalid-json", "null", "{}", '["unknown"]'])(
-    "keeps the default pins for invalid storage: %s",
-    (stored) => {
-      localStorage.setItem(PINNED_WORKSPACE_TABS_STORAGE_KEY, stored);
-      expect(readPinnedWorkspaceTabs()).toEqual(defaultWorkspaceTabs);
-    },
-  );
+  it.each([
+    ["invalid-json", defaultWorkspaceTabs],
+    ["null", defaultWorkspaceTabs],
+    ["{}", defaultWorkspaceTabs],
+    ['"files"', defaultWorkspaceTabs],
+    ["[]", []],
+    ['["unknown"]', []],
+    ['["github","unknown","changes","github",null]', ["changes", "github"]],
+  ] as const)("reads supported pins from storage: %s", (stored, expected) => {
+    localStorage.setItem(PINNED_WORKSPACE_TABS_STORAGE_KEY, stored);
+    expect(readPinnedWorkspaceTabs()).toEqual(expected);
+  });
 
   it("preserves an opened page when pinning it and other opened pages when unpinning it again", () => {
     writePinnedWorkspaceTabs(["files", "subagents"]);
@@ -66,7 +71,7 @@ describe("workspaceTabPreferences — read/write", () => {
     expect(readSessionWorkspaceState("conv")).toEqual({ openPanels: ["github"], open: false });
   });
 
-  it("preserves unrelated selections when a pin change needs a new default", () => {
+  it("uses a pinned fallback without changing the preferred default or unrelated selections", () => {
     const state: SessionWorkspaceState = {
       rightRailTab: "files",
       selectedFilePath: "README.md",
@@ -75,13 +80,15 @@ describe("workspaceTabPreferences — read/write", () => {
     writeSessionWorkspaceState("conv", state);
 
     writePinnedWorkspaceTabs(["changes", "github", "subagents"]);
-    writeDefaultWorkspaceTab("changes", false);
 
-    expect(readDefaultWorkspaceTab()).toBe("changes");
+    expect(readDefaultWorkspaceTab()).toBe("files");
+    expect(readInitialWorkspaceTab()).toBe("changes");
     expect(readSessionWorkspaceState("conv")).toEqual({
       selectedFilePath: "README.md",
       openFiles: ["README.md"],
     });
+    writePinnedWorkspaceTabs(defaultWorkspaceTabs);
+    expect(readInitialWorkspaceTab()).toBe("files");
   });
 
   it("returns files when nothing is stored", () => {

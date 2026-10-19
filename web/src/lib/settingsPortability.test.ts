@@ -31,7 +31,7 @@ it("round-trips workspace pins and default without restoring stale selections", 
   expect(readSessionWorkspaceState("conv")).toEqual({ open: true });
 });
 
-it("preserves unrelated session selections when importing changed pins and their default", () => {
+it("preserves unrelated session selections when importing changed pins without a new default", () => {
   writePinnedWorkspaceTabs(["files", "changes", "subagents"]);
   writeSessionWorkspaceState("files", {
     rightRailTab: "files",
@@ -51,7 +51,7 @@ it("preserves unrelated session selections when importing changed pins and their
     version: 1,
     settings: {
       [PINNED_WORKSPACE_TABS_STORAGE_KEY]: '["changes","subagents"]',
-      "omnigent:default-workspace-tab": "changes",
+      "omnigent:default-workspace-tab": "files",
     },
   });
   expect(readSessionWorkspaceState("files")).toEqual({
@@ -65,7 +65,7 @@ it("preserves unrelated session selections when importing changed pins and their
     version: 1,
     settings: {
       [PINNED_WORKSPACE_TABS_STORAGE_KEY]: '["changes","github","subagents"]',
-      "omnigent:default-workspace-tab": "changes",
+      "omnigent:default-workspace-tab": "files",
     },
   });
   expect(readSessionWorkspaceState("opened")).toEqual(openedPage);
@@ -82,7 +82,10 @@ it("preserves unrelated session selections when importing changed pins and their
   expect(readSessionWorkspaceState("browser")).toEqual({ openBrowsers: ["one"] });
 });
 
-it("applies an explicitly changed default when its previous page stays pinned", () => {
+it.each([
+  ['["files","changes","subagents"]', "changes"],
+  ['["changes","subagents"]', "subagents"],
+] as const)("applies an explicit imported default with pins %s", (pins, defaultTab) => {
   writePinnedWorkspaceTabs(["files", "changes"]);
   writeSessionWorkspaceState("browser", {
     rightRailTab: "browser",
@@ -93,12 +96,12 @@ it("applies an explicitly changed default when its previous page stays pinned", 
   applyImportedSettings({
     version: 1,
     settings: {
-      [PINNED_WORKSPACE_TABS_STORAGE_KEY]: '["files","changes","subagents"]',
-      "omnigent:default-workspace-tab": "changes",
+      [PINNED_WORKSPACE_TABS_STORAGE_KEY]: pins,
+      "omnigent:default-workspace-tab": defaultTab,
     },
   });
 
-  expect(readInitialWorkspaceTab()).toBe("changes");
+  expect(readInitialWorkspaceTab()).toBe(defaultTab);
   expect(readSessionWorkspaceState("browser")).toEqual({ openBrowsers: ["one"] });
 });
 
