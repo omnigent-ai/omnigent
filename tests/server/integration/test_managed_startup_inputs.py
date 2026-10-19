@@ -860,13 +860,15 @@ async def test_crashed_create_launch_is_recorded_on_the_session(
 
     monkeypatch.setattr(routes_core, "_run_managed_launch", crash)
     session_id = await _create(env)
+    # The failed label lands before its error item.
     for _ in range(50):
         conv = env.conv_store.get_conversation(session_id)
-        if conv is not None and conv.labels.get(STARTUP_LABEL) == "failed":
+        items = env.conv_store.list_items(session_id).data
+        if conv is not None and conv.labels.get(STARTUP_LABEL) == "failed" and items:
             break
         await asyncio.sleep(0.1)
     assert conv is not None and conv.labels.get(STARTUP_LABEL) == "failed"
-    [error] = env.conv_store.list_items(session_id).data
+    [error] = items
     assert isinstance(error.data, ErrorData) and "store unavailable" in error.data.message
 
 
