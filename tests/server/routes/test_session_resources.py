@@ -9581,6 +9581,91 @@ async def test_claude_native_slash_command_drains_its_queued_entry_under_either_
         pending_inputs.reset_for_tests()
 
 
+def _slash_command_echo(name: str, arguments: str, source_id: str) -> SessionEventInput:
+    """A Claude-native ``slash_command`` mirror as the transcript forwarder posts it."""
+    return SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "slash_command",
+            "item_data": {
+                "agent": "claude-native-ui",
+                "kind": "skill",
+                "name": name,
+                "arguments": arguments,
+            },
+            "response_id": f"resp_{source_id}",
+            "source_id": source_id,
+        },
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("separate_repeat", [False, True])
+async def test_claude_native_stacked_skill_command_drains_its_queued_entry_once(
+    separate_repeat: bool,
+) -> None:
+    """A web-typed ``/a /b args`` comes back as two command echoes and settles its own entry.
+
+    Neither echo equals the typed text, so the next message used to find the
+    entry unmatched and record it as lost. The second echo must not drain a
+    later ``/b args`` the person queued separately.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    pending_inputs.record(sid, [{"type": "input_text", "text": "/alpha /beta hello  there"}])
+    repeat = (
+        pending_inputs.record(sid, [{"type": "input_text", "text": "/beta hello there"}])
+        if separate_repeat
+        else None
+    )
+    pending_inputs.record(sid, [{"type": "input_text", "text": "and then this"}])
+    next_message = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "and then this"}],
+            },
+            "response_id": "resp_next",
+            "source_id": "claude:next:0",
+        },
+    )
+
+    try:
+        for body in (
+            _slash_command_echo("plugin:alpha", "hello there", "claude:alpha:0"),
+            _slash_command_echo("plugin:beta", "hello there", "claude:beta:0"),
+        ):
+            await _persist_external_conversation_item(sid, conv, body, store)  # type: ignore[arg-type]
+        if separate_repeat:
+            # The second echo left the separately queued repeat waiting for its own echo.
+            assert pending_inputs.snapshot_for(sid)[0]["pending_id"] == repeat
+            await _persist_external_conversation_item(
+                sid,
+                conv,
+                _slash_command_echo("plugin:beta", "hello there", "claude:repeat:0"),
+                store,  # type: ignore[arg-type]
+            )
+        await _persist_external_conversation_item(sid, conv, next_message, store)  # type: ignore[arg-type]
+
+        assert [item.type for item in store.appended_items] == [
+            "slash_command",
+            "slash_command",
+            *(["slash_command"] if separate_repeat else []),
+            "message",
+        ]
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
 @pytest.mark.asyncio
 async def test_claude_native_top_level_local_command_echo_drains_its_queued_entry(
     tmp_path: Path,

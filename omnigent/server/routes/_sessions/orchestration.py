@@ -2956,6 +2956,7 @@ async def _persist_external_conversation_item_unlocked(
     skipped_pending: list[pending_inputs.DrainedInput] = []
     uncertain_pending: list[pending_inputs.DrainedInput] = []
     held_older: list[pending_inputs.DrainedInput] = []
+    stacked_expansions: list[str] = []
     if (
         item.type == "message"
         and isinstance(item.data, MessageData)
@@ -3025,12 +3026,23 @@ async def _persist_external_conversation_item_unlocked(
         # A command typed in the web composer was queued as plain text but comes back
         # as a slash_command item; a plugin skill typed ``/simplify`` is recorded as
         # ``/<plugin>:simplify``. Drain its own entry so it is not mistaken for a lost message.
-        spellings = dict.fromkeys((item.data.name, item.data.name.rpartition(":")[2]))
-        for spelling in spellings:
-            command_line = f"/{spelling} {item.data.arguments}".strip()
-            matched = pending_inputs.resolve_matching_text(session_id, command_line, hold=True)
-            if matched.matched is not None:
-                break
+        # A stacked ``/a /b args`` is echoed as ``/a args`` then ``/b args``; once one
+        # echo settles it, the others must not drain an identical later message.
+        if pending_inputs.consume_stacked_expansion(
+            session_id, item.data.name, item.data.arguments
+        ):
+            matched = pending_inputs.MatchedDrain(matched=None, skipped=[])
+        else:
+            spellings = dict.fromkeys((item.data.name, item.data.name.rpartition(":")[2]))
+            for spelling in spellings:
+                command_line = f"/{spelling} {item.data.arguments}".strip()
+                matched = pending_inputs.resolve_matching_text(session_id, command_line, hold=True)
+                if matched.matched is not None:
+                    break
+            if matched.matched is None:
+                matched, stacked_expansions = pending_inputs.resolve_stacked_command(
+                    session_id, item.data.name, item.data.arguments, hold=True
+                )
         drained = matched.matched
         match_method = matched.match_method
         if drained is not None:
@@ -3083,6 +3095,10 @@ async def _persist_external_conversation_item_unlocked(
     # go back into play.
     _release_drained_inputs(session_id, [*skipped_pending, *uncertain_pending, drained])
     _restore_drained_inputs(session_id, held_older, None)
+    if stacked_expansions and isinstance(item.data, SlashCommandData):
+        pending_inputs.expect_stacked_expansions(
+            session_id, stacked_expansions, item.data.arguments
+        )
     # Not a duplicate: publish side effects for each skipped pair. Items are
     # [user0, error0, user1, error1, ...]; 2 per skipped entry. The consumed
     # event names each skipped entry so clients settle those bubbles in order
