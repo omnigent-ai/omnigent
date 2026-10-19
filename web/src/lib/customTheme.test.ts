@@ -42,6 +42,7 @@ describe("customTheme", () => {
       darkTint: "#0d1117",
       contrast: 72,
       translucentSidebar: true,
+      flatBackground: true,
     };
 
     writeCustomTheme(theme);
@@ -49,6 +50,23 @@ describe("customTheme", () => {
     expect(readCustomTheme()).toEqual(theme);
     expect(JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "null")).toEqual(theme);
   });
+
+  it.each([undefined, null, "true", "false", 1, false])(
+    "keeps preset backgrounds for missing or invalid flat-background preferences (%s)",
+    (flatBackground) => {
+      localStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify({ ...DEFAULT_CUSTOM_THEME, accent: "#2563eb", flatBackground }),
+      );
+
+      const theme = readCustomTheme();
+      expect(theme.flatBackground).toBe(false);
+      expect(theme.accent).toBe("#2563eb");
+      const variants = deriveCustomTheme(theme);
+      expect(variants.light.shellBackground).toBe(PALETTES[0].tokens.light.shellBackground);
+      expect(variants.dark.shellBackground).toBe(PALETTES[0].tokens.dark.shellBackground);
+    },
+  );
 
   it("restores the dark tint for legacy saved themes", () => {
     localStorage.setItem(
@@ -93,6 +111,7 @@ describe("customTheme", () => {
       darkTint: "#0d1117",
       contrast: 50,
       translucentSidebar: false,
+      flatBackground: false,
     });
   });
 
@@ -102,6 +121,33 @@ describe("customTheme", () => {
 
     expect(variants.light).toEqual(palette.tokens.light);
     expect(variants.dark).toEqual(palette.tokens.dark);
+  });
+
+  it.each(PALETTES)("flattens $label backgrounds without changing custom colors", (palette) => {
+    const theme = {
+      ...createCustomThemeFromPalette(palette),
+      accent: "#2563eb",
+      darkAccent: "#7aa2f7",
+      tint: "#dbeafe",
+      darkTint: "#24283b",
+      contrast: 55,
+      translucentSidebar: true,
+    };
+    const original = deriveCustomTheme(theme);
+    const flat = deriveCustomTheme({ ...theme, flatBackground: true });
+
+    for (const mode of ["light", "dark"] as const) {
+      expect(flat[mode]).toEqual({
+        ...original[mode],
+        shellBackground: original[mode].background,
+        sidebarBackground: "var(--sidebar)",
+      });
+      expect(flat[mode].shellBackground).toMatch(/^#[0-9a-f]{6}$/);
+    }
+    expect(flat.dark.shellBackground).toBe("#24283b");
+    expect(flat.light.primary).toBe("#2563eb");
+    expect(flat.dark.primary).toBe("#7aa2f7");
+    expect(deriveCustomTheme({ ...theme, flatBackground: false })).toEqual(original);
   });
 
   it.each(PALETTES)("restores the exact $label tokens after changing contrast", (palette) => {
@@ -213,6 +259,7 @@ describe("customTheme", () => {
       darkTint: "#160e24",
       contrast: 60,
       translucentSidebar: false,
+      flatBackground: false,
     });
 
     expect(variants.light.background).not.toBe(PALETTES[0].tokens.light.background);
@@ -248,6 +295,7 @@ describe("customTheme", () => {
         darkTint: "#0d1117",
         contrast,
         translucentSidebar: false,
+        flatBackground: false,
       });
       for (const surface of [
         variants.light.background,
@@ -277,11 +325,16 @@ describe("customTheme", () => {
       darkTint: "#160e24",
       contrast: 60,
       translucentSidebar: true,
+      flatBackground: true,
     });
 
     const style = document.documentElement.style;
     expect(style.getPropertyValue("--custom-light-background")).not.toBe("");
     expect(style.getPropertyValue("--custom-dark-background")).toBe("#160e24");
+    expect(style.getPropertyValue("--custom-dark-shell-background")).toBe("#160e24");
+    expect(style.getPropertyValue("--custom-light-shell-background")).toBe(
+      style.getPropertyValue("--custom-light-background"),
+    );
     expect(style.getPropertyValue("--custom-light-sidebar")).toMatch(/^rgba\(/);
     expect(style.getPropertyValue("--custom-dark-sidebar")).toMatch(/^rgba\(/);
     expect(document.documentElement).toHaveAttribute("data-custom-translucent-sidebar");
@@ -303,8 +356,13 @@ describe("customTheme", () => {
       darkTint: "#160e24",
       contrast: 60,
       translucentSidebar: true,
+      flatBackground: true,
     });
     expect(scope.style.getPropertyValue("--custom-dark-background")).toBe("#160e24");
+    expect(scope.style.getPropertyValue("--custom-dark-shell-background")).toBe("#160e24");
+    expect(scope.style.getPropertyValue("--custom-light-shell-background")).toBe(
+      scope.style.getPropertyValue("--custom-light-background"),
+    );
     expect(scope).toHaveAttribute("data-custom-translucent-sidebar");
     expect(inner).toHaveAttribute("data-custom-translucent-sidebar");
     expect(document.documentElement.style.getPropertyValue("--custom-dark-background")).toBe("");
