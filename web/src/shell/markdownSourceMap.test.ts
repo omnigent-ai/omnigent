@@ -55,7 +55,7 @@ const cases: [string, string, number, string?][] = [
     "word ⟦word⟧ [Details][ref]\n\n[ref]: https://example.com/word",
     1,
   ],
-  ["entities before selection", "&amp; &lt; &#119;ord word ⟦word⟧", 1],
+  ["entities before selection", "&amp; &lt; &#119;ord word ⟦word⟧", 2],
   ["escaped punctuation", "word \\* ⟦word⟧", 1],
   ["table", "| word | B |\n| --- | --- |\n| word | ⟦word⟧ |", 2],
   ["nested lists", "- word\n  - ⟦word⟧\n- word", 1],
