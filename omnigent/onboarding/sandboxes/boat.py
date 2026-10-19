@@ -14,8 +14,9 @@ Platform notes that shape this launcher:
   account secrets and repositories are not inherited, with command
   monitoring and automatic archival disabled.
 - **Persistent resume.** Archived or stopped sandboxes are resumed on
-  attach. Terminal states (deleted, cancelled) raise
-  :class:`SandboxGoneError` so the server provisions a replacement.
+  attach, still with ``noEnv``. Terminal states (deleted, cancelled) and a
+  snapshot Boat has expired (``409 snapshot_data_expired``, 14 days after
+  stop) raise :class:`SandboxGoneError` so the server provisions a replacement.
 - **Host package.** The host is installed with ``uv`` into an isolated
   Python 3.12 environment. ``OMNIGENT_BOAT_HOST_PACKAGE`` overrides the
   requirement, which defaults to the server's own version.
@@ -127,6 +128,9 @@ class BoatSandboxLauncher(ExecModelHostLauncher):
             if missing_ok:
                 return {}
             raise SandboxGoneError("Boat sandbox no longer exists.")
+        if response.status_code == 409 and _error_code(response) == " (snapshot_data_expired)":
+            # Boat deleted the stopped sandbox's disk; no resume can ever succeed.
+            raise SandboxGoneError("Boat sandbox snapshot data expired.")
         if response.is_error:
             # Provider bodies may contain credentials or remote command text.
             # Surface only Boat's machine readable error code.
@@ -202,7 +206,12 @@ class BoatSandboxLauncher(ExecModelHostLauncher):
         """Restore the persistent sandbox filesystem."""
         state = self._state(sandbox_id)
         if state not in _ACTIVE:
-            self._request("POST", self._path(sandbox_id) + "/resume", body={"ttlSeconds": None})
+            # Restate noEnv so account secrets are withheld on resume too (one-way at Boat).
+            self._request(
+                "POST",
+                self._path(sandbox_id) + "/resume",
+                body={"noEnv": True, "ttlSeconds": None},
+            )
         self._wait_ready(sandbox_id)
 
     def keep_alive(self, sandbox_id: str) -> bool:
