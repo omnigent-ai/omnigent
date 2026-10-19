@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -2353,6 +2354,87 @@ async def test_events_newer_model_pick_replaces_one_waiting_for_a_prompt(
         await _wait_for_commands(commands, 1)
         await asyncio.sleep(0.05)
     assert commands == ["/model sonnet"]
+
+
+async def _create_prompt_session(client: httpx.AsyncClient) -> None:
+    resp = await client.post(
+        "/v1/sessions",
+        json={"session_id": _PROMPT_SESSION_ID, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+    )
+    assert resp.status_code == 201, resp.text
+
+
+@pytest.mark.asyncio
+async def test_events_newer_pick_lands_after_a_queued_switch_that_is_typing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pick made while a queued switch types after the answer waits for it, so it lands last."""
+    prompt_open = [True]
+    commands = _patch_settings_behind_prompt(monkeypatch, prompt_open)
+    queued_typing, release = threading.Event(), threading.Event()
+    inject = claude_native_bridge.inject_slash_command
+
+    def _slow_queued_inject(bridge_dir: Any, *, command: str, **kwargs: Any) -> None:
+        if command == "/effort high" and not prompt_open[0]:
+            queued_typing.set()
+            release.wait(5)
+        inject(bridge_dir, command=command, **kwargs)
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _slow_queued_inject)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    url = f"/v1/sessions/{_PROMPT_SESSION_ID}/events"
+    async with _runner_client(app) as client:
+        await _create_prompt_session(client)
+        resp = await client.post(url, json={"type": "effort_change", "effort": "high"})
+        assert resp.status_code == 204, resp.text
+        prompt_open[0] = False
+        assert await asyncio.to_thread(queued_typing.wait, 5)
+        asyncio.get_running_loop().call_later(0.2, release.set)
+        resp = await client.post(url, json={"type": "effort_change", "effort": "low"})
+        assert resp.status_code == 204, resp.text
+    assert commands == ["/effort high", "/effort low"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        ("DELETE", "/v1/sessions/{sid}/resources", None),
+        ("POST", "/v1/sessions/{sid}/reset-state", None),
+        ("POST", "/v1/sessions/{sid}/events", {"type": "stop_session"}),
+        ("DELETE", "/v1/sessions/{sid}", None),
+    ],
+    ids=["cleanup", "reset", "stop", "delete"],
+)
+async def test_events_settings_change_queued_behind_a_prompt_ends_with_its_session(
+    monkeypatch: pytest.MonkeyPatch, method: str, path: str, body: dict[str, str] | None
+) -> None:
+    """Teardown drops a queued switch: it stops waiting, so it never prepares a pane or types."""
+    prompt_open = [True]
+    commands = _patch_settings_behind_prompt(monkeypatch, prompt_open)
+    polls: list[float] = []
+
+    def _pending(_bridge_dir: Any) -> bool:
+        polls.append(time.monotonic())
+        return prompt_open[0]
+
+    monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", _pending)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    async with _runner_client(app) as client:
+        await _create_prompt_session(client)
+        resp = await client.post(
+            f"/v1/sessions/{_PROMPT_SESSION_ID}/events",
+            json={"type": "effort_change", "effort": "high"},
+        )
+        assert resp.status_code == 204, resp.text
+        await asyncio.sleep(0.05)
+        assert polls, "the switch should be waiting on the prompt"
+        await client.request(method, path.format(sid=_PROMPT_SESSION_ID), json=body)
+        polled = len(polls)
+        prompt_open[0] = False
+        await asyncio.sleep(0.1)
+    assert len(polls) == polled
+    assert commands == []
 
 
 @pytest.mark.asyncio

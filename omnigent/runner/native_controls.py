@@ -133,6 +133,26 @@ _CLAUDE_SETTINGS_AFTER_PROMPT_BUDGET_S = 600.0
 _CLAUDE_SETTINGS_AFTER_PROMPT_POLL_S = 1.0
 
 
+# How long session teardown waits for its queued switches to stop.
+_CLAUDE_SETTINGS_CANCEL_TIMEOUT_S = 5.0
+
+
+@dataclasses.dataclass
+class _QueuedClaudeSetting:
+    """A Claude model or effort switch held until a pending prompt is answered."""
+
+    task: asyncio.Task[None]
+    # Set once the prompt is answered; a newer pick then waits for this switch.
+    applying: bool = False
+    budget: _ClaudeControlDeadline | None = None
+
+    def cancel(self) -> None:
+        self.task.cancel()
+        if self.budget is not None:
+            # A switch already typing stops before its next key.
+            self.budget.set()
+
+
 # Settle delay between keystrokes when driving Codex TUI popups. The
 # slash-command menu, the /permissions popup, and the Full Access confirm
 # sub-dialog are each drawn asynchronously; without a pause the next key races
@@ -246,6 +266,7 @@ class _HandleOpencodeNativeCostPopupFn(Protocol):
 class NativeControls:
     """Native-harness control handlers the runner app's event dispatch calls."""
 
+    cancel_claude_settings_after_prompt: Callable[[str], Coroutine[Any, Any, None]]
     codex_native_model_options: Callable[[str], Coroutine[Any, Any, list[_JsonObject]]]
     handle_claude_native_btw_dismiss: Callable[[str], Coroutine[Any, Any, Response]]
     handle_claude_native_compact: Callable[[str], Coroutine[Any, Any, Response]]
@@ -1174,12 +1195,34 @@ def build_native_controls(
         )
 
     # One switch per session and kind waits for a pending prompt; a newer pick replaces it.
-    _settings_after_prompt: dict[tuple[str, str], asyncio.Task[None]] = {}
+    _settings_after_prompt: dict[tuple[str, str], _QueuedClaudeSetting] = {}
 
-    def _cancel_settings_after_prompt(conv_id: str, kind: str) -> None:
+    async def _retire_settings_after_prompt(
+        conv_id: str, kind: str, deadline: _ClaudeControlDeadline
+    ) -> None:
+        """Clear the way for a newer pick of *kind*, so it lands last.
+
+        A queued switch still waiting for its prompt is dropped. One already
+        applying is given the newer pick's budget to finish first.
+        """
         queued = _settings_after_prompt.pop((conv_id, kind), None)
-        if queued is not None:
-            queued.cancel()
+        if queued is None:
+            return
+        if queued.applying:
+            await asyncio.wait({queued.task}, timeout=deadline.remaining_s())
+        queued.cancel()
+
+    async def _cancel_claude_settings_after_prompt(conv_id: str) -> None:
+        """Drop every switch queued for *conv_id* before its session is torn down."""
+        keys = [key for key in _settings_after_prompt if key[0] == conv_id]
+        queued = [_settings_after_prompt.pop(key) for key in keys]
+        for entry in queued:
+            entry.cancel()
+        if queued:
+            # Wait them out, or one mid-step could recreate the pane after cleanup.
+            await asyncio.wait(
+                {entry.task for entry in queued}, timeout=_CLAUDE_SETTINGS_CANCEL_TIMEOUT_S
+            )
 
     def _queue_settings_after_prompt(
         conv_id: str,
@@ -1205,11 +1248,11 @@ def build_native_controls(
                         )
                         return
                     await asyncio.sleep(_CLAUDE_SETTINGS_AFTER_PROMPT_POLL_S)
-                # From here a newer pick no longer cancels this switch mid-typing.
-                _forget(asyncio.current_task())
+                queued.applying = True
                 await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
                 # The request's budget is long spent; the switch gets one of its own.
-                await apply(_ClaudeControlDeadline())
+                queued.budget = _ClaudeControlDeadline()
+                await apply(queued.budget)
             except Exception:  # noqa: BLE001 — best-effort; the forwarder's report reconciles
                 _logger.warning(
                     "claude-native %s change for session=%s failed after the prompt was answered",
@@ -1219,18 +1262,20 @@ def build_native_controls(
                     extra={"session_id": conv_id},
                 )
 
-        def _forget(task: asyncio.Task[Any] | None) -> None:
-            if task is not None and _settings_after_prompt.get((conv_id, kind)) is task:
+        def _forget(_task: asyncio.Task[None]) -> None:
+            if _settings_after_prompt.get((conv_id, kind)) is queued:
                 del _settings_after_prompt[(conv_id, kind)]
 
-        _cancel_settings_after_prompt(conv_id, kind)
-        task = asyncio.create_task(
-            _wait_then_apply(), name=f"claude-{kind}-after-prompt-{conv_id}"
+        replaced = _settings_after_prompt.pop((conv_id, kind), None)
+        if replaced is not None:
+            replaced.cancel()
+        queued = _QueuedClaudeSetting(
+            asyncio.create_task(_wait_then_apply(), name=f"claude-{kind}-after-prompt-{conv_id}")
         )
-        _settings_after_prompt[(conv_id, kind)] = task
-        _model_dialog_watchers.add(task)
-        task.add_done_callback(_model_dialog_watchers.discard)
-        task.add_done_callback(_forget)
+        _settings_after_prompt[(conv_id, kind)] = queued
+        _model_dialog_watchers.add(queued.task)
+        queued.task.add_done_callback(_model_dialog_watchers.discard)
+        queued.task.add_done_callback(_forget)
         _logger.info(
             "claude-native %s change for session=%s waits for the pending prompt to be answered",
             kind,
@@ -1258,7 +1303,7 @@ def build_native_controls(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-        _cancel_settings_after_prompt(conv_id, "effort")
+        await _retire_settings_after_prompt(conv_id, "effort", deadline)
         await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
         command = f"/effort {effort}"
 
@@ -1340,6 +1385,15 @@ def build_native_controls(
             extra={"session_id": conv_id},
         )
 
+    def _start_late_model_dialog_watch(conv_id: str, bridge_dir: Path, expected: set[str]) -> None:
+        """Run :func:`_watch_late_model_dialog` detached, tracked with the other watchers."""
+        watcher = asyncio.create_task(
+            _watch_late_model_dialog(conv_id, bridge_dir, expected),
+            name=f"claude-model-dialog-{conv_id}",
+        )
+        _model_dialog_watchers.add(watcher)
+        watcher.add_done_callback(_model_dialog_watchers.discard)
+
     async def _handle_claude_native_model_change(
         conv_id: str,
         model: str | None,
@@ -1381,7 +1435,7 @@ def build_native_controls(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-        _cancel_settings_after_prompt(conv_id, "model")
+        await _retire_settings_after_prompt(conv_id, "model", deadline)
         await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
         selected_model = model.strip()
         claude_config = await _resolve_session_claude_launch_config(conv_id)
@@ -1472,7 +1526,8 @@ def build_native_controls(
 
         async def _switch_after_prompt(budget: _ClaudeControlDeadline) -> None:
             await _type_switch(budget, min(_CLAUDE_CONTROL_PROMPT_WAIT_S, budget.remaining_s()))
-            await _watch_late_model_dialog(conv_id, bridge_dir, expected)
+            # Detached: a newer pick waits for this switch only while it types.
+            _start_late_model_dialog_watch(conv_id, bridge_dir, expected)
 
         def _switch_once_answered() -> Response:
             # The pane is waiting on the person's answer; switch once they give it.
@@ -1574,12 +1629,7 @@ def build_native_controls(
             # now. Not a failure: answer success, keep a detached watcher on
             # the late dialog, and let the forwarder's report settle the
             # picker when the switch actually lands.
-            watcher = asyncio.create_task(
-                _watch_late_model_dialog(conv_id, bridge_dir, expected),
-                name=f"claude-model-dialog-{conv_id}",
-            )
-            _model_dialog_watchers.add(watcher)
-            watcher.add_done_callback(_model_dialog_watchers.discard)
+            _start_late_model_dialog_watch(conv_id, bridge_dir, expected)
             _logger.info(
                 "claude-native model change for session=%s is queued behind an active "
                 "turn; watching for the late confirm dialog",
@@ -2442,6 +2492,7 @@ def build_native_controls(
         return Response(status_code=204)
 
     return NativeControls(
+        cancel_claude_settings_after_prompt=_cancel_claude_settings_after_prompt,
         codex_native_model_options=_codex_native_model_options,
         handle_claude_native_btw_dismiss=_handle_claude_native_btw_dismiss,
         handle_claude_native_compact=_handle_claude_native_compact,
