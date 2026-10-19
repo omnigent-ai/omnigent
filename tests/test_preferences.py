@@ -153,6 +153,7 @@ def test_invalid_values_fail_at_the_layer_boundary(key, value):
         (PreferenceKind.HARNESS, "command"),
         (PreferenceKind.PLUGIN, "ambiguous-plugin"),
         (PreferenceKind.HARNESS_ARGS, ""),
+        (PreferenceKind.HARNESS_ARGS, "default"),
     ],
 )
 def test_invalid_keys_are_rejected(kind, name):

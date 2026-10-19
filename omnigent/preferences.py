@@ -88,7 +88,10 @@ class PreferenceKey:
             from omnigent.harness_aliases import canonicalize_harness
 
             assert isinstance(self.name, str)
-            object.__setattr__(self, "name", canonicalize_harness(self.name) or self.name)
+            canonical = canonicalize_harness(self.name) or self.name
+            if canonical == "default":
+                raise ValueError("'default' is reserved for the default harness selection")
+            object.__setattr__(self, "name", canonical)
 
 
 PreferenceValue: TypeAlias = str | bool | tuple[str, ...]

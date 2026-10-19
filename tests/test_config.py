@@ -319,17 +319,7 @@ def test_adopted_preferences_flow_from_yaml_to_launch_without_rewriting_files(
     assert load_effective_config(workspace=project)["model"] == "stale-global"
 
 
-@pytest.mark.parametrize(
-    "local",
-    [
-        {},
-        {"harness": "pi-native"},
-        {"harness": {"codex-native": {"args": []}}},
-        {"harness": None},
-        {"model": None},
-    ],
-)
-def test_cli_and_runtime_preserve_legacy_resolution(monkeypatch, local):
+def test_cli_and_runtime_preserve_legacy_resolution(monkeypatch):
     import omnigent.cli as cli
 
     global_cfg = {
@@ -339,13 +329,14 @@ def test_cli_and_runtime_preserve_legacy_resolution(monkeypatch, local):
             "codex-native": {"command": "wrapper", "args": ["base"]},
         },
     }
+    local = {"model": "project", "harness": {"codex-native": {"args": []}}}
     monkeypatch.setattr(cli, "_load_global_config", lambda: global_cfg)
     monkeypatch.setattr(cli, "_load_local_config", lambda: local)
+    monkeypatch.setattr(_config_module, "load_global_config", lambda: global_cfg)
+    monkeypatch.setattr(_config_module, "load_local_config", lambda path=None: local)
     expected = _merge_effective_config(global_cfg, local)
     assert cli._load_effective_config() == expected
-    result = _config_module.resolve_effective_config(global_cfg, local)
-    assert result.config == expected
-    assert result.preferences == {}
+    assert load_effective_config() == expected
 
 
 def test_preference_adoption_requires_context_and_owns_project_layer():
@@ -370,17 +361,21 @@ def test_preference_adoption_requires_context_and_owns_project_layer():
 
 
 @pytest.mark.parametrize(
-    "project",
+    "harness,project",
     [
-        {"harness": "pi-native"},
-        {"harness": None},
-        {"model": None},
-        {"harness": {"default": None}},
-        {"harness": {"codex-native": None}},
-        {"harness": {"codex-native": {"args": None}}},
+        ("codex-native", {"harness": "pi-native"}),
+        ("codex-native", {"harness": None}),
+        ("codex-native", {"model": None}),
+        ("codex-native", {"harness": {"default": None}}),
+        ("codex-native", {"harness": {"codex-native": None}}),
+        ("codex-native", {"harness": {"codex-native": {"args": None}}}),
+        ("claude", {"harness": {"claude": None}}),
+        ("claude", {"harness": {"claude": {"args": None}}}),
+        ("claude", {"harness": {"claude": {"command": "local-wrapper"}}}),
     ],
 )
-def test_adopted_preferences_keep_legacy_project_clears(project):
+def test_adopted_preferences_keep_legacy_project_clears(harness, project):
+    from omnigent.harness_startup_config import resolve_harness_args
     from omnigent.preferences import (
         PreferenceContext,
         PreferenceIdentity,
@@ -393,8 +388,8 @@ def test_adopted_preferences_keep_legacy_project_clears(project):
     defaults = {
         "model": "model-a",
         "harness": {
-            "default": "codex-native",
-            "codex-native": {"args": ["base"]},
+            "default": harness,
+            harness: {"args": ["base"]},
         },
     }
     shared = PreferenceLayer(PreferenceScope.SHARED, identity, preferences_from_config(defaults))
@@ -411,6 +406,11 @@ def test_adopted_preferences_keep_legacy_project_clears(project):
     assert {
         key: item.value for key, item in result.preferences.items()
     } == preferences_from_config(result.config)
+    assert resolve_harness_args(
+        harness, ("--invocation",), cfg=result.config
+    ) == resolve_harness_args(
+        harness, ("--invocation",), cfg=_merge_effective_config(defaults, project)
+    )
     session = PreferenceLayer(PreferenceScope.SESSION, identity, shared.values)
     result = _config_module.resolve_effective_config(
         {},
@@ -419,3 +419,7 @@ def test_adopted_preferences_keep_legacy_project_clears(project):
         preference_layers=[shared, session],
     )
     assert preferences_from_config(result.config) == shared.values
+    assert resolve_harness_args(harness, ("--invocation",), cfg=result.config) == [
+        "base",
+        "--invocation",
+    ]

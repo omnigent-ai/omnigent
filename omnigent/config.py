@@ -145,22 +145,38 @@ def resolve_effective_config(
         PreferenceScope.PROJECT, preference_context.identity, preferences_from_config(local_cfg)
     )
     resolved = resolve_preferences(preference_context, (*preference_layers, project))
-    # Apply the legacy project's whole-value replacements to lower scopes too.
-    lower = {
+    resolved = {
         key: item
         for key, item in resolved.items()
-        if item.source not in (PreferenceScope.SESSION, PreferenceScope.PROJECT)
-        and key.kind != PreferenceKind.PLUGIN
-    }
-    lower_config: _Config = {}
-    _apply_preferences(lower_config, lower)
-    surviving = preferences_from_config(_merge_effective_config(lower_config, local_cfg))
-    resolved = {
-        key: item for key, item in resolved.items() if key not in lower or key in surviving
+        if item.source in (PreferenceScope.SESSION, PreferenceScope.PROJECT)
+        or not _project_masks_preference(local_cfg, key)
     }
     config = _without_portable_preferences(_merge_effective_config(global_cfg, local_cfg))
     _apply_preferences(config, resolved)
     return ResolvedConfig(config, resolved)
+
+
+def _project_masks_preference(cfg: _Config, key: PreferenceKey) -> bool:
+    """Apply explicit project replacements to lower scopes by canonical key."""
+    if key.kind == PreferenceKind.MODEL:
+        return key.name in cfg
+    if key.kind == PreferenceKind.PLUGIN or "harness" not in cfg:
+        return False
+    harness = cfg["harness"]
+    if not isinstance(harness, dict):
+        return True
+    if key.kind == PreferenceKind.HARNESS:
+        return "default" in harness
+
+    from omnigent.harness_aliases import canonicalize_harness
+
+    return any(
+        isinstance(name, str)
+        and name != "default"
+        and canonicalize_harness(name) == key.name
+        and (not isinstance(entry, dict) or "args" in entry)
+        for name, entry in harness.items()
+    )
 
 
 def _apply_preferences(

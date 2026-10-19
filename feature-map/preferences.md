@@ -72,6 +72,9 @@ uv run --no-sync pytest tests/test_config.py tests/test_harness_startup_config.p
 - `user-defaults`, `project-defaults`: the config loader tests cover file
   precedence and clears; CLI tests cover writes, removal, inspection, and scalar
   harness migration. Removing a project value allows the user default to apply.
+  The adopted-preference clear matrix also covers aliases such as `claude` for
+  `claude-sdk`: clearing the entry or its arguments removes inherited arguments,
+  a command-only override keeps them, and a session choice can still override.
 - `launch-choice`: CLI dispatch tests check explicit choices and Pi argument
   ordering. The native startup tests check Claude/Codex pass-through arguments
   remain unmerged until the runner, so the configured base is applied once.
