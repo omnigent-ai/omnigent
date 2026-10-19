@@ -157,9 +157,11 @@ exists. Add an owner/next step for unresolved rows.
   unexecuted checks are Not run. Preserve the bench's raw verdicts beside the
   acceptance result. Failures must not be relabeled as coverage gaps.
 - **Evidence** includes the version/configuration record, actual command and
-  result, redacted request fields or process/session transcript, and screenshots
-  or recordings for browser claims. Keep failed attempts; do not publish tokens.
-  Use GitHub attachments for demo media, not committed evidence images.
+  result, redacted request fields or process/session transcript, and media for
+  user-visible claims following the [PR demo standard](README.md#pr-demo-standard).
+  Put the recording and its evidence caption in Demo; link it from the relevant
+  table rows without treating one recording as proof for unshown workflows.
+  Keep failed attempts; do not publish tokens.
 
 ## Gotchas
 

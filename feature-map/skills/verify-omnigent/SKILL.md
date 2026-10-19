@@ -110,6 +110,13 @@ not evidence that the journeys ran. The proof standards are in the
 [feature map README](../../README.md#proof-and-coverage). Mock runs prove
 Omnigent's integration with Claude and Codex, not a live vendor model.
 
+For PR evidence, follow the [demo standard](../../README.md#pr-demo-standard):
+use a short real-app recording for interactive workflows, screenshots for
+static visuals, and nonvisual results for backend/docs/tests. Caption the
+revision, harness/version, configuration, mock/live provider and observed
+outcome. Upload redacted captures as GitHub attachments in Demo, not repository
+files; state recording/upload limitations and manual steps when unavailable.
+
 ## Cleanup
 
 `verify-env stop` stops only this instance's supervisor, which stops its own
