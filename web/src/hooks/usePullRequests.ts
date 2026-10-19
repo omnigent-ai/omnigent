@@ -390,8 +390,8 @@ export function computePullRequestPollInterval(info: PullRequestInfo | undefined
 /**
  * Fetch GitHub context (repo, branch, base ref, PR + CI summary) for a session.
  *
- * Disabled when the runner is known offline. Retries the runner-offline case
- * with capped backoff so a cold-booting runner resolves before any error UI.
+ * Waits for a serving source (runner or host tunnel) before fetching, then
+ * retries transient runner-offline errors with capped backoff.
  *
  * Refetch is driven two ways, both harness-agnostic:
  *   - Turn end: a trailing invalidate on the focused session's active→idle
@@ -403,9 +403,6 @@ export function computePullRequestPollInterval(info: PullRequestInfo | undefined
  *     states poll and which rest. It catches changes a turn boundary can't
  *     (setup fixed outside the app, CI progressing after the turn). Backgrounded
  *     tabs pause (`refetchIntervalInBackground: false`).
- *
- * Disabled when the runner is known offline. Retries the runner-offline case
- * with capped backoff so a cold-booting runner resolves before any error UI.
  */
 export function usePullRequestInfo(
   rawConversationId: string | undefined,
@@ -421,7 +418,7 @@ export function usePullRequestInfo(
   return useQuery({
     queryKey: ["github-info", conversationId, ...(options?.prUrl ? [options.prUrl] : [])],
     queryFn: () => fetchPullRequestInfo(conversationId!, options?.prUrl),
-    enabled: !!conversationId && serveable !== false,
+    enabled: !!conversationId && serveable === true,
     retry: shouldRetryRunnerOffline,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
@@ -514,7 +511,7 @@ export function usePullRequestChangedFiles(
     queryFn: () => fetchPullRequestChangedFiles(conversationId!, prUrl),
     // Only a PR has files to show — skip the call in every no-PR / unavailable
     // / unauthenticated state (the panel shows an empty state instead).
-    enabled: !!conversationId && hasPr && serveable !== false,
+    enabled: !!conversationId && hasPr && serveable === true,
     retry: shouldRetryRunnerOffline,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
@@ -591,7 +588,7 @@ export function usePullRequestDiff(
   return useQuery({
     queryKey: ["github-pr-diff", conversationId, ...(prUrl ? [prUrl, revision] : [])],
     queryFn: () => fetchPullRequestDiff(conversationId!, prUrl),
-    enabled: !!conversationId && hasPr && serveable !== false,
+    enabled: !!conversationId && hasPr && serveable === true,
     retry: shouldRetryRunnerOffline,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
