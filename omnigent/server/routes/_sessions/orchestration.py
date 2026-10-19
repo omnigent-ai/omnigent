@@ -8340,6 +8340,41 @@ async def _relay_runner_live_elsewhere(
     )
 
 
+async def _relay_session_rebound(
+    session_id: str,
+    conversation_store: ConversationStore,
+    runner_id: str | None,
+) -> bool:
+    """
+    Check whether the session is now bound to a runner other than *runner_id*.
+
+    A rebind on this replica cancels the old relay, but a rebind served by
+    another replica cannot, so this relay can outlive the move and later see
+    its old runner exit. That exit says nothing about the new runner's turn.
+
+    :param session_id: Session/conversation identifier.
+    :param conversation_store: Store used to read runner metadata.
+    :param runner_id: Runner whose transport this relay lost, e.g.
+        ``"runner_abc123"``. ``None`` never counts as rebound.
+    :returns: ``True`` when the stored binding names a different runner;
+        ``False`` when it names *runner_id*, none, or cannot be read.
+    """
+    if runner_id is None:
+        return False
+    try:
+        liveness = await asyncio.to_thread(conversation_store.get_runner_liveness, session_id)
+    except Exception:  # noqa: BLE001 — fall through to the mid-turn check instead
+        _logger.warning(
+            "Relay: runner binding lookup failed for session=%s",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return False
+    bound_runner_id = liveness[0] if liveness is not None else None
+    return bound_runner_id is not None and bound_runner_id != runner_id
+
+
 async def _relay_runner_stream(
     session_id: str,
     runner_client: httpx.AsyncClient,
@@ -8381,11 +8416,14 @@ async def _relay_runner_stream(
     outage_id: str | None = None
     outage_runner_id: str | None = None
     outage_turn_id: str | None = None
+    # Whether the session was already bound to another runner when the outage began.
+    outage_bound_elsewhere = False
     retries = 0
 
     def _on_stream_ready() -> None:
         """Record one ready-confirmed recovery for the active outage."""
         nonlocal outage_id, outage_started, outage_runner_id, outage_turn_id
+        nonlocal outage_bound_elsewhere
         if outage_id is None or outage_started is None:
             # The first ready heartbeat is ordinary relay startup, not recovery.
             return
@@ -8397,6 +8435,7 @@ async def _relay_runner_stream(
         outage_started = None
         outage_runner_id = None
         outage_turn_id = None
+        outage_bound_elsewhere = False
         attributes = {
             "outage_id": recovered_id,
             "runner_id": recovered_runner_id,
@@ -8458,6 +8497,11 @@ async def _relay_runner_stream(
                         telemetry_schema=_RELAY_TELEMETRY_SCHEMA,
                     ),
                 )
+                # Read at the loss itself: a move during the outage can be this
+                # runner's own crash recovery, whose interrupted turn must still fail.
+                outage_bound_elsewhere = not lost.intentional and await _relay_session_rebound(
+                    session_id, conversation_store, runner_id
+                )
             if not lost.intentional and now + _RELAY_RETRY_INTERVAL_S < deadline:
                 retries += 1
                 _logger.info(
@@ -8487,6 +8531,10 @@ async def _relay_runner_stream(
                 decision = "handed_off"
             elif await _relay_runner_live_elsewhere(session_id, conversation_store):
                 decision = "live_elsewhere"
+            elif outage_bound_elsewhere and await _relay_session_rebound(
+                session_id, conversation_store, outage_runner_id
+            ):
+                decision = "rebound"
             elif await _runner_disconnect_requires_failure(
                 session_id, conversation_store, origin="runner_disconnected_mid_turn"
             ):
@@ -8545,6 +8593,16 @@ async def _relay_runner_stream(
                 _logger.info(
                     "Relay: runner live on another replica for session=%s; no failure to report",
                     session_id,
+                    extra={"session_id": session_id},
+                )
+            elif decision == "rebound":
+                # The session had moved to another runner before this one was lost,
+                # on a replica that could not cancel this relay; that runner owns the turn.
+                _relinquish_session_live_state(session_id)
+                _logger.info(
+                    "Relay: session=%s moved off runner %s; no failure to report",
+                    session_id,
+                    outage_runner_id,
                     extra={"session_id": session_id},
                 )
             elif decision == "idle_no_failure":

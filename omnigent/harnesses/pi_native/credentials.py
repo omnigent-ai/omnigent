@@ -76,7 +76,6 @@ from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 from omnigent.util.reasoning_effort import (
     EFFORT_CLEAR_VALUES,
     PI_EFFORTS,
-    PI_THINKING_OFF,
     to_pi_thinking_level,
     validate_effort,
 )
@@ -239,6 +238,10 @@ class PiProviderConfig:
         Databricks OAuth token). Pi still launches — its ``!command`` apiKey may
         recover at request time — but the caller surfaces this so a session that
         would otherwise fail silently tells the user how to re-authenticate.
+    :param model_notice: An informational notice about how the requested model
+        was routed (e.g. a pick qualified by another configured provider that is
+        requested from the serving provider instead). The session still works,
+        so the caller surfaces it as a neutral notice, not an error.
     :param databricks_surfaces: Base URLs of the Databricks gateway surfaces
         reachable with this provider's credential, keyed by surface. Set by the
         Databricks builders; lets a model the live catalog didn't list be routed
@@ -257,6 +260,7 @@ class PiProviderConfig:
     api_key: str
     auth_header: bool
     credential_warning: str | None = None
+    model_notice: str | None = None
     # Full model list for providers that expose multiple models (e.g. the
     # Databricks Anthropic gateway). Excluded from __hash__ so the frozen
     # dataclass stays hashable even though list[dict] is not hashable.
@@ -449,12 +453,10 @@ def _read_json_object(path: Path) -> dict[str, object]:
 
 
 def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str, object]]:
-    """Enumerate the models Pi's own login can use (the unmanaged fallback).
+    """List Pi's logged-in and keyed custom models for the prelaunch picker.
 
-    When no omnigent-managed provider is configured, the launched Pi runs on
-    its own credentials, so the pre-launch picker must offer the models that
-    login can actually drive: Pi's ``models-store.json`` catalog filtered to
-    providers with an ``auth.json`` entry.
+    Declared models.json entries override cached names. Reserved Omnigent
+    provider IDs are excluded because own-login launch strips their prefixes.
 
     :param agent_dir: Pi agent dir override (tests); defaults to the host's
         own Pi agent dir.
@@ -464,11 +466,24 @@ def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str, 
     """
     root = agent_dir if agent_dir is not None else _global_pi_agent_dir()
     logged_in = set(_read_json_object(root / "auth.json"))
-    if not logged_in:
-        return []
+    catalogs: list[tuple[str, object]] = [
+        (provider_id, payload)
+        for provider_id, payload in _read_json_object(root / "models-store.json").items()
+        if provider_id in logged_in
+    ]
+    declared = _read_json_object(root / "models.json").get("providers")
+    for provider_id, payload in declared.items() if _is_str_object_dict(declared) else ():
+        api_key = payload.get("apiKey") if _is_str_object_dict(payload) else None
+        if provider_id in logged_in or (isinstance(api_key, str) and api_key):
+            # Appended after the models-store rows so declared models.json names win.
+            catalogs.append((provider_id, payload))
     options: dict[str, dict[str, object]] = {}
-    for provider_id, payload in _read_json_object(root / "models-store.json").items():
-        if provider_id not in logged_in or not _is_str_object_dict(payload):
+    for provider_id, payload in catalogs:
+        if not _is_str_object_dict(payload):
+            continue
+        if provider_id in _PI_MANAGED_PROVIDER_IDS:
+            # pi_own_login_model_arg() strips these ids as a stale managed pick,
+            # so the launch could not address such a row.
             continue
         models = payload.get("models")
         for model in models if isinstance(models, list) else []:
@@ -797,7 +812,6 @@ def _databricks_openai_provider(
             "supportsDeveloperRole": False,
             "supportsStore": False,
             "supportsStrictMode": False,
-            "supportsReasoningEffort": False,
             # stream_options is OpenAI-specific; Gemini and other non-OpenAI
             # models reject it with 400.
             "supportsUsageInStreaming": False,
@@ -1682,7 +1696,7 @@ def resolve_pi_native_provider(
             )
         return replace(resolved, inference_bound=True)
 
-    unmanaged_prefix_warning: str | None = None
+    unmanaged_prefix_notice: str | None = None
     try:
         # Pi is multi-family; ``omnigent setup`` marks defaults per family, not
         # for ``pi``. Use the shared house-pattern selection so pi resolves its
@@ -1720,13 +1734,13 @@ def resolve_pi_native_provider(
             # OpenRouter, "zai-org/GLM-4.7") and must stay verbatim.
             if bare and isinstance(providers, dict) and prefix in providers:
                 if prefix != entry.name:
-                    unmanaged_prefix_warning = (
+                    unmanaged_prefix_notice = (
                         f"The model override '{model}' names provider "
                         f"'{prefix}', but this Pi session is served by "
                         f"provider '{entry.name}'; the model '{bare}' was "
                         f"requested from '{entry.name}' instead."
                     )
-                    _LOGGER.warning("pi-native: %s", unmanaged_prefix_warning)
+                    _LOGGER.info("pi-native: %s", unmanaged_prefix_notice)
                 model = bare
         if entry.kind == DATABRICKS_KIND:
             resolved = _databricks_pi_provider(entry, model=model)
@@ -1777,15 +1791,8 @@ def resolve_pi_native_provider(
                 resolved = _databricks_pi_provider(db_entry, model=model)
             if resolved is None:
                 _LOGGER.warning("pi-native: no usable provider found; Pi will use its own login.")
-        if resolved is not None and unmanaged_prefix_warning is not None:
-            resolved = replace(
-                resolved,
-                credential_warning=(
-                    unmanaged_prefix_warning
-                    if resolved.credential_warning is None
-                    else f"{unmanaged_prefix_warning}\n\n{resolved.credential_warning}"
-                ),
-            )
+        if resolved is not None and unmanaged_prefix_notice is not None:
+            resolved = replace(resolved, model_notice=unmanaged_prefix_notice)
         return resolved
     except Exception:  # noqa: BLE001 — any resolution failure must not break launch
         # Any failure (malformed config, duplicate per-family default, or an
@@ -1877,9 +1884,8 @@ def pi_native_provider_launch(
     :param agent_dir: The managed Pi config dir for this session.
     :param provider: The resolved provider config.
     :param reasoning_effort: Canonical omnigent effort for the session, e.g.
-        ``"high"``. Passed as ``--thinking`` on the primary provider; ignored
-        (with a warning) on a gateway-routed model, whose thinking must stay
-        off for text to surface.
+        ``"high"``. Passed as ``--thinking`` on the selected provider; Pi
+        applies the model's reasoning capabilities.
     :param selection: Optional picker value naming a generated provider and
         model. When that provider no longer serves the model, the provider that
         does is used instead.
@@ -1916,14 +1922,8 @@ def pi_native_provider_launch(
     else:
         model_provider_id = _default_model_provider_id(provider, rendered)
     write_pi_models_config(agent_dir, provider, rendered)
-    # Copy the user's global Pi settings but suppress defaultThinkingLevel.
-    # In TUI mode Pi applies the setting from ~/.pi/agent/settings.json; for
-    # non-Claude models via openai-completions, any thinking level causes the
-    # Databricks gateway to return 400 (reasoning_effort is sent even when
-    # supportsReasoningEffort is false in the compat block, because TUI mode
-    # applies the session-level thinking before the compat check fires).
-    # Passing None in the overlay makes _deep_merge_settings write null for the
-    # key; Pi's getDefaultThinkingLevel() returns null (falsy) → no thinking.
+    # Session effort or Pi's default selects thinking; don't inherit a global
+    # thinking preference that may belong to a different provider.
     from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir
 
     overlay: dict[str, object] = {"defaultThinkingLevel": None}
@@ -1960,20 +1960,6 @@ def pi_native_provider_launch(
             _LOGGER.warning("pi-native: %s", exc)
         if effort is not None:
             thinking = to_pi_thinking_level(effort)
-    # For non-Claude models on openai-completions/responses, disable thinking.
-    # Gemini and other Databricks models return reasoning_tokens in their
-    # responses; Pi's TUI mode applies thinking even with defaultThinkingLevel:null
-    # in settings, causing the agent loop to complete without surfacing the text
-    # content to the extension. Explicitly passing --thinking off ensures the
-    # completions handler doesn't activate the thinking path.
-    if model_provider_id != provider.provider_id:
-        args.extend(["--thinking", PI_THINKING_OFF])
-        if thinking is not None and thinking != PI_THINKING_OFF:
-            effort_warning = (
-                f"effort ignored for gateway-routed model {provider.model}: "
-                "thinking disabled to keep text surfacing"
-            )
-            _LOGGER.warning("pi-native: %s", effort_warning)
-    elif thinking is not None:
+    if thinking is not None:
         args.extend(["--thinking", thinking])
     return PiNativeLaunch(env=env, args=args, effort_warning=effort_warning)

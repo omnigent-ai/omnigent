@@ -68,6 +68,7 @@ import {
   getSessionSlim,
   getSessionUsage,
   fetchSessionItemsPage,
+  HOST_OFFLINE_CODE,
   INITIAL_WINDOW_ITEMS,
   interrupt as interruptSession,
   openSessionStream,
@@ -609,6 +610,8 @@ export interface QueuedMessage {
   stableId?: string;
   /** A failed send stays queued until the user explicitly retries or edits it. */
   requiresRetry?: boolean;
+  /** The session's host was offline; held until it reconnects, then sent. */
+  waitingForHost?: boolean;
 }
 
 /**
@@ -1178,6 +1181,8 @@ export interface ChatActions {
    * turn) when the session next goes idle — see the `session_status` handler.
    */
   enqueueMessage: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
+  /** Let a conversation's messages held for an offline host flush again. */
+  releaseHostHeldMessages: (conversationId: string) => void;
   /** Remove a queued message by id (the strip's per-row delete). */
   dequeueMessage: (queueId: string) => void;
   /**
@@ -2090,6 +2095,21 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }));
   },
 
+  releaseHostHeldMessages: (conversationId) => {
+    setActive((s) => {
+      if (!s.queuedMessages.some((m) => m.conversationId === conversationId && m.waitingForHost)) {
+        return {};
+      }
+      return {
+        queuedMessages: s.queuedMessages.map((m) =>
+          m.conversationId === conversationId && m.waitingForHost
+            ? { ...m, waitingForHost: false }
+            : m,
+        ),
+      };
+    });
+  },
+
   reorderQueuedMessage: (queueId, beforeQueueId) => {
     setActive((s) => {
       const moved = s.queuedMessages.find((m) => m.queueId === queueId);
@@ -2214,7 +2234,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // so an undrained message from another conversation can sit at index 0; a
     // head-only guard would let it block this conversation's messages forever.
     const head = s.queuedMessages.find((m) => m.conversationId === s.conversationId);
-    if (head === undefined || head.requiresRetry) return;
+    if (head === undefined || head.requiresRetry || head.waitingForHost) return;
     // Remove it BEFORE the POST so a re-entrant flush can't double-send.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
     void s.send(head.text, head.agentId ?? s.boundAgentId, head.files, queuedSendOptions(head));
@@ -2277,7 +2297,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const cooldownUntil = backgroundFlushCooldownUntil.get(conversationId);
       if (cooldownUntil !== undefined && cooldownUntil > now) continue;
       const head = get().queuedMessages.find((m) => m.conversationId === conversationId);
-      if (head === undefined || head.requiresRetry) continue;
+      if (head === undefined || head.requiresRetry || head.waitingForHost) continue;
       const compactAgentId = head.agentId ?? local?.boundAgentId;
       if (head.command === "compact" && !compactAgentId) continue;
 
@@ -2671,14 +2691,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }));
         initialDispatched = true;
       }
-      const postResult = await postEvent(sessionId, {
-        type: "message",
-        data: {
-          role: "user",
-          content: serverContent,
-          stable_id: stableId,
+      const postResult = await postEvent(
+        sessionId,
+        {
+          type: "message",
+          data: {
+            role: "user",
+            content: serverContent,
+            stable_id: stableId,
+          },
         },
-      });
+        { holdWhenHostOffline: true },
+      );
       // Policy denied the input — the server returned immediately
       // without starting a turn or persisting the user message, so
       // no session.input.consumed will reconcile this exact optimistic
@@ -2749,8 +2773,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // suppresses the default surfacing below — no restored draft, no error
       // block in the parent transcript. The bubble rollback + status settle still
       // run so the parent isn't left mid-send.
-      const callerHandlesError = opts?.onError !== undefined;
-      opts?.onError?.(message);
+      // The host is offline and the server recorded nothing: queue the message
+      // ahead of this conversation's others and send it once the host is back.
+      const holdTarget = postedSessionId ?? submitConversationId;
+      const heldForHost =
+        err instanceof ApiError && err.code === HOST_OFFLINE_CODE && holdTarget !== null;
+      if (heldForHost) {
+        holdSendForHost(holdTarget, message, {
+          text,
+          stableId,
+          ...(agentId ? { agentId } : {}),
+          ...(files && files.length > 0 ? { files } : {}),
+          ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+        });
+      }
+      const callerHandlesError = heldForHost || opts?.onError !== undefined;
+      if (!heldForHost) opts?.onError?.(message);
       // Hand the failed message back to the composer so the user can retry it —
       // a failed send has no server-side record, so nothing else would restore
       // it. Keyed by the session it was meant for, so it lands in the right
@@ -3627,6 +3665,39 @@ function rejectBusyCompact(conversationId: string | null): boolean {
   if (state?.status !== "streaming" && state?.sessionStatus !== "running") return false;
   toast.error("Compact is disabled while a chat is in progress", { richColors: true });
   return true;
+}
+
+/**
+ * Queue a send the server refused because the session's host is offline. It
+ * waits ahead of the conversation's other queued messages until
+ * `releaseHostHeldMessages` runs, then flushes like any queued message.
+ */
+function holdSendForHost(
+  conversationId: string,
+  notice: string,
+  message: Omit<QueuedMessage, "queueId" | "conversationId">,
+): void {
+  queueSeq += 1;
+  const held: QueuedMessage = {
+    ...message,
+    queueId: `q_${queueSeq}`,
+    conversationId,
+    waitingForHost: true,
+  };
+  setActive((s) => {
+    const at = s.queuedMessages.findIndex(
+      (m) => m.conversationId === conversationId && !m.waitingForHost,
+    );
+    const index = at === -1 ? s.queuedMessages.length : at;
+    return {
+      queuedMessages: [...s.queuedMessages.slice(0, index), held, ...s.queuedMessages.slice(index)],
+    };
+  });
+  setterFor(conversationId)((s) => {
+    const last = s.blocks[s.blocks.length - 1];
+    if (last?.type === "error" && last.code === HOST_OFFLINE_CODE) return {};
+    return { blocks: [...s.blocks, makeClientErrorBlock(notice, HOST_OFFLINE_CODE)] };
+  });
 }
 
 function queuedSendOptions(

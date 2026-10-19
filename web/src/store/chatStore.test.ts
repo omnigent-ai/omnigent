@@ -3105,6 +3105,69 @@ describe("chatStore — send (first-send ordering)", () => {
     });
   });
 
+  it("holds a send whose host is offline and sends it once released", async () => {
+    // The server refuses (and records nothing) only because this client asks to
+    // hold: the message must wait in the queue, not land back in the composer.
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      boundAgentId: "agent_xyz",
+      abortController: new AbortController(),
+      status: "idle",
+      sessionStatus: "idle",
+      blocks: [],
+      pendingUserMessages: [],
+      queuedMessages: [],
+    });
+    const holdHeaders: (string | null)[] = [];
+    let hostBack = false;
+    fetchMock.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/events")) {
+        holdHeaders.push(new Headers(init?.headers).get("x-omnigent-hold-when-host-offline"));
+        if (!hostBack) {
+          return mockResponse(
+            {
+              error: {
+                code: "host_offline",
+                message:
+                  "The host for this session is offline. Your message will be sent when it reconnects.",
+              },
+            },
+            { ok: false, status: 503 },
+          );
+        }
+        return mockResponse({ queued: true, item_id: "item_1" });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await useChatStore.getState().send("hi", "agent_xyz");
+
+    let state = useChatStore.getState();
+    expect(holdHeaders).toEqual(["on"]);
+    expect(state.failedSendDraft).toBeFalsy();
+    expect(state.queuedMessages).toHaveLength(1);
+    expect(state.queuedMessages[0]).toMatchObject({
+      text: "hi",
+      conversationId: "conv_existing",
+      waitingForHost: true,
+    });
+    expect(state.blocks.filter((b) => b.type === "error")).toMatchObject([
+      { code: "host_offline" },
+    ]);
+
+    // Still held: an idle flush must not post it into the offline host.
+    useChatStore.getState().maybeFlushQueuedHead();
+    expect(holdHeaders).toHaveLength(1);
+
+    hostBack = true;
+    useChatStore.getState().releaseHostHeldMessages("conv_existing");
+    // ChatPage's level-triggered flush effect runs on the queue change.
+    useChatStore.getState().maybeFlushQueuedHead();
+    await vi.waitFor(() => expect(holdHeaders).toEqual(["on", "on"]));
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
   it("surfaces the server's runner-unavailable cause verbatim when it names one", async () => {
     // Preserve the server's phase-specific detail in the error block.
     const causefulDetail =

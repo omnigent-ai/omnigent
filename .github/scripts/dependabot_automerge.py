@@ -194,6 +194,7 @@ def require_reports(repository: str, candidate: dict) -> None:
     # Require actual CI completion, even if Merge Ready treats an absent
     # path-filtered check as skippable while its workflow is being created.
     completed_runs = {}
+    policy = json.loads(POLICY.read_text())
     for workflow in sorted(set(candidate["workflows"]) | {"ci.yml", "lint.yml", "trivy.yml"}):
         latest, jobs = latest_workflow(repository, head, workflow)
         require(
@@ -202,7 +203,14 @@ def require_reports(repository: str, candidate: dict) -> None:
             and latest["conclusion"] == "success",
             f"Latest {workflow} run did not succeed",
         )
-        required_jobs = json.loads(POLICY.read_text())["workflow_test_jobs"][workflow]
+        required_jobs = (
+            policy["dependency_workflow_test_jobs"]
+            .get(candidate["ecosystem"], {})
+            .get(workflow, policy["workflow_test_jobs"][workflow])
+        )
+        # Older heads ran the full Python matrix before scope selection existed.
+        if required_jobs == ["CI scope"] and not any(job["name"] == "CI scope" for job in jobs):
+            required_jobs = policy["workflow_test_jobs"][workflow]
         for pattern in required_jobs:
             matching = [job for job in jobs if fnmatch.fnmatchcase(job["name"], pattern)]
             require(

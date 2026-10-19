@@ -185,6 +185,7 @@ import {
 import { useSession } from "@/hooks/useSession";
 import { useOpenGithubTab } from "@/shell/FileViewerContext";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useReleaseHostHeldSends } from "@/hooks/useReleaseHostHeldSends";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
 import {
   type LivenessRow,
@@ -2446,6 +2447,8 @@ function ComposerImpl(
   // No server session behind a temp id — gate goal/workspace fetches on it so
   // the create window issues no `/v1/sessions/temp:*` requests.
   const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
+  // A send held while the host was offline goes out once the host is back.
+  useReleaseHostHeldSends(composerSessionId);
   const { session: composerSession } = useSession(composerSessionId);
   const composerBranch = useChatStore((s) => s.gitBranch);
   const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);

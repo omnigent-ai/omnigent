@@ -300,16 +300,27 @@ function registerBrowserIpc({
     if (typeof conversationId !== "string" || !conversationId) {
       return { ok: false, error: "conversationId is required" };
     }
-    const navigate = (registry) =>
-      registry.openOrNavigate(conversationId, url, bounds, {
+    const isCurrentNavigation = g.registry.beginAgentNavigation(conversationId);
+    const cancelled = { ok: false, created: false, error: "navigation superseded or closed" };
+    const isCurrent = () => isCurrentNavigation() && isPinnedOriginSender(event);
+    const navigate = async (registry) => {
+      // The first-party renderer supplies the source-session host; main owns
+      // the target and eligibility. Caller exception flags never establish identity.
+      const agentContext = getAgentContextForEvent(event, opts?.sourceHostId);
+      if (url) {
+        const verdict = await registry.checkAgentNavigation(conversationId, url, agentContext);
+        if (!isCurrent()) return cancelled;
+        if (!verdict.ok) return verdict;
+      }
+      return registry.openOrNavigate(conversationId, url, bounds, {
         force: !!opts?.force,
         // Renderer flags do not establish user intent.
         agent: true,
-        // The first-party renderer supplies the source-session host; main owns
-        // the target and eligibility. Caller exception flags never establish identity.
-        agentContext: getAgentContextForEvent(event, opts?.sourceHostId),
+        agentContext,
       });
-    let r = navigate(g.registry);
+    };
+    let r = await navigate(g.registry);
+    if (!isCurrent()) return cancelled;
     let recovered = false;
     if (!r.ok && opts?.agent) {
       try {
@@ -324,11 +335,14 @@ function registerBrowserIpc({
         recovered = false;
       }
     }
+    if (!isCurrent()) return cancelled;
     if (recovered) {
       // Recovery updates main-owned identity, so rebuild the context and ask
       // the registry to evaluate the same navigation once more.
       const refreshed = gateRegistry(event);
-      if (!refreshed.error) r = navigate(refreshed.registry);
+      if (refreshed.error || refreshed.registry !== g.registry) return cancelled;
+      r = await navigate(refreshed.registry);
+      if (!isCurrent()) return cancelled;
     }
     // On first creation, wire nav listeners here (not in the registry factory,
     // which stays Electron-free) so the URL bar can live-track the real url.
