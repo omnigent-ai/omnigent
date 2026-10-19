@@ -4503,7 +4503,12 @@ function sessionBindingPatch(
     codexModelOptions: session.codexModelOptions ?? [],
     terminalPending: session.terminalPending ?? false,
     sandboxStatus: session.sandboxStatus ?? null,
-    startupPending: session.labels?.["omnigent.startup"] === "pending",
+    // "ready" with saved inputs left: a native first input awaits its transcript
+    // receipt, and the server still saves new messages behind it.
+    startupPending:
+      session.labels?.["omnigent.startup"] === "pending" ||
+      (session.labels?.["omnigent.startup"] === "ready" &&
+        (session.pendingInputs ?? []).length > 0),
     ...mcpStartupSnapshotPatch(session, state, launchBeforeFetch),
   };
 }

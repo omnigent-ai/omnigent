@@ -462,7 +462,9 @@ class ManagedStartupInputs:
                 session_id,
                 item.id,
                 (
-                    "Delivery could not be confirmed; check the terminal before resending. "
+                    "Delivery could not be confirmed, so later messages wait behind it. "
+                    "Check the terminal; if the agent never got it, press Stop, which "
+                    "also clears the waiting messages, then send them again. "
                     if uncertain
                     else "The message is saved but could not be delivered. "
                 )
