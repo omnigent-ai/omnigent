@@ -11,6 +11,7 @@ const {
   readArcaStatus,
   resolveArcaPath,
   runArcaExtend,
+  runDbcertRefresh,
   startArcaConnect,
   startArcaLogin,
 } = require("../src/arca");
@@ -141,6 +142,47 @@ describe("arca extend command", () => {
         ]);
       }),
     );
+  });
+});
+
+describe("dbcert refresh", () => {
+  const dbcertDeps = (outputs) => ({
+    ...commandDeps(outputs),
+    resolveDbcertPath: () => "/bin/dbcert",
+  });
+
+  it("forces a new certificate and names Omnigent as the caller", async () => {
+    const deps = dbcertDeps([{ stdout: "All credentials successfully written" }]);
+    assert.deepEqual(await runDbcertRefresh(deps), { ok: true });
+    assert.deepEqual(deps.calls, [["--force", "--caller-name", "omnigent"]]);
+  });
+
+  it("reports the last line dbcert printed when it fails", async () => {
+    const deps = dbcertDeps([{ code: 1, stderr: "Opening browser\nlogin was canceled\n" }]);
+    assert.deepEqual(await runDbcertRefresh(deps), { ok: false, error: "login was canceled" });
+  });
+
+  it("reports a missing dbcert without spawning", async () => {
+    const deps = { ...dbcertDeps([]), resolveDbcertPath: () => null };
+    assert.match((await runDbcertRefresh(deps)).error, /not found/);
+    assert.deepEqual(deps.calls, []);
+  });
+
+  it("ends an abandoned sign-in", async () => {
+    const child = fakeConnectChild();
+    const keepAlive = setTimeout(() => {}, 1000);
+    try {
+      const result = await runDbcertRefresh({
+        resolveDbcertPath: () => "/bin/dbcert",
+        spawn: () => child,
+        timeoutMs: 5,
+        killGraceMs: 5,
+      });
+      assert.deepEqual(result, { ok: false, error: "The dbcert sign-in timed out." });
+      assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+    } finally {
+      clearTimeout(keepAlive);
+    }
   });
 });
 
