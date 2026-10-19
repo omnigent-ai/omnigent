@@ -41,8 +41,10 @@ starts at `direct-link` and performs these actions in order:
 
 1. Read the heading, ordered list, table, and original code block.
 2. Create another Python code block and type two lines; verify the caret stays
-   inside it and autosave submits the changed Markdown.
-3. Reload and verify the edit is returned by the mock filesystem.
+   inside it. Change the original block's language with the pointer and the new
+   block's language with the keyboard, then verify autosave submits the changes.
+3. Reload and verify the edit and fence language are returned by the mock
+   filesystem.
 4. Find the edited text and verify exactly one match.
 5. Switch through Source, Preview, and Edit, retaining the changed text.
 6. Resize from desktop to phone and back, retaining the saved content.
@@ -92,7 +94,11 @@ entry point, fixture, and whether APIs were mocked. Keep artifacts out of Git.
 256 KiB. Each test writes `markdown-load.json` beside its recording: fixture hash,
 actual bytes, browser version, viewport, editor count, selection-read count,
 longest main-thread task, and navigation-to-ready time through two animation
-frames. The load runs use real time and no slow-motion or simulated clock.
+frames. Readiness waits directly for the visible editor's terminal marker;
+locator assertions can build a full accessibility snapshot and inflate timings.
+Results carry `readiness_probe: terminal-marker`; older results without this
+field include assertion overhead and must be remeasured for comparisons.
+The load runs use real time and no slow-motion or simulated clock.
 Report repeated samples for performance decisions; a single video is illustrative.
 This does not cover every Markdown shape or establish a safe 1 MiB limit.
 
