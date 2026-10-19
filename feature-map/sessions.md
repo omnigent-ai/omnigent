@@ -73,7 +73,9 @@ the header menu), and each place is a separate entry point.
   unchanged.
 - `message-recovery`: a message racing initial runner binding or replacement
   reaches the available runner without a false failed turn. Native sessions
-  initialize before delivery; SDK sub-agents reuse their loaded session state.
+  initialize before delivery, including when an idle reconnect already restored
+  the tunnel. Later messages reuse that generation's completed initialization;
+  SDK sub-agents reuse their loaded session state.
 - `import-progress`: import recent sessions or one session by ID from an online
   machine. Settings shows a spinner and count; the sidebar heading retains
   progress after leaving Settings. Results stay compact, with expandable failure
@@ -561,6 +563,10 @@ plain `uv run pytest`, which starts a private server for the test.
   distinguishes a replacement live on another replica from a failed launch
   with an old heartbeat or a local heartbeat. This controls liveness evidence;
   it does not drive an actual cross-replica host migration.
+- **`message-recovery`, already-connected native runner (server integration):**
+  `tests/server/integration/test_session_host_launch.py::test_relaunch_posts_session_init_before_forwarding_message`
+  checks Claude and Codex first-input initialization, suppression of replaying
+  persisted input, and reuse on the next message without repeating child recovery.
 - **`message-recovery`, rotated Codex session (own environment):**
   `tests/e2e/test_codex_rotated_bridge_relaunch_e2e.py::test_rotated_codex_session_relaunches_into_its_bridge_directory`
   drives `/new` in real Codex, stops that session's host-launched runner, then
@@ -603,6 +609,8 @@ plain `uv run pytest`, which starts a private server for the test.
   Grouping, feature gating, drag persistence, and live updates also run in
   `tests/e2e_ui/sessions/test_canvas_page.py`, with selection churn in
   `tests/e2e_ui/sessions/test_canvas_selected_highlight_persists.py::test_clicked_card_keeps_selected_highlight_across_live_updates`.
+  The selection journey covers duplicate titles and a long list whose nodes
+  move outside the rendered viewport after a live update.
   Unit tests in `web/src/canvas/canvasNavigation.test.ts` distinguish Canvas
   from similarly named routes under standalone and embedded mount paths.
   `web/src/canvas/CanvasWorkspace.test.tsx` verifies that dismissing a nested

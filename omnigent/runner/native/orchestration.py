@@ -68,6 +68,7 @@ from omnigent.harness_plugins import native_provider_for_key
 from omnigent.host.harness_startup import env_wrapper_chdir, env_wrapper_environment
 from omnigent.inner.terminal import build_terminal_os_env_spec, terminal_pane_environment
 from omnigent.models.model_override import validate_model_override
+from omnigent.native.failure_telemetry import FailureContext, normalize_failure_context
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_terminal_name,
@@ -2656,6 +2657,7 @@ async def _auto_create_pi_terminal(
     # never touching the user's global ``~/.pi/agent``.
     credential_warning: str | None = None
     effort_notice: str | None = None
+    model_notice: str | None = None
     from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
 
     pi_binding = binding_for_harness(load_runtime_inference_config(), "pi-native")
@@ -2699,6 +2701,7 @@ async def _auto_create_pi_terminal(
             # An ignored effort setting is informational — the session still
             # works, so it posts as a neutral notice rather than an error banner.
             effort_notice = launch.effort_warning if not credential_warning else None
+            model_notice = provider.model_notice
         elif spec_model:
             # No managed provider: Pi runs on its own login, but the pinned
             # model must still reach it — without this the pick is silently
@@ -2787,10 +2790,18 @@ async def _auto_create_pi_terminal(
             warning=credential_warning,
         )
     if effort_notice is not None:
-        await _post_pi_native_effort_notice(
+        await _post_pi_native_notice(
             session_id=session_id,
             server_client=server_client,
+            code="pi_native_effort_ignored",
             notice=effort_notice,
+        )
+    if model_notice is not None:
+        await _post_pi_native_notice(
+            session_id=session_id,
+            server_client=server_client,
+            code="pi_native_model_rerouted",
+            notice=model_notice,
         )
     return terminal_view
 
@@ -2841,21 +2852,22 @@ async def _post_pi_native_credential_warning(
         )
 
 
-async def _post_pi_native_effort_notice(
+async def _post_pi_native_notice(
     *,
     session_id: str,
     server_client: httpx.AsyncClient | None,
+    code: str,
     notice: str,
 ) -> None:
-    """Surface an ignored effort setting as a neutral info notice.
+    """Surface an informational launch notice (e.g. an ignored effort setting).
 
     Posts an ``error`` item with ``level: "info"`` so the web UI renders a
     neutral notice pill rather than a destructive banner. The session still
-    works; the effort setting was silently dropped because the gateway-routed
-    model does not support thinking.
+    works; the notice only explains how the launch adapted the user's choice.
 
     :param session_id: Session/conversation identifier.
     :param server_client: Runner Omnigent server client (``None`` in tests).
+    :param code: Stable notice code, e.g. ``"pi_native_effort_ignored"``.
     :param notice: The user-facing notice text to surface.
     """
     if server_client is None:
@@ -2869,7 +2881,7 @@ async def _post_pi_native_effort_notice(
                     "item_type": "error",
                     "item_data": {
                         "source": "execution",
-                        "code": "pi_native_effort_ignored",
+                        "code": code,
                         "message": notice,
                         "level": "info",
                     },
@@ -2880,7 +2892,8 @@ async def _post_pi_native_effort_notice(
         resp.raise_for_status()
     except httpx.HTTPError:
         _logger.warning(
-            "pi-native: failed to surface effort notice for session %s",
+            "pi-native: failed to surface %s notice for session %s",
+            code,
             session_id,
             exc_info=True,
         )
@@ -5095,8 +5108,17 @@ async def _auto_create_codex_terminal(
             if reachable is None:
                 # Re-resolve so provider overrides cannot retain the old model.
                 # A failed probe permits fallback, but cannot retire the pick.
+                fallback_model = unpinned_model
+                if (
+                    fallback_model is not None
+                    and fresh_rows
+                    and codex_reachable_model_slug(fallback_model, fresh_rows) is None
+                ):
+                    # `omnigent codex --model` pins the same id in the spec, so
+                    # falling back to it would relaunch the unlisted model.
+                    fallback_model = None
                 _codex_launch = resolve_native_codex_launch(
-                    model=unpinned_model,
+                    model=fallback_model,
                     spec=_launch_spec,
                     terminal_launch_args=_codex_terminal_args,
                 )
@@ -8001,6 +8023,29 @@ def _native_terminal_start_error_payload(
     }
 
 
+def _native_terminal_start_failure_context(exc: BaseException, error_id: str) -> FailureContext:
+    """Carry the runner's structured cause when its local log is unavailable."""
+    os_error = _os_error_with_errno(exc)
+    return normalize_failure_context(
+        {
+            "failure_id": error_id,
+            "failure_source": "native_terminal_start",
+            "exception_type": type(exc).__name__,
+            "exception_cause_type": type(exc.__cause__).__name__
+            if exc.__cause__ is not None
+            else None,
+            "exception_context_type": type(exc.__context__).__name__
+            if exc.__context__ is not None
+            else None,
+            "native_launch_os_errno": os_error.errno if os_error is not None else None,
+            "native_launch_os_errno_name": errno.errorcode.get(os_error.errno)
+            if os_error is not None and os_error.errno is not None
+            else None,
+            "native_launch_winerror": getattr(os_error, "winerror", None),
+        }
+    )
+
+
 def _publish_native_terminal_start_error(
     publish_event: Callable[[str, _JsonObject], None],
     session_id: str,
@@ -8034,6 +8079,7 @@ def _publish_native_terminal_start_error(
             "type": "session.status",
             "status": "failed",
             "error": error,
+            "failure_context": _native_terminal_start_failure_context(exc, error["error_id"]),
         },
     )
     return error
@@ -8058,10 +8104,12 @@ def _native_terminal_start_error_response(
         or exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
     ):
         status_code = exc.http_status
+    error = _native_terminal_start_error_payload(exc, runtime_name, session_id=session_id)
     return JSONResponse(
         status_code=status_code,
         content={
-            "error": _native_terminal_start_error_payload(exc, runtime_name, session_id=session_id)
+            "error": error,
+            "failure_context": _native_terminal_start_failure_context(exc, error["error_id"]),
         },
     )
 

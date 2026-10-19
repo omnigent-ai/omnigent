@@ -25,6 +25,7 @@ import httpx
 import pytest
 from playwright.async_api import async_playwright, expect
 
+from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME, CODEX_NATIVE_AGENT_NAME
 from tests.e2e_ui.conftest import _find_free_port, configure_mock_llm, set_fallback_mock_llm
 from tests.e2e_ui.start_session._managed_replica_server import terminate
 from tests.e2e_ui.start_session.test_start_session import _run_in_fresh_loop
@@ -52,12 +53,13 @@ def managed_replicas(
     """
     Start isolated product replicas, the real host launcher and a keyed ingress.
 
-    Indirect param ``(strip_host_id, legacy_host)``: whether the ingress strips
-    the create's chosen host id, as for a client that doesn't choose one, and
-    whether the sandbox host keys by its id regardless of the launch (default
-    neither).
+    Indirect param ``(strip_host_id, legacy_host[, message_launch_wait_s])``:
+    whether the ingress strips the create's chosen host id, as for a client that
+    doesn't choose one, whether the sandbox host keys by its id regardless of
+    the launch (default neither), and a shorter limit on how long a message
+    waits for an in-flight launch.
     """
-    strip_host_id, legacy_host = getattr(request, "param", (False, False))
+    strip_host_id, legacy_host, *launch_wait = getattr(request, "param", (False, False))
     ports = {role: _find_free_port() for role in ("a", "b", "ingress", "ui")}
     urls = {role: f"http://127.0.0.1:{port}" for role, port in ports.items()}
     config = tmp_path / "config"
@@ -122,6 +124,7 @@ def managed_replicas(
                     "--replica-b",
                     urls["b"],
                     *(["--strip-host-id"] if strip_host_id else []),
+                    *(["--message-launch-wait-s", str(launch_wait[0])] if launch_wait else []),
                     *(["--legacy-host"] if legacy_host else []),
                 ]
                 cwd, process_env = _REPO_ROOT, env
@@ -491,4 +494,154 @@ async def _drive_sharded(rig: ManagedReplicas, model_url: str, *, keyed: bool) -
             for url in (rig.a, rig.b):
                 await client.post(f"{url}/__test/provision/release")
             await client.post(f"{model_url}/gate/release")
+            await browser.close()
+
+
+# The web's cold-boot grace for a fresh session (STARTING_GRACE_S in useSessionLiveness.ts).
+_COLD_BOOT_GRACE_S = 45
+
+
+@pytest.mark.timeout(300)
+def test_terminal_view_stays_starting_while_sandbox_provisions(
+    managed_replicas: ManagedReplicas,
+) -> None:
+    """
+    A terminal-first session keeps its Terminal view on "Starting up…" through a
+    provision that outlasts the cold-boot grace, instead of offering Resume.
+    """
+    _run_in_fresh_loop(_drive_terminal_startup(managed_replicas))
+
+
+async def _drive_terminal_startup(rig: ManagedReplicas) -> None:
+    async with (
+        async_playwright() as playwright,
+        httpx.AsyncClient(timeout=10, trust_env=False) as client,
+    ):
+        browser = await playwright.chromium.launch()
+        page = await browser.new_page(viewport={"width": 1440, "height": 960})
+        try:
+            await page.goto(rig.ui)
+            agents = (await client.get(f"{rig.a}/v1/agents")).json()["data"]
+            agent_id = next(a["id"] for a in agents if a["name"] == CLAUDE_NATIVE_AGENT_NAME)
+            await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id(f"new-chat-landing-agent-{agent_id}").click()
+            await page.get_by_test_id("new-chat-landing-input").fill("Hey")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+            await expect(page).to_have_url(re.compile(r"/c/[a-f0-9]+"), timeout=30_000)
+            session_path = f"/v1/sessions/{page.url.rsplit('/', 1)[-1]}"
+            await page.get_by_test_id("view-mode-terminal").click()
+            terminal = page.locator('[data-testid="main-terminal-view"][data-visible="true"]')
+            starting = terminal.get_by_test_id("terminal-starting-up")
+            await expect(starting).to_be_visible()
+
+            # The keyed create provisions on B; outlast the grace plus a liveness poll.
+            created_at = (await client.get(rig.b + session_path)).json()["created_at"]
+            await asyncio.sleep(max(0.0, created_at + _COLD_BOOT_GRACE_S + 15 - time.time()))
+            snapshot = (await client.get(rig.b + session_path)).json()
+            assert snapshot["sandbox_status"]["stage"] == "provisioning"
+            assert snapshot["runner_id"] is None
+            await expect(starting).to_be_visible()
+            await expect(terminal.get_by_role("button", name="Resume session")).to_have_count(0)
+            await page.screenshot(path=str(rig.logs / "terminal-provisioning.png"))
+
+            # A freshly loaded tab learns about the launch from the session snapshot.
+            async with page.expect_response(
+                lambda response: "/health?session_ids=" in response.url
+            ):
+                await page.reload()
+            await page.get_by_test_id("view-mode-terminal").click()
+            await expect(starting).to_be_visible()
+            await expect(terminal.get_by_role("button", name="Resume session")).to_have_count(0)
+        finally:
+            for url in (rig.a, rig.b):
+                await client.post(f"{url}/__test/provision/release")
+            await browser.close()
+
+
+# How long the server holds a message for an in-flight launch here, shortened
+# from the production four minutes so the test can outlast it quickly.
+_MESSAGE_LAUNCH_WAIT_S = 20
+_NATIVE_PROMPT = "Confirm this first message outlasted the sandbox launch."
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize(
+    "managed_replicas", [(False, False, _MESSAGE_LAUNCH_WAIT_S)], indirect=True
+)
+@pytest.mark.parametrize(
+    ("agent_name", "sends_once_ready"),
+    [(CLAUDE_NATIVE_AGENT_NAME, False), (CODEX_NATIVE_AGENT_NAME, True)],
+    ids=["claude", "codex"],
+)
+def test_first_native_message_outlasts_a_long_sandbox_launch(
+    managed_replicas: ManagedReplicas, agent_name: str, sends_once_ready: bool
+) -> None:
+    """
+    A Claude Code or Codex session's first message stays pending through a launch
+    longer than the browser's model wait and the server's hold. Codex then sends
+    it once; Claude Code also waits for its model, which needs real inference.
+    """
+    _run_in_fresh_loop(_drive_long_launch(managed_replicas, agent_name, sends_once_ready))
+
+
+async def _drive_long_launch(
+    rig: ManagedReplicas, agent_name: str, sends_once_ready: bool
+) -> None:
+    async with (
+        async_playwright() as playwright,
+        httpx.AsyncClient(timeout=10, trust_env=False) as client,
+    ):
+        browser = await playwright.chromium.launch()
+        page = await browser.new_page(viewport={"width": 1440, "height": 960})
+        # Lets the test jump past the browser's three-minute wait for the model.
+        await page.clock.install()
+        network_url = f"{rig.ingress}/__test/network"
+        try:
+            await page.goto(rig.ui)
+            agents = (await client.get(f"{rig.a}/v1/agents")).json()["data"]
+            agent_id = next(a["id"] for a in agents if a["name"] == agent_name)
+            await page.get_by_test_id("new-chat-landing-agent-select").click()
+            await page.get_by_test_id(f"new-chat-landing-agent-{agent_id}").click()
+            await page.get_by_test_id("new-chat-landing-input").fill(_NATIVE_PROMPT)
+            await page.get_by_test_id("new-chat-landing-submit").click()
+            await expect(page).to_have_url(re.compile(r"/c/[a-f0-9]+"), timeout=30_000)
+            session_path = f"/v1/sessions/{page.url.rsplit('/', 1)[-1]}"
+
+            def posts(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                return [
+                    row
+                    for row in rows
+                    if row["path"] == f"{session_path}/events"
+                    and json.loads(row["request"])["type"] == "message"
+                ]
+
+            await asyncio.sleep(_MESSAGE_LAUNCH_WAIT_S + 5)
+            await page.clock.fast_forward("03:05")
+            # The keyed create provisions on B.
+            snapshot = (await client.get(rig.b + session_path)).json()
+            assert snapshot["sandbox_status"]["stage"] == "provisioning"
+            user = page.locator('[data-testid="message-bubble"][data-role="user"]')
+            await expect(user.filter(has_text=_NATIVE_PROMPT)).to_have_count(1)
+            await expect(page.get_by_test_id("error-pill")).to_have_count(0)
+            await expect(page.get_by_label("Message the agent")).to_have_value("")
+            # Still in the browser, not parked on the server.
+            assert not posts((await client.get(network_url)).json())
+            await page.screenshot(path=str(rig.logs / "long-launch.png"))
+            if not sends_once_ready:
+                return
+
+            (await client.post(f"{rig.b}/__test/provision/release")).raise_for_status()
+            rows = await _poll(
+                client,
+                network_url,
+                lambda rows: any(row["status"] == 202 for row in posts(rows)),
+                timeout=120,
+            )
+            [sent] = posts(rows)
+            assert json.loads(sent["request"])["data"]["content"] == [
+                {"type": "input_text", "text": _NATIVE_PROMPT}
+            ]
+        finally:
+            for url in (rig.a, rig.b):
+                await client.post(f"{url}/__test/provision/release")
             await browser.close()
