@@ -44,8 +44,8 @@ startup. The host forwards `OMNIGENT_FEATURES` to its runners, including through
 the CLI's background daemon. Changing a remote server's environment alone does
 not change a separate host's runners. Restart the host and affected runners
 after changing their feature set; existing terminals keep their launch
-configuration. See the [Claude status prototype](claude-program-status-prototype.md)
-for activation, rollback and remaining verification requirements.
+configuration. See the [native-harness feature map](../feature-map/native-harnesses.md#driving-it-with-the-repro-environment)
+for Claude working-status acceptance and kill-switch verification.
 
 ## Rollout and rollback
 
