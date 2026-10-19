@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import base64
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
 
 import pytest
 
@@ -105,3 +110,79 @@ def test_output_is_preserved_except_capability_query(chunk_size: int) -> None:
     )
     assert output == stream.replace(b"\x1b]7501;?\x07\x1b[c", b"\x1b[c")
     assert queries == [True]
+
+
+@pytest.mark.parametrize("failure", ["missing", "not-executable", "stdin-eof", "stdin-eio"])
+def test_relay_process_failure_cleanup(tmp_path: Path, failure: str) -> None:
+    """Exercise exec errors and input loss with a real child and PTY."""
+    state_file = tmp_path / "status.json"
+    ready = tmp_path / "ready"
+    command = [str(tmp_path / "command")]
+    wrapper = "from omnigent.terminals.program_status import main; main()"
+    if failure == "not-executable":
+        Path(command[0]).write_text("#!/bin/sh\nexit 0\n")
+    if failure.startswith("stdin-"):
+        command = [
+            sys.executable,
+            "-c",
+            "import os,signal,time; from pathlib import Path; "
+            "signal.signal(signal.SIGHUP, lambda *_: "
+            "(time.sleep(0.05), print('graceful-exit-tail', flush=True), exit(23))); "
+            f"Path({str(ready)!r}).write_text(str(os.getpid())); "
+            "time.sleep(30)",
+        ]
+        # Inject only the outer input failure; fork, inner PTY and child are real.
+        wrapper = (
+            "import errno,os\n"
+            "from omnigent.terminals.program_status import main\n"
+            "read = os.read\n"
+            "def disconnected_read(fd, size):\n"
+            " if fd == 0:\n"
+            + (
+                "  raise OSError(errno.EIO, 'terminal disconnected')\n"
+                if failure == "stdin-eio"
+                else "  return b''\n"
+            )
+            + " return read(fd, size)\n"
+            "os.read = disconnected_read\n"
+            "main()\n"
+        )
+    master, slave = os.openpty()
+    try:
+        with subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                wrapper,
+                "--state-file",
+                str(state_file),
+                "--app",
+                "claude-code",
+                "--",
+                *command,
+            ],
+            stdin=slave,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        ) as process:
+            if failure.startswith("stdin-"):
+                deadline = time.monotonic() + 5
+                while not ready.exists() and time.monotonic() < deadline:
+                    assert process.poll() is None
+                    time.sleep(0.01)
+                assert ready.exists(), "child never became ready"
+                os.write(master, b"x")
+            output, _ = process.communicate(timeout=10)
+            assert b"Traceback" not in output, output
+            if failure.startswith("stdin-"):
+                assert process.returncode == 23, output
+                assert b"graceful-exit-tail" in output
+                with pytest.raises(ProcessLookupError):
+                    os.kill(int(ready.read_text()), 0)
+            else:
+                assert process.returncode == (127 if failure == "missing" else 126), output
+                assert b"cannot exec" in output
+            assert not state_file.exists()
+    finally:
+        os.close(master)
+        os.close(slave)

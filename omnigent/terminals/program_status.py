@@ -255,11 +255,20 @@ def relay(path: Path, app: str, command: list[str]) -> int:
     size = fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8)
     pid, master = pty.fork()
     if pid == 0:
-        fcntl.ioctl(0, termios.TIOCSWINSZ, size)
-        os.execvp(command[0], command)
+        exit_code = 126
+        try:
+            fcntl.ioctl(0, termios.TIOCSWINSZ, size)
+            os.execvp(command[0], command)
+        except OSError as exc:
+            exit_code = 127 if exc.errno == errno.ENOENT else 126
+            with contextlib.suppress(OSError):
+                _write_all(2, f"relay: cannot exec {command[0]}: {exc}\n".encode())
+        finally:
+            os._exit(exit_code)
     status: ProgramStatus | None = None
     stopping_at: float | None = None
     exit_status: int | None = None
+    stdin_open = True
 
     def save() -> None:
         temporary = path.with_suffix(".tmp")
@@ -284,6 +293,8 @@ def relay(path: Path, app: str, command: list[str]) -> int:
         if report.id is not None:
             return
         if report.state == "clear":
+            if report.app is not None and report.app != app:
+                return
             status = None
         elif report.app == app:
             if status == report:
@@ -323,7 +334,7 @@ def relay(path: Path, app: str, command: list[str]) -> int:
         while True:
             if stopping_at is not None and time.monotonic() - stopping_at > 2:
                 break
-            readable, _, _ = select.select([0, master], [], [], 0.2)
+            readable, _, _ = select.select([0, master] if stdin_open else [master], [], [], 0.2)
             if master in readable:
                 try:
                     data = os.read(master, 65536)
@@ -335,10 +346,17 @@ def relay(path: Path, app: str, command: list[str]) -> int:
                     break
                 _write_all(1, parser.feed(data))
             if 0 in readable:
-                data = os.read(0, 65536)
+                try:
+                    data = os.read(0, 65536)
+                except OSError as exc:
+                    if exc.errno != errno.EIO:
+                        raise
+                    data = b""
                 if not data:
-                    break
-                _write_all(master, data)
+                    stdin_open = False
+                    stop(signal.SIGHUP, None)
+                else:
+                    _write_all(master, data)
             if exit_status is None:
                 child, result = os.waitpid(pid, os.WNOHANG)
                 if child:

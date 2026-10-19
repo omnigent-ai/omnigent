@@ -78,14 +78,16 @@ async def test_claude_program_status_real_launch_and_fallback(
         " os.write(1,b'\\x1b]7501;state=working:app=claude-code\\x07')\n"
         "reports={b'b':b'state=blocked:kind=permission',b'd':b'state=done',"
         "b'i':b'state=idle',b'e':b'state=error',b'w':b'state=working',"
-        "b'c':b'state=clear',b'x':b'state=idle:id=child',b'o':b'state=idle:app=other'}\n"
+        "b'c':b'state=clear',b'u':b'state=clear',b'x':b'state=idle:id=child',"
+        "b'o':b'state=idle:app=other',b'a':b'state=clear:app=other',"
+        "b'y':b'state=clear:id=child'}\n"
         "while True:\n"
         " key=os.read(0,1)\n"
         " if key==b'q': break\n"
         " if key==b'r':\n"
         "  open(sys.argv[2],'w').write(str(tuple(os.get_terminal_size())))\n"
         "  continue\n"
-        " body=b'app=claude-code:'+reports[key]\n"
+        " body=(b'' if key==b'u' else b'app=claude-code:')+reports[key]\n"
         " os.write(1,b'\\x1b]7501;'+body+b'\\x1b\\\\')\n"
     )
     terminals = TerminalRegistry()
@@ -156,9 +158,10 @@ async def test_claude_program_status_real_launch_and_fallback(
         status_file.write_text(json.dumps({"kind": "interactive", "status": "idle"}))
         await asyncio.sleep(1.4)  # Real elapsed time, longer than the pane idle threshold.
         assert statuses == [("running", None)]
-        for key in ("x", "o"):
+        for key in ("x", "o", "a", "y"):
             await instance.send(keys=key)
         await asyncio.sleep(0.3)
+        assert reader.status is not None and reader.status.state == "working"
         assert statuses == [("running", None)]
         await instance.send(keys="b")
         await wait_status("running", "permission prompt")
@@ -175,10 +178,11 @@ async def test_claude_program_status_real_launch_and_fallback(
         for key, state in (("d", "idle"), ("w", "running"), ("i", "idle"), ("e", "failed")):
             await instance.send(keys=key)
             await wait_status(state)
-        await instance.send(keys="c")
-        await wait_status("idle")  # Falls back to the still-unchanged status file.
-        await instance.send(keys="w")
-        await wait_status("running")
+        for key in ("c", "u"):
+            await instance.send(keys=key)
+            await wait_status("idle")  # Falls back to the still-unchanged status file.
+            await instance.send(keys="w")
+            await wait_status("running")
         reader.path.unlink()
         reader.path.mkdir()  # Make snapshot replacement fail while the command keeps running.
         await instance.send(keys="b")
