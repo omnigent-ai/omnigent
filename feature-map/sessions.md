@@ -909,6 +909,10 @@ plain `uv run pytest`, which starts a private server for the test.
 - The reconnect command depends on why the session stopped (host offline vs. a
   stranded local session vs. a sandbox). Reproduce the reporter's reason, not
   just any stopped session.
+- A web-composer message to a native session whose host is offline waits as
+  "Waiting for host" instead of becoming a failed turn (see
+  [Composer](./composer.md)). The offline-host recipe posts through the API,
+  which still records the failed turn.
 - The desktop app's direct reconnect is not available in a browser; a browser
   shows the command instead.
 - Tests marked "own environment" fail under `verify-env run` with an explicit
