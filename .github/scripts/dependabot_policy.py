@@ -482,7 +482,7 @@ def cargo_changes(read, files: set[str], policy: dict) -> dict:
         target,
         "cargo",
         ["ci.yml", "e2e-ui.yml"],
-        ["Pytest (codex-parity)", "Browser Contract UI"],
+        ["Pytest (codex-parity)"],
     )
 
 

@@ -10,6 +10,9 @@ REQUIRED=(
   "DCO"
   "Pre-commit checks"
   "Docker build"
+  "CI scope"
+  "Rust tests (omnidev)"
+  "Pytest (codex-parity)"
   "Pytest (runtime-harnesses)"
   "Pytest (runtime-policies)"
   "Pytest (runtime-core)"
@@ -40,6 +43,8 @@ REQUIRED=(
   "E2E UI Tests (shard 7/10)"
   "E2E UI Tests (shard 8/10)"
   "E2E UI Tests (shard 9/10)"
+  "E2E UI Tests (shard 0/2)"
+  "E2E UI Tests (shard 1/2)"
   "Browser Contract UI"
   "UI Snapshot (visual baselines)"
   "Integration (claude-sdk)"
@@ -49,6 +54,9 @@ REQUIRED=(
 
 ALLOW_SKIP=(
   "Docker build"
+  "CI scope"
+  "Rust tests (omnidev)"
+  "Pytest (codex-parity)"
   "Pytest (runtime-harnesses)"
   "Pytest (runtime-policies)"
   "Pytest (runtime-core)"
@@ -79,6 +87,8 @@ ALLOW_SKIP=(
   "E2E UI Tests (shard 7/10)"
   "E2E UI Tests (shard 8/10)"
   "E2E UI Tests (shard 9/10)"
+  "E2E UI Tests (shard 0/2)"
+  "E2E UI Tests (shard 1/2)"
   "Browser Contract UI"
   "UI Snapshot (visual baselines)"
   "Integration (claude-sdk)"
@@ -95,6 +105,7 @@ is_allow_skip() { printf '%s\n' "${ALLOW_SKIP[@]}" | grep -qxF "$1"; }
 workflow_for() {
   case "$1" in
     "Docker build")          echo "Docker build" ;;
+    "CI scope"|"Rust tests (omnidev)") echo "CI" ;;
     "Pytest ("*)             echo "CI" ;;
     "E2E Tests (shard "*)    echo "E2E Tests" ;;
     "E2E UI Tests (shard "*) echo "E2E UI Tests" ;;

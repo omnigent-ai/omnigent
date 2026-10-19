@@ -321,6 +321,11 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     :param parser: The pytest option parser.
     """
     parser.addoption(
+        "--ui-codex-sidecar-only",
+        action="store_true",
+        help="Run consumers of the Codex Responses sidecar before splitting into shards.",
+    )
+    parser.addoption(
         "--ui-base-url",
         default=None,
         help=(
@@ -428,11 +433,17 @@ def pytest_collection_modifyitems(
     bucket. That averages cost across shards without maintaining a
     durations file.
 
-    No-op unless both ``--splits`` and ``--group`` are passed, so local
-    runs and the non-sharded suites are unaffected. ``trylast`` lets the
-    repo-wide known-failures marking in ``tests/conftest.py`` tag items
-    first; markers travel with the items the slice keeps.
+    Optional sidecar selection precedes the split and includes indirect fixture
+    consumers. ``trylast`` lets repo-wide known-failure marking tag items first;
+    markers travel with the items the slice keeps.
     """
+    if config.getoption("--ui-codex-sidecar-only"):
+        selected = [item for item in items if "mocked_native_codex_session" in item.fixturenames]
+        if not selected:
+            raise pytest.UsageError("No Codex sidecar consumers collected")
+        config.hook.pytest_deselected(items=[item for item in items if item not in selected])
+        items[:] = selected
+
     splits = config.getoption("--splits")
     group = config.getoption("--group")
     if splits is None and group is None:
@@ -2340,11 +2351,15 @@ def _stop_recorded_context(item: pytest.Item) -> None:
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(
     item: pytest.Item, call: pytest.CallInfo[None]
-) -> Generator[None, None, None]:
-    """Stop the recording when the test body ends, before later fixtures tear down.
+) -> Generator[None, Any, None]:
+    """Finalize recordings and reject skipped tests in selected sidecar runs.
 
     The ``context`` behind ``page`` otherwise outlives the session fixtures' teardown."""
-    yield
+    outcome = yield
+    report = outcome.get_result()
+    if item.config.getoption("--ui-codex-sidecar-only") and report.skipped:
+        report.outcome = "failed"
+        report.longrepr = f"Selected sidecar test skipped: {report.longrepr}"
     if call.when == "call" and _recording_requested(item):
         _stop_recorded_context(item)
 

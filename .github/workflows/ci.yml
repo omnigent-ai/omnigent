@@ -52,10 +52,30 @@ jobs:
   gate:
     uses: ./.github/workflows/security-gate.yml
 
+  scope:
+    name: CI scope
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      backend: ${{ steps.scope.outputs.backend }}
+      omnidev: ${{ steps.scope.outputs.omnidev }}
+      sidecar: ${{ steps.scope.outputs.sidecar }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 2
+          sparse-checkout: |
+            .github/scripts/ci
+            .github/actions/dependency-ci-scope
+          persist-credentials: false
+      - id: scope
+        uses: ./.github/actions/dependency-ci-scope
+
   pytest:
     name: Pytest (${{ matrix.group }})
-    needs: gate
-    if: ${{ !github.event.pull_request.draft }}
+    needs: scope
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.backend == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -237,7 +257,7 @@ jobs:
               -m "${{ matrix.markexpr || 'not databricks' }}" \
               -n ${{ matrix.workers || '8' }} \
               --dist=${{ matrix.dist || 'loadfile' }} \
-              --timeout=${{ matrix.timeout || '300' }} \
+              --timeout=300 \
               --junitxml=artifacts/pytest-${{ matrix.group }}.xml \
               --cov=omnigent --cov-report= \
               -v --tb=long --showlocals --log-level=INFO -r a \
@@ -267,8 +287,8 @@ jobs:
 
   stores-postgres:
     name: Pytest (stores-postgres)
-    needs: gate
-    if: ${{ !github.event.pull_request.draft }}
+    needs: scope
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.backend == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -315,8 +335,8 @@ jobs:
   # postgres/mysql lanes. The full version matrix runs locally via `just crdb-test`.
   stores-cockroachdb:
     name: Pytest (stores-crdb-${{ matrix.crdb_version }})
-    needs: gate
-    if: ${{ !github.event.pull_request.draft }}
+    needs: scope
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.backend == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -364,8 +384,8 @@ jobs:
 
   stores-mysql:
     name: Pytest (stores-mysql)
-    needs: gate
-    if: ${{ !github.event.pull_request.draft }}
+    needs: scope
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.backend == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -410,10 +430,32 @@ jobs:
           path: artifacts/
           retention-days: 14
 
+  omnidev:
+    name: Rust tests (omnidev)
+    needs: scope
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.omnidev == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - id: rustc
+        run: echo "version=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry
+            dev/omnidev/target
+          key: omnidev-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('dev/omnidev/**', '!dev/omnidev/target/**') }}
+      - name: Test omnidev
+        run: cargo test --locked --manifest-path dev/omnidev/Cargo.toml
+
   codex-parity:
     name: Pytest (codex-parity)
-    needs: gate
-    if: ${{ !github.event.pull_request.draft }}
+    needs: scope
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.sidecar == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -448,7 +490,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .tmp-codex-parity-target/debug/codex-parity-sidecar
-          key: codex-parity-bin-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
+          key: codex-parity-bin-locked-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
 
       - name: Set up pnpm
         # This job never runs pnpm install, so caching the (empty) pnpm store
@@ -474,7 +516,7 @@ jobs:
       - name: Build parity sidecar
         if: steps.sidecar-cache.outputs.cache-hit != 'true'
         run: |
-          cargo build \
+          cargo build --locked \
             --manifest-path tests/codex_parity/sidecar/Cargo.toml \
             --target-dir .tmp-codex-parity-target
 

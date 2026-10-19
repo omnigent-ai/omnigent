@@ -90,13 +90,19 @@ jobs:
         with:
           # Triggering ref (not main): the script must exist on it, and it
           # only shards tests -- no secrets exposure, so the PR's copy is fine.
-          sparse-checkout: .github/scripts/ci
+          fetch-depth: 2
+          sparse-checkout: |
+            .github/scripts/ci
+            .github/actions/dependency-ci-scope
           persist-credentials: false
+      - id: scope
+        uses: ./.github/actions/dependency-ci-scope
       - name: Compute shard matrix
         id: matrix
         env:
           EVENT_NAME: ${{ github.event_name }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
+          RUN_TESTS: ${{ steps.scope.outputs.backend }}
           NUM_SHARDS: "4"
         run: bash .github/scripts/ci/e2e-shard-matrix.sh
 
