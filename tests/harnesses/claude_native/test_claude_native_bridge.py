@@ -5447,6 +5447,10 @@ def test_kill_session_raises_when_tmux_target_never_published(
     [
         "no server running on /tmp/example/tmux.sock",
         "can't find session: main",
+        pytest.param(
+            "error connecting to /tmp/example/tmux.sock (No such file or directory)",
+            id="socket-removed-after-idle-cleanup",
+        ),
     ],
 )
 def test_kill_session_is_idempotent_when_tmux_is_absent(

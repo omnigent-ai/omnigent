@@ -4639,13 +4639,9 @@ def kill_session(
         time, or if ``tmux kill-session`` fails for an unexpected reason.
     """
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    try:
-        _run_tmux(info["socket_path"], "kill-session", "-t", info["tmux_target"])
-    except RuntimeError as exc:
-        detail = str(exc).lower()
-        if "can't find session" in detail or "no server running on" in detail:
-            return
-        raise
+    _run_tmux(
+        info["socket_path"], "kill-session", "-t", info["tmux_target"], allow_missing_target=True
+    )
 
 
 @_serialize_bridge_injection
@@ -5396,7 +5392,7 @@ class _UnixHTTPConnection(HTTPConnection):
         self.sock = sock
 
 
-def _run_tmux(socket_path: str, *args: str) -> None:
+def _run_tmux(socket_path: str, *args: str, allow_missing_target: bool = False) -> None:
     """
     Invoke ``tmux -S <socket_path> <args...>`` and raise on failure.
 
@@ -5409,6 +5405,8 @@ def _run_tmux(socket_path: str, *args: str) -> None:
         was launched on, e.g. ``"/tmp/.../tmux.sock"``.
     :param args: Arguments after ``tmux -S <socket_path>``, e.g.
         ``("send-keys", "-l", "-t", "claude:0.0", "hello")``.
+    :param allow_missing_target: Treat a confirmed missing tmux server or
+        target as success.
     :returns: None.
     :raises RuntimeError: If the subprocess exits non-zero or times
         out.
@@ -5438,6 +5436,11 @@ def _run_tmux(socket_path: str, *args: str) -> None:
     if proc.returncode != 0:
         delivery_diagnostics.record_tmux_failure(operation, returncode=proc.returncode)
         detail = proc.stderr.strip() or proc.stdout.strip() or "<no output>"
+        if allow_missing_target:
+            from omnigent.inner.terminal import _tmux_reports_target_gone
+
+            if _tmux_reports_target_gone(detail):
+                return
         raise RuntimeError(f"tmux command failed (rc={proc.returncode}): {detail}")
 
 
