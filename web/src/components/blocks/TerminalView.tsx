@@ -128,6 +128,8 @@ interface TerminalViewProps {
   onInput?: TerminalInputListener;
   /** Optional action shown beside the closed-bridge message. */
   onResume?: () => void | Promise<void>;
+  /** Label for that action, e.g. "Resume sandbox" when the sandbox itself is offline. */
+  resumeLabel?: string;
   /** Whether the optional resume action is currently in flight. */
   resumePending?: boolean;
   /**
@@ -166,6 +168,7 @@ export function TerminalView({
   onActivity,
   onInput,
   onResume,
+  resumeLabel = "Resume session",
   resumePending = false,
   active = true,
   focusOnConnect = active,
@@ -785,6 +788,7 @@ export function TerminalView({
             state={state}
             reconnectPending={reconnectPending}
             onResume={onResume ? handleResume : undefined}
+            resumeLabel={resumeLabel}
             resumePending={resumePending}
             resumeError={resumeError}
           />
@@ -798,6 +802,7 @@ function StatusOverlay({
   state,
   reconnectPending,
   onResume,
+  resumeLabel,
   resumePending,
   resumeError,
 }: {
@@ -805,6 +810,7 @@ function StatusOverlay({
   /** True while an automatic re-dial is scheduled for a closed bridge. */
   reconnectPending: boolean;
   onResume?: () => void | Promise<void>;
+  resumeLabel: string;
   resumePending: boolean;
   resumeError: string | null;
 }) {
@@ -839,7 +845,7 @@ function StatusOverlay({
               className="border-zinc-500/50 bg-zinc-100 text-zinc-950 hover:bg-white"
               componentId="diagnostics.terminal.resume"
             >
-              {resumePending ? "Resuming…" : "Resume session"}
+              {resumePending ? "Resuming…" : resumeLabel}
             </Button>
           )}
           {resumeError && (

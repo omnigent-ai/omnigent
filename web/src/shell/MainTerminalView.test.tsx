@@ -20,6 +20,7 @@ vi.mock("@/components/blocks/TerminalView", () => ({
     readOnly,
     directAttachUrl,
     onResume,
+    resumeLabel,
     resumePending,
   }: {
     sessionId: string;
@@ -27,6 +28,7 @@ vi.mock("@/components/blocks/TerminalView", () => ({
     readOnly?: boolean;
     directAttachUrl?: string;
     onResume?: () => void | Promise<void>;
+    resumeLabel?: string;
     resumePending?: boolean;
   }) => {
     // Assign once per mount (useRef(arg) evaluates arg every render but keeps
@@ -43,6 +45,7 @@ vi.mock("@/components/blocks/TerminalView", () => ({
         data-instance={String(instance.current)}
         data-direct-attach-url={directAttachUrl ?? ""}
         data-resume-pending={String(resumePending ?? false)}
+        data-resume-label={resumeLabel ?? ""}
       >
         {onResume && (
           <button type="button" onClick={() => void onResume()}>
@@ -120,6 +123,7 @@ function viewTree({
   onResume,
   setView,
   terminalStartingUp = false,
+  sandboxOffline = false,
 }: {
   terminals: TerminalInfo[];
   isNativeWrapper?: boolean;
@@ -131,6 +135,7 @@ function viewTree({
   onResume?: () => void | Promise<void>;
   setView?: (view: "chat" | "terminal") => void;
   terminalStartingUp?: boolean;
+  sandboxOffline?: boolean;
 }) {
   useTerminalsMock.mockReturnValue({ terminals, isLoading: false, error: null });
   return (
@@ -142,6 +147,7 @@ function viewTree({
         readOnly={readOnly}
         runnerOnline={runnerOnline}
         onResume={onResume}
+        sandboxOffline={sandboxOffline}
       />
     </TerminalFirstContextProvider>
   );
@@ -242,6 +248,34 @@ describe("MainTerminalView — terminal-first SDK sessions", () => {
     fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
 
     await waitFor(() => expect(onResume).toHaveBeenCalledTimes(1));
+  });
+
+  it("names an offline sandbox and its resume action", async () => {
+    const onResume = vi.fn().mockRejectedValue(new Error("launch failed"));
+    renderView({ terminals: [], runnerOnline: false, onResume, sandboxOffline: true });
+
+    expect(screen.getByText("The sandbox is offline.")).toBeInTheDocument();
+    expect(screen.getByText("Resume it to reconnect the terminal.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Resume sandbox" }));
+
+    expect(
+      await screen.findByText("Couldn't resume the sandbox: launch failed"),
+    ).toBeInTheDocument();
+    expect(onResume).toHaveBeenCalledTimes(1);
+  });
+
+  it("labels an attached terminal's resume action for an offline sandbox", async () => {
+    renderView({
+      terminals: [REPL_TERMINAL],
+      runnerOnline: false,
+      onResume: vi.fn().mockResolvedValue(undefined),
+      sandboxOffline: true,
+    });
+
+    expect(await screen.findByTestId("terminal-view")).toHaveAttribute(
+      "data-resume-label",
+      "Resume sandbox",
+    );
   });
 
   it("keeps the offline state actionable when resuming fails", async () => {

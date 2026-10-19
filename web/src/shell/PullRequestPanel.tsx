@@ -225,6 +225,7 @@ function GithubAccountSelector({
 export type PullRequestPanelState =
   | { kind: "loading" }
   | { kind: "runner-offline" }
+  | { kind: "sandbox-offline" }
   | { kind: "error"; message: string }
   | { kind: "host-outdated" }
   | { kind: "unavailable" }
@@ -247,10 +248,10 @@ export function derivePullRequestPanelState(info: {
   /** The session's managed sandbox is asleep (see `useWorkspaceAsleep`). */
   sandboxAsleep?: boolean;
 }): PullRequestPanelState {
-  // Nothing can answer until the sandbox wakes, so the query is skipped or 503s.
-  // Say so instead of spinning or "not available"; info cached before it slept
-  // still renders.
-  if (info.sandboxAsleep && info.data === undefined) return { kind: "runner-offline" };
+  // Nothing can answer until the sandbox starts again, so the query is skipped
+  // or 503s. Say so instead of spinning or "not available"; info cached before
+  // it stopped still renders.
+  if (info.sandboxAsleep && info.data === undefined) return { kind: "sandbox-offline" };
   if (info.isLoading) return { kind: "loading" };
   if (info.error) {
     if (info.error instanceof RunnerOfflineError) return { kind: "runner-offline" };
@@ -1527,6 +1528,13 @@ function PullRequestPanelDetails({
       return (
         <PanelMessage>
           <p>The agent is asleep. Send a message to reconnect its runner.</p>
+          {emptyStateAction}
+        </PanelMessage>
+      );
+    case "sandbox-offline":
+      return (
+        <PanelMessage>
+          <p>The sandbox is offline. Send a message in the chat to start it again.</p>
           {emptyStateAction}
         </PanelMessage>
       );
