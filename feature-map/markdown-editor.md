@@ -133,6 +133,12 @@ instead of treating one comparison clip as complete feature verification.
 
 - File editing uses TipTap. Chat Markdown, read-only Preview, and Source use
   different rendering paths; speeding up one does not validate the others.
+- Task-list tokenization and table-start detection bound the source passed to
+  TipTap 3.31.4. `web/src/shell/tiptapBoundedTokenizers.test.ts` checks upstream
+  token compatibility and line-splitting volume using the CUJ fixture. Remove
+  these bounds when upstream avoids the repeated whole-remainder scans.
+- Load measurements do not establish typing latency. The editor currently
+  serializes the full document on each edit to detect unsaved changes.
 - Browser-contract saves update an in-memory mock filesystem. A successful
   reload there does not prove server/runner persistence or external-file edits.
 - Desktop and mobile can have hidden viewer instances on older revisions.
