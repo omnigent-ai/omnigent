@@ -31,6 +31,7 @@ from unittest.mock import Mock
 import httpx
 import pytest
 
+from omnigent.errors import ErrorCategory
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native import hook as claude_native_hook
 from omnigent.harnesses.claude_native.bridge import (
@@ -11492,31 +11493,48 @@ _TRUST_DIALOG_PANE = """\
  Enter to confirm · Esc to cancel
 """
 
+_SETTINGS_ERROR_DIALOG_PANE = """\
+────────────────────────────────────────────────────────────────────────────────
+ Settings Error
+ /home/user/.claude/settings.json
+ └ Invalid or malformed JSON
+ Files with errors are skipped entirely, not just the invalid settings.
+ ❯ 1. Fix with Claude
+   2. Exit and fix manually
+   3. Continue without these settings
+ Enter to confirm · Esc to cancel
+"""
+
 # The same dialog text scrolled into the transcript above a live input box.
 _DIALOG_ECHO_ABOVE_COMPOSER_PANE = _MCP_APPROVAL_DIALOG_PANE + _READY_PANE
 
 
 @pytest.mark.parametrize(
-    ("pane", "headline"),
+    ("pane", "headline", "category"),
     [
-        (_MCP_APPROVAL_DIALOG_PANE, "New MCP server found in this project: e2e-noop"),
-        (_MCP_APPROVAL_CHECKLIST_PANE, "2 new MCP servers found in this project"),
-        (_API_KEY_DIALOG_PANE, "Detected a custom API key in your environment"),
-        (_TRUST_DIALOG_PANE, "Accessing workspace:"),
+        (_MCP_APPROVAL_DIALOG_PANE, "New MCP server found in this project: e2e-noop", None),
+        (_MCP_APPROVAL_CHECKLIST_PANE, "2 new MCP servers found in this project", None),
+        (_API_KEY_DIALOG_PANE, "Detected a custom API key in your environment", None),
+        (_TRUST_DIALOG_PANE, "Accessing workspace:", None),
+        (_SETTINGS_ERROR_DIALOG_PANE, "Settings Error", ErrorCategory.CONFIG),
     ],
-    ids=["mcp-single", "mcp-checklist", "api-key", "folder-trust"],
+    ids=["mcp-single", "mcp-checklist", "api-key", "folder-trust", "settings-error"],
 )
-def test_terminal_dialog_headline_names_startup_dialogs(pane: str, headline: str) -> None:
+def test_terminal_dialog_headline_names_startup_dialogs(
+    pane: str, headline: str, category: ErrorCategory | None
+) -> None:
     """
-    Each real startup dialog is recognised by shape and named by its headline.
+    Each real startup dialog is recognised by shape, named by its headline and attributed.
 
-    All four captures come from Claude Code 2.1.269. None of them is a mounted
-    input box, and each replaces the box with an option list under a
-    "Enter to … · Esc to …" footer, so the headline is what the web error
-    can show the person who has to answer it.
+    The first four captures come from Claude Code 2.1.269 and the settings
+    error from 2.1.283. None of them is a mounted input box, and each replaces
+    the box with an option list under a "Enter to … · Esc to …" footer, so the
+    headline is what the web error can show the person who has to answer it.
+    Only the invalid-settings dialog names a cause; the rest wait on a choice.
     """
     assert claude_native_bridge._terminal_dialog_headline(pane) == headline
     assert _claude_prompt_rendered(pane) is False
+    assert claude_native_bridge.claude_startup_dialog_category(headline) is category
 
 
 @pytest.mark.parametrize(

@@ -418,6 +418,34 @@ describe("parseEvent — response.output_item.done error level", () => {
     expect(plainError).not.toHaveProperty("level");
   });
 
+  it("keeps a live notice's title, cause and remediation like the history path", () => {
+    // Live notices must preserve title, cause and remediation, matching the history path.
+    const ev = parseEvent("response.output_item.done", {
+      item: {
+        id: "err_2",
+        response_id: "",
+        type: "error",
+        source: "harness",
+        code: "native_startup_dialog",
+        message: "Claude Code is showing “Settings Error” in its terminal.",
+        level: "info",
+        title: "Claude Code is waiting for an answer in its terminal (Settings Error)",
+        cause: "The settings file is not valid JSON.",
+        remediation: "Open the terminal to continue.",
+      },
+    });
+    expect(ev).toMatchObject({
+      type: "error",
+      error: {
+        code: "native_startup_dialog",
+        level: "info",
+        title: "Claude Code is waiting for an answer in its terminal (Settings Error)",
+        cause: "The settings file is not valid JSON.",
+        remediation: "Open the terminal to continue.",
+      },
+    });
+  });
+
   it("keeps a classified item's title, cause and remediation for the live card", () => {
     const message =
       'Pi model error: 404 {"type":"error","error":{"type":"not_found_error",' +

@@ -363,6 +363,12 @@ _COST_POPUP_REPOP_TASKS: set[asyncio.Task[object]] = set()
 _TERMINAL_INTERACTIVE_TASKS: set[asyncio.Task[None]] = set()
 _TERMINAL_INTERACTIVE_TIMEOUT_S = 180.0
 _TERMINAL_INTERACTIVE_POLL_INTERVAL_S = 0.15
+# A startup dialog still up after this long is waiting on the person, not a repaint.
+_STARTUP_DIALOG_NOTICE_AFTER_S = 3.0
+# Notice posts that failed are retried at that same spacing while the dialog
+# stays up. The post carries a stable source id, so the server dedupes a retry
+# whose first response was lost; the cap only bounds the work.
+_STARTUP_DIALOG_NOTICE_ATTEMPTS = 3
 # Sign-in may stay open indefinitely; limit its liveness subprocess rate.
 _CODEX_LOGIN_EXIT_POLL_INTERVAL_S = 1.0
 # How often a starting pane is read for a launcher sign-in prompt.
@@ -400,6 +406,85 @@ _TERMINAL_LOOKUP_MISS_LOG_INTERVAL_S = 10.0
 _terminal_lookup_miss_log_state: dict[tuple[str, str, str], float] = {}
 
 
+@dataclasses.dataclass(frozen=True)
+class _StartupDialogWatch:
+    """
+    How a harness spots a dialog holding its starting pane and tells the person.
+
+    :param headline: Names the dialog on a pane capture, e.g. ``"Settings Error"``,
+        or returns ``None`` when no dialog is up.
+    :param notify: Posts the session notice for a dialog headline under a stable
+        source id, so a retried post is deduplicated server-side.
+    :param category: Fault attribution for a dialog headline, e.g.
+        :attr:`ErrorCategory.CONFIG` for a settings file the agent cannot read,
+        or ``None`` when the dialog says nothing about fault.
+    """
+
+    headline: Callable[[str], str | None]
+    notify: Callable[[str, str], Awaitable[None]]
+    category: Callable[[str], ErrorCategory | None]
+
+
+async def _report_startup_dialog(
+    watch: _StartupDialogWatch,
+    headline: str,
+    *,
+    session_id: str,
+    harness: str,
+    terminal_id: str,
+    instance: TerminalInstance,
+    waited_s: float,
+    record: bool = True,
+) -> bool:
+    """
+    Log the dialog holding a starting pane, then tell the person to answer it.
+
+    :param record: Write the ``native_startup_dialog`` record; ``False`` on a
+        retry of the notice alone.
+    :returns: Whether the notice was posted.
+    """
+    # One notice per dialog per terminal launch; a resumed terminal may report again.
+    source_id = f"native_startup_dialog:{instance.diagnostic_id}:{headline}"
+    from omnigent.process_logging import redact_log_text
+
+    if record:
+        category = watch.category(headline)
+        attribution = (
+            {
+                "error_category": category.value,
+                "error_impact": ErrorImpact.BLOCKING.value,
+                "error_phase": ErrorPhase.HARNESS_STARTUP.value,
+            }
+            if category is not None
+            else {}
+        )
+        _logger.warning(
+            "Native terminal startup is waiting on a dialog: session=%s harness=%s "
+            "terminal_id=%s waited_s=%.0f",
+            session_id,
+            harness,
+            terminal_id,
+            waited_s,
+            extra=debug_event(
+                "native_startup_dialog",
+                session_id=session_id,
+                harness=harness,
+                terminal_id=terminal_id,
+                terminal_instance_id=instance.diagnostic_id,
+                dialog_headline=redact_log_text(headline),
+                **attribution,
+            ),
+        )
+    try:
+        await watch.notify(headline, source_id)
+    except Exception:  # noqa: BLE001 — a lost notice must not end the readiness watch
+        _logger.warning(
+            "Failed to post the startup dialog notice for %s", session_id, exc_info=True
+        )
+        return False
+    return True
+
+
 async def _observe_terminal_interactive(
     *,
     session_id: str,
@@ -410,10 +495,25 @@ async def _observe_terminal_interactive(
     is_interactive: Callable[[str], bool],
     timeout_s: float = _TERMINAL_INTERACTIVE_TIMEOUT_S,
     poll_interval_s: float = _TERMINAL_INTERACTIVE_POLL_INTERVAL_S,
+    startup_dialog: _StartupDialogWatch | None = None,
 ) -> None:
-    """Emit one semantic event when a native TUI can accept a message."""
+    """Emit one semantic event when a native TUI can accept a message.
+
+    With ``startup_dialog``, a dialog that holds the pane for
+    :data:`_STARTUP_DIALOG_NOTICE_AFTER_S` is reported once, so the person
+    learns the session is waiting on them rather than starting slowly.
+    """
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout_s
+    started_at = loop.time()
+    deadline = started_at + timeout_s
+    dialog_headline: str | None = None
+    dialog_since = started_at
+    next_notice_at = started_at
+    # Per dialog headline, so a later different dialog gets its own record and
+    # notice while a flickering or returning headline is never reported twice.
+    recorded_dialogs: set[str] = set()
+    notified_dialogs: set[str] = set()
+    notice_attempts: dict[str, int] = {}
     try:
         while True:
             result = await instance.read()
@@ -438,6 +538,33 @@ async def _observe_terminal_interactive(
                 raise RuntimeError("terminal stopped before becoming interactive")
             if loop.time() >= deadline:
                 raise TimeoutError(f"terminal did not become interactive within {timeout_s:g}s")
+            if startup_dialog is not None and isinstance(screen, str):
+                headline = startup_dialog.headline(screen)
+                if headline != dialog_headline:
+                    dialog_headline, dialog_since = headline, loop.time()
+                    next_notice_at = dialog_since
+                elif (
+                    headline is not None
+                    and headline not in notified_dialogs
+                    and notice_attempts.get(headline, 0) < _STARTUP_DIALOG_NOTICE_ATTEMPTS
+                    and loop.time()
+                    >= max(dialog_since + _STARTUP_DIALOG_NOTICE_AFTER_S, next_notice_at)
+                ):
+                    notice_attempts[headline] = notice_attempts.get(headline, 0) + 1
+                    next_notice_at = loop.time() + _STARTUP_DIALOG_NOTICE_AFTER_S
+                    posted = await _report_startup_dialog(
+                        startup_dialog,
+                        headline,
+                        session_id=session_id,
+                        harness=harness,
+                        terminal_id=terminal_id,
+                        instance=instance,
+                        waited_s=loop.time() - started_at,
+                        record=headline not in recorded_dialogs,
+                    )
+                    recorded_dialogs.add(headline)
+                    if posted:
+                        notified_dialogs.add(headline)
             await asyncio.sleep(poll_interval_s)
     except asyncio.CancelledError:
         raise
@@ -470,6 +597,7 @@ def _schedule_terminal_interactive_observer(
     harness: str,
     readiness_signal: str,
     is_interactive: Callable[[str], bool],
+    startup_dialog: _StartupDialogWatch | None = None,
 ) -> None:
     """Start a non-blocking readiness observer for a registered terminal."""
     terminal_registry = getattr(resource_registry, "terminal_registry", None)
@@ -496,6 +624,7 @@ def _schedule_terminal_interactive_observer(
             readiness_signal=readiness_signal,
             instance=instance,
             is_interactive=is_interactive,
+            startup_dialog=startup_dialog,
         ),
         name=f"terminal-interactive-{session_id}-{terminal_name}",
     )
@@ -2904,6 +3033,50 @@ _CODEX_THREAD_RESET_NOTICE = (
     "Codex thread instead of failing the turn. The chat history here is intact, but "
     "Codex's own memory of the earlier turns is not restored."
 )
+
+
+async def _post_claude_startup_dialog_notice(
+    headline: str,
+    *,
+    session_id: str,
+    server_client: httpx.AsyncClient,
+    source_id: str,
+) -> None:
+    """Post an informational startup notice naming the dialog and terminal in its collapsed title.
+
+    An ``error`` item with ``level: "info"`` renders as a neutral notice,
+    persists across reload and stays out of the model's context.
+
+    :param headline: The dialog's first line, e.g. ``"Settings Error"``.
+    :param session_id: Session/conversation identifier.
+    :param server_client: Runner Omnigent server client.
+    :param source_id: Stable key for this notice; the server dedupes a repost.
+    :raises httpx.HTTPError: If the notice could not be posted.
+    """
+    resp = await server_client.post(
+        f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "source_id": source_id,
+                "item_type": "error",
+                "item_data": {
+                    "source": "harness",
+                    "code": "native_startup_dialog",
+                    "title": f"Claude Code is waiting for an answer in its terminal ({headline})",
+                    "message": (
+                        f"Claude Code is showing “{headline}” in its terminal and won't "
+                        "start until it is answered. Open the terminal to continue."
+                    ),
+                    "level": "info",
+                },
+            },
+        },
+        # Awaited inside the readiness poll; a slow server costs at most one
+        # retry spacing before the loop reads the pane again.
+        timeout=_STARTUP_DIALOG_NOTICE_AFTER_S,
+    )
+    resp.raise_for_status()
 
 
 async def _post_codex_thread_reset_notice(
@@ -9364,7 +9537,16 @@ async def _auto_create_claude_terminal(
         terminal_name="claude",
         session_key="main",
     )
-    from omnigent.harnesses.claude_native.bridge import _claude_prompt_rendered
+    from omnigent.harnesses.claude_native.bridge import (
+        _claude_prompt_rendered,
+        _terminal_dialog_headline,
+        claude_startup_dialog_category,
+    )
+
+    async def notify_startup_dialog(headline: str, source_id: str) -> None:
+        await _post_claude_startup_dialog_notice(
+            headline, session_id=session_id, server_client=server_client, source_id=source_id
+        )
 
     _schedule_terminal_interactive_observer(
         session_id=session_id,
@@ -9374,6 +9556,11 @@ async def _auto_create_claude_terminal(
         harness="claude-native",
         readiness_signal="claude_composer",
         is_interactive=_claude_prompt_rendered,
+        startup_dialog=_StartupDialogWatch(
+            headline=_terminal_dialog_headline,
+            notify=notify_startup_dialog,
+            category=claude_startup_dialog_category,
+        ),
     )
     _logger.info(
         "Claude terminal tmux target published: session=%s bridge_id=%s",

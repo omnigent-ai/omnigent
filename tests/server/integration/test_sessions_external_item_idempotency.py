@@ -83,6 +83,38 @@ async def test_distinct_source_ids_persist_separately(
     assert await _message_texts(client, session_id) == ["same text", "same text"]
 
 
+async def test_reposted_error_notice_persists_once_with_its_title(
+    client: httpx.AsyncClient,
+) -> None:
+    # The runner's startup-dialog notice retries a post whose response was lost;
+    # the person must still see exactly one notice, with its classified title.
+    session_id = await _create_session(client, "idem-notice")
+    title = "Claude Code is waiting for an answer in its terminal (Settings Error)"
+    event = {
+        "type": "external_conversation_item",
+        "data": {
+            "source_id": "native_startup_dialog:terminal-1:Settings Error",
+            "item_type": "error",
+            "item_data": {
+                "source": "harness",
+                "code": "native_startup_dialog",
+                "title": title,
+                "message": "Claude Code is showing “Settings Error” in its terminal.",
+                "level": "info",
+            },
+        },
+    }
+    acks = []
+    for _ in range(2):
+        resp = await client.post(f"/v1/sessions/{session_id}/events", json=event)
+        assert resp.status_code in (200, 201, 202), resp.text
+        acks.append(resp.json())
+    assert acks[0]["item_id"] == acks[1]["item_id"]
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    notices = [item for item in items if item.get("code") == "native_startup_dialog"]
+    assert [item["title"] for item in notices] == [title]
+
+
 async def test_repost_without_source_id_keeps_legacy_behavior(
     client: httpx.AsyncClient,
 ) -> None:
