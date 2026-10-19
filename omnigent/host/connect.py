@@ -1347,6 +1347,8 @@ class HostProcess:
         # Set only when that retirement fired, so a lifecycle loss from another
         # cause keeps its own exit.
         self._retired_for_runtime_gone = False
+        # Launch frames accepted but not yet answered; retirement waits for them.
+        self._launches_in_flight = 0
 
     def _tracked_runner_pids(self) -> set[int]:
         """Return child PIDs whose exit status still belongs to a process handle.
@@ -1878,6 +1880,11 @@ class HostProcess:
             ``"failed"`` result. Deterministic preflight refusals
             include a machine-readable ``error_code``.
         """
+        if self._lifecycle_lost.is_set():
+            # Teardown would kill a runner started now, so refuse it instead.
+            return self._launch_failed(
+                frame, "this host is shutting down; retry once it reconnects."
+            )
         # Refuse to spawn for a harness this machine can't actually run —
         # otherwise the runner starts, the session looks alive, and the
         # first turn dies confusingly inside the executor. ``None`` (an
@@ -2025,8 +2032,9 @@ class HostProcess:
                         frame,
                         "failed to spawn runner: this host's Python runtime "
                         f"({sys.executable}) was deleted while the host was running. "
-                        "The host restarts on a fresh runtime once its other runners "
-                        f"have exited; retry after it reconnects. ({exc})",
+                        "The host exits once its other runners have; a supervised host "
+                        "then restarts on a fresh runtime, otherwise restart it with "
+                        f"`{cli_invocation()} host` before retrying. ({exc})",
                     )
                 return self._launch_failed(
                     frame,
@@ -4077,8 +4085,9 @@ class HostProcess:
         Callers run this after sending the frames that report the change. The
         tunnel closes gracefully, so those frames are flushed before the close;
         :meth:`run` then breaks out of its serve loop and the entry point exits
-        with :data:`HOST_RUNTIME_GONE_EXIT_CODE`. While disconnected, or with an
-        exit report still parked, the next registration rechecks instead.
+        with :data:`HOST_RUNTIME_GONE_EXIT_CODE`. While a launch is unanswered the
+        last one rechecks; while disconnected, or with an exit report still
+        parked, the next registration does.
 
         :returns: None.
         """
@@ -4086,10 +4095,16 @@ class HostProcess:
         if (
             not self._runtime_gone
             or self._runners
+            or self._launches_in_flight
             or self._lifecycle_lost.is_set()
             or ws is None
             or self._unreported_exits
         ):
+            return
+        if os.path.exists(sys.executable):
+            # The interpreter was recreated at the same path, so spawns work again.
+            _logger.info("Host runtime %s is back; the host stays up.", sys.executable)
+            self._runtime_gone = False
             return
         _logger.warning("Host runtime is gone and no runner is live; exiting for a restart.")
         self._retired_for_runtime_gone = True
@@ -5076,12 +5091,16 @@ class HostProcess:
                 )
             # Register before queuing; keep the lifecycle lock as the first
             # await so launch/stop frames still acquire it in arrival order.
+            self._launches_in_flight += 1
             try:
-                async with self._runner_lifecycle_lock:
-                    launch_result = await self._handle_launch(frame)
+                try:
+                    async with self._runner_lifecycle_lock:
+                        launch_result = await self._handle_launch(frame)
+                finally:
+                    completion.set_result(None)
+                await self._send_text(ws, encode_host_frame(launch_result))
             finally:
-                completion.set_result(None)
-            await self._send_text(ws, encode_host_frame(launch_result))
+                self._launches_in_flight -= 1
             await self._retire_if_runtime_gone()
         elif isinstance(frame, HostStopRunnerFrame):
             async with self._runner_lifecycle_lock:
