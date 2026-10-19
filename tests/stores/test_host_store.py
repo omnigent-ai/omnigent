@@ -51,6 +51,72 @@ def _set_updated_at(db_uri: str, host_id: str, value: int) -> None:
         session.commit()
 
 
+def test_host_keeps_legacy_positional_fields() -> None:
+    host = Host(
+        "id",
+        "box",
+        "alice",
+        "offline",
+        1,
+        2,
+        "modal",
+        "box",
+        {"codex": True},
+        "old",
+        3,
+        "generation",
+    )
+    assert host.configured_harnesses == {"codex": True}
+    assert (host.terminating_sandbox_id, host.deleted_at, host.account_generation) == (
+        "old",
+        3,
+        "generation",
+    )
+    assert host.sandbox_attached is False and host.display_name is None
+
+
+def test_reusable_host_label_preserves_identity_and_liveness(host_store, db_uri) -> None:
+    host_id = uuid.uuid4().hex
+    reserve = {
+        "host_id": host_id,
+        "name": "controller-name",
+        "user_id": "alice",
+        "provider": "static",
+        "attached_sandbox_id": "box",
+    }
+    host_store.reserve_sandbox_host(**reserve)
+    host_store.upsert_on_connect(host_id, "controller-name", "alice")
+    _set_updated_at(db_uri, host_id, 1)
+    original = host_store.get_host(host_id)
+    renamed = host_store.set_display_name(host_id, user_id="alice", display_name="My project")
+    assert renamed.name == original.name
+    assert renamed.updated_at == original.updated_at == 1
+    assert renamed.created_at == original.created_at
+    assert renamed.display_name == "My project" and not host_is_live(renamed)
+    assert host_store.set_display_name(host_id, user_id="bob", display_name="Foreign") is None
+    with workspace_scope(42):
+        assert (
+            host_store.set_display_name(host_id, user_id="alice", display_name="Foreign") is None
+        )
+    assert host_store.reserve_sandbox_host(**reserve).display_name == "My project"
+    reconnected = host_store.upsert_on_connect(host_id, "new-controller-name", "alice")
+    assert reconnected.name == "new-controller-name" and reconnected.display_name == "My project"
+    rotated = host_store.upsert_on_connect(uuid.uuid4().hex, reconnected.name, "alice")
+    assert rotated.display_name == "My project"
+    assert (
+        host_store.set_display_name(
+            rotated.host_id, user_id="alice", display_name=None
+        ).display_name
+        is None
+    )
+    host_store.delete_host(rotated.host_id, user_id="alice")
+    assert (
+        host_store.set_display_name(rotated.host_id, user_id="alice", display_name="Gone") is None
+    )
+    host_store.upsert_on_connect(host_id, "ordinary-host", "alice")
+    assert host_store.set_display_name(host_id, user_id="alice", display_name="Ordinary") is None
+
+
 @pytest.mark.parametrize("provider", [None, "kubernetes", "agent_sandbox", "modal", "lakebox"])
 @pytest.mark.parametrize("saved_profile", [False, True])
 @pytest.mark.parametrize("binding", ["unbound", "same-host", "transfer"])
@@ -940,7 +1006,7 @@ def test_stale_request_cannot_reserve_host(host_store: HostStore) -> None:
     assert host_store.get_host(_RESERVED_HOST_ID) is None
 
 
-@pytest.mark.parametrize("operation", ["reserve", "bind"])
+@pytest.mark.parametrize("operation", ["reserve", "bind", "rename"])
 def test_sandbox_metadata_cannot_cross_account_generation(
     host_store: HostStore, db_uri: str, operation: str
 ) -> None:
@@ -954,6 +1020,14 @@ def test_sandbox_metadata_cannot_cross_account_generation(
             )
         )
     reserved = _reserve(host_store)
+    if operation == "rename":
+        with engine.begin() as connection:
+            connection.execute(
+                update(SqlHost)
+                .where(SqlHost.host_id == _RESERVED_HOST_ID)
+                .values(sandbox_attached=True)
+            )
+        reserved = host_store.get_host(_RESERVED_HOST_ID)
     with engine.begin() as connection:
         connection.execute(
             update(SqlUser)
@@ -965,6 +1039,10 @@ def test_sandbox_metadata_cannot_cross_account_generation(
     with pytest.raises(OmnigentError, match="authority has been revoked"):
         if operation == "reserve":
             _reserve(host_store)
+        elif operation == "rename":
+            host_store.set_display_name(
+                _RESERVED_HOST_ID, user_id="alice@example.test", display_name="Renamed"
+            )
         else:
             host_store.bind_sandbox(_RESERVED_HOST_ID, provider="modal", sandbox_id="environment")
     assert host_store.get_host(_RESERVED_HOST_ID) == reserved

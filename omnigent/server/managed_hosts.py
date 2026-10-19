@@ -678,7 +678,7 @@ class ManagedSandboxConfig:
         always re-authenticate its tunnel across reconnects.
     :param managed_launch_supported: Whether ``launcher_factory`` can
         create a sandbox. The YAML path uses contributed providers'
-        ``managed_launch`` capability or :data:`PROVIDERS_WITH_MANAGED_LAUNCH` — staged providers
+        registry metadata or :data:`PROVIDERS_WITH_MANAGED_LAUNCH` — staged providers
         (``lakebox``) parse but get ``False``, since their factory
         rejects at launch. Defaults to ``True`` for
         directly-constructed configs (an embedding deployment's
@@ -1664,6 +1664,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
     validate_inference_credentials({}, model_discovery)
     if provider == "agent_sandbox":
         host_config = _apply_keep_warm(host_config, _parse_keep_warm_s(raw))
+    managed_launch_supported = provider in PROVIDERS_WITH_MANAGED_LAUNCH
     if provider == "modal":
         launcher_factory = _modal_launcher_factory(
             _parse_modal_image(raw), _parse_modal_secrets(raw)
@@ -1916,6 +1917,8 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         )
         token_ttl_s = MICROSANDBOX_MANAGED_TOKEN_TTL_S
     elif provider in community:
+        from omnigent.onboarding.sandboxes.registry import get_provider_metadata
+
         # A provider contributed through the `omnigent.sandbox_providers`
         # entry point group. The registry has validated it (name not shadowing
         # a built-in, launcher class under `omnigent.community.sandbox.*`) at
@@ -1931,6 +1934,8 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         _parse_registry_config(provider, section)
         launcher_factory = _registry_launcher_factory(provider, section)
         token_ttl_s = _registry_token_ttl_s(provider)
+        metadata = get_provider_metadata(provider)
+        managed_launch_supported = metadata is None or metadata.managed_launch_supported
     else:
         launcher_factory = _unsupported_launcher_factory(provider)
         # Never consulted (the factory rejects before any token is
@@ -1940,11 +1945,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         server_url=server_url.strip().rstrip("/"),
         launcher_factory=launcher_factory,
         token_ttl_s=token_ttl_s,
-        managed_launch_supported=(
-            launcher_factory().capabilities.managed_launch
-            if provider in community
-            else provider in PROVIDERS_WITH_MANAGED_LAUNCH
-        ),
+        managed_launch_supported=managed_launch_supported,
         provider=provider,
         host_config=host_config,
         model_discovery=model_discovery,
@@ -3794,7 +3795,7 @@ async def discover_sandbox_hosts(
 ) -> Sequence[SandboxInfo]:
     """Read the caller's controller inventory without registering or waking hosts."""
     entry = _select_provider_config(config, provider)
-    launcher = _launcher_for_owner(entry, owner)
+    launcher = build_owner_launcher(entry, config, owner)
     if launcher.provider != provider or not launcher.capabilities.reusable_hosts:
         raise HTTPException(400, "discovery requires a reusable sandbox provider")
     try:
@@ -3914,10 +3915,12 @@ async def launch_managed_host(
         provisioning, cloning, host startup, or registration fails.
     """
     entry = _select_provider_config(config, provider)
+    if not entry.managed_launch_supported:
+        raise HTTPException(
+            400, f"sandbox provider {entry.provider!r} does not support creating new sandboxes"
+        )
     launcher = build_owner_launcher(entry, config, owner)
     reusable = launcher.capabilities.reusable_hosts
-    if not entry.managed_launch_supported or not launcher.capabilities.managed_launch:
-        raise HTTPException(400, "sandbox provider does not support creating new sandboxes")
     if reusable and not launcher.capabilities.resume_stopped:
         raise HTTPException(400, "reusable sandbox providers must support resume")
     repos = _apply_git_clone_options(launcher, repos, entry.git_clone)

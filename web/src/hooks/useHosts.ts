@@ -13,6 +13,8 @@ import type { NativeModelOption } from "@/lib/types";
 export interface Host {
   host_id: string;
   name: string;
+  /** Optional user-owned label; older servers omit it. */
+  display_name?: string | null;
   owner: string;
   status: "online" | "offline";
   /**

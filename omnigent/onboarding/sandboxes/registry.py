@@ -58,12 +58,15 @@ class SandboxProviderMetadata:
         provider-specific ``sandbox.<name>`` config block.
     :param managed_token_ttl_s: Optional default managed launch-token
         lifetime in seconds.
+    :param managed_launch_supported: Opt out for discovery-only providers.
+        Defaults to True to preserve existing contributed providers' creation support.
     """
 
     name: str
     launcher_class: str
     config_model: type[object] | None = None
     managed_token_ttl_s: int | None = None
+    managed_launch_supported: bool = True
 
 
 @dataclass(frozen=True)

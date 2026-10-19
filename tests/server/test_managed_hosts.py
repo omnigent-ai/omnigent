@@ -2741,8 +2741,10 @@ async def test_launch_without_host_config_writes_no_config(db_uri: str) -> None:
     assert not any(cmd.startswith("python3 -c") for cmd in fake.commands)
 
 
+@pytest.mark.parametrize("partial_capabilities", [False, True])
 async def test_launch_and_resume_without_optional_kwargs_support_legacy_start_host_signature(
     db_uri: str,
+    partial_capabilities: bool,
 ) -> None:
     """
     A deployment-injected launcher whose ``start_host`` override predates the
@@ -2760,6 +2762,14 @@ async def test_launch_and_resume_without_optional_kwargs_support_legacy_start_ho
 
     class _LegacySignatureLauncher(FakeSandboxLauncher):
         """Overrides start_host with the pre-host_config explicit signature."""
+
+        @property
+        def capabilities(self):
+            from omnigent.onboarding.sandboxes.types import SandboxCapabilities
+
+            if partial_capabilities:
+                return SandboxCapabilities(resume_stopped=True)
+            return super().capabilities
 
         def start_host(
             self,
@@ -5820,7 +5830,16 @@ def test_parse_contributed_provider_builds_registry_backed_factory(
     A provider contributed through the entry point group is configurable and
     serves managed sessions, without being named in this module.
     """
-    monkeypatch.setattr(_AcmeLauncher, "supports_managed_launch", supports_creation)
+    from omnigent.onboarding.sandboxes.registry import plugin_state
+
+    registry = plugin_state()
+    assert registry.providers["acme"].managed_launch_supported is True
+    registry.providers["acme"] = replace(
+        registry.providers["acme"], managed_launch_supported=supports_creation
+    )
+    # Parsing config must not construct a launcher or inspect partial capabilities.
+    original_init = _AcmeLauncher.__init__
+    monkeypatch.setattr(_AcmeLauncher, "__init__", lambda *a, **k: pytest.fail("eager launcher"))
     cfg = parse_sandbox_config(
         {
             "provider": "acme",
@@ -5833,6 +5852,7 @@ def test_parse_contributed_provider_builds_registry_backed_factory(
     assert cfg.provider == "acme"
     assert cfg.managed_launch_supported is supports_creation
     assert cfg.token_ttl_s == 1234
+    monkeypatch.setattr(_AcmeLauncher, "__init__", original_init)
 
     launcher = cfg.launcher_factory()
     assert isinstance(launcher, _AcmeLauncher)

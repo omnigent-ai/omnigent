@@ -53,6 +53,19 @@ describe("resolveHostBadge", () => {
     ).toEqual({ label: "Databricks Sandbox", status: "online" });
   });
 
+  it.each([null, "My project"])(
+    "labels a reusable sandbox with its optional label: %s",
+    (display_name) => {
+      expect(
+        resolveHostBadge({
+          hostId: "host_sb",
+          host: host({ sandbox_provider: "static", sandbox_attached: true, display_name }),
+          online: false,
+        }),
+      ).toEqual({ label: display_name ?? "mac-laptop", status: "offline" });
+    },
+  );
+
   it("falls back to the raw host_id when the host record is unresolved", () => {
     // Shared session on another owner's host, or hosts not loaded yet:
     // there's no name to show, but the session IS host-bound, so the

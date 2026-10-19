@@ -60,7 +60,7 @@ type Phase =
 export function HarnessFixDialog(props: HarnessFixDialogProps) {
   const { open, onOpenChange, mode, host, harness, harnessLabel, onFixed } = props;
   const hostId = host.host_id;
-  const hostName = host.name;
+  const hostName = host.display_name ?? host.name;
   const queryClient = useQueryClient();
   const { mutateAsync: installHarness } = useInstallHarness(hostId);
   const info = useServerInfo();

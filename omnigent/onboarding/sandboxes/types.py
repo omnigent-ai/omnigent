@@ -135,6 +135,8 @@ class SandboxInfo:
     workspace_path: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     name: str | None = None
+    # Optional controller-reported state, independent of host connectivity.
+    state: str | None = None
 
 
 @dataclass(frozen=True)

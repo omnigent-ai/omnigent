@@ -3483,7 +3483,11 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
     async def drive(base_url, session_id):
         async with async_playwright() as pw:
             browser = await pw.chromium.launch()
-            page = await browser.new_page(viewport={"width": 1280, "height": 900})
+            page = await browser.new_page(
+                viewport={"width": 1280, "height": 900},
+                record_video_dir=str(tmp_path / "video"),
+                record_video_size={"width": 1280, "height": 900},
+            )
             creates = []
             await _register_common_routes(
                 page, created_session_id=session_id, create_bodies=creates
@@ -3509,6 +3513,7 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
             wake_calls = []
             discovery_calls = []
             attach_calls = []
+            rename_calls = []
 
             async def discover(route):
                 discovery_calls.append(route.request.method)
@@ -3520,7 +3525,11 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
                             "sandboxes": []
                             if len(discovery_calls) == 2
                             else [
-                                {"sandbox_id": "existing-box", "name": "My devbox"},
+                                {
+                                    "sandbox_id": "existing-box",
+                                    "name": "My devbox",
+                                    "state": "running",
+                                },
                                 {"sandbox_id": "another-box", "name": "Another sandbox"},
                             ]
                         }
@@ -3534,6 +3543,14 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
                     attached["status"] = "online"
                     hosts.append(attached)
                     await route.fulfill(json={"host_id": attached["host_id"]})
+
+            async def rename(route):
+                assert route.request.method == "PATCH"
+                rename_calls.append(route.request.post_data_json)
+                attached["display_name"] = route.request.post_data_json["display_name"]
+                await route.fulfill(
+                    json={"host_id": attached["host_id"], "display_name": attached["display_name"]}
+                )
 
             async def wake(route):
                 wake_calls.append(route.request.method)
@@ -3552,6 +3569,7 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
             await page.route("**/v1/hosts/sandboxes?provider=static", discover)
             await page.route("**/v1/hosts/attach", attach)
             await page.route("**/v1/hosts/host_devbox/wake", wake)
+            await page.route("**/v1/hosts/host_devbox", rename)
             await page.route(
                 re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"),
                 lambda route: route.fulfill(json={"data": []}),
@@ -3575,6 +3593,7 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
                 await expect(
                     discovery.get_by_role("button", name="Another sandbox")
                 ).to_be_visible()
+                await expect(discovery).to_contain_text("Controller state: running")
                 assert not attach_calls
                 await discovery.get_by_role("button", name="My devbox").click()
                 await expect(discovery.get_by_role("alert")).to_have_text("Access denied")
@@ -3617,6 +3636,19 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
                 await row.click()
                 await expect(chip).to_have_attribute("aria-label", "Host: My devbox, Online")
                 assert wake_calls == ["POST"]
+                await page.get_by_role("button", name="Rename static sandbox", exact=True).click()
+                naming = page.get_by_role("dialog", name="Rename static sandbox")
+                await naming.get_by_role("textbox", name="Sandbox name").fill("My project")
+                await naming.get_by_role("button", name="Save", exact=True).click()
+                await expect(naming).to_be_hidden()
+                await expect(chip).to_have_attribute("aria-label", "Host: My project, Online")
+                await page.reload()
+                await expect(chip).to_have_attribute("aria-label", "Host: My project, Online")
+                assert rename_calls == [{"display_name": "My project"}]
+                assert wake_calls == ["POST"] and len(attach_calls) == 2
+                await page.screenshot(
+                    path=str(tmp_path / "named-static-sandbox.png"), animations="disabled"
+                )
                 for number in range(2):
                     if number:
                         await page.goto(f"{base_url}/")
@@ -3624,11 +3656,41 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
                         "Explain this project"
                     )
                     await page.get_by_test_id("new-chat-landing-submit").click()
-                    await _wait_until(lambda expected=number + 1: len(creates) == expected)
+                    await poll_until_async(lambda expected=number + 1: len(creates) == expected)
                     await expect(page).to_have_url(re.compile(rf"/c/{session_id}$"))
                 assert [body["host_id"] for body in creates] == ["host_devbox", "host_devbox"]
                 assert all(body.get("host_type") != "managed" for body in creates)
+
+                async def coding_snapshot(route):
+                    response = await route.fetch()
+                    body = await response.json()
+                    body.update(host_id="host_devbox", workspace="/work/repo")
+                    await route.fulfill(response=response, json=body)
+
+                await page.route(re.compile(rf"/v1/sessions/{session_id}(\?|$)"), coding_snapshot)
+                await page.set_viewport_size({"width": 390, "height": 844})
+                await page.reload()
+                await page.get_by_test_id("header-conversation-actions").click()
+                await page.get_by_test_id("header-fork-conversation").click()
+                clone = page.get_by_test_id("fork-session-dialog")
+                await expect(clone).to_be_visible()
+                await expect(clone.get_by_test_id("fork-session-host-select")).to_contain_text(
+                    "My project"
+                )
+                await clone.get_by_role("button", name="Rename static sandbox").click()
+                await naming.get_by_role("textbox", name="Sandbox name").fill("")
+                await naming.get_by_role("button", name="Save", exact=True).click()
+                await expect(naming).to_be_hidden()
+                await expect(clone.get_by_test_id("fork-session-host-select")).to_contain_text(
+                    "My devbox"
+                )
+                assert rename_calls == [{"display_name": "My project"}, {"display_name": None}]
+                assert wake_calls == ["POST"] and len(attach_calls) == 2
+                await page.screenshot(
+                    path=str(tmp_path / "clone-static-sandbox-name.png"), animations="disabled"
+                )
             finally:
+                await page.context.close()
                 await browser.close()
 
     # This picker scenario needs a rendered session, but never an agent process.

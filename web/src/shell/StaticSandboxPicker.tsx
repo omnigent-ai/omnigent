@@ -13,6 +13,7 @@ import { authenticatedFetch } from "@/lib/identity";
 interface Sandbox {
   sandbox_id: string;
   name: string;
+  state?: string | null;
 }
 
 /** Mounted only while choosing a box from one provider's current inventory. */
@@ -91,6 +92,9 @@ export function StaticSandboxPicker({
             >
               <span className="break-all">{box.name}</span>
               <span className="break-all text-xs text-muted-foreground">{box.sandbox_id}</span>
+              {box.state && (
+                <span className="text-xs text-muted-foreground">Controller state: {box.state}</span>
+              )}
             </Button>
           ))}
         </div>

@@ -66,6 +66,7 @@ class Host:
     :param host_id: Stable identifier from the host's local
         ``~/.omnigent/config.yaml``, e.g. ``"host_a1b2c3d4..."``.
     :param name: Human-readable name, e.g. ``"corey-laptop"``.
+    :param display_name: Optional owner-assigned label, separate from host identity.
     :param user_id: User ID from the Databricks auth Bearer token,
         e.g. ``"corey.zumar@databricks.com"``.
     :param status: ``"online"`` or ``"offline"``.
@@ -105,11 +106,13 @@ class Host:
     updated_at: int
     sandbox_provider: str | None = None
     sandbox_id: str | None = None
-    sandbox_attached: bool = False
     configured_harnesses: dict[str, HarnessAvailability] | None = None
     terminating_sandbox_id: str | None = None
     deleted_at: int | None = None
     account_generation: str | None = None
+    # Append optional fields to preserve existing positional constructors.
+    sandbox_attached: bool = False
+    display_name: str | None = None
 
 
 ManagedSandboxScanCursor = tuple[str, int, str]
@@ -175,6 +178,7 @@ def _row_to_host(row: SqlHost) -> Host:
     return Host(
         host_id=row.host_id,
         name=row.name,
+        display_name=row.display_name,
         user_id=row.user_id,
         status=decode_host_status(row.status),
         created_at=row.created_at,
@@ -481,6 +485,7 @@ class HostStore:
         user_id = row.user_id
         generation = row.account_generation
         name = row.name
+        display_name = row.display_name
         token_hash = row.token_hash
         token_expires_at = row.token_expires_at
         sandbox_provider = row.sandbox_provider
@@ -522,6 +527,7 @@ class HostStore:
             host_id=new_host_id,
             user_id=user_id,
             name=name,
+            display_name=display_name,
             status=encode_host_status("online"),
             created_at=created_at,
             updated_at=now,
@@ -623,6 +629,7 @@ class HostStore:
             sandbox_provider=existing.sandbox_provider,
             sandbox_id=existing.sandbox_id,
             sandbox_attached=bool(existing.sandbox_attached),
+            display_name=existing.display_name,
             configured_harnesses=_parse_configured_harnesses(configured_harnesses_json),
         )
 
@@ -899,6 +906,41 @@ class HostStore:
             if row is None:
                 return None
             return _row_to_host(row)
+
+    def set_display_name(
+        self, host_id: str, *, user_id: str, display_name: str | None
+    ) -> Host | None:
+        """Set an owner's reusable-host label without changing identity or liveness."""
+        if display_name is not None and (
+            not display_name
+            or len(display_name) > 64
+            or display_name != display_name.strip()
+            or any(ord(char) < 32 or ord(char) == 127 for char in display_name)
+        ):
+            raise ValueError(
+                "display_name must be 1–64 characters without surrounding whitespace or controls"
+            )
+
+        def write(session: Session) -> Host | None:
+            require_active_account(session, user_id)
+            row = session.execute(
+                select(SqlHost)
+                .where(
+                    SqlHost.workspace_id == current_workspace_id(),
+                    SqlHost.host_id == host_id,
+                    SqlHost.user_id == user_id,
+                    SqlHost.deleted_at.is_(None),
+                    SqlHost.sandbox_attached.is_(True),
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None:
+                return None
+            require_active_account(session, user_id, generation=row.account_generation)
+            row.display_name = display_name
+            return _row_to_host(row)
+
+        return run_write_transaction(self._lifecycle_session, "rename_sandbox_host", write)
 
     def host_identity_taken(self, *, host_id: str, user_id: str, name: str) -> bool:
         """

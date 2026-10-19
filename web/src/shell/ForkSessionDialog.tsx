@@ -90,6 +90,7 @@ import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferen
 import { resolveWorkspacePath, useResolvedHostHome } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { StaticSandboxPicker } from "./StaticSandboxPicker";
+import { StaticSandboxName } from "./StaticSandboxName";
 import { WorkspacePathField } from "./WorkspacePathField";
 import {
   ConnectHostInstructions,
@@ -144,7 +145,7 @@ function HostLabel({ host }: { host: Host }) {
       ) : (
         <MonitorIcon className="size-4 text-muted-foreground" />
       )}
-      <span className="font-mono text-sm">{host.name}</span>
+      <span className="font-mono text-sm">{host.display_name ?? host.name}</span>
       <span
         className={`inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${
           isOnline ? "text-green-600" : "text-muted-foreground"
@@ -835,6 +836,7 @@ function SupportedForkSessionForm({
   // never shows the host field).
   const { data: hosts } = useHosts({ enabled: isCodingSource });
   const allHosts = hosts ?? [];
+  const selectedHost = allHosts.find((host) => host.host_id === selectedHostId);
   const onlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "online"), [hosts]);
   const offlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "offline"), [hosts]);
   const sourceHostOnline = onlineHosts.some((h) => h.host_id === sourceHostId);
@@ -1499,7 +1501,12 @@ function SupportedForkSessionForm({
               or the connect instructions directly when none is. */}
         {isCodingSource && (
           <div className="flex flex-col gap-2">
-            <span className="text-sm font-medium text-muted-foreground">Host</span>
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-medium text-muted-foreground">Host</span>
+              {!sandboxSelected && selectedHost?.sandbox_attached && (
+                <StaticSandboxName host={selectedHost} />
+              )}
+            </div>
             {hosts === undefined ? (
               <p className="text-sm text-muted-foreground" data-testid="fork-session-no-hosts">
                 Loading hosts…

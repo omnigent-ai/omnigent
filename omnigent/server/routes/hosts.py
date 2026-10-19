@@ -25,7 +25,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from packaging.version import InvalidVersion, Version
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.db.utils import now_epoch
 from omnigent.debug_logging import (
@@ -78,6 +78,18 @@ from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
+
+
+class RenameSandboxRequest(BaseModel):
+    """Null clears the user-owned label; registration names remain unchanged."""
+
+    model_config = ConfigDict(extra="forbid")
+    display_name: str | None = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[^\s\x00-\x1f\x7f](?:[^\x00-\x1f\x7f]*[^\s\x00-\x1f\x7f])?$",
+    )
 
 
 class AttachSandboxRequest(BaseModel):
@@ -722,7 +734,7 @@ def create_hosts_router(
     @router.get("/hosts/sandboxes")
     async def discover_sandboxes(
         request: Request, provider: str = Query(min_length=1, max_length=32)
-    ) -> dict[str, list[dict[str, str]]]:
+    ) -> dict[str, list[dict[str, str | None]]]:
         """List the caller's reusable boxes, including those not registered as hosts."""
         from omnigent.server.managed_hosts import discover_sandbox_hosts
 
@@ -733,7 +745,12 @@ def create_hosts_router(
         boxes = await discover_sandbox_hosts(config=config, owner=owner, provider=provider)
         return {
             "sandboxes": [
-                {"sandbox_id": box.sandbox_id, "name": box.name or box.sandbox_id} for box in boxes
+                {
+                    "sandbox_id": box.sandbox_id,
+                    "name": box.name or box.sandbox_id,
+                    "state": box.state,
+                }
+                for box in boxes
             ]
         }
 
@@ -783,6 +800,19 @@ def create_hosts_router(
         await asyncio.to_thread(host_store.delete_host, host_id, user_id=owner)
         return {"host_id": host_id}
 
+    @router.patch("/hosts/{host_id}")
+    async def rename_sandbox_host(
+        request: Request, host_id: str, body: RenameSandboxRequest
+    ) -> dict[str, str | None]:
+        """Rename an owned reusable host without contacting its controller."""
+        owner = require_user(request, auth_provider) or "local"
+        host = await asyncio.to_thread(
+            host_store.set_display_name, host_id, user_id=owner, display_name=body.display_name
+        )
+        if host is None:
+            raise HTTPException(404, "reusable host not found")
+        return {"host_id": host.host_id, "display_name": host.display_name}
+
     @router.get("/hosts")
     async def list_hosts(request: Request) -> dict[str, list[dict[str, Any]]]:
         """List all hosts owned by the authenticated user.
@@ -823,6 +853,7 @@ def create_hosts_router(
                 {
                     "host_id": host.host_id,
                     "name": host.name,
+                    "display_name": host.display_name,
                     "owner": host.user_id,
                     "status": "online" if host_is_live(host, now=now) else "offline",
                     # Only sandboxes marked reusable appear in host pickers.
@@ -868,6 +899,7 @@ def create_hosts_router(
         return {
             "host_id": host.host_id,
             "name": host.name,
+            "display_name": host.display_name,
             "owner": host.user_id,
             "status": "online" if host_is_live(host) else "offline",
             "sandbox_provider": host.sandbox_provider,

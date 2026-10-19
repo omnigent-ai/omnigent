@@ -76,11 +76,13 @@ def capabilities(self):
     )
 ```
 
-The plugin registry reads `managed_launch` when configuring creation. For a
-directly injected `ManagedSandboxConfig`, also set
-`managed_launch_supported=False`. The provider still implements discovery,
-authorization, preparation, resume and host startup; `provision` can retain its
-default unsupported implementation.
+Set `managed_launch_supported=False` in the contributed
+`SandboxProviderMetadata` (or in a directly injected `ManagedSandboxConfig`).
+This opt-out defaults to true: existing providers remain launchable even if
+they return a partial capability object with `managed_launch` unset. Config
+parsing does not construct the launcher to decide whether creation is enabled.
+The provider still implements discovery, authorization, preparation, resume and
+host startup; `provision` can retain its default unsupported implementation.
 
 `GET /v1/info` lists creation providers in `sandbox_providers` and advertises
 `reusable_hosts` independently in `sandbox_provider_capabilities`. Both session
@@ -108,8 +110,12 @@ def list_for_user(self, *, owner: str):
     ]
 ```
 
-`SandboxInfo.name` is optional and falls back to the ID. Other metadata is not
-sent to the browser. The controller supplies the current inventory; Omnigent
+`SandboxInfo.name` is optional and falls back to the ID. `SandboxInfo.state`
+optionally supplies a controller-reported string such as `running` or `stopped`;
+omission means unknown. Discovery displays that state as information, never as
+a launch gate. It is not saved or polled in the background. Host `status` still
+means the existing heartbeat-based online/offline status; a running box need
+not have a connected host. Other metadata is not sent to the browser. The controller supplies the current inventory; Omnigent
 only saves a host registration after selection, not a copy of that inventory.
 
 The attachment authorization hook is optional and rejects requests by default:
@@ -159,6 +165,23 @@ HTTP is only the customer's control channel. Agents still run through the
 existing outbound host/runner connections. The controller must honor the supplied
 host identity and token; returning an HTTP endpoint alone is insufficient.
 
+## Friendly names owned by Omnigent
+
+`hosts.display_name` is an optional user-owned label, independent of the existing
+registration `name` and the provider's sandbox ID. After selecting a static
+sandbox in New session or Clone session, use the pencil button to rename it.
+The label appears in host pickers, the session badge, and host setup screens.
+Clearing it restores the existing host name. Duplicate display names are allowed.
+
+Only the host owner can rename a reusable host. Renaming does not contact the
+controller, change credentials, change the registration name, or touch the
+heartbeat timestamp. Reconnecting and reattaching preserve the label. Removing
+the registration removes its label; this is not a separate inventory of boxes.
+
+The existing row already contains workspace, owner, provider, sandbox ID, host
+ID and creation time. No metadata JSON or second provider store is needed for
+this mapping. Providers do not need to read or write the new label field.
+
 ## HTTP surface
 
 These additions under `/v1/hosts` are sandbox-specific. Ordinary host listing
@@ -166,9 +189,10 @@ and session launch APIs keep their existing purpose.
 
 | API | Purpose |
 | --- | --- |
-| `GET /v1/hosts/sandboxes?provider=…` | New: read the caller's controller inventory as `{sandboxes: [{sandbox_id, name}]}`. Requires `reusable_hosts`. |
+| `GET /v1/hosts/sandboxes?provider=…` | New: read the caller's controller inventory as `{sandboxes: [{sandbox_id, name, state}]}`. Requires `reusable_hosts`. |
 | `POST /v1/hosts/attach` | Authorize `{provider, sandbox_id, name}`, register or reuse the host, wake/connect it, return `{host_id}`. |
 | `POST /v1/hosts/{host_id}/wake` | Wake a saved reusable host before selecting a working directory. |
+| `PATCH /v1/hosts/{host_id}` | Set `{display_name: "My project"}` or clear with `{display_name: null}` for an owned reusable host. Return `{host_id, display_name}`. |
 | `DELETE /v1/hosts/{host_id}` | Remove a reusable registration and its credentials, without deleting the box. |
 | Existing session creation | A provider choice creates a fresh box. A host choice reuses that host. |
 
@@ -222,7 +246,7 @@ Content-Type: application/json
 This waits for the ordinary host connection and returns `{"host_id":"..."}`.
 Retries reuse the same host and keep its original name. An authorized but failed
 startup leaves the attachment available for retry. `GET /v1/hosts` and the host
-detail response expose `sandbox_attached`; older servers omit it, preserving the
+detail response expose `sandbox_attached` and nullable `display_name`; older servers omit it, preserving the
 old picker behavior. `POST /v1/hosts/{host_id}/wake` wakes an attachment, and
 `DELETE /v1/hosts/{host_id}` removes the attachment and revokes its credential
 without deleting the box. Detachment unbinds its sessions; it does not stop
