@@ -12,6 +12,9 @@ implements them separately, so a fix for one harness does not reach the others.
 - `launch-web`: pick the harness in the new-session composer and start a session.
 - `launch-cli`: `omnigent <name>` starts the harness in the user's terminal with
   an Omnigent session behind it.
+- `readiness-actions`: missing harnesses offer Install without a warning; known
+  auth/version problems offer Sign in/Update; unknown failures offer Needs
+  attention with details. Manual instructions remain available without automatic setup.
 - `needs-auth`: a harness without usable credentials is shown as needing
   sign-in, with a repair hint, instead of failing after launch. A harness the
   host has not configured can be hidden from the picker.
@@ -53,6 +56,11 @@ implements them separately, so a fix for one harness does not reach the others.
 **Web:** start a new session, choose the harness in the harness picker, open its
 configuration for model and effort, and send. Approval cards and the Terminal
 view appear in the session.
+
+**Readiness actions:** Settings → Harnesses cards and bookmarked harness detail
+pages; New Chat’s harness picker and the selected-harness notice. Settings
+warnings expose details by hover, keyboard focus, or tap. New Chat’s SDK menu
+uses the same reason labels without changing which harnesses can launch.
 
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
@@ -138,6 +146,19 @@ the extra fields. Resolver and raw-tunnel checks:
 `tests/server/integration/test_host_tunnel_route.py::test_startup_http_through_real_tunnel`.
 
 Cross-harness journeys:
+
+- **`readiness-actions` (browser contract, no server required):**
+  `tests/browser_ui/chat/test_harness_picker_availability.py::test_missing_harness_is_disabled_with_repair_tooltip`
+  drives desktop/manual and mobile/automatic setup through the built SPA with
+  explicit host-readiness and setup responses. It covers the New Chat picker,
+  selected-harness notice, Settings grid, and bookmarked detail route. Verify
+  that Install is neutral, unknown failures explain the limitation, and manual
+  setup never sends an install request. Run with `--video=on`; this proves UI
+  wiring, not a real vendor installation. Component coverage for statuses,
+  SDK labels, capability gates, and sign-in/update actions:
+  `web/src/lib/harnessSetup.test.ts`,
+  `web/src/pages/settings/SettingsHarnessesSection.test.tsx`, and
+  `web/src/shell/NewChatDialog.test.tsx`.
 
 - **Antigravity permission choices (Chat and Inbox):**
   `tests/e2e_ui/approvals/test_agy_permission_full_prompt.py::test_agy_permission_persist_request_round_trip`

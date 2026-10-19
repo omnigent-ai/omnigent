@@ -132,8 +132,7 @@ vi.mock("@/hooks/useHarnessInventory", async (importActual) => ({
   },
 }));
 
-// The "Set up" button is gated on the harness_install feature (like New Chat),
-// so drive that flag through the server-info mock.
+// Setup guidance stays reachable with or without automatic installation.
 let harnessInstall = true;
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
@@ -212,17 +211,27 @@ afterEach(() => {
 });
 
 describe("Harnesses grid", () => {
-  it("shows Installed (no Set-up) for a ready harness and a badge + Set-up for a not-ready one", () => {
+  it("shows Configured for a ready harness and Sign in for missing credentials", () => {
     hosts = [ONLINE];
     renderHarnesses();
 
-    // claude-native is ready → "Installed", no action button.
+    // Ready harnesses retain their settings gear.
     expect(within(card("claude-native")).getByText("Configured")).toBeTruthy();
     expect(screen.queryByTestId("harness-action-claude-native")).toBeNull();
 
-    // codex-native reports needs-auth → warning badge + a Set-up button.
-    expect(screen.getByText("Needs auth")).toBeTruthy();
+    // Missing credentials have a specific status and action.
+    expect(screen.getByText("Needs sign-in")).toBeTruthy();
     expect(screen.getByTestId("harness-action-codex-native")).toBeTruthy();
+  });
+
+  it("shows Needs sign-in for a credential the host reports as blocking", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "missing-credentials" } }];
+    renderHarnesses();
+
+    expect(within(card("codex-native")).getByText("Needs sign-in")).toBeTruthy();
+    expect(
+      within(card("codex-native")).getByRole("button", { name: "Sign in Codex" }),
+    ).toBeTruthy();
   });
 
   it("opens the setup dialog for the clicked harness", () => {
@@ -247,18 +256,43 @@ describe("Harnesses grid", () => {
     expect(screen.queryByTestId("harness-action-codex-native")).toBeNull();
     expect(screen.queryByTestId("harness-action-claude-native")).toBeNull();
     expect(within(card("claude-native")).queryByText("Installed")).toBeNull();
-    expect(screen.queryByText("Needs setup")).toBeNull();
+    expect(screen.queryByText("Needs attention")).toBeNull();
+    expect(screen.getByText(/isn’t reporting harness status/)).toBeVisible();
   });
 
-  it("hides Set-up (keeps the badge) when harness_install is disabled", () => {
-    // Flag off + binary-missing: the setup dialog would be a dead end (no
-    // runnable install step), so we show status only — matching New Chat.
-    harnessInstall = false;
+  it.each([false, true])("offers Install without a warning when harness_install=%s", (enabled) => {
+    harnessInstall = enabled;
     hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "binary-missing" } }];
     renderHarnesses();
+    expect(within(card("codex-native")).queryByText("Not installed")).toBeNull();
+    const install = within(card("codex-native")).getByRole("button", { name: "Install Codex" });
+    fireEvent.click(install);
+    expect(screen.getByTestId("setup-dialog")).toHaveAttribute("data-harness", "codex-native");
+  });
 
-    expect(screen.getByText("Binary missing")).toBeTruthy();
-    expect(screen.queryByTestId("harness-action-codex-native")).toBeNull();
+  it.each([false, "probe-failed"])(
+    "explains ambiguous readiness %s without suggesting installation",
+    async (value) => {
+      hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": value } }];
+      renderHarnesses();
+      const codex = within(card("codex-native"));
+      expect(codex.getByText("Needs attention")).toBeVisible();
+      expect(codex.queryByRole("button", { name: "Install Codex" })).toBeNull();
+      const details = codex.getByRole("button", { name: "Readiness details on my-laptop" });
+      fireEvent.focus(details);
+      expect(await screen.findByRole("tooltip")).toHaveTextContent("my-laptop:");
+      expect(screen.getByRole("tooltip")).toHaveTextContent("omni setup");
+      fireEvent.click(details);
+      expect(screen.getByTestId("setup-dialog")).toBeVisible();
+    },
+  );
+
+  it("offers Update only for a reported old version", () => {
+    hosts = [{ ...ONLINE, configured_harnesses: { "codex-native": "version-too-low" } }];
+    renderHarnesses();
+    expect(within(card("codex-native")).getByText("Outdated")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Update Codex" }));
+    expect(screen.getByTestId("setup-dialog")).toBeVisible();
   });
 
   it("shows the no-host notice and no Set-up buttons when no host is online", () => {
@@ -404,11 +438,11 @@ describe("Harness details", () => {
     expect(screen.queryByRole("tab", { name: /MCP servers/ })).toBeNull();
   });
 
-  it("offers Set up instead of the catalog for a harness that isn't ready", () => {
+  it("offers Sign in instead of the catalog for a harness that needs credentials", () => {
     hosts = [ONLINE];
     renderHarnesses("codex-native");
 
-    expect(screen.getByText(/Set up Codex on my-laptop/)).toBeTruthy();
+    expect(screen.getByText(/Sign in or add credentials/)).toBeTruthy();
     expect(screen.getByTestId("harness-action-codex-native")).toBeTruthy();
     expect(screen.queryByRole("tab", { name: /MCP servers/ })).toBeNull();
   });

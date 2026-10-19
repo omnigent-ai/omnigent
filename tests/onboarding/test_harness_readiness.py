@@ -235,7 +235,7 @@ def test_cli_harness_configured_only_when_binary_installed(
         ("0.84.1", "0.85.1", True),
         ("0.85.1", "0.84.1", HARNESS_VERSION_TOO_LOW),
         ("0.85.1", None, HARNESS_BINARY_MISSING),
-        ("0.85.1", "unparseable", HARNESS_VERSION_TOO_LOW),
+        ("0.85.1", "unparseable", False),
     ],
 )
 def test_pi_readiness_uses_selected_executable(
@@ -548,13 +548,13 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "agents_sdk",
     ):
         assert result[sdk] == "needs-auth", f"{sdk} should read the credential axis"
-    # CLI-wrapping spellings — gated, so False when the binary is absent.
+    # CLI-wrapping spellings — gated, so "binary-missing" when the binary is absent.
     # (The SDK ``cursor`` harness is excluded: it runs via the ``cursor-sdk``
     # package and gates on a configured ``CURSOR_API_KEY``, not a binary —
     # covered separately. Native Cursor (``cursor-native`` / ``native-cursor``)
     # wraps the ``cursor-agent`` CLI, so it IS gated on the binary.)
     # antigravity-native is also gated (it wraps the ``agy`` CLI); with no
-    # binary it reads False before its credential check is even reached.
+    # binary it reads "binary-missing" before its credential check is even reached.
     for cli in (
         "kimi",
         "kiro-native",
@@ -567,7 +567,7 @@ def test_configured_harness_map_gates_only_cli_harnesses(
         "hermes",
         *sorted(ACP_CLI_HARNESSES),
     ):
-        assert result[cli] is not True, f"{cli} should be gated on its CLI binary"
+        assert result[cli] == "binary-missing", f"{cli} should be gated on its CLI binary"
     # Auth-aware harnesses (codex, claude, opencode, cursor, pi) carry a
     # two-step signal in the picker map, so a missing binary is the structured
     # ``"binary-missing"`` (step 1 to-do), not a bare ``False``. Cursor joined
@@ -601,7 +601,7 @@ def test_copilot_ready_via_gh_cli_login_without_stored_token(
     import omnigent.onboarding.copilot_auth as _ca
 
     _all_clis_installed(monkeypatch)
-    assert configured_harness_map()["copilot"] is False
+    assert configured_harness_map()["copilot"] == "missing-credentials"
 
     monkeypatch.setattr(_ca, "gh_cli_github_token", lambda host=None: "gho_from_gh")
     assert configured_harness_map()["copilot"] is True
@@ -818,6 +818,7 @@ def test_kimi_readiness_keys_off_binary_and_credential(
     monkeypatch.setattr(_ka, "kimi_auth_configured", lambda: False)
     assert harness_is_configured("kimi") is False
     assert harness_is_configured("kimi-code") is False
+    assert configured_harness_map()["kimi"] == "missing-credentials"
 
     # Binary present and auth detected → configured.
     monkeypatch.setattr(_ka, "kimi_auth_configured", lambda: True)
@@ -840,6 +841,7 @@ def test_cursor_readiness_keys_off_api_key(
     # No key anywhere (autouse isolation), even with all CLIs present → False.
     _all_clis_installed(monkeypatch)
     assert harness_is_configured("cursor") is False
+    assert configured_harness_map()["cursor"] == "missing-credentials"
 
     # An inherited environment key satisfies it, with no CLI installed.
     _no_clis_installed(monkeypatch)
@@ -880,21 +882,19 @@ def test_native_cursor_keys_off_binary_not_api_key(
     assert harness_is_configured("native-cursor") is True
 
 
-def test_configured_harness_map_reports_version_too_low_for_outdated_clis(
+@pytest.mark.parametrize("version,expected", [("0.0.1", HARNESS_VERSION_TOO_LOW), (None, False)])
+def test_configured_harness_map_distinguishes_old_versions_from_failed_probes(
     monkeypatch: pytest.MonkeyPatch,
+    version: str | None,
+    expected: str | bool,
 ) -> None:
-    """An outdated CLI for major native harnesses is flagged ``version-too-low``.
-
-    This exercises the readiness-layer wiring, which is where the binary is
-    on ``PATH`` but does not satisfy the declared ``min_version`` of the spec.
-    The core promise of the feature is that users see an upgrade prompt instead
-    of being told the binary is missing.
-    """
+    """Only a confirmed old version gets an upgrade prompt; both cases block launch."""
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(hi, "harness_cli_installed", lambda _key, **_kw: False)
+    monkeypatch.setattr(hi, "_harness_cli_version_string", lambda *_args: version)
     monkeypatch.setattr(hi, "harness_cli_logged_in", lambda _key, **_kw: True)
     result = configured_harness_map()
     for harness in (
+        "codex-native",
         "claude-native",
         "native-claude",
         "opencode-native",
@@ -904,9 +904,8 @@ def test_configured_harness_map_reports_version_too_low_for_outdated_clis(
         "kiro-native",
         "native-kiro",
     ):
-        assert result[harness] == HARNESS_VERSION_TOO_LOW, (
-            f"{harness} should report version-too-low, not binary-missing"
-        )
+        assert result[harness] == expected
+        assert harness_is_configured(harness) is False
 
 
 def test_antigravity_native_requires_credential(

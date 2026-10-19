@@ -5662,7 +5662,7 @@ describe("NewChatLandingScreen", () => {
       "Codex, Model GPT-5.5",
     );
     expect(screen.getByTestId("new-chat-landing-harness-fallback")).toHaveTextContent(
-      "Setup required. Using Codex instead",
+      "Needs attention. Using Codex instead",
     );
   });
 
@@ -6315,15 +6315,42 @@ describe("NewChatLandingScreen", () => {
       harness_install_enabled: true,
       installable_harnesses: ["codex", "codex-native"],
     });
-    breakSelectedHarness("a2", "codex-native", false);
+    breakSelectedHarness("a2", "codex-native", "binary-missing");
 
     // The composer action is labelled with the agent, not "the harness".
     const setup = screen.getByTestId("new-chat-landing-harness-setup");
-    expect(setup.textContent).toBe("Set up Codex");
+    expect(setup.textContent).toBe("Install");
     fireEvent.click(setup);
     // Dialog opens with a one-click Install (codex-native is installable).
     fireEvent.click(screen.getByTestId("harness-setup-install"));
     expect(installMutate).toHaveBeenCalledWith("codex-native", expect.anything());
+  });
+
+  it("opens manual installation instructions when automatic install is disabled", () => {
+    const installMutate = vi.fn();
+    vi.mocked(useInstallHarness).mockReturnValue({
+      mutate: installMutate,
+      isPending: false,
+    } as unknown as ReturnType<typeof useInstallHarness>);
+    renderLanding({ harness_install_enabled: false });
+    breakSelectedHarness("a2", "codex-native", "binary-missing");
+    fireEvent.click(screen.getByRole("button", { name: "Install" }));
+    expect(screen.getByRole("dialog")).toHaveTextContent("Run this on machine-1 to install Codex.");
+    // The mocked step carries no command (an older server), so the dialog falls back to omni setup.
+    expect(
+      within(screen.getByTestId("harness-setup-step-install")).getByTestId("harness-setup-command"),
+    ).toHaveTextContent("omni setup");
+    expect(screen.queryByTestId("harness-setup-install")).toBeNull();
+    expect(installMutate).not.toHaveBeenCalled();
+  });
+
+  it("shows investigation guidance for an unknown readiness failure", () => {
+    renderLanding({ harness_install_enabled: true, installable_harnesses: ["codex-native"] });
+    breakSelectedHarness("a2", "codex-native", false);
+    fireEvent.click(screen.getByRole("button", { name: "View details" }));
+    expect(screen.getByRole("dialog")).toHaveTextContent("didn’t provide a reason");
+    expect(screen.queryByTestId("harness-setup-install")).toBeNull();
+    expect(screen.queryByTestId("harness-setup-add-credential")).toBeNull();
   });
 
   it("shows setup-required harness badges with a real tooltip", async () => {
@@ -6350,7 +6377,7 @@ describe("NewChatLandingScreen", () => {
       displayName: "Codex",
       harness: "codex-native",
       readiness: "needs-auth",
-      badgeName: "needs auth",
+      badgeName: "Needs sign-in",
       warning: "Codex needs Codex authentication on machine-1 — run codex login",
     },
     {
@@ -6359,8 +6386,8 @@ describe("NewChatLandingScreen", () => {
       displayName: "Cursor",
       harness: "cursor-native",
       readiness: "binary-missing",
-      badgeName: "binary missing",
-      warning: "Cursor isn't configured on machine-1 — run omni setup",
+      badgeName: "Not installed",
+      warning: "Cursor is not installed on machine-1.",
     },
     {
       id: "a_pi",
@@ -6368,7 +6395,7 @@ describe("NewChatLandingScreen", () => {
       displayName: "Pi",
       harness: "pi-native",
       readiness: "version-too-low",
-      badgeName: "outdated",
+      badgeName: "Outdated",
       warning: "Pi has an outdated CLI on machine-1 — run omni setup",
     },
     {
@@ -6377,7 +6404,7 @@ describe("NewChatLandingScreen", () => {
       displayName: "Polly",
       harness: "codex",
       readiness: "needs-auth",
-      badgeName: "needs auth",
+      badgeName: "Needs sign-in",
       warning: "Polly needs Codex authentication on machine-1 — run codex login",
     },
   ])(
@@ -6444,7 +6471,7 @@ describe("NewChatLandingScreen", () => {
       .getAttribute("aria-label");
     await userEvent.hover(within(row).getByText("Codex"));
     expect(await screen.findByRole("tooltip")).toHaveTextContent(
-      "Codex isn't configured on machine-1 — run omni setup on that machine.",
+      "machine-1 reports Codex isn’t ready but didn’t provide a recognized reason. Run omni setup on that machine to investigate.",
     );
     fireEvent.click(row);
     fireEvent.keyDown(row, { key: "Enter" });
@@ -6462,7 +6489,7 @@ describe("NewChatLandingScreen", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
     fireEvent.focus(screen.getByTestId("new-chat-landing-agent-a2"));
     expect(await screen.findByRole("tooltip")).toHaveTextContent(
-      "Codex isn't configured on machine-1 — run omni setup on that machine.",
+      "machine-1 reports Codex isn’t ready but didn’t provide a recognized reason. Run omni setup on that machine to investigate.",
     );
   });
 
@@ -6488,12 +6515,12 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-agent-warning")).toBeVisible();
     await userEvent.hover(picker);
     expect(await screen.findByTestId("new-chat-landing-agent-tooltip")).toHaveTextContent(
-      "Codex isn't configured on machine-1 — run omni setup on that machine.",
+      "machine-1 reports Codex isn’t ready but didn’t provide a recognized reason. Run omni setup on that machine to investigate.",
     );
     await userEvent.unhover(picker);
     fireEvent.focus(picker);
     expect(await screen.findByTestId("new-chat-landing-agent-tooltip")).toHaveTextContent(
-      "Codex isn't configured on machine-1 — run omni setup on that machine.",
+      "machine-1 reports Codex isn’t ready but didn’t provide a recognized reason. Run omni setup on that machine to investigate.",
     );
   });
 
@@ -6506,7 +6533,7 @@ describe("NewChatLandingScreen", () => {
       harness_install_enabled: true,
       installable_harnesses: ["codex", "codex-native"],
     });
-    breakSelectedHarness("a2", "codex-native", false);
+    breakSelectedHarness("a2", "codex-native", "binary-missing");
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
 
     // Install is offered; the auth row's control is present but disabled.
@@ -6545,7 +6572,7 @@ describe("NewChatLandingScreen", () => {
       harness_install_enabled: true,
       installable_harnesses: ["codex", "codex-native"],
     });
-    breakSelectedHarness("a2", "codex-native", false);
+    breakSelectedHarness("a2", "codex-native", "binary-missing");
 
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
     expect((screen.getByTestId("harness-setup-install") as HTMLButtonElement).disabled).toBe(true);
@@ -6591,7 +6618,7 @@ describe("NewChatLandingScreen", () => {
       harness_install_enabled: true,
       installable_harnesses: [], // step catalog says install; allowlist disagrees
     });
-    breakSelectedHarness("a2", "codex-native", false);
+    breakSelectedHarness("a2", "codex-native", "binary-missing");
 
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
     expect(screen.queryByTestId("harness-setup-install")).toBeNull();
@@ -6614,7 +6641,7 @@ describe("NewChatLandingScreen", () => {
       harness_install_enabled: true,
       installable_harnesses: ["codex", "codex-native"],
     });
-    breakSelectedHarness("a2", "codex-native", false);
+    breakSelectedHarness("a2", "codex-native", "binary-missing");
 
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
     fireEvent.click(screen.getByTestId("harness-setup-install"));
@@ -6639,7 +6666,7 @@ describe("NewChatLandingScreen", () => {
       harness_install_enabled: true,
       installable_harnesses: ["codex", "codex-native"],
     });
-    breakSelectedHarness("a2", "codex-native", false);
+    breakSelectedHarness("a2", "codex-native", "binary-missing");
 
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
     fireEvent.click(screen.getByTestId("harness-setup-install"));
@@ -6662,18 +6689,31 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("harness-setup-install")).toBeNull();
   });
 
-  it("falls back to the original setup guidance when the feature is off", () => {
-    // Flag OFF (renderLanding default) → the pre-feature UI: the warning shows
-    // the descriptive "run omni setup" message, NOT the "Set up" action or
-    // dialog. This is the no-op-when-disabled contract.
+  it("offers manual sign-in guidance when automatic setup is disabled", () => {
     renderLanding();
     breakSelectedHarness("a2", "codex-native", "needs-auth");
-
-    const warning = screen.getByTestId("new-chat-landing-harness-warning");
-    expect(warning.textContent).toContain("codex login");
-    // No "Set up" affordance and no dialog trigger when the feature is off.
-    expect(screen.queryByTestId("new-chat-landing-harness-setup")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-harness-warning")).toHaveTextContent("codex login");
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    expect(screen.getByRole("dialog")).toHaveTextContent("codex login");
+    expect(screen.queryByTestId("harness-setup-add-credential")).toBeNull();
   });
+
+  it.each([false, true])(
+    "offers an update for an old version with automatic setup=%s",
+    (enabled) => {
+      renderLanding({ harness_install_enabled: enabled, installable_harnesses: ["codex-native"] });
+      breakSelectedHarness("a2", "codex-native", "version-too-low");
+      fireEvent.click(screen.getByRole("button", { name: "Update" }));
+      expect(screen.getByRole("dialog")).toHaveTextContent("Update Codex");
+      if (enabled) expect(screen.getByTestId("harness-setup-install")).toHaveTextContent("Update");
+      else {
+        expect(screen.getByRole("dialog")).toHaveTextContent(
+          "Run this on machine-1 to update Codex.",
+        );
+        expect(screen.queryByTestId("harness-setup-install")).toBeNull();
+      }
+    },
+  );
 
   it("suppresses the conflict banner once a git branch is named", async () => {
     useDirectorySessionsMock.mockReturnValue({

@@ -99,6 +99,13 @@ const QWEN_STEPS: SetupStepWire[] = [
 
 describe("harnessUnavailableReasonOnHost", () => {
   it("classifies structured reasons and generic unconfigured", () => {
+    // Blocking credential gap: shown as sign-in, never selectable.
+    const noKey = hostWith({ cursor: "missing-credentials" });
+    expect(harnessUnavailableReasonOnHost("cursor", noKey)).toBe("needs-auth");
+    expect(harnessReadinessOnHost("cursor", noKey)).toMatchObject({
+      reason: "needs-auth",
+      selectable: false,
+    });
     expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: "binary-missing" }))).toBe(
       "binary-missing",
     );
@@ -112,6 +119,10 @@ describe("harnessUnavailableReasonOnHost", () => {
       ),
     ).toBe("binary-missing");
     expect(harnessUnavailableReasonOnHost("pi", hostWith({ pi: false }))).toBe("unconfigured");
+    // A bare false cannot distinguish a missing CLI from a failed probe.
+    expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: false }))).toBe(
+      "unconfigured",
+    );
     expect(harnessUnavailableReasonOnHost("codex", hostWith({ codex: "version-too-low" }))).toBe(
       "version-too-low",
     );
@@ -374,6 +385,14 @@ describe("resolveSetupSteps", () => {
     ]);
   });
 
+  it.each([false, "probe-failed"])(
+    "does not infer installation or auth from %s",
+    (availability) => {
+      const steps = resolveSetupSteps(CODEX_STEPS, "codex", hostWith({ codex: availability }));
+      expect(steps.map((s) => s.status)).toEqual(["unknown", "unknown"]);
+    },
+  );
+
   it("marks both done when the harness is ready", () => {
     const steps = resolveSetupSteps(CODEX_STEPS, "codex", hostWith({ codex: true }));
     expect(steps.map((s) => s.status)).toEqual(["done", "done"]);
@@ -383,7 +402,7 @@ describe("resolveSetupSteps", () => {
     // Qwen's credential step (status_key: null) can't be tracked; showing it
     // pre-install then vanishing post-install is confusing, so it's dropped —
     // leaving just the trackable install step.
-    const steps = resolveSetupSteps(QWEN_STEPS, "qwen", hostWith({ qwen: false }));
+    const steps = resolveSetupSteps(QWEN_STEPS, "qwen", hostWith({ qwen: "binary-missing" }));
     expect(steps).toHaveLength(1);
     expect(steps[0].kind).toBe("install");
   });

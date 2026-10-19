@@ -355,7 +355,7 @@ def test_failed_version_probe_does_not_admit_or_cache_a_broken_cli(
 
     monkeypatch.setattr(hi.subprocess, "run", run_probe)
 
-    assert not hi.harness_cli_installed(OPENAI_FAMILY)
+    assert hi.harness_cli_readiness(OPENAI_FAMILY) is False
     assert hi.missing_harness_cli("codex-native") == spec
     assert hi.harness_cli_version(OPENAI_FAMILY)[0] is None
     assert runs == 3
@@ -1292,7 +1292,7 @@ def test_ui_setup_steps_install_then_ui_auth_for_codex() -> None:
     install, auth = steps
     assert install.action == "install"
     assert install.status_key == "installed"
-    assert install.command is None
+    assert install.command == "npm install -g @openai/codex"
     assert auth.action == "auth"
     assert auth.title == "Set up authentication"
     assert auth.command == "codex login"
@@ -1370,7 +1370,7 @@ def test_versioned_specs_declare_bounds(
 @pytest.mark.parametrize(
     "version,expected",
     [
-        ("1.17.6", False),  # below min
+        ("1.17.6", "version-too-low"),  # below min
         ("1.19.0", False),  # at max exclusive
         ("2.0.0", False),  # above max
         ("1.17.8", True),  # inside range
@@ -1378,10 +1378,9 @@ def test_versioned_specs_declare_bounds(
     ],
 )
 def test_harness_cli_installed_checks_version_for_versioned_specs(
-    monkeypatch: pytest.MonkeyPatch, version: str, expected: bool
+    monkeypatch: pytest.MonkeyPatch, version: str, expected: bool | str
 ) -> None:
-    """A present CLI whose ``--version`` is outside the declared range reads as
-    not installed, so setup prompts for an upgrade before the runtime gate."""
+    """Only below-minimum versions are outdated; all unsupported versions block launch."""
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
@@ -1393,7 +1392,8 @@ def test_harness_cli_installed_checks_version_for_versioned_specs(
         raise AssertionError(f"unexpected subprocess: {argv!r}")
 
     monkeypatch.setattr(hi.subprocess, "run", _run)
-    assert hi.harness_cli_installed(hi.OPENCODE_KEY) is expected
+    assert hi.harness_cli_readiness(hi.OPENCODE_KEY) == expected
+    assert hi.harness_cli_installed(hi.OPENCODE_KEY) is (expected is True)
 
 
 @pytest.mark.parametrize(
@@ -1625,7 +1625,7 @@ def test_harness_cli_installed_false_when_version_unparseable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A present CLI whose ``--version`` output contains no parseable version is
-    treated as not installed, so setup prompts for an upgrade."""
+    reported as unconfigured without claiming the version is outdated."""
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
 
     def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
@@ -1637,6 +1637,7 @@ def test_harness_cli_installed_false_when_version_unparseable(
 
     monkeypatch.setattr(hi.subprocess, "run", _run)
     assert hi.harness_cli_installed(hi.OPENCODE_KEY) is False
+    assert hi.harness_cli_readiness(hi.OPENCODE_KEY) is False
 
 
 def test_harness_cli_version_satisfies_short_circuits_when_binary_missing(

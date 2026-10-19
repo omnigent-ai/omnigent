@@ -2,7 +2,7 @@
 // shows.
 //
 // The picker normally lists every harness and badges the ones that aren't set
-// up on the selected host ("needs setup" / "binary missing" / "needs auth").
+// up on the selected host ("Needs attention" / "Not installed" / "Needs sign-in").
 // When this opt-in preference is on, those unconfigured harnesses are hidden
 // instead of badged, so the picker only offers harnesses that can actually
 // launch on the chosen host. It's a device-local UI filter — no account or

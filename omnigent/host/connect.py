@@ -57,7 +57,11 @@ from omnigent.errors import (
 )
 from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_aliases import canonicalize_harness, is_claude_sdk_harness_name
-from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
+from omnigent.harness_availability import (
+    HARNESS_BINARY_MISSING,
+    HARNESS_MISSING_CREDENTIALS,
+    HarnessAvailability,
+)
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
@@ -260,7 +264,7 @@ def _unavailable_harness_became_ready(
 ) -> bool:
     """Detect newly available binaries; auth changes wait for the full refresh."""
     return any(
-        (availability is False or availability == HARNESS_BINARY_MISSING)
+        availability in (False, HARNESS_BINARY_MISSING, HARNESS_MISSING_CREDENTIALS)
         and _harness_now_configured(harness)
         for harness, availability in previous.items()
     )

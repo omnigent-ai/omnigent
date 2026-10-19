@@ -15,6 +15,7 @@ import re
 import time
 from typing import Any
 
+import pytest
 from playwright.sync_api import Page, Route, expect
 
 from tests._helpers.picker_routes import OWN_AGENTS
@@ -208,20 +209,29 @@ def test_picker_leads_with_primary_harnesses(
     expect(_agent_row(page, _PI_AGENT_ID)).to_have_attribute("data-active", "true")
 
 
+@pytest.mark.parametrize(
+    "viewport,automatic_install",
+    [({"width": 1440, "height": 1000}, False), ({"width": 390, "height": 844}, True)],
+    ids=["desktop-manual", "mobile-automatic"],
+)
 def test_missing_harness_is_disabled_with_repair_tooltip(
-    page: Page, chat_session_contract: ChatSessionContract
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    viewport: dict[str, int],
+    automatic_install: bool,
 ) -> None:
     """A missing harness stays unselectable and explains how to repair it."""
+    page.set_viewport_size(viewport)
     chat = chat_session_contract
     contract = chat.contract
-    # Claude is ready and stays the inline default, so Codex exercises the More
-    # submenu; the host reports Codex missing.
-    _stub_picker(
-        page,
-        chat,
-        agents=[_CLAUDE, _CODEX],
-        configured_harnesses={"claude-native": True, _CODEX_HARNESS: False},
-    )
+    readiness = {
+        "claude-native": True,
+        _CODEX_HARNESS: "binary-missing",
+        "cursor-native": "needs-auth",
+        "pi-native": "version-too-low",
+        "opencode-native": False,
+    }
+    _stub_picker(page, chat, agents=[_CLAUDE, _CODEX], configured_harnesses=readiness)
     contract.json(
         "/v1/info",
         {
@@ -236,7 +246,7 @@ def test_missing_harness_is_disabled_with_repair_tooltip(
             "public_sharing_enabled": True,
             "server_version": "0.0.0-e2e",
             "smart_routing_enabled": False,
-            "harness_install_enabled": True,
+            "harness_install_enabled": automatic_install,
             "installable_harnesses": ["codex", _CODEX_HARNESS],
         },
     )
@@ -277,7 +287,7 @@ def test_missing_harness_is_disabled_with_repair_tooltip(
             json={
                 "object": "harness_install",
                 "harness": _CODEX_HARNESS,
-                "configured_harnesses": {_CODEX_HARNESS: True},
+                "configured_harnesses": {**readiness, _CODEX_HARNESS: True},
             }
         )
 
@@ -294,9 +304,52 @@ def test_missing_harness_is_disabled_with_repair_tooltip(
     codex_option.get_by_text("Codex", exact=True).hover()
     expect(
         page.get_by_test_id(f"new-chat-landing-agent-tooltip-{_CODEX_AGENT_ID}")
-    ).to_contain_text(f"Codex isn't configured on {_HOST_NAME} — run omni setup on that machine.")
+    ).to_contain_text(
+        f"Codex is not installed on {_HOST_NAME}. Install it from Settings → Harnesses."
+    )
     expect(picker).to_have_attribute("aria-label", re.compile(r"^Claude Code,"))
     assert install_requests == []
+
+    page.goto(f"{chat.base_url}/settings/harnesses")
+    codex_card = page.get_by_test_id("harness-card-codex-native")
+    expect(codex_card.get_by_text("Not installed", exact=True)).to_have_count(0)
+    expect(page.get_by_test_id("harness-card-cursor-native")).to_contain_text("Needs sign-in")
+    expect(page.get_by_test_id("harness-card-pi-native")).to_contain_text("Outdated")
+    expect(page.get_by_test_id("harness-card-opencode-native")).to_contain_text("Needs attention")
+    codex_card.get_by_role("button", name="Install Codex").click()
+    dialog = page.get_by_role("dialog")
+    if automatic_install:
+        dialog.get_by_role("button", name="Install", exact=True).click()
+        expect(dialog).to_contain_text("Codex is ready")
+        assert len(install_requests) == 1
+    else:
+        expect(dialog).to_contain_text(f"Run this on {_HOST_NAME} to install Codex.")
+        install_step = dialog.get_by_test_id("harness-setup-step-install")
+        expect(install_step.get_by_test_id("harness-setup-command")).to_have_text("omni setup")
+        expect(dialog.get_by_role("button", name="Install", exact=True)).to_have_count(0)
+        assert install_requests == []
+    dialog.get_by_role("button", name=re.compile("^(Close|Done)$")).first.click()
+
+    # The warning icon works by tap as well as hover; it opens readable guidance.
+    page.get_by_test_id("harness-card-opencode-native").get_by_role(
+        "button", name=f"Readiness details on {_HOST_NAME}"
+    ).click()
+    expect(page.get_by_role("dialog")).to_contain_text("didn’t provide a reason")
+    expect(page.get_by_test_id("harness-setup-install")).to_have_count(0)
+    page.get_by_role("button", name="Close", exact=True).first.click()
+
+    # A bookmarked details route must expose the same action and explanation.
+    page.goto(f"{chat.base_url}/settings/harnesses/opencode-native")
+    page.get_by_role("button", name="View details OpenCode").click()
+    expect(page.get_by_role("dialog")).to_contain_text("didn’t provide a reason")
+    page.get_by_role("button", name="Close", exact=True).first.click()
+
+    _stub_picker(
+        page, chat, agents=[_CODEX], configured_harnesses={_CODEX_HARNESS: "binary-missing"}
+    )
+    _open_landing(page, chat)
+    page.get_by_test_id("new-chat-landing-harness-setup").click()
+    expect(page.get_by_role("dialog")).to_contain_text("Install Codex")
 
 
 def test_harness_picker_not_blocked_by_slow_session_scan(
