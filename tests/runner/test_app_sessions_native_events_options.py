@@ -127,11 +127,13 @@ async def test_events_effort_change_on_native_session_skips_inject_for_unsupport
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [RuntimeError, OSError])
 async def test_events_effort_change_on_native_session_returns_503_when_bridge_not_ready(
     monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
 ) -> None:
     """
-    Bridge-not-ready RuntimeError surfaces as 503 from /events.
+    A bridge-not-ready RuntimeError or a tmux OSError surfaces as 503 from /events.
 
     Sister to the happy-path test. Pins that the failure mode of the
     native effort dispatch (tmux pane gone / bridge dir not yet
@@ -152,7 +154,7 @@ async def test_events_effort_change_on_native_session_returns_503_when_bridge_no
     ) -> None:
         """Simulate the bridge-not-ready path."""
         del bridge_dir, command, timeout_s
-        raise RuntimeError("tmux target is not advertised")
+        raise error_type("tmux target is not advertised")
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
 
@@ -498,11 +500,13 @@ async def test_events_compact_on_native_session_types_slash_command(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [RuntimeError, OSError])
 async def test_events_compact_on_native_session_returns_503_when_bridge_not_ready(
     monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
 ) -> None:
     """
-    Bridge-not-ready RuntimeError surfaces as 503 from /events.
+    A bridge-not-ready RuntimeError or a tmux OSError surfaces as 503 from /events.
 
     Sister to the happy-path test. When the tmux pane isn't attached
     there is no live Claude to compact, so the native compact handler
@@ -522,7 +526,7 @@ async def test_events_compact_on_native_session_returns_503_when_bridge_not_read
     ) -> None:
         """Simulate the bridge-not-ready path."""
         del bridge_dir, command, timeout_s, auto_confirm
-        raise RuntimeError("tmux target is not advertised")
+        raise error_type("tmux target is not advertised")
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
 
@@ -2194,6 +2198,7 @@ async def _post_model_change_through_a_boot(
     status: Callable[[Any], str | None],
     clock: _VirtualClock | None = None,
     dialog_deadlines: list[float | None] | None = None,
+    dialog: Callable[..., bool] | None = None,
 ) -> httpx.Response:
     """Run one claude-native ``model_change`` against a scripted terminal boot.
 
@@ -2206,6 +2211,7 @@ async def _post_model_change_through_a_boot(
     holds exactly on a loaded machine. The stand-ins advance it for the time
     they would take. ``dialog_deadlines`` collects the instant each in-request
     dialog check stops sending keys at (``None`` when it runs unbounded).
+    ``dialog`` replaces the stand-in for ``confirm_dialog_if_open``.
 
     :returns: The ``/events`` response.
     """
@@ -2226,7 +2232,7 @@ async def _post_model_change_through_a_boot(
             clock.sleep(_VIRTUAL_CONFIRM_POLL_S)
         return False
 
-    monkeypatch.setattr(claude_native_bridge, "confirm_dialog_if_open", _no_dialog)
+    monkeypatch.setattr(claude_native_bridge, "confirm_dialog_if_open", dialog or _no_dialog)
     monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_CONFIRM_POLL_S", 0.01)
     app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
     async with _runner_client(app) as client:
@@ -2366,6 +2372,119 @@ async def test_events_model_change_spends_its_budget_on_the_boot(
     assert dialog_deadlines == [pytest.approx(started_at + 1.5)] * len(dialog_deadlines)
     # The confirm window ran out with the budget (give or take one poll), not its 10s default.
     assert clock.now - started_at <= 1.5 + _VIRTUAL_CONFIRM_POLL_S
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_keeps_a_short_injection_wait_after_a_long_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A boot that uses up the prompt budget still leaves the injection a 1 s wait.
+
+    The injection re-checks readiness itself, and one torn capture right after
+    the prompt rendered must not fail the switch while the request still has
+    budget. The floor stays clipped by the request deadline.
+    """
+    clock = _VirtualClock()
+    monkeypatch.setattr(native_controls, "_CLAUDE_CONTROL_PROMPT_WAIT_S", 1.0)
+    monkeypatch.setattr(native_controls, "_CLAUDE_CONTROL_BUDGET_S", 3.0)
+    budgets: dict[str, float] = {}
+
+    def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
+        del bridge_dir, timeout_s
+        budgets["wait"] = ready_timeout_s
+        clock.sleep(0.95)
+
+    def _inject(
+        bridge_dir: Any, *, command: str, ready_timeout_s: float | None = None, **_kwargs: Any
+    ) -> None:
+        del bridge_dir, command
+        assert ready_timeout_s is not None
+        budgets["inject"] = ready_timeout_s
+
+    resp = await _post_model_change_through_a_boot(
+        monkeypatch,
+        wait=_wait,
+        inject=_inject,
+        status=lambda _bridge_dir: "claude-opus-4-6",
+        clock=clock,
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert budgets["wait"] == pytest.approx(1.0)
+    assert budgets["inject"] == pytest.approx(1.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["wait", "inject"])
+async def test_events_model_change_reports_a_tmux_failure_as_503(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    """A tmux failure while waiting for the prompt or typing is a 503, not an unhandled error."""
+    typed: list[str] = []
+
+    def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
+        del bridge_dir, ready_timeout_s, timeout_s
+        if stage == "wait":
+            raise OSError("tmux: command not found")
+
+    def _inject(bridge_dir: Any, *, command: str, **_kwargs: Any) -> None:
+        del bridge_dir
+        typed.append(command)
+        raise OSError("tmux: command not found")
+
+    resp = await _post_model_change_through_a_boot(
+        monkeypatch, wait=_wait, inject=_inject, status=lambda _bridge_dir: None
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "claude_native_model_failed"
+    assert typed == ([] if stage == "wait" else ["/model claude-opus-4-7"])
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_skips_the_dialog_check_once_its_budget_lapsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A boot that spends the whole budget ends the confirm window without driving the pane."""
+    clock = _VirtualClock()
+    monkeypatch.setattr(native_controls, "_CLAUDE_CONTROL_PROMPT_WAIT_S", 5.0)
+    monkeypatch.setattr(native_controls, "_CLAUDE_CONTROL_BUDGET_S", 1.5)
+    dialog_checks: list[str] = []
+
+    def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
+        del bridge_dir, ready_timeout_s, timeout_s
+        clock.sleep(1.6)
+
+    def _dialog(_bridge_dir: Any, *, hint: str) -> bool:
+        dialog_checks.append(hint)
+        return False
+
+    resp = await _post_model_change_through_a_boot(
+        monkeypatch,
+        wait=_wait,
+        inject=lambda _bridge_dir, *, command, **_kwargs: None,
+        status=lambda _bridge_dir: "claude-opus-4-6",
+        clock=clock,
+        dialog=_dialog,
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "claude_native_model_unconfirmed"
+    assert dialog_checks == []
+
+
+def test_claude_control_deadline_wait_returns_once_the_budget_lapses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``wait`` cannot block past the budget, so a blocked waiter sees the deadline too."""
+    monkeypatch.setattr(native_controls, "_CLAUDE_CONTROL_BUDGET_S", 0.2)
+    deadline = native_controls._ClaudeControlDeadline()
+
+    started = time.monotonic()
+    assert deadline.wait() is True
+    assert deadline.wait(5.0) is True
+    assert time.monotonic() - started < 2.0
 
 
 def _tui_composer(draft: str = "") -> str:

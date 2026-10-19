@@ -100,6 +100,10 @@ class _ClaudeControlDeadline(threading.Event):
     def is_set(self) -> bool:
         return super().is_set() or time.monotonic() >= self.at
 
+    def wait(self, timeout: float | None = None) -> bool:
+        budget = self.remaining_s()
+        return super().wait(budget if timeout is None else min(timeout, budget)) or self.is_set()
+
 
 async def _drive_claude_pane(
     deadline: _ClaudeControlDeadline, function: Callable[..., Any], /, *args: Any, **kwargs: Any
@@ -1196,7 +1200,7 @@ def build_native_controls(
                 auto_confirm=True,
                 confirm_hint=EFFORT_DIALOG_HINT,
             )
-        except (RuntimeError, ValueError) as exc:
+        except (RuntimeError, ValueError, OSError) as exc:
             return JSONResponse(
                 status_code=503,
                 content={
@@ -1358,7 +1362,7 @@ def build_native_controls(
         # pane's model rather than an empty or leftover snapshot.
         prompt_budget_s = min(_CLAUDE_CONTROL_PROMPT_WAIT_S, deadline.remaining_s())
         wait_started = time.monotonic()
-        wait_error: RuntimeError | None = None
+        wait_error: Exception | None = None
         try:
             await _drive_claude_pane(
                 deadline,
@@ -1367,7 +1371,7 @@ def build_native_controls(
                 ready_timeout_s=prompt_budget_s,
                 timeout_s=1.0,
             )
-        except RuntimeError as exc:
+        except (RuntimeError, OSError) as exc:
             wait_error = exc
         waited_s = time.monotonic() - wait_started
         _logger.info(
@@ -1398,11 +1402,13 @@ def build_native_controls(
                 bridge_dir,
                 command=command,
                 timeout_s=1.0,
-                ready_timeout_s=max(0.0, prompt_budget_s - waited_s),
+                # A boot that used the prompt budget still leaves the injection a
+                # short wait for a torn capture right after the prompt rendered.
+                ready_timeout_s=min(deadline.remaining_s(), max(1.0, prompt_budget_s - waited_s)),
                 auto_confirm=True,
                 confirm_hint=SWITCH_MODEL_DIALOG_HINT,
             )
-        except (RuntimeError, ValueError) as exc:
+        except (RuntimeError, ValueError, OSError) as exc:
             return _model_failed(exc)
         # Verify against the statusLine snapshot the forwarder already polls:
         # Claude rewrites it on every render, including right after ``/model``.
@@ -1445,9 +1451,10 @@ def build_native_controls(
                     extra={"session_id": conv_id},
                 )
                 return Response(status_code=204)
-            # The confirm dialog can render well after the injection's own
-            # short watch (a warm repaint, or a queued command surfacing) —
-            # answer it whenever it shows inside the window.
+            # The dialog can render after the injection's short watch; answer it
+            # inside the window. A lapsed budget ends the window like a timeout.
+            if deadline.is_set():
+                break
             await _drive_claude_pane(
                 deadline, confirm_dialog_if_open, bridge_dir, hint=SWITCH_MODEL_DIALOG_HINT
             )
@@ -1701,7 +1708,7 @@ def build_native_controls(
                 timeout_s=1.0,
                 ready_timeout_s=min(_CLAUDE_CONTROL_PROMPT_WAIT_S, deadline.remaining_s()),
             )
-        except (RuntimeError, ValueError) as exc:
+        except (RuntimeError, ValueError, OSError) as exc:
             return JSONResponse(
                 status_code=503,
                 content={
