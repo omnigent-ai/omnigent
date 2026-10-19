@@ -864,9 +864,7 @@ def register_events_routes(
                                 )
                             )
                         continue
-                    user_id, conv = await _authorized_conversation(
-                        request, session_id, external_transcript=True
-                    )
+                    await _authorized_conversation(request, session_id, external_transcript=True)
                     add_audit_attrs(event_type=_EXTERNAL_CONVERSATION_ITEM_TYPE)
                     item_ids = await _persist_external_conversation_items(
                         session_id, list(run), conversation_store
