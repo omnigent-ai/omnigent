@@ -16,6 +16,7 @@
 // did / didn't fire after unmount. Only the write is a controllable deferred.
 
 import { StrictMode } from "react";
+import { Schema, type Node } from "@tiptap/pm/model";
 import { act, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -27,7 +28,7 @@ interface FakeEditor {
   off: (evt: string, h: () => void) => void;
   commands: { setContent: (c: string) => void };
   setEditable: () => void;
-  state: { selection: { empty: boolean; from: number; to: number } };
+  state: { doc: Node; selection: { empty: boolean; from: number; to: number } };
   emit: (evt: string) => void;
   setMarkdown: (m: string) => void;
   isFocused: boolean;
@@ -38,9 +39,14 @@ interface FakeEditor {
   latestOnUpdate: ((p: { editor: FakeEditor }) => void) | null;
 }
 
+const schema = new Schema({ nodes: { doc: { content: "text*" }, text: {} } });
+const documentFor = (text: string) =>
+  schema.node("doc", null, text ? schema.text(text) : undefined);
+
 function makeFakeEditor(initial: string): FakeEditor {
   const handlers: Record<string, Set<() => void>> = {};
   let markdown = initial;
+  const state = { doc: documentFor(initial), selection: { empty: true, from: 0, to: 0 } };
   return {
     isDestroyed: false,
     getMarkdown: () => markdown,
@@ -53,15 +59,17 @@ function makeFakeEditor(initial: string): FakeEditor {
     commands: {
       setContent: (c: string) => {
         markdown = c;
+        state.doc = documentFor(c);
       },
     },
     setEditable: () => {},
-    state: { selection: { empty: true, from: 0, to: 0 } },
+    state,
     emit: (evt) => {
       handlers[evt]?.forEach((h) => h());
     },
     setMarkdown: (m) => {
       markdown = m;
+      state.doc = documentFor(m);
     },
     // Default focused: these tests simulate USER edits, which only fire 'update'
     // while the editor has focus (a pre-focus normalisation update re-baselines).

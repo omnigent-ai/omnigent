@@ -73,27 +73,33 @@ jobs:
   # yields an EMPTY matrix -> zero shard jobs -> no skipped placeholder check.
   # Shared with e2e.yml via e2e-shard-matrix.sh (only NUM_SHARDS differs).
   setup:
-    name: setup
+    name: UI scope
     needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
+      ui: ${{ steps.scope.outputs.ui }}
     steps:
       - name: Check out CI scripts
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
           # Triggering ref (not main): the script must exist on it, and it
           # only shards tests -- no secrets exposure, so the PR's copy is fine.
-          sparse-checkout: .github/scripts/ci
+          fetch-depth: 2
+          sparse-checkout: |
+            .github/scripts/ci
+            .github/actions/dependency-ci-scope
           persist-credentials: false
+      - id: scope
+        uses: ./.github/actions/dependency-ci-scope
       - name: Compute shard matrix
         id: matrix
         env:
           EVENT_NAME: ${{ github.event_name }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
-          # Reduce this temporary capacity after measuring suite workload savings.
-          NUM_SHARDS: "10"
+          RUN_TESTS: ${{ steps.scope.outputs.ui != 'none' }}
+          NUM_SHARDS: ${{ steps.scope.outputs.ui != 'full' && '2' || '10' }}
         run: bash .github/scripts/ci/e2e-shard-matrix.sh
 
   # Build the Codex-parity sidecar ONCE and publish the binary. The
@@ -131,11 +137,11 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .tmp-codex-parity-target/debug/codex-parity-sidecar
-          key: codex-parity-bin-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
+          key: codex-parity-bin-locked-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
       - name: Build parity sidecar
         if: steps.sidecar-cache.outputs.cache-hit != 'true'
         run: |
-          cargo build \
+          cargo build --locked \
             --manifest-path tests/codex_parity/sidecar/Cargo.toml \
             --target-dir .tmp-codex-parity-target
       - name: Upload sidecar binary
@@ -151,7 +157,7 @@ jobs:
     # Keep this as a separately visible required-style check. It deliberately
     # omits the server, runner, harness CLIs, bubblewrap, tmux, and sidecar.
     needs: setup
-    if: needs.setup.outputs.matrix != '{"include":[]}'
+    if: needs.setup.outputs.matrix != '{"include":[]}' && (needs.setup.outputs.ui == 'full' || needs.setup.outputs.ui == 'dependency')
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -204,8 +210,16 @@ jobs:
           pnpm --filter web run build
 
       - name: Run browser-contract tests
+        env:
+          UI_SCOPE: ${{ needs.setup.outputs.ui }}
         run: |
-          time uv run pytest tests/browser_ui \
+          targets=(tests/browser_ui)
+          extra_args=()
+          if [[ "$UI_SCOPE" == "dependency" ]]; then
+            targets=(tests/browser_ui/chat/test_transcript_rendering.py tests/browser_ui/files/test_markdown_editor_journey.py)
+            extra_args=(-p tests._helpers.required_tests)
+          fi
+          time uv run pytest "${targets[@]}" "${extra_args[@]}" \
             -v --tb=long --showlocals -r a \
             --durations=25 --durations-min=0.5 \
             --browser-ui-skip-build \
@@ -344,6 +358,7 @@ jobs:
           NIGHTLY_FULL: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
           SHARD_ID: ${{ matrix.shard_id }}
           NUM_SHARDS: ${{ matrix.num_shards }}
+          UI_SCOPE: ${{ needs.setup.outputs.ui }}
           OMNIGENT_E2E_ANTIGRAVITY: mock
           # Prebuilt sidecar from build-sidecar; the codex goal-mode fixture
           # uses this instead of running cargo build. Absolute path: the
@@ -358,6 +373,12 @@ jobs:
           if [[ "$NIGHTLY_FULL" != "true" ]]; then
             MARKER="$MARKER and not nightly"
           fi
+          scope_args=()
+          if [[ "$UI_SCOPE" == "sidecar" ]]; then
+            scope_args+=(--ui-codex-sidecar-only)
+          elif [[ "$UI_SCOPE" == "dependency" ]]; then
+            scope_args+=(--ui-dependency-smoke)
+          fi
           # --splits/--group partition the suite via a strided slice (see
           # pytest_collection_modifyitems in tests/e2e_ui/conftest.py), which
           # evens out wall-clock better than pytest-shard's hash-bucketing.
@@ -368,7 +389,7 @@ jobs:
           # Retry every otherwise-unmarked failure once for transient CI races;
           # per-test @pytest.mark.flaky settings still take precedence.
           # Keep the failed attempt's traceback even when its retry passes.
-          uv run pytest tests/e2e_ui \
+          uv run pytest tests/e2e_ui "${scope_args[@]}" \
             -v --tb=long --showlocals --log-level=INFO -r a \
             --durations=25 --durations-min=1.0 \
             --reruns=1 --reruns-delay=5 --rerun-show-tracebacks \
@@ -380,7 +401,7 @@ jobs:
             --screenshot=only-on-failure \
             --video=retain-on-failure \
             -m "$MARKER" \
-            || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
+            || { rc=$?; [ "$rc" -eq 5 ] && [ "$UI_SCOPE" == "full" ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
 
       - name: Upload UI test timings and shard assignment
         if: always()
@@ -478,3 +499,24 @@ jobs:
               echo "- 📜 server.log: _no artifact uploaded (glob matched nothing)_"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  result:
+    name: E2E UI result
+    if: always()
+    needs: [setup, build-sidecar, browser-contract, e2e-ui]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require successful test selection
+        env:
+          SELECTION_RESULT: ${{ needs.setup.result }}
+        run: test "$SELECTION_RESULT" = success
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          sparse-checkout: .github/scripts/ci
+          persist-credentials: false
+      - name: Require selected consumer results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+        run: python3 .github/scripts/ci/require_results.py ui

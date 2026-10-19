@@ -39,13 +39,25 @@ jobs:
     outputs:
       ui: ${{ steps.changes.outputs.ui }}
     steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - id: scope
+        uses: ./.github/actions/dependency-ci-scope
       - id: changes
         env:
+          DEPENDENCY: ${{ steps.scope.outputs.dependency }}
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
           PR_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
           REPO: ${{ github.repository }}
         run: |
+          if [ "$DEPENDENCY" = true ]; then
+            echo "ui=false" >> "$GITHUB_OUTPUT"
+            echo "Dependency-only PR: performance benchmarking remains on scheduled runs."
+            exit 0
+          fi
           # The files API truncates successful responses at 3,000 entries.
           if [ -z "${PR:-}" ] || [ "${PR_CHANGED_FILES:-0}" -ge 3000 ]; then
             echo "ui=true" >> "$GITHUB_OUTPUT"
