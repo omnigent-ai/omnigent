@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  CLAUDE_NATIVE_INHERIT_PERMISSION_MODE,
+  CLAUDE_NATIVE_NEW_CHAT_PERMISSION_MODES,
   CLAUDE_NATIVE_PERMISSION_MODES,
   CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
   claudePermissionModeFromSession,
@@ -28,6 +30,29 @@ describe("claudePermissionMode", () => {
     const startup = CLAUDE_NATIVE_PERMISSION_MODES.map((m) => m.value);
     expect(startup).toContain("dontAsk");
     expect(startup).toContain("bypassPermissions");
+  });
+
+  it("leads the New Chat picker with Default (inherit) then the real modes", () => {
+    // The New Chat picker prepends the no-flag "inherit" sentinel labelled
+    // "Default", then lists every real launch mode unchanged and in order.
+    expect(CLAUDE_NATIVE_NEW_CHAT_PERMISSION_MODES.map((m) => m.value)).toEqual([
+      CLAUDE_NATIVE_INHERIT_PERMISSION_MODE,
+      ...CLAUDE_NATIVE_PERMISSION_MODES.map((m) => m.value),
+    ]);
+    expect(CLAUDE_NATIVE_NEW_CHAT_PERMISSION_MODES[0]).toMatchObject({
+      value: CLAUDE_NATIVE_INHERIT_PERMISSION_MODE,
+      label: "Default",
+    });
+  });
+
+  it("keeps the inherit sentinel out of the launch and switch vocabularies", () => {
+    // "inherit" is not a value `claude --permission-mode` accepts, so it must
+    // never reach the launch modes (which the fork and scheduled-task pickers
+    // build from) or the live switcher.
+    expect(CLAUDE_NATIVE_PERMISSION_MODES.map((m) => m.value)).not.toContain(
+      CLAUDE_NATIVE_INHERIT_PERMISSION_MODE,
+    );
+    expect(isSwitchableClaudePermissionMode(CLAUDE_NATIVE_INHERIT_PERMISSION_MODE)).toBe(false);
   });
 
   it("labels the prompting mode the way Claude Code does", () => {
