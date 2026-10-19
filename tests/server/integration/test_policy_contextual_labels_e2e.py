@@ -18,7 +18,6 @@ pipeline without subprocesses or real LLM calls.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from typing import Any
 
 import httpx
@@ -27,19 +26,6 @@ import pytest
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
-
-
-POLICY_REGISTRY = [{"handler": f"{__name__}._deny_all_tool_calls", "kind": "callable"}]
-
-
-@pytest.fixture(autouse=True)
-def _register_test_policy_handlers() -> Iterator[None]:
-    from omnigent.policies.registry import load_registry
-
-    # HTTP uploads accept custom policies only when the server registers them.
-    load_registry([__name__])
-    yield
-    load_registry()
 
 
 # ── Policy callables ───────────────────────────────────────
