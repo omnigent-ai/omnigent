@@ -685,39 +685,33 @@ function WorkspaceTabsControl() {
           })}
         </div>
       </ThemeSubsection>
-      <div className="flex flex-col items-stretch justify-between gap-4 border-t border-border pt-4 sm:flex-row sm:items-center">
-        <SettingsLabel
-          labelId={labelId}
-          label="Open first"
-          description={
-            firstTab
-              ? "Start with this pinned page. Later tab choices are remembered."
-              : "Pin a page to choose what opens first."
-          }
-        />
-        <Select
-          value={firstTab?.value ?? ""}
-          onValueChange={(next) => choose(next as DefaultWorkspaceTab)}
-          disabled={!firstTab}
-          componentId="settings.appearance.default_workspace_tab"
-          valueHasNoPii
-        >
-          <SelectTrigger
-            aria-labelledby={labelId}
-            data-testid="workspace-tab-default-select"
-            className="w-full shrink-0 sm:w-40"
+      {firstTab && (
+        <div className="border-t border-border pt-4">
+          <ThemeSubsection
+            labelId={labelId}
+            title="Default Workspace tab"
+            helper="Shown first in Workspace. Changing this also updates existing chats when reopened or refreshed. Later tab choices are remembered. File links still open the linked file."
           >
-            <SelectValue placeholder="No pinned tabs" />
-          </SelectTrigger>
-          <SelectContent>
-            {pinnedCards.map((card) => (
-              <SelectItem key={card.value} value={card.value}>
-                {card.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
+            <CardRadioGroup<DefaultWorkspaceTab>
+              labelledBy={labelId}
+              value={firstTab.value}
+              onSelect={choose}
+              className={cn(
+                "grid gap-3",
+                pinnedCards.length > 1 && "grid-cols-2",
+                pinnedCards.length === 3 && "sm:grid-cols-3",
+                pinnedCards.length === 4 && "sm:grid-cols-4",
+              )}
+              cardClassName="items-center gap-2 p-4"
+              items={pinnedCards.map((card) => ({
+                value: card.value,
+                testId: `workspace-tab-default-${card.value}`,
+                body: iconCardBody(card.icon, card.label),
+              }))}
+            />
+          </ThemeSubsection>
+        </div>
+      )}
     </div>
   );
 }

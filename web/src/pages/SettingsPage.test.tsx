@@ -612,17 +612,23 @@ describe("SettingsPage", () => {
   it("selects and persists the default Workspace tab", () => {
     renderPage("/settings/appearance");
 
-    const select = screen.getByTestId("workspace-tab-default-select");
-    const options = within(select).getAllByRole("option");
+    const group = screen.getByRole("radiogroup", { name: "Default Workspace tab" });
+    const options = within(group).getAllByRole("radio");
     expect(options).toHaveLength(4);
     ["Files", "Changes", "Pull Requests", "Agents"].forEach((label, index) => {
       expect(options[index]).toHaveAccessibleName(label);
     });
-    expect(select).toHaveValue("files");
+    expect(screen.getByTestId("workspace-tab-default-files")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
     expect(localStorage.getItem("omnigent:default-workspace-tab")).toBeNull();
 
-    fireEvent.change(select, { target: { value: "subagents" } });
-    expect(select).toHaveValue("subagents");
+    fireEvent.click(screen.getByTestId("workspace-tab-default-subagents"));
+    expect(screen.getByTestId("workspace-tab-default-subagents")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
     expect(
       screen.getByRole("img", {
         name: "Sidebar preview: Agents, Files, Changes, Pull Requests pinned.",
@@ -635,7 +641,15 @@ describe("SettingsPage", () => {
     localStorage.setItem("omnigent:default-workspace-tab", "changes");
     renderPage("/settings/appearance");
 
-    expect(screen.getByTestId("workspace-tab-default-select")).toHaveValue("changes");
+    expect(screen.getByTestId("workspace-tab-default-changes")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(
+      screen.getByRole("img", {
+        name: "Sidebar preview: Changes, Files, Pull Requests, Agents pinned.",
+      }),
+    ).toBeInTheDocument();
   });
 
   it("lets every workspace page be unpinned, remembers the choice, and selects a pinned default", () => {
@@ -645,13 +659,9 @@ describe("SettingsPage", () => {
       expect(toggle).toHaveAttribute("aria-pressed", "true");
       fireEvent.click(toggle);
       expect(toggle).toHaveAttribute("aria-pressed", "false");
-      expect(
-        within(screen.getByTestId("workspace-tab-default-select")).queryByRole("option", {
-          name: label,
-        }),
-      ).toBeNull();
+      expect(screen.queryByRole("radio", { name: label })).toBeNull();
     }
-    expect(screen.getByTestId("workspace-tab-default-select")).toBeDisabled();
+    expect(screen.queryByRole("radiogroup", { name: "Default Workspace tab" })).toBeNull();
     expect(
       screen.getByRole("img", { name: "Sidebar preview: all pages in the + menu." }),
     ).toBeInTheDocument();
@@ -664,8 +674,13 @@ describe("SettingsPage", () => {
       "false",
     );
     fireEvent.click(screen.getByRole("button", { name: "Pin Changes" }));
-    expect(screen.getByTestId("workspace-tab-default-select")).toBeEnabled();
-    expect(screen.getByTestId("workspace-tab-default-select")).toHaveValue("changes");
+    expect(screen.getByTestId("workspace-tab-default-changes")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(
+      screen.getByRole("img", { name: "Sidebar preview: Changes pinned." }),
+    ).toBeInTheDocument();
     expect(localStorage.getItem("omnigent:default-workspace-tab")).toBe("changes");
   });
 
@@ -867,9 +882,7 @@ describe("SettingsPage", () => {
     });
     fireEvent.click(screen.getByTestId("transcript-view-default-terminal"));
     fireEvent.click(screen.getByTestId("workspace-panel-default-open"));
-    fireEvent.change(screen.getByTestId("workspace-tab-default-select"), {
-      target: { value: "subagents" },
-    });
+    fireEvent.click(screen.getByTestId("workspace-tab-default-subagents"));
     fireEvent.click(screen.getByRole("button", { name: "Pin Changes" }));
     fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
@@ -926,7 +939,10 @@ describe("SettingsPage", () => {
       "aria-checked",
       "true",
     );
-    expect(screen.getByTestId("workspace-tab-default-select")).toHaveValue("files");
+    expect(screen.getByTestId("workspace-tab-default-files")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
     expect(localStorage.getItem("omnigent:default-workspace-tab")).toBeNull();
     expect(localStorage.getItem("omnigent:pinned-workspace-tabs")).toBeNull();
     expect(screen.getByRole("button", { name: "Pin Changes" })).toHaveAttribute(
