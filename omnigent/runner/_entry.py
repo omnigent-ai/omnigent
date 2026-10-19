@@ -586,6 +586,14 @@ class _InitialAuthTokenFactory:
         with self._lock:
             return bool(getattr(self._fallback_factory, "declined_by_server_error", False))
 
+    @property
+    def sign_in_pending(self) -> bool:
+        """True while the fallback credential source waits on an interactive sign-in."""
+        with self._lock:
+            if self._initial_token is not None:
+                return False
+            return bool(getattr(self._fallback_factory, "sign_in_pending", False))
+
     def reset_decline(self) -> None:
         """Clear the inner fallback factory's ``declined`` latch, if any."""
         with self._lock:

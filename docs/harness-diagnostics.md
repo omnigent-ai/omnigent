@@ -219,6 +219,25 @@ their screen-only excerpt independently of this flag; the flag is not a master
 content switch for ordinary lifecycle logs. Other terminals still export no
 pane text in these event attributes.
 
+## Native startup failure context
+
+Native terminal startup failures carry bounded `failure_context` metadata on
+the existing runner status event and terminal-ensure error response. Updated
+servers retain it on the existing `session_turn_failed` record for both delivery
+paths, including when the runner's local logs are unavailable.
+
+`failure_id` matches the runner's `native_terminal_start_failed` `error_id`, and
+`failure_source` is `native_terminal_start`. `exception_type`,
+`exception_cause_type`, and `exception_context_type` name available exception
+classes. `native_launch_os_errno`, `native_launch_os_errno_name`, and
+`native_launch_winerror` preserve available OS facts from the bounded cause
+chain. Missing fields mean unavailable evidence. These fields contain no raw
+exception messages, paths, arguments, or pane output.
+
+Older runners can omit the context; malformed and unknown fields are ignored.
+The context does not change error codes, display text, status handling, or
+retry policy, and does not add failure records.
+
 ## Codex startup failure snapshot
 
 When a fresh native Codex session's TUI exits, thread discovery times out, or

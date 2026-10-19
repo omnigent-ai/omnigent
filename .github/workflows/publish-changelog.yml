@@ -113,7 +113,7 @@ jobs:
       PIP_INDEX_URL: https://pypi.org/simple
     steps:
       - name: Checkout omnigent (for the render script)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: omnigent
 
@@ -449,7 +449,7 @@ jobs:
 
       - name: Checkout omnigent-site (sync target)
         if: env.DRY_RUN != 'true'
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ env.SITE_REPO }}
           token: ${{ steps.app-token.outputs.token }}

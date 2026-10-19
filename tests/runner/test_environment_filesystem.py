@@ -982,6 +982,104 @@ async def test_download_under_real_sandbox_refuses_masked_file(
         os_env.close()
 
 
+# Records that it was imported, then fails whatever imported it.
+_WORKSPACE_MODULE_SOURCE = (
+    "try:\n"
+    "    open(__file__ + '.imported', 'w').close()\n"
+    "except OSError:\n"
+    "    pass\n"
+    "raise ImportError(__name__ + ' was loaded from the workspace')\n"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sandbox_type", ["none", *_SANDBOX_BACKENDS])
+async def test_helper_scripts_ignore_workspace_modules(tmp_path: Path, sandbox_type: str) -> None:
+    """Workspace files named like stdlib modules leave every helper script intact."""
+    ws = tmp_path / "workspace"
+    (ws / "src").mkdir(parents=True)
+    (ws / "src" / "main.py").write_text("print('hi')")
+    (ws / "empty").mkdir()
+    planted = [f"{name}.py" for name in ("os", "json", "re", "stat", "collections")]
+    for name in planted:
+        (ws / name).write_text(_WORKSPACE_MODULE_SOURCE)
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(ws),
+            sandbox=OSEnvSandboxSpec(
+                type=sandbox_type, read_paths=[str(_REPO_ROOT)], write_paths=["."]
+            ),
+        )
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+    try:
+        listing = await fs.list_dir(limit=100, order="asc")
+        assert [e.name for e in listing.data] == sorted(["empty", "src", *planted])
+        found, truncated = await fs.search_files("main")
+        assert ([e.path for e in found], truncated) == (["src/main.py"], False)
+        entry = await fs.stat("src/main.py")
+        assert (entry.type, entry.bytes) == ("file", 11)
+        handle, _resolved, size = await fs.open_download("src/main.py")
+        with handle:
+            assert (handle.read(), size) == (b"print('hi')", 11)
+        with pytest.raises(DirectoryNotEmpty):
+            await fs.delete("src")
+        assert (await fs.delete("empty")).type == "directory"
+        assert not (ws / "empty").exists()
+    finally:
+        os_env.close()
+    assert list(ws.glob("*.imported")) == []
+
+
+# The OS helper inherits the same PYTHONPATH and must keep the real module, so
+# only inline ``-c`` scripts are handed the failing one.
+_PYTHONPATH_JSON_SOURCE = (
+    "import os, sys\n"
+    "if sys.argv[0] == '-c':\n"
+    "    open(__file__ + '.imported', 'w').close()\n"
+    "    raise ImportError('json was loaded from PYTHONPATH')\n"
+    "here = os.path.dirname(os.path.abspath(__file__))\n"
+    "sys.path[:] = [p for p in sys.path if os.path.abspath(p) != here]\n"
+    "del sys.modules[__name__]\n"
+    "import json\n"
+)
+
+
+@pytest.mark.asyncio
+async def test_helper_scripts_ignore_pythonpath_modules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``PYTHONPATH`` the environment's shell inherits never feeds the helper scripts."""
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "json.py").write_text(_PYTHONPATH_JSON_SOURCE)
+    ws = tmp_path / "workspace"
+    (ws / "src").mkdir(parents=True)
+    (ws / "src" / "main.py").write_text("print('hi')")
+    # An unsandboxed environment's shell inherits the runner's environment.
+    monkeypatch.setenv("PYTHONPATH", str(external))
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(ws), sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert os_env is not None
+    fs = CallerProcessFilesystem(os_env)
+    try:
+        probe = await os_env.shell("printenv PYTHONPATH")
+        assert probe.get("stdout", "").strip() == str(external), probe
+        listing = await fs.list_dir(order="asc")
+        assert [e.name for e in listing.data] == ["src"]
+        found, _truncated = await fs.search_files("main")
+        assert [e.path for e in found] == ["src/main.py"]
+        assert (await fs.stat("src/main.py")).bytes == 11
+        with pytest.raises(DirectoryNotEmpty):
+            await fs.delete("src")
+    finally:
+        os_env.close()
+    assert not (external / "json.py.imported").exists()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("sandbox_type", _SANDBOX_BACKENDS)
 async def test_workspace_delete_under_real_sandbox(

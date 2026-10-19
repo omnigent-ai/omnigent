@@ -42,6 +42,7 @@ from omnigent.harnesses.cursor_native.permissions import (
     cursor_tool_call_elicitation_id,
     read_cursor_pending_tool_calls,
 )
+from tests.budgets import budget
 
 
 class _QueueClient:
@@ -606,8 +607,8 @@ def _start_supervisor(
 
 
 async def _wait_for(predicate: Callable[[], bool], *, timeout_s: float = 1.0) -> bool:
-    """Poll *predicate* until it is true or *timeout_s* elapses."""
-    deadline = asyncio.get_running_loop().time() + timeout_s
+    """Poll *predicate* until it is true or the scaled *timeout_s* elapses."""
+    deadline = asyncio.get_running_loop().time() + budget(timeout_s)
     while asyncio.get_running_loop().time() < deadline:
         if predicate():
             return True

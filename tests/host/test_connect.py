@@ -98,6 +98,7 @@ from omnigent.runner.identity import (
     token_bound_runner_id,
 )
 from omnigent.runtime.harnesses.paths import HARNESS_TMP_PARENT_ENV_VAR
+from tests._helpers.providers import isolate_provider_resolution
 
 pytestmark = pytest.mark.asyncio
 
@@ -118,6 +119,14 @@ def _isolated_model_catalog_store(
     """
     store_dir = tmp_path_factory.mktemp("model_catalog_store")
     monkeypatch.setattr("omnigent.models.model_catalog_store._data_dir", lambda: store_dir)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_provider_resolution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Keep model-options frames independent of the developer's provider setup."""
+    isolate_provider_resolution(monkeypatch, tmp_path_factory.mktemp("config_home"))
 
 
 @pytest.fixture(autouse=True)
@@ -2234,6 +2243,52 @@ async def test_connect_watchdog_silent_when_runner_connects(
 
     assert [r for r in caplog.records if r.levelno == logging.ERROR] == []
     _cleanup_host(host)
+
+
+async def test_connect_watchdog_allows_the_runner_sign_in_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A runner connecting after its allowed sign-in wait is not reported as hung."""
+    from omnigent.host import connect as connect_module
+    from omnigent.runner.transports.ws_tunnel.serve import _SIGN_IN_PENDING_WAIT_S
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    host = _make_host_process()
+    marker = tmp_path / "connected"
+    runner_id = "runner_pending_sign_in"
+    host._runners[runner_id] = _RunnerHandle(
+        proc=Mock(pid=1234),
+        log_path=tmp_path / "runner.log",
+        connect_marker=marker,
+        session_id="conv_pending_sign_in",
+    )
+    exit_watcher = asyncio.create_task(asyncio.Event().wait())
+
+    async def _connect_after_sign_in(tasks: set[asyncio.Task[None]], *, timeout: float) -> None:
+        # Advance the host wait to a connect just after the runner's permitted wait.
+        if timeout >= _SIGN_IN_PENDING_WAIT_S + 1:
+            marker.touch()
+
+    monkeypatch.setattr(
+        connect_module,
+        "asyncio",
+        SimpleNamespace(**{**vars(asyncio), "wait": _connect_after_sign_in}),
+    )
+    try:
+        with caplog.at_level(logging.ERROR, logger="omnigent.host.connect"):
+            await host._watch_runner_connect(runner_id, exit_watcher=exit_watcher)
+    finally:
+        host._runners.pop(runner_id)
+        exit_watcher.cancel()
+        await asyncio.gather(exit_watcher, return_exceptions=True)
+
+    assert not [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_never_connected"
+    ]
 
 
 async def test_connect_watchdog_silent_on_intentional_stop(
@@ -9014,6 +9069,43 @@ def test_run_host_process_classifies_how_the_host_ended(
         )
 
     assert _host_exit_reasons(caplog) == [expected]
+
+
+@pytest.mark.parametrize(
+    "state", ["pending", "dead", "untracked", "stopped", "rebound", "stop_during_read"]
+)
+async def test_runner_status_only_exposes_pending_sign_in_for_its_live_launch(
+    tmp_path, monkeypatch, state
+) -> None:
+    from omnigent.host.connect import _RunnerHandle
+    from omnigent.runner.identity import mark_sign_in_pending
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    host = _make_host_process()
+    connected = tmp_path / "owned.connected"
+    monkeypatch.setenv(RUNNER_CONNECT_MARKER_ENV_VAR, str(connected))
+    mark_sign_in_pending("runner-owned", time.monotonic() + 20)
+    proc = Mock(pid=123, returncode=None)
+    proc.poll.return_value = 1 if state == "dead" else None
+    handle = _RunnerHandle(
+        proc, tmp_path / "runner.log", "session-owned", connected, state == "stopped"
+    )
+    if state != "untracked":
+        host._runners["runner-owned"] = handle
+    if state in {"rebound", "stop_during_read"}:
+
+        def replaced(*_args):
+            if state == "rebound":
+                host._runners.pop("runner-owned")
+            else:
+                handle.stop_requested = True
+            return True
+
+        monkeypatch.setattr("omnigent.host.connect.runner_sign_in_is_pending", replaced)
+    result = await host._handle_runner_status(HostRunnerStatusFrame("status", "runner-owned"))
+    assert (result.status == "sign_in_pending") is (state == "pending")
+    proc.terminate.assert_not_called()
+    proc.kill.assert_not_called()
 
 
 async def test_host_publishes_stored_workspace_at_startup(

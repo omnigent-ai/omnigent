@@ -211,8 +211,9 @@ export function filterConversations(
   });
 }
 
-// Newest first. Freeze update timestamps for the active chat and hovered list;
-// creation timestamps stay immutable, including when the selected order changes.
+// Newest first; equal timestamps fall back to id, so arrival order never shows.
+// Freeze update timestamps for the active chat and hovered list; creation
+// timestamps stay immutable, including when the selected order changes.
 export function sortConversations(
   conversations: Conversation[],
   activeOverride: ActiveChatOverride | null,
@@ -225,10 +226,7 @@ export function sortConversations(
     frozenKeys?.set(c.id, updatedAt);
     return sortBy === "created_at" ? c.created_at : updatedAt;
   };
-  return [...conversations].sort(
-    (a, b) =>
-      effective(b) - effective(a) || (sortBy === "created_at" ? b.id.localeCompare(a.id) : 0),
-  );
+  return [...conversations].sort((a, b) => effective(b) - effective(a) || b.id.localeCompare(a.id));
 }
 
 /** Status groups, in the order the grouped sidebar renders them. */

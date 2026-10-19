@@ -79,11 +79,14 @@ async def main():
         while not worker_ready.exists():
             await asyncio.sleep(0.01)
     pids = [child.pid for child in psutil.Process().children(recursive=True)]
-    state_path.write_text(json.dumps({
+    # Publish atomically: the test polls for the path, then parses it.
+    pending = state_path.with_suffix(".pending")
+    pending.write_text(json.dumps({
         "pids": pids,
         "socket": str(readiness.socket_path),
         "public_dir": str(readiness.socket_path.parent),
     }))
+    pending.replace(state_path)
     while True:
         await asyncio.sleep(3600)
 
