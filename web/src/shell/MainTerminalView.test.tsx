@@ -20,7 +20,7 @@ vi.mock("@/components/blocks/TerminalView", () => ({
     readOnly,
     directAttachUrl,
     onResume,
-    resumeLabel,
+    resumeTarget,
     resumePending,
   }: {
     sessionId: string;
@@ -28,7 +28,7 @@ vi.mock("@/components/blocks/TerminalView", () => ({
     readOnly?: boolean;
     directAttachUrl?: string;
     onResume?: () => void | Promise<void>;
-    resumeLabel?: string;
+    resumeTarget?: string;
     resumePending?: boolean;
   }) => {
     // Assign once per mount (useRef(arg) evaluates arg every render but keeps
@@ -45,7 +45,7 @@ vi.mock("@/components/blocks/TerminalView", () => ({
         data-instance={String(instance.current)}
         data-direct-attach-url={directAttachUrl ?? ""}
         data-resume-pending={String(resumePending ?? false)}
-        data-resume-label={resumeLabel ?? ""}
+        data-resume-target={resumeTarget ?? ""}
       >
         {onResume && (
           <button type="button" onClick={() => void onResume()}>
@@ -258,13 +258,11 @@ describe("MainTerminalView — terminal-first SDK sessions", () => {
     expect(screen.getByText("Resume it to reconnect the terminal.")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Resume sandbox" }));
 
-    expect(
-      await screen.findByText("Couldn't resume the sandbox: launch failed"),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("Couldn't resume sandbox: launch failed")).toBeInTheDocument();
     expect(onResume).toHaveBeenCalledTimes(1);
   });
 
-  it("labels an attached terminal's resume action for an offline sandbox", async () => {
+  it("names the sandbox in an attached terminal's resume action", async () => {
     renderView({
       terminals: [REPL_TERMINAL],
       runnerOnline: false,
@@ -273,8 +271,8 @@ describe("MainTerminalView — terminal-first SDK sessions", () => {
     });
 
     expect(await screen.findByTestId("terminal-view")).toHaveAttribute(
-      "data-resume-label",
-      "Resume sandbox",
+      "data-resume-target",
+      "sandbox",
     );
   });
 

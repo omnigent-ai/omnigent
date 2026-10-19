@@ -101,7 +101,7 @@ export function MainTerminalView({
   const [resumePending, setResumePending] = useState(false);
   const [resumeError, setResumeError] = useState<string | null>(null);
   const runnerOffline = runnerOnline === false;
-  const resumeLabel = sandboxOffline ? "Resume sandbox" : "Resume session";
+  const resumeTarget = sandboxOffline ? "sandbox" : "session";
   // A session whose terminal is coming up (fresh cold boot, relaunch, or
   // server-side PTY creation) must never read as stopped — the health poll
   // can report the runner down before the boot registers.
@@ -118,12 +118,12 @@ export function MainTerminalView({
     try {
       await onResume();
     } catch (error) {
-      setResumeError(resumeErrorText(error, sandboxOffline ? "the sandbox" : "session"));
+      setResumeError(resumeErrorText(error, resumeTarget));
       throw error;
     } finally {
       setResumePending(false);
     }
-  }, [onResume, sandboxOffline]);
+  }, [onResume, resumeTarget]);
   // No manual keyboard padding here: this view is flow content inside the
   // app-shell, which useIOSViewportLock sizes to the visual viewport, so the
   // terminal already sits above the keyboard. (Fixed overlays like the mobile
@@ -239,7 +239,7 @@ export function MainTerminalView({
                 componentId="diagnostics.main-terminal.resume"
               >
                 {resumePending && <Loader2Icon className="size-3.5 animate-spin" aria-hidden />}
-                {resumePending ? "Resuming…" : resumeLabel}
+                {resumePending ? "Resuming…" : `Resume ${resumeTarget}`}
               </Button>
               {resumeError && <p className="text-destructive text-sm">{resumeError}</p>}
             </div>
@@ -289,7 +289,7 @@ export function MainTerminalView({
                       active={visible}
                       directAttachUrl={activeTerminal.directAttachUrl}
                       onResume={runnerOffline && onResume ? handleResume : undefined}
-                      resumeLabel={resumeLabel}
+                      resumeTarget={resumeTarget}
                       resumePending={resumePending}
                       onStateChange={(state) => {
                         setTerminalConnectionState(activeTerminal.id, state);
@@ -307,7 +307,7 @@ export function MainTerminalView({
   );
 }
 
-function resumeErrorText(error: unknown, what = "session"): string {
-  if (error instanceof Error && error.message) return `Couldn't resume ${what}: ${error.message}`;
-  return `Couldn't resume ${what}.`;
+function resumeErrorText(error: unknown, target: string): string {
+  if (error instanceof Error && error.message) return `Couldn't resume ${target}: ${error.message}`;
+  return `Couldn't resume ${target}.`;
 }
