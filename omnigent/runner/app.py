@@ -2197,16 +2197,19 @@ def create_runner_app(
         route = getattr(request.scope.get("route"), "path", None)
         # Starlette runs this handler outside RunnerLogContextMiddleware's scope,
         # so the request's session is re-read from the path, not the context.
+        payload = _client_safe_error_payload(
+            exc,
+            context="runner HTTP request",
+            session_id=request_path_session_id(request.scope.get("path", "")),
+            route=route if isinstance(route, str) else None,
+        )
+        # The coded envelope is what resource proxies parse; event-forward callers
+        # read the top-level ``detail`` and ``failure_context``.
         return JSONResponse(
             status_code=500,
             content={
-                "error": "runner_request_failed",
-                **_client_safe_error_payload(
-                    exc,
-                    context="runner HTTP request",
-                    session_id=request_path_session_id(request.scope.get("path", "")),
-                    route=route if isinstance(route, str) else None,
-                ),
+                "error": {"code": "runner_request_failed", "message": payload["detail"]},
+                **payload,
             },
         )
 

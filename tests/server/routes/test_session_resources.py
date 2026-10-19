@@ -22,6 +22,7 @@ from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import HOST_CAPABILITIES, HostHelloFrame
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
+from omnigent.runner import create_runner_app
 from omnigent.runtime import (
     _globals,
     session_stream,
@@ -33,6 +34,7 @@ from omnigent.server._runner_ws_tunnel import DirectAttachEndpoint
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
+from tests.runner.helpers import NullServerClient
 
 
 class _ConversationStore:
@@ -1372,6 +1374,33 @@ async def test_get_resource_by_id_rejects_invalid_runner_json(
 
     assert resp.status_code == 502
     assert resp.json()["detail"] == "runner resource endpoint returned invalid JSON"
+
+
+@pytest.mark.asyncio
+async def test_get_resource_by_id_maps_an_unexpected_runner_failure_to_502(
+    client: httpx.AsyncClient,
+) -> None:
+    """The runner's catch-all 500 body becomes a controlled 502 with its client-safe message."""
+    runner_app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+
+    @runner_app.get("/v1/sessions/{conversation_id}/failure-probe")
+    async def failure_probe(conversation_id: str) -> None:
+        raise RuntimeError("private-runner-data")
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=runner_app, raise_app_exceptions=False),
+        base_url="http://runner",
+    ) as runner:
+        failed = await runner.get("/v1/sessions/child/failure-probe")
+    assert failed.status_code == 500
+    fake_runner = _FakeRunnerClient(payload=failed.json(), status_code=500)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/env_broken")
+
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == failed.json()["error"]["message"]
+    assert "private-runner-data" not in resp.text
 
 
 @pytest.mark.asyncio

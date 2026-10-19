@@ -1529,10 +1529,9 @@ def build_native_controls(
                     "claude-native",
                     "model_unconfirmed",
                     control_model_requested=selected_model,
-                    control_model_command_arg=model_arg,
                     control_model_before=baseline,
                     control_model_observed=current,
-                    control_confirmation_budget_ms=round(_CLAUDE_MODEL_CONFIRM_TIMEOUT_S * 1000),
+                    control_confirmation_budget_ms=round(confirm_window_s * 1000),
                 ),
             },
         )

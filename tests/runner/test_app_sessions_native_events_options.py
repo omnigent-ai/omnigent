@@ -2166,6 +2166,24 @@ async def test_events_model_change_unconfirmed_switch_answers_503(
     assert context["control_model_requested"] == "claude-opus-4-7"
     assert context["control_pane_status_snapshot"] == "idle"
     assert context["control_confirmation_budget_ms"] == 300
+    assert "control_model_command_arg" not in context
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_unconfirmed_switch_reports_its_capped_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reported confirmation budget is the window the request had left, not the default."""
+    monkeypatch.setattr(native_controls, "_CLAUDE_CONTROL_BUDGET_S", 0.2)
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6"],
+        pane_status="idle",
+    )
+    assert resp.status_code == 503, resp.text
+    context = resp.json()["failure_context"]
+    assert context["control_failure_reason"] == "model_unconfirmed"
+    assert 0 < context["control_confirmation_budget_ms"] <= 200
 
 
 @pytest.mark.asyncio

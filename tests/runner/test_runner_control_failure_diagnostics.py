@@ -146,7 +146,8 @@ async def test_unexpected_control_failure_answers_a_structured_500(
         f"bare framework 500 instead of a structured error body: {response.text!r}"
     )
     body = response.json()
-    assert body["error"] == "runner_request_failed", body
+    # The runner's coded error envelope, with the client-safe detail as its message.
+    assert body["error"] == {"code": "runner_request_failed", "message": body["detail"]}, body
     failure_id = _failure_id(response.text)
     assert body["failure_context"]["failure_id"] == failure_id
     [row] = _rows_with_failure_id(rows, failure_id)
