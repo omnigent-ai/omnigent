@@ -143,3 +143,41 @@ def test_bwrap_helper_outlives_the_tool_call_thread(tmp_path: Path) -> None:
         assert env._helper._proc is helper
     finally:
         env.close()
+
+
+@requires_bwrap
+def test_bwrap_code_run_helper_outlives_the_thread_that_started_it(tmp_path: Path) -> None:
+    """A code run's helper is spawned like a tool call's, so its thread ending cannot kill it."""
+    env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path.resolve()),
+            sandbox=OSEnvSandboxSpec(
+                type="linux_bwrap", read_paths=[str(_project_root() / "omnigent")]
+            ),
+        )
+    )
+    assert isinstance(env, CallerProcessOSEnvironment)
+    chunks: list[str] = []
+
+    async def run(command: str) -> object:
+        return await env.shell_stream(
+            command,
+            language="shell",
+            timeout=30,
+            on_output=lambda stream, text: chunks.append(text),
+        )
+
+    try:
+        first = asyncio.run(run("echo first"))
+        assert first == {"exit_code": 0, "timed_out": False, "truncated": False}, first
+        helper = env._helper._proc
+        assert helper is not None
+        with pytest.raises(subprocess.TimeoutExpired):
+            helper.wait(timeout=1)
+        second = asyncio.run(run("echo second"))
+        assert second == {"exit_code": 0, "timed_out": False, "truncated": False}, second
+        assert env._helper._proc is helper
+        assert "".join(chunks) == "first\nsecond\n"
+    finally:
+        env.close()

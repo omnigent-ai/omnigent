@@ -10,18 +10,21 @@ import errno
 import json
 import logging
 import os
+import selectors
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict, cast
+from typing import TYPE_CHECKING, Any, TextIO, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse, urlunparse
 
 from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
@@ -177,6 +180,17 @@ _MAX_TOOL_OUTPUT_CHARS = 100_000
 # Without a cap an agent can ask to read an unbounded file and saturate the
 # context window, causing the next LLM call to fail with a context-length
 # error. 2 000 lines matches the convention used by most coding tools.
+# Characters ``shell_stream`` forwards before it drops the rest of a run's output.
+_SHELL_STREAM_MAX_OUTPUT_CHARS = 5_000_000
+# Seconds a killed run's pipes may stay open (a process left the group) before
+# ``shell_stream`` stops waiting for them.
+_SHELL_STREAM_KILL_GRACE_S = 2.0
+# Interpreters that read a code run's source from stdin; shell runs use ``_shell_argv``.
+_SHELL_STREAM_INTERPRETERS: dict[str, list[str]] = {
+    "python": ["python3", "-"],
+    "node": ["node", "-"],
+}
+
 _DEFAULT_READ_LIMIT = 2_000
 
 
@@ -451,6 +465,58 @@ class _HelperProcessClient:
             self._stop_locked()
         self._spawner.shutdown(wait=False)
         atexit.unregister(self.close)
+
+    def stream(self, payload: OpRequest, on_line: Callable[[OpResult], None]) -> OpResult:
+        """Send a streaming request and pass each ``stream`` line to *on_line*.
+
+        :param payload: The helper request, e.g. ``{"op": "shell_stream", ...}``.
+        :param on_line: Called on this thread for every output line.
+        :returns: The helper's final line, or an ``error`` dict.
+        """
+        with self._lock:
+            if self._closed:
+                return {"error": "OS environment helper is closed"}
+            try:
+                self._ensure_started_locked()
+                assert self._proc is not None
+                assert self._proc.stdin is not None
+                assert self._proc.stdout is not None
+                self._proc.stdin.write(json.dumps(payload) + "\n")
+                self._proc.stdin.flush()
+                while True:
+                    line = self._proc.stdout.readline()
+                    if not line:
+                        raise RuntimeError(self._helper_exit_detail_locked())
+                    result = json.loads(line)
+                    if not isinstance(result, dict):
+                        return {"error": f"Helper returned non-object response: {result!r}"}
+                    if "stream" not in result:
+                        return result
+                    on_line(result)
+            except Exception as exc:  # noqa: BLE001 - helper IO failures end the stream with an error dict
+                self._stop_locked()
+                return {"error": f"os_env helper failed: {exc}"}
+
+    def send_control(self, payload: OpRequest) -> None:
+        """Write a control line (e.g. ``{"op": "stop"}``) to a streaming helper.
+
+        Skips the request lock, which the streaming call holds.
+
+        :param payload: The control message.
+        """
+        proc = self._proc
+        if proc is None or proc.stdin is None:
+            return
+        with contextlib.suppress(OSError, ValueError):
+            proc.stdin.write(json.dumps(payload) + "\n")
+            proc.stdin.flush()
+
+    def kill(self) -> None:
+        """Kill the helper without the request lock, ending a stuck stream."""
+        proc = self._proc
+        if proc is not None:
+            with contextlib.suppress(OSError):
+                proc.kill()
 
     def _request_locked(
         self,
@@ -1020,6 +1086,47 @@ class CallerProcessOSEnvironment(OSEnvironment):
         result = await run_sync_on_thread(self._helper.request, request)
         return cast(OpResult, result)
 
+    async def shell_stream(
+        self,
+        command: str,
+        *,
+        language: str,
+        timeout: int,
+        on_output: Callable[[str, str], None],
+    ) -> OpResult:
+        """Run *command* and report its output as it arrives.
+
+        :param command: Shell command, or Python / Node source.
+        :param language: ``"shell"``, ``"python"``, or ``"node"``.
+        :param timeout: Seconds before the process group is killed.
+        :param on_output: Called on a worker thread with ``(stream, text)``.
+        :returns: ``{"exit_code", "timed_out", "truncated"}`` or an ``error`` dict.
+        """
+        if not isinstance(command, str) or not command.strip():
+            return {"error": "command must be a non-empty string"}
+        if timeout < 1:
+            return {"error": "timeout must be >= 1"}
+
+        def on_line(line: OpResult) -> None:
+            stream, text = line.get("stream"), line.get("text")
+            if isinstance(stream, str) and isinstance(text, str):
+                on_output(stream, text)
+
+        result = await run_sync_on_thread(
+            self._helper.stream,
+            {"op": "shell_stream", "command": command, "language": language, "timeout": timeout},
+            on_line,
+        )
+        return cast(OpResult, result)
+
+    def stop_shell_stream(self) -> None:
+        """Ask a running ``shell_stream`` to kill its process group."""
+        self._helper.send_control({"op": "stop"})
+
+    def kill_shell_stream(self) -> None:
+        """Kill the helper of a ``shell_stream`` that did not stop on request."""
+        self._helper.kill()
+
     async def delete(self, path: str, *, recursive: bool = False) -> OpResult:
         result = await run_sync_on_thread(
             self._helper.request,
@@ -1108,6 +1215,8 @@ def _handle_helper_request(
     cwd: Path,
     shell_path: str,
     sandbox: SandboxPolicy,
+    control: TextIO | None = None,
+    emit: Callable[[OpResult], None] | None = None,
 ) -> OpResult:
     op = request.get("op")
     if op == "read":
@@ -1202,6 +1311,26 @@ def _handle_helper_request(
             shell_path=shell_path,
             cwd=cwd,
             max_output=max_output,
+        )
+
+    if op == "shell_stream":
+        command = request.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return {"error": "command must be a non-empty string"}
+        timeout_raw = request.get("timeout", 120)
+        timeout = timeout_raw if isinstance(timeout_raw, int) else 120
+        if timeout < 1:
+            return {"error": "timeout must be >= 1"}
+        if control is None or emit is None:
+            return {"error": "shell_stream needs a streaming helper"}
+        return _shell_stream_impl(
+            command=command,
+            language=str(request.get("language", "shell")),
+            timeout=timeout,
+            shell_path=shell_path,
+            cwd=cwd,
+            control=control,
+            emit=emit,
         )
 
     return {"error": f"Unsupported os_env helper operation: {op!r}"}
@@ -1819,6 +1948,149 @@ def _shell_impl(
     return result
 
 
+def _shell_stream_impl(
+    *,
+    command: str,
+    language: str,
+    timeout: int,
+    shell_path: str,
+    cwd: Path,
+    control: TextIO,
+    emit: Callable[[OpResult], None],
+    max_output: int = _SHELL_STREAM_MAX_OUTPUT_CHARS,
+) -> OpResult:
+    """
+    Run a code block in its own session and process group, streaming output.
+
+    Shell commands run like :func:`_shell_impl`; Python and Node source is
+    written to the interpreter's stdin. Each chunk is passed to *emit* as
+    ``{"stream", "text"}``. A ``{"op": "stop"}`` line or EOF on *control*, or
+    the deadline, kills the process group.
+
+    :param command: Shell command, or Python / Node source.
+    :param language: ``"shell"``, ``"python"``, or ``"node"``.
+    :param timeout: Seconds before the process group is killed.
+    :param shell_path: Shell binary for shell runs, e.g. ``"/bin/bash"``.
+    :param cwd: Working directory.
+    :param control: Line source carrying stop requests (the helper's stdin).
+    :param emit: Sink for output lines.
+    :param max_output: Characters forwarded before the rest is dropped.
+    :returns: ``{"exit_code", "timed_out", "truncated"}``; ``exit_code`` is
+        ``None`` when the run was killed. An ``error`` dict if it cannot start.
+    """
+    if IS_WINDOWS:
+        return {"error": "Code runs are not supported on Windows"}
+    if language == "shell":
+        argv = _shell_argv(shell_path, command)
+        source: str | None = None
+    elif language in _SHELL_STREAM_INTERPRETERS:
+        argv = _SHELL_STREAM_INTERPRETERS[language]
+        source = command
+    else:
+        return {"error": f"Unsupported code run language: {language!r}"}
+    try:
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(cwd),
+            env=_child_shell_env(),
+            stdin=subprocess.PIPE if source is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return {"error": f"Failed to run {language} code: {exc}"}
+    assert proc.stdout is not None and proc.stderr is not None
+    if source is not None:
+        threading.Thread(
+            target=_feed_interpreter_stdin, args=(proc.stdin, source), daemon=True
+        ).start()
+
+    selector = selectors.DefaultSelector()
+    for pipe, stream in ((proc.stdout, "stdout"), (proc.stderr, "stderr")):
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        selector.register(pipe.fileno(), selectors.EVENT_READ, (stream, decoder))
+    # In-process callers have no stop channel; the deadline still applies.
+    with contextlib.suppress(OSError, ValueError):
+        selector.register(control.fileno(), selectors.EVENT_READ, None)
+
+    deadline = time.monotonic() + timeout
+    killed_at: float | None = None
+    timed_out = False
+    emitted = 0
+    truncated = False
+    open_pipes = 2
+    try:
+        while open_pipes:
+            now = time.monotonic()
+            if killed_at is None and now >= deadline:
+                timed_out = True
+                killed_at = _kill_process_group(proc)
+            if killed_at is not None and now >= killed_at + _SHELL_STREAM_KILL_GRACE_S:
+                break
+            wait = (
+                deadline - now
+                if killed_at is None
+                else killed_at + _SHELL_STREAM_KILL_GRACE_S - now
+            )
+            for key, _mask in selector.select(timeout=max(wait, 0.0)):
+                if key.data is None:
+                    line = control.readline()
+                    if not line:
+                        selector.unregister(key.fd)
+                    if killed_at is None and (not line or _is_stop_request(line)):
+                        killed_at = _kill_process_group(proc)
+                    continue
+                stream, decoder = key.data
+                chunk = os.read(key.fd, 65536)
+                if not chunk:
+                    selector.unregister(key.fd)
+                    open_pipes -= 1
+                text = decoder.decode(chunk, final=not chunk)
+                if not text:
+                    continue
+                kept = text[: max(max_output - emitted, 0)]
+                if kept:
+                    emit({"stream": stream, "text": kept})
+                    emitted += len(kept)
+                truncated = truncated or len(kept) < len(text)
+    finally:
+        selector.close()
+        if killed_at is not None:
+            _kill_process_group(proc)
+        proc.stdout.close()
+        proc.stderr.close()
+    returncode = proc.wait()
+    return {
+        "exit_code": None if killed_at is not None else returncode,
+        "timed_out": timed_out,
+        "truncated": truncated,
+    }
+
+
+def _feed_interpreter_stdin(stdin: Any, source: str) -> None:  # type: ignore[explicit-any]
+    """Write a code run's source to its interpreter and close stdin."""
+    with contextlib.suppress(OSError, ValueError):
+        stdin.write(source.encode("utf-8"))
+    with contextlib.suppress(OSError, ValueError):
+        stdin.close()
+
+
+def _kill_process_group(proc: subprocess.Popen[bytes]) -> float:
+    """SIGKILL *proc*'s process group (its own session) and return the time."""
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    return time.monotonic()
+
+
+def _is_stop_request(line: str) -> bool:
+    try:
+        message = json.loads(line)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(message, dict) and message.get("op") == "stop"
+
+
 def _normalize_edits(
     old_text: str | None,
     new_text: str | None,
@@ -2019,12 +2291,18 @@ def _run_helper(config: JsonValue) -> int:
                 cwd=cwd,
                 shell_path=shell_path_value,
                 sandbox=sandbox,
+                control=sys.stdin,
+                emit=_write_helper_line,
             )
         except Exception as exc:  # noqa: BLE001 — helper loop surfaces any error through the JSON response envelope
             response = {"error": f"os_env helper exception: {exc}"}
-        sys.stdout.write(json.dumps(response) + "\n")
-        sys.stdout.flush()
+        _write_helper_line(response)
     return 0
+
+
+def _write_helper_line(message: OpResult) -> None:
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
 
 
 def main(argv: list[str] | None = None) -> int:

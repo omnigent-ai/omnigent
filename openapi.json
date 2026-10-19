@@ -1166,6 +1166,213 @@
         "title": "ClientTaskCancelEvent",
         "type": "object"
       },
+      "CodeRunData": {
+        "description": "Data payload for a chat code block the session owner ran.\n\nEach run appends two `code_run` items sharing `run_id`: a\n`started` item and, once the process ends, a `finished` item.\nFields of the other phase stay unset. Listed in\n`NON_CONTENT_ITEM_TYPES` so the agent loop never replays a run\nas model history; the agent gets a summary through a framework notice.",
+        "properties": {
+          "approved_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Started: who approved a policy ASK for this run, or `None` when no approval was needed.",
+            "title": "Approved By"
+          },
+          "block_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Started: hash identifying the block within that message.",
+            "title": "Block Hash"
+          },
+          "command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Started: the exact code that ran.",
+            "title": "Command"
+          },
+          "duration_ms": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Finished: run duration in milliseconds.",
+            "title": "Duration Ms"
+          },
+          "exit_code": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Finished: process exit code, or `None` when the process did not exit on its own.",
+            "title": "Exit Code"
+          },
+          "language": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Started: block language, e.g. `\"bash\"`.",
+            "title": "Language"
+          },
+          "message_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Started: id of the assistant message holding the block.",
+            "title": "Message Id"
+          },
+          "output": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/CodeRunOutputSegment"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Finished: output segments in arrival order, at most `CODE_RUN_OUTPUT_MAX_CHARS` characters in total.",
+            "title": "Output"
+          },
+          "phase": {
+            "description": "`\"started\"` or `\"finished\"`.",
+            "enum": [
+              "started",
+              "finished"
+            ],
+            "title": "Phase",
+            "type": "string"
+          },
+          "run_id": {
+            "description": "Id shared by the run's two items, e.g. `\"run_abc\"`.",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "started_at": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Started: Unix epoch seconds when the run began.",
+            "title": "Started At"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "exited",
+                  "stopped",
+                  "timed_out",
+                  "failed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Finished: `\"exited\"`, `\"stopped\"`, `\"timed_out\"`, or `\"failed\"`.",
+            "title": "Status"
+          },
+          "timeout": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Started: timeout in seconds, e.g. `60`.",
+            "title": "Timeout"
+          },
+          "truncated": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Finished: `True` when output was cut to the cap.",
+            "title": "Truncated"
+          }
+        },
+        "required": [
+          "run_id",
+          "phase"
+        ],
+        "title": "CodeRunData",
+        "type": "object"
+      },
+      "CodeRunOutputSegment": {
+        "description": "One contiguous chunk of a code run's output from a single stream.",
+        "properties": {
+          "stream": {
+            "description": "`\"stdout\"` or `\"stderr\"`.",
+            "enum": [
+              "stdout",
+              "stderr"
+            ],
+            "title": "Stream",
+            "type": "string"
+          },
+          "text": {
+            "description": "The chunk's text, e.g. `\"hello\\n\"`.",
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "stream",
+          "text"
+        ],
+        "title": "CodeRunOutputSegment",
+        "type": "object"
+      },
       "CodexGoalObject": {
         "description": "Current Codex goal state for a Codex-native session.\n\nMirrors Codex app-server's `ThreadGoal` shape using Omnigent's\nsnake-case API convention. `created_at` and `updated_at` are optional\nbecause older app-server documentation examples omit them even though the\ncurrent protocol includes them.",
         "properties": {
@@ -1614,6 +1821,9 @@
               },
               {
                 "$ref": "#/components/schemas/TerminalCommandData"
+              },
+              {
+                "$ref": "#/components/schemas/CodeRunData"
               }
             ],
             "description": "The typed data payload (MessageData, etc.).",
@@ -5878,6 +6088,10 @@
             "session.btw_sidechat": "#/components/schemas/SessionBtwSidechatEvent",
             "session.changed_files.invalidated": "#/components/schemas/SessionChangedFilesInvalidatedEvent",
             "session.child_session.updated": "#/components/schemas/SessionChildSessionUpdatedEvent",
+            "session.code_run.finished": "#/components/schemas/SessionCodeRunFinishedEvent",
+            "session.code_run.output": "#/components/schemas/SessionCodeRunOutputEvent",
+            "session.code_run.snapshot": "#/components/schemas/SessionCodeRunSnapshotEvent",
+            "session.code_run.started": "#/components/schemas/SessionCodeRunStartedEvent",
             "session.codex_approval_mode": "#/components/schemas/SessionCodexApprovalModeEvent",
             "session.collaboration_mode": "#/components/schemas/SessionCollaborationModeEvent",
             "session.created": "#/components/schemas/SessionCreatedEvent",
@@ -5982,6 +6196,18 @@
           },
           {
             "$ref": "#/components/schemas/SessionTerminalActivityEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionCodeRunStartedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionCodeRunOutputEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionCodeRunFinishedEvent"
+          },
+          {
+            "$ref": "#/components/schemas/SessionCodeRunSnapshotEvent"
           },
           {
             "$ref": "#/components/schemas/OutputTextDeltaEvent"
@@ -6262,6 +6488,187 @@
           "child"
         ],
         "title": "SessionChildSessionUpdatedEvent",
+        "type": "object"
+      },
+      "SessionCodeRunFinishedEvent": {
+        "description": "A chat code run ended and its `finished` item was saved.",
+        "properties": {
+          "item": {
+            "additionalProperties": true,
+            "description": "The saved `code_run` item (`phase: \"finished\"`).",
+            "title": "Item",
+            "type": "object"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.code_run.finished",
+            "description": "Always `\"session.code_run.finished\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "item"
+        ],
+        "title": "SessionCodeRunFinishedEvent",
+        "type": "object"
+      },
+      "SessionCodeRunOutputEvent": {
+        "description": "Live output from a running chat code run. Transient; not persisted.",
+        "properties": {
+          "offset": {
+            "description": "Characters of the run's output before `text`; clients drop output whose offset they already have.",
+            "format": "int64",
+            "title": "Offset",
+            "type": "integer"
+          },
+          "run_id": {
+            "description": "The run, e.g. `\"run_abc\"`.",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "stream": {
+            "description": "`\"stdout\"` or `\"stderr\"`.",
+            "enum": [
+              "stdout",
+              "stderr"
+            ],
+            "title": "Stream",
+            "type": "string"
+          },
+          "text": {
+            "description": "The chunk's text.",
+            "title": "Text",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.code_run.output",
+            "description": "Always `\"session.code_run.output\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "run_id",
+          "offset",
+          "stream",
+          "text"
+        ],
+        "title": "SessionCodeRunOutputEvent",
+        "type": "object"
+      },
+      "SessionCodeRunSnapshotEvent": {
+        "description": "Output so far of a run in progress, sent when a client subscribes.",
+        "properties": {
+          "offset": {
+            "description": "Total characters the run has produced; later output events start at or after it.",
+            "format": "int64",
+            "title": "Offset",
+            "type": "integer"
+          },
+          "output": {
+            "description": "The runner's bounded copy (start and end kept).",
+            "items": {
+              "$ref": "#/components/schemas/CodeRunOutputSegment"
+            },
+            "title": "Output",
+            "type": "array"
+          },
+          "run_id": {
+            "description": "The run, e.g. `\"run_abc\"`.",
+            "title": "Run Id",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.code_run.snapshot",
+            "description": "Always `\"session.code_run.snapshot\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "run_id",
+          "offset",
+          "output"
+        ],
+        "title": "SessionCodeRunSnapshotEvent",
+        "type": "object"
+      },
+      "SessionCodeRunStartedEvent": {
+        "description": "A chat code run was accepted and its `started` item saved.",
+        "properties": {
+          "item": {
+            "additionalProperties": true,
+            "description": "The saved `code_run` item (`phase: \"started\"`).",
+            "title": "Item",
+            "type": "object"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "session.code_run.started",
+            "description": "Always `\"session.code_run.started\"`.",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "item"
+        ],
+        "title": "SessionCodeRunStartedEvent",
         "type": "object"
       },
       "SessionCodexApprovalModeEvent": {
@@ -13830,6 +14237,97 @@
           }
         },
         "summary": "List Child Sessions",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/code-runs": {
+      "post": {
+        "description": "Run a code block from an assistant message on the session's runner.\n\nOwner-only. Body: `message_id`, `block_hash` (SHA-256 hex of\n`code`), `language` (`shell` / `python` / `node`), `code`,\noptional `timeout` (seconds, default 120) and `approved` (the\nowner confirmed a policy ASK).\n\n**Returns:** 202 `{\"run_id\"}`; 403 `policy_denied`, 409 `needs_approval` / `copy_on_write`, 429 `too_many_runs`.",
+        "operationId": "start_code_run_v1_sessions__session_id__code_runs_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Code Run",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/code-runs/{run_id}/stop": {
+      "post": {
+        "description": "Stop a running code run. Owner-only.\n\nProxied to the runner like a terminal close; a finished or unknown\nrun returns 200 and nothing happens.\n\n**Returns:** `{\"stopped\": bool}`.",
+        "operationId": "stop_code_run_v1_sessions__session_id__code_runs__run_id__stop_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stop Code Run",
         "tags": [
           "sessions"
         ]

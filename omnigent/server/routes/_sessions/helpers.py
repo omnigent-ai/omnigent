@@ -15,6 +15,7 @@ import re
 import secrets
 import time
 import urllib.parse
+import uuid
 import weakref
 from collections import deque
 from collections.abc import (
@@ -43,10 +44,11 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError, StatementError
 from omnigent.codex_approval_modes import CODEX_NATIVE_PERMISSION_VALUES
 from omnigent.db.utils import generate_task_id
 from omnigent.db.workspace_cache import WorkspaceScopedCache
-from omnigent.debug_logging import debug_event, runner_log_scope
+from omnigent.debug_logging import add_audit_attrs, debug_event, runner_log_scope
 from omnigent.entities import (
     USER_SESSION_TITLE_MAX_CHARS,
     Agent,
+    CodeRunData,
     Conversation,
     ConversationItem,
     ErrorData,
@@ -271,6 +273,8 @@ from omnigent.server.schemas import (
     SandboxStatus,
     SessionBtwSidechatEvent,
     SessionChildSessionUpdatedEvent,
+    SessionCodeRunFinishedEvent,
+    SessionCodeRunStartedEvent,
     SessionCodexApprovalModeEvent,
     SessionCollaborationModeEvent,
     SessionCreatedEvent,
@@ -3051,6 +3055,9 @@ def _publish_external_conversation_item(
             # Hidden context on a non-user message has no live rendering
             # path that filters on the flag, so keep it off the stream.
             return
+    if isinstance(item.data, CodeRunData):
+        _publish_code_run_item(session_id, item)
+        return
     if (
         item.type == "message"
         and isinstance(item.data, MessageData)
@@ -3062,6 +3069,48 @@ def _publish_external_conversation_item(
     if message_id is not None:
         payload["message_id"] = message_id
     session_stream.publish(session_id, payload)
+
+
+def _external_item_stable_id(session_id: str, source_id: str) -> str:
+    """
+    Derive the item id an ``external_conversation_item`` with *source_id* gets.
+
+    :param session_id: Session/conversation identifier.
+    :param source_id: The producer's dedup key, e.g. ``"code_run:run_abc:finished"``.
+    :returns: A 32-char hex stable id.
+    """
+    return uuid.uuid5(
+        uuid.NAMESPACE_URL, f"omnigent-external-item:{session_id}:{source_id.strip()}"
+    ).hex
+
+
+def _publish_code_run_item(session_id: str, item: ConversationItem) -> None:
+    """
+    Broadcast a saved ``code_run`` item as its phase event.
+
+    Runs render under their code block, never as timeline items, so they
+    skip ``response.output_item.done``. A ``finished`` item also adds the
+    run's outcome to the request's audit record.
+
+    :param session_id: Session/conversation identifier.
+    :param item: Persisted ``code_run`` item.
+    """
+    assert isinstance(item.data, CodeRunData)
+    payload = item.to_api_dict()
+    if item.data.phase == "started":
+        event: SessionCodeRunStartedEvent | SessionCodeRunFinishedEvent = (
+            SessionCodeRunStartedEvent(type="session.code_run.started", item=payload)
+        )
+    else:
+        add_audit_attrs(
+            code_run_id=item.data.run_id,
+            code_run_status=item.data.status,
+            code_run_exit_code=item.data.exit_code,
+            code_run_duration_ms=item.data.duration_ms,
+            code_run_truncated=item.data.truncated,
+        )
+        event = SessionCodeRunFinishedEvent(type="session.code_run.finished", item=payload)
+    session_stream.publish(session_id, event.model_dump())
 
 
 def _publish_external_output_text_delta(session_id: str, body: SessionEventInput) -> None:

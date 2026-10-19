@@ -267,6 +267,7 @@ from omnigent.server.routes._sessions.helpers import (
     _devin_subagent_labels_from_body,
     _emit_server_routing_decision,
     _error_item_from_sse,
+    _external_item_stable_id,
     _extract_claude_native_runner_failure,
     _extract_persistent_item_from_sse,
     _extract_user_text_for_routing,
@@ -3183,12 +3184,7 @@ def _new_external_conversation_item(
                 code=ErrorCode.INVALID_INPUT,
             )
         item = item.model_copy(
-            update={
-                "stable_id": uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"omnigent-external-item:{session_id}:{source_id.strip()}",
-                ).hex
-            }
+            update={"stable_id": _external_item_stable_id(session_id, source_id)}
         )
     return item
 

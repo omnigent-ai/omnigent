@@ -31,6 +31,8 @@ if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeToolRelay
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
+    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.runner.code_runs import CodeRunEnvironment, CodeRunServerClient
     from omnigent.runner.mcp_manager import RunnerMcpManager
     from omnigent.terminals.registry import TerminalRegistry
 
@@ -103,6 +105,7 @@ from omnigent.runner.background_titles import (
     generate_background_title as run_background_title,
 )
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
+from omnigent.runner.code_runs import CodeRunRegistry, register_code_run_routes
 from omnigent.runner.codex.goal import CodexGoalRunner
 from omnigent.runner.launch_failure import FailureDiagnosis, classify_terminal_failure
 from omnigent.runner.mcp_execution_registry import (
@@ -1230,7 +1233,12 @@ def create_runner_app(
             if request.url.path == "/health":
                 return await call_next(request)
             client = request.scope.get("client")
-            if client is not None and client[0] == "tunnel":
+            # Proxy headers can rewrite ``client``; only the tunnel also sets ``server``.
+            if (
+                client is not None
+                and client[0] == "tunnel"
+                and request.scope.get("server") == ("runner", 0)
+            ):
                 return await call_next(request)
             auth_header = request.headers.get("authorization", "")
             if auth_header.startswith("Bearer "):
@@ -7370,6 +7378,44 @@ def create_runner_app(
         _session_harness_name=_session_harness_name,
         _session_spec_cache=_session_spec_cache,
         server_client=server_client,
+    )
+
+    async def _code_run_effective_spec(session_id: str) -> OSEnvSpec:
+        from omnigent.runner.tool_dispatch import _effective_runner_os_env_spec
+
+        return _effective_runner_os_env_spec(
+            await _resolve_session_agent_spec(session_id),
+            session_id,
+            await _session_runtime_cwd(session_id),
+        )
+
+    async def _code_run_environment(session_id: str) -> CodeRunEnvironment | None:
+        # Built like a sys_os_shell call's own helper: same spec, cwd, and env.
+        from omnigent.runner.tool_dispatch import _dedicated_os_environment
+
+        environment = _dedicated_os_environment(
+            await _code_run_effective_spec(session_id), session_id, resource_registry
+        )
+        return cast("CodeRunEnvironment | None", environment)
+
+    async def _code_run_uses_copy_on_write(session_id: str) -> bool:
+        from omnigent.runner.tool_dispatch import _needs_shared_environment
+
+        return resource_registry.uses_copy_on_write(session_id) or _needs_shared_environment(
+            await _code_run_effective_spec(session_id)
+        )
+
+    code_run_registry = CodeRunRegistry(
+        publish_event=_publish_event,
+        server_client=cast("CodeRunServerClient", server_client),
+        environment_factory=_code_run_environment,
+    )
+    app.state.code_run_registry = code_run_registry
+    resource_registry.set_code_run_stopper(code_run_registry.stop_session)
+    register_code_run_routes(
+        app,
+        registry=code_run_registry,
+        uses_copy_on_write=_code_run_uses_copy_on_write,
     )
 
     @app.post("/v1/sessions/{session_id}/resources/environments/{environment_id}/shell")

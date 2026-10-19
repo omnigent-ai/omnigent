@@ -11,9 +11,11 @@ import hashlib
 import time
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from omnigent.db.db_models import (
+    ConversationBase,
     SqlAccountToken,
     SqlAgent,
     SqlComment,
@@ -29,6 +31,7 @@ from omnigent.db.db_models import (
     SqlUserDailyCost,
 )
 from omnigent.db.enum_codecs import (
+    ITEM_TYPE,
     encode_account_token_kind,
     encode_agent_kind,
     encode_comment_status,
@@ -581,6 +584,21 @@ class TestSqlConversationItem:
             )
             assert len(items) == 5
             assert [it.position for it in items] == [0, 1, 2, 3, 4]
+
+    def test_model_type_check_admits_every_item_type_code(self, tmp_path) -> None:
+        """Schemas built from the models (``create_all``) accept every item type code."""
+        engine = sa.create_engine(f"sqlite:///{tmp_path / 'models.db'}")
+        ConversationBase.metadata.create_all(engine)
+        managed = make_managed_session_maker(engine)
+        with managed() as session:
+            for position, item_type in enumerate(ITEM_TYPE):
+                item = _make_item(id=f"{position:032x}", position=position)
+                item.type = encode_item_type(item_type)
+                session.add(item)
+        with managed() as session:
+            stored = {item.type for item in session.query(SqlConversationItem)}
+        engine.dispose()
+        assert stored == set(ITEM_TYPE.values())
 
 
 # ── SqlConversationLabel ──────────────────────────────

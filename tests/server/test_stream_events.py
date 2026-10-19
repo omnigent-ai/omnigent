@@ -540,3 +540,102 @@ def test_session_created_event_payload_shape() -> None:
     assert parsed.conversation_id == "conv_parent"
     assert parsed.child_session_id == "conv_child"
     assert parsed.agent_id == "agent_xyz"
+
+
+# ── Code runs ─────────────────────────────────────────────────────
+
+
+def _code_run_item(**data: Any) -> Any:
+    from omnigent.entities import CodeRunData, ConversationItem
+
+    return ConversationItem(
+        id="ci_run",
+        type="code_run",
+        status="completed",
+        response_id="run_1",
+        created_at=0,
+        data=CodeRunData(run_id="run_1", **data),
+    )
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {
+            "type": "session.code_run.output",
+            "run_id": "run_1",
+            "offset": 4,
+            "stream": "stderr",
+            "text": "x",
+        },
+        {
+            "type": "session.code_run.snapshot",
+            "run_id": "run_1",
+            "offset": 3,
+            "output": [{"stream": "stdout", "text": "abc"}],
+        },
+        {"type": "session.code_run.started", "item": {"id": "ci_run", "type": "code_run"}},
+        {"type": "session.code_run.finished", "item": {"id": "ci_run", "type": "code_run"}},
+    ],
+    ids=lambda event: event["type"],
+)
+def test_code_run_events_round_trip_through_union(event: dict[str, Any]) -> None:
+    assert _ADAPTER.validate_python(event).model_dump(exclude_none=True) == event
+
+
+def test_code_run_output_event_rejects_an_unknown_stream() -> None:
+    with pytest.raises(ValidationError):
+        _ADAPTER.validate_python(
+            {
+                "type": "session.code_run.output",
+                "run_id": "r",
+                "offset": 0,
+                "stream": "tty",
+                "text": "",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("data", "wire_type"),
+    [
+        (
+            {
+                "phase": "started",
+                "message_id": "msg_1",
+                "block_hash": "abc",
+                "language": "shell",
+                "command": "ls",
+                "timeout": 120,
+                "started_at": 1,
+            },
+            "session.code_run.started",
+        ),
+        (
+            {
+                "phase": "finished",
+                "status": "exited",
+                "exit_code": 0,
+                "duration_ms": 5,
+                "output": [],
+                "truncated": False,
+            },
+            "session.code_run.finished",
+        ),
+    ],
+)
+def test_external_code_run_items_publish_code_run_events(
+    monkeypatch: pytest.MonkeyPatch, data: dict[str, Any], wire_type: str
+) -> None:
+    """A saved code run item reaches viewers as its phase event, never a timeline item."""
+    from omnigent.runtime import session_stream as cs
+    from omnigent.server.routes._sessions.helpers import _publish_external_conversation_item
+
+    captured: list[dict[str, Any]] = []
+    monkeypatch.setattr(cs, "publish", lambda conversation_id, event: captured.append(event))
+
+    _publish_external_conversation_item("conv_abc", _code_run_item(**data))
+
+    assert [event["type"] for event in captured] == [wire_type]
+    assert captured[0]["item"]["run_id"] == "run_1"
+    _ADAPTER.validate_python(captured[0])
