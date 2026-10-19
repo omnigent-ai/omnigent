@@ -52,6 +52,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     AuthProvider,
 )
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
@@ -453,6 +454,7 @@ def register_resources_routes(
         path: str,
         conversation: Conversation,
         params: dict[str, str] | None = None,
+        timeout: float = 10.0,
     ) -> dict[str, Any]:
         """Proxy a GET request to the runner and return parsed JSON.
 
@@ -461,6 +463,7 @@ def register_resources_routes(
         :param conversation: Conversation loaded during authorization.
         :param params: Optional query params forwarded to the runner,
             e.g. ``{"order": "asc"}``. ``None`` sends no query string.
+        :param timeout: Seconds to wait for the runner response.
         :returns: Parsed JSON response body.
         :raises OmnigentError: Typed ``not_found`` (404) or
             ``session_agent_missing`` (410) re-derived from the runner body.
@@ -476,7 +479,7 @@ def register_resources_routes(
                 detail="no runner available for resource access",
             )
         try:
-            resp = await runner_client.get(path, params=params, timeout=10.0)
+            resp = await runner_client.get(path, params=params, timeout=timeout)
         except (httpx.HTTPError, ConnectionError) as exc:
             raise HTTPException(
                 status_code=502,
@@ -2438,6 +2441,37 @@ def register_resources_routes(
                 },
                 runner_path=path,
             ),
+        )
+
+    @router.get(
+        "/sessions/{session_id}/resources/environments/{environment_id}/content-search",
+        response_model=None,
+    )
+    async def search_environment_content(
+        request: Request,
+        session_id: str,
+        environment_id: str,
+        q: str = Query(min_length=1, max_length=4096, pattern=r".*\S.*"),
+        case_sensitive: bool = False,
+        regex: bool = False,
+        limit: int = Query(default=500, ge=1, le=500),
+    ) -> Any:
+        """Search the session workspace with the same access gate as file reads."""
+        flags = getattr(request.app.state, "feature_flags", FeatureFlags())
+        if not flags.enabled(Feature.WORKSPACE_CONTENT_SEARCH):
+            raise HTTPException(status_code=404, detail="Workspace content search is disabled")
+        conv = await _authorize_browse_read(session_id, request)
+        return await _proxy_get_to_runner(
+            session_id,
+            f"/v1/sessions/{session_id}/resources/environments/{environment_id}/content-search",
+            conv,
+            params={
+                "q": q,
+                "case_sensitive": str(case_sensitive).lower(),
+                "regex": str(regex).lower(),
+                "limit": str(limit),
+            },
+            timeout=25.0,
         )
 
     @router.get(

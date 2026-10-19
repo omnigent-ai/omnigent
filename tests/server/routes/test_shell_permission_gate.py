@@ -56,6 +56,7 @@ from omnigent.server.auth import (
     RESERVED_USER_PUBLIC,
     UnifiedAuthProvider,
 )
+from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.routes.sessions import create_sessions_router
 
 # The server route is mounted under /v1 and proxies to the runner at the
@@ -297,6 +298,7 @@ def app(runner_globals_reset: None, runner_client: _RecordingRunnerClient) -> Fa
     set_runner_router(_FakeRunnerRouter(runner_client))  # type: ignore[arg-type]
 
     application = FastAPI()
+    application.state.feature_flags = FeatureFlags(frozenset({Feature.WORKSPACE_CONTENT_SEARCH}))
 
     @application.exception_handler(OmnigentError)
     async def _handle_omnigent_error(
@@ -646,6 +648,7 @@ _CONTENT_READ_PATHS = (
     "/v1/sessions/{cid}/resources/environments/default/changes",
     "/v1/sessions/{cid}/resources/environments/default/diff/src/app.py",
     "/v1/sessions/{cid}/resources/environments/default/search?q=todo",
+    "/v1/sessions/{cid}/resources/environments/default/content-search?q=todo",
     "/v1/sessions/{cid}/resources/github/changes",
     "/v1/sessions/{cid}/resources/github/diff",
     "/v1/sessions/{cid}/resources/github/diff/src/app.py",
@@ -656,6 +659,7 @@ _CONTENT_READ_IDS = (
     "changed-files",
     "file-diff",
     "search",
+    "content-search",
     "github-changes",
     "github-pr-diff",
     "github-file-diff",
@@ -821,3 +825,16 @@ async def test_elicitation_resolve_rejects_unauthenticated(
     resp = await client.post(f"{_ELICITATION_PATH}/resolve", json={"action": "accept"})
 
     assert resp.status_code == 401, resp.text
+
+
+@pytest.mark.asyncio
+async def test_content_search_disabled_never_reaches_runner(
+    app: FastAPI, client: httpx.AsyncClient, runner_client: _RecordingRunnerClient
+) -> None:
+    app.state.feature_flags = FeatureFlags()
+    response = await client.get(
+        "/v1/sessions/conv_share/resources/environments/default/content-search?q=todo",
+        headers={"X-Forwarded-Email": "real-owner@example.com"},
+    )
+    assert response.status_code == 404
+    assert runner_client.gets == []

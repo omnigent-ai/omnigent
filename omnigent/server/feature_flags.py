@@ -28,6 +28,7 @@ class Feature(StrEnum):
     CUSTOM_AGENTS_SETTINGS_UI = "custom_agents_settings_ui"
     SIDEBAR_GROUPING_UI = "sidebar_grouping_ui"
     CLAUDE_OSC_STATUS = "claude_osc_status"
+    WORKSPACE_CONTENT_SEARCH = "workspace_content_search"
 
 
 @dataclass(frozen=True)

@@ -84,7 +84,7 @@ def seeded_session(browser_contract: BrowserContract) -> BrowserSession:
             "server_version": "browser-contract",
             "smart_routing_enabled": False,
             "smart_routing_sources": {"external": False, "oss": False},
-            "features": {},
+            "features": {"workspace_content_search": True},
             "harness_install_enabled": False,
             "installable_harnesses": [],
             "dictation_available": False,
@@ -490,6 +490,66 @@ def test_chat_line_link_expands_and_centers_diff_context(
         )
         expect(diff).to_be_visible()
         expect(page).to_have_url(re.compile(r"[?&]diff=1(?:&|$)"))
+
+
+def test_content_search_opens_line_and_preserves_results(
+    page: Page, seeded_session: BrowserSession
+) -> None:
+    """The tab, picker and hotkey preserve search and line navigation."""
+    _seed_citation_file(page, seeded_session)
+    seeded_session.contract.json(
+        f"/v1/sessions/{seeded_session.session_id}/resources/environments/default/content-search",
+        {
+            "matches": [
+                {
+                    "path": _FILE_PATH,
+                    "line": 351,
+                    "column": 3,
+                    "text": _AFTER_LINES[350],
+                    "match_start": 2,
+                    "match_end": 9,
+                }
+            ],
+            "truncated": False,
+            "warning": None,
+        },
+    )
+    _open_monaco(page, seeded_session)
+    rail = page.get_by_role("complementary", name="Workspace")
+    rail.get_by_role("tab", name="Content search", exact=True).click()
+    search = rail.get_by_role("searchbox", name="Search file contents")
+    search.fill("changed")
+    search.press("Enter")
+    result = rail.get_by_role("button", name=f"Open {_FILE_PATH} at line 351")
+    result.click()
+    page.wait_for_function(_CENTERED_LINE, arg={"text": _AFTER_LINES[350], "diff": False})
+
+    # The global chord must escape Monaco's key handlers and reopen a collapsed rail.
+    page.locator(".monaco-editor textarea").first.focus()
+    page.keyboard.press("ControlOrMeta+Shift+f")
+    expect(search).to_be_focused()
+    expect(search).to_have_value("changed")
+    expect(result).to_be_visible()
+    for _ in range(2):
+        page.get_by_role("button", name="Collapse right panel", exact=True).click()
+        expect(rail).not_to_be_visible()
+        page.keyboard.press("ControlOrMeta+Shift+f")
+        expect(rail).to_be_visible()
+        expect(search).to_be_focused()
+        expect(result).to_be_visible()
+
+    rail.get_by_role("tab", name="Files", exact=True).click()
+    file_search = rail.get_by_role("searchbox", name="Search all files")
+    expect(file_search).to_have_attribute("placeholder", "Find files by name")
+    expect(rail.get_by_role("group", name="Search mode")).to_have_count(0)
+    expect(rail.get_by_role("button", name="Contents", exact=True)).to_have_count(0)
+    rail.get_by_role("button", name="Select panel", exact=True).click()
+    page.get_by_role("menuitem", name="Content search", exact=True).click()
+    expect(search).to_have_value("changed")
+    expect(result).to_be_visible()
+    result.click()
+    page.wait_for_function(_CENTERED_LINE, arg={"text": _AFTER_LINES[350], "diff": False})
+    expect(page).to_have_url(re.compile(r"[?&]line=351(?:&|$)"))
 
 
 def test_source_citation_centers_last_loaded_line(

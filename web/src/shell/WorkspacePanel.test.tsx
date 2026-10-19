@@ -50,6 +50,9 @@ vi.mock("./FilesPanel", () => ({
 vi.mock("./SubagentsPanel", () => ({
   SubagentsPanel: () => <div data-testid="subagents-stub" />,
 }));
+vi.mock("./ContentSearchPanel", () => ({
+  ContentSearchPanel: () => <div data-testid="content-search-stub" />,
+}));
 vi.mock("@/components/BrowserPane/BrowserPane", () => ({
   BrowserPane: ({ conversationId, active }: { conversationId: string; active?: boolean }) => (
     <div data-testid="browser-pane-stub" data-active={String(active)}>
@@ -119,6 +122,8 @@ function renderWorkspace(
     openFiles?: string[];
     changedCount?: number;
     showGithubTab?: boolean;
+    showContentSearch?: boolean;
+    showFilesPanel?: boolean;
     showBrowserTab?: boolean;
     openTerminals?: string[];
     selectedTerminalKey?: string | null;
@@ -136,7 +141,7 @@ function renderWorkspace(
   const onCloseFile = vi.fn();
   const onRightRailTabChange = vi.fn();
   const onClosePanel = vi.fn();
-  const onBrowserTabOpened = vi.fn();
+  const onReveal = vi.fn();
   const openTerminalTab = vi.fn();
   const onCloseTerminal = vi.fn();
   const onToggleMaximized = vi.fn();
@@ -162,9 +167,10 @@ function renderWorkspace(
         openPanels={overrides.openPanels ?? []}
         onClosePanel={onClosePanel}
         showFilesPanel={overrides.showFilesPanel ?? true}
+        showContentSearch={overrides.showContentSearch}
         showGithubTab={overrides.showGithubTab ?? false}
         showBrowserTab={overrides.showBrowserTab ?? false}
-        onBrowserTabOpened={onBrowserTabOpened}
+        onReveal={onReveal}
         changedCount={overrides.changedCount ?? 0}
         subagentsWorking={0}
         agentCount={1}
@@ -198,7 +204,7 @@ function renderWorkspace(
     onCloseFile,
     onRightRailTabChange,
     onClosePanel,
-    onBrowserTabOpened,
+    onReveal,
     openTerminalTab,
     onCloseTerminal,
     onToggleMaximized,
@@ -249,6 +255,67 @@ describe("WorkspacePanel surface presentation", () => {
     expect(screen.getByRole("menuitem", { name: "Agents" })).toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: "Files" })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: "Pull Requests" })).toBeNull();
+  });
+
+  it.each([
+    { showContentSearch: false },
+    { showContentSearch: true, showFilesPanel: false },
+    { showContentSearch: true, pending: true },
+  ])("leaves the content-search shortcut alone when unavailable: %j", (overrides) => {
+    const { onRightRailTabChange, onReveal } = renderWorkspace(overrides);
+    expect(fireEvent.keyDown(window, { code: "KeyF", ctrlKey: true, shiftKey: true })).toBe(true);
+    expect(onRightRailTabChange).not.toHaveBeenCalled();
+    expect(onReveal).not.toHaveBeenCalled();
+  });
+
+  it("ignores content-search shortcuts on mobile and unrelated chords on desktop", () => {
+    isMobileMock.mockReturnValue(true);
+    const mobile = renderWorkspace({ showContentSearch: true });
+    fireEvent.keyDown(window, { code: "KeyF", ctrlKey: true, shiftKey: true });
+    expect(mobile.onReveal).not.toHaveBeenCalled();
+    mobile.view.unmount();
+    isMobileMock.mockReturnValue(false);
+    const desktop = renderWorkspace({ showContentSearch: true });
+    for (const modifiers of [
+      { shiftKey: false },
+      { altKey: true },
+      { metaKey: true },
+      { repeat: true },
+      { isComposing: true },
+    ]) {
+      expect(
+        fireEvent.keyDown(window, {
+          code: "KeyF",
+          ctrlKey: true,
+          shiftKey: true,
+          ...modifiers,
+        }),
+      ).toBe(true);
+    }
+    expect(desktop.onReveal).not.toHaveBeenCalled();
+    expect(fireEvent.keyDown(window, { code: "KeyF", ctrlKey: true, shiftKey: true })).toBe(false);
+    expect(desktop.onReveal).toHaveBeenCalledOnce();
+    expect(desktop.onRightRailTabChange).toHaveBeenCalledWith("content-search");
+  });
+
+  it("gates content search and exposes it in the tab strip and panel picker", async () => {
+    const disabled = renderWorkspace();
+    expect(screen.queryByRole("tab", { name: "Content search" })).not.toBeInTheDocument();
+    expect(screen.queryByTestId("content-search-stub")).not.toBeInTheDocument();
+    disabled.view.unmount();
+    const enabled = renderWorkspace({ showContentSearch: true });
+    expect(screen.getByTestId("content-search-stub")).toBeInTheDocument();
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Content search" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    expect(enabled.onRightRailTabChange).toHaveBeenCalledWith("content-search");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Content search" }));
+    expect(enabled.onRightRailTabChange).toHaveBeenCalledTimes(2);
   });
 
   it("sits flush to the window edge with a left divider, no floating card frame", () => {
@@ -1021,7 +1088,7 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
 
 describe("WorkspacePanel browser tab", () => {
   it("opens a browser tab with Ctrl+Alt+B", () => {
-    const { onRightRailTabChange, onBrowserTabOpened } = renderWorkspace({
+    const { onRightRailTabChange, onReveal } = renderWorkspace({
       showBrowserTab: true,
     });
 
@@ -1029,7 +1096,7 @@ describe("WorkspacePanel browser tab", () => {
 
     expect(screen.getByRole("tab", { name: "Browser 1" })).toBeInTheDocument();
     expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
-    expect(onBrowserTabOpened).toHaveBeenCalledOnce();
+    expect(onReveal).toHaveBeenCalledOnce();
   });
 
   it("offers browsers without shell access and creates multiple closable tabs", async () => {

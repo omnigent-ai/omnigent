@@ -1021,6 +1021,26 @@ def register_resource_routes(
             order=order,
         )
 
+    @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}/content-search")
+    async def search_environment_content(
+        session_id: str,
+        environment_id: str,
+        q: str = Query(min_length=1, max_length=4096, pattern=r".*\S.*"),
+        case_sensitive: bool = False,
+        regex: bool = False,
+        limit: int = Query(default=500, ge=1, le=500),
+    ) -> JSONResponse:
+        """Search live file contents inside the session's environment."""
+        from omnigent.runner.content_search import search_content
+
+        agent_spec = await _require_os_env(session_id)
+        await _ensure_session_registered(session_id)
+        env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
+        result = await search_content(
+            env, q, case_sensitive=case_sensitive, regex=regex, limit=limit
+        )
+        return JSONResponse(result)
+
     @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}/search")
     async def search_environment_files(
         session_id: str,
