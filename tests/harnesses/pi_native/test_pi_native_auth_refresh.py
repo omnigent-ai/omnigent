@@ -47,7 +47,7 @@ async def test_refresh_retries_failures_and_keeps_launch_headers(
     calls: list[dict[str, object]] = []
 
     def _mint() -> str:
-        result = next(mints)
+        result = next(mints, "fresh")
         if isinstance(result, Exception):
             assert _bearer(path) == "Bearer stale"
             raise result
