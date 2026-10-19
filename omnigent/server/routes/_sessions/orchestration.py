@@ -1431,9 +1431,9 @@ def _build_session_response(
     labels = labels_with_closed_status(_labels_for_viewer(conv.labels, viewer_id), conv.title)
     # Restore terminal access for older custom native sessions. Child mirrors
     # can inherit the parent's harness without owning a terminal of their own.
-    if agent_name in (_CLAUDE_NATIVE_MODEL, _CODEX_NATIVE_MODEL) or (
-        conv.parent_conversation_id is None
-        and native_coding_agent_for_harness(harness) is not None
+    if conv.parent_conversation_id is None and (
+        agent_name in (_CLAUDE_NATIVE_MODEL, _CODEX_NATIVE_MODEL)
+        or native_coding_agent_for_harness(harness) is not None
     ):
         labels = {**labels, _CLAUDE_NATIVE_UI_LABEL_KEY: _CLAUDE_NATIVE_UI_LABEL_VALUE}
     # A codex /side child whose ephemeral fork's runner is gone (parent resumed
