@@ -89,6 +89,7 @@ from omnigent.util.tunnel_limits import (
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
+from tests._helpers.providers import isolate_provider_resolution
 
 
 @pytest.fixture(autouse=True)
@@ -1554,9 +1555,8 @@ def test_bundled_agent_launches_with_first_available_credential(
     the ``_run_bundled_agent`` path and the ``claude-sdk`` brain, so the
     fallback fires identically for each.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     # No ambient credentials — the explicit provider below is the only one.
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     _write_isolated_provider_config(
         tmp_path,
@@ -1603,8 +1603,7 @@ def test_bundled_agent_multiple_credentials_notice_preserves_first_pick(
     shorthand remains headless-safe: it promotes the first configured
     credential, reports the ambiguity, and tells the user where to change it.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
 
     def _fail_prompt(*_args: object, **_kwargs: object) -> None:
@@ -1660,8 +1659,7 @@ def test_bundled_agent_leaves_existing_default_credential_alone(
     brain's family, the shorthand must NOT touch the config — the fallback
     only fires when no default exists.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     config_path = _write_isolated_provider_config(
         tmp_path,
@@ -1698,8 +1696,7 @@ def test_bundled_agent_no_credential_does_not_write_config(
     config is left untouched and ``run`` is still forwarded so that error
     surfaces in the normal launch path rather than as a silent no-op.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     # An OpenAI-only credential — the claude-sdk brain needs anthropic.
     config_path = _write_isolated_provider_config(
@@ -1738,8 +1735,7 @@ def test_bundled_agent_unreadable_global_config_degrades_to_launch(
     before the harness ever runs — the exact failure mode this path exists to
     avoid. An explicit anthropic key keeps the fallback loop reaching that read.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     _write_isolated_provider_config(
         tmp_path,
@@ -1786,8 +1782,7 @@ def test_bundled_agent_ambiguous_default_config_degrades_to_launch(
     with a traceback. Regression for the narrow guard that caught only the
     ``_load_global_config`` read.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     _write_isolated_provider_config(
         tmp_path,
@@ -1833,8 +1828,7 @@ def test_bundled_agent_codex_only_credential_reroutes_brain_harness(
     harness (mirroring bare ``omnigent``'s first-run pick) and announce the
     reroute.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     _write_isolated_provider_config(
         tmp_path,
@@ -1865,8 +1859,7 @@ def test_bundled_agent_brain_family_credential_keeps_declared_harness(
     serves the brain's own family — even alongside a Codex one — the brain
     stays on its declared harness and no ``--harness`` is injected.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     _write_isolated_provider_config(
         tmp_path,
@@ -1901,8 +1894,7 @@ def test_bundled_agent_no_credential_anywhere_skips_brain_reroute(
     There is nothing to fall back to, so the shorthand must not inject a
     harness — the downstream launch surfaces its own credential error.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     _write_isolated_provider_config(tmp_path, {})
     dispatch = Mock()
@@ -1924,8 +1916,7 @@ def test_bundled_agent_explicit_harness_wins_over_brain_reroute(
     Even on a Codex-only config, a forwarded ``--harness`` must reach ``run``
     unchanged (never doubled or overridden by the fallback's injection).
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     _write_isolated_provider_config(
         tmp_path,
@@ -1952,8 +1943,7 @@ def test_bundled_agent_flag_lookalike_prompt_value_keeps_brain_reroute(
     pin — the applicability check must parse flag shapes exactly like the
     forwarded ``run`` does, so the fallback still fires.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     _write_isolated_provider_config(
         tmp_path,
@@ -2002,8 +1992,7 @@ def test_bundled_agent_resume_flags_skip_brain_reroute(
     A resume/continue/fork picks up a conversation whose brain harness is
     already decided; injecting ``--harness`` there would silently change it.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     _write_isolated_provider_config(
         tmp_path,
@@ -2029,8 +2018,7 @@ def test_bundled_agent_remote_server_flag_skips_brain_reroute(
     managed gateway), so a missing local credential is not evidence the
     brain can't run there.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     _write_isolated_provider_config(
         tmp_path,
@@ -2056,8 +2044,7 @@ def test_bundled_agent_configured_remote_server_skips_brain_reroute(
     config pointing at a remote app, the launch targets that server and its
     routing — the local-credential fallback must stay out.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr(
         "omnigent.cli._load_effective_config",
         lambda: {"server": "https://example.databricksapps.com"},
@@ -2086,8 +2073,7 @@ def test_bundled_agent_local_server_alias_keeps_brain_reroute(
     launch — exactly the topology whose brain credential must resolve from
     the local config, so the fallback fires the same as with no flag.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     _write_isolated_provider_config(
         tmp_path,
@@ -2113,8 +2099,7 @@ def test_bundled_agent_brain_reroute_config_error_degrades_to_launch(
     malformed config must not crash the launch — the harness surfaces its
     own error downstream.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     # Two defaults for the openai family — load_providers/get_default_provider
     # raise OmnigentError when the fallback resolves the codex candidate.
