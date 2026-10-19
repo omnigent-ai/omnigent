@@ -142,6 +142,42 @@ class _PausedStreamHarness(_TurnScriptHarness):
         return _Paused()
 
 
+class _BrokenStreamHarness(_TurnScriptHarness):
+    """Break the first turn's stream with ``httpx.ReadError`` once all its frames are read."""
+
+    def __init__(self, scripts: list[list[str]]) -> None:
+        super().__init__(scripts)
+        self.before_break: Callable[[], None] = lambda: None
+
+    def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+        inner = super().stream(method, url, json=json, timeout=timeout)
+        if len(self.posted_bodies) != 1:
+            return inner
+        harness = self
+
+        class _Broken:
+            status_code = 200
+
+            async def __aenter__(self) -> Any:
+                handle = await inner.__aenter__()
+
+                class _Handle:
+                    status_code = 200
+
+                    async def aiter_text(self) -> AsyncIterator[str]:
+                        async for frame in handle.aiter_text():
+                            yield frame
+                        harness.before_break()
+                        raise httpx.ReadError("synthetic harness disconnect")
+
+                return _Handle()
+
+            async def __aexit__(self, *exc: Any) -> None:
+                await inner.__aexit__(*exc)
+
+        return _Broken()
+
+
 class _RecordingServerClient(NullServerClient):
     def __init__(self) -> None:
         self.posts: list[tuple[str, Any]] = []
@@ -802,3 +838,45 @@ async def test_ready_notice_during_the_resend_an_expired_wait_released_asks_for_
     assert ready["message"] == "Claude Code is ready. Sending your message now."
     assert [_sent_text(body) for body in harness.posted_bodies] == ["first", "first"]
     assert sid not in app.state.sign_in_holds
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream_end", ["read-error", "required-terminal-exit"])
+async def test_sign_in_refusal_is_reported_when_the_stream_breaks_after_it(
+    stream_end: str,
+) -> None:
+    """A refusal kept for the wait still reaches the server as undelivered if the stream breaks."""
+    harness = _BrokenStreamHarness([_REFUSED, _DELIVERED])
+    app, _harness, server = _build_app([], harness=harness)
+    sid = uuid.uuid4().hex
+    if stream_end == "required-terminal-exit":
+
+        def terminal_exited() -> None:
+            app.state.required_terminal_exit_errors[sid] = {
+                "code": "required_terminal_exited",
+                "message": "Claude Code exited.",
+            }
+
+        harness.before_break = terminal_exited
+    async with _runner_client(app) as client:
+        await _create_session(client, sid)
+        await client.post(
+            f"/v1/sessions/{sid}/events", json={**_message("first"), "stable_id": _STABLE_ID}
+        )
+        await _until(lambda: sid not in app.state.active_turns)
+        await asyncio.sleep(0.05)
+
+    failures = [e for e in _published(app, sid) if e.get("type") == "response.failed"]
+    refusal, broken = failures
+    assert refusal["error"]["code"] == "databricks_sign_in_pending"
+    assert refusal["error"]["undelivered"] is True
+    assert refusal["input_stable_id"] == _STABLE_ID
+    assert broken["error"]["code"] == (
+        "required_terminal_exited"
+        if stream_end == "required-terminal-exit"
+        else "connection_error"
+    )
+    assert len(harness.posted_bodies) == 1
+    assert sid not in app.state.sign_in_holds
+    assert not app.state.session_message_buffers.get(sid)
+    assert not server.notices("databricks_sign_in_pending")

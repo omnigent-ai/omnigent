@@ -1468,6 +1468,7 @@ def create_runner_app(
     # ``proxy_stream`` is reading, which surfaces there as a transport error;
     # the stream's failure handler consumes the record to report the exit.
     _required_terminal_exit_errors: dict[str, dict[str, str]] = {}
+    app.state.required_terminal_exit_errors = _required_terminal_exit_errors
     # Monotonic epoch stamped at each turn bind; lets recovery detect a replacement that ran
     # and finished during a teardown await (slot empty, but epoch advanced).
     _turn_epoch_seq = itertools.count(1)
@@ -5993,6 +5994,20 @@ def create_runner_app(
             event_body = _wrap_as_message_event(_instr_body)
             _inject_mcp_schemas(event_body, _mcp_schemas)
             _response_id: str | None = None
+            # A sign-in refusal kept from the chat while its message waits to be resent.
+            _held_refusal: _JsonObject | None = None
+            _held_body: _JsonObject | None = None
+
+            def _report_held_refusal() -> None:
+                """Publish a kept sign-in refusal as the harness sent it: nothing is held."""
+                nonlocal _held_refusal
+                if _held_refusal is None:
+                    return
+                if turn_input_stable_id is not None:
+                    _held_refusal["input_stable_id"] = turn_input_stable_id
+                _publish_event(conv_id, _held_refusal)
+                _held_refusal = None
+
             try:
                 async with client.stream(
                     "POST",
@@ -6053,9 +6068,6 @@ def create_runner_app(
                     _subagent_post_chains: dict[str, _asyncio.Task[object]] = {}
                     _text_acc: list[str] = []
                     _stream_failed_error: _JsonObject | None = None
-                    # A sign-in refusal kept from the chat while its message waits to be resent.
-                    _held_refusal: _JsonObject | None = None
-                    _held_body: _JsonObject | None = None
 
                     def _owns_live_turn() -> bool:
                         live = _live_response_id.get(conv_id)
@@ -6448,16 +6460,13 @@ def create_runner_app(
                     if _dispatch_tasks:
                         await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
 
-                    if _held_refusal is not None and (
+                    if (
                         not _owns_live_turn()
                         or _turn_message_bodies.get(conv_id) is not _held_body
                     ):
                         # A newer turn took the session, or an interrupt or Stop cancelled
                         # this one meanwhile: report the refusal as usual.
-                        if turn_input_stable_id is not None:
-                            _held_refusal["input_stable_id"] = turn_input_stable_id
-                        _publish_event(conv_id, _held_refusal)
-                        _held_refusal = None
+                        _report_held_refusal()
                     if _held_refusal is not None and _stream_failed_error is not None:
                         _hold_message_for_sign_in(conv_id, _stream_failed_error)
                     # _on_proxy_stream_end clears any claude-sdk `/compact`
@@ -6471,6 +6480,7 @@ def create_runner_app(
                     )
 
             except _ContextWindowOverflow as overflow:
+                _report_held_refusal()
                 _error = {
                     "code": "context_length_exceeded",
                     "message": overflow.detail_message
@@ -6494,6 +6504,8 @@ def create_runner_app(
                 )
 
             except (httpx.HTTPError, RuntimeError) as exc:
+                # A refusal kept before the stream broke still reports its message undelivered.
+                _report_held_refusal()
                 _exit_error = _required_terminal_exit_errors.pop(conv_id, None)
                 if _exit_error is not None:
                     # The runner ended this stream itself: the session's required
