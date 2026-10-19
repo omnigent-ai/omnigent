@@ -796,6 +796,90 @@ def test_record_hook_event_first_event_bootstraps_identity(tmp_path: Path) -> No
     assert read_claude_session_id(bridge_dir) == "claude-session"
 
 
+@pytest.mark.parametrize("updated_file", ["hook_identity", "model_vocabulary"])
+def test_bridge_writers_preserve_concurrent_identity_and_model_updates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, updated_file: str
+) -> None:
+    """A delayed writer must not replace another writer's newer bridge metadata."""
+    from tests.budgets import budget
+
+    bridge_dir = prepare_bridge_dir("conv_old", workspace=tmp_path)
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "native_old",
+            "transcript_path": str(tmp_path / "old.jsonl"),
+        },
+    )
+    claude_native_bridge.record_model_vocabulary(
+        bridge_dir, launch_env=None, launch_model="model_old"
+    )
+    watched_path = bridge_dir / (
+        "state.json" if updated_file == "hook_identity" else "bridge.json"
+    )
+    first_read = threading.Event()
+    update_attempted = threading.Event()
+    update_finished = threading.Event()
+    writer_context = threading.local()
+    original_read = claude_native_bridge._read_json_file
+
+    def read_with_delayed_writer(path: Path) -> dict[str, Any]:
+        result = original_read(path)
+        if path == watched_path and getattr(writer_context, "delay", False):
+            writer_context.delay = False
+            first_read.set()
+            assert update_attempted.wait(timeout=budget(3.0))
+            # Expected to time out under correct locking: this bounded window only
+            # lets a buggy unlocked write complete and clobber state (final asserts).
+            update_finished.wait(timeout=0.5)
+        return result
+
+    monkeypatch.setattr(claude_native_bridge, "_read_json_file", read_with_delayed_writer)
+
+    def delayed_write() -> None:
+        writer_context.delay = True
+        if updated_file == "hook_identity":
+            record_hook_event(bridge_dir, {"hook_event_name": "Stop", "session_id": "native_old"})
+        else:
+            claude_native_bridge.write_active_session_id(bridge_dir, "conv_new")
+
+    def newer_write() -> None:
+        assert first_read.wait(timeout=budget(3.0))
+        update_attempted.set()
+        try:
+            if updated_file == "hook_identity":
+                record_hook_event(
+                    bridge_dir,
+                    {
+                        "hook_event_name": "SessionStart",
+                        "session_id": "native_new",
+                        "transcript_path": str(tmp_path / "new.jsonl"),
+                    },
+                )
+            else:
+                claude_native_bridge.record_model_vocabulary(
+                    bridge_dir, launch_env=None, launch_model="model_new"
+                )
+        finally:
+            update_finished.set()
+
+    with ThreadPoolExecutor(max_workers=2) as writers:
+        delayed = writers.submit(delayed_write)
+        newer = writers.submit(newer_write)
+        delayed.result(timeout=budget(6.0))
+        newer.result(timeout=budget(6.0))
+
+    if updated_file == "hook_identity":
+        assert read_claude_session_id(bridge_dir) == "native_new"
+        assert read_transcript_path(bridge_dir) == tmp_path / "new.jsonl"
+        assert read_seen_claude_session_ids(bridge_dir) == {"native_old", "native_new"}
+        assert count_hook_events(bridge_dir) == 3
+    else:
+        assert claude_native_bridge.read_active_session_id(bridge_dir) == "conv_new"
+        assert read_launch_model(bridge_dir) == "model_new"
+
+
 def test_read_assistant_text_since_parses_claude_jsonl(tmp_path: Path) -> None:
     """
     Transcript parsing returns only assistant text after the cursor.

@@ -9,6 +9,7 @@ import asyncio
 import base64
 import logging
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -103,14 +104,42 @@ async def test_mark_frame_seen_returns_false_for_stale_session() -> None:
 
 
 @pytest.mark.asyncio
-async def test_seconds_since_last_frame_returns_positive_float() -> None:
-    """Active session reports a small idle time."""
+@pytest.mark.parametrize("wall_clock_step", [-3600.0, 0.0, 3600.0])
+@pytest.mark.parametrize("frame_kind", ["heartbeat", "response", "websocket"])
+async def test_seconds_since_last_frame_returns_positive_float(
+    monkeypatch: pytest.MonkeyPatch, wall_clock_step: float, frame_kind: str
+) -> None:
+    """Clock corrections cannot expire a live tunnel or extend a dead one's grace."""
+    from omnigent.runner.transports.ws_tunnel import registry as registry_module
+
+    clock = SimpleNamespace(wall=1000.0, monotonic=100.0)
+    monkeypatch.setattr(
+        registry_module,
+        "time",
+        SimpleNamespace(time=lambda: clock.wall, monotonic=lambda: clock.monotonic),
+    )
     reg = TunnelRegistry()
     session = reg.register("r1", _NoopWS(), _hello())
-    await asyncio.sleep(0.01)
-    idle = reg.seconds_since_last_frame(session)
-    assert idle is not None
-    assert idle >= 0.01
+    clock.wall += wall_clock_step + 7
+    clock.monotonic += 7
+    assert reg.seconds_since_last_frame(session) == pytest.approx(7.0)
+
+    if frame_kind == "heartbeat":
+        assert reg.mark_frame_seen(session)
+    elif frame_kind == "response":
+        request = reg.open_request("r1", "req1")
+        assert reg.route_response_frame("r1", ResponseHeadFrame(id="req1", status=200, headers=[]))
+        await request.head_future
+        reg.close_request("r1", "req1")
+    else:
+        channel = reg.open_ws_channel("r1", "ch1")
+        assert reg.route_ws_inbound("r1", WSFrame(ch_id="ch1", data="hello"))
+        await channel.inbound_queue.get()
+        reg.close_ws_channel("r1", "ch1")
+    assert session.last_frame_at == clock.wall
+    clock.wall += 3
+    clock.monotonic += 3
+    assert reg.seconds_since_last_frame(session) == pytest.approx(3.0)
 
 
 @pytest.mark.asyncio

@@ -2200,6 +2200,14 @@ async def test_ping_timeout_closes_tunnel_and_names_the_connection(
     assert timeouts[0]["app_silence_timeout_s"] == 0.02
     assert timeouts[0]["last_received_frame_age_s"] >= 0
     assert timeouts[0]["last_app_pong_received_age_s"] is None
+    # A silent peer is an expected, self-recovering outage, not a warning.
+    assert timeouts[0]["silence_source"] == "peer"
+    assert timeouts[0]["error_category"] == "runner"
+    assert timeouts[0]["error_impact"] == "transient"
+    [timeout_record] = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "runner_ping_timeout"
+    ]
+    assert timeout_record.levelno == logging.INFO
     ends = _tunnel_end_events(caplog)
     assert len(ends) == 1
     assert ends[0]["phase"] == "disconnected"
@@ -2271,11 +2279,40 @@ async def test_ping_timeout_retains_blocked_send_and_queued_heartbeats(
 
         await route_app.app(scope, receive, delayed_send)
 
+    # Keep the runner fresh until the stuck send, queued heartbeat and health report
+    # all exist; a loaded event loop could otherwise time out before any of them.
+    runner_silent = False
+    real_seconds_since_last_frame = route_app.registry.seconds_since_last_frame
+
+    def seconds_since_last_frame(session: RunnerSession) -> float | None:
+        elapsed = real_seconds_since_last_frame(session)
+        return elapsed if elapsed is None or runner_silent else 0.0
+
+    monkeypatch.setattr(route_app.registry, "seconds_since_last_frame", seconds_since_last_frame)
+
+    def evidence_ready() -> bool:
+        session = route_app.registry.get(_RUNNER_ID)
+        if session is None:
+            return False
+        snapshot = session.diagnostics.snapshot()
+        return (
+            snapshot["sends_in_flight"] == 1
+            and (snapshot["outbound_queue_depth"] or 0) >= 1
+            and any(
+                getattr(record, "event_name", None) == "runner_tunnel_health"
+                for record in caplog.records
+            )
+        )
+
     communicator = ApplicationCommunicator(blocked_sender_app, _websocket_scope(_TUNNEL_PATH))
     try:
         await communicator.send_input({"type": "websocket.connect"})
         assert (await communicator.receive_output(timeout=budget(1)))["type"] == "websocket.accept"
         await _send_hello(communicator, route_app.registry, connection_id="conn-blocked-send")
+        async with asyncio.timeout(budget(2)):
+            while not evidence_ready():
+                await asyncio.sleep(0.005)
+        runner_silent = True
         message = await communicator.receive_output(timeout=budget(2))
         assert message["type"] == "websocket.close"
         assert message["code"] == 4003

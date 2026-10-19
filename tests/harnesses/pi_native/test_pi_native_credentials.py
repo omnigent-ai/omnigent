@@ -2178,17 +2178,19 @@ def test_provider_qualified_override_split_to_configured_provider() -> None:
     # Prefix split; the gateway-kind provider keeps the id verbatim.
     assert provider.model == "databricks-claude-fable-5-1"
     assert provider.credential_warning is None
+    assert provider.model_notice is None
     cfg = provider.to_models_config()
     ids = [m["id"] for prov in cfg["providers"].values() for m in prov["models"]]
     assert not [mid for mid in ids if "/" in mid]
 
 
-def test_override_qualified_by_other_configured_provider_warns() -> None:
-    """Naming a configured provider other than the serving one warns.
+def test_override_qualified_by_other_configured_provider_notifies() -> None:
+    """Naming a configured provider other than the serving one leaves a notice.
 
     The session is served by the pi-default provider, so a model picked from
     another configured provider is requested from the default instead — say
-    so rather than silently reinterpreting the value.
+    so rather than silently reinterpreting the value. The session still works,
+    so this is a neutral model notice, never a credential warning.
     """
     config = _rpw_fable_anthropic_gateway()
     config["providers"]["other-gw"] = {
@@ -2204,9 +2206,10 @@ def test_override_qualified_by_other_configured_provider_warns() -> None:
     )
     assert provider is not None
     assert provider.model == "databricks-claude-fable-5-1"
-    assert provider.credential_warning is not None
-    assert "other-gw" in provider.credential_warning
-    assert "rpw-fable" in provider.credential_warning
+    assert provider.credential_warning is None
+    assert provider.model_notice is not None
+    assert "other-gw" in provider.model_notice
+    assert "rpw-fable" in provider.model_notice
 
 
 @pytest.mark.parametrize(
@@ -3871,6 +3874,77 @@ def test_curated_tier_alias_resolves_before_bracket_strip() -> None:
     assert provider is not None
     assert provider.model == "GLM-5.3"
     assert [entry["id"] for entry in provider.extra_models] == ["GLM-5.3", "GLM-5.3-Flash"]
+
+
+def test_fetch_pi_model_lists_marks_catalog_reasoning_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catalog-reasoning GPT (Responses) and Gemini (MLflow) entries get ``reasoning: true``."""
+    import unittest.mock
+
+    from omnigent.models import model_catalog
+    from omnigent.models.model_metadata import ModelCapability, ModelMetadata
+
+    def _service(name: str, api_types: list[str]) -> dict[str, object]:
+        return {"name": f"model-services/{name}", "supported_api_types": api_types}
+
+    payload = {
+        "model_services": [
+            _service("system.ai.claude-fable-5-1", ["anthropic/v1/messages"]),
+            _service(
+                "system.ai.gpt-6-luna", ["openai/v1/responses", "openai/v1/chat/completions"]
+            ),
+            _service("system.ai.gemini-3-8-flash", ["openai/v1/chat/completions"]),
+            _service("system.ai.deepseek-v4", ["openai/v1/chat/completions"]),
+            _service("system.ai.llama-4-maverick", ["openai/v1/chat/completions"]),
+        ]
+    }
+    reasoning = frozenset({ModelCapability.REASONING})
+
+    def _catalog(provider_name: str) -> tuple[model_catalog.ModelEntry, ...]:
+        assert provider_name == "databricks"
+        capable = ModelMetadata(supported_capabilities=reasoning)
+        return (
+            model_catalog.ModelEntry(
+                id="databricks-claude-fable-5-1", family="claude", metadata=capable
+            ),
+            model_catalog.ModelEntry(
+                id="databricks-gpt-6-luna", family="openai", metadata=capable
+            ),
+            model_catalog.ModelEntry(
+                id="databricks-gemini-3-8-flash", family="other", metadata=capable
+            ),
+            model_catalog.ModelEntry(
+                id="databricks-deepseek-v4", family="other", metadata=capable
+            ),
+            model_catalog.ModelEntry(
+                id="databricks-llama-4-maverick",
+                family="other",
+                metadata=ModelMetadata(unsupported_capabilities=reasoning),
+            ),
+        )
+
+    monkeypatch.setattr(model_catalog, "catalog_model_entries", _catalog)
+
+    class _MockTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=json.dumps(payload).encode())
+
+    _real_client = httpx.Client
+    with unittest.mock.patch(
+        "httpx.Client",
+        lambda *args, **kwargs: _real_client(transport=_MockTransport()),
+    ):
+        claude, gpt, _completions, mlflow = creds._fetch_pi_model_lists(
+            "https://wkspc.example.com", "tok"
+        )
+
+    by_id = {m["id"]: m for m in claude + gpt + mlflow}
+    assert by_id["system.ai.claude-fable-5-1"].get("reasoning") is True
+    assert by_id["system.ai.deepseek-v4"].get("reasoning") is True
+    assert by_id["system.ai.gpt-6-luna"].get("reasoning") is True
+    assert by_id["system.ai.gemini-3-8-flash"].get("reasoning") is True
+    assert "reasoning" not in by_id["system.ai.llama-4-maverick"]
 
 
 @pytest.mark.parametrize("outcome", ["timeout", "cancelled", "shell_parent", "output_limit", "ok"])

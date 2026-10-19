@@ -65,6 +65,32 @@ check that they exist at the checkout revision before using them.
 - Report an unreachable entry point with the attempted route and the unmet
   prerequisite. Do not report it as verified through a different path.
 
+### PR demo standard
+
+Choose evidence for the changed behavior, not a video for every PR:
+
+| Change | Default evidence in the PR's Demo section |
+| --- | --- |
+| Interactive UI or user-visible harness workflow | Short recording of the real app or terminal, ideally 30–90 seconds, showing the action and outcome. |
+| Static visual change | Screenshots of the changed state; before/after when useful. |
+| Nonvisual backend, docs or tests | Test results, logs or transcripts in Test Plan; Demo may be N/A. Video is optional. |
+
+- Record the actual candidate build. For bugs, show before/after when practical
+  and label each revision. Generated illustrations are explanations, not proof.
+- Caption each capture with the commit, harness/version (or N/A), entry point,
+  SDK/native transport, OSS/Managed deployment, and mock or live provider/model.
+  State the action, observed outcome and what remains untested. Managed means
+  a managed Omnigent deployment, not an OSS instance using a hosted model gateway.
+- A real-app recording may use a scripted provider: label it **mock** and do not
+  claim live compatibility. Reuse an authorized verification run; do not make
+  paid live calls just to obtain a video. Media supplements tests and proves
+  only the behavior shown, not other entry points or unshown recovery paths.
+- Keep captures outside the tracked tree, redact private data, and upload them
+  as GitHub attachments linked from Demo. Never commit PR-only evidence media.
+- If recording or upload is unavailable, explain the limitation in Demo, link
+  the available evidence, and give exact manual verification steps. Ask for
+  upload help when needed; do not fabricate a capture or hide the missing proof.
+
 ## Feature entry contract
 
 Each feature file starts with an H1 title and one paragraph describing the
@@ -86,6 +112,13 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 [Keeping the map current](#keeping-the-map-current) for everything it enforces.
 
 ## Features
+
+- [Harness acceptance](./harness-acceptance.md) standardizes the SDK/native
+  checklist, connects existing bench probes to user journeys, and records
+  per-harness coverage gaps separately from observed results.
+
+- [Markdown editor](./markdown-editor.md) defines the file-editor CUJ, fixed
+  before/after recordings, load probes, and complementary persistence checks.
 
 - [Custom agents](./custom-agents.md) covers Settings listing, creation, summary
   review, deletion, and capability gating.
@@ -184,7 +217,9 @@ budgets, MCP servers, sandbox providers, and smart routing.
 - **Every PR, enforced:** `tests/dev/test_verify_omnigent_feature_map.py` fails
   when a referenced test is renamed or removed, a feature file breaks the entry
   contract, a native harness has no matrix row, or a UI test area or CLI command
-  is neither mapped nor listed under [Not yet mapped](#not-yet-mapped). It runs
+  is neither mapped nor listed under [Not yet mapped](#not-yet-mapped). It also
+  checks that the harness acceptance checklist maps every registered bench
+  probe; this is a documentation check, not a harness acceptance run. It runs
   in CI and in the E2E UI workflow, so UI-only PRs are checked too.
 - **Every PR, advisory:** when a PR changes user-facing code, the Polly review
   adds a non-blocking note if the change adds or removes an entry point that the

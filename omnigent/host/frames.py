@@ -409,6 +409,8 @@ class HostRunnerStatusResultFrame:
 
         * ``"alive"`` — the host has this runner and its process is
           running (booting or serving). The runner is coming; wait.
+        * ``"sign_in_pending"`` — this live, unconnected runner is waiting
+          within its bounded host sign-in window. Keep the original input.
         * ``"dead"`` — the host has this runner but its process has
           exited. It will never connect; relaunch now.
         * ``"unknown"`` — the host has no record of this runner (it was

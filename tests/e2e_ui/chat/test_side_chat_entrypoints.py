@@ -100,7 +100,7 @@ def test_composer_add_tray_offers_a_side_chat(
     runner_id: str,
     mock_llm_server_url: str,
 ) -> None:
-    """The composer ``+`` tray starts a working chat on the parent's runner."""
+    """The ``+`` tray starts a working side chat whose composer also opens the slash menu."""
     base_url, session_id = seeded_session
     question = f"tray-side-{session_id}: answer in the side chat"
     reply = "The add tray started a side chat."
@@ -119,6 +119,13 @@ def test_composer_add_tray_offers_a_side_chat(
     response = httpx.get(f"{base_url}/v1/sessions/{side_chat_forks[0]}", timeout=10.0)
     response.raise_for_status()
     assert response.json()["runner_id"] == runner_id
+
+    # The live side chat shares the main composer's slash menu; /help is the
+    # built-in offered on every non-native harness, so it proves the menu opened.
+    side_input = page.get_by_test_id("side-chat-input")
+    expect(side_input).to_be_enabled(timeout=30_000)
+    side_input.fill("/")
+    expect(page.get_by_test_id("slash-menu-item-help")).to_be_visible(timeout=10_000)
 
 
 def test_rail_new_tab_menu_offers_a_side_chat(page: Page, seeded_session: tuple[str, str]) -> None:
