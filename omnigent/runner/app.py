@@ -2129,6 +2129,21 @@ def create_runner_app(
         _session_init_envelopes.pop(session_id, None)
         return None
 
+    async def _rebind_claude_bridge(session_id: str, bridge_id: str) -> None:
+        """Point a session's cached init labels and harness at its new Claude bridge.
+
+        :param session_id: Session whose terminal launch moved its bridge dir.
+        :param bridge_id: The bridge id the new pane was launched under.
+        """
+        from omnigent.harnesses.claude_native.bridge import BRIDGE_ID_LABEL_KEY
+
+        cached = _session_init_envelopes.get(session_id)
+        if cached is not None:
+            cached[1].snapshot.labels[BRIDGE_ID_LABEL_KEY] = bridge_id
+        # The next turn respawns the harness with the new bridge dir.
+        if process_manager is not None:
+            await process_manager.release(session_id)
+
     async def _load_session_init_context(
         body: _JsonObject,
         *,
@@ -2710,6 +2725,7 @@ def create_runner_app(
                 server_client=server_client,
                 event_dispatcher=getattr(app.state, "runner_event_dispatcher", None),
                 ensure_comment_relay=_ensure_comment_relay_started,
+                rebind_bridge=_rebind_claude_bridge,
             )
             _launch_pre: Callable[[bool], Awaitable[PreLaunchResult]] | None = None
             _launch_build: (
@@ -7262,6 +7278,7 @@ def create_runner_app(
         _pi_terminal_ensure_locks=_pi_terminal_ensure_locks,
         _publish_event=_publish_event,
         _qwen_terminal_ensure_locks=_qwen_terminal_ensure_locks,
+        _rebind_claude_bridge=_rebind_claude_bridge,
         _record_session_claude_launch_config=_record_session_claude_launch_config,
         _repl_terminal_ensure_locks=_repl_terminal_ensure_locks,
         _repop_pending_cost_popup_on_attach=_repop_pending_cost_popup_on_attach,
