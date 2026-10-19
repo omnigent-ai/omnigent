@@ -655,7 +655,7 @@ export function FilesPanel({
         )}
         onScroll={handleScroll}
       >
-        {showAsleepHint && <RunnerAsleepHint />}
+        {showAsleepHint && <RunnerAsleepHint sandboxOffline />}
         {!showAsleepHint && flatView && (
           <FlatFileList
             files={changedQuery.data?.data}

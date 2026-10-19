@@ -1711,6 +1711,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           visible={isShown}
           runnerOnline={isActive ? runnerOnline : undefined}
           onResume={isActive ? handleTerminalResume : undefined}
+          sandboxOffline={isActive && liveness.kind === "host_asleep"}
           onSurfaceElement={isActive ? setTerminalSurfaceEl : undefined}
           readOnly={entry.readOnly}
         />

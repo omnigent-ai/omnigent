@@ -58,7 +58,12 @@ import {
 } from "@/lib/workspacePanelPreferences";
 import { readTranscriptViewDefault } from "@/lib/transcriptViewPreferences";
 import { updateOverlayToastOffset } from "@/lib/updateOverlayInset";
-import { readDefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
+import {
+  type DefaultWorkspaceTab,
+  isDefaultWorkspaceTab,
+  readInitialWorkspaceTab,
+  readPinnedWorkspaceTabs,
+} from "@/lib/workspaceTabPreferences";
 import {
   Dialog,
   DialogContent,
@@ -270,11 +275,20 @@ export function AppShell() {
   const pendingConversation = conversationId != null && serverConversationId == null;
   const [fileViewerCommentsOpen, setFileViewerCommentsOpen] = useState(false);
   const [mobileFileTarget, setMobileFileTarget] = useState<HTMLDivElement | null>(null);
-  const [rightRailTab, setRightRailTab] = useState<RightRailTab>(() =>
+  const [rightRailTab, setRightRailTab] = useState<RightRailTab | null>(() =>
     conversationId
-      ? (readSessionWorkspaceState(conversationId).rightRailTab ?? readDefaultWorkspaceTab())
-      : "files",
+      ? (readSessionWorkspaceState(conversationId).rightRailTab ?? readInitialWorkspaceTab())
+      : null,
   );
+  const [openPanels, setOpenPanels] = useState<DefaultWorkspaceTab[]>(() =>
+    conversationId ? (readSessionWorkspaceState(conversationId).openPanels ?? []) : [],
+  );
+  const selectRightRailTab = useCallback((next: RightRailTab | null) => {
+    setRightRailTab(next);
+    if (isDefaultWorkspaceTab(next) && !readPinnedWorkspaceTabs().includes(next)) {
+      setOpenPanels((previous) => (previous.includes(next) ? previous : [...previous, next]));
+    }
+  }, []);
   // The comments panel only contributes to the min width when the rail is
   // actually showing the file viewer — on any other tab the FileViewer
   // is unmounted, so the 720 floor would just waste horizontal space. Both
@@ -956,6 +970,11 @@ export function AppShell() {
   // no-filesystem agent with no terminals/sub-agents would otherwise
   // render an empty white card with no way to dismiss it.
   const hasRailContent = Object.values(railTabsAvailable).some(Boolean);
+  const initialWorkspaceTab = readInitialWorkspaceTab();
+  const fallbackWorkspaceTab =
+    initialWorkspaceTab !== null && railTabsAvailable[initialWorkspaceTab]
+      ? initialWorkspaceTab
+      : (readPinnedWorkspaceTabs().find((tab) => railTabsAvailable[tab]) ?? null);
   // Mount the relay at the always-present shell level (not BrowserPane, which
   // only mounts while its tab is selected) so it's listening before the first
   // browser_navigate. No-op outside Electron / with no conversation.
@@ -1149,7 +1168,8 @@ export function AppShell() {
       // No session → no rail; false (not the open default) so rail-gated
       // effects stay quiet on non-session routes.
       setRightPanelOpenImmediately(false);
-      setRightRailTab("files");
+      setRightRailTab(null);
+      setOpenPanels([]);
       setSelectedFilePath(null);
       setOpenFiles([]);
       autoFocusTerminalKeyRef.current = null;
@@ -1184,9 +1204,9 @@ export function AppShell() {
       rightRailTab === "subagents" &&
       rootSessionId !== null &&
       previousRootSessionIdRef.current === rootSessionId;
-    let nextTab: RightRailTab =
+    let nextTab: RightRailTab | null =
       persisted.rightRailTab ??
-      (keepAgentsAcrossTreeNavigation ? "subagents" : readDefaultWorkspaceTab());
+      (keepAgentsAcrossTreeNavigation ? "subagents" : readInitialWorkspaceTab());
     // Browser is a dynamic soft-tab mode, not a permanent nav destination.
     // A stale pre-soft-tab selection (or a closed last tab) restores to the
     // configured static default instead of showing an unselected rail.
@@ -1197,7 +1217,7 @@ export function AppShell() {
         persisted.selectedBrowserId === undefined ||
         !persistedBrowsers.includes(persisted.selectedBrowserId))
     ) {
-      nextTab = readDefaultWorkspaceTab();
+      nextTab = readInitialWorkspaceTab();
     }
 
     // Restore the open file tabs from the per-session store, then merge the
@@ -1237,6 +1257,15 @@ export function AppShell() {
       setSubagentsPanelOpen(isMobileViewport());
     }
     setRightRailTab(nextTab);
+    const restoredPanels = persisted.openPanels ?? [];
+    setOpenPanels(
+      isDefaultWorkspaceTab(nextTab) &&
+        !readPinnedWorkspaceTabs().includes(nextTab) &&
+        !nextSelected &&
+        !restoredPanels.includes(nextTab)
+        ? [...restoredPanels, nextTab]
+        : restoredPanels,
+    );
 
     // Restore the rail open-state for this session. A deep link / reload that
     // carries a workspace signal — a file to open (?file=) or a comment to
@@ -1285,17 +1314,37 @@ export function AppShell() {
   // Validate the latest selection, including a tab queued by session restoration.
   useEffect(() => {
     setRightRailTab((tab) => {
+      const fallbackTab =
+        openPanels.filter((panel) => railTabsAvailable[panel]).at(-1) ?? fallbackWorkspaceTab;
       // "sidechat" is a dynamic mode (a side-chat tab is selected), not a
       // gated nav tab — always valid, and never a fallback target.
+      if (tab === null) return fallbackTab;
       if (tab === "sidechat") return tab;
       if (railTabsAvailable[tab]) return tab;
-      return (
-        (["files", "changes", "github", "subagents", "browser"] as const).find(
-          (candidate) => railTabsAvailable[candidate],
-        ) ?? tab
-      );
+      return fallbackTab;
     });
-  }, [railTabsAvailable, rightRailTab]);
+  }, [railTabsAvailable, rightRailTab, openPanels, fallbackWorkspaceTab]);
+
+  // Closing a file must not reveal an unpinned scope that was never opened.
+  useEffect(() => {
+    if (
+      selectedFilePath === null &&
+      selectedTerminalKey === null &&
+      isDefaultWorkspaceTab(rightRailTab) &&
+      !readPinnedWorkspaceTabs().includes(rightRailTab) &&
+      !openPanels.includes(rightRailTab)
+    )
+      setRightRailTab(
+        openPanels.filter((tab) => railTabsAvailable[tab]).at(-1) ?? fallbackWorkspaceTab,
+      );
+  }, [
+    rightRailTab,
+    openPanels,
+    selectedFilePath,
+    selectedTerminalKey,
+    fallbackWorkspaceTab,
+    railTabsAvailable,
+  ]);
 
   // Selecting the current agent removes the panel query without changing sessions.
   useEffect(() => {
@@ -1311,10 +1360,10 @@ export function AppShell() {
     setFilesPanelOpen(false);
     setShellsPanelOpen(false);
     setGithubPanelOpen(false);
-    setRightRailTab("subagents");
+    selectRightRailTab("subagents");
     setRightPanelOpenImmediately(true);
     setSubagentsPanelOpen(isMobileViewport());
-  }, [conversationId, agentsPanelRequested, setRightPanelOpenImmediately]);
+  }, [conversationId, agentsPanelRequested, setRightPanelOpenImmediately, selectRightRailTab]);
 
   // Persist the per-session rail tab + open file tabs whenever they change.
   // Keyed on the state (not conversationId) and targeted at the conversation
@@ -1331,11 +1380,12 @@ export function AppShell() {
     if (!id) return;
     writeSessionWorkspaceState(id, {
       rightRailTab,
+      openPanels,
       openFiles,
       selectedFilePath,
       selectedTerminalKey,
     });
-  }, [rightRailTab, openFiles, selectedFilePath, selectedTerminalKey]);
+  }, [rightRailTab, openPanels, openFiles, selectedFilePath, selectedTerminalKey]);
 
   const handleFilesSortChange = useCallback((s: ChangedSort) => {
     setFilesPanelSort(s);
@@ -1803,8 +1853,8 @@ export function AppShell() {
   // per-tab file to stash and restore; switching tabs just closes any
   // open file to reveal the picked tab's scope list.
   const handleRightRailTabChange = useCallback(
-    (next: RightRailTab) => {
-      setRightRailTab(next);
+    (next: RightRailTab | null) => {
+      selectRightRailTab(next);
       if (selectedFilePath !== null) {
         setSelectedFilePath(null);
         setFileViewerCommentsOpen(false);
@@ -1816,7 +1866,19 @@ export function AppShell() {
         setSelectedTerminalKey(null);
       }
     },
-    [selectedFilePath, selectedTerminalKey, clearFileViewerUrl],
+    [selectedFilePath, selectedTerminalKey, clearFileViewerUrl, selectRightRailTab],
+  );
+  const closeWorkspacePanel = useCallback(
+    (tab: DefaultWorkspaceTab) => {
+      const remaining = openPanels.filter((panel) => panel !== tab);
+      setOpenPanels(remaining);
+      if (rightRailTab === tab) {
+        setRightRailTab(
+          remaining.filter((panel) => railTabsAvailable[panel]).at(-1) ?? fallbackWorkspaceTab,
+        );
+      }
+    },
+    [openPanels, rightRailTab, fallbackWorkspaceTab, railTabsAvailable],
   );
 
   // Auto-open a Browser soft tab on a `navigate` action — agent-issued
@@ -2084,7 +2146,7 @@ export function AppShell() {
     setExecutionLogsKey(null);
     setFilesPanelOpen(false);
     setSubagentsPanelOpen(false);
-    setRightRailTab("github");
+    selectRightRailTab("github");
     setRightPanelOpenAnimated(true);
     if (conversationId) writeSessionWorkspaceState(conversationId, { open: true });
   }, [
@@ -2092,6 +2154,7 @@ export function AppShell() {
     terminalFirst,
     setPanelInitialKey,
     openGithubPanel,
+    selectRightRailTab,
     setRightPanelOpenAnimated,
   ]);
 
@@ -2567,6 +2630,8 @@ export function AppShell() {
                     rightRailTab={rightRailTab}
                     tabListRef={workspaceTabListRef}
                     onRightRailTabChange={handleRightRailTabChange}
+                    openPanels={openPanels}
+                    onClosePanel={closeWorkspacePanel}
                     showFilesPanel={showFilesPanel}
                     showGithubTab={railTabsAvailable.github}
                     showBrowserTab={railTabsAvailable.browser}

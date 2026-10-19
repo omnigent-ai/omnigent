@@ -121,7 +121,7 @@ jobs:
       # the runner's Docker so the smoke step below can run it. Shares the same
       # type=gha cache the publish workflow writes, so warm PRs reuse layers.
       - name: Build server image (amd64, no push)
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           file: deploy/docker/Dockerfile
@@ -169,7 +169,7 @@ jobs:
 
       - name: Build UBI server image
         if: steps.cloudflare.outputs.ubi == 'true'
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: deploy/docker/Dockerfile.ubi
