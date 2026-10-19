@@ -17,18 +17,20 @@
 import { useCallback, useEffect, useRef } from "react";
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useSession } from "@/hooks/useSession";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { authenticatedFetch } from "@/lib/identity";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
 
-/** True when `id` is the focused conversation and its agent loop is live. */
+/** True while this session’s agent loop is live, including visible grid panes. */
 export function useSessionActive(conversationId: string | undefined): boolean {
   const focusedId = useChatStore((s) => s.conversationId);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
-  if (!conversationId || conversationId !== focusedId) return false;
-  return sessionStatus === "running" || sessionStatus === "waiting";
+  const scoped = useConversationEntryState(conversationId ?? null);
+  const status = conversationId === focusedId ? sessionStatus : scoped.sessionStatus;
+  return !!conversationId && (status === "running" || status === "waiting");
 }
 
 /**

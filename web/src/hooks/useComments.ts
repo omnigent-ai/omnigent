@@ -175,7 +175,9 @@ export function useSendCommentsToAgent(sessionId: string, agentId: string) {
       };
     },
     onSuccess: (data) => {
-      void useChatStore.getState().send(data.formatted_message, agentId);
+      void useChatStore
+        .getState()
+        .send(data.formatted_message, agentId, undefined, { pinnedConversationId: sessionId });
       void queryClient.invalidateQueries({
         queryKey: ["comments", sessionId],
       });

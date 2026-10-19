@@ -118,12 +118,15 @@ export function SideChatPane({
   selectionParentId,
   onStart,
   readOnly: restoredReadOnly = false,
+  fullSession = false,
 }: {
   childId: string;
   selectionParentId?: string;
   onStart?: (text: string) => Promise<void>;
   /** A dead, restored Codex side chat: show the transcript without a composer. */
   readOnly?: boolean;
+  /** Display an existing session with its complete history and scoped composer. */
+  fullSession?: boolean;
 }) {
   const pending = isPendingSideChat(childId);
   const starting = useChatStore((s) => s.sideChatComposers[childId]?.starting ?? false);
@@ -166,7 +169,7 @@ export function SideChatPane({
   // GENERIC forks only — they copy the parent transcript. A native Codex child
   // already holds only its own turns (context lives in the native thread), so
   // filtering there would wrongly hide the side chat's first question.
-  const filterHistory = !usesNativeSideChatFork(sessionHarness);
+  const filterHistory = !fullSession && !usesNativeSideChatFork(sessionHarness);
   // Load the persisted boundary when the child changes (mount / rekey); the
   // in-mount ref avoids re-reading storage every render and tracks whether we've
   // actually observed a load run, so we don't capture a boundary on the initial
@@ -246,7 +249,8 @@ export function SideChatPane({
 
   const lastAssistantIndex = liveCandidateAssistantIndex(bubbles);
   const showsWorking =
-    !readOnly && (starting || computeIsTurnActive(sessionStatus, state.status === "streaming"));
+    (!readOnly || fullSession) &&
+    (starting || computeIsTurnActive(sessionStatus, state.status === "streaming"));
   // Native interruption needs an observed turn; local streaming can start before one exists.
   const interruptReady =
     !usesNativeSideChatFork(sessionHarness) || activeResponse?.state === "streaming";
@@ -255,9 +259,10 @@ export function SideChatPane({
   // so a bottom sentinel scrolled on each change is enough.
   const transcriptRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const followTail = useRef(true);
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ block: "end" });
-  }, [bubbles.length, activeResponse]);
+    if (!fullSession || followTail.current) bottomRef.current?.scrollIntoView({ block: "end" });
+  }, [bubbles.length, activeResponse, fullSession]);
 
   const loadFailed = !pending && conversationLoadError !== null && bubbles.length === 0;
   const isEmpty = bubbles.length === 0 && !loadingConversation && !loadFailed && !showsWorking;
@@ -285,11 +290,33 @@ export function SideChatPane({
   return (
     <ConversationScopeContext.Provider value={childId}>
       <div className="side-chat-backdrop flex h-full min-h-0 flex-col">
-        <div ref={transcriptRef} className="flex min-h-0 flex-1 flex-col overflow-y-auto px-3 py-4">
+        <div
+          ref={transcriptRef}
+          className="flex min-h-0 flex-1 flex-col overflow-y-auto px-3 py-4"
+          onScroll={(event) => {
+            const node = event.currentTarget;
+            followTail.current = node.scrollHeight - node.scrollTop - node.clientHeight < 64;
+          }}
+        >
+          {fullSession && state.hasMoreHistory && (
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={state.loadingMoreHistory}
+              onClick={() => {
+                followTail.current = false;
+                void useChatStore.getState().loadMoreHistory(childId);
+              }}
+            >
+              {state.loadingMoreHistory ? "Loading…" : "Load earlier messages"}
+            </Button>
+          )}
           {loadFailed ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
               <TriangleAlertIcon className="size-6 text-muted-foreground" />
-              <p className="text-ui font-medium text-foreground">Couldn’t load this side chat</p>
+              <p className="text-ui font-medium text-foreground">
+                {fullSession ? "Couldn’t load this session" : "Couldn’t load this side chat"}
+              </p>
               <p className="max-w-[36ch] text-sm text-muted-foreground">
                 {conversationLoadError?.message ?? "Please try again."}
               </p>
@@ -303,11 +330,19 @@ export function SideChatPane({
                 Retry
               </Button>
             </div>
+          ) : fullSession && loadingConversation && bubbles.length === 0 ? (
+            <p role="status" className="m-auto text-sm text-muted-foreground">
+              Loading session…
+            </p>
           ) : isEmpty ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
               <MessagesSquareIcon className="size-6 text-muted-foreground" />
-              <p className="text-ui font-medium text-foreground">Side chat</p>
-              <p className="max-w-[36ch] text-sm text-muted-foreground">{EMPTY_STATE_BODY}</p>
+              <p className="text-ui font-medium text-foreground">
+                {fullSession ? "No messages yet" : "Side chat"}
+              </p>
+              {!fullSession && (
+                <p className="max-w-[36ch] text-sm text-muted-foreground">{EMPTY_STATE_BODY}</p>
+              )}
             </div>
           ) : (
             <div className="flex flex-col gap-4">
@@ -336,26 +371,29 @@ export function SideChatPane({
             }}
           />
         )}
-        <div className="shrink-0 px-3 pt-3 pb-5">
-          {readOnly ? (
-            <p className="rounded-md border border-border bg-muted/40 px-3 py-2 text-center text-sm text-muted-foreground">
-              This side chat has ended and can’t be continued.
-            </p>
-          ) : (
-            <SideChatComposer
-              childId={childId}
-              harness={sessionHarness}
-              session={session}
-              agentId={boundAgentId}
-              responseId={activeResponse?.responseId}
-              interruptReady={interruptReady}
-              busy={showsWorking}
-              pending={pending}
-              starting={starting}
-              onStart={onStart ? startSideChat : undefined}
-            />
-          )}
-        </div>
+        {(!fullSession || !readOnly) && (
+          <div className="shrink-0 px-3 pt-3 pb-5">
+            {readOnly ? (
+              <p className="rounded-md border border-border bg-muted/40 px-3 py-2 text-center text-sm text-muted-foreground">
+                This side chat has ended and can’t be continued.
+              </p>
+            ) : (
+              <SideChatComposer
+                fullSession={fullSession}
+                childId={childId}
+                harness={sessionHarness}
+                session={session}
+                agentId={boundAgentId}
+                responseId={activeResponse?.responseId}
+                interruptReady={interruptReady}
+                busy={showsWorking}
+                pending={pending}
+                starting={starting}
+                onStart={onStart ? startSideChat : undefined}
+              />
+            )}
+          </div>
+        )}
       </div>
     </ConversationScopeContext.Provider>
   );
@@ -369,6 +407,7 @@ export function SideChatPane({
  * the text is kept if creation fails so it isn't lost.
  */
 function SideChatComposer({
+  fullSession,
   childId,
   harness,
   session,
@@ -380,6 +419,7 @@ function SideChatComposer({
   starting,
   onStart,
 }: {
+  fullSession: boolean;
   childId: string;
   harness: string | null | undefined;
   session: Session | null | undefined;
@@ -468,7 +508,11 @@ function SideChatComposer({
   // A generic side chat has no host/workspace of its own: it forks the parent and
   // runs in the parent's workspace. Discover skills against the parent (the same
   // catalog the main composer shows); the hostless child always reads unavailable.
-  const parentId = nativeSession ? null : parentIdFromLabels(session?.labels);
+  const parentId = fullSession
+    ? childId
+    : nativeSession
+      ? null
+      : parentIdFromLabels(session?.labels);
   const { session: parentSession, isLoading: parentLoading } = useSession(parentId);
   const {
     skills,
@@ -658,7 +702,7 @@ function SideChatComposer({
           onFocus: () => setInputFocused(true),
           // Menu rows preventDefault on mousedown so selecting one keeps focus.
           onBlur: () => setInputFocused(false),
-          placeholder: "Ask a side question...",
+          placeholder: fullSession ? "Reply to this session..." : "Ask a side question...",
           disabled: !ready,
           "data-testid": "side-chat-input",
           onKeyDown: (event, intent) => {
@@ -734,7 +778,15 @@ function SideChatComposer({
               />
               <ComposerSendButton
                 type="button"
-                label={showInterrupt ? "Interrupt side chat" : "Send side question"}
+                label={
+                  fullSession
+                    ? showInterrupt
+                      ? "Interrupt session"
+                      : "Send message"
+                    : showInterrupt
+                      ? "Interrupt side chat"
+                      : "Send side question"
+                }
                 interrupt={showInterrupt}
                 busy={interrupting}
                 disabled={

@@ -9,6 +9,7 @@ import * as sessionsApi from "@/lib/sessionsApi";
 import type * as ChatStoreModule from "@/store/chatStore";
 import { useChatStore, type ChatState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
+import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { SideChatPane } from "./SideChatPane";
 
 vi.mock("@/store/chatStore", async (importOriginal) => ({
@@ -95,6 +96,31 @@ afterEach(() => {
 });
 
 describe("side-chat working indicator", () => {
+  it("shows the full session history and live state without exposing a read-only composer", () => {
+    const entry = conversationRegistry.acquire(childId);
+    entry.setState({ sessionHarness: "openai-agents", loadingConversation: true });
+    renderPane(<SideChatPane childId={childId} fullSession readOnly />);
+    expect(screen.getByRole("status")).toHaveTextContent("Loading session");
+    act(() =>
+      entry.setState({
+        loadingConversation: false,
+        blocks: itemsToBlocks([
+          {
+            id: "history",
+            response_id: "turn",
+            type: "message",
+            role: "user",
+            status: "completed",
+            content: [{ type: "input_text", text: "Earlier session history" }],
+          },
+        ]),
+      }),
+    );
+    expect(screen.getByText("Earlier session history")).toBeInTheDocument();
+    expect(screen.getByTestId("working-indicator")).toBeInTheDocument();
+    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(localStorage.getItem(`omnigent.sideChatInherited:${childId}`)).toBeNull();
+  });
   it("shows progress before a native child's first transcript bubble arrives", () => {
     renderPane(<SideChatPane childId={childId} />);
 
@@ -548,17 +574,27 @@ describe("unsent composer state survives the pane moving", () => {
     expect(screen.getByTestId("side-chat-input")).toHaveValue("half-typed question");
   });
 
-  it("drops the draft once it is sent", async () => {
-    // Idle, so the trailing button is Send rather than Interrupt.
-    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
-    renderPane(<SideChatPane childId={childId} />);
-    fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: "ask this" } });
-    fireEvent.click(screen.getByTestId("side-chat-send"));
+  it.each([false, true])(
+    "drops only its own draft once sent (full session: %s)",
+    async (fullSession) => {
+      // Idle, so the trailing button is Send rather than Interrupt.
+      conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+      useChatStore
+        .getState()
+        .updateSideChatComposer("other-pane", (current) => ({ ...current, text: "keep me" }));
+      renderPane(<SideChatPane childId={childId} fullSession={fullSession} />);
+      fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: "ask this" } });
+      fireEvent.click(screen.getByTestId("side-chat-send"));
 
-    await waitFor(() => expect(send).toHaveBeenCalledOnce());
-    expect(useChatStore.getState().sideChatComposers[childId]).toBeUndefined();
-    expect(screen.getByTestId("side-chat-input")).toHaveValue("");
-  });
+      await waitFor(() => expect(send).toHaveBeenCalledOnce());
+      expect(useChatStore.getState().sideChatComposers[childId]).toBeUndefined();
+      expect(screen.getByTestId("side-chat-input")).toHaveValue("");
+      expect(send).toHaveBeenCalledWith("ask this", "agent_side", undefined, {
+        pinnedConversationId: childId,
+      });
+      expect(useChatStore.getState().sideChatComposers["other-pane"].text).toBe("keep me");
+    },
+  );
 });
 
 describe("side chat sealed by the server", () => {

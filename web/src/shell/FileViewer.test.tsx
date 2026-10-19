@@ -231,6 +231,7 @@ function LocationDisplay() {
 }
 
 interface RenderProps {
+  syncUrl?: boolean;
   frameless?: boolean;
   mobileOverlay?: boolean;
   position?: { line: number; column?: number };
@@ -259,6 +260,7 @@ interface RenderProps {
  * the current params after state changes.
  */
 function viewerTree({
+  syncUrl,
   frameless,
   mobileOverlay,
   position,
@@ -277,6 +279,7 @@ function viewerTree({
       <MemoryRouter initialEntries={[url]}>
         <LocationDisplay />
         <FileViewer
+          syncUrl={syncUrl}
           frameless={frameless}
           mobileOverlay={mobileOverlay}
           position={position}
@@ -2291,4 +2294,18 @@ describe("large Markdown file routing", () => {
       );
     },
   );
+});
+
+it("keeps grid file viewers independent of shared URL parameters and copies a session link", () => {
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  vi.stubGlobal("navigator", { clipboard: { writeText } });
+  useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  renderViewer({ open: true, syncUrl: false, initialSearch: "diff=1&comment=other-cell" });
+  expect(screen.queryByTestId("diff-viewer")).toBeNull();
+  expect(screen.getByTestId("url-params")).toHaveTextContent("diff=1&comment=other-cell");
+  fireEvent.click(screen.getByRole("button", { name: "Copy link to file" }));
+  const copied = new URL(writeText.mock.calls[0][0]);
+  expect(copied.pathname).toBe("/c/conv_1");
+  expect(copied.searchParams.get("file")).toBe("file1.py");
+  expect(copied.searchParams.has("comment")).toBe(false);
 });

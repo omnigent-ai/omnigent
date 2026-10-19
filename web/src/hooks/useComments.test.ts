@@ -284,7 +284,9 @@ describe("useSendCommentsToAgent", () => {
     result.current.mutate({ comment_ids: ["c1"] });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-    expect(sendMock).toHaveBeenCalledWith("please address these", "ag_1");
+    expect(sendMock).toHaveBeenCalledWith("please address these", "ag_1", undefined, {
+      pinnedConversationId: "conv_1",
+    });
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["comments", "conv_1"] });
   });
 

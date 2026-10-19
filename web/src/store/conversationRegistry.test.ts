@@ -18,12 +18,12 @@ function postedBubble(tempId = "pend_1"): PendingUserMessage {
 }
 
 describe("maxLiveConversations", () => {
-  it("allows 30 when multiplexed and only 3 when serial", () => {
+  it("allows 30 when multiplexed and four grid panes when serial", () => {
     // Not a product number: HTTP/2 multiplexes over one connection, while
     // HTTP/1.1 caps ~6 per origin and an SSE stream holds one for its whole
     // life — 30 there deadlocks every other fetch.
     expect(maxLiveConversations("multiplexed")).toBe(30);
-    expect(maxLiveConversations("serial")).toBe(3);
+    expect(maxLiveConversations("serial")).toBe(4);
   });
 });
 
@@ -127,6 +127,23 @@ describe("ConversationRegistry", () => {
 
   it("returns null when there is nothing to evict", () => {
     expect(registry.evictLruEvictable()).toBeNull();
+  });
+
+  it("keeps all four visible grid panes live until their final owner unmounts", () => {
+    const releases = ["a", "b", "c", "d"].map((id) => {
+      registry.acquire(id);
+      return registry.retain(id);
+    });
+    const releaseSecondOwner = registry.retain("a");
+    registry.acquire("background");
+    expect(registry.evictLruEvictable()).toBe("background");
+    expect(registry.evictLruEvictable()).toBeNull();
+    releases[0]();
+    expect(registry.evictLruEvictable()).toBeNull();
+    releaseSecondOwner();
+    expect(registry.evictLruEvictable()).toBe("a");
+    releases.slice(1).forEach((release) => release());
+    expect(registry.evictLruEvictable()).toBe("b");
   });
 
   it("treats acquire as a recency touch, so a revisited entry is not the victim", () => {

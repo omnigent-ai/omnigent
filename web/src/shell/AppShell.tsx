@@ -1,4 +1,6 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
+import { GridSessionsProvider } from "@/grid/GridSessionsContext";
+import { GridWorkspace } from "@/grid/GridWorkspace";
 import {
   type CSSProperties,
   lazy,
@@ -12,7 +14,7 @@ import {
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Outlet, useLocation, useParams, useRebasePath, useSearchParams } from "@/lib/routing";
-import { CANVAS_CONVERSATION_MIN_WIDTH, CanvasWorkspace } from "@/canvas/CanvasWorkspace";
+import { CANVAS_CONVERSATION_MIN_WIDTH } from "@/canvas/CanvasWorkspace";
 import { isCanvasPathname } from "@/canvas/canvasNavigation";
 import { useCanvasSidebar } from "@/canvas/useCanvasSidebar";
 import { PROJECT_LABEL_KEY, type Conversation, useProjects } from "@/hooks/useConversations";
@@ -218,6 +220,14 @@ function resolveTerminalViewKey(stored: string | null, agentKey: string): string
 }
 
 export function AppShell() {
+  return (
+    <GridSessionsProvider>
+      <AppShellImpl />
+    </GridSessionsProvider>
+  );
+}
+
+function AppShellImpl() {
   // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
   // here so it works on every chat route, regardless of where focus sits.
   useApproveHotkey();
@@ -2486,7 +2496,7 @@ export function AppShell() {
             {/* Content region (everything right of the sidebar): a relative
           flex row holding the chat+workspace group and the push panels
           as siblings. */}
-            <CanvasWorkspace
+            <GridWorkspace
               active={canvasMode}
               conversationId={conversationId}
               minConversationWidth={workspacePanelVisible ? preferredConversationWidth : undefined}
@@ -2756,7 +2766,7 @@ export function AppShell() {
                 </MobilePanelDrawer>
               )}
               <div ref={setMobileFileTarget} className="md:hidden" />
-            </CanvasWorkspace>
+            </GridWorkspace>
           </div>
           {conversationId && (
             <PermissionsModal
