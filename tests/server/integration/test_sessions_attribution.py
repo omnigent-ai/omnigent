@@ -24,7 +24,7 @@ from omnigent.entities import MessageData, NewConversationItem
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
-from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_OWNER
 from omnigent.server.routes._auth_helpers import attribution_user
 from omnigent.server.routes.sessions import _build_new_item
 from omnigent.server.schemas import SessionEventInput
@@ -386,6 +386,53 @@ async def test_bound_runner_can_update_native_approval_mode(
         stored = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
         assert stored is not None
         assert stored.terminal_launch_args == args
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batched", [False, True], ids=["single", "batch"])
+@pytest.mark.parametrize(
+    "poster,expected_status",
+    [("editor", 403), ("manager", 403), ("owner", 202), ("bound-runner", 202)],
+)
+async def test_external_transcript_requires_owner_or_bound_runner(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    poster: str,
+    expected_status: int,
+    batched: bool,
+) -> None:
+    """Editors can no longer publish transcripts; owners and bound runners can."""
+    session_id = _seed_shared_session(
+        db_uri,
+        {
+            "editor@example.com": LEVEL_EDIT,
+            "manager@example.com": LEVEL_MANAGE,
+            "owner@example.com": LEVEL_OWNER,
+        },
+    )
+    email = "editor@example.com" if poster == "bound-runner" else f"{poster}@example.com"
+    headers = {"X-Forwarded-Email": email}
+    if poster == "bound-runner":
+        headers.update(_bind_runner(db_uri, session_id))
+    event = {
+        "type": "external_conversation_item",
+        "data": {
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "typed in the terminal"}],
+            },
+            "response_id": "resp_transcript_authority",
+        },
+    }
+    response = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=[event] if batched else event,
+        headers=headers,
+    )
+    assert response.status_code == expected_status, response.text
+    items = SqlAlchemyConversationStore(db_uri).list_items(session_id)
+    assert len(items.data) == (1 if expected_status == 202 else 0)
 
 
 @pytest.mark.asyncio

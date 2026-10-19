@@ -1014,7 +1014,12 @@ Request body matches `SessionEventInput`:
       - "external_conversation_item"
                                 — internal terminal-observed item
                                   envelope; appends/broadcasts without
-                                  starting a duplicate task
+                                  starting a duplicate task. Requires
+                                  LEVEL_OWNER or the session's bound
+                                  runner credential, also in batches;
+                                  editors and managers receive `403`.
+                                  Integrations that posted as an editor
+                                  must post as the owner or via the runner.
       - "external_output_text_delta"
                                 — internal terminal-observed assistant
                                   text delta; publishes a transient
