@@ -63,10 +63,35 @@ def test_merge_effective_config_scalar_global_no_deep_merge() -> None:
 
 
 def test_merge_effective_config_no_harness_key_unchanged() -> None:
-    assert _merge_effective_config({"model": "x"}, {"server": "y"}) == {
+    assert _merge_effective_config({"model": "x"}, {"profile": "y"}) == {
         "model": "x",
-        "server": "y",
+        "profile": "y",
     }
+
+
+@pytest.mark.parametrize("global_server", [None, "https://configured.example.com"])
+@pytest.mark.parametrize("explicit_workspace", [False, True])
+def test_project_config_cannot_select_the_server(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    global_server: str | None,
+    explicit_workspace: bool,
+) -> None:
+    config_home = tmp_path / "home"
+    project = tmp_path / "project"
+    config_home.mkdir()
+    (project / ".omnigent").mkdir(parents=True)
+    (config_home / "config.yaml").write_text(
+        f"server: {global_server}\n" if global_server else "{}\n"
+    )
+    (project / ".omnigent" / "config.yaml").write_text(
+        "server: https://project.example.com\nprofile: project-profile\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    monkeypatch.chdir(project)
+    cfg = load_effective_config(workspace=project if explicit_workspace else None)
+    assert cfg.get("server") == global_server
+    assert cfg["profile"] == "project-profile"
 
 
 def test_global_config_path_respects_config_home(

@@ -81,13 +81,16 @@ def _merge_effective_config(
     replace the global one entirely, dropping the user's global
     per-harness overrides. So the ``harness`` key is merged one level deep
     (per-harness sub-keys, local winning per-field) while every other key
-    stays a shallow replace (local wins outright). See
+    stays a shallow replace (local wins outright), except ``server``,
+    which is user-owned. See
     :mod:`omnigent.harness_startup_config` for the ``harness:`` shape.
 
     :param global_cfg: User-level config (``~/.omnigent/config.yaml``).
     :param local_cfg: Project-level config (``.omnigent/config.yaml``).
     :returns: The merged effective config dict.
     """
+    # The authentication destination must not be selected by workspace content.
+    local_cfg = {key: value for key, value in local_cfg.items() if key != "server"}
     merged: _Config = {**global_cfg, **local_cfg}
     g_harness = global_cfg.get("harness")
     l_harness = local_cfg.get("harness")
@@ -227,8 +230,8 @@ def load_effective_config(
     The ``harness`` mapping is deep-merged (per-harness sub-keys, local
     winning per-field) so a project's per-harness overrides augment —
     rather than replace — the user's global ones. Every other key is a
-    shallow replace. When supplied, *workspace* selects the project config
-    directory instead of the process cwd.
+    shallow replace, except the user-level ``server``. When supplied,
+    *workspace* selects the project config directory instead of the process cwd.
     """
     local_path = Path(workspace) / _LOCAL_CONFIG_RELPATH if workspace is not None else None
     return resolve_effective_config(

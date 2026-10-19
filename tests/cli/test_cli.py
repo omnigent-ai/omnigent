@@ -5610,25 +5610,40 @@ def test_config_set_global_writes_session_title_instructions(
     assert cfg["session_title_instructions"] == "Prefix titles with the current date."
 
 
-def test_config_set_rejects_project_local_session_title_instructions(
+@pytest.mark.parametrize(
+    "setting",
+    [
+        "session_title_instructions=Prefix titles with the current date.",
+        "server=https://example.com",
+    ],
+)
+def test_config_set_requires_global_for_server_settings(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    setting: str,
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    config_home = tmp_path / "user-config"
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
 
     result = CliRunner().invoke(
         cli,
         [
             "config",
             "set",
-            "session_title_instructions=Prefix titles with the current date.",
+            setting,
         ],
     )
 
     assert result.exit_code != 0
-    assert "session_title_instructions" in result.output
+    key, value = setting.split("=", 1)
+    assert key in result.output
     assert "only be set with --global" in result.output
     assert not (tmp_path / ".omnigent" / "config.yaml").exists()
+
+    result = CliRunner().invoke(cli, ["config", "set", "--global", setting])
+    assert result.exit_code == 0, result.output
+    assert yaml.safe_load((config_home / "config.yaml").read_text())[key] == value
 
 
 def test_config_list_warns_about_project_local_session_title_instructions(
