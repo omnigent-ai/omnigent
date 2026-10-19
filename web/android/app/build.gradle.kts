@@ -38,10 +38,23 @@ fun buildProperty(key: String): String? =
 
 val appVersionCode = buildProperty("versionCode")?.toIntOrNull() ?: 9
 val appVersionName = buildProperty("versionName") ?: "0.1.3"
+// The public first-party Databricks client the desktop and iOS apps use too.
+val databricksOAuthClientId = buildProperty("databricksOAuthClientId") ?: "omnigent"
+val databricksOAuthRedirectUrl =
+    buildProperty("databricksOAuthRedirectUrl") ?: "https://login.databricks.com/mobile-redirect"
+val databricksOAuthRedirectUri = URI(databricksOAuthRedirectUrl)
+require(
+    databricksOAuthRedirectUri.scheme == "https" &&
+        !databricksOAuthRedirectUri.host.isNullOrBlank() &&
+        !databricksOAuthRedirectUri.path.isNullOrBlank(),
+) { "databricksOAuthRedirectUrl must be an HTTPS URL with a host and path" }
+
+fun quotedBuildConfig(value: String): String =
+    "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
 
 android {
     namespace = "ai.omnigent.android"
-    compileSdk = 36
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "ai.omnigent.android"
@@ -49,6 +62,22 @@ android {
         targetSdk = 36
         versionCode = appVersionCode
         versionName = appVersionName
+        buildConfigField(
+            "String",
+            "DATABRICKS_OAUTH_CLIENT_ID",
+            quotedBuildConfig(databricksOAuthClientId),
+        )
+        buildConfigField(
+            "String",
+            "DATABRICKS_OAUTH_REDIRECT_URL",
+            quotedBuildConfig(databricksOAuthRedirectUrl),
+        )
+        manifestPlaceholders["databricksOAuthRedirectScheme"] =
+            databricksOAuthRedirectUri.scheme
+        manifestPlaceholders["databricksOAuthRedirectHost"] =
+            databricksOAuthRedirectUri.host
+        manifestPlaceholders["databricksOAuthRedirectPath"] =
+            databricksOAuthRedirectUri.path
 
         // Instrumented (androidTest) runner — required for UI Automator / Espresso
         // screenshot tests. Mirrors the androidx.test stable line pinned below.
@@ -93,6 +122,21 @@ android {
         unitTests {
             // Robolectric needs the module's resources (channel name, plurals).
             isIncludeAndroidResources = true
+            // Robolectric's Java 17+ setup requires access to internal JDK APIs.
+            // https://robolectric.org/getting-started/#running-with-java-17-and-higher
+            all {
+                it.jvmArgs(
+                    "--add-opens=java.base/java.lang=ALL-UNNAMED",
+                    "--add-opens=java.base/java.util=ALL-UNNAMED",
+                    "--add-opens=java.base/java.io=ALL-UNNAMED",
+                    "--add-opens=java.base/java.net=ALL-UNNAMED",
+                    "--add-opens=java.base/java.security=ALL-UNNAMED",
+                    "--add-opens=java.base/java.text=ALL-UNNAMED",
+                    "--add-opens=java.base/jdk.internal.access=ALL-UNNAMED",
+                    "--add-opens=java.desktop/java.awt.font=ALL-UNNAMED",
+                    "--add-opens=jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED",
+                )
+            }
         }
     }
 }
@@ -122,6 +166,7 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity)
     implementation(libs.androidx.appcompat)
+    implementation(libs.androidx.browser)
     implementation(libs.androidx.webkit)
     testImplementation(libs.junit)
     testImplementation(libs.robolectric)

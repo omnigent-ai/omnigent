@@ -192,7 +192,9 @@ def test_scheduled_task_rows_show_schedule_summary_and_relative_next_run(
     agent_id = _builtin_agent_id(live_server, "hello_world")
 
     # Daily at 9:00 AM → "Every day at 9:00 AM".
-    _create_task(live_server, agent_id, "Daily digest", "FREQ=DAILY;BYHOUR=9;BYMINUTE=0")
+    daily_id = _create_task(
+        live_server, agent_id, "Daily digest", "FREQ=DAILY;BYHOUR=9;BYMINUTE=0"
+    )
     # Mon–Fri at 8:00 AM → "Weekdays at 8:00 AM".
     _create_task(
         live_server,
@@ -203,6 +205,12 @@ def test_scheduled_task_rows_show_schedule_summary_and_relative_next_run(
     # Hourly at :30 → "Hourly at :30" (the interval-1 non-zero-BYMINUTE fix).
     _create_task(live_server, agent_id, "Half-past sweep", "FREQ=HOURLY;BYMINUTE=30")
 
+    created = httpx.get(f"{live_server}/v1/scheduled-tasks/{daily_id}", timeout=10.0)
+    created.raise_for_status()
+    next_run_at = created.json()["next_run_at"]
+    assert next_run_at, "seeded active task should have an armed next_run_at"
+    # Keep the label away from the valid "soon" state near the scheduled instant.
+    page.clock.install(time=_parse_iso(next_run_at) - timedelta(hours=1))
     page.goto(f"{live_server}/tasks")
 
     # All three rows render (the list query resolves against the seeded tasks).
@@ -225,11 +233,7 @@ def test_scheduled_task_rows_show_schedule_summary_and_relative_next_run(
     hourly = _row_by_name(page, "Half-past sweep")
     expect(hourly.get_by_test_id("task-schedule-line")).to_contain_text("Hourly at :30")
 
-    # The next-run label IS shown now — but as a DELTA from the server's
-    # next_run_at ("Next run in Xh/Xd"), not a client-recomputed instant. An
-    # armed daily task is always <24h out, so its label is "Next run in …".
-    # (The forbidden thing was a client recompute of WHICH instant is next; a
-    # delta off the server value is fine.)
+    # The label is relative to the server's timestamp and the controlled clock.
     expect(daily.get_by_test_id("task-next-run")).to_contain_text("Next run in", timeout=30_000)
 
 

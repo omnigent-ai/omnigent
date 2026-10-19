@@ -149,6 +149,10 @@ def test_display_round_trips_through_login_resolution(monkeypatch) -> None:
 
     assert resolved.api_base == _WORKSPACE_API
     assert resolved.org_id == "123"
+    # Every CLI resolution also attributes the CLI's own debug-log rows.
+    from omnigent import debug_logging
+
+    assert debug_logging._process_identity()[0] == "123"
 
 
 @pytest.mark.parametrize(

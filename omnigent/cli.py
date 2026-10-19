@@ -58,10 +58,10 @@ from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
 from omnigent.cli_sandbox import sandbox as _sandbox_group
 from omnigent.cli_speculate import speculate_command as _speculate_command
 from omnigent.config import (
-    _merge_effective_config,
     global_config_path,
     load_global_config,
     load_local_config,
+    resolve_effective_config,
 )
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.daemon_lifecycle import (
@@ -111,8 +111,6 @@ from omnigent.util.server_url import ServerUrl
 from omnigent.util.server_url import org_id_from_url as _org_id_from_url
 
 if TYPE_CHECKING:
-    import socket
-
     import httpx
 
     from omnigent.install_ledger import InstallLedger
@@ -675,22 +673,6 @@ _DAEMON_RECONNECT_GRACE_S = 5.0
 # bringing its tunnel up. Avoids racing/thrashing sibling invocations.
 _DAEMON_REUSE_MIN_AGE_S = 6.0
 
-# How long uvicorn waits for active connections (WebSocket, SSE) after
-# SIGTERM before force-closing them.  SSE streams signal themselves via
-# session_stream.shutdown_all() in _ShutdownSignalingServer.shutdown(),
-# so the main remaining consumers of this window are WebSocket tunnels
-# that need a moment to drain.  5 s is enough for a clean tunnel teardown
-# while keeping Ctrl-C feeling instant.
-# Overridable via OMNIGENT_SERVER_SHUTDOWN_TIMEOUT_S for deployments that
-# need a longer drain window (e.g. large file uploads).
-_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S_DEFAULT = 5
-_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S = int(
-    os.environ.get(
-        "OMNIGENT_SERVER_SHUTDOWN_TIMEOUT_S",
-        str(_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S_DEFAULT),
-    )
-)
-
 _LOCAL_DAEMON_ENV_ALLOWLIST: frozenset[str] = frozenset(
     {
         "ANTHROPIC_API_KEY",
@@ -714,6 +696,7 @@ _LOCAL_DAEMON_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "COHERE_API_KEY",
         "DEEPSEEK_API_KEY",
         "GEMINI_API_KEY",
+        "GOOGLE_GEMINI_BASE_URL",
         "GOOGLE_API_KEY",
         "GROQ_API_KEY",
         "MISTRAL_API_KEY",
@@ -847,13 +830,13 @@ def _load_effective_config() -> dict[str, Any]:  # type: ignore[explicit-any]
     always wins so per-repo settings override user defaults.
 
     The ``harness`` mapping is deep-merged (per-harness sub-keys, local
-    winning per-field) via :func:`omnigent.config._merge_effective_config`
+    winning per-field) via :func:`omnigent.config.resolve_effective_config`
     so a project's per-harness overrides augment — rather than replace —
     the user's global ones. Every other key is a shallow replace.
 
     :returns: Merged config dict.
     """
-    return _merge_effective_config(_load_global_config(), _load_local_config())
+    return resolve_effective_config(_load_global_config(), _load_local_config()).config
 
 
 def _peek_default_agent_harness(target: str) -> str | None:
@@ -4732,39 +4715,10 @@ def server(
         # sig mismatch.
         register_local_server(port)
 
-    class _ShutdownSignalingServer(uvicorn.server.Server):
-        """uvicorn.Server that signals active SSE subscribers before the
-        graceful-shutdown wait starts.
-
-        uvicorn calls ``Server.shutdown()`` in this order:
-          1. close listening sockets / call connection.shutdown()
-          2. ``asyncio.wait_for(_wait_tasks_to_complete(), timeout=…)``
-          3. force-cancel remaining tasks on timeout
-          4. run the ASGI lifespan shutdown handler
-
-        The ASGI lifespan ``finally`` block runs at step 4 — too late. SSE
-        generators waiting on a heartbeat tick are already force-cancelled by
-        step 3, which produces spurious ``CancelledError`` tracebacks.
-        Overriding here lets us drain SSE streams before step 2 so they exit
-        cleanly within the graceful window.
-        """
-
-        async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
-            import asyncio as _asyncio
-
-            from omnigent.runtime import session_stream as _session_stream
-            from omnigent.server import shutdown_state as _shutdown_state
-
-            # The runner tunnels close next; their disconnect handlers must
-            # read that loss as ours, not as the runners dying.
-            _shutdown_state.mark_server_shutting_down()
-            _session_stream.shutdown_all()
-            # Yield so streams consume _DONE and exit before transports close.
-            # No [DONE] reaches browsers: they must reconnect after restart.
-            # Without this pause the generators write to an already-closing
-            # transport, leaving connections open past the graceful window.
-            await _asyncio.sleep(0)
-            await super().shutdown(sockets)
+    from omnigent.server.graceful_shutdown import (
+        SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+        ShutdownSignalingServer,
+    )
 
     _config = uvicorn.Config(
         app,
@@ -4790,10 +4744,10 @@ def server(
         # change. The tunnels are the sockets that actually need the looser
         # budget (issue #1116).
         **uvicorn_tunnel_kwargs(),
-        timeout_graceful_shutdown=_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+        timeout_graceful_shutdown=SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
     )
     try:
-        _ShutdownSignalingServer(_config).run()
+        ShutdownSignalingServer(_config).run()
     except KeyboardInterrupt:
         # uvicorn.run() swallows KeyboardInterrupt; match that behaviour so
         # a Ctrl-C exit doesn't print Click's "Aborted!" or exit non-zero.
@@ -12711,6 +12665,8 @@ def _resolve_server_url(server: str) -> ServerUrl:
     org_id = _org_id_from_url(server)
 
     def _resolved(api_base: str) -> ServerUrl:
+        from omnigent.debug_logging import publish_origin_identity
+
         if org_id is not None:
             resolved = ServerUrl(api_base=api_base, org_id=org_id)
             if resolved.is_workspace_hosted:
@@ -12723,8 +12679,12 @@ def _resolve_server_url(server: str) -> ServerUrl:
                         "Could not persist the workspace routing selector. "
                         "Check that the Omnigent data directory is writable, then retry."
                     ) from exc
-            return resolved
-        return ServerUrl.from_api_base(api_base)
+        else:
+            resolved = ServerUrl.from_api_base(api_base)
+        # Every remote CLI command resolves its server here, so this attributes
+        # the CLI's own debug-log rows.
+        publish_origin_identity(resolved.api_base)
+        return resolved
 
     # A URL copied from the browser while a conversation is open carries the
     # SPA's ``/c/<id>`` route. The SPA catch-all answers any GET under it with

@@ -118,7 +118,9 @@ describe("ServerSelectorV2", () => {
       />,
     );
     fireEvent.pointerDown(screen.getByRole("button", { name: /choose team url/i }), { button: 0 });
-    fireEvent.click(screen.getByRole("menuitem", { name: "old.example.com" }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "https://old.example.com/" }));
+    expect(onConnect).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Join your team (old.example.com)" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("rejected");
     unmount();
 
@@ -276,6 +278,7 @@ describe("ServerSelectorV2", () => {
       target: { value: "https://typed.example.com" },
     });
     fireEvent.keyDown(screen.getByLabelText("Server URL"), { key: "Enter" });
+    fireEvent.click(screen.getByRole("button", { name: "Join your team (typed.example.com)" }));
     expect(
       await screen.findByRole("heading", { name: /where do you work today/i }),
     ).toBeInTheDocument();
@@ -327,6 +330,7 @@ describe("ServerSelectorV2", () => {
       target: { value: "https://typed.example.com" },
     });
     fireEvent.keyDown(screen.getByLabelText("Server URL"), { key: "Enter" });
+    fireEvent.click(screen.getByRole("button", { name: "Join your team (typed.example.com)" }));
     const laptop = await screen.findByRole("radio", { name: /my laptop/i });
     resolveFirst({ remote: true });
     await waitFor(() => expect(getRunnerOptions).toHaveBeenCalledTimes(2));
@@ -599,7 +603,7 @@ describe("ServerSelectorV2", () => {
     expect(open).toHaveAttribute("aria-busy", "true");
   });
 
-  it("a second join from the MDM dropdown can't start or hide the first's progress", async () => {
+  it("a second join from the MDM landing can't start or hide the first's progress", async () => {
     const { onConnect, finish } = pendingSignIn();
     render(
       <ServerSelectorV2
@@ -615,11 +619,15 @@ describe("ServerSelectorV2", () => {
     openPresetDropdown();
     const input = await screen.findByRole("textbox", { name: "Server URL" });
     fireEvent.change(input, { target: { value: "https://other.example.com" } });
-    // Both Enters land before the dropdown's close renders.
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onConnect).not.toHaveBeenCalled();
+    const join = screen.getByRole("button", { name: "Join your team (other.example.com)" });
     act(() => {
-      fireEvent.keyDown(input, { key: "Enter" });
-      fireEvent.keyDown(input, { key: "Enter" });
+      fireEvent.click(join);
+      fireEvent.click(join);
     });
+    expect(join).toBeDisabled();
+    expect(screen.getByRole("button", { name: /choose team url/i })).toBeDisabled();
     expect(onConnect).toHaveBeenCalledTimes(1);
     await waitFor(() =>
       expect(screen.queryByRole("textbox", { name: "Server URL" })).not.toBeInTheDocument(),

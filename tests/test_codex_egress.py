@@ -61,6 +61,38 @@ def test_detect_certificate_failure_ignores_other_output(line: str) -> None:
     assert detect_certificate_failure(line) is None
 
 
+_MCP_EXPIRED_LINE = (
+    "2026-10-16T12:00:00.000000Z  WARN codex_mcp::rmcp_client: failed to connect MCP server "
+    "`docs`: error sending request: invalid peer certificate: Expired"
+)
+_MODEL_EXPIRED_LINE = (
+    "2026-10-16T12:00:00.000000Z ERROR codex_core::client: error sending request for url "
+    "(https://model.example/v1/responses): invalid peer certificate: Expired"
+)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        _MCP_EXPIRED_LINE,
+        "2026-10-16T12:00:00.000000Z ERROR session_init{thread_id=thread_1 cwd=/w}: "
+        "rmcp::transport::streamable_http_client: the server certificate has expired",
+        "\x1b[33m WARN\x1b[0m \x1b[2mcodex_mcp_client::client\x1b[0m\x1b[2m:\x1b[0m "
+        "certificate verify failed: unable to get local issuer certificate",
+    ],
+)
+def test_detect_certificate_failure_ignores_mcp_client_lines(line: str) -> None:
+    """An MCP server's certificate failure says nothing about the model endpoint."""
+    assert detect_certificate_failure(line) is None
+
+
+def test_detect_certificate_failure_keeps_model_client_tracing_lines() -> None:
+    failure = detect_certificate_failure(_MODEL_EXPIRED_LINE)
+    assert failure is not None
+    assert failure.expired is True
+    assert "codex_core::client" in failure.evidence
+
+
 def test_detect_certificate_failure_redacts_and_bounds_evidence() -> None:
     line = "certificate expired for https://user:secret@proxy.example/v1 " + "x" * 1000
     failure = detect_certificate_failure(line)

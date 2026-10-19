@@ -30,7 +30,10 @@ from starlette.websockets import WebSocketState
 from omnigent.debug_logging import debug_event
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
-from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnosticAttrs
+from omnigent.runner.transports.ws_tunnel.diagnostics import (
+    TunnelDiagnosticAttrs,
+    silence_source,
+)
 from omnigent.runner.transports.ws_tunnel.frames import (
     EVENT_INGEST_CAPABILITY,
     EventAckFrame,
@@ -58,6 +61,8 @@ PING_INTERVAL_S = 30.0
 PING_MISS_THRESHOLD = 3
 RUNNER_ID_MISMATCH_CLOSE_CODE = 4004
 _RUNNER_RECOVERY_SLOW_SEC = 30.0
+# WebSocket close codes a runner sends on purpose: 1000 normal, 1001 going away.
+_CLEAN_CLOSE_CODES = frozenset({1000, 1001})
 
 # Lifetime of a managed runner's minted owner bearer (POST
 # /v1/runners/{id}/token). Short by design: the runner re-mints on demand
@@ -490,7 +495,9 @@ def create_runner_tunnel_router(
                     round(now - session.connected_at, 3) if session is not None else None
                 ),
                 "last_frame_age_s": (
-                    round(now - session.last_frame_at, 3) if session is not None else None
+                    round(time.monotonic() - session.last_frame_monotonic, 3)
+                    if session is not None
+                    else None
                 ),
             }
             if session is not None:
@@ -661,7 +668,12 @@ def create_runner_tunnel_router(
 
         except WebSocketDisconnect as exc:
             shutdown_state.note_tunnel_close_code(getattr(exc, "code", None))
-            _logger.warning(
+            if session is not None:
+                session.peer_close_reason = getattr(exc, "reason", None) or None
+            close_code = getattr(exc, "code", None)
+            # A normal or going-away close (idle shutdown, host restart) is expected.
+            _logger.log(
+                logging.INFO if close_code in _CLEAN_CLOSE_CODES else logging.WARNING,
                 "Runner %s websocket disconnected (code=%s, reason=%r)",
                 runner_id,
                 getattr(exc, "code", None),
@@ -685,7 +697,7 @@ def create_runner_tunnel_router(
                 task.cancel()
             await asyncio.gather(*owned, return_exceptions=True)
             if session is not None:
-                registry.deregister(runner_id, session)
+                registry.deregister(runner_id, session, retire=False)
                 if on_runner_disconnect is not None:
                     try:
                         await on_runner_disconnect(runner_id, session)
@@ -752,9 +764,9 @@ async def _sender_loop(ws: WebSocket, session: RunnerSession) -> None:
         try:
             await session.diagnostics.send(ws.send_text, frame.data, app_ping_ts=frame.app_ping_ts)
         except RuntimeError:
-            if ws.application_state is WebSocketState.DISCONNECTED:
-                # The ping loop or registry retirement closed the socket
-                # concurrently; the disconnect is already logged there.
+            if WebSocketState.DISCONNECTED in (ws.application_state, ws.client_state):
+                # A local close (ping timeout, retire) or the peer's close won the
+                # race; the receive helper or closer reports the disconnect.
                 _logger.debug("Runner %s send raced a concurrent close", session.runner_id)
                 return
             raise
@@ -984,9 +996,15 @@ async def _ping_loop(
         if elapsed is None:
             return
         if elapsed > PING_INTERVAL_S * PING_MISS_THRESHOLD:
-            # Runner tunnel went silent past the liveness window: the runner or
-            # its network died, blocking sessions on it until it reconnects.
-            _logger.warning(
+            # Runner tunnel went silent past the liveness window. A sleeping or
+            # offline machine is the usual peer cause and reconnects on its own;
+            # whether a turn was lost is logged per session by the disconnect
+            # decision. A stall of this server's own loop is a server fault.
+            diagnostics = session.diagnostics.snapshot()
+            source = silence_source(elapsed, diagnostics)
+            local_stall = source == "local_event_loop"
+            _logger.log(
+                logging.WARNING if local_stall else logging.INFO,
                 "Runner %s missed %d ping intervals (%.0fs since last frame); declaring dead",
                 runner_id,
                 PING_MISS_THRESHOLD,
@@ -997,10 +1015,13 @@ async def _ping_loop(
                     connection_id=session.hello.connection_id,
                     connection_age_s=round(time.time() - session.connected_at, 3),
                     silent_s=round(elapsed, 3),
-                    error_category=ErrorCategory.RUNNER.value,
-                    error_impact=ErrorImpact.BLOCKING.value,
+                    silence_source=source,
+                    error_category=(
+                        ErrorCategory.SERVER.value if local_stall else ErrorCategory.RUNNER.value
+                    ),
+                    error_impact=ErrorImpact.TRANSIENT.value,
                     error_phase=ErrorPhase.UNKNOWN.value,
-                    **session.diagnostics.snapshot(),
+                    **diagnostics,
                 ),
             )
             registry.record_close(session, code=4003, reason="ping timeout")

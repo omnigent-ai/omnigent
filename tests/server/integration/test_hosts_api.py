@@ -32,11 +32,15 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests.budgets import budget
 from tests.server.helpers import websocket_scope as _websocket_scope
 
 pytestmark = pytest.mark.asyncio
 
 _HOST_ID = "33296f9b15e02671c34e013dd711407e"
+# Binding persistence can exceed two seconds under parallel CI load.
+# A receive timeout cancels the ASGI app and disconnects the fake host.
+_LAUNCH_FRAME_TIMEOUT_S = 10.0
 
 
 def _make_hello(
@@ -141,7 +145,7 @@ async def _connect_host(
     path = f"/v1/hosts/{host_id}/tunnel"
     comm = ApplicationCommunicator(app, _websocket_scope(path))
     await comm.send_input({"type": "websocket.connect"})
-    accepted = await comm.receive_output(timeout=1.0)
+    accepted = await comm.receive_output(timeout=budget(1.0))
     assert accepted["type"] == "websocket.accept"
 
     await comm.send_input(
@@ -565,7 +569,7 @@ async def test_launch_runner_happy_path(
         from omnigent.host.frames import HostLaunchRunnerFrame, decode_host_frame
 
         for _ in range(20):
-            output = await comm.receive_output(timeout=2.0)
+            output = await comm.receive_output(timeout=budget(_LAUNCH_FRAME_TIMEOUT_S))
             if output["type"] != "websocket.send":
                 continue
             frame = decode_host_frame(output["text"])
@@ -689,7 +693,7 @@ async def test_launch_runner_categorical_failure_returns_specific_status(
         from omnigent.host.frames import HostLaunchRunnerFrame, decode_host_frame
 
         for _ in range(20):
-            output = await comm.receive_output(timeout=2.0)
+            output = await comm.receive_output(timeout=budget(_LAUNCH_FRAME_TIMEOUT_S))
             if output["type"] != "websocket.send":
                 continue
             frame = decode_host_frame(output["text"])
@@ -1145,7 +1149,7 @@ async def test_tunnel_rejects_unauthenticated_when_auth_enabled(
 
     # Unauthenticated peers are refused BEFORE the WS upgrade, so the
     # first (and only) output is the close — no accept, no frame exchange.
-    closed = await comm.receive_output(timeout=1.0)
+    closed = await comm.receive_output(timeout=budget(1.0))
     assert closed["type"] == "websocket.close", (
         f"expected the tunnel to close on missing identity before accept, got {closed!r}"
     )
@@ -1173,7 +1177,7 @@ async def test_tunnel_accepts_authenticated_owner(
     scope["headers"] = [(b"x-test-user", b"alice@test.com")]
     comm = ApplicationCommunicator(app, scope)
     await comm.send_input({"type": "websocket.connect"})
-    accepted = await comm.receive_output(timeout=1.0)
+    accepted = await comm.receive_output(timeout=budget(1.0))
     assert accepted["type"] == "websocket.accept"
     await comm.send_input(
         {"type": "websocket.receive", "text": _make_hello()},
@@ -1363,11 +1367,11 @@ async def test_failed_connect_does_not_offline_another_users_host(
     await comm.send_input({"type": "websocket.connect"})
     # Refused before accept(); no denial extension in this scope, so the
     # server falls back to a pre-accept close (code 4009).
-    closed = await comm.receive_output(timeout=1.0)
+    closed = await comm.receive_output(timeout=budget(1.0))
     assert closed["type"] == "websocket.close"
     assert closed["code"] == 4009
     with contextlib.suppress(Exception):
-        await comm.wait(timeout=2.0)
+        await comm.wait(timeout=budget(2.0))
 
     after = host_store.get_host("be2a05c6f9530d33276f7c4b34bc39ad")
     assert after is not None

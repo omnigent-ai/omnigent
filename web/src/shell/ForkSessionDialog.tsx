@@ -78,6 +78,7 @@ import { agentRootName, forkTargetCarriesHistory, harnessFamily } from "@/lib/fo
 import { checkHostDirectory, hostDirectoryMissing } from "@/hooks/useHostFilesystem";
 import { getCliServerUrl } from "@/lib/host";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { randomUUID } from "@/lib/randomUUID";
 import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferences";
 import { resolveWorkspacePath, useResolvedHostHome } from "./WorkspacePicker";
@@ -1319,6 +1320,11 @@ function SupportedForkSessionForm({
               workspace: multiRepoSource
                 ? undefined
                 : (composeSandboxWorkspace(sandboxRepoUrl, sandboxRepoBranch) ?? null),
+              // The new sandbox host's id; keys the fork and its requests
+              // until the host binds (see NewChatDialog's managed create).
+              ...(info !== "loading" && info.request_managed_sandbox_host_id
+                ? { hostId: randomUUID().replace(/-/g, "") }
+                : {}),
             }
           : undefined,
       });

@@ -90,8 +90,9 @@ class RunnerSession:
         directly.
     :param connected_at: Unix epoch float of connect time.
     :param last_frame_at: Unix epoch float of the most recent frame
-        from this runner. Updated on every receive — feeds the
-        watchdog inactivity check.
+        from this runner, retained for diagnostics.
+    :param last_frame_monotonic: Monotonic timestamp of the last frame,
+        used for watchdog inactivity checks across wall-clock corrections.
     :param owner: Authenticated user who established the tunnel,
         e.g. ``"alice@example.com"``. ``None`` when auth is
         disabled (single-user mode). Used to enforce runner
@@ -104,6 +105,8 @@ class RunnerSession:
     :param close_code: First server-requested close code, recorded under
         the registry lock before helpers can observe retirement.
     :param close_reason: Reason accompanying ``close_code``.
+    :param peer_close_reason: Reason in the runner's own close frame, e.g.
+        ``RUNNER_IDLE_SHUTDOWN_CLOSE_REASON``; ``None`` until the runner closes.
     :param diagnostics: Timing observations owned by this connection's socket loop.
     """
 
@@ -115,6 +118,7 @@ class RunnerSession:
     connected_at: float
     last_frame_at: float
     owner: str | None
+    last_frame_monotonic: float = field(default_factory=time.monotonic, kw_only=True)
     generation: int = field(default_factory=lambda: next(_connection_generations))
     in_flight: dict[str, RequestState] = field(default_factory=dict)
     # Per-channel state for tunneled WebSocket attaches.  Keys are
@@ -123,6 +127,7 @@ class RunnerSession:
     ws_channels: dict[str, WSChannelState] = field(default_factory=dict)
     close_code: int | None = None
     close_reason: str | None = None
+    peer_close_reason: str | None = None
     diagnostics: TunnelDiagnostics = field(default_factory=TunnelDiagnostics)
 
 
@@ -226,6 +231,7 @@ class TunnelRegistry:
         *,
         max_connect_waiters_per_runner: int = 1024,
         max_connect_waiters_total: int = 8192,
+        on_retire: Callable[[str], None] | None = None,
     ) -> None:
         """
         Create an empty runner tunnel registry.
@@ -240,6 +246,9 @@ class TunnelRegistry:
             ``wait_for_runner`` futures allowed across all runner ids,
             e.g. ``8192``. Additional callers use the same bounded
             overflow path as the per-runner cap.
+        :param on_retire: Called with the runner id whenever this server
+            retires a live tunnel on purpose (:meth:`deregister` with
+            ``retire=True``), before the close reaches the runner.
         :raises ValueError: If either waiter limit is less than one.
         """
         if max_connect_waiters_per_runner < 1:
@@ -251,6 +260,7 @@ class TunnelRegistry:
         self._max_connect_waiters_per_runner = max_connect_waiters_per_runner
         self._max_connect_waiters_total = max_connect_waiters_total
         self._connect_waiter_total = 0
+        self._on_retire = on_retire
         self._lock = threading.RLock()
 
     # ── Session lifecycle ────────────────────────────────
@@ -291,6 +301,7 @@ class TunnelRegistry:
             connected_at=now,
             last_frame_at=now,
             owner=owner,
+            last_frame_monotonic=time.monotonic(),
         )
         with self._lock:
             old = self._sessions.pop(runner_id, None)
@@ -317,13 +328,17 @@ class TunnelRegistry:
         self,
         runner_id: str,
         session: RunnerSession | None = None,
+        *,
+        retire: bool = True,
     ) -> RunnerSession | None:
         """Remove a session and abort all its in-flight requests.
 
         Called by the WS route handler when the tunnel closes for
-        any reason (clean shutdown, network error, etc.). The abort
-        ensures awaiters of in-flight requests don't hang — they
-        get a ConnectionError and propagate it up.
+        any reason (clean shutdown, network error, etc.), and by
+        server-side callers that retire a live tunnel so the runner
+        reconnects, usually to another replica. The abort ensures
+        awaiters of in-flight requests don't hang — they get a
+        ConnectionError and propagate it up.
 
         :param runner_id: Runner id to remove, e.g.
             ``"runner_0123456789abcdef"``.
@@ -331,6 +346,10 @@ class TunnelRegistry:
             deregistration only removes the registry entry if the
             current entry is this exact session object. This prevents
             stale route handlers from deleting a newer tunnel.
+        :param retire: ``True`` when this server retires a live tunnel on
+            purpose and expects the runner to reconnect, which the
+            ``on_retire`` callback reports. The tunnel route passes
+            ``False`` for its own cleanup after the socket closed.
         :returns: The removed session, or ``None`` when the runner is
             already offline or the guard did not match.
         """
@@ -358,6 +377,10 @@ class TunnelRegistry:
                 removed,
                 ConnectionError("tunnel closed before request completed"),
             )
+        # Report the deliberate retire before the close reaches the route's
+        # disconnect hook, which reads it when deciding what the loss means.
+        if retire and self._on_retire is not None:
+            self._on_retire(runner_id)
         # 1001 ("going away"), not 4003: it lands in the runner's existing
         # tunnel-recycle path (serve.py's ``_TUNNEL_RECYCLE_CLOSE_CODES``) for a
         # prompt, spread reconnect instead of an escalating backoff. Avoid 1012
@@ -544,6 +567,7 @@ class TunnelRegistry:
             if self._sessions.get(session.runner_id) is not session:
                 return False
             session.last_frame_at = time.time()
+            session.last_frame_monotonic = time.monotonic()
             return True
 
     def seconds_since_last_frame(self, session: RunnerSession) -> float | None:
@@ -556,7 +580,7 @@ class TunnelRegistry:
         with self._lock:
             if self._sessions.get(session.runner_id) is not session:
                 return None
-            return time.time() - session.last_frame_at
+            return time.monotonic() - session.last_frame_monotonic
 
     # ── Per-request lifecycle ────────────────────────────
 
@@ -690,7 +714,7 @@ class TunnelRegistry:
             current = self._sessions.get(runner_id)
             if current is None or (session is not None and current is not session):
                 return False
-            current.last_frame_at = time.time()
+            self.mark_frame_seen(current)
             if not isinstance(frame, (WSFrame, WSCloseFrame)):
                 return False
             channel = current.ws_channels.get(frame.ch_id)
@@ -803,7 +827,7 @@ class TunnelRegistry:
             current = self._sessions.get(runner_id)
             if current is None or (session is not None and current is not session):
                 return False
-            current.last_frame_at = time.time()
+            self.mark_frame_seen(current)
             if not isinstance(frame, ResponseHeadFrame | ResponseBodyFrame | ResponseEndFrame):
                 return False
             req_id = frame.id

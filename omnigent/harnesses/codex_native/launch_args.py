@@ -14,6 +14,8 @@ from urllib.parse import urlsplit, urlunsplit
 import tomlkit
 from tomlkit.exceptions import ParseError, TOMLKitError
 
+from omnigent.errors import ErrorCode, OmnigentError
+
 _CODEX_CONFIG_PATHS = (
     "agents.*.config_file",
     "experimental_compact_prompt_file",
@@ -111,6 +113,9 @@ _CODEX_VALUE_FLAGS = frozenset(
         "--local-provider",
         "--enable",
         "--disable",
+        # Names an env var holding the remote auth token; unlike the reserved
+        # ``--remote`` transport flag it takes a value and is caller-settable.
+        "--remote-auth-token-env",
     }
 )
 
@@ -144,10 +149,23 @@ def reserved_codex_transport_arg(args: Sequence[str]) -> str | None:
             # Skip the option and its value (an attached ``=`` form carries its own).
             index += 1 if "=" in arg else 2
             continue
-        if arg in _RESERVED_CODEX_TRANSPORT_TOKENS:
-            return arg
+        token = arg.split("=", 1)[0]
+        if token in _RESERVED_CODEX_TRANSPORT_TOKENS:
+            return token
         index += 1
     return None
+
+
+class CodexTransportArgsError(OmnigentError, ValueError):
+    """Saved launch arguments conflict with the transport Omnigent manages."""
+
+    def __init__(self, token: str) -> None:
+        super().__init__(
+            f"terminal_launch_args may not contain the runner-owned Codex transport "
+            f"token {token!r}. Start a new Codex session without that argument; "
+            "Omnigent starts the app-server and attaches the terminal automatically.",
+            code=ErrorCode.HARNESS_NOT_CONFIGURED,
+        )
 
 
 def reject_reserved_codex_transport_args(args: Sequence[str]) -> None:
@@ -159,11 +177,7 @@ def reject_reserved_codex_transport_args(args: Sequence[str]) -> None:
     """
     token = reserved_codex_transport_arg(args)
     if token is not None:
-        raise ValueError(
-            f"terminal_launch_args may not contain the runner-owned Codex transport "
-            f"token {token!r}: the runner starts the app-server and appends the TUI "
-            "attach itself"
-        )
+        raise CodexTransportArgsError(token)
 
 
 def canonical_codex_launch_args(args: Sequence[str]) -> list[str]:
@@ -214,26 +228,7 @@ def codex_config_profile(args: Sequence[str]) -> str | None:
             profile = canonical[index + 1]
             if not re.fullmatch(r"[A-Za-z0-9_-]+", profile):
                 raise ValueError("Invalid Codex config profile name")
-        if arg in {
-            "-c",
-            "--config",
-            "-s",
-            "--sandbox",
-            "-a",
-            "--ask-for-approval",
-            "-p",
-            "--profile",
-            "--add-dir",
-            "-m",
-            "--model",
-            "-C",
-            "--cd",
-            "-i",
-            "--image",
-            "--local-provider",
-            "--enable",
-            "--disable",
-        }:
+        if arg in _CODEX_VALUE_FLAGS:
             index += 1
         index += 1
     return profile
@@ -298,6 +293,25 @@ def without_codex_add_dirs(args: Sequence[str]) -> list[str]:
             stripped.append(canonical[index])
         index += 1
     return stripped
+
+
+def without_codex_positional_prompt(args: Sequence[str]) -> list[str]:
+    """Drop the ``[PROMPT]`` positional and any ``--`` tail; options keep their values."""
+    canonical = canonical_codex_launch_args(args)
+    kept: list[str] = []
+    index = 0
+    while index < len(canonical):
+        arg = canonical[index]
+        if arg == "--":
+            break
+        if arg in _CODEX_VALUE_FLAGS:
+            kept.extend(canonical[index : index + 2])
+            index += 2
+            continue
+        if arg.startswith("-") and arg != "-":
+            kept.append(arg)
+        index += 1
+    return kept
 
 
 def _merge_tables(base: dict[str, Any], overlay: dict[str, Any]) -> None:

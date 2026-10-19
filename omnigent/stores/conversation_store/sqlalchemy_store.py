@@ -1453,6 +1453,31 @@ class SqlAlchemyConversationStore(ConversationStore):
                 result[parent_id].append(child_id)
         return result
 
+    def list_child_conversation_ids_page(
+        self,
+        parent_conversation_id: str,
+        *,
+        after: tuple[int, str] | None = None,
+        limit: int = 128,
+    ) -> list[tuple[str, int]]:
+        if limit <= 0:
+            raise ValueError("limit must be positive")
+        stmt = select(SqlConversation.id, SqlConversation.created_at).where(
+            SqlConversation.workspace_id == current_workspace_id(),
+            SqlConversation.parent_conversation_id == parent_conversation_id,
+        )
+        if after is not None:
+            stmt = stmt.where(tuple_(SqlConversation.created_at, SqlConversation.id) < after)
+        with self._conv_session("list_child_conversation_ids_page") as ap_sess:
+            return [
+                (child_id, created_at)
+                for child_id, created_at in ap_sess.execute(
+                    stmt.order_by(
+                        desc(SqlConversation.created_at), desc(SqlConversation.id)
+                    ).limit(limit)
+                ).all()
+            ]
+
     def set_labels(
         self,
         conversation_id: str,

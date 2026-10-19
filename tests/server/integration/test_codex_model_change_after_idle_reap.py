@@ -28,6 +28,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.host_store import HostStore
 from omnigent.terminals.pane_reaper import NativePaneReaper
 from omnigent.terminals.registry import TerminalRegistry
+from tests.budgets import budget
 from tests.runner.conftest import _build_app_for_spec, _runner_client
 from tests.runner.helpers import make_test_terminal_instance
 from tests.runner.native_helpers import _harness_spec
@@ -381,7 +382,7 @@ async def test_model_change_recovers_dead_backend_while_codex_pane_is_alive(
         selection["reasoning_effort"] = "low"
 
     response = await asyncio.wait_for(
-        client.patch(f"/v1/sessions/{session.session_id}", json=selection), timeout=5
+        client.patch(f"/v1/sessions/{session.session_id}", json=selection), timeout=budget(5)
     )
 
     session.assert_applied(response, effort="low" if combined else "high")
@@ -540,7 +541,7 @@ async def test_codex_replacement_connection_refusal_is_not_retried_again(
         client.patch(
             f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
         ),
-        timeout=5,
+        timeout=budget(5),
     )
     _assert_codex_refusal(session, response)
     assert session.codex.launches == 2
@@ -559,7 +560,7 @@ async def test_codex_dead_backend_recovery_startup_timeout_refuses_settings(
         client.patch(
             f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
         ),
-        timeout=2,
+        timeout=budget(2),
     )
     _assert_codex_refusal(session, response)
     assert session.codex.launches == 2
@@ -651,11 +652,11 @@ async def test_model_change_waits_for_codex_startup(
         )
     )
     try:
-        await asyncio.wait_for(missing.wait(), timeout=5)
+        await asyncio.wait_for(missing.wait(), timeout=budget(5))
         assert session.codex.applied_updates == []
         session.codex.ready_gate.set()
-        await asyncio.wait_for(session.codex.ready.wait(), timeout=5)
-        response = await asyncio.wait_for(change, timeout=5)
+        await asyncio.wait_for(session.codex.ready.wait(), timeout=budget(5))
+        response = await asyncio.wait_for(change, timeout=budget(5))
     finally:
         session.codex.ready_gate.set()
         change.cancel()
@@ -673,7 +674,7 @@ async def test_model_change_succeeds_after_delayed_codex_startup(
     assert session.codex.ready_gate is not None
     assert bridge.read_bridge_state(session.codex.bridge_dir) is None
     session.codex.ready_gate.set()
-    await asyncio.wait_for(session.codex.ready.wait(), timeout=5)
+    await asyncio.wait_for(session.codex.ready.wait(), timeout=budget(5))
     response = await client.patch(
         f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
     )
@@ -712,11 +713,11 @@ async def test_codex_settings_forward_outlasts_tui_budget_during_startup(
         settings["reasoning_effort"] = "low"
     change = asyncio.create_task(client.patch(f"/v1/sessions/{session.session_id}", json=settings))
     try:
-        await asyncio.wait_for(missing.wait(), timeout=2)
+        await asyncio.wait_for(missing.wait(), timeout=budget(2))
         await asyncio.sleep(0.1)
         assert not change.done()
         session.codex.ready_gate.set()
-        response = await asyncio.wait_for(change, timeout=2)
+        response = await asyncio.wait_for(change, timeout=budget(2))
     finally:
         session.codex.ready_gate.set()
         change.cancel()
@@ -747,14 +748,14 @@ async def test_codex_startup_timeout_refuses_settings_and_allows_retry(
     if combined:
         selection["reasoning_effort"] = "low"
     response = await asyncio.wait_for(
-        client.patch(f"/v1/sessions/{session.session_id}", json=selection), timeout=2
+        client.patch(f"/v1/sessions/{session.session_id}", json=selection), timeout=budget(2)
     )
     _assert_codex_refusal(session, response, combined=combined)
     assert session.codex.requests == []
     assert session.codex.launches == 1
 
     session.codex.ready_gate.set()
-    await asyncio.wait_for(session.codex.ready.wait(), timeout=2)
+    await asyncio.wait_for(session.codex.ready.wait(), timeout=budget(2))
     response = await client.patch(f"/v1/sessions/{session.session_id}", json=selection)
     assert response.status_code == 200, response.text
     session.assert_settings(_REQUESTED_MODEL, "low" if combined else "high")
@@ -776,7 +777,7 @@ async def test_cancelling_codex_readiness_wait_releases_settings_lock(
         )
     )
     try:
-        await asyncio.wait_for(missing.wait(), timeout=2)
+        await asyncio.wait_for(missing.wait(), timeout=budget(2))
     finally:
         change.cancel()
         await asyncio.gather(change, return_exceptions=True)
@@ -785,10 +786,10 @@ async def test_cancelling_codex_readiness_wait_releases_settings_lock(
     assert bridge.read_codex_config_model(session.codex.bridge_dir) == _PREVIOUS_MODEL
 
     session.codex.ready_gate.set()
-    await asyncio.wait_for(session.codex.ready.wait(), timeout=2)
+    await asyncio.wait_for(session.codex.ready.wait(), timeout=budget(2))
     response = await asyncio.wait_for(
         client.patch(f"/v1/sessions/{session.session_id}", json={"model_override": _LATEST_MODEL}),
-        timeout=2,
+        timeout=budget(2),
     )
     session.assert_applied(response, model=_LATEST_MODEL)
     assert session.codex.launches == 1
@@ -809,7 +810,7 @@ async def test_codex_relaunch_failure_refuses_settings_and_allows_retry(
         client.patch(
             f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
         ),
-        timeout=2,
+        timeout=budget(2),
     )
     _assert_codex_refusal(session, response)
     assert session.codex.requests == []
@@ -893,7 +894,7 @@ async def test_codex_readiness_wait_rejects_another_sessions_bridge(
         )
     )
     try:
-        await asyncio.wait_for(missing.wait(), timeout=2)
+        await asyncio.wait_for(missing.wait(), timeout=budget(2))
         bridge.write_bridge_state(
             session.codex.bridge_dir,
             bridge.CodexNativeBridgeState(
@@ -903,7 +904,7 @@ async def test_codex_readiness_wait_rejects_another_sessions_bridge(
                 codex_home=str(bridge.codex_home_for_bridge_dir(session.codex.bridge_dir)),
             ),
         )
-        response = await asyncio.wait_for(change, timeout=2)
+        response = await asyncio.wait_for(change, timeout=budget(2))
     finally:
         change.cancel()
         await asyncio.gather(change, return_exceptions=True)
@@ -1011,7 +1012,7 @@ async def test_overlapping_model_picks_during_recovery_keep_the_latest_selection
     )
     tasks = [first]
     try:
-        await asyncio.wait_for(missing.wait(), timeout=5)
+        await asyncio.wait_for(missing.wait(), timeout=budget(5))
         tasks.append(
             asyncio.create_task(
                 client.patch(
@@ -1019,12 +1020,12 @@ async def test_overlapping_model_picks_during_recovery_keep_the_latest_selection
                 )
             )
         )
-        await asyncio.wait_for(latest_waiting.wait(), timeout=5)
+        await asyncio.wait_for(latest_waiting.wait(), timeout=budget(5))
         assert not any(task.done() for task in tasks)
         session.codex.ready_gate.set()
-        await asyncio.wait_for(session.codex.ready.wait(), timeout=5)
+        await asyncio.wait_for(session.codex.ready.wait(), timeout=budget(5))
         release_reply.set()
-        earlier, latest = await asyncio.wait_for(asyncio.gather(*tasks), timeout=10)
+        earlier, latest = await asyncio.wait_for(asyncio.gather(*tasks), timeout=budget(10))
     finally:
         session.codex.ready_gate.set()
         release_reply.set()

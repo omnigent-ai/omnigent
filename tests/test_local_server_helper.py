@@ -6,7 +6,23 @@ from pathlib import Path
 
 import pytest
 
-from tests._helpers.live_server import isolated_local_server
+from tests._helpers.live_server import isolated_local_server, isolated_process_env
+
+
+def test_isolated_process_env_keeps_the_suite_harness_root(tmp_path: Path) -> None:
+    """Isolated runtimes must not fall back to sweeping the developer's live harness root."""
+    base = {
+        "PATH": os.defpath,
+        "OMNIGENT_HARNESS_TMP_PARENT": "/tmp/omni-h-suite",
+        "OMNIGENT_RUNNER_ID": "parent-runner",
+    }
+
+    env = isolated_process_env(tmp_path, {}, base)
+    assert env["OMNIGENT_HARNESS_TMP_PARENT"] == "/tmp/omni-h-suite"
+    assert "OMNIGENT_RUNNER_ID" not in env
+
+    removed = isolated_process_env(tmp_path, {"OMNIGENT_HARNESS_TMP_PARENT": None}, base)
+    assert "OMNIGENT_HARNESS_TMP_PARENT" not in removed
 
 
 def test_startup_exit_reports_log_and_reaps_child(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
