@@ -27,6 +27,8 @@ pytestmark = pytest.mark.asyncio
 _TEST_SECRET = b"n" * 32
 _REDIRECT = "http://127.0.0.1:53682/callback"
 _IOS_REDIRECT = "ai.omnigent.ios:/oauth/callback"
+_ANDROID_REDIRECT = "ai.omnigent.android:/oauth/callback"
+_APP_REDIRECTS = [_IOS_REDIRECT, _ANDROID_REDIRECT]
 _VERIFIER = "v" * 64
 _NATIVE_STATE = "desktop-state-123"
 
@@ -131,11 +133,11 @@ def _loopback_query(resp: httpx.Response) -> dict[str, str]:
     return {k: v[0] for k, v in parse_qs(location.query).items()}
 
 
-def _ios_query(resp: httpx.Response) -> dict[str, str]:
-    """Assert ``resp`` redirects to the iOS app scheme and return its query."""
+def _app_query(resp: httpx.Response, redirect: str) -> dict[str, str]:
+    """Assert ``resp`` redirects to the app ``redirect`` and return its query."""
     assert resp.status_code == 302
     base, _, query = resp.headers["location"].partition("?")
-    assert base == _IOS_REDIRECT
+    assert base == redirect
     return {k: v[0] for k, v in parse_qs(query).items()}
 
 
@@ -382,20 +384,21 @@ async def test_redirect_query_round_trips() -> None:
     assert resp.headers["location"] == f"{_REDIRECT}?{urlencode({'code': 'a b&c', 'state': 's'})}"
 
 
-async def test_ios_sign_in_delivers_code_to_app_scheme_and_exchanges() -> None:
-    """The iOS app's private-use-scheme redirect runs the same flow as loopback."""
+@pytest.mark.parametrize("redirect", _APP_REDIRECTS)
+async def test_app_sign_in_delivers_code_to_app_scheme_and_exchanges(redirect: str) -> None:
+    """A mobile app's private-use-scheme redirect runs the same flow as loopback."""
     async with _client(_transport()) as client:
-        idp_state, state_cookie = await _start(client, _IOS_REDIRECT)
+        idp_state, state_cookie = await _start(client, redirect)
         state = jwt.decode(state_cookie, _TEST_SECRET, algorithms=["HS256"])
         callback = await _callback(client, idp_state, state_cookie)
-        query = _ios_query(callback)
+        query = _app_query(callback, redirect)
         resp = await _exchange(
-            client, code=query["code"], code_verifier=_VERIFIER, redirect_uri=_IOS_REDIRECT
+            client, code=query["code"], code_verifier=_VERIFIER, redirect_uri=redirect
         )
 
-    assert state["native"]["redirect_uri"] == _IOS_REDIRECT
+    assert state["native"]["redirect_uri"] == redirect
     assert callback.headers["location"] == (
-        f"{_IOS_REDIRECT}?{urlencode({'code': query['code'], 'state': _NATIVE_STATE})}"
+        f"{redirect}?{urlencode({'code': query['code'], 'state': _NATIVE_STATE})}"
     )
     assert "ap_session" not in callback.cookies
     assert resp.status_code == 200
@@ -415,6 +418,12 @@ async def test_ios_sign_in_delivers_code_to_app_scheme_and_exchanges() -> None:
         "AI.OMNIGENT.IOS:/oauth/callback",
         "ai.omnigent.ios:/OAuth/Callback",
         "ai.omnigent.ios.evil:/oauth/callback",
+        "ai.omnigent.android://oauth/callback",
+        "ai.omnigent.android:/oauth/callback/",
+        "ai.omnigent.android:/oauth/callback?x=1",
+        "AI.OMNIGENT.ANDROID:/oauth/callback",
+        "ai.omnigent.android.evil:/oauth/callback",
+        "ai.omnigent.android://mobile-redirect",
         "com.example.evil:/oauth/callback",
         "omnigent://oauth/callback",
         "omnigent:/oauth/callback",
@@ -429,10 +438,11 @@ async def test_login_rejects_near_miss_app_redirects(redirect: str) -> None:
     assert resp.json() == {"error": "Invalid native sign-in parameters"}
 
 
-async def test_ios_callback_reports_admission_denial_to_app_scheme() -> None:
+@pytest.mark.parametrize("redirect", _APP_REDIRECTS)
+async def test_app_callback_reports_admission_denial_to_app_scheme(redirect: str) -> None:
     async with _client(_transport(allowed_domains=frozenset({"corp.example"}))) as client:
-        idp_state, state_cookie = await _start(client, _IOS_REDIRECT)
-        query = _ios_query(await _callback(client, idp_state, state_cookie))
+        idp_state, state_cookie = await _start(client, redirect)
+        query = _app_query(await _callback(client, idp_state, state_cookie), redirect)
 
     assert query["error"] == "access_denied"
     assert (
@@ -448,6 +458,9 @@ async def test_ios_callback_reports_admission_denial_to_app_scheme() -> None:
         (_IOS_REDIRECT, _REDIRECT),
         (_IOS_REDIRECT, "ai.omnigent.ios://oauth/callback"),
         (_REDIRECT, _IOS_REDIRECT),
+        (_ANDROID_REDIRECT, _IOS_REDIRECT),
+        (_IOS_REDIRECT, _ANDROID_REDIRECT),
+        (_ANDROID_REDIRECT, _REDIRECT),
     ],
 )
 async def test_native_exchange_requires_the_exact_redirect_uri(
@@ -456,7 +469,11 @@ async def test_native_exchange_requires_the_exact_redirect_uri(
     async with _client(_transport()) as client:
         idp_state, state_cookie = await _start(client, issued_to)
         callback = await _callback(client, idp_state, state_cookie)
-        query = _ios_query(callback) if issued_to == _IOS_REDIRECT else _loopback_query(callback)
+        query = (
+            _loopback_query(callback)
+            if issued_to == _REDIRECT
+            else _app_query(callback, issued_to)
+        )
         resp = await _exchange(
             client, code=query["code"], code_verifier=_VERIFIER, redirect_uri=exchanged_with
         )

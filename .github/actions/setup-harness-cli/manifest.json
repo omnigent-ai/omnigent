@@ -2,7 +2,7 @@
   "claude": {
     "kind": "npm",
     "package": "@anthropic-ai/claude-code",
-    "version": "2.1.266",
+    "version": "2.1.283",
     "binary": "claude",
     "lockfile": "locks/claude/package-lock.json",
     "installScript": "node_modules/@anthropic-ai/claude-code/install.cjs"
@@ -17,7 +17,7 @@
   "pi": {
     "kind": "npm",
     "package": "@earendil-works/pi-coding-agent",
-    "version": "0.84.2",
+    "version": "1.0.4",
     "binary": "pi",
     "lockfile": "locks/pi/package-lock.json"
   },

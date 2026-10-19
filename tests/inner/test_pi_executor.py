@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 import shutil
 import socket
 import tempfile
@@ -1666,6 +1667,7 @@ class TestPiExecutorConstructor(unittest.TestCase):
             ),
         ):
             executor = PiExecutor(gateway=True)
+            _run(executor._get_gateway_token())
         self.assertTrue(executor._gateway)
         self.assertEqual(executor._databricks_host, "https://h.example.com")
         self.assertEqual(executor._databricks_token, "tok")
@@ -1703,8 +1705,11 @@ class TestPiExecutorConstructor(unittest.TestCase):
                 gateway_auth_command="printf token",
             )
 
+            fetch_command_token.assert_not_called()
+            _run(executor._get_gateway_token())
+
         read_cfg.assert_not_called()
-        fetch_command_token.assert_called_once_with("printf token")
+        fetch_command_token.assert_awaited_once_with("printf token")
         self.assertEqual(executor._databricks_host, "https://example.databricks.com")
         self.assertEqual(executor._databricks_token, "command-token")
         self.assertEqual(
@@ -1718,8 +1723,9 @@ class TestPiExecutorConstructor(unittest.TestCase):
             patch.dict("os.environ", {}, clear=True),
             patch("omnigent.inner.pi_executor._read_databrickscfg", return_value=None),
         ):
-            with self.assertRaises(EnvironmentError):
-                PiExecutor(gateway=True)
+            executor = PiExecutor(gateway=True)
+            with self.assertRaisesRegex(OSError, "authentication returned no token"):
+                _run(executor._get_gateway_token())
 
     def test_constructor_with_model_override(self):
         with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
@@ -1889,8 +1895,11 @@ class TestBuildEnvAndDir(unittest.TestCase):
             ),
         ):
             executor = PiExecutor(gateway=True)
+            _run(executor._get_gateway_token())
 
-        config = executor._build_env_and_dir([], None, None, None)
+        config = executor._build_env_and_dir(
+            [], 12345, "bridge-token", _build_models_json("https://h.example.com", "tok")
+        )
         try:
             self.assertIn("PI_CODING_AGENT_DIR", config.env)
             managed_dir = Path(config.env["PI_CODING_AGENT_DIR"])
@@ -1962,8 +1971,11 @@ def test_gateway_seeds_managed_settings_from_global_agent(
         ),
     ):
         executor = PiExecutor(gateway=True)
+        _run(executor._get_gateway_token())
 
-    config = executor._build_env_and_dir([], None, None, None)
+    config = executor._build_env_and_dir(
+        [], 12345, "bridge-token", _build_models_json("https://h.example.com", "tok")
+    )
     try:
         managed_dir = Path(config.env["PI_CODING_AGENT_DIR"])
         settings = json.loads((managed_dir / "settings.json").read_text(encoding="utf-8"))
@@ -2083,6 +2095,218 @@ def test_pi_tools_arg_skips_unnamed_entries() -> None:
 # ---------------------------------------------------------------------------
 # PiExecutor.run_turn tests (with mocked RPC)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("credential_source", ["command", "profile"])
+async def test_gateway_refresh_reuses_process_and_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, credential_source: str
+) -> None:
+    from omnigent.inner import pi_executor
+
+    if not shutil.which("node"):
+        pytest.skip("node is required for the generated credential client")
+    private_dir = tmp_path / "Pi's config"
+    private_dir.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr("omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", tmp_path / "pi-agent")
+    monkeypatch.setattr(tempfile, "tempdir", str(private_dir))
+    current_token = "initial-token"
+
+    async def fetch_token(_):
+        return current_token
+
+    monkeypatch.setattr(pi_executor, "_fetch_shell_command_token", fetch_token)
+    monkeypatch.setattr(
+        pi_executor,
+        "_read_databrickscfg",
+        lambda _: (
+            DatabricksCredentials(host="https://example.test", token=current_token)
+            if current_token
+            else None
+        ),
+    )
+
+    async def start(rpc, *args, **kwargs):
+        rpc.process = _FakeProcess()
+
+    monkeypatch.setattr(_PiRpcSession, "start", start)
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        model="mock-model",
+        gateway_host="https://example.test" if credential_source == "command" else None,
+        gateway_auth_command="get-token" if credential_source == "command" else None,
+        gateway_auth_refresh_interval_ms="0",
+    )
+    monkeypatch.setattr(executor, "_load_gateway_model_wire_apis", AsyncMock(return_value={}))
+    try:
+        events = [e async for e in executor.run_turn([], [], "")]
+        assert not [e for e in events if isinstance(e, ExecutorError)]
+        rpc = executor._session_states["__default__"].rpc
+        agent_dir = Path(rpc._tmp_dir)
+        assert agent_dir.stat().st_mode & 0o777 == 0o700
+        assert (agent_dir / "gateway-auth.cjs").stat().st_mode & 0o777 == 0o600
+        assert (agent_dir / "gateway-auth.json").stat().st_mode & 0o777 == 0o600
+        models_text = (agent_dir / "models.json").read_text()
+        bridge_token = executor._tool_server.token
+        assert bridge_token not in models_text
+        assert bridge_token not in (agent_dir / "gateway-auth.cjs").read_text()
+        command = next(iter(json.loads(models_text)["providers"].values()))["apiKey"][1:]
+        for current_token in (
+            "initial-token",
+            "!literal-$TOKEN-$(no-execution)",
+            None,
+            "recovered-token",
+        ):
+            # Run the actual JS client asynchronously so the parent can serve it.
+            process = await asyncio.create_subprocess_shell(
+                command, stdout=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await asyncio.wait_for(process.communicate(), 10)
+            assert bool(process.returncode == 0) is bool(current_token)
+            assert stdout.decode() == (current_token or "")
+            events = [e async for e in executor.run_turn([], [], "")]
+            assert bool([e for e in events if isinstance(e, ExecutorError)]) is (
+                current_token is None
+            )
+            assert executor._session_states["__default__"].rpc is rpc
+            if current_token:
+                assert current_token not in models_text
+    finally:
+        server = executor._tool_server
+        await executor.close()
+    assert not agent_dir.exists()
+    assert not server._clients
+
+
+@pytest.mark.parametrize("interval", [None, "100", "0"])
+async def test_gateway_cache_honors_ttl_and_serializes_refresh(monkeypatch, interval):
+    from omnigent.inner import pi_executor
+
+    fetch = AsyncMock(return_value="first")
+    monkeypatch.setattr(pi_executor, "_fetch_shell_command_token", fetch)
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        gateway_host="https://example.test",
+        gateway_auth_command="get-token",
+        gateway_auth_refresh_interval_ms=interval,
+    )
+    # Use a controlled monotonic clock only for this cache-policy test.
+    clock = SimpleNamespace(monotonic=lambda: now)
+    monkeypatch.setattr(pi_executor, "time", clock)
+    now = 100.0
+    assert await executor._get_gateway_token() == "first"
+    fetch.reset_mock()
+    fetch.return_value = "rotated"
+    if interval != "0":
+        assert await executor._get_gateway_token() == "first"
+        fetch.assert_not_called()
+        now += (900 if interval is None else 0.1) + 0.001
+    assert (
+        await asyncio.gather(*(executor._get_gateway_token() for _ in range(3))) == ["rotated"] * 3
+    )
+    assert fetch.call_count == (3 if interval == "0" else 1)
+    now += 901
+    fetch.side_effect = RuntimeError("secret must not leak")
+    with pytest.raises(OSError, match="credential refresh failed") as failure:
+        await executor._get_gateway_token()
+    assert "secret" not in str(failure.value)
+    fetch.side_effect = None
+    fetch.return_value = "recovered"
+    assert await executor._get_gateway_token() == "recovered"
+
+
+@pytest.mark.parametrize("interval", ["-1", "nonsense"])
+def test_gateway_rejects_invalid_refresh_interval(interval):
+    with pytest.raises(ValueError):
+        PiExecutor(pi_path="/usr/bin/pi", gateway_auth_refresh_interval_ms=interval)
+
+
+@pytest.mark.parametrize(
+    ("command", "error"),
+    [
+        ("printf secret; printf secret >&2; exit 1", "command failed"),
+        ("printf '  '", "empty token"),
+        ("sleep 30 & wait", "timed out"),
+    ],
+)
+async def test_gateway_helper_failure_is_bounded_and_redacted(monkeypatch, command, error):
+    from omnigent.inner import pi_executor
+
+    if error == "timed out":
+        monkeypatch.setattr(pi_executor, "_GATEWAY_AUTH_TIMEOUT_S", 0.05)
+    with pytest.raises(OSError, match=error) as failure:
+        await pi_executor._fetch_shell_command_token(command)
+    assert "secret" not in str(failure.value)
+
+
+async def test_gateway_bridge_authenticates_and_cancels_helper_on_shutdown(tmp_path):
+    pid_file = tmp_path / "helper pid"
+    executor = PiExecutor(
+        pi_path="/usr/bin/pi",
+        gateway=True,
+        gateway_host="https://example.test",
+        gateway_auth_command=f"echo $$ > {shlex.quote(str(pid_file))}; sleep 30 & wait",
+    )
+    assert not pid_file.exists(), "construction must not run a blocking auth helper"
+    port = await executor._ensure_tool_server([])
+    server = executor._tool_server
+    try:
+        for token in (None, server.token + "wrong"):
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.write(json.dumps({"kind": "gateway_auth", "token": token}).encode() + b"\n")
+            await writer.drain()
+            assert json.loads(await reader.readline())["error"] == "unauthorized"
+            writer.close()
+            await writer.wait_closed()
+        assert not pid_file.exists(), "unauthenticated requests must not resolve credentials"
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(json.dumps({"kind": "gateway_auth", "token": server.token}).encode() + b"\n")
+        await writer.drain()
+        async with asyncio.timeout(3):
+            while not pid_file.exists():
+                await asyncio.sleep(0.01)
+        pid = int(pid_file.read_text())
+    finally:
+        await asyncio.wait_for(executor.close(), 3)
+    assert await reader.read() == b""
+    writer.close()
+    await writer.wait_closed()
+    assert not server._clients
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+async def test_gateway_profile_timeout_does_not_publish_a_late_result(monkeypatch):
+    import threading
+
+    from omnigent.inner import pi_executor
+
+    release = threading.Event()
+    finished = threading.Event()
+
+    def resolve(_):
+        release.wait(timeout=2)
+        finished.set()
+        return DatabricksCredentials(host="https://example.test", token="late-token")
+
+    monkeypatch.setattr(pi_executor, "_read_databrickscfg", resolve)
+    monkeypatch.setattr(pi_executor, "_GATEWAY_BRIDGE_TIMEOUT_S", 0.05)
+    executor = PiExecutor(pi_path="/usr/bin/pi", gateway=True, model="mock-model")
+    try:
+        events = [e async for e in executor.run_turn([], [], "")]
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == [
+            "Pi gateway credential refresh timed out"
+        ]
+        assert not executor._session_states
+        assert executor._databricks_token == ""
+    finally:
+        release.set()
+        await executor.close()
+    assert await asyncio.to_thread(finished.wait, timeout=1)
+    assert executor._databricks_token == ""
+    assert executor._gateway_refresh_after == 0
 
 
 class TestRunTurn(unittest.TestCase):
@@ -4497,7 +4721,10 @@ def test_run_turn_spawn_env_honors_spec_env_passthrough(monkeypatch) -> None:
     assert "FAKE_HOST_SECRET" not in captured["env"]
 
 
-def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("layout", ["dist/cli.js", "dist/bundle/cli.js", "standalone"])
+def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
+    monkeypatch, tmp_path, layout
+) -> None:
     """The sandbox launcher policy names exactly the env the executor spawns.
 
     Defense in depth: ``_clean_pi_env`` already filters the spawn env,
@@ -4519,8 +4746,21 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(monkeypatch, tmp
 
     monkeypatch.setenv("FAKE_HOST_SECRET", "PWNED")
     captured: dict[str, SandboxPolicy] = {}
+    if layout == "standalone":
+        executable = tmp_path / "install/bin/pi"
+        pi_binary = executable
+        install = executable.parent
+    else:
+        install = tmp_path / "install/node_modules"
+        executable = install / "@earendil-works/pi-coding-agent" / layout
+        pi_binary = install / ".bin/pi"
+        pi_binary.parent.mkdir(parents=True)
+        pi_binary.symlink_to(executable)
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.touch()
 
     def _fake_create_exec_launcher(target_path: str, sandbox: SandboxPolicy) -> str:
+        assert target_path == str(executable.resolve())
         captured["policy"] = sandbox
         return "/fake/launcher"
 
@@ -4540,7 +4780,7 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(monkeypatch, tmp
     monkeypatch.setattr(sandbox_mod, "resolve_sandbox", _fake_resolve_sandbox)
     monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _fake_create_exec_launcher)
 
-    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value=str(pi_binary)):
         executor = PiExecutor(
             cwd=str(tmp_path),
             os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
@@ -4550,6 +4790,7 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(monkeypatch, tmp
     # fallback in ``_try_sandbox_pi``'s except clause).
     assert executor._sandboxed is True
     assert executor._pi_launch_path == "/fake/launcher"
+    assert captured["policy"].read_roots == [tmp_path.resolve(), install.resolve()]
     allowlist = captured["policy"].spawn_env_allowlist
     assert allowlist is not None
     # Per-spawn gateway var must be pruneproof even though it is not in
@@ -5739,3 +5980,152 @@ def test_settled_queued_continuation_stays_in_the_turn() -> None:
         assert rpc._line_queue.empty()
 
     _run(_test())
+
+
+def test_build_models_json_catalog_reasoning_models_get_reasoning_flag() -> None:
+    """Catalog-reasoning GPT/Gemini entries get ``reasoning: true``; catalog False stays off."""
+    from omnigent.models.model_metadata import ModelCapability
+
+    reasoning = frozenset({ModelCapability.REASONING})
+    catalog_models = (
+        ModelEntry(
+            id="system.ai.gpt-6-luna",
+            family="openai",
+            metadata=ModelMetadata(
+                supported_capabilities=reasoning,
+                wire_apis=frozenset({ModelWireAPI.OPENAI_RESPONSES, ModelWireAPI.OPENAI_CHAT}),
+            ),
+        ),
+        ModelEntry(
+            id="system.ai.gemini-3-8-flash",
+            family="other",
+            metadata=ModelMetadata(
+                supported_capabilities=reasoning,
+                wire_apis=frozenset({ModelWireAPI.OPENAI_CHAT}),
+            ),
+        ),
+        ModelEntry(
+            id="system.ai.llama-4-maverick",
+            family="other",
+            metadata=ModelMetadata(
+                unsupported_capabilities=reasoning,
+                wire_apis=frozenset({ModelWireAPI.OPENAI_CHAT}),
+            ),
+        ),
+    )
+
+    result = _build_models_json("https://host.example.com", "tok", catalog_models=catalog_models)
+
+    providers = result["providers"]
+    by_id = {
+        entry["id"]: entry
+        for name in ("databricks-openai", "databricks-mlflow")
+        for entry in providers[name]["models"]
+    }
+    assert by_id["system.ai.gpt-6-luna"].get("reasoning") is True
+    assert by_id["system.ai.gemini-3-8-flash"].get("reasoning") is True
+    assert "reasoning" not in by_id["system.ai.llama-4-maverick"]
+
+
+@pytest.mark.parametrize(
+    ("base_urls", "wire_api"),
+    [
+        ({"openai": "https://gateway.example/v1"}, "chat"),
+        ({"openai": "https://gateway.example/v1"}, "responses"),
+        (None, None),
+    ],
+    ids=["generic-chat", "generic-responses", "databricks"],
+)
+def test_generic_and_databricks_reasoning_use_pi_compat_detection(base_urls, wire_api):
+    config = _build_models_json(
+        "https://gateway.example",
+        "synthetic",
+        base_urls,
+        model="deepseek-test",
+        openai_wire_api=wire_api,
+    )
+    selected = next(p for p in config["providers"].values() if p["models"])
+    assert selected["models"][0]["reasoning"] is True
+    for provider in config["providers"].values():
+        if provider["api"].startswith("openai"):
+            assert "supportsReasoningEffort" not in provider["compat"]
+
+
+@pytest.mark.parametrize("destination", ["generic", "mixed-databricks", "catalog"])
+async def test_generic_catalog_discovery_does_not_block_runtime(
+    monkeypatch, tmp_path, destination
+):
+    import asyncio
+    import threading
+
+    from omnigent.inner import pi_executor as pi_mod
+
+    started = threading.Event()
+    release = threading.Event()
+    heartbeat_ran = False
+
+    def discover(model):
+        assert destination == "generic", "unused generic catalog lookup"
+        started.set()
+        assert release.wait(2), "catalog discovery blocked the runtime event loop"
+        return {"id": model, "reasoning": True}
+
+    async def heartbeat():
+        nonlocal heartbeat_ran
+        while not started.is_set():
+            await asyncio.sleep(0.01)
+        heartbeat_ran = True
+        release.set()
+
+    async def spawn(*args, **kwargs):
+        return _FakeProcess(
+            stdout_lines=[
+                _levels_response(["off", "low", "high"]),
+                json.dumps({"type": "response", "command": "prompt", "success": True}),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ]
+        )
+
+    monkeypatch.setattr(pi_mod, "pi_generic_model_json_entry", discover)
+    monkeypatch.setattr(pi_mod, "_create_subprocess_exec", spawn)
+    monkeypatch.setattr(pi_mod, "_find_pi_cli", lambda: "/usr/bin/pi")
+    model = "system.ai.gpt-5" if destination == "mixed-databricks" else "custom-model"
+    base_urls = (
+        {
+            "openai": "https://workspace.example/ai-gateway/codex/v1",
+            "claude": "http://generic.example/anthropic",
+        }
+        if destination == "mixed-databricks"
+        else {"openai": "http://generic.example/v1"}
+    )
+    executor = PiExecutor(
+        gateway=True,
+        gateway_host="http://generic.example",
+        gateway_auth_command="printf synthetic",
+        base_urls_override=base_urls,
+        model=model,
+        cwd=str(tmp_path),
+    )
+    executor._gateway_model_wire_apis = {}
+    executor._gateway_model_entries = (
+        (ModelEntry(id=model, family="other"),) if destination == "catalog" else ()
+    )
+    beat = asyncio.create_task(heartbeat()) if destination == "generic" else None
+    try:
+        events = [
+            e
+            async for e in executor.run_turn(
+                [{"role": "user", "content": "hello", "session_id": "generic"}],
+                [],
+                "system",
+                ExecutorConfig(extra={"reasoning_effort": "high"}),
+            )
+        ]
+        assert not [e for e in events if isinstance(e, ExecutorError)]
+        assert heartbeat_ran is (destination == "generic")
+    finally:
+        release.set()
+        if beat is not None:
+            beat.cancel()
+            await asyncio.gather(beat, return_exceptions=True)
+        await executor.close()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
+from typing import cast
 
 import pytest
 
@@ -13,6 +14,7 @@ from omnigent.runner.transports.ws_tunnel.diagnostics import (
     OutboundFrame,
     TunnelDiagnosticAttrs,
     TunnelDiagnostics,
+    silence_source,
 )
 from tests.budgets import budget
 
@@ -314,3 +316,23 @@ async def test_concurrent_send_sampling_is_bounded(monkeypatch: pytest.MonkeyPat
         await asyncio.gather(*tasks, return_exceptions=True)
     assert diagnostics.snapshot()["sends_in_flight"] == 0
     assert diagnostics.snapshot()["oldest_tracked_send_age_s"] is None
+
+
+@pytest.mark.parametrize(
+    ("silent_s", "loop_lag_s", "expected"),
+    [
+        # This process froze for ~5 min and woke to find its peer "silent".
+        (312.0, 307.0, "local_event_loop"),
+        # The peer's last frame predates the stall by up to one ping interval.
+        (97.0, 64.0, "local_event_loop"),
+        # A sleeping laptop: this loop was healthy the whole time.
+        (105.0, 0.2, "peer"),
+        (105.0, None, "peer"),
+    ],
+)
+def test_silence_source_blames_a_local_stall_only_when_it_covers_the_silence(
+    silent_s: float, loop_lag_s: float | None, expected: str
+) -> None:
+    """A tunnel timeout is a local fault only when this loop was stalled for it."""
+    attrs = cast(TunnelDiagnosticAttrs, {"loop_lag_s": loop_lag_s})
+    assert silence_source(silent_s, attrs) == expected

@@ -41,9 +41,11 @@ import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from urllib.parse import quote
 
+from omnigent.debug_logging import debug_event
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import OSEnvironment
 from omnigent.inner.terminal import TerminalInstance, create_terminal_instance
@@ -111,6 +113,79 @@ class TerminalExitedDuringLaunch(RuntimeError):
         super().__init__(
             f"terminal {instance.name}:{instance.session_key} exited before it became available "
             f"(exit status {instance.last_exit_status()})"
+        )
+
+
+@dataclass(frozen=True)
+class _UnregisteredCleanup:
+    """How closing a never-registered instance ended."""
+
+    outcome: str
+    error_type: str | None
+    caller_cancelled: bool
+
+
+async def _close_unregistered_instance(instance: TerminalInstance) -> _UnregisteredCleanup:
+    """Close an instance that never reached the registry, within two ``_CLOSE_TIMEOUT_S`` windows.
+
+    Keeps closing while the caller is being cancelled, so the tmux server and
+    private directory are not orphaned; ``caller_cancelled`` reports that cancellation.
+    The first window covers the close itself, the second the grace after cancelling it.
+    """
+    close_task = asyncio.ensure_future(instance.close())
+    current = asyncio.current_task()
+    cancel_requests = current.cancelling() if current is not None else 0
+    caller_cancelled = False
+    timed_out = False
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _CLOSE_TIMEOUT_S
+    while not close_task.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(close_task), timeout=deadline - loop.time())
+        except asyncio.TimeoutError:
+            if close_task.done() or timed_out:
+                break
+            # Cancel the close as ``asyncio.wait_for`` would, but wait only one more window for it.
+            timed_out = True
+            close_task.cancel()
+            deadline = loop.time() + _CLOSE_TIMEOUT_S
+        except asyncio.CancelledError:
+            if current is not None and current.cancelling() > cancel_requests:
+                cancel_requests = current.cancelling()
+                caller_cancelled = True
+            # Otherwise ``close()`` itself ended cancelled and the loop exits.
+        except Exception:
+            # The failure is read back from the task below.
+            break
+    if not close_task.done():
+        # A loop that closed with a pending close never runs its done callbacks.
+        _ABANDONED_CLOSES.difference_update(
+            {task for task in _ABANDONED_CLOSES if task.get_loop().is_closed()}
+        )
+        _ABANDONED_CLOSES.add(close_task)
+        close_task.add_done_callback(_ABANDONED_CLOSES.discard)
+        close_task.add_done_callback(partial(_log_abandoned_close, instance.diagnostic_id))
+        return _UnregisteredCleanup("timed_out", "TimeoutError", caller_cancelled)
+    if close_task.cancelled():
+        if timed_out:
+            return _UnregisteredCleanup("timed_out", "TimeoutError", caller_cancelled)
+        return _UnregisteredCleanup("cancelled", "CancelledError", caller_cancelled)
+    cleanup_exc = close_task.exception()
+    if cleanup_exc is not None:
+        return _UnregisteredCleanup("error", type(cleanup_exc).__name__, caller_cancelled)
+    return _UnregisteredCleanup("closed", None, caller_cancelled)
+
+
+# Closes that outlived their grace window; the event loop only holds tasks weakly.
+_ABANDONED_CLOSES: set[asyncio.Future[None]] = set()
+
+
+def _log_abandoned_close(instance_id: str, task: asyncio.Future[None]) -> None:
+    if not task.cancelled() and task.exception() is not None:
+        logger.warning(
+            "Abandoned terminal close for instance %s finished with %s",
+            instance_id,
+            type(task.exception()).__name__,
         )
 
 
@@ -257,20 +332,43 @@ class TerminalRegistry:
             sandbox_override=sandbox_override,
             conversation_link=self.conversation_link_for_id(conversation_id),
         )
-        created.instance.lifecycle_trace.transfer_session(conversation_id)
-        await created.instance.launch(cwd=created.cwd)
-        if not await created.instance.is_alive():
-            created.instance.lifecycle_trace.note_exit()
-            try:
-                await asyncio.wait_for(created.instance.close(), timeout=_CLOSE_TIMEOUT_S)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Newly launched terminal close timed out for %s:%s in conv %s",
-                    terminal_name,
-                    session_key,
-                    conversation_id,
-                )
-            raise TerminalExitedDuringLaunch(created.instance)
+        stage = "terminal_spawn"
+        try:
+            created.instance.lifecycle_trace.transfer_session(conversation_id)
+            await created.instance.launch(cwd=created.cwd)
+            stage = "terminal_liveness"
+            if not await created.instance.is_alive():
+                created.instance.lifecycle_trace.note_exit()
+                raise TerminalExitedDuringLaunch(created.instance)
+        except (Exception, asyncio.CancelledError) as exc:
+            # Until registration, no shutdown sweep can discover this instance.
+            cleanup = await _close_unregistered_instance(created.instance)
+            cancelled = isinstance(exc, asyncio.CancelledError)
+            logger.log(
+                logging.INFO if cancelled and cleanup.outcome == "closed" else logging.WARNING,
+                "Terminal launch failed during %s; cleanup=%s",
+                stage,
+                cleanup.outcome,
+                extra=debug_event(
+                    "terminal_launch_failed",
+                    session_id=conversation_id,
+                    terminal_name=terminal_name,
+                    terminal_key=session_key,
+                    terminal_instance_id=created.instance.diagnostic_id,
+                    terminal_launch_id=created.instance.lifecycle_trace.launch_id,
+                    launch_stage=stage,
+                    launch_outcome="cancelled" if cancelled else "error",
+                    exception_type=type(exc).__name__,
+                    native_launch_os_errno=exc.errno if isinstance(exc, OSError) else None,
+                    launch_cleanup_outcome=cleanup.outcome,
+                    cleanup_error_type=cleanup.error_type,
+                    cancelled_during_cleanup=cleanup.caller_cancelled,
+                ),
+            )
+            if cleanup.caller_cancelled and not cancelled:
+                # The caller cancelled us while cleanup ran; cancellation wins.
+                raise asyncio.CancelledError() from exc
+            raise
 
         with self._lock:
             slot = self._by_conversation.setdefault(conversation_id, {})

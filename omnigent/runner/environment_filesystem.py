@@ -17,7 +17,7 @@ import re
 import stat
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, BinaryIO, Literal, ParamSpec
+from typing import TYPE_CHECKING, Any, BinaryIO, Literal, ParamSpec, cast
 
 from omnigent.entities.environment_filesystem import (
     DeleteFilesystemResult,
@@ -28,6 +28,8 @@ from omnigent.entities.environment_filesystem import (
     FilesystemPathNotFound,
     InvalidPath,
     PathUnreachable,
+    PermissionDenied,
+    ResourceError,
     TextEditRequest,
     WriteFileResult,
 )
@@ -59,6 +61,7 @@ _MAX_READ_BYTES = 10 * 1024 * 1024  # 10 MiB
 # the same answer, and sized to match the sandbox cwd scan budget.
 _SEARCH_SCAN_BUDGET = 50000
 _Params = ParamSpec("_Params")
+_DELETED_ENTRY_TYPES = ("file", "directory", "symlink", "other")
 
 
 def _shell_quote(s: str) -> str:
@@ -68,6 +71,20 @@ def _shell_quote(s: str) -> str:
     :returns: Single-quoted shell-safe string.
     """
     return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _python_script_command(script: str) -> str:
+    """Shell command that runs a stdlib-only *script* with ``python3``.
+
+    The helper runs it with the workspace as cwd. Isolated mode (``-I``) keeps
+    that directory off ``sys.path`` and ignores ``PYTHON*`` variables, so
+    workspace files never stand in for the modules the script imports. ``-P``
+    would need Python 3.11, which the environment's ``python3`` may predate.
+
+    :param script: Python source that imports only the standard library.
+    :returns: Shell-quoted command for ``os_env.shell``.
+    """
+    return f"python3 -I -c {_shell_quote(script)}"
 
 
 def _glob_to_regex(pattern: str) -> str:
@@ -847,7 +864,7 @@ class CallerProcessFilesystem:
         )
         result = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            _python_script_command(_script),
         )
         if "error" in result or result.get("exit_code") != 0:
             raise FilesystemPathNotFound(f"Directory {path!r} not found or not accessible")
@@ -1071,7 +1088,7 @@ print(json.dumps({'r': results, 't': truncated}))
         _script = _header + "\n" + _body
         result = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            _python_script_command(_script),
         )
         if "error" in result:
             raise FilesystemPathNotFound(f"Root directory not accessible: {result['error']}")
@@ -1300,7 +1317,7 @@ print(json.dumps({'r': results, 't': truncated}))
         )
         result = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            _python_script_command(_script),
         )
         if "error" in result or result.get("exit_code", 1) != 0:
             return None
@@ -1467,7 +1484,7 @@ print(json.dumps({'r': results, 't': truncated}))
     async def _stat_via_shell(self, validated: str) -> tuple[int, bool]:
         """Stat a path via the sandboxed helper.
 
-        :param validated: Validated relative path.
+        :param validated: Resolved absolute path to hand the helper.
         :returns: Tuple of (size_bytes, is_directory).
         :raises FilesystemPathNotFound: If the path does not exist.
         """
@@ -1486,7 +1503,7 @@ print(json.dumps({'r': results, 't': truncated}))
         )
         result = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            _python_script_command(_script),
         )
         if "error" in result or result.get("exit_code", 1) != 0:
             raise FilesystemPathNotFound(f"Path {validated!r} not found")
@@ -1501,8 +1518,9 @@ print(json.dumps({'r': results, 't': truncated}))
     async def _check_dir_empty(self, validated: str) -> bool:
         """Check if a directory is empty via the sandboxed helper.
 
-        :param validated: Validated relative path.
-        :returns: ``True`` if the directory has children.
+        :param validated: Resolved absolute path to hand the helper.
+        :returns: ``True`` if the directory has children, or if it could not
+            be listed: an unreadable directory must not pass as empty.
         """
         import json as _json
 
@@ -1518,10 +1536,57 @@ print(json.dumps({'r': results, 't': truncated}))
         )
         check = await _run_os_env_async(
             self._os_env.shell,
-            f"python3 -c {_shell_quote(_script)}",
+            _python_script_command(_script),
         )
-        count = int(check.get("stdout", "0").strip() or "0")
-        return count > 0
+        if "error" in check or check.get("exit_code") != 0:
+            return True
+        try:
+            return int(check.get("stdout", "").strip()) > 0
+        except ValueError:
+            return True
+
+    async def _delete_in_workspace(self, path: str, *, recursive: bool) -> DeleteFilesystemResult:
+        """Delete a workspace-relative entry through the helper's ``delete`` op.
+
+        The helper confines the entry's resolved parent to write reach, as
+        for ``write``, and removes the entry itself without following it.
+
+        :param path: Client-supplied relative path.
+        :param recursive: Allow recursive directory deletion.
+        :returns: Delete result.
+        :raises InvalidPath: For the root, or a parent leading out of reach.
+        :raises FilesystemPathNotFound: If the path does not exist.
+        :raises DirectoryNotEmpty: If non-empty without recursive.
+        :raises PermissionDenied: If the OS or sandbox refuses the removal.
+        :raises ResourceError: If the delete failed or was not confirmed.
+        """
+        validated = _validate_path(path)
+        if not validated:
+            raise InvalidPath("Cannot delete the environment root")
+        result = await _run_os_env_async(self._os_env.delete, validated, recursive=recursive)
+        if "error" in result:
+            error, code = str(result["error"]), result.get("code")
+            if code == "invalid_path":
+                raise InvalidPath(error)
+            if code == "not_found":
+                raise FilesystemPathNotFound(f"Path {path!r} not found")
+            if code == "directory_not_empty":
+                raise DirectoryNotEmpty(
+                    f"Directory {path!r} is not empty; use recursive=true to delete"
+                )
+            if code == "permission_denied":
+                raise PermissionDenied(f"Delete of {path!r} was refused: {error}")
+            raise ResourceError(f"Delete of {path!r} did not complete: {error}")
+        entry_type = result.get("type")
+        if result.get("deleted") is not True or entry_type not in _DELETED_ENTRY_TYPES:
+            raise ResourceError(f"Delete of {path!r} was not confirmed")
+        bytes_deleted = result.get("bytes_deleted")
+        return DeleteFilesystemResult(
+            path=path,
+            deleted=True,
+            type=cast("Literal['file', 'directory', 'symlink', 'other']", entry_type),
+            bytes_deleted=bytes_deleted if isinstance(bytes_deleted, int) else None,
+        )
 
     async def delete(
         self,
@@ -1531,16 +1596,19 @@ print(json.dumps({'r': results, 't': truncated}))
     ) -> DeleteFilesystemResult:
         """Delete a file or directory via the sandboxed helper.
 
-        :param path: Relative path. Root deletion is rejected.
+        :param path: Relative path within the environment, or an absolute
+            path elsewhere on the filesystem. Root deletion is rejected.
         :param recursive: Allow recursive directory deletion.
         :returns: Delete result.
-        :raises InvalidPath: If attempting to delete the root.
+        :raises InvalidPath: If attempting to delete the root, or a relative
+            path's parent leads out of reach.
         :raises FilesystemPathNotFound: If the path does not exist.
         :raises DirectoryNotEmpty: If non-empty without recursive.
+        :raises ResourceError: If the delete did not complete.
         """
+        if not self._absolute(path):
+            return await self._delete_in_workspace(path, recursive=recursive)
         validated, _direct = self._write_route(path)
-        if not validated:
-            raise InvalidPath("Cannot delete the environment root")
 
         size, is_dir = await self._stat_via_shell(validated)
 
@@ -1551,10 +1619,12 @@ print(json.dumps({'r': results, 't': truncated}))
 
         cmd = f"rm -rf {_shell_quote(validated)}" if is_dir else f"rm -f {_shell_quote(validated)}"
         result = await _run_os_env_async(self._os_env.shell, cmd)
-        if "error" in result and result.get("exit_code", 0) != 0:
-            raise FilesystemPathNotFound(
-                result.get("error", f"Delete failed for {path!r}"),
-            )
+        exit_code = result.get("exit_code")
+        if "error" in result or exit_code != 0:
+            if isinstance(exit_code, int):
+                raise FilesystemPathNotFound(result.get("error") or f"Delete failed for {path!r}")
+            # No exit status: the command never ran, or timed out mid-delete.
+            raise ResourceError(f"Delete of {path!r} did not complete: {result.get('error')}")
 
         return DeleteFilesystemResult(
             path=path,

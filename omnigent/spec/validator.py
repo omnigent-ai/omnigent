@@ -335,6 +335,16 @@ def _validate_mcp_servers(spec: AgentSpec, result: ValidationResult) -> None:
                 result.add(f"{prefix}.args", "not allowed when transport is 'http'")
             if mcp.env:
                 result.add(f"{prefix}.env", "not allowed when transport is 'http'")
+        elif mcp.transport == "registry":
+            if (
+                mcp.url
+                or mcp.headers
+                or mcp.command
+                or mcp.args
+                or mcp.env
+                or mcp.databricks_profile
+            ):
+                result.add(prefix, "registry services cannot override server connection settings")
         elif mcp.transport == "stdio":
             if mcp.command is None:
                 result.add(f"{prefix}.command", "required when transport is 'stdio'")

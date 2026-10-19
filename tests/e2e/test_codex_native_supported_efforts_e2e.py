@@ -2,6 +2,10 @@
 
 Only Responses replies are mocked. The installed Codex binary supplies the
 catalog, runs its app-server and TUI, and sends the recorded HTTP requests.
+Set ``OMNIGENT_TEST_CODEX_STANDARD_MODEL`` to change the low..xhigh model,
+``OMNIGENT_TEST_CODEX_EXTENDED_MODEL`` for max/ultra, and
+``OMNIGENT_TEST_CODEX_SWITCH_MODEL`` for a different default effort.
+All replies stay on the local mock server, including with these overrides.
 Run with ``uv run --no-sync pytest tests/e2e/test_codex_native_supported_efforts_e2e.py -v -s``.
 """
 
@@ -31,6 +35,11 @@ from tests._helpers.live_server import terminate_process
 from tests._helpers.native_session import create_native_session
 from tests._helpers.server_runner import ServerRunner, server_runner
 
+# Keep capability roles explicit: substituting a model must preserve the assertions.
+_STANDARD_MODEL = os.environ.get("OMNIGENT_TEST_CODEX_STANDARD_MODEL", "gpt-5.5")
+_EXTENDED_MODEL = os.environ.get("OMNIGENT_TEST_CODEX_EXTENDED_MODEL", "gpt-6-sol")
+_SWITCH_MODEL = os.environ.get("OMNIGENT_TEST_CODEX_SWITCH_MODEL", "gpt-5.6-sol")
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 pytestmark = [
     pytest.mark.posix_only,
@@ -59,6 +68,17 @@ class _Rig:
     def capabilities(self, model: str) -> set[str]:
         row = next((row for row in self.catalog["models"] if row["slug"] == model), None)
         if row is None:
+            if any(
+                os.environ.get(name) == model
+                for name in (
+                    "OMNIGENT_TEST_CODEX_STANDARD_MODEL",
+                    "OMNIGENT_TEST_CODEX_EXTENDED_MODEL",
+                    "OMNIGENT_TEST_CODEX_SWITCH_MODEL",
+                )
+            ):
+                pytest.fail(
+                    f"Configured test model {model!r} is absent from the installed Codex catalog"
+                )
             pytest.skip(f"installed Codex does not advertise {model}")
         return {level["effort"] for level in row["supported_reasoning_levels"]}
 
@@ -85,7 +105,7 @@ def codex_effort_rig(
                             "base_url": f"{mock_llm_server_url}/v1",
                             "api_key": "mock-key",
                             "wire_api": "responses",
-                            "models": {"default": "gpt-5.4"},
+                            "models": {"default": _STANDARD_MODEL},
                         },
                     }
                 },
@@ -369,9 +389,9 @@ def _assert_turn(
 @pytest.mark.parametrize(
     ("model", "requested", "expected"),
     [
-        ("gpt-5.4", "minimal", "low"),
-        ("gpt-5.4", "max", "xhigh"),
-        ("gpt-5.6-sol", "minimal", "low"),
+        (_STANDARD_MODEL, "minimal", "low"),
+        (_STANDARD_MODEL, "max", "xhigh"),
+        (_SWITCH_MODEL, "minimal", "low"),
     ],
 )
 def test_codex_clamps_unsupported_effort(
@@ -394,7 +414,8 @@ def test_codex_clamps_unsupported_effort(
 
 
 @pytest.mark.parametrize(
-    ("model", "effort"), [("gpt-5.4", "xhigh"), ("gpt-6-sol", "max"), ("gpt-6-sol", "ultra")]
+    ("model", "effort"),
+    [(_STANDARD_MODEL, "xhigh"), (_EXTENDED_MODEL, "max"), (_EXTENDED_MODEL, "ultra")],
 )
 def test_codex_preserves_supported_effort(codex_effort_rig: _Rig, model: str, effort: str) -> None:
     """Supported high levels survive both launch and subsequent settings changes."""
@@ -409,56 +430,87 @@ def test_codex_preserves_supported_effort(codex_effort_rig: _Rig, model: str, ef
 def test_codex_model_switch_clamps_inherited_effort(codex_effort_rig: _Rig) -> None:
     """Changing only the model revalidates the existing session's supported max effort."""
     rig = codex_effort_rig
-    assert "max" in rig.capabilities("gpt-6-sol")
-    assert "max" not in rig.capabilities("gpt-5.4")
-    with _session(rig, "gpt-6-sol", "max") as session:
-        _assert_turn(rig, session, "gpt-6-sol", "max")
-        _json(rig.api.patch(f"/v1/sessions/{session.id}", json={"model_override": "gpt-5.4"}))
-        _assert_turn(rig, session, "gpt-5.4", "xhigh")
+    assert "max" in rig.capabilities(_EXTENDED_MODEL)
+    assert "max" not in rig.capabilities(_STANDARD_MODEL)
+    with _session(rig, _EXTENDED_MODEL, "max") as session:
+        _assert_turn(rig, session, _EXTENDED_MODEL, "max")
+        _json(
+            rig.api.patch(f"/v1/sessions/{session.id}", json={"model_override": _STANDARD_MODEL})
+        )
+        _assert_turn(rig, session, _STANDARD_MODEL, "xhigh")
+
+
+def test_codex_model_pick_recreates_closed_terminal(codex_effort_rig: _Rig) -> None:
+    """A model pick restores an exited TUI and keeps the live Codex thread."""
+    rig = codex_effort_rig
+    assert "high" in rig.capabilities("gpt-6-sol")
+    assert "low" in rig.capabilities("gpt-6-astra")
+    with _session(rig, "gpt-6-sol", "high") as session:
+        _assert_turn(rig, session, "gpt-6-sol", "high")
+        original = read_bridge_state(session.bridge)
+        assert original is not None
+        terminal_path = f"/v1/sessions/{session.id}/resources/terminals/{session.terminal['id']}"
+        _json(rig.api.delete(terminal_path))
+        assert rig.api.get(terminal_path).status_code == 404
+
+        _json(
+            rig.api.patch(
+                f"/v1/sessions/{session.id}",
+                json={"model_override": "gpt-6-astra", "reasoning_effort": "low"},
+            )
+        )
+        session.terminal = _json(rig.api.get(terminal_path))
+        recovered = read_bridge_state(session.bridge)
+        assert recovered is not None
+        assert recovered.thread_id == original.thread_id
+        assert recovered.socket_path == original.socket_path
+        _assert_turn(rig, session, "gpt-6-astra", "low", terminal=True)
+        _assert_turn(rig, session, "gpt-6-astra", "low")
 
 
 def test_codex_effort_reset_survives_next_turn(codex_effort_rig: _Rig) -> None:
     """Clearing the picker uses the real model default without restoring the saved effort."""
     rig = codex_effort_rig
-    assert "xhigh" in rig.capabilities("gpt-5.4")
-    with _session(rig, "gpt-5.4", "xhigh") as session:
-        _assert_turn(rig, session, "gpt-5.4", "xhigh")
-        settings = asyncio.run(_native_settings(session, "gpt-5.4"))
+    assert "xhigh" in rig.capabilities(_STANDARD_MODEL)
+    with _session(rig, _STANDARD_MODEL, "xhigh") as session:
+        _assert_turn(rig, session, _STANDARD_MODEL, "xhigh")
+        settings = asyncio.run(_native_settings(session, _STANDARD_MODEL))
         default = settings["model"]["defaultReasoningEffort"]
         assert default != "xhigh", "Reset must select a different effort than the prior setting"
         # REST's default selection forwards an explicit effort:null to the native runner.
         _json(rig.api.patch(f"/v1/sessions/{session.id}", json={"reasoning_effort": "default"}))
-        _assert_turn(rig, session, "gpt-5.4", default, terminal=True)
-        _assert_turn(rig, session, "gpt-5.4", default)
+        _assert_turn(rig, session, _STANDARD_MODEL, default, terminal=True)
+        _assert_turn(rig, session, _STANDARD_MODEL, default)
 
 
 def test_codex_combined_model_and_reset_uses_target_default(codex_effort_rig: _Rig) -> None:
     """A combined public update selects the new model's real advertised default."""
     rig = codex_effort_rig
-    supported = rig.capabilities("gpt-5.6-sol")
-    with _session(rig, "gpt-5.4", "xhigh") as session:
-        _assert_turn(rig, session, "gpt-5.4", "xhigh")
-        previous = asyncio.run(_native_settings(session, "gpt-5.4"))["model"]
-        target = asyncio.run(_native_settings(session, "gpt-5.6-sol"))["model"]
+    supported = rig.capabilities(_SWITCH_MODEL)
+    assert "xhigh" in rig.capabilities(_STANDARD_MODEL)
+    with _session(rig, _STANDARD_MODEL, "xhigh") as session:
+        _assert_turn(rig, session, _STANDARD_MODEL, "xhigh")
+        previous = asyncio.run(_native_settings(session, _STANDARD_MODEL))["model"]
+        target = asyncio.run(_native_settings(session, _SWITCH_MODEL))["model"]
         default = target["defaultReasoningEffort"]
         assert previous["defaultReasoningEffort"] != default
         assert previous["defaultReasoningEffort"] in supported
         _json(
             rig.api.patch(
                 f"/v1/sessions/{session.id}",
-                json={"model_override": "gpt-5.6-sol", "reasoning_effort": "default"},
+                json={"model_override": _SWITCH_MODEL, "reasoning_effort": "default"},
             )
         )
-        _assert_turn(rig, session, "gpt-5.6-sol", default, terminal=True)
-        _assert_turn(rig, session, "gpt-5.6-sol", default)
+        _assert_turn(rig, session, _SWITCH_MODEL, default, terminal=True)
+        _assert_turn(rig, session, _SWITCH_MODEL, default)
 
 
 def test_codex_resume_clamps_persisted_effort(codex_effort_rig: _Rig) -> None:
     """Restart the real runner, resume the same Codex thread, and send from its TUI."""
     rig = codex_effort_rig
-    assert "minimal" not in rig.capabilities("gpt-5.4")
-    with _session(rig, "gpt-5.4", "medium") as session:
-        _assert_turn(rig, session, "gpt-5.4", "medium")
+    assert "minimal" not in rig.capabilities(_STANDARD_MODEL)
+    with _session(rig, _STANDARD_MODEL, "medium") as session:
+        _assert_turn(rig, session, _STANDARD_MODEL, "medium")
         original = read_bridge_state(session.bridge)
         assert original is not None
         terminate_process(rig.stack.runner)
@@ -478,4 +530,4 @@ def test_codex_resume_clamps_persisted_effort(codex_effort_rig: _Rig) -> None:
         assert resumed is not None
         assert resumed.socket_path != original.socket_path, "A new app-server must own the resume"
         assert resumed.thread_id == original.thread_id, "Resume must retain the existing thread"
-        _assert_turn(rig, session, "gpt-5.4", "low", terminal=True)
+        _assert_turn(rig, session, _STANDARD_MODEL, "low", terminal=True)

@@ -8,7 +8,10 @@ import pytest
 
 from omnigent.debug_logging import record_to_row
 from omnigent.runtime import pending_inputs, session_stream
-from omnigent.server.routes._sessions.orchestration import _persist_external_conversation_item
+from omnigent.server.routes._sessions.orchestration import (
+    _persist_external_conversation_item,
+    _record_native_input_lifecycle,
+)
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
@@ -79,6 +82,8 @@ async def test_skipped_message_logs_committed_ids_once_and_keeps_enqueue_identit
     assert lost["delivery_attempt_id"] == before["delivery_attempt_id"]
     assert lost["input_enqueued_at_ms"] == str(before["input_enqueued_at_ms"])
     assert lost["last_delivery_stage"] == "forward_accepted"
+    assert lost["cause_class"] == "unknown"
+    assert lost["reason_code"] == "no_identity_linked_lifecycle"
     assert int(lost["pending_age_ms"]) >= 0
     assert saved[lost["error_item_id"]].data.code == "native_prompt_not_recorded"
     assert saved[lost["error_item_id"]].response_id == lost["response_id"]
@@ -118,6 +123,92 @@ async def test_skipped_message_logs_committed_ids_once_and_keeps_enqueue_identit
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "cause_class", "reason_code"),
+    [
+        ("completed", "accepted_missing_native_record", "completed_without_native_record"),
+        ("cancelled", "interrupted_or_lifecycle", "response_cancelled"),
+        ("incomplete", "interrupted_or_lifecycle", "response_incomplete"),
+    ],
+)
+async def test_lifecycle_without_a_native_record_has_a_stable_cause_class(
+    db_uri: str,
+    caplog: pytest.LogCaptureFixture,
+    outcome: str,
+    cause_class: str,
+    reason_code: str,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Test", labels={"omnigent.wrapper": "codex-native"})
+    first = pending_inputs.record(
+        conv.id,
+        [{"type": "input_text", "text": "missing"}],
+        stable_id="a" * 32,
+        background_titles_enabled=False,
+    )
+    second = pending_inputs.record(
+        conv.id,
+        [{"type": "input_text", "text": "later"}],
+        stable_id="b" * 32,
+        background_titles_enabled=False,
+    )
+    _record_native_input_lifecycle(
+        conv.id,
+        {
+            "type": "response.in_progress",
+            "input_stable_id": "a" * 32,
+            "response": {"id": "resp_missing"},
+        },
+    )
+    _record_native_input_lifecycle(
+        conv.id,
+        {
+            "type": f"response.{outcome}",
+            "input_stable_id": "a" * 32,
+            "response": {"id": "resp_missing"},
+        },
+    )
+    assert pending_inputs.has_pending(conv.id)
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(conv.id)] == [
+        first,
+        second,
+    ]
+    caplog.set_level(logging.INFO)
+
+    await _persist_external_conversation_item(
+        conv.id,
+        conv,
+        SessionEventInput(
+            type="external_conversation_item",
+            data={
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "later"}],
+                },
+                "response_id": "resp_later",
+                "source_id": "codex:later-record:0",
+            },
+        ),
+        store,
+    )
+
+    [record] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "native_input_settled"
+        and record.attributes.get("pending_id") == first
+    ]
+    assert record.attributes["outcome"] == "skipped_without_native_record"
+    assert record.attributes["cause_class"] == cause_class
+    assert record.attributes["reason_code"] == reason_code
+    assert record.attributes["lifecycle_response_id"] == "resp_missing"
+    saved = {item.id: item for item in store.list_items(conv.id).data}
+    assert saved[record.attributes["item_id"]].data.content[0]["text"] == "missing"
+    assert saved[record.attributes["error_item_id"]].data.code == "native_prompt_not_recorded"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("interrupted", [False, True])
 async def test_uncertain_or_interrupted_input_does_not_report_missing_message(
     db_uri: str, caplog: pytest.LogCaptureFixture, interrupted: bool
@@ -144,6 +235,10 @@ async def test_uncertain_or_interrupted_input_does_not_report_missing_message(
     )
     original = pending_inputs.delivery_attributes_for(conv.id, uncertain)
     if interrupted:
+        _record_native_input_lifecycle(
+            conv.id,
+            {"type": "response.cancelled", "input_stable_id": "b" * 32},
+        )
         pending_inputs.mark_interrupted(conv.id, [uncertain])
     caplog.set_level(logging.INFO)
     await _persist_external_conversation_item(
@@ -208,6 +303,12 @@ async def test_uncertain_or_interrupted_input_does_not_report_missing_message(
     assert attrs["matched_pending_id"] == last
     assert attrs["matched_response_id"] == "resp_later"
     assert attrs["match_method"] == "normalized_text"
+    assert attrs["cause_class"] == (
+        "interrupted_or_lifecycle" if interrupted else "reconciliation_ambiguity"
+    )
+    assert attrs["reason_code"] == (
+        "response_cancelled" if interrupted else "prior_fifo_attribution"
+    )
     saved = {item.id: item for item in store.list_items(conv.id).data}
     assert len(saved) == 2
     assert saved[later_id].response_id == attrs["matched_response_id"]

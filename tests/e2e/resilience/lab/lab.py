@@ -164,10 +164,11 @@ def wait_for(predicate: Callable[[], T | None], *, timeout: float, what: str) ->
         time.sleep(_POLL_S)
 
 
-def _free_port() -> int:
+@contextlib.contextmanager
+def _reserve_port() -> Iterator[socket.socket]:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+        yield sock
 
 
 def _write_yaml(path: Path, value: dict[str, Any]) -> None:
@@ -195,8 +196,6 @@ class Lab:
         self.host_name = f"resilience-lab-{self.host_id[:8]}"
         self.runner_id: str | None = None
         self._loop = LoopThread()
-        self._server_port = _free_port()
-        self._model_port = _free_port()
         self._tunnel_token = secrets.token_urlsafe(32)
         self._tls = TlsInterceptor(self.root / "tls")
         self._processes: list[ManagedProcess] = []
@@ -208,6 +207,12 @@ class Lab:
         self.model: MockModel | None = None
         self.client: httpx.Client | None = None
         self.observer: httpx.Client | None = None
+        with contextlib.ExitStack() as ports:
+            self._server_port_reservation = ports.enter_context(_reserve_port())
+            self._model_port_reservation = ports.enter_context(_reserve_port())
+            self._server_port = int(self._server_port_reservation.getsockname()[1])
+            self._model_port = int(self._model_port_reservation.getsockname()[1])
+            self._port_reservations = ports.pop_all()
 
     # ── lifecycle ────────────────────────────────────────────────
 
@@ -240,6 +245,7 @@ class Lab:
 
     def stop(self) -> None:
         """Stop every process, proxy and client; keep :attr:`root` for inspection."""
+        self._port_reservations.close()
         for client in self._clients:
             client.close()
         self._clients.clear()
@@ -597,6 +603,8 @@ class Lab:
 
     def _start_model(self) -> None:
         env = self._base_env()
+        # The lab's proxies have bound their listeners before this release.
+        self._model_port_reservation.close()
         self._spawn(
             "model",
             [sys.executable, "-m", "tests.e2e.resilience.lab.model_server", str(self._model_port)],
@@ -645,6 +653,7 @@ class Lab:
             "--config",
             str(config_home / "server.yaml"),
         ]
+        self._server_port_reservation.close()
         self._server = self._spawn("server", argv, env)
         self._wait_server_healthy()
 

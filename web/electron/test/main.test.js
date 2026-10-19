@@ -146,6 +146,7 @@ function loadNavigationHarness({
   arcaPath = null,
   arcaResult = { ok: true, alreadyRunning: false },
   arcaExtendResult = { ok: true, shutdownAt: null },
+  dbcertRefreshResult = { ok: true },
   arcaLoginResult = { ok: true },
   arcaConsentResult,
   loadServer = async () => {},
@@ -181,6 +182,7 @@ function loadNavigationHarness({
     reloads: 0,
     arcaConnects: [],
     arcaExtends: [],
+    dbcertRefreshes: 0,
     arcaConsentRuns: [],
     cookiesSet: [],
     oidc: { refresh: 0, signIn: 0, signOut: 0 },
@@ -451,6 +453,12 @@ function loadNavigationHarness({
       runArcaExtend: async (mode) => {
         calls.arcaExtends.push(mode);
         return typeof arcaExtendResult === "function" ? arcaExtendResult(mode) : arcaExtendResult;
+      },
+      runDbcertRefresh: async () => {
+        calls.dbcertRefreshes += 1;
+        return typeof dbcertRefreshResult === "function"
+          ? dbcertRefreshResult()
+          : dbcertRefreshResult;
       },
       isExecutableFile: (p) => p === arcaPath,
       startArcaConnect: (url) => {
@@ -727,6 +735,7 @@ describe("Arca extend IPC", () => {
       {
         databricksInternalFeatures: true,
         canExtendArca: true,
+        canRefreshDbcert: true,
         arcaPreviewRecovery: true,
       },
     );
@@ -766,6 +775,62 @@ describe("Arca extend IPC", () => {
     assert.equal((await h.ipc.get("omnigent:arca-extend")(event, "overnight")).ok, false);
     assert.deepEqual(h.calls.arcaExtends, []);
   });
+});
+
+describe("dbcert refresh IPC", () => {
+  const serverUrl = "https://workspace.cloud.databricks.com/omnigent";
+
+  it("shares one sign-in between concurrent clicks", async (t) => {
+    let finish;
+    const pending = new Promise((resolve) => {
+      finish = resolve;
+    });
+    const h = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      dbcertRefreshResult: () => pending,
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const refresh = h.ipc.get("omnigent:dbcert-refresh");
+    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+    const first = refresh(event);
+    const second = refresh(event);
+    finish({ ok: true });
+    assert.deepEqual(await Promise.all([first, second]), [{ ok: true }, { ok: true }]);
+    assert.equal(h.calls.dbcertRefreshes, 1);
+    assert.deepEqual(await refresh(event), { ok: true });
+    assert.equal(h.calls.dbcertRefreshes, 2);
+  });
+
+  it("refuses pages other than the connected server's", async (t) => {
+    const h = loadNavigationHarness({ serverUrl, internalFeatures: true });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    await assert.rejects(
+      h.ipc.get("omnigent:dbcert-refresh")({
+        sender: h.webContents,
+        senderFrame: { url: "https://evil.example" },
+      }),
+      /connected server page/,
+    );
+    assert.equal(h.calls.dbcertRefreshes, 0);
+  });
+
+  for (const [what, options] of [
+    ["a local server", { serverUrl: "http://localhost:6767", internalFeatures: true }],
+    ["a machine without Databricks-internal features", { serverUrl }],
+  ]) {
+    it(`refuses ${what}`, async (t) => {
+      const h = loadNavigationHarness(options);
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      const event = { sender: h.webContents, senderFrame: { url: h.webContents.getURL() } };
+      assert.equal(h.ipc.get("omnigent:get-desktop-features")(event).canRefreshDbcert, false);
+      assert.equal((await h.ipc.get("omnigent:dbcert-refresh")(event)).ok, false);
+      assert.equal(h.calls.dbcertRefreshes, 0);
+    });
+  }
 });
 
 describe("Arca auto-connect wiring", () => {
@@ -1921,6 +1986,35 @@ describe("Databricks auth mode wiring", () => {
     assert.deepEqual(h.calls.loadURL, [[workspace]]);
     assert.deepEqual(h.calls.manifests, [workspace]);
     assert.equal(h.api.windows.get(h.win).origin, new URL(workspace).origin);
+  });
+
+  it("attributes an account-first landing failure to the resolved workspace", async (t) => {
+    const events = [];
+    t.mock.method(require("../src/diagnostics").diagnostics, "record", (...args) =>
+      events.push(args),
+    );
+    const account = "https://accounts.cloud.databricks.com/omnigent";
+    const h = loadNavigationHarness({
+      serverUrl: account,
+      databricksMode: "browser",
+      ensureSession: async () => new URL(workspace).origin,
+      loadURL: async () => {
+        throw new Error("landing failed");
+      },
+    });
+    t.after(h.cleanup);
+    await assert.rejects(
+      h.api.loadServerUrl(h.win, account, undefined, { interactive: true }),
+      /landing failed/,
+    );
+    assert.ok(
+      events.some(
+        ([event, fields]) =>
+          event === "connection_result" &&
+          fields.outcome === "failed" &&
+          fields.origin === new URL(workspace).origin,
+      ),
+    );
   });
 
   it("reports authentication and cancels only the owning setup window's matching request", async (t) => {
@@ -3710,7 +3804,12 @@ describe("browser-view teardown on server change (src/main.js)", () => {
           }),
         ),
       ),
-      { databricksInternalFeatures: true, canExtendArca: true, arcaPreviewRecovery: true },
+      {
+        databricksInternalFeatures: true,
+        canExtendArca: true,
+        canRefreshDbcert: true,
+        arcaPreviewRecovery: true,
+      },
     );
   });
 

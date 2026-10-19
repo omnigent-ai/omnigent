@@ -9,6 +9,7 @@ import uuid
 from omnigent.process_logging import redact_log_text
 
 FailureContext = dict[str, str | int | float | bool]
+_PROVIDER_ERROR_TEXT_LIMIT = 16384
 
 _TEXT_FIELDS = frozenset(
     {
@@ -42,6 +43,10 @@ _TEXT_FIELDS = frozenset(
         "diagnostic_capture_state",
         "diagnostic_launch_id",
         "diagnostic_read_error_kind",
+        "exception_type",
+        "exception_cause_type",
+        "exception_context_type",
+        "native_launch_os_errno_name",
     }
 )
 _BOOL_FIELDS = frozenset(
@@ -61,6 +66,8 @@ _INT_FIELDS = frozenset(
         "diagnostic_read_offset",
         "diagnostic_lines_omitted",
         "diagnostic_bytes_omitted",
+        "native_launch_os_errno",
+        "native_launch_winerror",
     }
 )
 _TIME_FIELDS = frozenset({"native_hook_recorded_at", "diagnostic_last_read_at"})
@@ -126,6 +133,61 @@ def failure_log_attributes(value: object) -> dict[str, str]:
             field for field in _AVAILABILITY_FIELDS if field not in result
         )
     return {key: str(field_value) for key, field_value in result.items()}
+
+
+def provider_error_fields(error: object) -> FailureContext:
+    """Read typed provider fields without retaining its message or unrelated keys."""
+    if not isinstance(error, dict):
+        return {}
+    return normalize_failure_context(
+        {
+            "provider_error_type": error.get("type"),
+            "provider_error_code": error.get("code")
+            if error.get("code") is not None
+            else error.get("error_code"),
+            "provider_error_param": error.get("param"),
+        }
+    )
+
+
+def provider_error_context_from_text(text: object) -> FailureContext:
+    """Read at most three explicit provider/gateway error envelopes from bounded JSON."""
+    if not isinstance(text, str) or len(text) > _PROVIDER_ERROR_TEXT_LIMIT:
+        return {}
+    pending = text.strip()
+    context: FailureContext = {}
+    for _ in range(3):
+        if not pending.startswith("{"):
+            break
+        try:
+            envelope = json.loads(pending)
+        except (ValueError, RecursionError):
+            break
+        if not isinstance(envelope, dict):
+            break
+        error = envelope.get("error")
+        if not isinstance(error, dict):
+            if "error_code" not in envelope:
+                break
+            error = envelope
+        context.update(provider_error_fields(error))
+        context.update(
+            normalize_failure_context(
+                {
+                    "http_status": envelope.get("status_code", envelope.get("status")),
+                    "native_error_request_id": envelope.get("request_id"),
+                    "gateway_request_id": envelope.get("gateway_request_id"),
+                    "provider_request_id": envelope.get("provider_request_id"),
+                }
+            )
+        )
+        nested = error.get("message")
+        if not isinstance(nested, str) or len(nested) > _PROVIDER_ERROR_TEXT_LIMIT:
+            break
+        pending = nested.strip()
+    if context:
+        context["inference_detail_source"] = "provider_error_json"
+    return context
 
 
 def native_failure_id(source: str, *identity: str | int | float | None) -> str:
