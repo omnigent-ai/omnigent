@@ -310,6 +310,8 @@ _DIALOG_FOOTER_RE = re.compile(
 )
 # Lines scanned for a dialog when no box rule anchors the region.
 _DIALOG_SCAN_TAIL_LINES = 15
+# A selection dialog's highlighted option, e.g. ``❯ 1. Yes``.
+_NUMBERED_SELECTOR_RE = re.compile(rf"{_CLAUDE_PROMPT_GLYPH}\s*\d+\.")
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _CLAUDE_LIVENESS_POLL_INTERVAL_S = 1.0
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
@@ -5729,9 +5731,11 @@ def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
 
 
 def _user_prompt_visible(pane: str) -> bool:
-    """Recognize a native decision dialog, excluding text above a mounted composer."""
-    if not pane.strip() or _composer_row(pane) is not None:
+    """Recognize a native decision dialog, excluding stale text above a mounted composer."""
+    if not pane.strip():
         return False
+    if _composer_row(pane) is not None:
+        return _selection_dialog_above_composer(pane)
     lines = [line for line in pane.splitlines() if line.strip()]
     rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
     region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
@@ -6071,18 +6075,62 @@ def _composer_row(pane: str) -> str | None:
         mode, or ``None`` when no input box is on screen.
     """
     non_empty = [line for line in pane.splitlines() if line.strip()]
+    idx = _composer_row_index(non_empty)
+    return None if idx is None else non_empty[idx]
+
+
+def _composer_row_index(non_empty: list[str]) -> int | None:
+    """Return the index of :func:`_composer_row` within the pane's non-empty lines."""
     rules = [idx for idx, line in enumerate(non_empty) if _is_box_rule(line)]
     if not rules:
         return None
     candidates = [rules[-2] + 1] if len(rules) >= 2 else []
     candidates.append(rules[-1] + 1)
     for idx in candidates:
-        if idx >= len(non_empty):
-            continue
-        row = non_empty[idx]
-        if row.strip()[:1] in _COMPOSER_MODE_GLYPHS:
-            return row
+        if idx < len(non_empty) and non_empty[idx].strip()[:1] in _COMPOSER_MODE_GLYPHS:
+            return idx
     return None
+
+
+def _selection_dialog_above_composer(pane: str) -> bool:
+    """
+    Return whether a selection dialog owns the keyboard above a framed composer.
+
+    Claude Code draws some offers, such as auto-mode setup, above an input box
+    that stays framed. Only a short band under a rule as wide and as indented
+    as the composer's frame counts, and only when it ends in the dialog footer
+    and holds a numbered ``❯`` option. A dialog quoted in the transcript is
+    indented or narrower, so it does not line up with the frame.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when such a dialog is live.
+    """
+    non_empty = [line for line in pane.splitlines() if line.strip()]
+    row = _composer_row_index(non_empty)
+    if row is None:
+        return False
+    opening_rule = row - 1
+    frame = [non_empty[opening_rule], *filter(_is_box_rule, non_empty[row + 1 :])]
+    dialog_rule = next(
+        (idx for idx in range(opening_rule - 1, -1, -1) if _is_box_rule(non_empty[idx])),
+        None,
+    )
+    if dialog_rule is None or _rule_span(non_empty[dialog_rule]) not in map(_rule_span, frame):
+        return False
+    band = non_empty[dialog_rule + 1 : opening_rule]
+    return (
+        0 < len(band) <= _DIALOG_SCAN_TAIL_LINES
+        and _DIALOG_FOOTER_RE.search(band[-1]) is not None
+        and any(_NUMBERED_SELECTOR_RE.match(line.strip().lstrip("│ ")) for line in band)
+    )
+
+
+def _rule_span(line: str) -> tuple[int, int]:
+    """Return a pane line's starting column and its display width without surrounding blanks."""
+    # Imported here so the per-tool-call hooks that import this module stay free of rich.
+    from rich.cells import cell_len
+
+    return len(line) - len(line.lstrip()), cell_len(line.strip())
 
 
 def _claude_prompt_rendered(pane: str) -> bool:

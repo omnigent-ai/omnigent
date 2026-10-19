@@ -32,6 +32,30 @@ _PERMISSION = """\
 ╰──────────────────────────────────────────────────────────╯
 """
 _COMPOSER = "\n──────────────────────────────\n❯\n──────────────────────────────\n"
+# Claude Code 2.1.283 draws this post-turn offer above the still-framed, empty input box.
+_AUTO_MODE_SETUP_OFFER = """\
+❯ please say hello
+
+● Mock LLM response
+
+✻ Cooked for 1s · done 5:45 PM
+
+────────────────────────────────────────────────────────────────────────────────
+  Teach auto mode about your environment?
+
+  Auto mode works better when it knows your environment. Takes about a minute.
+
+  ❯ 1. Yes
+    2. Not now
+    3. Don't show again
+
+  Enter to confirm · Esc to cancel
+────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────
+
+  ⏵⏵ auto mode on (shift+tab to cycle)
+"""
 
 
 @pytest.fixture
@@ -70,13 +94,17 @@ def test_live_hook_protects_a_prompt_even_during_a_torn_capture(
         _QUESTION,
         _QUESTION.replace("Enter to select", "Space to select · Enter to submit"),
         _PERMISSION,
+        _AUTO_MODE_SETUP_OFFER,
+        # A wide-character session title shortens the composer's opening rule as a string.
+        _AUTO_MODE_SETUP_OFFER.replace("─" * 80 + "\n❯", "─" * 73 + " 会话 ─\n❯"),
+        _AUTO_MODE_SETUP_OFFER.replace("─" * 80 + "\n❯\n" + "─" * 80, "─" * 73 + " 会话 ─\n❯"),
     ],
 )
 @pytest.mark.parametrize("operation", ["message", "settings"])
 def test_terminal_fallback_prompt_receives_no_injected_keystrokes(
     native_bridge: Path, monkeypatch: pytest.MonkeyPatch, pane: str, operation: str
 ) -> None:
-    """A hook may have timed out; its still-visible native prompt remains protected."""
+    """A still-visible native prompt stays protected without a live hook."""
     sent = []
     monkeypatch.setattr(bridge, "_capture_pane", lambda *_: pane)
     monkeypatch.setattr(bridge, "_run_tmux", lambda *args: sent.append(args))
@@ -91,7 +119,22 @@ def test_terminal_fallback_prompt_receives_no_injected_keystrokes(
     assert sent == []
 
 
-@pytest.mark.parametrize("pane", [_QUESTION, _PERMISSION])
+@pytest.mark.parametrize(
+    "pane",
+    [
+        _QUESTION,
+        _PERMISSION,
+        "❯ 1. refactor X\n● Press Enter to continue.\n",
+        "──────────────────────────────\n❯ 1. Yes\n  2. Not now\n"
+        "Enter to confirm · Esc to cancel\n● Mock LLM response\n",
+        "● Captured pane:\n  ────────────\n  ❯ 1. Yes\n  Enter to confirm · Esc to cancel\n",
+        "● Captured pane:\n  ──────────────────────────────\n  ❯ 1. Yes\n"
+        "  Enter to confirm · Esc to cancel\n",
+        "● Captured pane:\n────────────\n  ❯ 1. Yes\n  Enter to confirm · Esc to cancel\n",
+        "──────────────────────────────\n  Teach auto mode about your environment?\n"
+        "Enter to confirm · Esc to cancel\n",
+    ],
+)
 def test_decision_text_above_a_ready_composer_does_not_block_delivery(
     native_bridge: Path, monkeypatch: pytest.MonkeyPatch, pane: str
 ) -> None:
