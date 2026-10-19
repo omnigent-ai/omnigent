@@ -512,6 +512,72 @@ describe("browser local network permissions", () => {
     assert.equal(a.check(), false, "clearing Deny must not revive an older one-visit grant");
   });
 
+  it("lets the current site recover from a saved denial with Allow once", async () => {
+    const saved = storage({ browser_local_network_permissions: { [ORIGIN]: false } });
+    const h = harness({ saved });
+    assert.equal(h.check(), false);
+    assert.equal(h.policy.showForCurrentPage(), true);
+    await tick();
+    assert.equal(h.dialogs.length, 1);
+    assert.equal(h.dialogs[0].origin, ORIGIN);
+    assert.equal(h.check(), false, "opening settings must not grant permission");
+    assert.equal(saved.writes.length, 0);
+    h.respond("allow-once");
+    await tick();
+    assert.equal(h.check(), true);
+    assert.equal(h.wc.reloads, 1);
+    assert.equal(saved.store.get(ORIGIN), undefined, "Allow once must replace a saved denial");
+    const other = harness({ saved, visible: false });
+    assert.equal(other.check(), false, "the new visit grant is private to this browser");
+  });
+
+  for (const granted of [true, false]) {
+    it(`keeps the saved choice ${granted} when site settings are dismissed`, async () => {
+      const saved = storage({ browser_local_network_permissions: { [ORIGIN]: granted } });
+      const h = harness({ saved });
+      assert.equal(h.policy.showForCurrentPage(), true);
+      await tick();
+      h.respond("dismiss");
+      await tick();
+      assert.equal(h.check(), granted);
+      assert.equal(saved.store.get(ORIGIN), granted);
+      assert.equal(saved.writes.length, 0);
+      assert.equal(h.wc.reloads, 0);
+    });
+  }
+
+  it("reopens a dismissed decision without navigation and can revoke a saved grant", async () => {
+    const h = harness();
+    h.check();
+    await tick();
+    h.respond("dismiss");
+    await tick();
+    assert.equal(h.policy.showForCurrentPage(), true);
+    await tick();
+    h.respond("always-allow");
+    await tick();
+    assert.equal(h.check(), true);
+    assert.equal(h.policy.showForCurrentPage(), true);
+    await tick();
+    h.respond("deny");
+    await tick();
+    assert.equal(h.check(), false);
+    assert.equal(h.saved.store.get(ORIGIN), false);
+  });
+
+  it("does not open site settings for a hidden, destroyed, or insecure page", async () => {
+    const h = harness({ visible: false });
+    assert.equal(h.policy.showForCurrentPage(), false);
+    h.setVisible(true);
+    h.navigate("http://login.example.com");
+    assert.equal(h.policy.showForCurrentPage(), false);
+    h.navigate(ORIGIN);
+    h.destroy();
+    assert.equal(h.policy.showForCurrentPage(), false);
+    await tick();
+    assert.equal(h.dialogs.length, 0);
+  });
+
   it("dismissal neither saves a denial nor reloads, and can be retried after navigation", async () => {
     const h = harness();
     const result = h.request();

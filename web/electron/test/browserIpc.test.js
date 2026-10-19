@@ -347,7 +347,12 @@ function makeRegistry(conversationId, webContents) {
 
 /** Register the IPC surface with injectable gate + registry, and capture the
  *  events sent to a fake sender. */
-function setup({ pinned = true, conversationId = "conv_1", webContents } = {}) {
+function setup({
+  pinned = true,
+  conversationId = "conv_1",
+  webContents,
+  showBrowserPermissions,
+} = {}) {
   const ipcMain = makeIpcMain();
   const wc = webContents ?? makeWebContents();
   const registry = makeRegistry(conversationId, wc);
@@ -357,6 +362,7 @@ function setup({ pinned = true, conversationId = "conv_1", webContents } = {}) {
     ipcMain,
     isPinnedOriginSender: () => pinned,
     getRegistryForEvent: () => registry,
+    showBrowserPermissions,
   });
   return { ipcMain, registry, wc, sent, event };
 }
@@ -397,6 +403,7 @@ describe("browserIpc — trust gate", () => {
       "omnigent:browser-go-back",
       "omnigent:browser-go-forward",
       "omnigent:browser-reload",
+      "omnigent:browser-site-permissions",
       "omnigent:open-browser-devtools",
       "omnigent:browser-enable-design-mode",
       "omnigent:browser-disable-design-mode",
@@ -412,6 +419,7 @@ describe("browserIpc — trust gate", () => {
       "omnigent:browser-go-back",
       "omnigent:browser-go-forward",
       "omnigent:browser-reload",
+      "omnigent:browser-site-permissions",
       "omnigent:open-browser-devtools",
       "omnigent:browser-perform-action",
       "omnigent:browser-execute",
@@ -430,6 +438,40 @@ describe("browserIpc — trust gate", () => {
       assert.match(r.error, /connected server's page/);
     });
     assert.deepEqual(wc.scripts, []);
+  });
+});
+
+describe("browser IPC site permissions", () => {
+  it("opens only the selected view's native settings, ignoring renderer-supplied grants", () => {
+    const views = [];
+    const { ipcMain, event, wc } = setup({
+      showBrowserPermissions: (contents) => {
+        views.push(contents);
+        return true;
+      },
+    });
+    const result = ipcMain.invoke("omnigent:browser-site-permissions", event, {
+      conversationId: "conv_1",
+      origin: "https://unrelated.example",
+      decision: "always-allow",
+    });
+    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(views, [wc]);
+    assert.deepEqual(wc.scripts, [], "permission changes must not run site JavaScript");
+    assert.equal(
+      ipcMain.invoke("omnigent:browser-site-permissions", event, { conversationId: "missing" }).ok,
+      false,
+    );
+    assert.equal(views.length, 1);
+  });
+
+  it("reports when the current page cannot show a permission prompt", () => {
+    const { ipcMain, event } = setup({ showBrowserPermissions: () => false });
+    const result = ipcMain.invoke("omnigent:browser-site-permissions", event, {
+      conversationId: "conv_1",
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /permission/i);
   });
 });
 

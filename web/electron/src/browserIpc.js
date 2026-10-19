@@ -262,6 +262,7 @@ function registerBrowserIpc({
   ipcMain,
   isPinnedOriginSender,
   getRegistryForEvent,
+  showBrowserPermissions = () => false,
   getAgentContextForEvent = () => null,
   recoverAgentNavigationForEvent = async () => false,
   getAgentNavigationHintForEvent = () => null,
@@ -502,6 +503,16 @@ function registerBrowserIpc({
       /* destroyed */
     }
     return { ok: true };
+  });
+
+  ipcMain.handle("omnigent:browser-site-permissions", (event, args) => {
+    const g = gateRegistry(event);
+    if (g.error) return { ok: false, error: g.error };
+    const entry = g.registry.get(args?.conversationId);
+    if (!entry) return { ok: false, error: "No browser view" };
+    return showBrowserPermissions(entry.view.webContents)
+      ? { ok: true }
+      : { ok: false, error: "Site permissions are unavailable for this page." };
   });
 
   // ── Toolbar: DevTools toggle ─────────────────────────────────────────────

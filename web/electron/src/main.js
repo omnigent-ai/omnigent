@@ -1649,6 +1649,7 @@ const reconnectOverlay = createReconnectOverlay({
 });
 
 const browserPermissionStore = createBrowserPermissionStore({ loadSettings, saveSettings });
+const browserPermissionPolicies = new WeakMap();
 const browserPermissionPrompt = createBrowserPermissionPrompt({
   BrowserWindow,
   ipcMain,
@@ -3836,6 +3837,7 @@ function createBrowserRegistryForWindow(win) {
       );
       const view = new WebContentsView(opts);
       policy.attach(view.webContents);
+      browserPermissionPolicies.set(view.webContents, policy);
       return view;
     },
     onSuppressionChange: (suppressed) => {
@@ -4906,6 +4908,8 @@ function registerIpc() {
     ipcMain,
     isPinnedOriginSender,
     getRegistryForEvent: browserRegistryForSender,
+    showBrowserPermissions: (contents) =>
+      browserPermissionPolicies.get(contents)?.showForCurrentPage() ?? false,
     getAgentContextForEvent: (event, sourceHostId) => ({
       serverTarget: arcaTarget(windowArcaServerUrl(BrowserWindow.fromWebContents(event.sender))),
       sourceHostId: typeof sourceHostId === "string" ? sourceHostId : null,

@@ -19,6 +19,7 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   RotateCwIcon,
+  SlidersHorizontalIcon,
   SquareDashedMousePointerIcon,
   WrenchIcon,
 } from "lucide-react";
@@ -63,6 +64,7 @@ interface BrowserPaneBridge {
   browserGoBack?: (conversationId: string) => Promise<NavResult>;
   browserGoForward?: (conversationId: string) => Promise<NavResult>;
   browserReload?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
+  browserSitePermissions?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   openBrowserDevTools?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   browserEnableDesignMode?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   browserDisableDesignMode?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
@@ -117,6 +119,7 @@ export function BrowserPane({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const lastBoundsRef = useRef<Bounds | null>(null);
   const browserSupported = supportsBrowser();
+  const sitePermissionsSupported = !!getBridge()?.browserSitePermissions;
   // A detached view still exists; only `active` controls its attachment.
   const [hasView, setHasView] = useState(false);
 
@@ -245,6 +248,18 @@ export function BrowserPane({
   const handleDevTools = useCallback(() => {
     const bridge = getBridge();
     void bridge?.openBrowserDevTools?.(conversationId);
+  }, [conversationId]);
+
+  const handleSitePermissions = useCallback(() => {
+    const bridge = getBridge();
+    if (!bridge?.browserSitePermissions) return;
+    setNavigationError(null);
+    void bridge
+      .browserSitePermissions(conversationId)
+      .then((result) => {
+        if (!result.ok) setNavigationError(result.error ?? "Unable to open site permissions.");
+      })
+      .catch(() => setNavigationError("Unable to open site permissions."));
   }, [conversationId]);
 
   const handleToggleDesignMode = useCallback(() => {
@@ -440,6 +455,18 @@ export function BrowserPane({
         >
           <RotateCwIcon className="size-4" />
         </button>
+        {sitePermissionsSupported && (
+          <button
+            type="button"
+            onClick={handleSitePermissions}
+            disabled={!hasView || !active}
+            aria-label="Site permissions"
+            title="Site permissions: local network access"
+            className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
+          >
+            <SlidersHorizontalIcon className="size-4" />
+          </button>
+        )}
         <input
           type="text"
           value={currentUrl}

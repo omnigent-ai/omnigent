@@ -31,6 +31,7 @@ function installBridge(overrides: Record<string, unknown> = {}) {
     browserGoBack: vi.fn().mockResolvedValue({ ok: true }),
     browserGoForward: vi.fn().mockResolvedValue({ ok: true }),
     browserReload: vi.fn().mockResolvedValue({ ok: true }),
+    browserSitePermissions: vi.fn().mockResolvedValue({ ok: true }),
     openBrowserDevTools: vi.fn().mockResolvedValue({ ok: true }),
     browserEnableDesignMode: vi.fn().mockResolvedValue({ ok: true }),
     browserDisableDesignMode: vi.fn().mockResolvedValue({ ok: true }),
@@ -162,6 +163,7 @@ describe("BrowserPane cold-start (no view yet)", () => {
     await screen.findByRole("textbox", { name: /address bar/i });
     expect(screen.getByRole("button", { name: /reload/i })).toBeDisabled();
     expect(screen.getByRole("button", { name: /toggle devtools/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Site permissions" })).toBeDisabled();
   });
 
   it("disables back and forward while no view is attached", async () => {
@@ -369,6 +371,31 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
     const { bridge } = await renderActive("conv_dt");
     screen.getByRole("button", { name: /toggle devtools/i }).click();
     await waitFor(() => expect(bridge.openBrowserDevTools).toHaveBeenCalledWith("conv_dt"));
+  });
+
+  it("opens site permissions for the current browser without supplying a grant or origin", async () => {
+    const { bridge } = await renderActive("conv_permissions");
+    fireEvent.click(screen.getByRole("button", { name: "Site permissions" }));
+    await waitFor(() =>
+      expect(bridge.browserSitePermissions).toHaveBeenCalledWith("conv_permissions"),
+    );
+  });
+
+  it("hides site permissions on desktop shells without that capability", async () => {
+    await renderActive("conv_legacy", { browserSitePermissions: undefined });
+    expect(screen.queryByRole("button", { name: "Site permissions" })).toBeNull();
+  });
+
+  it("shows a permission error when native site settings cannot open", async () => {
+    await renderActive("conv_permissions_error", {
+      browserSitePermissions: vi
+        .fn()
+        .mockResolvedValue({ ok: false, error: "Site permissions are unavailable for this page." }),
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Site permissions" }));
+    expect(
+      await screen.findByText("Site permissions are unavailable for this page."),
+    ).toBeInTheDocument();
   });
 
   it("back/forward buttons enable when nav-state reports history available", async () => {

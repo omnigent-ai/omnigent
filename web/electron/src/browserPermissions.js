@@ -121,13 +121,13 @@ function registerBrowserPermissions(session, { canPrompt, showPrompt, store }) {
     );
   }
 
-  function ask(ctx, reload) {
+  function ask(ctx, reload, reconsider = false) {
     if (!ctx || !isCurrent(ctx)) return Promise.resolve(false);
     const decision = decisionFor(ctx.origin);
-    if (decision !== undefined) return Promise.resolve(decision);
+    if (!reconsider && decision !== undefined) return Promise.resolve(decision);
     // Visibility gates new consent prompts, not an origin's existing grant.
     if (!canPrompt(contents)) return Promise.resolve(false);
-    if (dismissedGeneration === generation) return Promise.resolve(false);
+    if (!reconsider && dismissedGeneration === generation) return Promise.resolve(false);
     if (pending) {
       return pending.origin === ctx.origin && pending.generation === ctx.generation
         ? pending.result
@@ -154,7 +154,9 @@ function registerBrowserPermissions(session, { canPrompt, showPrompt, store }) {
           store.set(ctx.origin, choice === "always-allow");
           visits.delete(ctx.origin);
         } else if (choice === "allow-once") {
-          visits.set(ctx.origin, { granted: true, revision: request.storeRevision });
+          // A new visit choice replaces a saved allow or deny only after consent.
+          if (store.get(ctx.origin) !== undefined) store.set(ctx.origin, undefined);
+          visits.set(ctx.origin, { granted: true, revision: store.revision(ctx.origin) });
         } else {
           dismissedGeneration = generation;
           return false;
@@ -207,6 +209,15 @@ function registerBrowserPermissions(session, { canPrompt, showPrompt, store }) {
   }
 
   return {
+    showForCurrentPage() {
+      if (!contents || contents.isDestroyed() || !canPrompt(contents)) return false;
+      // The toolbar opens a prompt for the actual top-level page, never an
+      // origin or permission decision supplied by the renderer.
+      const ctx = context(contents, contents.getURL(), { isMainFrame: true });
+      if (!ctx) return false;
+      void ask(ctx, true, true);
+      return true;
+    },
     attach(webContents) {
       if (contents) throw new Error("Browser permission policy is already attached");
       contents = webContents;

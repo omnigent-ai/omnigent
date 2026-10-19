@@ -86,6 +86,9 @@ the header menu), and each place is a separate entry point.
 - `browser-storage`: browser soft tabs, including one opened by the agent, share
   cookies within a session; different sessions stay isolated. Navigation stays
   per-tab.
+- `browser-permissions`: the desktop browser's Site permissions control reopens
+  local network consent after a denied or dismissed request, without granting
+  access until the user chooses an allow option.
 - `canvas-workspace`: Canvas collapses the shared sidebar on entry; clicking a
   card opens its session beside the project board. Switching cards keeps
   drafts and board state; resize, focus, and close controls adjust the split.
@@ -285,6 +288,9 @@ does not send a message; enter a question and send when ready.
 **Desktop browser:** choose **+ → Browser** in the Workspace panel or press
 ⌘/Ctrl+Alt+B. Agent browser requests and chat links with in-app opening enabled
 create or select a closable Browser soft tab automatically.
+In the visible tab, choose **Site permissions** beside the address bar to
+reconsider its local network access. Both user-opened and agent-opened tabs
+have this toolbar; the permission choice is made in a native popover.
 
 **Desktop recent sessions:** hold Control and press Tab to open the five most
 recent sessions. Continue pressing Tab (or Shift+Tab) to cycle, release Control
@@ -601,6 +607,15 @@ plain `uv run pytest`, which starts a private server for the test.
   tab, open it in another tab and the agent browser, and confirm both are signed
   in. Another session should be signed out. Log out and refresh the same-session
   tabs; all should be signed out.
+- **`browser-permissions`, + → Browser (real Electron, own environment):**
+  `web/electron/e2e/desktop_browser_permissions.e2e.js` drives a real Chromium
+  permission query, Deny/Dismiss, Site permissions, and explicit approval. It
+  checks that no device request occurs before consent and that approval reloads
+  the page and connects to the test-owned loopback endpoint. Use the command in
+  `web/electron/e2e/README.md`. Keyboard-, agent-, and chat-link-opened tabs use
+  the same toolbar but are not separate permission E2E journeys: repeat those
+  routes manually and expect the same native prompt and reload. IPC, policy,
+  and component tests cover current-view targeting and unsupported shells.
 - **`canvas-workspace` (sidebar entry, project cards, chat, focus, and history):**
   `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_keeps_board_drafts_and_sidebar_while_switching_sessions`.
   Workspace open/close, independent focus, maximizing, and pane sizing on wide
@@ -700,6 +715,11 @@ plain `uv run pytest`, which starts a private server for the test.
 
 - Browser storage sharing is limited to one desktop window and app run;
   restarting the app clears it. Closing an individual tab does not.
+- Local network permission is separate from cookies. Saved Allow/Deny choices
+  apply across conversations and restarts; Allow once belongs to a tab's visit.
+  Reopening or dismissing Site permissions must not change the saved decision.
+  The desktop permission test does not prove live Okta Verify authentication,
+  bypass CORS or TLS, or test macOS's own local-network permission.
 - Archive and unarchive exist on the row, in bulk selection, and in the header
   menu. A fix to one of these does not reach the others; check each, and check
   that the undo toast restores the session.

@@ -124,6 +124,35 @@ into the nearby floating editor, and confirm the field remains `W41`. Escape
 should close only the editor. Reopen it and use Send or Enter to submit an
 instruction to chat. No instruction bar should appear below the browser URL.
 
+## Recovering local network permission
+
+`desktop_browser_permissions.e2e.js` opens a Browser tab through the real SPA
+and exercises Chromium's `loopback-network` permission with the native consent
+popover. Two journeys recover through **Site permissions** after **Deny** and
+**Dismiss**, then approve **Allow once** and **Always allow**, respectively.
+The test-owned sign-in page makes a real cross-origin loopback request only
+after consent. No permission answers are mocked. The test verifies that opening
+the popover alone does not grant access and that approval reloads the page.
+
+Build the SPA and overlays as above, then run from the repository root:
+
+```bash
+OMNIGENT_PYTHON="$PWD/.venv/bin/python" \
+  OMNIGENT_DESKTOP_RECORD_DIR=/tmp/omnigent-browser-permissions-evidence \
+  node --test --test-concurrency=1 web/electron/e2e/desktop_browser_permissions.e2e.js
+```
+
+On headless Linux, set `OMNIGENT_PW_NO_SANDBOX=1` and prefix `node` with
+`xvfb-run -a`. This test owns its server, runner, mock model, desktop profile,
+and device endpoint; do not launch a second repro environment. Recordings and
+screenshots are retained under `deny/` and `dismiss/` in the evidence directory.
+It does not exercise a live identity provider or an installed Okta Verify app.
+
+Human check: when an embedded sign-in reports blocked local network access,
+click the sliders icon beside the address bar, choose **Allow once** or
+**Always allow**, and confirm the page reloads and retries device verification.
+Also dismiss the reopened prompt and confirm access remains blocked.
+
 ## Authoring a desktop reproduction
 
 For macOS titlebar clearance, build the SPA and run

@@ -590,11 +590,17 @@ Electron's permission-check API returns only allowed/denied, not Chrome's
 reload hint and either allow button reloads the page to retry. If a background
 page already stopped its sign-in flow, bring its pane into view and reload.
 
+To change a saved choice or reopen a dismissed request, click **Site permissions**
+(the sliders icon beside the address bar). This reopens the same trusted popover
+for the current page. Opening or dismissing it does not change the existing
+decision; choosing an allow option reloads the page. **Allow once** replaces a
+saved decision with a grant for this visit only. The control requires a desktop
+shell that supports site permissions; older shells do not show it.
+
 Saved choices live in `settings.json` under `browser_local_network_permissions`
-(origin → boolean). To reset a saved choice, quit the app, remove that origin's
-entry, and reopen it. These choices do not change cookie/storage isolation or
-the shell's own sign-in window policy. Camera, microphone, notifications, and
-other browser permissions remain denied.
+(origin → boolean). These choices do not change cookie/storage isolation or the
+shell's own sign-in window policy. Camera, microphone, notifications, and other
+browser permissions remain denied.
 
 This controls Chromium's local-network permission answers, **not a network
 firewall**: Electron versions may not gate every local-network fetch on this

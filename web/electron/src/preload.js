@@ -366,6 +366,9 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   browserReload: (conversationId) =>
     ipcRenderer.invoke("omnigent:browser-reload", { conversationId }),
+  /** Open the trusted local network permission prompt for this view's site. */
+  browserSitePermissions: (conversationId) =>
+    ipcRenderer.invoke("omnigent:browser-site-permissions", { conversationId }),
   /**
    * Toggle Chrome DevTools (docked bottom) for the conversation's view.
    * @param {string} conversationId
