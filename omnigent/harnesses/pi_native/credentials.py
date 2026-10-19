@@ -451,16 +451,10 @@ def _read_json_object(path: Path) -> dict[str, object]:
 
 
 def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str, object]]:
-    """Enumerate the models Pi's own login can use (the unmanaged fallback).
+    """List Pi's logged-in and keyed custom models for the prelaunch picker.
 
-    When no omnigent-managed provider is configured, the launched Pi runs on
-    its own credentials, so the pre-launch picker must offer the models that
-    login can actually drive: Pi's ``models-store.json`` catalog filtered to
-    providers with an ``auth.json`` entry, plus the models declared in Pi's
-    ``models.json`` for the providers Pi activates there — logged-in ones and
-    custom endpoints carrying their own ``apiKey``, which never appear in
-    ``auth.json`` or ``models-store.json``. Providers reusing Omnigent's managed
-    ids are skipped: the own-login launch path reads those prefixes as managed.
+    Declared models.json entries override cached names. Reserved Omnigent
+    provider IDs are excluded because own-login launch strips their prefixes.
 
     :param agent_dir: Pi agent dir override (tests); defaults to the host's
         own Pi agent dir.

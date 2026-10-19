@@ -3524,12 +3524,7 @@ def test_pi_own_login_options_skip_custom_providers_without_a_credential(
 
 
 def test_pi_own_login_options_skip_providers_reusing_managed_ids(tmp_path: Path) -> None:
-    """Providers named like a managed id are left out of both catalogs.
-
-    ``pi_own_login_model_arg()`` reads ``omnigent/...`` as a stale managed pick
-    and strips the prefix, so the picker must not offer rows it cannot address,
-    whether they come from a cached login or from ``models.json``.
-    """
+    """Exclude reserved provider IDs: own-login launch would strip their prefixes."""
     (tmp_path / "auth.json").write_text(
         json.dumps({creds._PI_PROVIDER_ID: {"type": "api_key", "key": "sk-shadow"}})
     )
@@ -3599,12 +3594,7 @@ def test_pi_own_login_options_empty_without_login(tmp_path: Path) -> None:
 
 
 def test_pi_own_login_options_include_models_json_custom_providers(tmp_path: Path) -> None:
-    """Custom providers keyed in ``models.json`` list beside the logged-in catalog.
-
-    They never appear in ``auth.json`` or ``models-store.json``, yet the
-    launched Pi drives them (``pi --list-models`` shows them), so the picker
-    must offer them too.
-    """
+    """Include keyed custom models even without auth.json or models-store.json entries."""
     _seed_pi_own_login(tmp_path)
     _seed_pi_custom_providers(tmp_path)
 

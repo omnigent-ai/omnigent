@@ -79,9 +79,7 @@ _WORKTREE = Path(__file__).resolve().parents[2]
 _PI_MODEL_ID = "claude-sonnet-4-5"
 _PINNED_SPEC_MODEL = f"anthropic/{_PI_MODEL_ID}"
 
-# A custom provider declared in Pi's own models.json. It carries its own
-# apiKey, so it never appears in auth.json or models-store.json, yet Pi lists
-# and drives it; the picker must offer it next to the logged-in catalog.
+# Keyed models.json providers must appear even without a cached login catalog.
 _CUSTOM_PROVIDER_ID = "ollama"
 _CUSTOM_MODEL_ID = "llama3.1:8b"
 _CUSTOM_PICKER_MODEL = f"{_CUSTOM_PROVIDER_ID}/{_CUSTOM_MODEL_ID}"
