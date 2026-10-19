@@ -52,10 +52,11 @@ The [API guide](../docs/shared-preferences-api.md) covers requests, conflict
 resolution, identity, and limits. These endpoints do not adopt preferences into
 launchers or turn on sync.
 
-**Shared scopes:** there is no user entry point yet for importing/reimporting
+**Shared scope controls:** the CLI and UI do not yet offer importing/reimporting
 preferences, saving shared or machine defaults, removing a machine override,
-resolving conflicts, or continuing with temporary defaults. Add the actual
-routes and their journey tests here as those controls are implemented.
+resolving conflicts, or continuing with temporary defaults. The API above can
+save shared defaults and resolve conflicts. Add CLI/UI routes and their journey
+tests here as those controls are implemented.
 
 ## Driving it with the repro environment
 
