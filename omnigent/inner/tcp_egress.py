@@ -101,11 +101,15 @@ class _BoundedTcpServer(socketserver.ThreadingMixIn):
 
     def process_request(self, request: Any, client_address: Any) -> None:
         if not self.broker._slots.acquire(blocking=False):
+            request.settimeout(0.25)
+            with contextlib.suppress(OSError, TcpEgressDenied, ValueError):
+                length = struct.unpack("!I", _read_exact(request, 4))[0]
+                if 1 <= length <= _MAX_REQUEST:
+                    _read_exact(request, length)
             with contextlib.suppress(OSError):
-                request.settimeout(1)
                 request.sendall(b"\x01TCP egress connection limit reached")
             with contextlib.suppress(OSError):
-                request.shutdown(socket.SHUT_RDWR)
+                request.shutdown(socket.SHUT_WR)
             request.close()
             return
         try:
