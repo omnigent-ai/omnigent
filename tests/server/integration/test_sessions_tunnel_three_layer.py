@@ -2836,6 +2836,175 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize(
+    ("stop_at", "host_returns"),
+    [("hold", "with_runner"), ("hold", "without_runner"), ("grace", "with_runner")],
+)
+async def test_stop_while_host_offline_is_kept_for_the_runner(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    stop_at: str,
+    host_returns: str,
+) -> None:
+    """Stop while the host is offline settles the turn now and reaches the runner later.
+
+    The offline host can't take the stop, so Stop used to answer 503 and the
+    held turn resumed when the laptop woke. Now the turn settles as stopped at
+    once, during the disconnect grace or the hold that follows, and nothing
+    holds or fails it. A runner that reconnects is stopped, and its session
+    isn't re-attached. A host back without its runner has nothing to fail.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+    from tests.debug_log_helpers import capture_debug_rows
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+    grace = 0.2
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
+    monkeypatch.setattr("omnigent.server.routes.sessions.HOST_OFFLINE_HOLD_S", 30.0)
+    monkeypatch.setattr("omnigent.server.routes.sessions._HOST_OFFLINE_RECHECK_S", 0.05)
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+    relayed: list[str] = []
+    stub_ensure = sessions_module._ensure_runner_relay
+
+    def recording_ensure(sid, rid, client, store=None, **kwargs):  # type: ignore[no-untyped-def]
+        relayed.append(sid)
+        return stub_ensure(sid, rid, client, store, **kwargs)
+
+    monkeypatch.setattr(sessions_module, "_ensure_runner_relay", recording_ensure)
+    host_back: list[bool] = []
+
+    async def scripted_host_offline(host_id: str | None) -> bool:
+        return not host_back
+
+    monkeypatch.setattr(sessions_module, "_host_offline_state", scripted_host_offline)
+    stops: list[tuple[str, str]] = []
+
+    async def runner_stop(session_id: str, runner_router: object) -> bool:
+        stops.append(("runner", session_id))
+        return True
+
+    async def host_runner_stop(
+        session_id: str, host_id: str, runner_id: str, host_registry: object, store: object
+    ) -> bool:
+        stops.append(("host", session_id))
+        return True
+
+    create_resp = await ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={
+            "bundle": ("agent.tar.gz", _build_harness_agent_bundle(), "application/gzip"),
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+    runner_id = f"runner-stop-while-offline-{stop_at}-{host_returns}"
+    store = get_conversation_store()
+    store.set_host_id(session_id, "fedcba9876543210fedcba9876543210", workspace="/tmp/stop-hold")
+    store.replace_runner_id(session_id, runner_id)
+    store.set_session_live_status(session_id, "running")
+
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+    sessions_module._session_status_cache[session_id] = "running"
+    reconnect: ApplicationCommunicator | None = None
+    key = sessions_module.HOST_OFFLINE_DEFERRED_STOP_LABEL_KEY
+
+    async def _until(check: Callable[[], bool]) -> None:
+        while not check():
+            await asyncio.sleep(0.02)
+
+    try:
+        with capture_debug_rows("server") as rows:
+            await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+            await communicator.wait(timeout=budget(2.0))
+
+            def _labeled() -> bool:
+                row = store.get_conversation(session_id)
+                return row is not None and sessions_module.HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY in (
+                    row.labels
+                )
+
+            if stop_at == "hold":
+                await asyncio.wait_for(_until(_labeled), timeout=budget(5.0))
+            assert sessions_module._session_status_cache.get(session_id) == "running"
+
+            stop = await ap_client.post(
+                f"/v1/sessions/{session_id}/events", json={"type": "stop_session"}
+            )
+            assert stop.status_code < 400, stop.text
+            row = store.get_conversation(session_id)
+            assert row is not None
+            assert row.labels[key] == runner_id
+            assert row.live_status == "idle"
+            assert sessions_module._session_status_cache.get(session_id) == "idle"
+
+            if stop_at == "hold":
+
+                def _hold_ended() -> bool:
+                    return any(r["event_name"] == "runner_disconnect_hold_ended" for r in rows)
+
+                await asyncio.wait_for(_until(_hold_ended), timeout=budget(5.0))
+                ended = [r for r in rows if r["event_name"] == "runner_disconnect_hold_ended"]
+                assert [r["attributes"]["outcome"] for r in ended] == ["stopped"]
+                await asyncio.wait_for(_until(lambda: not _labeled()), timeout=budget(5.0))
+            else:
+                # The replica whose grace is running may still see the turn running,
+                # and the host may be back without the runner when the grace ends.
+                sessions_module._session_status_cache[session_id] = "running"
+                host_back.append(True)
+                await asyncio.sleep(grace * 3)
+                assert not any(
+                    r["event_name"] == "runner_disconnect_held_host_offline" for r in rows
+                )
+                assert not any(r["event_name"] == "session_turn_failed" for r in rows)
+                assert not _labeled()
+
+            # The stop reaches only the runner it was waiting for.
+            monkeypatch.setattr(sessions_module, "_stop_session_via_runner", runner_stop)
+            monkeypatch.setattr(
+                sessions_module, "_stop_host_runner_intentionally", host_runner_stop
+            )
+            host_back.append(True)
+            relayed.clear()
+            if host_returns == "with_runner":
+                reconnect = await _connect_runner_tunnel(ap_app, runner_id)
+                await _send_hello_and_wait(
+                    reconnect, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
+                )
+
+                def _label_cleared() -> bool:
+                    row = store.get_conversation(session_id)
+                    return row is not None and key not in row.labels
+
+                await asyncio.wait_for(_until(_label_cleared), timeout=budget(5.0))
+                assert stops == [("runner", session_id), ("host", session_id)]
+                assert session_id not in relayed
+            else:
+                await asyncio.sleep(0.3)
+                assert stops == []
+                row = store.get_conversation(session_id)
+                assert row is not None
+                assert row.labels[key] == runner_id
+
+            row = store.get_conversation(session_id)
+            assert row is not None
+            assert row.live_status == "idle"
+            assert sessions_module._last_task_error_from_labels(row.labels) is None
+            assert not any(r["event_name"] == "session_turn_failed" for r in rows)
+    finally:
+        if reconnect is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await reconnect.send_input({"type": "websocket.disconnect", "code": 1000})
+            with contextlib.suppress(asyncio.TimeoutError, Exception):
+                await reconnect.wait(timeout=budget(2.0))
+        sessions_module._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
 async def test_an_ended_hold_leaves_a_later_holds_deadline_in_place(
     tunnel_three_layer_stack: _TunnelStack,
     monkeypatch: pytest.MonkeyPatch,

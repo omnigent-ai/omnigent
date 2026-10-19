@@ -398,6 +398,7 @@ from omnigent.spec.types import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
+    HOST_OFFLINE_DEFERRED_STOP_LABEL_KEY,
     HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY,
     PINNED_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
@@ -8077,6 +8078,63 @@ def host_offline_hold_active(labels: Mapping[str, str], now: float) -> bool:
     except ValueError:
         return False
     return now < deadline <= now + HOST_OFFLINE_HOLD_S + _HOST_OFFLINE_HOLD_SKEW_S
+
+
+async def defer_stop_until_runner_returns(
+    session_id: str, runner_id: str, conversation_store: ConversationStore
+) -> None:
+    """
+    Stop a session whose offline host can't receive the stop yet.
+
+    The session settles as stopped now, and the runner id is recorded so the
+    server stops that runner when it reconnects, before its turn can resume.
+    A runner that never returns has nothing left to stop.
+
+    :param session_id: The session the person stopped.
+    :param runner_id: The unreachable runner still bound to it.
+    :param conversation_store: Store holding the session's labels and status.
+    :returns: None.
+    :raises OmnigentError: ``RUNNER_UNAVAILABLE`` if the stop couldn't be recorded.
+    """
+    try:
+        await asyncio.to_thread(
+            conversation_store.set_labels,
+            session_id,
+            {HOST_OFFLINE_DEFERRED_STOP_LABEL_KEY: runner_id},
+        )
+        # Ordered after earlier live-state writes; skips a rebound or failed row.
+        settled = await asyncio.wrap_future(
+            session_live_state.submit(
+                "settle_intentional_stop",
+                conversation_store.settle_intentionally_stopped_session,
+                session_id,
+                runner_id,
+            )
+        )
+    except Exception as exc:
+        raise OmnigentError(
+            "Couldn't stop the session while its host is offline. Please try again.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        ) from exc
+    if settled is None:
+        raise OmnigentError(
+            "Couldn't stop the session while its host is offline. Please try again.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+    if settled:
+        session_live_state.forget_live_status(session_id)
+        _publish_status(session_id, "idle", persist_live_status=False)
+    _logger.info(
+        "Stop deferred until runner %s returns for session=%s",
+        runner_id,
+        session_id,
+        extra=debug_event(
+            "host_offline_stop_deferred",
+            session_id=session_id,
+            runner_id=runner_id,
+            settled=bool(settled),
+        ),
+    )
 
 
 # Reports whether this replica's disconnect task for a runner is still running;

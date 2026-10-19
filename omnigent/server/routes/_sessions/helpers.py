@@ -307,6 +307,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     ARCHIVED_AT_LABEL_KEY,
+    HOST_OFFLINE_DEFERRED_STOP_LABEL_KEY,
     HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY,
     PINNED_LABEL_KEY,
     ConversationNotFoundError,
@@ -10402,13 +10403,14 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
             code=ErrorCode.INVALID_INPUT,
         )
     # A host-offline hold's deadline keeps other replicas from settling a held
-    # turn; a client write would forge or cancel that protection.
-    if HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY in labels:
-        raise OmnigentError(
-            f"label {HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY!r} is server-internal"
-            " and cannot be set by clients",
-            code=ErrorCode.INVALID_INPUT,
-        )
+    # turn, and a deferred Stop names the runner to stop on reconnect; a client
+    # write would forge or cancel either.
+    for server_key in (HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY, HOST_OFFLINE_DEFERRED_STOP_LABEL_KEY):
+        if server_key in labels:
+            raise OmnigentError(
+                f"label {server_key!r} is server-internal and cannot be set by clients",
+                code=ErrorCode.INVALID_INPUT,
+            )
     # Pins are per-user: the client may only write the bare canonical
     # ``omnigent.pinned`` key (which the route rewrites to the CALLER's per-user
     # key). A suffixed ``omnigent.pinned.<user>`` is server-derived — accepting
