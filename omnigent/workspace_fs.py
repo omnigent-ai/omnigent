@@ -483,7 +483,9 @@ class WorkspaceReader:
 
         Git workspaces report the working-tree diff (``git status``);
         non-git workspaces report an empty list because the host has no
-        access to the live agent's in-memory edit history.
+        access to the live agent's in-memory edit history. ``tracking``
+        mirrors the runner's descriptor so the panel can say when that list
+        is necessarily partial instead of reading it as "no changes".
 
         :param session_id: Session id (used only by the edit-tracking
             registry; ignored in git mode).
@@ -507,7 +509,15 @@ class WorkspaceReader:
             }
             for rec in raw_changes
         ]
-        return {"object": "list", "data": data, "has_more": False}
+        return {
+            "object": "list",
+            "data": data,
+            "has_more": False,
+            "tracking": {
+                "complete": self._registry.tracks_all_changes,
+                "reason": self._registry.tracking_limit_reason,
+            },
+        }
 
     def diff(self, session_id: str, relative_path: str) -> _WorkspacePayload:
         """Return before/after content, mirroring the runner diff endpoint.

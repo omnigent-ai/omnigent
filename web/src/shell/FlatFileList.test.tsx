@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
+import { RunnerOfflineError, type WorkspaceChangedFile } from "@/hooks/useWorkspaceChangedFiles";
 import { ROW_STATUS_SLOT_CLASS } from "./fileStatusUtils";
 import { FlatFileList } from "./FlatFileList";
 
@@ -220,5 +220,92 @@ describe("FlatFileList copy path", () => {
     fireEvent.click(button);
 
     expect(copyTextMock).toHaveBeenCalledWith("src/deep/app.ts");
+  });
+});
+
+/** A single changed-file record with sensible defaults. */
+function changedFile(path: string): WorkspaceChangedFile {
+  return {
+    path,
+    name: path.split("/").at(-1) ?? path,
+    status: "modified",
+    bytes: 10,
+    modified_at: null,
+    lines_added: null,
+    lines_removed: null,
+  };
+}
+
+describe("FlatFileList limited-tracking notice", () => {
+  it("replaces the empty state with the non-git notice when tracking is limited", () => {
+    // A non-git workspace with no recorded edits: the empty list would read as
+    // "no changes", so the notice must explain the limitation instead.
+    renderList({ files: [], trackingComplete: false, trackingReason: "non_git_workspace" });
+
+    expect(screen.getByText(/limited change tracking/i)).toBeInTheDocument();
+    expect(screen.getByText(/isn't a git repository/i)).toBeInTheDocument();
+    expect(screen.queryByText(/no workspace changes yet/i)).not.toBeInTheDocument();
+  });
+
+  it("shows the notice above the list when limited tracking still has some files", () => {
+    // Non-git workspaces still surface the agent's own file-tool edits; the
+    // notice warns those aren't the whole story (CLI/shell edits are missed).
+    renderList({
+      files: [changedFile("src/app.ts")],
+      trackingComplete: false,
+      trackingReason: "non_git_workspace",
+    });
+
+    expect(screen.getByText(/limited change tracking/i)).toBeInTheDocument();
+    expect(screen.getByText("app.ts")).toBeInTheDocument();
+  });
+
+  it("keeps the notice when every change is in a hidden file", () => {
+    renderList({
+      files: [changedFile(".env")],
+      trackingComplete: false,
+      trackingReason: "non_git_workspace",
+    });
+
+    expect(screen.getByText(/limited change tracking/i)).toBeInTheDocument();
+    expect(screen.getByText(/all changes are in hidden files/i)).toBeInTheDocument();
+  });
+
+  it("keeps the notice when the search matches no changed file", () => {
+    renderList({
+      files: [changedFile("src/app.ts")],
+      searchQuery: "zzz",
+      trackingComplete: false,
+      trackingReason: "non_git_workspace",
+    });
+
+    expect(screen.getByText(/limited change tracking/i)).toBeInTheDocument();
+    expect(screen.getByText(/no changed files match "zzz"/i)).toBeInTheDocument();
+  });
+
+  it("uses the no-workspace copy for the no_workspace reason", () => {
+    renderList({ files: [], trackingComplete: false, trackingReason: "no_workspace" });
+
+    expect(screen.getByText(/limited change tracking/i)).toBeInTheDocument();
+    expect(screen.getByText(/no tracked workspace/i)).toBeInTheDocument();
+  });
+
+  it("uses a neutral fallback when the runner gives no recognized reason", () => {
+    // An unrecognized reason still means tracking is incomplete, but the UI
+    // must not guess at a cause such as "isn't a Git repository".
+    renderList({ files: [], trackingComplete: false, trackingReason: null });
+
+    expect(screen.getByText(/limited change tracking/i)).toBeInTheDocument();
+    expect(screen.getByText(/some edits may not be listed here/i)).toBeInTheDocument();
+    expect(screen.queryByText(/isn't a git repository/i)).not.toBeInTheDocument();
+  });
+
+  it("shows the normal empty state (no notice) when tracking is complete", () => {
+    // Git workspaces report complete tracking, so an empty list genuinely
+    // means nothing changed — keep the plain empty state.
+    renderList({ files: [], trackingComplete: true });
+
+    expect(screen.getByText(/no workspace changes yet/i)).toBeInTheDocument();
+    expect(screen.queryByText(/limited change tracking/i)).not.toBeInTheDocument();
   });
 });
