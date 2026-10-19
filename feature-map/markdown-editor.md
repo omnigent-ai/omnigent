@@ -101,6 +101,10 @@ This does not cover every Markdown shape or establish a safe 1 MiB limit.
 - `files`, `read`, and `modes`:
   `tests/e2e_ui/files/test_markdown_rich_rendering.py::test_markdown_renders_rich_constructs_and_source_toggle`
   opens from Files and checks rich constructs, reflow, copying, and Source.
+- `files`, oversized read-only content:
+  `tests/e2e_ui/files/test_right_panel.py::test_file_viewer_download_saves_the_complete_file`
+  includes a single-line Markdown file beyond the server read cap. Its loaded
+  prefix must render read-only, and downloading must preserve the entire file.
 - `direct-link`, `edit-save`:
   `tests/e2e_ui/files/test_file_autosave.py::test_markdown_edit_autosaves`
   confirms the edit through a fresh filesystem API read from the real server.
@@ -139,6 +143,9 @@ instead of treating one comparison clip as complete feature verification.
   these bounds when upstream avoids the repeated whole-remainder scans.
 - Load measurements do not establish typing latency. The editor currently
   serializes the full document on each edit to detect unsaved changes.
+- Setext-heading detection uses a line scanner with marked 17 interruption
+  rules. Compatibility tests compare it with upstream; remove the workaround
+  when upstream handles long lines without exhausting the regex stack.
 - Browser-contract saves update an in-memory mock filesystem. A successful
   reload there does not prove server/runner persistence or external-file edits.
 - Desktop and mobile can have hidden viewer instances on older revisions.

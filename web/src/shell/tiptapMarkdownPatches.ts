@@ -24,6 +24,7 @@ import { marksEqual, type JSONContent } from "@tiptap/core";
 
 import { toBlockContent } from "./TipTapGitHubAlert";
 import { SOFT_BREAK_NODE } from "./TipTapSoftBreak";
+import { installIterativeSetextHeadings } from "./markdownSetextHeading";
 
 /** Ampersands that would parse as an entity reference on the way back in. */
 const ENTITY_AMP = /&(?=[a-zA-Z][a-zA-Z0-9]{1,31};|#\d{1,7};|#[xX][0-9a-fA-F]{1,6};)/g;
@@ -234,6 +235,7 @@ export function installMarkdownParserPatch(): void {
   const proto = MarkdownManager.prototype;
   const originalParse = proto.parse;
   proto.parse = function (this: MarkdownManager, markdown: string): JSONContent {
+    installIterativeSetextHeadings(this.instance);
     const doc = wrapLooseInlineRuns(originalParse.call(this, markdown));
     if (!hasSoftBreakNode(this)) return doc;
     // Without the manager's code-type registry no node can be proven verbatim,
