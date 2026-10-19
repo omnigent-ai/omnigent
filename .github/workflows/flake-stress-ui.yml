@@ -186,7 +186,7 @@ jobs:
             --manifest-path tests/codex_parity/sidecar/Cargo.toml \
             --target-dir .tmp-codex-parity-target
       - name: Upload sidecar binary
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: codex-parity-sidecar
           path: .tmp-codex-parity-target/debug/codex-parity-sidecar
@@ -322,7 +322,7 @@ jobs:
 
       - name: Upload pytest junit
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: pytest-attempt-${{ matrix.attempt }}-${{ github.run_id }}
           path: artifacts/pytest-attempt-${{ matrix.attempt }}.xml
@@ -331,7 +331,7 @@ jobs:
 
       - name: Upload Playwright artifacts on failure
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: playwright-attempt-${{ matrix.attempt }}-${{ github.run_id }}
           path: test-results/
