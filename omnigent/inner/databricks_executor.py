@@ -267,7 +267,9 @@ def _databricks_sdk_token_command(host: str, profile: str | None) -> str:
     The mint runs under omnigent's own interpreter: a bare ``python3`` is whatever
     the harness's ``PATH`` finds, often one without omnigent or the SDK (→ empty
     bearer → 401). ``-P`` keeps the harness cwd — the agent's workspace — off
-    ``sys.path`` so a checkout there cannot shadow the installed package.
+    ``sys.path`` so a checkout there cannot shadow the installed package. An
+    empty ``PYTHONPATH`` component (``PYTHONPATH=:/opt/lib``) still resolves to
+    the cwd, so the mint also runs from ``/``.
 
     :param host: Databricks workspace host, e.g.
         ``"https://example.databricks.com"``.
@@ -279,7 +281,7 @@ def _databricks_sdk_token_command(host: str, profile: str | None) -> str:
     argv += ["--host", host.rstrip("/")]
     if profile:
         argv += ["--profile", profile]
-    return shlex.join(argv)
+    return f"cd / && exec {shlex.join(argv)}"
 
 
 def databricks_bearer_token_command(
