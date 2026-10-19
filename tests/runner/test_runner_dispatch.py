@@ -10849,14 +10849,90 @@ async def test_run_turn_bg_finalizer_identity_guard_spares_foreign_slot(
         queue = app.state.session_event_queues.get(conv)
         while queue is not None and not queue.empty():
             event = queue.get_nowait()
+            if not isinstance(event, dict):
+                continue
             assert event.get("type") != "response.failed", event
-            assert not (
-                event.get("type") == "session.status" and event.get("status") == "failed"
-            ), event
+            if event.get("type") == "session.status":
+                # Only the turn's own initial status may appear; any terminal
+                # status would overwrite the replacement turn's.
+                assert event.get("status") == "running", event
     finally:
         foreign_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await foreign_task
+        app.state.active_turns.pop(conv, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [ValueError, asyncio.CancelledError])
+async def test_run_turn_bg_setup_exit_after_slot_pop_still_settles_turn(
+    failure: type[BaseException],
+) -> None:
+    """A setup exit whose slot was popped by a session delete still settles its work."""
+    conv = "conv_setup_exit_slot_popped"
+    parent = "conv_setup_exit_slot_popped_parent"
+    stable_id = "9d4b7e2a1c6f4a8b9e0d3c5f7a1b2e4d"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        # ``delete_session`` pops the slot before it cancels the turn.
+        app.state.active_turns.pop(conv, None)
+        raise failure
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    subagent_work.register_subagent_work(
+        parent_session_id=parent,
+        child_session_id=conv,
+        agent="worker",
+        title="child",
+    )
+
+    try:
+        async with _recovery_runner_client(app) as http:
+            resp = await http.post(
+                f"/v1/sessions/{conv}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag",
+                    "model": "x",
+                    "content": [{"role": "user", "content": "turn A"}],
+                    "stable_id": stable_id,
+                    "input_stable_id": stable_id,
+                },
+            )
+            assert resp.status_code == 202, resp.text
+
+            task = app.state.active_turns.get(conv)
+            assert isinstance(task, asyncio.Task)
+
+            with contextlib.suppress(BaseException):
+                await task
+
+        entry = subagent_work.get_subagent_work(conv)
+        assert entry is not None
+        assert entry.status == "failed", entry
+        statuses: list[str] = []
+        failed_items: list[dict[str, Any]] = []
+        queue = app.state.session_event_queues.get(conv)
+        while queue is not None and not queue.empty():
+            event = queue.get_nowait()
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") == "session.status":
+                statuses.append(str(event.get("status")))
+            elif event.get("type") == "response.failed":
+                failed_items.append(event)
+        assert statuses[-1:] == ["failed"], statuses
+        if failure is ValueError:
+            assert len(failed_items) == 1, failed_items
+    finally:
+        subagent_work.unregister_subagent_work(conv)
         app.state.active_turns.pop(conv, None)
 
 
