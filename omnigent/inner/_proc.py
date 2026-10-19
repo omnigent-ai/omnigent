@@ -241,10 +241,12 @@ def process_create_time(pid: int) -> float | None:
     """Return the OS start time identifying the process at *pid*, or ``None``.
 
     Pairs with the PID to detect reuse: a recycled PID reports a different
-    start time, letting a caller reject a stale PID before acting on it.
+    start time, letting a caller reject a stale PID before acting on it. The
+    stamp is boot-relative where possible, so a wall-clock step can't make a
+    live process look like a different one.
     """
     with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-        return psutil.Process(pid).create_time()
+        return _process_start_stamp(psutil.Process(pid))
     return None
 
 

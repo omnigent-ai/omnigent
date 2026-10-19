@@ -21,7 +21,7 @@ launches use the callers' direct-exec fallback.
 Protocol (newline-delimited JSON, one request → one response):
 
   {"cmd": "ping"}                          -> {"pong": true}
-  {"cmd": "fork", "env": {...},            -> {"pid": 12345}
+  {"cmd": "fork", "env": {...},            -> {"pid": 12345, "start": 4242.17}
    "log_path": "/…/runner-ab12.log"}          or {"error": "..."}
   {"cmd": "poll", "pid": 12345}            -> {"returncode": 0} | {"returncode": null}
 
@@ -729,7 +729,9 @@ class _ZygoteServer:
         self._control_socks.add(z_end)
         self._buffers[z_end.fileno()] = bytearray()
         self._sel.register(z_end, selectors.EVENT_READ, "runner")
-        _send(conn, {"pid": pid})
+        # Read the child's start identity while it is still unreaped here, so
+        # its PID can't belong to another process yet.
+        _send(conn, {"pid": pid, "start": _child_start_identity(pid)})
 
     def _handle_fork_harness(self, conn: socket.socket, request: dict[str, Any]) -> None:
         """Fork a harness child on behalf of the runner that owns *conn*.
@@ -819,6 +821,18 @@ class _ZygoteServer:
                     os.kill(harness_pid, signal.SIGTERM)
         with contextlib.suppress(OSError):
             conn.close()
+
+
+def _child_start_identity(pid: int) -> float | None:
+    """Return a just-forked child's start identity, or ``None`` if unreadable.
+
+    :param pid: The unreaped child's process id.
+    :returns: Its clock-step-proof start stamp, as
+        :func:`omnigent.inner._proc.process_create_time` reports it.
+    """
+    from omnigent.inner import _proc
+
+    return _proc.process_create_time(pid)
 
 
 def _send(control_sock: socket.socket, payload: dict[str, Any]) -> None:

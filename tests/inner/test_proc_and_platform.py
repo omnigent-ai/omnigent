@@ -292,11 +292,32 @@ def test_process_alive_false_for_bogus_pid() -> None:
     assert _proc.process_alive(-1) is False
 
 
-def test_process_create_time_matches_psutil_for_a_live_process() -> None:
+def test_process_create_time_matches_the_start_stamp_for_a_live_process() -> None:
     proc = subprocess.Popen(_spin_cmd(), **_proc.spawn_kwargs())
     try:
-        assert _proc.process_create_time(proc.pid) == psutil.Process(proc.pid).create_time()
+        expected = _proc._process_start_stamp(psutil.Process(proc.pid))
+        assert _proc.process_create_time(proc.pid) == expected
     finally:
+        _proc.kill_tree(proc)
+        proc.wait(timeout=5)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="/proc/stat btime is Linux-only")
+@pytest.mark.parametrize("step", [-1.0, 1.0])
+def test_process_create_time_survives_a_wall_clock_step(
+    monkeypatch: pytest.MonkeyPatch, step: float
+) -> None:
+    """An NTP/hypervisor clock step moves btime; a live process keeps its identity."""
+    import psutil._pslinux as pslinux
+
+    proc = subprocess.Popen(_spin_cmd(), **_proc.spawn_kwargs())
+    try:
+        before = _proc.process_create_time(proc.pid)
+        real_boot_time = pslinux.boot_time
+        monkeypatch.setattr(pslinux, "boot_time", lambda: real_boot_time() + step)
+        assert _proc.process_create_time(proc.pid) == before
+    finally:
+        monkeypatch.undo()
         _proc.kill_tree(proc)
         proc.wait(timeout=5)
 

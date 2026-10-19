@@ -503,3 +503,37 @@ def test_hangup_signals_live_runners_but_not_the_zygote(
         (4005, RUNNER_FINISH_WORK_SIGNAL),
     ]
     assert 4007 not in [pid for pid, _ in sent]  # the reused PID was never signalled
+
+
+def test_hangup_never_signals_a_pid_reused_before_registration(
+    host: HostProcess, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A runner that exited and lost its PID before registration is never signalled.
+
+    The zygote reaps its own children, so a forked runner's PID can be reused
+    between the zygote's reply and the host recording the runner. The host keeps
+    the identity the zygote read before replying, so the reused PID fails the
+    comparison; a reply without one leaves the runner unsignalled.
+    """
+    from omnigent.host.connect import _runner_start_identity
+
+    monkeypatch.setattr(host, "_zygote", SimpleNamespace(unreaped_pid=None))
+    manager = ZygoteManager()
+    monkeypatch.setattr(
+        manager, "poll", lambda *a, **k: pytest.fail("exit thread blocked on zygote IPC")
+    )
+    # By registration time the PID belongs to an unrelated process.
+    monkeypatch.setattr("omnigent.inner._proc.process_create_time", lambda pid: 999.0)
+    reused = ZygoteRunnerProc(4011, manager, start_identity=111.0)
+    unknown = ZygoteRunnerProc(4012, manager)
+    for name, proc in (("reused", reused), ("unknown", unknown)):
+        host._runners[name] = _RunnerHandle(
+            proc=proc, log_path=tmp_path / "runner.log", create_time=_runner_start_identity(proc)
+        )
+    sent: list[tuple[int, int]] = []
+
+    host.signal_runners_finish_work(kill=lambda pid, sig: sent.append((pid, sig)))
+
+    assert host._runners["reused"].create_time == 111.0
+    assert host._runners["unknown"].create_time is None
+    assert sent == []

@@ -74,16 +74,25 @@ class ZygoteRunnerProc:
     :param pid: The forked runner's process id.
     :param manager: The owning :class:`ZygoteManager`, used to poll exit status.
     :param zygote_generation: The forkserver generation that owns this child.
+    :param start_identity: The child's start identity as the zygote read it
+        before replying, or ``None`` from a zygote that doesn't report one.
     """
 
     def __init__(
-        self, pid: int, manager: ZygoteManager, *, zygote_generation: int | None = None
+        self,
+        pid: int,
+        manager: ZygoteManager,
+        *,
+        zygote_generation: int | None = None,
+        start_identity: float | None = None,
     ) -> None:
         self.pid = pid
         self._manager = manager
         self._zygote_generation = (
             manager._generation if zygote_generation is None else zygote_generation
         )
+        # Read by the zygote before replying, while the child was still unreaped.
+        self.start_identity = start_identity
         self.returncode: int | None = None
 
     def poll(self) -> int | None:
@@ -292,7 +301,13 @@ class ZygoteManager:
         pid = reply.get("pid")
         if not isinstance(pid, int):
             raise ZygoteUnavailable(f"zygote returned no pid: {reply!r}")
-        return ZygoteRunnerProc(pid, self, zygote_generation=generation)
+        start = reply.get("start")
+        return ZygoteRunnerProc(
+            pid,
+            self,
+            zygote_generation=generation,
+            start_identity=float(start) if isinstance(start, int | float) else None,
+        )
 
     def poll(self, pid: int, *, zygote_generation: int | None = None) -> int | None:
         """Return the exit code for a forked runner, or ``None`` if still live.

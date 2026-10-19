@@ -486,6 +486,23 @@ def test_fork_runner_reports_pid_and_exit_code(manager: ZygoteManager, tmp_path)
     assert _wait_exit(proc) == 0
 
 
+def test_fork_runner_reports_the_start_identity_read_before_its_reply(
+    manager: ZygoteManager, tmp_path
+) -> None:
+    """The zygote reads a runner's start identity while it still owns the unreaped child.
+
+    :param manager: The started manager fixture.
+    :param tmp_path: Temp dir for the child's log.
+    """
+    from omnigent.inner import _proc
+
+    proc = manager.fork_runner(_fork_env(0), str(tmp_path / "runner.log"), str(tmp_path))
+    assert isinstance(proc.start_identity, float)
+    zygote_start = _proc.process_create_time(manager.pid)  # type: ignore[arg-type]
+    assert zygote_start is not None and proc.start_identity >= zygote_start
+    assert _wait_exit(proc) == 0
+
+
 def test_fork_runner_nonzero_exit_is_reported(manager: ZygoteManager, tmp_path) -> None:
     """A non-zero child exit surfaces through poll(), matching Popen semantics.
 
@@ -1081,9 +1098,11 @@ def test_fork_proceeds_while_disk_stamp_matches(monkeypatch, cmd) -> None:
     )
     monkeypatch.setattr(_zygote, "_disk_build_stamp", lambda: (1000.0, "sha"))
     monkeypatch.setattr(os, "fork", lambda: 4242)
+    monkeypatch.setattr(_zygote, "_child_start_identity", lambda pid: 77.5)
     try:
         reply = _dispatch_fork(server, conn, peer, cmd)
-        assert reply == {"pid": 4242}
+        # A runner fork also reports the start identity read before the reply.
+        assert reply == ({"pid": 4242, "start": 77.5} if cmd == "fork" else {"pid": 4242})
         assert 4242 in server._live
     finally:
         server._sel.close()

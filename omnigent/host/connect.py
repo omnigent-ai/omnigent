@@ -1112,6 +1112,19 @@ class _RunnerHandle:
     create_time: float | None = None
 
 
+def _runner_start_identity(proc: subprocess.Popen[bytes] | ZygoteRunnerProc) -> float | None:
+    """Return the start identity that guards a runner's PID against reuse.
+
+    The zygote, not the host, reaps a forked runner, so its PID can be reused
+    before the host gets here: only the identity the zygote read before
+    replying is safe, and without one the runner is never signalled. A direct
+    child stays unreaped until this host polls it.
+    """
+    if isinstance(proc, ZygoteRunnerProc):
+        return proc.start_identity
+    return _proc.process_create_time(proc.pid)
+
+
 @dataclass(frozen=True)
 class _HostFrameFailureContext:
     """Safe metadata retained when a host-frame task fails."""
@@ -2086,7 +2099,7 @@ class HostProcess:
             log_path=log_path,
             session_id=frame.session_id or None,
             connect_marker=_connect_marker_path(log_path),
-            create_time=_proc.process_create_time(proc.pid),
+            create_time=_runner_start_identity(proc),
         )
         watcher = asyncio.create_task(self._watch_runner(runner_id))
         self._watcher_tasks.add(watcher)
