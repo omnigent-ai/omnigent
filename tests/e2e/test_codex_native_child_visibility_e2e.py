@@ -37,7 +37,8 @@ import sys
 import time
 
 gate = Path(sys.argv[1])
-(gate / "started").write_text(str(os.getpid()))
+(gate / "started.tmp").write_text(str(os.getpid()))
+(gate / "started.tmp").rename(gate / "started")
 deadline = time.monotonic() + 180
 while not (gate / "emit").exists():
     if time.monotonic() > deadline:
