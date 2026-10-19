@@ -4894,11 +4894,35 @@ def _failure_log_detail(error: ErrorDetail | None) -> str:
 _ERROR_ITEM_LOG_TEXT_MAX_CHARS: Final[int] = 300
 # Only this prefix is redacted, so a huge error message can't stall the request.
 _ERROR_ITEM_LOG_REDACT_PREFIX_CHARS: Final[int] = 4096
+# Error codes are short identifiers; the stream's debug mirror drops longer ones too.
+_ERROR_ITEM_LOG_CODE_MAX_CHARS: Final[int] = 64
 
 # Error items whose text quotes part of the person's own message.
 _ERROR_ITEM_CODES_WITHOUT_LOG_TEXT: Final[frozenset[str]] = frozenset(
     {"pi_followup_delivery_dropped"}
 )
+
+
+def _error_item_log_text(message: str) -> str:
+    """Return an error item's text as its log row shows it: redacted, then clipped.
+
+    Redacting first keeps a credential cut by the clip recognisable. Only a
+    bounded prefix is redacted, cut back to its last line break: no credential
+    value the sanitizer redacts spans one, so nothing kept is a fragment it would
+    miss. A prefix with no line break is withheld.
+
+    :param message: The item's full text, e.g. ``"Pi model error: overloaded"``.
+    :returns: The text to log; ``… (+N chars)`` counts the characters left out.
+    """
+    kept = message
+    if len(message) > _ERROR_ITEM_LOG_REDACT_PREFIX_CHARS:
+        prefix = message[:_ERROR_ITEM_LOG_REDACT_PREFIX_CHARS]
+        kept = prefix[: max(prefix.rfind("\n"), prefix.rfind("\r"), 0)]
+    text = sanitize_diagnostic_text(kept)
+    dropped = max(0, len(text) - _ERROR_ITEM_LOG_TEXT_MAX_CHARS) + len(message) - len(kept)
+    if not dropped:
+        return text
+    return f"{text[:_ERROR_ITEM_LOG_TEXT_MAX_CHARS]}… (+{dropped} chars)"
 
 
 def _log_external_error_item(session_id: str, item: ConversationItem) -> None:
@@ -4915,26 +4939,19 @@ def _log_external_error_item(session_id: str, item: ConversationItem) -> None:
     data = item.data
     if not isinstance(data, ErrorData) or data.level == "info":
         return
+    code = data.code if len(data.code) <= _ERROR_ITEM_LOG_CODE_MAX_CHARS else None
     if data.code in _ERROR_ITEM_CODES_WITHOUT_LOG_TEXT:
         text = "(text withheld)"
     else:
-        # Sanitize before clipping: terminal controls, whitespace-delimited credentials
-        # and URL userinfo are stripped. A credential cut at the bound would otherwise
-        # survive as a fragment the sanitizer no longer recognises.
-        message = data.message
-        text = sanitize_diagnostic_text(message[:_ERROR_ITEM_LOG_REDACT_PREFIX_CHARS])
-        unredacted = max(0, len(message) - _ERROR_ITEM_LOG_REDACT_PREFIX_CHARS)
-        if len(text) > _ERROR_ITEM_LOG_TEXT_MAX_CHARS or unredacted:
-            dropped = len(text) - _ERROR_ITEM_LOG_TEXT_MAX_CHARS + unredacted
-            text = f"{text[:_ERROR_ITEM_LOG_TEXT_MAX_CHARS]}… (+{dropped} chars)"
+        text = _error_item_log_text(data.message)
     _logger.warning(
         "error item [%s]: %s",
-        data.code,
+        code or "(code withheld)",
         text,
         extra=debug_event(
             "error_item_published",
             session_id=session_id,
-            code=data.code,
+            code=code,
             source=data.source,
             item_id=item.id,
             response_id=item.response_id,
@@ -12003,6 +12020,7 @@ __all__ = [
     "_dispatch_skill_slash_command_to_runner",
     "_emit_server_routing_decision",
     "_error_item_from_sse",
+    "_error_item_log_text",
     "_evaluate_output_policy",
     "_extract_assistant_text_from_event",
     "_extract_claude_native_runner_failure",

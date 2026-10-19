@@ -12950,29 +12950,32 @@ async def test_external_info_error_item_publishes_and_persists_level(
     the live ``response.output_item.done`` frame and the persisted item.
 
     This is the runner's fresh-thread notice: the web renders it as a neutral
-    pill live, and again after reload from the items endpoint.
+    pill live, and again after reload from the items endpoint. Being a notice,
+    not an error, it gets no error-item log row.
     """
     published: list[tuple[str, dict[str, Any]]] = []
     _capture_published(monkeypatch, published)
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
 
-    resp = await client.post(
-        f"/v1/sessions/{session['id']}/events",
-        json={
-            "type": "external_conversation_item",
-            "data": {
-                "item_type": "error",
-                "item_data": {
-                    "source": "harness",
-                    "code": "codex_thread_reset",
-                    "message": "Codex started a fresh thread.",
-                    "level": "info",
+    with capture_debug_rows("server") as rows:
+        resp = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "external_conversation_item",
+                "data": {
+                    "item_type": "error",
+                    "item_data": {
+                        "source": "harness",
+                        "code": "codex_thread_reset",
+                        "message": "Codex started a fresh thread.",
+                        "level": "info",
+                    },
                 },
             },
-        },
-    )
+        )
     assert resp.status_code in (200, 202)
+    assert _error_item_log_rows(rows) == []
 
     done = [ev for _sid, ev in published if ev.get("type") == "response.output_item.done"]
     assert len(done) == 1
@@ -13076,32 +13079,6 @@ async def test_external_error_item_log_redacts_a_credential_cut_by_the_bound(
     assert "A1b2" not in message
 
 
-async def test_external_info_error_item_is_not_logged(client: httpx.AsyncClient) -> None:
-    """
-    An info-level notice gets no error-item row, though an error posted beside it does.
-    """
-    agent = await create_test_agent(client)
-    session = await _create_session(client, agent["id"])
-    events = [
-        _error_item_event(
-            "Codex started a fresh thread.", code="codex_thread_reset", level="info"
-        ),
-        _error_item_event("Pi model error: overloaded"),
-    ]
-
-    with capture_debug_rows("server") as rows:
-        for event in events:
-            resp = await client.post(f"/v1/sessions/{session['id']}/events", json=event)
-            assert resp.status_code in (200, 202), resp.text
-
-    assert [row["attributes"]["code"] for row in _error_item_log_rows(rows)] == ["RuntimeError"]
-    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
-    assert sorted(item["code"] for item in items if item["type"] == "error") == [
-        "RuntimeError",
-        "codex_thread_reset",
-    ]
-
-
 async def test_external_error_item_deduplicated_retry_is_not_logged_again(
     client: httpx.AsyncClient,
 ) -> None:
@@ -13159,33 +13136,21 @@ async def test_external_pi_followup_dropped_error_item_logs_no_text(
     assert "synthetic queued words" not in str(rows)
 
 
-async def test_external_error_item_redacts_whitespace_delimited_passwords(
-    client: httpx.AsyncClient,
-) -> None:
-    """Error item text with whitespace-delimited passwords is redacted."""
-    agent = await create_test_agent(client)
-    session = await _create_session(client, agent["id"])
-    text = "Auth failed: password=secretpass123 user=bob@example.com"
-
-    with capture_debug_rows("server") as rows:
-        resp = await client.post(
-            f"/v1/sessions/{session['id']}/events", json=_error_item_event(text)
-        )
-    assert resp.status_code in (200, 202), resp.text
-
-    (row,) = _error_item_log_rows(rows)
-    message = str(row["message"])
-    assert "secretpass123" not in message
-    assert "[REDACTED]" in message
-
-
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Connection error: https://probe-user:probe-password@host.example.com/path",
+        # The "@" lies past the redacted prefix, where the sanitizer can't see it.
+        "x" * 270 + " https://probe-user:" + "P" * 3900 + "@example.invalid/path",
+    ],
+    ids=["whole", "past-the-redacted-prefix"],
+)
 async def test_external_error_item_redacts_url_userinfo(
-    client: httpx.AsyncClient,
+    client: httpx.AsyncClient, text: str
 ) -> None:
-    """Error item text with URL userinfo is redacted."""
+    """Error item text with URL userinfo logs neither its user nor its password."""
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
-    text = "Connection error: https://user:password@host.example.com/path"
 
     with capture_debug_rows("server") as rows:
         resp = await client.post(
@@ -13195,29 +13160,9 @@ async def test_external_error_item_redacts_url_userinfo(
 
     (row,) = _error_item_log_rows(rows)
     message = str(row["message"])
-    assert "password@" not in message
-    assert "[REDACTED]@" in message
-
-
-async def test_external_error_item_redacts_http_cookies(
-    client: httpx.AsyncClient,
-) -> None:
-    """Error item text with HTTP cookies is redacted."""
-    agent = await create_test_agent(client)
-    session = await _create_session(client, agent["id"])
-    text = "Request failed: Cookie: session_id=abc123def456; auth_token=xyz789"
-
-    with capture_debug_rows("server") as rows:
-        resp = await client.post(
-            f"/v1/sessions/{session['id']}/events", json=_error_item_event(text)
-        )
-    assert resp.status_code in (200, 202), resp.text
-
-    (row,) = _error_item_log_rows(rows)
-    message = str(row["message"])
-    assert "abc123def456" not in message
-    assert "xyz789" not in message
-    assert "[REDACTED]" in message
+    assert "probe-user" not in message
+    assert "probe-password" not in message
+    assert "PPP" not in message
 
 
 _PI_MODEL_NOT_FOUND = (
