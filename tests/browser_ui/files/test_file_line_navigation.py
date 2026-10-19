@@ -194,6 +194,16 @@ def _open_viewer(
     return page.locator('[data-testid="file-viewer"]:visible')
 
 
+def _click_into_rich_editor(target: Locator) -> None:
+    """Click into the TipTap editor and let the click's selection settle before typing.
+
+    ProseMirror re-applies a click's selection on a zero-delay timer after mouseup; keys
+    sent before that timer runs move the caret only to have it reset.
+    """
+    target.click()
+    target.page.evaluate("() => new Promise(resolve => setTimeout(resolve))")
+
+
 def _open_monaco(page: Page, session: BrowserSession, layout: str | None = None) -> Locator:
     viewer = _open_viewer(
         page,
@@ -335,7 +345,7 @@ def test_markdown_code_block_creation_keeps_caret(
     _mock_markdown_files(page, seeded_session, {path: "```python\noriginal\n```\n\nTail\n"})
     viewer = _open_viewer(page, seeded_session, path, {"diffActive": False})
     editor = viewer.locator(".tiptap")
-    editor.locator("p").last.click()
+    _click_into_rich_editor(editor.locator("p").last)
     page.keyboard.press("Home")
     page.keyboard.press("Shift+End")
     page.keyboard.type("```python")
@@ -825,9 +835,10 @@ def test_markdown_comment_draft_survives_responsive_layouts(
     expect(viewer).to_have_count(1)
     editor = viewer.locator(".tiptap")
     expect(editor).to_be_visible()
-    editor.click()
+    _click_into_rich_editor(editor)
     page.keyboard.press("Control+Home")
     page.keyboard.press("Control+Shift+ArrowRight")
+    page.wait_for_function("() => window.getSelection()?.toString() !== ''")
     page.get_by_role("button", name="Add comment", exact=True).click()
     draft = viewer.get_by_placeholder("Add a comment", exact=False)
     draft.fill("Keep this unsubmitted review")
