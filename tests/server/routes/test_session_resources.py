@@ -1822,9 +1822,11 @@ async def test_delete_terminal_proxies_to_runner(
         (LEVEL_OWNER, LEVEL_MANAGE, "alice@example.com", 403, False, False),
         (LEVEL_OWNER, LEVEL_OWNER, "bob@example.com", 403, False, False),
         (LEVEL_OWNER, LEVEL_OWNER, None, 403, False, False),
+        (LEVEL_OWNER, LEVEL_OWNER, "", 404, False, False),
         (LEVEL_OWNER, LEVEL_OWNER, "alice@example.com", 200, False, False),
         (LEVEL_READ, LEVEL_READ, "bob@example.com", 403, True, False),
-        (LEVEL_READ, LEVEL_READ, "bob@example.com", 200, True, True),
+        (LEVEL_READ, LEVEL_READ, "bob@example.com", 403, True, True),
+        (LEVEL_OWNER, LEVEL_OWNER, "alice@example.com", 200, False, True),
     ],
 )
 async def test_terminal_transfer_requires_session_and_host_ownership(
@@ -1862,10 +1864,14 @@ async def test_terminal_transfer_requires_session_and_host_ownership(
         permissions.add_admin("alice@example.com")
     permissions.add_grant("alice@example.com", source_id, source_level)
     permissions.add_grant("alice@example.com", target_id, target_level)
+    if inherited:
+        permissions.add_grant("alice@example.com", parent.id, source_level)
     application = FastAPI()
     if host_owner is not None:
         hosts = HostStore(db_uri)
-        hosts.upsert_on_connect(host_id, "test-host", host_owner)
+        # An empty owner leaves the host unregistered in a configured store.
+        if host_owner:
+            hosts.upsert_on_connect(host_id, "test-host", host_owner)
         application.state.host_store = hosts
 
     @application.exception_handler(OmnigentError)
@@ -1902,11 +1908,11 @@ async def test_terminal_transfer_requires_session_and_host_ownership(
         assert target.workspace == source.workspace
         assert target.git_branch == source.git_branch
     else:
-        if expected_status == 403:
-            assert runner.calls == []
-        else:
+        if expected_status == 200:
             assert runner.calls
             assert response.json()["session_id"] == target_id
+        else:
+            assert runner.calls == []
         assert target.host_id is None
         assert target.workspace is None
         assert target.git_branch is None

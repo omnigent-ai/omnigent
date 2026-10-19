@@ -36,7 +36,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_terminal_name,
 )
-from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -1542,7 +1542,9 @@ def register_resources_routes(
         await _validate_session(target_session_id, request, LEVEL_OWNER)
 
         user_id = _get_user_id(request, auth_provider)
-        if conv.host_id is not None and user_id is not None:
+        # Sub-agents inherit their parent's host; check the host the terminal runs on.
+        source_host_id = await asyncio.to_thread(routing_host_id, conv, conversation_store)
+        if source_host_id is not None and user_id is not None:
             host_store = getattr(request.app.state, "host_store", None)
             if host_store is None:
                 raise OmnigentError(
@@ -1552,7 +1554,7 @@ def register_resources_routes(
             await asyncio.to_thread(
                 resolve_host_owner,
                 user_id=user_id,
-                host_id=conv.host_id,
+                host_id=source_host_id,
                 host_store=host_store,
             )
 
