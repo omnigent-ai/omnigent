@@ -76,11 +76,25 @@ def test_markdown_editor_review_journey(page: Page, seeded_session: BrowserSessi
     assert editor.locator("pre").last.evaluate(
         "el => el.contains(document.getSelection().anchorNode)"
     )
+    # Exercise the native menu from both pointer and keyboard focus before
+    # verifying that the fence language survives autosave and reload.
+    pickers = editor.get_by_role("combobox", name="Code block language")
+    pickers.first.hover()
+    pickers.first.select_option("typescript")
+    picker = pickers.last
+    picker.focus()
+    picker.press("End")
+    picker.press("Enter")
+    expect(picker).to_have_value("yaml")
     expect(viewer.get_by_role("button", name="All changes saved")).to_be_visible(timeout=15_000)
     assert writes and "# caret stays in the code block" in writes[-1]
+    assert "```yaml" in writes[-1]
+    assert "```typescript" in writes[-1]
 
     page.reload()
     expect(editor.locator("pre").last).to_contain_text("journey edit")
+    expect(pickers.first).to_have_value("typescript")
+    expect(pickers.last).to_have_value("yaml")
     editor.locator("pre").last.click()
     page.keyboard.press("ControlOrMeta+f")
     search = viewer.get_by_placeholder(re.compile(r"^Find"))

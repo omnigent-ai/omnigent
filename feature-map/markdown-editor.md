@@ -41,8 +41,10 @@ starts at `direct-link` and performs these actions in order:
 
 1. Read the heading, ordered list, table, and original code block.
 2. Create another Python code block and type two lines; verify the caret stays
-   inside it and autosave submits the changed Markdown.
-3. Reload and verify the edit is returned by the mock filesystem.
+   inside it. Change the original block's language with the pointer and the new
+   block's language with the keyboard, then verify autosave submits the changes.
+3. Reload and verify the edit and fence language are returned by the mock
+   filesystem.
 4. Find the edited text and verify exactly one match.
 5. Switch through Source, Preview, and Edit, retaining the changed text.
 6. Resize from desktop to phone and back, retaining the saved content.
