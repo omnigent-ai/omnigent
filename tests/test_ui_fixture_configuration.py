@@ -26,9 +26,14 @@ def test_mock_config_respects_workflow_ownership(monkeypatch, tmp_path, harness,
     assert config.read_text() == "original config\n"
 
 
-@pytest.mark.parametrize("missing", ["SERVER_URL", "MODEL_URL", "RUNNER_ID"])
+@pytest.mark.parametrize("missing", ["SERVER_URL", "MODEL_URL", "RUNNER_ID", "ENV_DIR"])
 def test_prepared_environment_rejects_missing_setting(monkeypatch, missing):
-    keys = ("OMNIGENT_REPRO_SERVER_URL", "OMNIGENT_REPRO_MODEL_URL", "OMNIGENT_REPRO_RUNNER_ID")
+    keys = (
+        "OMNIGENT_REPRO_SERVER_URL",
+        "OMNIGENT_REPRO_MODEL_URL",
+        "OMNIGENT_REPRO_RUNNER_ID",
+        "OMNIGENT_REPRO_ENV_DIR",
+    )
     missing_key = f"OMNIGENT_REPRO_{missing}"
     for key in keys:
         monkeypatch.setenv(key, "" if key == missing_key else "configured")

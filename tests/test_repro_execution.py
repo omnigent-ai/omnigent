@@ -215,6 +215,51 @@ def test_execute_records_readiness_failure_before_command(tmp_path, monkeypatch)
     assert "exit_code" not in record
 
 
+@pytest.mark.parametrize("evidence", [False, True])
+def test_exec_exposes_relocated_environment_directory(tmp_path, monkeypatch, evidence):
+    from dev.repro_env import __main__ as cli
+
+    class _Relay:
+        port = 1
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    class _Client(_Relay):
+        def get(self, url):
+            return httpx.Response(200, json={"online": True}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(cli, "Relay", _Relay)
+    monkeypatch.setattr(cli.httpx, "Client", _Client)
+    monkeypatch.chdir(tmp_path)
+    # The workflow started the environment somewhere other than .omnigent/repro-env.
+    output = tmp_path / "relocated-env"
+    output.mkdir()
+    config_home = output / "config"
+    (output / "environment.json").write_text(
+        json.dumps({"status": "ready", "runner_id": "runner-1", "config_home": str(config_home)})
+    )
+    if evidence:
+        (output / "execution-context.json").write_text("{}")
+    monkeypatch.setenv("EXPECTED_CONFIG_HOME", str(config_home))
+    script = (
+        "import json, os, pathlib; "
+        "env_dir = pathlib.Path(os.environ['OMNIGENT_REPRO_ENV_DIR']); "
+        "assert env_dir.is_absolute(), env_dir; "
+        "state = json.loads((env_dir / 'environment.json').read_text()); "
+        "assert state['config_home'] == os.environ['EXPECTED_CONFIG_HOME'], state"
+    )
+    argv = ["dev.repro_env", "--output", output.name, "exec", "--", sys.executable, "-c", script]
+    monkeypatch.setattr(sys, "argv", argv)
+    assert cli.main() == 0
+
+
 def test_execute_without_context_uses_existing_command_path(tmp_path, monkeypatch):
     from contextlib import nullcontext
 
