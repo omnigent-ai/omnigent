@@ -20,6 +20,7 @@ from fastapi import FastAPI
 from omnigent.debug_logging import PRIMARY_SESSION_ID_ENV_VAR
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.runner import native_controls
+from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.server.routes._sessions import helpers as session_helpers
 from tests.debug_log_helpers import capture_debug_rows
 from tests.runner.conftest import _build_app_for_spec, _runner_client
@@ -146,14 +147,47 @@ async def test_unexpected_control_failure_answers_a_structured_500(
         f"bare framework 500 instead of a structured error body: {response.text!r}"
     )
     body = response.json()
-    # The runner's coded error envelope, with the client-safe detail as its message.
-    assert body["error"] == {"code": "runner_request_failed", "message": body["detail"]}, body
+    # An error object without a code, so servers keep their unexpected-failure fallback.
+    assert body["error"] == {"message": body["detail"]}, body
     failure_id = _failure_id(response.text)
     assert body["failure_context"]["failure_id"] == failure_id
     [row] = _rows_with_failure_id(rows, failure_id)
     assert row["session_id"] == _CHILD
     assert row["attributes"]["exception_type"] == "RuntimeError"
     assert row["event_name"], "the row must name the failing operation"
+
+
+async def test_unexpected_terminal_ensure_failure_keeps_the_server_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An uncaught terminal-ensure failure still reads as the server's ensure failure."""
+    app = await _child_session_app()
+
+    async def _failing_lookup(self: object, session_id: str, terminal_id: str) -> None:
+        del self, session_id, terminal_id
+        raise RuntimeError(_PRIVATE_DETAIL)
+
+    monkeypatch.setattr(SessionResourceRegistry, "get_terminal_resource", _failing_lookup)
+    async with _runner_client_for(app, raise_app_exceptions=False) as client:
+        response = await client.post(
+            f"/v1/sessions/{_CHILD}/resources/terminals",
+            json={"terminal": "claude", "session_key": "main", "ensure_native_terminal": True},
+        )
+
+    assert response.status_code == 500
+    assert _PRIVATE_DETAIL not in response.text
+    body = response.json()
+    assert "code" not in body["error"], body
+    outcome = session_helpers._native_terminal_failure_from_runner_response(
+        response, display_name="Claude"
+    )
+    assert outcome.error is not None
+    assert outcome.error.code == "native_terminal_ensure_failed"
+    assert outcome.error.message == (
+        "Native Claude terminal ensure failed with malformed runner response (HTTP 500)."
+    )
+    assert outcome.failure_context is not None
+    assert outcome.failure_context["failure_id"] == body["failure_context"]["failure_id"]
 
 
 async def test_handled_control_failure_returns_a_failure_id(

@@ -2203,14 +2203,11 @@ def create_runner_app(
             session_id=request_path_session_id(request.scope.get("path", "")),
             route=route if isinstance(route, str) else None,
         )
-        # The coded envelope is what resource proxies parse; event-forward callers
-        # read the top-level ``detail`` and ``failure_context``.
+        # An error object without a ``code``: servers read a coded error as a typed
+        # failure (a terminal start's cause, say), so this keeps their fallback.
         return JSONResponse(
             status_code=500,
-            content={
-                "error": {"code": "runner_request_failed", "message": payload["detail"]},
-                **payload,
-            },
+            content={"error": {"message": payload["detail"]}, **payload},
         )
 
     @app.exception_handler(ValueError)

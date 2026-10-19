@@ -6749,6 +6749,8 @@ def _native_terminal_failure_from_runner_response(
                     error=ErrorData(source="execution", code=raw_code, message=raw_message),
                     failure_context=normalize_failure_context(body.get("failure_context")),
                 )
+    # An uncoded body (the runner's unexpected-failure 500) keeps this fallback
+    # error but still carries its correlatable evidence.
     return _NativeTerminalEnsureOutcome(
         error=ErrorData(
             source="execution",
@@ -6757,7 +6759,12 @@ def _native_terminal_failure_from_runner_response(
                 f"Native {display_name} terminal ensure failed with malformed "
                 f"runner response (HTTP {resp.status_code})."
             ),
-        )
+        ),
+        failure_context=(
+            normalize_failure_context(body.get("failure_context"))
+            if isinstance(body, dict)
+            else None
+        ),
     )
 
 

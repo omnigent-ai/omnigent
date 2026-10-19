@@ -10,7 +10,7 @@ import re
 import threading
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import Mock
 
 import httpx
@@ -34,6 +34,7 @@ from omnigent.server._runner_ws_tunnel import DirectAttachEndpoint
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
+from tests.debug_log_helpers import capture_debug_rows
 from tests.runner.helpers import NullServerClient
 
 
@@ -1376,11 +1377,8 @@ async def test_get_resource_by_id_rejects_invalid_runner_json(
     assert resp.json()["detail"] == "runner resource endpoint returned invalid JSON"
 
 
-@pytest.mark.asyncio
-async def test_get_resource_by_id_maps_an_unexpected_runner_failure_to_502(
-    client: httpx.AsyncClient,
-) -> None:
-    """The runner's catch-all 500 body becomes a controlled 502 with its client-safe message."""
+async def _runner_unexpected_failure_body() -> dict[str, Any]:
+    """Return the body the real runner app answers when a route raises unexpectedly."""
     runner_app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
 
     @runner_app.get("/v1/sessions/{conversation_id}/failure-probe")
@@ -1393,14 +1391,23 @@ async def test_get_resource_by_id_maps_an_unexpected_runner_failure_to_502(
     ) as runner:
         failed = await runner.get("/v1/sessions/child/failure-probe")
     assert failed.status_code == 500
-    fake_runner = _FakeRunnerClient(payload=failed.json(), status_code=500)
+    assert "private-runner-data" not in failed.text
+    return cast(dict[str, Any], failed.json())
+
+
+@pytest.mark.asyncio
+async def test_get_resource_by_id_maps_an_unexpected_runner_failure_to_502(
+    client: httpx.AsyncClient,
+) -> None:
+    """The runner's catch-all 500 body becomes a controlled 502 with its client-safe message."""
+    failure_body = await _runner_unexpected_failure_body()
+    fake_runner = _FakeRunnerClient(payload=failure_body, status_code=500)
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
     resp = await client.get("/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/env_broken")
 
     assert resp.status_code == 502
-    assert resp.json()["detail"] == failed.json()["error"]["message"]
-    assert "private-runner-data" not in resp.text
+    assert resp.json()["detail"] == failure_body["error"]["message"]
 
 
 @pytest.mark.asyncio
@@ -6310,27 +6317,30 @@ async def test_claude_native_reformatted_mirror_never_brands_later_messages_unde
 
 
 @pytest.mark.asyncio
-async def test_native_dispatch_reports_malformed_runner_error_body() -> None:
+@pytest.mark.parametrize("runner_body", ["framework_text", "runner_unexpected_failure"])
+async def test_native_dispatch_reports_malformed_runner_error_body(runner_body: str) -> None:
     """Opaque framework 500 bodies become explicit ensure errors.
 
-    If the runner/tunnel returns a plain ``Internal Server Error`` body
-    instead of the structured native startup error JSON, Omnigent still fast
-    fails the message. The transcript should not invent a missing
-    native CLI cause or persist the raw HTTP body; it should say the
-    runner returned a malformed ensure response.
+    If the runner/tunnel returns a plain ``Internal Server Error`` body, or the
+    runner's uncoded unexpected-failure JSON, instead of the structured native
+    startup error, Omnigent still fast fails the message. The transcript should
+    not invent a missing native CLI cause or persist the raw HTTP body; it
+    should say the runner returned a malformed ensure response.
     """
     from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
 
     store = _ConversationStore()
     conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
     assert conv is not None
+    failure_body: dict[str, Any] | None = None
+    if runner_body == "framework_text":
+        response = (500, "Internal Server Error", {"content-type": "text/plain"})
+    else:
+        failure_body = await _runner_unexpected_failure_body()
+        response = (500, json.dumps(failure_body), {"content-type": "application/json"})
     client = _FakeRunnerClient(
         text_responses={
-            "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals": (
-                500,
-                "Internal Server Error",
-                {"content-type": "text/plain"},
-            )
+            "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals": response
         }
     )
     body = SessionEventInput(
@@ -6338,17 +6348,18 @@ async def test_native_dispatch_reports_malformed_runner_error_body() -> None:
         data={"role": "user", "content": [{"type": "input_text", "text": "retry"}]},
     )
 
-    result = await _dispatch_session_event_to_runner(
-        "64a784c3aa907d1774f44313546947c6",
-        conv,
-        body,
-        store,  # type: ignore[arg-type]
-        client,  # type: ignore[arg-type]
-        agent_name="claude-native-ui",
-        file_store=None,
-        artifact_store=None,
-        created_by=None,
-    )
+    with capture_debug_rows("server") as rows:
+        result = await _dispatch_session_event_to_runner(
+            "64a784c3aa907d1774f44313546947c6",
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+            client,  # type: ignore[arg-type]
+            agent_name="claude-native-ui",
+            file_store=None,
+            artifact_store=None,
+            created_by=None,
+        )
 
     assert result.pending_id is None
     errors = [i for i in store.appended_items if i.type == "error"]
@@ -6361,6 +6372,10 @@ async def test_native_dispatch_reports_malformed_runner_error_body() -> None:
         errors[0].data.message
         == "Native Claude terminal ensure failed with malformed runner response (HTTP 500)."
     )
+    if failure_body is not None:
+        # The runner's failure evidence still reaches the failed-turn row.
+        [failed] = [r for r in rows if r["event_name"] == "session_turn_failed"]
+        assert failed["attributes"]["failure_id"] == failure_body["failure_context"]["failure_id"]
 
 
 @pytest.mark.asyncio
