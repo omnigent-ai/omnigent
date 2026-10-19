@@ -13,7 +13,6 @@ import contextlib
 import os
 import re
 import signal
-import socket
 import subprocess
 import threading
 import time
@@ -26,6 +25,7 @@ import pexpect
 import pytest
 from omnigent_client import OmnigentClient, SessionsChat
 
+from tests._helpers.live_server import find_free_port
 from tests.e2e.omnigent._pexpect_harness import (
     PROMPT_READY,
     STATE_SLEEPING,
@@ -130,17 +130,6 @@ class _ServerHandle:
     proc: subprocess.Popen[bytes]
     db_path: Path
     log_path: Path
-
-
-def _free_port() -> int:
-    """
-    Reserve and release a localhost TCP port.
-
-    :returns: A currently free port number.
-    """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def _write_marker_agent(tmp_path: Path, name: str, marker: str) -> Path:
@@ -564,7 +553,7 @@ def _running_server(
     :param tmp_path: Per-test temp directory.
     :yields: The server handle.
     """
-    port = _free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     db_path = tmp_path / "server.db"
     artifacts = tmp_path / "artifacts"

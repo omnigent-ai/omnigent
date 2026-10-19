@@ -59,7 +59,6 @@ import secrets
 import shlex
 import shutil
 import signal
-import socket
 import stat
 import subprocess
 import sys
@@ -72,6 +71,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.live_server import find_free_port
 from tests.e2e_ui.conftest import _create_native_claude_session
 from tests.e2e_ui.messages.test_message_render_parity import (
     _ensure_chat_view,
@@ -114,12 +114,6 @@ _FIRST_PROMPT = (
     "Audit the universe DAO layer for SQL anti-patterns. "
     f"Reply with exactly this token and nothing else: {_ECHO_TOKEN}"
 )
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 # Proxy-blind client: CI forces an egress proxy via HTTP(S)_PROXY env vars
@@ -361,7 +355,7 @@ def slow_ready_claude_session(
         f"        default: {_CLAUDE_MOCK_MODEL}\n"
     )
 
-    port = _free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     binding_token = secrets.token_urlsafe(32)
 
