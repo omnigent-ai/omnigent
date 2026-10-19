@@ -176,6 +176,7 @@ def register_resources_routes(
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
     host_registry: HostRegistry | None = None,
+    register_initial_file_upload: Callable[..., None] | None = None,
 ) -> None:
     """Register the resources routes on router."""
 
@@ -1699,6 +1700,11 @@ def register_resources_routes(
         :param file: The uploaded file (multipart form data).
         :returns: The session file resource object.
         """
+        return await _store_session_file(request, session_id, file)
+
+    async def _store_session_file(
+        request: Request, session_id: str, file: UploadFile, *, initial_input: bool = False
+    ) -> dict[str, Any]:
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
         if file_store is None or artifact_store is None:
             raise HTTPException(
@@ -1734,7 +1740,11 @@ def register_resources_routes(
         if filesystem_required:
             # Drop the declared type so the file is never stored as text.
             content_type = _resolve_content_type("application/octet-stream", file.filename)
-            await _require_filesystem_attachment_support(request, conv, file.filename)
+            if initial_input:
+                # The host does not exist yet; dispatch validates its runtime after provisioning.
+                await _require_filesystem_attachment_harness(conv, file.filename)
+            else:
+                await _require_filesystem_attachment_support(request, conv, file.filename)
         # Hold the quota check through the store below, so parallel uploads can't
         # all spend the same remaining allowance.
         attachment_lock = (
@@ -1847,6 +1857,14 @@ def register_resources_routes(
             resource=resource,
         )
         return resource
+
+    async def _upload_initial_file(
+        request: Request, session_id: str, file: UploadFile
+    ) -> dict[str, Any]:
+        return await _store_session_file(request, session_id, file, initial_input=True)
+
+    if register_initial_file_upload is not None:
+        register_initial_file_upload(_upload_initial_file)
 
     @router.get(
         "/sessions/{session_id}/resources/files/{file_id}",

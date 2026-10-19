@@ -3354,6 +3354,260 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
     )
 
 
+_RELAUNCHED_SESSION_ID = "6fe4feaa4dc772577c234c9f48c30dda"
+_SOURCE_BRIDGE_ID = "971d4249f0c874d2718c0ea35ed53ef5"
+
+
+class _LiveClaudeInstance:
+    """Minimal live terminal instance for the tmux-target publish."""
+
+    running = True
+    socket_path = "/tmp/fake-claude.sock"
+    tmux_target = "main"
+
+
+class _LiveClaudeTerminalRegistry:
+    """Returns the live instance for any (session, terminal, key) lookup."""
+
+    def get(self, conversation_id: str, terminal_name: str, session_key: str) -> Any:
+        """Return the fake live instance."""
+        del conversation_id, terminal_name, session_key
+        return _LiveClaudeInstance()
+
+
+class _LiveClaudeResourceRegistry:
+    """Resource registry whose launched Claude pane is live."""
+
+    terminal_registry = _LiveClaudeTerminalRegistry()
+
+    async def launch_required_terminal(
+        self,
+        *,
+        session_id: str,
+        terminal_name: str,
+        session_key: str,
+        spec: Any,
+        resource_role: str | None = None,
+        parent_os_env: Any = None,
+    ) -> SessionResourceView:
+        """Return a running terminal view."""
+        del spec, resource_role, parent_os_env
+        return SessionResourceView(
+            id="terminal_claude_main",
+            type="terminal",
+            session_id=session_id,
+            name=f"{terminal_name}:{session_key}",
+            metadata={"terminal_name": terminal_name, "session_key": session_key, "running": True},
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("bridge_id_label", "moves"),
+    [(_SOURCE_BRIDGE_ID, True), (_RELAUNCHED_SESSION_ID, False)],
+    ids=["inherited_label", "own_label"],
+)
+async def test_auto_create_claude_terminal_rebinds_a_moved_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bridge_id_label: str,
+    moves: bool,
+) -> None:
+    """
+    A fresh pane for a session with an inherited bridge id moves it to its own dir.
+
+    A /clear or /fork replacement carries its source's bridge id label. A new
+    runner spawns the session's harness from that label, then launches the pane
+    in ``D(session_id)``. The launch must persist the label, since turns after the
+    init envelope expires read it from the server, and pass the move to
+    ``rebind_bridge`` so the harness is respawned in the new dir. A session
+    already on its own bridge id makes neither call.
+    """
+    from unittest.mock import AsyncMock
+
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PROTOCOL_VERSION,
+        RunnerSessionInitSnapshot,
+    )
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    envelope = RunnerSessionInitEnvelope(
+        protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+        server_version="test",
+        session_id=_RELAUNCHED_SESSION_ID,
+        agent_id="agent",
+        snapshot=RunnerSessionInitSnapshot(
+            created_at=0,
+            updated_at=0,
+            workspace=str(workspace),
+            labels={BRIDGE_ID_LABEL_KEY: bridge_id_label},
+        ),
+    )
+    requests: list[httpx.Request] = []
+
+    def _handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={}, request=request)
+
+    rebinds: list[tuple[str, str]] = []
+
+    async def _rebind(session_id: str, bridge_id: str) -> None:
+        rebinds.append((session_id, bridge_id))
+
+    async with httpx.AsyncClient(
+        base_url="http://test-server", transport=httpx.MockTransport(_handle)
+    ) as client:
+        await _auto_create_claude_terminal(
+            _RELAUNCHED_SESSION_ID,
+            _LiveClaudeResourceRegistry(),
+            lambda _sid, _evt: None,
+            server_client=client,
+            session_init=envelope,
+            auth_token_factory=lambda: None,
+            resolve_launch_config=AsyncMock(return_value=None),
+            rebind_bridge=_rebind,
+        )
+
+    # The pane is advertised in the session's own dir either way.
+    assert (bridge_dir_for_bridge_id(_RELAUNCHED_SESSION_ID) / "tmux.json").exists()
+    assert envelope.snapshot.labels[BRIDGE_ID_LABEL_KEY] == _RELAUNCHED_SESSION_ID
+    label_patches = [
+        body["labels"]
+        for request in requests
+        if request.method == "PATCH"
+        and BRIDGE_ID_LABEL_KEY in (body := json.loads(request.content)).get("labels", {})
+    ]
+    if moves:
+        assert label_patches == [{BRIDGE_ID_LABEL_KEY: _RELAUNCHED_SESSION_ID}]
+        assert rebinds == [(_RELAUNCHED_SESSION_ID, _RELAUNCHED_SESSION_ID)]
+    else:
+        assert label_patches == []
+        assert rebinds == []
+
+
+@pytest.mark.asyncio
+async def test_relaunch_that_moves_the_bridge_respawns_the_harness_there(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The turn after a relaunch moved the Claude bridge spawns its harness in the new dir.
+
+    Session init spawns the harness from the inherited bridge id label before the
+    terminal launch moves the bridge. The runner's ``rebind_bridge`` must release
+    that harness and update the cached init labels, so the next turn's spawn env
+    names the dir the pane advertises in. Before, every web message waited 30 s
+    in the old dir and failed with "tmux target is not advertised yet".
+    """
+    from omnigent.harnesses.claude_native.bridge import BRIDGE_DIR_ENV_VAR
+
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    agent_id = "b1428afa05a7169b76a73ae805a6f71f"
+    launches: list[str] = []
+
+    async def _moving_auto_create(
+        session_id: str,
+        resource_registry: Any,
+        publish_event: Any,
+        **kwargs: Any,
+    ) -> SessionResourceView:
+        # The real launch moves a session off an inherited bridge id this way.
+        del resource_registry, publish_event
+        launches.append(session_id)
+        if len(launches) == 1:
+            await kwargs["rebind_bridge"](session_id, session_id)
+        return SessionResourceView(
+            id="terminal_claude_main",
+            type="terminal",
+            session_id=session_id,
+            name="claude:main",
+            metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_claude_terminal",
+        _moving_auto_create,
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=TerminalRegistry(),
+    )
+
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": _RELAUNCHED_SESSION_ID,
+                "agent_id": agent_id,
+                "session_init": {
+                    "protocol_version": 2,
+                    "server_version": "0.19.0.dev0",
+                    "session_id": _RELAUNCHED_SESSION_ID,
+                    "agent_id": agent_id,
+                    "snapshot": {
+                        "created_at": 10,
+                        "updated_at": 11,
+                        "workspace": str(tmp_path),
+                        "labels": {BRIDGE_ID_LABEL_KEY: _SOURCE_BRIDGE_ID},
+                    },
+                },
+            },
+        )
+        assert created.status_code == 201, created.text
+        # Init spawned the harness from the inherited label, then the launch
+        # released it.
+        assert pm.get_client_calls[0][2][BRIDGE_DIR_ENV_VAR] == str(
+            bridge_dir_for_bridge_id(_SOURCE_BRIDGE_ID)
+        )
+        assert pm.released == [_RELAUNCHED_SESSION_ID]
+
+        sent = await client.post(
+            f"/v1/sessions/{_RELAUNCHED_SESSION_ID}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": agent_id,
+                "content": [{"type": "input_text", "text": "hello"}],
+            },
+        )
+        assert sent.status_code == 202, sent.text
+        for _ in range(100):
+            if len(pm.get_client_calls) > 1:
+                break
+            await asyncio.sleep(0.02)
+
+    turn_spawns = [
+        env for _conv, harness, env in pm.get_client_calls[1:] if harness == "claude-native"
+    ]
+    assert turn_spawns, f"the turn never acquired its harness: {pm.get_client_calls!r}"
+    assert turn_spawns[0][BRIDGE_DIR_ENV_VAR] == str(
+        bridge_dir_for_bridge_id(_RELAUNCHED_SESSION_ID)
+    )
+
+
 @dataclass
 class _AutoCreateScenario:
     """

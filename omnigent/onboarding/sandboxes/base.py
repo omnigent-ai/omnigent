@@ -1058,10 +1058,17 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
                 (HOST_NAME_ENV_VAR, host_name),
             )
         )
-        self.run_background(
-            sandbox_id,
-            f"{env_prefix} omnigent host --server {shlex.quote(server_url)}",
-        )
+        try:
+            self.run_background(
+                sandbox_id,
+                f"{env_prefix} omnigent host --server {shlex.quote(server_url)}",
+            )
+        except click.ClickException as exc:
+            # Provider errors echo the failed command, and this one carries the token.
+            # Redact in place so subclasses such as SandboxGoneError keep their type.
+            exc.message = exc.message.replace(token, "[redacted]")
+            exc.args = (exc.message,)
+            raise exc from None
         return workspace
 
     def materialize_workspace(

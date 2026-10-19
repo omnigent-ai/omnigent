@@ -73,6 +73,10 @@ and steers messages while the agent is busy.
 - `delivered-send-recovery`: a sent message stays out of the composer when its
   HTTP acknowledgement is lost. Delivery during draft restoration clears the
   untouched draft; user edits remain.
+- `managed-first-input`: submitting a new managed session saves its first input
+  and attachments before provisioning. Follow-ups sent during startup are saved
+  in order too. They run even if the creating browser closes; reopening shows
+  each message once.
 - `import-bundle`: Create custom agent → Import bundle installs a `.tar.gz` agent
   bundle and selects it. States: import in flight (Cancel and Create locked),
   rejected bundle, imported agent missing from the refreshed list, and hidden on
@@ -139,6 +143,14 @@ and steers messages while the agent is busy.
   `tests/e2e_ui/start_session/test_sandbox_gateway_models_without_binding.py`
   and `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_optional_gateway_preview_without_a_host`.
 - Attach files or type `/` before the first send.
+- For a managed sandbox, submit a prompt and close the browser once the session
+  URL appears, while provisioning is still in progress. Reopen that URL after
+  startup and check that the first turn completed without another send. Repeat
+  with an attachment and with the original tab left open.
+- While the managed session is still starting, send two more messages from the
+  in-session composer, then close the browser. Reopen after startup and check
+  that all three reached the agent in order. Ordinary busy-session queueing
+  resumes after the first input is delivered.
 - Select a Codex host and workspace, then type `$<skill-name>` and select the
   namespaced plugin suggestion before starting the session.
 - Open **MCPs** in the workspace bar above the composer (the plug icon when space is tight), then turn
@@ -352,6 +364,23 @@ Other connection providers alone do not enable the managed MCP picker.
   runs with a phone viewport. Run the same lost-ack journey at a desktop viewport
   for the desktop entry point. The restore/delivery ordering and preservation of
   user edits are covered in `web/src/pages/ChatPage.composer.test.tsx`.
+- **`managed-first-input`, new-session composer (own environments):**
+  `tests/e2e_ui/start_session/test_managed_first_input_tab_close.py::test_managed_first_input_runs_after_browser_closes`
+  closes the entire browser during provisioning, on both the creating replica
+  and another replica. It requires a persisted reply before opening a fresh
+  browser, then checks reload for duplicates.
+  `tests/e2e_ui/start_session/test_managed_first_message_routing.py::test_managed_first_message_rebinds_live_stream_across_replicas`
+  keeps the tab open and requires two live turns across the replica handoff.
+  `tests/e2e_ui/start_session/test_managed_initial_attachment.py::test_managed_initial_attachment_survives_browser_close`
+  covers attachments with an SDK agent and the real native Codex CLI (Codex and
+  tmux required).
+  `tests/e2e_ui/start_session/test_managed_startup_followups.py::test_startup_followups_survive_browser_close`
+  sends three messages during provisioning with both harness types, closes the
+  browser, and verifies ordered input delivery and a fresh-browser reload.
+  These tests use real servers, host, runner and browser; only
+  cloud allocation and model output are local substitutes. Backend coverage in
+  `tests/server/integration/test_managed_startup_inputs.py` checks native
+  transcript ownership, bundle uploads, recovery, access revocation and deletion.
 - **`new-session-hotkey`:**
   `tests/e2e_ui/sessions/test_new_session_hotkey.py::test_new_session_hotkey_from_focused_composer`
 - **`import-bundle`:** no browser-level coverage; the web unit tests for the

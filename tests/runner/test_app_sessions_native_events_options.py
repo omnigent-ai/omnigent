@@ -2633,6 +2633,41 @@ async def test_events_model_change_sends_no_key_past_its_budget(
 
 
 @pytest.mark.asyncio
+async def test_events_model_change_keeps_a_switch_that_landed_before_its_budget_lapsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow recreation can spend the budget in the dialog watch after ``/model``.
+
+    Claude applies the switch at once and opens no dialog, but the watch for one
+    outlasts the request's budget and the injection is cancelled. The statusLine
+    already shows the pick, so the reply is success, not a rollback.
+    """
+    clock = _VirtualClock()
+    submitted = False
+
+    def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
+        del bridge_dir, ready_timeout_s, timeout_s
+        clock.sleep(native_controls._CLAUDE_CONTROL_PROMPT_WAIT_S)
+
+    def _inject(bridge_dir: Any, **kwargs: Any) -> None:
+        nonlocal submitted
+        del bridge_dir, kwargs
+        submitted = True
+        clock.sleep(native_controls._CLAUDE_CONTROL_BUDGET_S)
+        raise claude_native_bridge.ClaudeInjectionCancelled("budget lapsed in the dialog watch")
+
+    resp = await _post_model_change_through_a_boot(
+        monkeypatch,
+        wait=_wait,
+        inject=_inject,
+        status=lambda _bridge_dir: "claude-opus-4-7" if submitted else "claude-opus-4-6",
+        clock=clock,
+    )
+
+    assert resp.status_code == 204, resp.text
+
+
+@pytest.mark.asyncio
 async def test_events_model_change_fails_and_logs_when_the_prompt_never_renders(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

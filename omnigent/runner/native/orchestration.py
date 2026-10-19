@@ -8485,6 +8485,7 @@ async def _auto_create_claude_terminal(
     auth_token_factory: Callable[[], str | None] | None = None,
     resolve_launch_config: Callable[[], Awaitable[ClaudeNativeUcodeConfig | None]] | None = None,
     record_launch_config: Callable[[str, ClaudeNativeUcodeConfig | None], None] | None = None,
+    rebind_bridge: Callable[[str, str], Awaitable[None]] | None = None,
 ) -> SessionResourceView:
     """
     Auto-create a Claude Code terminal for a claude-native session.
@@ -8529,6 +8530,9 @@ async def _auto_create_claude_terminal(
         the model-options endpoint so launch and UI use one catalog query.
     :param record_launch_config: Optional callback that stores the exact
         provider/model snapshot used for this session's launch.
+    :param rebind_bridge: Optional runner callback, given the session id and its
+        new bridge id when this launch moves the session to a different bridge
+        dir. It points the runner's cached labels and harness subprocess there.
     :returns: The launched terminal's :class:`SessionResourceView`, so
         callers that create it on demand (the resume "ensure" path in
         :func:`create_session_terminal`) can return the resource.
@@ -8580,12 +8584,16 @@ async def _auto_create_claude_terminal(
         session_labels=session_init.snapshot.labels if session_init is not None else None,
     )
     bridge_id = cleared_bridge_id if existing_bridge_id == cleared_bridge_id else session_id
+    # A /clear or /fork replacement inherits its source's bridge id, so a fresh
+    # pane for it moves the session to D(bridge_id).
+    rekeyed = existing_bridge_id != bridge_id
     if session_init is not None:
         # The transfer-inbound guard has already consumed the original label.
         # From this point this terminal owns the bridge, so later first-turn
         # helpers must observe the normalized id selected here.
         session_init.snapshot.labels[BRIDGE_ID_LABEL_KEY] = bridge_id
-    else:
+    if session_init is None or rekeyed:
+        # Turns after the envelope expires read the label from the server.
         try:
             await server_client.patch(
                 f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
@@ -8597,6 +8605,15 @@ async def _auto_create_claude_terminal(
                 "Could not set bridge_id label for %s; relay may target wrong dir",
                 session_id,
             )
+    if rekeyed and rebind_bridge is not None:
+        # The harness reads its bridge dir once at spawn; one started under the
+        # old label would wait for this pane's tmux.json in the wrong dir.
+        _logger.info(
+            "Claude terminal bridge moved to the session's own dir: session=%s",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        await rebind_bridge(session_id, bridge_id)
     # Capture the previous claude_session_id from the bridge state file BEFORE
     # prepare_bridge_dir unlinks it. read_claude_session_id reads _STATE_FILE,
     # which prepare_bridge_dir removes as part of its refresh; reading it here
@@ -9842,6 +9859,7 @@ class NativeLaunchContext:
     auth_token_factory: Callable[[], str | None] | None = None
     resolve_launch_config: Callable[[], Awaitable[ClaudeNativeUcodeConfig | None]] | None = None
     record_launch_config: Callable[[str, ClaudeNativeUcodeConfig | None], None] | None = None
+    rebind_bridge: Callable[[str, str], Awaitable[None]] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -10020,6 +10038,7 @@ async def _launch_claude(ctx: NativeLaunchContext) -> SessionResourceView:
         auth_token_factory=ctx.auth_token_factory,
         resolve_launch_config=ctx.resolve_launch_config,
         record_launch_config=ctx.record_launch_config,
+        rebind_bridge=ctx.rebind_bridge,
     )
 
 

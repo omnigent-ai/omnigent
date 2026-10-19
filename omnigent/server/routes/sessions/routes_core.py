@@ -197,6 +197,7 @@ from omnigent.server.schemas import (
     ResetSessionModelOverrideRequest,
     ResetSessionModelOverrideResponse,
     SessionCreateRequest,
+    SessionEventInput,
     SessionForkRequest,
     SessionLabelsResponse,
     SessionList,
@@ -407,6 +408,85 @@ def register_core_routes(
 ) -> None:
     """Register the core session routes on router."""
 
+    async def _check_initial_input(request: Request, event: SessionEventInput | None) -> None:
+        """Refuse a malformed first input before the session exists."""
+        from starlette.datastructures import UploadFile as FormUploadFile
+
+        form = (
+            await request.form()
+            if request.headers.get("content-type", "").startswith("multipart/form-data")
+            else None
+        )
+        files = form.getlist("initial_files") if form is not None else []
+        if event is None:
+            if files:
+                raise OmnigentError(
+                    "initial_files requires initial_input", code=ErrorCode.INVALID_INPUT
+                )
+            return
+        if getattr(request.app.state, "startup_inputs", None) is None:
+            raise OmnigentError(
+                "durable initial input is not configured", code=ErrorCode.INVALID_INPUT
+            )
+        if files and (
+            file_store is None or not all(isinstance(file, FormUploadFile) for file in files)
+        ):
+            raise OmnigentError(
+                "initial_files must contain uploaded files", code=ErrorCode.INVALID_INPUT
+            )
+
+    async def _accept_initial_input(
+        request: Request, session_id: str, event: SessionEventInput | None, user_id: str | None
+    ) -> None:
+        """Save a checked first input, deleting the new session if that fails."""
+        if event is None:
+            return
+        startup = request.app.state.startup_inputs
+        try:
+            form = (
+                await request.form()
+                if request.headers.get("content-type", "").startswith("multipart/form-data")
+                else None
+            )
+            blocks = []
+            for file in form.getlist("initial_files") if form is not None else []:
+                assert file_store is not None  # _check_initial_input refused files without one
+                resource = await request.app.state.initial_file_upload(request, session_id, file)
+                stored = await asyncio.to_thread(
+                    file_store.get, resource["id"], session_id=session_id
+                )
+                assert stored is not None
+                blocks.append(
+                    {
+                        "type": "input_image"
+                        if (stored.content_type or "").startswith("image/")
+                        else "input_file",
+                        "file_id": stored.id,
+                        "filename": stored.filename,
+                    }
+                )
+            if blocks:
+                event = event.model_copy(
+                    update={
+                        "data": {
+                            **event.data,
+                            "content": [*blocks, *event.data.get("content", [])],
+                        }
+                    }
+                )
+            await startup.enqueue(session_id, event, user_id=user_id, headers=request.headers)
+        except Exception:
+            # The create fails, so leave no session (or uploaded file) for a retry
+            # to duplicate.
+            if file_store is not None:
+                blob_keys = await asyncio.to_thread(file_store.delete_all_for_session, session_id)
+                if artifact_store is not None:
+                    for blob_key in blob_keys:
+                        with contextlib.suppress(Exception):
+                            await asyncio.to_thread(artifact_store.delete, blob_key)
+            await conversation_store.delete_conversation(session_id)
+            raise
+
     async def _schedule_managed_launch(
         request: Request,
         *,
@@ -512,6 +592,12 @@ def register_core_routes(
                 session_id,
                 managed_labels,
             )
+        if getattr(request.app.state, "startup_inputs", None) is not None:
+            from omnigent.server.startup_inputs import STARTUP_LABEL
+
+            await asyncio.to_thread(
+                conversation_store.set_labels, session_id, {STARTUP_LABEL: "pending"}
+            )
         managed_launches.begin(session_id)
         # Seed the launch-progress indicator before the background task
         # starts, so the first GET snapshot (the Web UI navigates to the
@@ -522,25 +608,39 @@ def register_core_routes(
             "provisioning",
             provider=sandbox_provider or sandbox_config.default.provider,
         )
-        launch_task = asyncio.create_task(
-            _run_managed_launch(
-                session_id=session_id,
-                # On auth-disabled servers user_id is None; the sandbox
-                # host registers under the reserved local owner.
-                owner=user_id if user_id is not None else RESERVED_USER_LOCAL,
-                sandbox_config=sandbox_config,
-                repos=repos,
-                tracker=managed_launches,
-                conversation_store=conversation_store,
-                host_store=host_store_for_managed,
-                host_registry=getattr(request.app.state, "host_registry", None),
-                tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
-                provider=sandbox_provider,
-                agent_store=agent_store,
-                agent_id=agent_id,
-                host_id=requested_host_id,
-            )
+        launch = _run_managed_launch(
+            session_id=session_id,
+            # On auth-disabled servers user_id is None; the sandbox
+            # host registers under the reserved local owner.
+            owner=user_id if user_id is not None else RESERVED_USER_LOCAL,
+            sandbox_config=sandbox_config,
+            repos=repos,
+            tracker=managed_launches,
+            conversation_store=conversation_store,
+            host_store=host_store_for_managed,
+            host_registry=getattr(request.app.state, "host_registry", None),
+            tunnel_registry=getattr(request.app.state, "tunnel_registry", None),
+            provider=sandbox_provider,
+            agent_store=agent_store,
+            agent_id=agent_id,
+            host_id=requested_host_id,
         )
+        startup = getattr(request.app.state, "startup_inputs", None)
+
+        async def launch_and_record_failure() -> None:
+            try:
+                await launch
+            except Exception as exc:
+                if startup is not None:
+                    await startup.record_launch_failure(
+                        session_id, f"managed sandbox failed to launch: {exc}"
+                    )
+                raise
+            failed = managed_launches.get(session_id)
+            if startup is not None and failed is not None and failed.error is not None:
+                await startup.record_launch_failure(session_id, failed.error)
+
+        launch_task = asyncio.create_task(launch_and_record_failure())
         _managed_launch_tasks.add(launch_task)
         launch_task.add_done_callback(_managed_launch_tasks.discard)
 
@@ -791,7 +891,8 @@ def register_core_routes(
         """
         user_id = _require_user(request, auth_provider)
         content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
-        if content_type == "multipart/form-data":
+        form = await request.form(max_files=21) if content_type == "multipart/form-data" else None
+        if form is not None and (form.get("bundle") is not None or "initial_files" not in form):
             result = await _create_bundled_session_from_multipart(request, user_id)
             # Surface the freshly-minted session id (the request path has no
             # {session_id} on create); the middleware promotes a bag session_id
@@ -799,8 +900,14 @@ def register_core_routes(
             add_audit_attrs(session_id=result.session_id, agent=result.agent_id)
             return result
 
+        if form is not None and not isinstance(form.get("metadata"), str):
+            raise HTTPException(status_code=422, detail=[_multipart_missing_detail("metadata")])
         try:
-            payload = await request.json()
+            payload = (
+                json.loads(str(form.get("metadata", "{}")))
+                if form is not None
+                else await request.json()
+            )
             # Dispatch on the VALUE, not key presence: a null project_id is
             # "no project", so it must keep the legacy request shape (and its
             # 422 contract) byte-identical to an absent key.
@@ -832,6 +939,7 @@ def register_core_routes(
 
         # Checked before the session exists so a rejected create leaves nothing
         # behind.
+        await _check_initial_input(request, body.initial_input)
         if body.requested_host_id is not None:
             await _check_requested_host_id(request, body.requested_host_id, user_id)
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
@@ -937,6 +1045,7 @@ def register_core_routes(
                     LEVEL_OWNER,
                 )
             resp.permission_level = grant.level
+        await _accept_initial_input(request, resp.id, body.initial_input, user_id)
         # Managed host: schedule a BACKGROUND sandbox provision bound
         # to this session and return immediately — provisioning takes
         # tens of seconds and must not block the create POST. The
@@ -1063,6 +1172,7 @@ def register_core_routes(
             project_store=project_store,
         )
         parsed_metadata = project_resolution.body
+        await _check_initial_input(request, parsed_metadata.initial_input)
         creation_metadata(
             parent_session_id=parsed_metadata.parent_session_id,
             host_type=parsed_metadata.host_type,
@@ -1203,6 +1313,9 @@ def register_core_routes(
                 await asyncio.to_thread(
                     permission_store.grant, user_id, result.session_id, LEVEL_OWNER
                 )
+        await _accept_initial_input(
+            request, result.session_id, parsed_metadata.initial_input, user_id
+        )
         _announce_session_added(user_id, result.session_id)
         # Managed bundle create: provision a sandbox host for the
         # just-uploaded session-scoped agent (same background launch as

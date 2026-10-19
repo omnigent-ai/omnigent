@@ -13,15 +13,18 @@ import os
 import re
 import shlex
 import subprocess
+import traceback
 from pathlib import Path
 from typing import ClassVar
 
+import click
 import pytest
 import yaml
 
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
+    SandboxGoneError,
     SandboxLauncher,
     render_host_config_write_command,
     supervise_host_command,
@@ -209,6 +212,38 @@ def test_start_host_env_prefix_is_honored_by_a_real_shell() -> None:
         ["sh", "-c", probe], capture_output=True, text=True, check=True
     ).stdout.strip()
     assert out == "tok-123:host_abc:managed-abc"
+
+
+@pytest.mark.parametrize("error_type", [click.ClickException, SandboxGoneError])
+def test_start_host_launch_failure_redacts_the_token(
+    error_type: type[click.ClickException],
+) -> None:
+    """
+    Providers echo a failed command in their error, the server shows that error
+    to the user as the session failure, and the host launch command carries the
+    launch token. The type must survive: a wake recreates on SandboxGoneError.
+    """
+
+    class _FailingLaunchLauncher(_RecordingLauncher):
+        def run(self, sandbox_id: str, command: str, *, check: bool = True) -> RemoteCommandResult:
+            if "omnigent host --server" in command:
+                raise error_type(
+                    f"Remote command failed on sandbox '{sandbox_id}' (exit 1): {command}"
+                ) from RuntimeError(command)
+            return super().run(sandbox_id, command, check=check)
+
+    with pytest.raises(error_type) as caught:
+        _FailingLaunchLauncher().start_host(
+            "sb-1",
+            token="tok-secret-123",
+            host_id="host_abc",
+            host_name="managed-abc",
+            server_url="https://srv",
+        )
+
+    assert "OMNIGENT_HOST_TOKEN=[redacted]" in caught.value.message
+    rendered = "".join(traceback.format_exception(caught.value)) + repr(caught.value)
+    assert "tok-secret-123" not in rendered
 
 
 def test_start_host_default_materialize_clones_repo() -> None:
