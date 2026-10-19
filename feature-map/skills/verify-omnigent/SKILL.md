@@ -66,6 +66,9 @@ instance runs old code: stop it and start a new one.
 
 1. Open the matching file in [feature map](../../README.md) and list every
    entry point for the behavior in question.
+   For harness work, use the shared [acceptance checklist](../../harness-acceptance.md)
+   to select existing bench/scenario coverage and record gaps per affected
+   harness, transport and surface. A bench API pass does not cover the browser.
 2. For each entry point, run the named test through the instance, recording on:
 
    ```sh

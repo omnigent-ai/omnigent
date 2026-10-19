@@ -87,6 +87,10 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 ## Features
 
+- [Harness acceptance](./harness-acceptance.md) standardizes the SDK/native
+  checklist, connects existing bench probes to user journeys, and records
+  per-harness coverage gaps separately from observed results.
+
 - [Markdown editor](./markdown-editor.md) defines the file-editor CUJ, fixed
   before/after recordings, load probes, and complementary persistence checks.
 
@@ -187,7 +191,9 @@ budgets, MCP servers, sandbox providers, and smart routing.
 - **Every PR, enforced:** `tests/dev/test_verify_omnigent_feature_map.py` fails
   when a referenced test is renamed or removed, a feature file breaks the entry
   contract, a native harness has no matrix row, or a UI test area or CLI command
-  is neither mapped nor listed under [Not yet mapped](#not-yet-mapped). It runs
+  is neither mapped nor listed under [Not yet mapped](#not-yet-mapped). It also
+  checks that the harness acceptance checklist maps every registered bench
+  probe; this is a documentation check, not a harness acceptance run. It runs
   in CI and in the E2E UI workflow, so UI-only PRs are checked too.
 - **Every PR, advisory:** when a PR changes user-facing code, the Polly review
   adds a non-blocking note if the change adds or removes an entry point that the
