@@ -10,6 +10,7 @@ later runs with the runner's authority.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import httpx
@@ -276,6 +277,117 @@ async def test_shared_editor_cannot_edit_mcp_servers(auth_client: httpx.AsyncCli
         headers={"X-Forwarded-Email": BOB},
     )
     assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.parametrize(
+    "hook",
+    [
+        "permission-request",
+        "codex-elicitation-request",
+        "antigravity-elicitation-request",
+        "cursor-permission-request",
+        "native-permission-request",
+    ],
+)
+async def test_read_only_collaborator_cannot_publish_native_hooks(
+    auth_client: httpx.AsyncClient, hook: str
+) -> None:
+    agent = await create_test_agent(auth_client, name="native-hooks", user=ALICE)
+    path = f"/v1/sessions/{agent['_session_id']}"
+    owner = {"X-Forwarded-Email": ALICE}
+    collaborator = {"X-Forwarded-Email": BOB}
+    for level, expected in [(LEVEL_READ, 403), (LEVEL_EDIT, 400)]:
+        response = await auth_client.put(
+            f"{path}/permissions", json={"user_id": BOB, "level": level}, headers=owner
+        )
+        assert response.status_code in (200, 204), response.text
+        # An empty body reaches validation only after mutation authority is checked.
+        response = await auth_client.post(
+            f"{path}/hooks/{hook}", json={}, headers=collaborator
+        )
+        assert response.status_code == expected, response.text
+
+
+@pytest.mark.parametrize("child", [False, True])
+async def test_policy_evaluation_uses_inherited_edit_authority(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    child: bool,
+) -> None:
+    from tests.server.helpers import policy_tool_call_request
+    from tests.server.integration.test_sessions_endpoints import _capture_published
+    from tests.server.integration.test_sessions_policy_evaluate import (
+        _drain_elicitation_id,
+        _patch_default_policies,
+    )
+
+    agent = await create_test_agent(auth_client, name="policy-authority", user=ALICE)
+    parent_id = agent["_session_id"]
+    session_id = parent_id
+    if child:
+        session_id = (
+            SqlAlchemyConversationStore(db_uri)
+            .create_conversation(agent_id=agent["id"], parent_conversation_id=parent_id)
+            .id
+        )
+    owner = {"X-Forwarded-Email": ALICE}
+    collaborator = {"X-Forwarded-Email": BOB}
+    _patch_default_policies(
+        monkeypatch,
+        "tests.server.integration.test_sessions_policy_evaluate._ask_for_bash",
+    )
+    response = await auth_client.put(
+        f"/v1/sessions/{parent_id}/permissions",
+        json={"user_id": BOB, "level": LEVEL_READ},
+        headers=owner,
+    )
+    assert response.status_code in (200, 204), response.text
+    published = []
+    with monkeypatch.context() as observer:
+        _capture_published(observer, published)
+        response = await asyncio.wait_for(
+            auth_client.post(
+                f"/v1/sessions/{session_id}/policies/evaluate",
+                json=policy_tool_call_request("Bash"),
+                headers=collaborator,
+            ),
+            timeout=5,
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["result"] == "POLICY_ACTION_ASK"
+    assert not published
+
+    response = await auth_client.put(
+        f"/v1/sessions/{parent_id}/permissions",
+        json={"user_id": BOB, "level": LEVEL_EDIT},
+        headers=owner,
+    )
+    assert response.status_code in (200, 204), response.text
+    drain = asyncio.create_task(_drain_elicitation_id(session_id))
+    await asyncio.sleep(0.05)
+    evaluation = asyncio.create_task(
+        auth_client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=policy_tool_call_request("Bash"),
+            headers=collaborator,
+        )
+    )
+    try:
+        elicitation_id = await asyncio.wait_for(drain, timeout=5)
+        verdict = await auth_client.post(
+            f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+            json={"action": "accept"},
+            headers=owner,
+        )
+        assert verdict.status_code == 202, verdict.text
+        response = await asyncio.wait_for(evaluation, timeout=5)
+        assert response.status_code == 200, response.text
+        assert response.json()["result"] == "POLICY_ACTION_ALLOW"
+    finally:
+        for task in (drain, evaluation):
+            task.cancel()
+        await asyncio.gather(drain, evaluation, return_exceptions=True)
 
 
 async def test_reuse_then_patch_never_reaches_the_owners_agent(
