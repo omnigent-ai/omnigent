@@ -3281,6 +3281,10 @@ async def _forward_approval_to_runner(
         )
 
 
+# ``conversation_items.response_id`` is ``String(64)``; a longer id fails the insert.
+_EXTERNAL_RESPONSE_ID_MAX_LEN: Final[int] = 64
+
+
 def _parse_external_assistant_message(
     body: SessionEventInput,
 ) -> tuple[str, str, str]:
@@ -3311,6 +3315,12 @@ def _parse_external_assistant_message(
     if not isinstance(response_id, str) or not response_id.strip():
         raise OmnigentError(
             "external_assistant_message data.response_id must be a non-empty string",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if len(response_id.strip()) > _EXTERNAL_RESPONSE_ID_MAX_LEN:
+        raise OmnigentError(
+            "external_assistant_message data.response_id must be at most "
+            f"{_EXTERNAL_RESPONSE_ID_MAX_LEN} characters",
             code=ErrorCode.INVALID_INPUT,
         )
     return agent_name.strip(), text, response_id.strip()
@@ -3406,6 +3416,12 @@ def _parse_external_conversation_item(
     if not isinstance(response_id, str) or not response_id.strip():
         raise OmnigentError(
             "external_conversation_item data.response_id must be a non-empty string",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if len(response_id.strip()) > _EXTERNAL_RESPONSE_ID_MAX_LEN:
+        raise OmnigentError(
+            "external_conversation_item data.response_id must be at most "
+            f"{_EXTERNAL_RESPONSE_ID_MAX_LEN} characters",
             code=ErrorCode.INVALID_INPUT,
         )
     message_id = body.data.get("message_id")
