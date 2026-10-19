@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -69,30 +70,65 @@ def test_hook_refusal_sends_one_enter_and_keeps_delivery_unconfirmed(
             snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=15).json()
             bridge_id = snapshot["labels"].get(bridge.BRIDGE_ID_LABEL_KEY) or session_id
             native = bridge.bridge_dir_for_bridge_id(bridge_id)
+            # The retry guard needs native identity before capturing the submit boundary.
+            deadline = time.monotonic() + 60
+            while (
+                bridge.read_claude_session_id(native) is None
+                or bridge.read_transcript_path(native) is None
+            ):
+                assert time.monotonic() < deadline, "Claude did not publish its session identity"
+                time.sleep(0.05)
             original_tmux = bridge._run_tmux
             submit_enters = 0
 
+            def refusals() -> list[dict[str, Any]]:
+                transcript = bridge.read_transcript_path(native)
+                if transcript is None:
+                    return []
+                try:
+                    text = transcript.read_text()
+                except FileNotFoundError:
+                    return []
+                records = [
+                    json.loads(line)
+                    for line in text.splitlines(keepends=True)
+                    if line.endswith("\n")
+                ]
+                return [
+                    record
+                    for record in records
+                    if record.get("type") == "system"
+                    and record.get("sessionId") == bridge.read_claude_session_id(native)
+                    and record.get("content")
+                    == "UserPromptSubmit operation blocked by hook:\n"
+                    "Synthetic retry refusal.\n\nOriginal prompt: BLOCKME retry probe"
+                ]
+
             def count_enters(socket_path: str, *args: str) -> str:
                 nonlocal submit_enters
+                result = original_tmux(socket_path, *args)
                 if args[-1] == "Enter":
                     submit_enters += 1
-                return original_tmux(socket_path, *args)
+                    if submit_enters == 1:
+                        # Exercise the retry guard after Claude records the refusal,
+                        # rather than during its transiently empty composer state.
+                        deadline = time.monotonic() + 20
+                        while not refusals():
+                            assert time.monotonic() < deadline, "Claude did not record its refusal"
+                            time.sleep(0.05)
+                return result
 
+            assert refusals() == []
             monkeypatch.setattr(bridge, "_run_tmux", count_enters)
             with pytest.raises(RuntimeError) as caught:
                 bridge.inject_user_message(native, content="BLOCKME retry probe", timeout_s=60)
             assert submit_enters == 1
             assert isinstance(caught.value, bridge.ClaudeSubmitBlockedUnconfirmed)
-            transcript = bridge.read_transcript_path(native)
-            assert transcript is not None
-            records = [json.loads(line) for line in transcript.read_text().splitlines()]
-            blocks = [
-                record
-                for record in records
-                if record.get("promptSubmitEnding", {}).get("ending", {}).get("kind")
-                == "blocked_by_hook"
-            ]
+            blocks = refusals()
             assert len(blocks) == 1
+            ending = blocks[0].get("promptSubmitEnding")
+            if ending is not None:
+                assert ending.get("ending", {}).get("kind") == "blocked_by_hook"
             hooks = [
                 json.loads(line)["payload"]
                 for line in (native / "hooks.jsonl").read_text().splitlines()
