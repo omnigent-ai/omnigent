@@ -3641,10 +3641,7 @@ def create_app(
                 host_id = await _session_host_id(held[0], conversation_store)
             if held and await _host_offline_state(host_id) is True:
                 await _mark_runner_sessions_offline(settle_now, error, conversation_store)
-                hold_until = time.time() + HOST_OFFLINE_HOLD_S
-                outcome = await _hold_while_host_offline(
-                    runner_id, host_id, held, reference_stamp, hold_until
-                )
+                outcome = await _hold_while_host_offline(runner_id, host_id, held, reference_stamp)
                 if outcome not in ("expired", "host_back_without_runner"):
                     return
                 try:
@@ -3661,7 +3658,7 @@ def create_app(
                         )
                     await _mark_runner_sessions_offline(to_fail, error, conversation_store)
                 finally:
-                    await asyncio.shield(_clear_hold_labels(held, hold_until))
+                    await asyncio.shield(_mark_hold(held, None))
                 return
         await _mark_runner_sessions_offline(affected, error, conversation_store)
 
@@ -3748,7 +3745,6 @@ def create_app(
         host_id: str | None,
         held: "list[Conversation]",
         reference_stamp: int | None,
-        hold_until: float,
     ) -> str:
         """Wait for a runner whose host went offline mid-turn, and report how it ended.
 
@@ -3764,7 +3760,6 @@ def create_app(
         :param host_id: The offline host the runner ran on.
         :param held: The interrupted sessions being held.
         :param reference_stamp: This replica's last liveness stamp for the runner.
-        :param hold_until: Epoch-seconds deadline written to the held sessions.
         :returns: ``"runner_reconnected"``, ``"live_elsewhere"``, ``"rebound"``
             or ``"server_shutdown"`` when nothing should fail, else ``"expired"``
             or ``"host_back_without_runner"``.
@@ -3795,7 +3790,9 @@ def create_app(
         )
         # A crash report cancels the hold; its end still gets a row.
         outcome = "cancelled"
-        hold_labels = {HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY: str(int(hold_until))}
+        hold_labels = {
+            HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY: str(int(time.time() + HOST_OFFLINE_HOLD_S))
+        }
         # A task, so a crash report's cancel leaves the write for the cleanup
         # below to wait on; retried on every re-check until each held session
         # carries its deadline.
@@ -3858,38 +3855,21 @@ def create_app(
             # turns. A replica shutting down keeps it, so other replicas leave
             # the turns running until the deadline.
             concluded = outcome not in ("expired", "host_back_without_runner")
-            await asyncio.shield(
-                _settle_hold_labels(label_write, held, hold_until, clear=concluded)
-            )
+            await asyncio.shield(_settle_hold_labels(label_write, held, clear=concluded))
         return outcome
 
     async def _settle_hold_labels(
-        write: "asyncio.Future[list[Conversation]]",
-        held: "list[Conversation]",
-        hold_until: float,
-        *,
-        clear: bool,
+        write: "asyncio.Future[list[Conversation]]", held: "list[Conversation]", *, clear: bool
     ) -> None:
         """Let an in-flight hold-label write land, then clear the labels if *clear*.
 
         Run shielded as one step, so no cancel can skip the clear or let the
-        write land after it.
+        write land after it. The clear is tried once: a retry could land after
+        a later hold on the same session wrote its own deadline.
         """
         await write
         if clear and not shutdown_state.server_shutting_down():
-            await _clear_hold_labels(held, hold_until)
-
-    async def _clear_hold_labels(held: "list[Conversation]", hold_until: float) -> None:
-        """Clear the hold labels, retrying failed deletes until the deadline lapses.
-
-        A deadline already past is inert, so the retries stop there.
-        """
-        from omnigent.server.routes.sessions import _HOST_OFFLINE_RECHECK_S
-
-        pending = await _mark_hold(held, None)
-        while pending and time.time() < hold_until and not shutdown_state.server_shutting_down():
-            await asyncio.sleep(_HOST_OFFLINE_RECHECK_S)
-            pending = await _mark_hold(pending, None)
+            await _mark_hold(held, None)
 
     async def _mark_hold(
         held: "list[Conversation]", labels: dict[str, str] | None

@@ -39,7 +39,7 @@ import json
 import tarfile
 import threading
 import time
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -2455,7 +2455,6 @@ async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
         "list_during_hold",
         "remote_live_at_expiry",
         "label_write_retry",
-        "label_clear_retry",
         "shutdown_keeps_label",
         "final_read_recovers",
     ],
@@ -2488,7 +2487,6 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
         "host_back_without_runner": 30.0,
         "list_during_hold": 30.0,
         "label_write_retry": 30.0,
-        "label_clear_retry": 30.0,
         "shutdown_keeps_label": 30.0,
     }.get(scenario, 0.6)
     monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
@@ -2615,20 +2613,6 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             return set_labels(conversation_id, updates, *args, **kwargs)
 
         monkeypatch.setattr(store, "set_labels", flaky_set_labels)
-    label_clears_failed: list[bool] = []
-    if scenario == "label_clear_retry":
-        delete_label = store.delete_label
-
-        def flaky_delete_label(conversation_id: str, key: str, *args, **kwargs):  # type: ignore[no-untyped-def]
-            if (
-                key == sessions_module.HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY
-                and not label_clears_failed
-            ):
-                label_clears_failed.append(True)
-                raise RuntimeError("store unavailable")
-            return delete_label(conversation_id, key, *args, **kwargs)
-
-        monkeypatch.setattr(store, "delete_label", flaky_delete_label)
 
     communicator = await _connect_runner_tunnel(ap_app, runner_id)
     await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
@@ -2678,7 +2662,7 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
                         await asyncio.sleep(0.02)
 
                 await asyncio.wait_for(_label_cleared(), timeout=budget(5.0))
-            elif scenario in ("label_write_retry", "label_clear_retry", "shutdown_keeps_label"):
+            elif scenario in ("label_write_retry", "shutdown_keeps_label"):
 
                 async def _labeled() -> None:
                     while True:
@@ -2693,26 +2677,10 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
                 await asyncio.wait_for(_labeled(), timeout=budget(5.0))
                 if scenario == "label_write_retry":
                     assert label_writes_failed
-                if scenario in ("label_write_retry", "label_clear_retry"):
                     reconnect = await _connect_runner_tunnel(ap_app, runner_id)
                     await _send_hello_and_wait(
                         reconnect, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
                     )
-                    if scenario == "label_clear_retry":
-
-                        async def _unlabeled() -> None:
-                            while True:
-                                row = store.get_conversation(held_id)
-                                if row is not None and (
-                                    sessions_module.HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY
-                                    not in row.labels
-                                ):
-                                    return
-                                await asyncio.sleep(0.02)
-
-                        # A failed clear is retried, so no deadline outlives the hold.
-                        await asyncio.wait_for(_unlabeled(), timeout=budget(5.0))
-                        assert label_clears_failed
                 else:
                     from omnigent.server import shutdown_state
 
@@ -2819,7 +2787,6 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             "list_during_hold": "runner_reconnected",
             "remote_live_at_expiry": "expired",
             "label_write_retry": "runner_reconnected",
-            "label_clear_retry": "runner_reconnected",
             "shutdown_keeps_label": "server_shutdown",
             "final_read_recovers": "expired",
         }[scenario]
@@ -2832,3 +2799,128 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
                 await reconnect.wait(timeout=budget(2.0))
         for cached_id in {session_id, held_id}:
             sessions_module._session_status_cache.pop(cached_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+async def test_an_ended_hold_leaves_a_later_holds_deadline_in_place(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hold whose clear failed never removes a later hold's deadline.
+
+    The first hold ends on reconnect but its clear fails, leaving its deadline.
+    The runner drops again and a second hold writes a newer one. Nothing from
+    the first hold deletes it, so a replica without the hold leaves the turn
+    running.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+    from tests.debug_log_helpers import capture_debug_rows
+
+    ap_client = tunnel_three_layer_stack.ap_client
+    ap_app = tunnel_three_layer_stack.ap_app
+    monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", 0.2)
+    monkeypatch.setattr("omnigent.server.routes.sessions.HOST_OFFLINE_HOLD_S", 30.0)
+    monkeypatch.setattr("omnigent.server.routes.sessions._HOST_OFFLINE_RECHECK_S", 0.05)
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+
+    async def host_offline(_host_id: str | None) -> bool:
+        return True
+
+    monkeypatch.setattr(sessions_module, "_host_offline_state", host_offline)
+    create_resp = await ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={
+            "bundle": ("agent.tar.gz", _build_harness_agent_bundle(), "application/gzip"),
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    session_id = create_resp.json()["session_id"]
+    runner_id = "runner-host-offline-two-holds"
+    store = get_conversation_store()
+    store.replace_runner_id(session_id, runner_id)
+    clears_failed: list[bool] = []
+    store_recovered: list[bool] = []
+    delete_label = store.delete_label
+
+    def clears_fail_until_recovered(conversation_id: str, key: str, *args, **kwargs):  # type: ignore[no-untyped-def]
+        # Deletes fail until the second hold has written its deadline.
+        if key == sessions_module.HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY and not store_recovered:
+            clears_failed.append(True)
+            raise RuntimeError("store unavailable")
+        return delete_label(conversation_id, key, *args, **kwargs)
+
+    monkeypatch.setattr(store, "delete_label", clears_fail_until_recovered)
+
+    def deadline() -> str | None:
+        row = store.get_conversation(session_id)
+        assert row is not None
+        return row.labels.get(sessions_module.HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY)
+
+    async def until(predicate: Callable[[], bool]) -> None:
+        while not predicate():
+            await asyncio.sleep(0.02)
+
+    tunnels: list[ApplicationCommunicator] = []
+
+    async def connect() -> ApplicationCommunicator:
+        comm = await _connect_runner_tunnel(ap_app, runner_id)
+        tunnels.append(comm)
+        await _send_hello_and_wait(comm, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+        return comm
+
+    async def drop(comm: ApplicationCommunicator) -> None:
+        sessions_module._session_status_cache[session_id] = "running"
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(2.0))
+
+    try:
+        with capture_debug_rows("server") as rows:
+
+            def ended() -> list[str]:
+                return [
+                    r["attributes"]["outcome"]  # type: ignore[index]
+                    for r in rows
+                    if r["event_name"] == "runner_disconnect_hold_ended"
+                ]
+
+            await drop(await connect())
+            await asyncio.wait_for(until(lambda: deadline() is not None), timeout=budget(5.0))
+            first_deadline = deadline()
+            # The runner returns; the first hold ends and fails to clear its deadline.
+            second = await connect()
+            await asyncio.wait_for(
+                until(lambda: len(ended()) == 1 and bool(clears_failed)), timeout=budget(5.0)
+            )
+            assert deadline() == first_deadline
+
+            monkeypatch.setattr("omnigent.server.routes.sessions.HOST_OFFLINE_HOLD_S", 40.0)
+            await drop(second)
+            await asyncio.wait_for(
+                until(lambda: deadline() not in (None, first_deadline)), timeout=budget(5.0)
+            )
+            second_deadline = deadline()
+            store_recovered.append(True)
+            # Many re-check intervals later the newer deadline is still there.
+            await asyncio.sleep(0.5)
+            assert deadline() == second_deadline
+            store.set_session_live_status(session_id, "running")
+            sessions_module._session_status_cache.pop(session_id, None)
+            listed = await ap_client.get("/v1/sessions")
+            assert listed.status_code == 200, listed.text
+            refreshed = store.get_conversation(session_id)
+            assert refreshed is not None
+            assert refreshed.live_status == "running"
+
+            await connect()
+            await asyncio.wait_for(until(lambda: len(ended()) == 2), timeout=budget(5.0))
+        assert ended() == ["runner_reconnected", "runner_reconnected"]
+    finally:
+        for comm in tunnels:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+            with contextlib.suppress(asyncio.TimeoutError, Exception):
+                await comm.wait(timeout=budget(2.0))
+        sessions_module._session_status_cache.pop(session_id, None)
