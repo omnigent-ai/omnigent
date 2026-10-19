@@ -1205,7 +1205,10 @@ def create_runner_app(
 
     app = FastAPI(title="omnigent-runner")
 
-    from omnigent.runner.logging_context import RunnerLogContextMiddleware
+    from omnigent.runner.logging_context import (
+        RunnerLogContextMiddleware,
+        request_path_session_id,
+    )
 
     app.add_middleware(RunnerLogContextMiddleware)
     mcp_execution_registry = McpExecutionRegistry()
@@ -2192,7 +2195,8 @@ def create_runner_app(
     @app.exception_handler(Exception)
     async def _handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
         route = getattr(request.scope.get("route"), "path", None)
-        session_id = request.path_params.get("session_id")
+        # Starlette runs this handler outside RunnerLogContextMiddleware's scope,
+        # so the request's session is re-read from the path, not the context.
         return JSONResponse(
             status_code=500,
             content={
@@ -2200,7 +2204,7 @@ def create_runner_app(
                 **_client_safe_error_payload(
                     exc,
                     context="runner HTTP request",
-                    session_id=session_id if isinstance(session_id, str) else None,
+                    session_id=request_path_session_id(request.scope.get("path", "")),
                     route=route if isinstance(route, str) else None,
                 ),
             },

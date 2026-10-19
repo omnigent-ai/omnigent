@@ -65,8 +65,8 @@ async def test_unhandled_request_failure_carries_safe_correlated_context(
     monkeypatch.setenv(dl.RUNNER_ID_ENV_VAR, "runner_parent")
     app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
 
-    @app.get("/v1/sessions/{session_id}/failure-probe")
-    async def failure_probe(session_id: str) -> None:
+    @app.get("/v1/sessions/{conversation_id}/failure-probe")
+    async def failure_probe(conversation_id: str) -> None:
         if wrapped_os_error:
             try:
                 raise FileNotFoundError(errno.ENOENT, "private-runner-data", "/private/file")
@@ -88,7 +88,7 @@ async def test_unhandled_request_failure_carries_safe_correlated_context(
     assert context["failure_source"] == "runner_request"
     assert context["runner_request_exception_type"] == "RuntimeError"
     assert "failure_probe" in context["runner_request_origin"]
-    assert context["runner_request_route"] == "/v1/sessions/{session_id}/failure-probe"
+    assert context["runner_request_route"] == "/v1/sessions/{conversation_id}/failure-probe"
     if wrapped_os_error:
         assert context["runner_request_cause_type"] == "FileNotFoundError"
         assert context["runner_request_os_errno"] == errno.ENOENT
