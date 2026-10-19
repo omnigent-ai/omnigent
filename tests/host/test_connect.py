@@ -1040,19 +1040,6 @@ async def test_launch_on_deleted_runtime_retires_host_after_reply_is_sent(
     failed one that spawns after the runtime is restored keeps its runner.
     """
 
-    class _GatedTunnel(_FakeTunnel):
-        """Fake tunnel whose sends park until ``release`` is set."""
-
-        def __init__(self) -> None:
-            super().__init__()
-            self.send_started = asyncio.Event()
-            self.release = asyncio.Event()
-
-        async def send(self, data: str) -> None:
-            self.send_started.set()
-            await self.release.wait()
-            await super().send(data)
-
     host = _make_host_process()
     missing = tmp_path / "deleted-venv" / "bin" / "python"
     original_popen = subprocess.Popen
@@ -1095,10 +1082,8 @@ async def test_launch_on_deleted_runtime_retires_host_after_reply_is_sent(
     try:
         with patch("omnigent.host.connect.subprocess.Popen", side_effect=_sleeping_popen):
             # The second launch queues on the lifecycle lock behind the first.
-            dispatches = [
-                asyncio.create_task(host._dispatch_host_frame(tunnel, frame))  # type: ignore[arg-type]
-                for frame in frames
-            ]
+            for frame in frames:
+                host._start_frame_task(tunnel, encode_host_frame(frame))  # type: ignore[arg-type]
             await asyncio.wait_for(tunnel.send_started.wait(), timeout=5.0)
             for _ in range(5):
                 await asyncio.sleep(0)
@@ -1107,7 +1092,7 @@ async def test_launch_on_deleted_runtime_retires_host_after_reply_is_sent(
             assert not host.lifecycle_lost
             assert tunnel.closed_after_sent is None
             tunnel.release.set()
-            await asyncio.wait_for(asyncio.gather(*dispatches), timeout=10.0)
+            await asyncio.wait_for(_drain_frame_tasks_and_followups(host), timeout=10.0)
 
         replies = {
             reply.request_id: reply
@@ -1147,6 +1132,52 @@ async def test_launch_on_deleted_runtime_retires_host_after_reply_is_sent(
             relaunched.proc.wait()
     finally:
         _cleanup_host(host)
+
+
+async def test_received_launch_is_answered_before_runtime_gone_retirement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A launch received before its handler starts still holds off retirement.
+
+    The first launch's reply finishes ahead of the second launch's handler in
+    the ready queue, so counting only started handlers would close the tunnel
+    before the second launch could answer.
+    """
+    host = _make_host_process()
+    missing = tmp_path / "deleted-venv" / "bin" / "python"
+
+    def _interpreter_gone(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
+        raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(missing))
+
+    monkeypatch.setattr(sys, "executable", str(missing))
+    monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
+    monkeypatch.setattr(host, "_spawn_runner_proc", _interpreter_gone)
+    tunnel = _GatedTunnel()
+    host._ws = tunnel  # type: ignore[assignment] — duck-typed ws
+    first, second = (
+        HostLaunchRunnerFrame(
+            request_id=f"req_{name}",
+            binding_token=f"token_{name}",
+            workspace=str(tmp_path),
+            session_id=f"session_{name}",
+        )
+        for name in ("first", "second")
+    )
+
+    host._start_frame_task(tunnel, encode_host_frame(first))  # type: ignore[arg-type]
+    await asyncio.wait_for(tunnel.send_started.wait(), timeout=5.0)
+    # Wake the first reply's send, then receive the second launch behind it.
+    tunnel.release.set()
+    host._start_frame_task(tunnel, encode_host_frame(second))  # type: ignore[arg-type]
+    await asyncio.wait_for(_drain_frame_tasks_and_followups(host), timeout=10.0)
+
+    replies = [decode_host_frame(sent) for sent in tunnel.sent]
+    assert [reply.request_id for reply in replies] == ["req_first", "req_second"]  # type: ignore[union-attr]
+    for reply in replies:
+        assert isinstance(reply, HostLaunchRunnerResultFrame)
+        assert "was deleted" in (reply.error or "")
+    assert host.runtime_gone
+    assert tunnel.closed_after_sent == 2
 
 
 @pytest.mark.parametrize("binding_token", ["token_abc", "", "   "])
@@ -1515,6 +1546,28 @@ class _FakeTunnel:
     async def close(self, code: int = 1000, reason: str = "") -> None:
         """Record a graceful close and how many frames were sent before it."""
         self.closed_after_sent = len(self.sent)
+
+
+class _GatedTunnel(_FakeTunnel):
+    """Fake tunnel whose sends park until ``release`` is set."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.send_started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def send(self, data: str) -> None:
+        self.send_started.set()
+        await self.release.wait()
+        await super().send(data)
+
+
+async def _drain_frame_tasks_and_followups(host: HostProcess) -> None:
+    """Await frame tasks until none remain, including ones they schedule."""
+    while host._frame_tasks:
+        await asyncio.gather(*list(host._frame_tasks))
+        # Gathering finished tasks doesn't yield; let their done callbacks run.
+        await asyncio.sleep(0)
 
 
 class _ConnectionErrorTunnel:

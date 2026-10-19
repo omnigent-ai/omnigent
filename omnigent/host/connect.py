@@ -1347,7 +1347,8 @@ class HostProcess:
         # Set only when that retirement fired, so a lifecycle loss from another
         # cause keeps its own exit.
         self._retired_for_runtime_gone = False
-        # Launch frames accepted but not yet answered; retirement waits for them.
+        # Launch frames received but whose handler hasn't finished; retirement
+        # waits for them.
         self._launches_in_flight = 0
 
     def _tracked_runner_pids(self) -> set[int]:
@@ -4085,9 +4086,9 @@ class HostProcess:
         Callers run this after sending the frames that report the change. The
         tunnel closes gracefully, so those frames are flushed before the close;
         :meth:`run` then breaks out of its serve loop and the entry point exits
-        with :data:`HOST_RUNTIME_GONE_EXIT_CODE`. While a launch is unanswered the
-        last one rechecks; while disconnected, or with an exit report still
-        parked, the next registration does.
+        with :data:`HOST_RUNTIME_GONE_EXIT_CODE`. While a received launch is
+        unfinished the last one rechecks; while disconnected, or with an exit
+        report still parked, the next registration does.
 
         :returns: None.
         """
@@ -4863,7 +4864,7 @@ class HostProcess:
                     # loop exits or reconnects, so handle them inline. Ordinary
                     # request frames run concurrently below; exceptions raised
                     # on those detached tasks are intentionally contained.
-                    self._raise_connection_error_from_raw(raw)
+                    frame = self._raise_connection_error_from_raw(raw)
                     # Each request frame is handled on its own task so a slow
                     # handler (a model-options CLI exec, a long git walk) can't
                     # head-of-line block the frames behind it — measured
@@ -4872,7 +4873,7 @@ class HostProcess:
                     # request_id, so completion order doesn't matter; the one
                     # ordering that does (launch vs stop) is preserved by
                     # _runner_lifecycle_lock in _dispatch_host_frame.
-                    self._start_frame_task(ws, raw)
+                    self._start_frame_task(ws, raw, frame)
         finally:
             if (diagnostics := self._diagnostics_for(ws)) is not None:
                 diagnostics.freeze()
@@ -4940,25 +4941,58 @@ class HostProcess:
             raise HostRetryableConnectionError(message)
         raise HostConnectError(message)
 
-    def _raise_connection_error_from_raw(self, raw: str) -> None:
-        """Handle connection-level frames before request-task dispatch."""
+    def _raise_connection_error_from_raw(self, raw: str) -> HostFrame | None:
+        """Handle connection-level frames before request-task dispatch.
+
+        :returns: The decoded host frame, or None if ``raw`` isn't one.
+        """
         try:
             frame = decode_host_frame(raw)
         except ValueError:
-            return
+            return None
         if isinstance(frame, HostConnectionErrorFrame):
             self._raise_connection_error(frame)
+        return frame
 
-    def _start_frame_task(self, ws: websockets.asyncio.client.ClientConnection, raw: str) -> None:
+    def _start_frame_task(
+        self,
+        ws: websockets.asyncio.client.ClientConnection,
+        raw: str,
+        frame: HostFrame | None = None,
+    ) -> None:
         """Handle one inbound frame on its own task, off the receive loop.
+
+        A launch counts as accepted from here until its task ends, so a
+        deleted-runtime retirement never closes the tunnel before answering it.
 
         :param ws: The open tunnel connection, passed through to the handler.
         :param raw: The raw text frame received off the socket.
+        :param frame: ``raw`` already decoded by the receive loop, if it was.
         :returns: None.
         """
+        if frame is None:
+            with contextlib.suppress(ValueError):
+                frame = decode_host_frame(raw)
         task = asyncio.create_task(self._run_frame_handler(ws, raw), name="host-frame")
         self._frame_tasks.add(task)
         task.add_done_callback(self._frame_tasks.discard)
+        if isinstance(frame, HostLaunchRunnerFrame):
+            self._launches_in_flight += 1
+            task.add_done_callback(self._finish_accepted_launch)
+
+    def _finish_accepted_launch(self, _task: asyncio.Task[None]) -> None:
+        """Release an accepted launch, then recheck a deleted-runtime retirement.
+
+        :param _task: The launch's finished frame task, whatever its outcome.
+        :returns: None.
+        """
+        self._launches_in_flight -= 1
+        if self._runtime_gone and not self._launches_in_flight:
+            retire = asyncio.create_task(
+                self._retire_if_runtime_gone(), name="host-runtime-gone-retire"
+            )
+            self._frame_tasks.add(retire)
+            retire.add_done_callback(self._frame_tasks.discard)
 
     async def _quiesce_frame_tasks(self) -> None:
         """Cancel and await every in-flight host frame handler."""
@@ -5091,17 +5125,13 @@ class HostProcess:
                 )
             # Register before queuing; keep the lifecycle lock as the first
             # await so launch/stop frames still acquire it in arrival order.
-            self._launches_in_flight += 1
+            # Retirement is rechecked when the launch's frame task ends.
             try:
-                try:
-                    async with self._runner_lifecycle_lock:
-                        launch_result = await self._handle_launch(frame)
-                finally:
-                    completion.set_result(None)
-                await self._send_text(ws, encode_host_frame(launch_result))
+                async with self._runner_lifecycle_lock:
+                    launch_result = await self._handle_launch(frame)
             finally:
-                self._launches_in_flight -= 1
-            await self._retire_if_runtime_gone()
+                completion.set_result(None)
+            await self._send_text(ws, encode_host_frame(launch_result))
         elif isinstance(frame, HostStopRunnerFrame):
             async with self._runner_lifecycle_lock:
                 stop_result = await self._handle_stop(frame)
