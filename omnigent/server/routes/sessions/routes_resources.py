@@ -93,6 +93,7 @@ from omnigent.server.routes._sessions.helpers import (
     require_filesystem_attachment_runtime,
 )
 from omnigent.server.routes._sessions.orchestration import (
+    HostLaunchRefusedError,
     ensure_runner_connected,
 )
 from omnigent.server.schemas import (
@@ -2239,14 +2240,17 @@ def register_resources_routes(
             # enforce the environment's write policy. Reconnect before saving
             # and use the refreshed binding if recovery launched a new runner.
             if request is not None:
-                _, conv = await ensure_runner_connected(
-                    session_id=session_id,
-                    conv=conv,
-                    app_state=request.app.state,
-                    conversation_store=conversation_store,
-                    runner_router=runner_router or get_server_runner_router(),
-                    raise_host_refusal=True,
-                )
+                try:
+                    _, conv = await ensure_runner_connected(
+                        session_id=session_id,
+                        conv=conv,
+                        app_state=request.app.state,
+                        conversation_store=conversation_store,
+                        runner_router=runner_router or get_server_runner_router(),
+                        raise_host_refusal=True,
+                    )
+                except HostLaunchRefusedError as exc:
+                    raise exc.for_viewer(_get_user_id(request, auth_provider)) from exc
             status, payload = await _proxy_put_to_runner(
                 session_id,
                 path,
