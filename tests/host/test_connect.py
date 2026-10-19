@@ -33,6 +33,7 @@ from omnigent.host.connect import (
     HostRuntimeGoneExit,
     ModelOptionsResult,
     _build_runner_env,
+    _exit_if_runtime_gone,
     _runner_exit_error,
     _RunnerHandle,
     run_host_process,
@@ -3570,6 +3571,21 @@ async def test_handle_stop_terminates_process(tmp_path: Path) -> None:
     assert proc.poll() is not None, "Runner process should be terminated after stop"
     # Runner should be removed from tracking.
     assert "runner_aaa" not in host._runners
+
+
+@pytest.mark.parametrize("retired", [False, True])
+def test_exit_if_runtime_gone_maps_retirement_to_restartable_exit(retired: bool) -> None:
+    """Only a host that retired for a deleted runtime exits with the restartable code."""
+    host = _make_host_process()
+    host._runtime_gone = True
+    host._retired_for_runtime_gone = retired
+
+    if not retired:
+        _exit_if_runtime_gone(host)
+        return
+    with pytest.raises(HostRuntimeGoneExit) as exc_info:
+        _exit_if_runtime_gone(host)
+    assert exc_info.value.code == HOST_RUNTIME_GONE_EXIT_CODE
 
 
 @pytest.mark.parametrize("path", ["stop", "reconnect_cleanup", "reconnect_with_parked_report"])

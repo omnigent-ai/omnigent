@@ -5487,6 +5487,17 @@ def _serve_host_until_exit(
             flush=True,
         )
         raise SystemExit(HOST_FATAL_EXIT_CODE) from exc
+    _exit_if_runtime_gone(host)
+    return host.lifecycle_lost
+
+
+def _exit_if_runtime_gone(host: HostProcess) -> None:
+    """Exit restartably when the host retired because its runtime was deleted.
+
+    :param host: The host whose :meth:`HostProcess.run` has returned.
+    :raises HostRuntimeGoneExit: When the deleted-runtime retirement fired.
+    :returns: None.
+    """
     if host.runtime_gone:
         print(
             f"\n✗ This host's Python runtime ({sys.executable}) was deleted. "
@@ -5495,4 +5506,3 @@ def _serve_host_until_exit(
             flush=True,
         )
         raise HostRuntimeGoneExit
-    return host.lifecycle_lost
