@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import pathlib
+import shlex
 import sys
 import tempfile
 import time
@@ -41,6 +42,7 @@ from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, NamedTuple, Protocol, TypeAlias, cast
+from urllib.parse import urlsplit
 
 from omnigent._platform import resolve_cli_binary, stable_user_id
 from omnigent.cli_invocation import cli_invocation
@@ -2006,6 +2008,28 @@ class ClaudeSDKExecutor(Executor):
         # the loop tears down.
         await self._force_close_client(state.client)
 
+    def _provider_auth_hint(self) -> str:
+        """Say where to fix a provider credential the gateway rejected.
+
+        :returns: One sentence, e.g. ``"Check your selected ~/.databrickscfg
+            profile; re-authenticate with `databricks auth login --profile oss`."``
+        """
+        if self._gateway_uses_databricks_profile:
+            if self._databricks_profile:
+                login = f"databricks auth login --profile {shlex.quote(self._databricks_profile)}"
+            else:
+                # No named profile: the token is minted with ``--host``, and this
+                # path's base URL is always ``<workspace host>/ai-gateway/anthropic``.
+                base_url = urlsplit(self._extra_env.get("ANTHROPIC_BASE_URL", ""))
+                login = f"databricks auth login --host {base_url.scheme}://{base_url.netloc}"
+            return f"Check your selected ~/.databrickscfg profile; re-authenticate with `{login}`."
+        if self._gateway:
+            return (
+                "Check your provider's base URL and auth command "
+                "(ANTHROPIC_BASE_URL / gateway auth)."
+            )
+        return "Check your Claude CLI login status (`claude /status`) or API key configuration."
+
     def _evict_client_on_cancel(self, session_key: str) -> None:
         state = self._clients.pop(session_key, None)
         if state is None:
@@ -3077,7 +3101,13 @@ class ClaudeSDKExecutor(Executor):
                         _am_model = concrete_reported_model(getattr(assistant_msg, "model", None))
                         if _am_model is not None:
                             observed_model = _am_model
-                        if got_stream_events:
+                        if getattr(assistant_msg, "error", None):
+                            # A failed API call (e.g. an apiKeyHelper that printed no
+                            # token) arrives as a ``<synthetic>`` message whose text is
+                            # the error, not a reply. The is_error ResultMessage that
+                            # follows fails the turn.
+                            pass
+                        elif got_stream_events:
                             # StreamEvents already emitted text. Emit the
                             # ToolCallRequest here, once the full
                             # ``tool_block.input`` has assembled — see the
@@ -3192,7 +3222,17 @@ class ClaudeSDKExecutor(Executor):
                                 self._agent_name,
                                 failure_text,
                             )
-                            terminal_error = failure_text
+                            error_status = getattr(result_msg, "api_error_status", None)
+                            if error_status in {401, 403}:
+                                # The CLI's own advice ("Run /status") needs an
+                                # interactive Claude session; name the real fix.
+                                terminal_error = (
+                                    "Claude SDK provider authentication failed"
+                                    f" (status={error_status}): {failure_text.rstrip('.')}. "
+                                    f"{self._provider_auth_hint()}"
+                                )
+                            else:
+                                terminal_error = failure_text
                         elif not response_text and result_msg.result:
                             response_text = result_msg.result
                         raw_usage = getattr(result_msg, "usage", None)
@@ -3262,22 +3302,10 @@ class ClaudeSDKExecutor(Executor):
                                 error_status in {401, 403}
                                 or retry_error == "authentication_failed"
                             ):
-                                if self._gateway_uses_databricks_profile:
-                                    auth_hint = "Check your selected ~/.databrickscfg profile."
-                                elif self._gateway:
-                                    auth_hint = (
-                                        "Check your provider's base URL and auth command "
-                                        "(ANTHROPIC_BASE_URL / gateway auth)."
-                                    )
-                                else:
-                                    auth_hint = (
-                                        "Check your Claude CLI login status "
-                                        "(`claude /status`) or API key configuration."
-                                    )
                                 terminal_error = (
                                     "Claude SDK provider authentication failed"
                                     f" ({retry_error}, status={error_status}). "
-                                    f"{auth_hint}"
+                                    f"{self._provider_auth_hint()}"
                                 )
                                 break
 
