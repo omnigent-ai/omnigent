@@ -8181,15 +8181,16 @@ async def _relay_host_offline(
     """
     if get_server_host_store() is None:
         return False
-    handle = _runner_relay_tasks.get(session_id)
-    conv: Conversation | _RelayStatusSnapshot | None = (
-        handle.status_snapshot if handle is not None else None
-    )
+    # The stored row carries the labels a side chat routes through; the relay's
+    # saved snapshot does not, so it is only a fallback.
+    conv: Conversation | _RelayStatusSnapshot | None = None
+    try:
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    except Exception:  # noqa: BLE001 — fall back to the relay's saved snapshot
+        conv = None
     if conv is None:
-        try:
-            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        except Exception:  # noqa: BLE001 — unknown session state fails as before
-            return False
+        handle = _runner_relay_tasks.get(session_id)
+        conv = handle.status_snapshot if handle is not None else None
     if conv is None:
         return False
     host_id = await _session_host_id(conv, conversation_store)
@@ -8421,12 +8422,7 @@ async def _runner_disconnect_requires_failure(
     else:
         decision = "idle_no_failure"
 
-    # Only a decision that fails the session is a warning; an idle session or
-    # an already-recorded failure is the expected outcome of a runner drop.
-    _logger.log(
-        logging.WARNING
-        if decision in ("failed_mid_turn", "failed_before_start")
-        else logging.INFO,
+    _logger.warning(
         "Runner disconnect for session=%s: %s (status=%s source=%s)",
         session_id,
         decision,
@@ -8704,14 +8700,14 @@ async def _relay_runner_stream(
                 decision = "idle_no_failure"
             # One row per outage outcome: which branch below fired, how long the
             # runner was gone against the grace, and how many retries it got.
-            # Only a failed turn is a warning; the other outcomes are expected.
-            failed = decision == "failed_mid_turn"
+            # A held turn is the expected outcome of a host going offline.
+            held = decision == "held_host_offline"
             _logger.log(
-                logging.WARNING if failed else logging.INFO,
+                logging.INFO if held else logging.WARNING,
                 "Relay: runner transport lost for session=%s (%s)",
                 session_id,
                 decision,
-                exc_info=failed,
+                exc_info=not held,
                 extra=debug_event(
                     "runner_stream_disconnected",
                     session_id=session_id,

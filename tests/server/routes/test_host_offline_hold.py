@@ -130,3 +130,59 @@ async def test_session_host_id_follows_hostless_parents(as_snapshot: bool) -> No
             updated_at=0,
         )
     assert await orchestration._session_host_id(conv, store) == _HOST_ID  # type: ignore[arg-type]
+
+
+class _SideChatStore(_AncestorStore):
+    """A conversation store whose point read can fail."""
+
+    def __init__(self, *rows: SimpleNamespace, fail: bool = False) -> None:
+        super().__init__(*rows)
+        self.fail = fail
+
+    def get_conversation(self, conversation_id: str) -> SimpleNamespace | None:
+        if self.fail:
+            raise RuntimeError("store down")
+        return super().get_conversation(conversation_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("read_fails", "expected"), [(False, True), (True, False)])
+async def test_relay_finds_an_offline_host_through_a_side_chats_source(
+    monkeypatch: pytest.MonkeyPatch, read_fails: bool, expected: bool
+) -> None:
+    """A side chat's relay reads its stored row, since its saved snapshot can't name the source.
+
+    A parentless, hostless side chat routes through the session it was forked
+    from. Only the stored row carries that link, so with the row unreadable
+    the snapshot alone leaves the host unknown and the turn is not held.
+    """
+    from omnigent.server.routes._sessions.common import _RelayHandle
+    from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
+
+    source = _row("source", parent=None, host_id=_HOST_ID)
+    side_chat = SimpleNamespace(
+        **{
+            **vars(_row("side", parent=None)),
+            "labels": {SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: "source"},
+        }
+    )
+    store = _SideChatStore(source, side_chat, fail=read_fails)
+    snapshot = _RelayStatusSnapshot(
+        live_status="running",
+        kind="default",
+        parent_conversation_id=None,
+        runner_id="runner_shared",
+        host_id=None,
+        updated_at=0,
+    )
+    handle = _RelayHandle(
+        runner_id="runner_shared",
+        task=SimpleNamespace(done=lambda: False),  # type: ignore[arg-type]
+        ready=SimpleNamespace(),  # type: ignore[arg-type]
+        status_snapshot=snapshot,
+    )
+    monkeypatch.setitem(orchestration._runner_relay_tasks, "side", handle)
+    monkeypatch.setattr(orchestration, "get_server_host_store", lambda: _FakeHostStore(_host))
+    monkeypatch.setattr(orchestration, "get_server_host_registry", lambda: _FakeRegistry(False))
+
+    assert await orchestration._relay_host_offline("side", store) is expected  # type: ignore[arg-type]

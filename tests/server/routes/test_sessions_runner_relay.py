@@ -1032,7 +1032,6 @@ async def test_relay_suppresses_disconnect_error_on_intentional_stop(
     quiet ``idle`` (no ``runner_disconnected`` status, no persisted error
     labels) rather than rendering "Error · runner_disconnected".
     """
-    caplog.set_level(logging.INFO)
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
 
@@ -1077,9 +1076,6 @@ async def test_relay_suppresses_disconnect_error_on_intentional_stop(
         assert record.attributes["intentional_stop"] is True
         assert record.attributes["cached_session_status"] is None
         assert record.attributes["decision"] == "intentional_stop"
-        # An expected outcome is not a warning and carries no traceback.
-        assert record.levelno == logging.INFO
-        assert not record.exc_info
 
         # No durable runner_disconnected label persists, so snapshots and
         # child summaries stay clean.
@@ -1861,7 +1857,6 @@ async def test_relay_stays_quiet_when_runner_leaves_an_idle_session(
     the drop and asserts the relay publishes no failure and persists no
     error labels — the disconnect surfaces through liveness instead.
     """
-    caplog.set_level(logging.INFO)
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
 
@@ -1920,8 +1915,6 @@ async def test_relay_stays_quiet_when_runner_leaves_an_idle_session(
         assert record.attributes["intentional_stop"] is False
         assert record.attributes["cached_session_status"] == "idle"
         assert record.attributes["decision"] == "idle_no_failure"
-        assert record.levelno == logging.INFO
-        assert not record.exc_info
     finally:
         gate.set()
         if collector is not None:
@@ -2315,7 +2308,7 @@ async def test_disconnect_uses_status_arriving_during_lookup(
             assert not any(row["event_name"] == "session_turn_failed" for row in rows)
 
         decision = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
-        assert decision["level"] == ("WARNING" if expect_failed else "INFO")
+        assert decision["level"] == "WARNING"
         assert (
             decision["attributes"].items()
             >= {

@@ -279,8 +279,7 @@ async def test_offline_sweep_refreshes_child_status_after_idle_observation(
 
     decision = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
     assert decision["session_id"] == route.child_id
-    # An idle session losing its runner is expected, not a warning.
-    assert decision["level"] == "INFO"
+    assert decision["level"] == "WARNING"
     assert not any(row["event_name"] == "session_turn_failed" for row in rows)
     assert (
         decision["attributes"].items()

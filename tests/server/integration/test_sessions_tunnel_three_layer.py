@@ -1336,7 +1336,7 @@ async def test_on_runner_connect_retains_idle_child_status_for_disconnect(
             decision = next(
                 row for row in child_rows if row["event_name"] == "runner_disconnect_decision"
             )
-            assert decision["level"] == "INFO"
+            assert decision["level"] == "WARNING"
             assert decision["attributes"]["decision"] == "idle_no_failure"
             assert decision["attributes"]["status_source"] == "relay_snapshot"
             assert decision["attributes"]["status_lookup"] == lookup_result
@@ -2444,7 +2444,14 @@ async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
 @pytest.mark.usefixtures("_isolated_session_status_cache")
 @pytest.mark.parametrize(
     "scenario",
-    ["reconnect", "expired", "host_back_without_runner", "recheck_error", "nested"],
+    [
+        "reconnect",
+        "expired",
+        "host_back_without_runner",
+        "recheck_error",
+        "nested",
+        "reconnect_at_expiry",
+    ],
 )
 async def test_runner_disconnect_holds_turn_while_host_offline(
     tunnel_three_layer_stack: _TunnelStack,
@@ -2457,8 +2464,9 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
     grace marks work as lost that resumes when the lid opens. The hold ends
     without a failure when the runner reconnects, and fails the turn as a
     disconnect when the hold expires or the host returns without its runner.
-    A failed re-check keeps the deadline instead of dropping the hold, and a
-    grandchild under hostless parents finds the root's host.
+    A failed re-check keeps the deadline instead of dropping the hold, a
+    grandchild under hostless parents finds the root's host, and a runner that
+    reconnects while the expired hold re-reads its sessions keeps its turn.
     """
     from omnigent.runtime import get_conversation_store
     from omnigent.server.routes import sessions as sessions_module
@@ -2531,6 +2539,27 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             return get_liveness(conversation_id)
 
         monkeypatch.setattr(store, "get_runner_liveness", flaky_liveness)
+    reconnect_started: list[bool] = []
+    reconnected_at_expiry: list[ApplicationCommunicator] = []
+    if scenario == "reconnect_at_expiry":
+        get_liveness = store.get_runner_liveness
+        loop = asyncio.get_running_loop()
+
+        async def _reconnect_runner() -> ApplicationCommunicator:
+            comm = await _connect_runner_tunnel(ap_app, runner_id)
+            await _send_hello_and_wait(comm, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+            return comm
+
+        def reconnect_during_final_read(conversation_id: str):  # type: ignore[no-untyped-def]
+            # The read after the hold expired: the runner comes back in the middle of it.
+            hold_over = any(r["event_name"] == "runner_disconnect_hold_ended" for r in rows)
+            if hold_over and not reconnect_started:
+                reconnect_started.append(True)
+                future = asyncio.run_coroutine_threadsafe(_reconnect_runner(), loop)
+                reconnected_at_expiry.append(future.result(timeout=budget(10.0)))
+            return get_liveness(conversation_id)
+
+        monkeypatch.setattr(store, "get_runner_liveness", reconnect_during_final_read)
 
     communicator = await _connect_runner_tunnel(ap_app, runner_id)
     await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
@@ -2553,6 +2582,20 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
                 )
                 await asyncio.sleep(hold * 1.5)
                 assert sessions_module._session_status_cache.get(session_id) == "running"
+            elif scenario == "reconnect_at_expiry":
+
+                async def _reconnected() -> None:
+                    while not reconnected_at_expiry:
+                        await asyncio.sleep(0.02)
+
+                await asyncio.wait_for(_reconnected(), timeout=budget(10.0))
+                reconnect = reconnected_at_expiry[0]
+                # Give a wrongly-proceeding settlement time to land.
+                await asyncio.sleep(0.5)
+                assert sessions_module._session_status_cache.get(held_id) == "running"
+                refreshed = store.get_conversation(held_id)
+                assert refreshed is not None
+                assert sessions_module._last_task_error_from_labels(refreshed.labels) is None
             else:
                 if scenario == "recheck_error":
                     assert failed_once
@@ -2596,6 +2639,7 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             "host_back_without_runner": "host_back_without_runner",
             "recheck_error": "expired",
             "nested": "expired",
+            "reconnect_at_expiry": "expired",
         }[scenario]
         assert [r["attributes"]["outcome"] for r in ended] == [expected_outcome]
     finally:

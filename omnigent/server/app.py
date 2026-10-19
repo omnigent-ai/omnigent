@@ -3533,7 +3533,10 @@ def create_app(
             ``RUNNER_IDLE_SHUTDOWN_CLOSE_REASON``. Its idle watchdog found no
             active work, so a stale mid-turn status is settled like a Stop.
         """
-        from omnigent.server.routes._sessions.orchestration import _session_host_id
+        from omnigent.server.routes._sessions.orchestration import (
+            _runner_stamp_is_live_elsewhere,
+            _session_host_id,
+        )
         from omnigent.server.routes.sessions import (
             HOST_OFFLINE_HOLD_S,
             RUNNER_DISCONNECT_GRACE_S,
@@ -3615,8 +3618,7 @@ def create_app(
                 ),
             )
         else:
-            # Each interrupted turn logs its own failure; the sweep itself is routine.
-            _logger.info(
+            _logger.warning(
                 "Runner %s disconnected; reconciling %d bound session(s)",
                 runner_id,
                 len(affected),
@@ -3636,14 +3638,35 @@ def create_app(
                 if outcome not in ("expired", "host_back_without_runner"):
                     return
                 try:
-                    affected = [conv for conv, _ in await _held_still_bound(runner_id, held)]
+                    bound = await _held_still_bound(runner_id, held)
                 except Exception:  # noqa: BLE001 — the sweep re-checks each held row itself
                     _logger.warning(
                         "Runner %s: bound-session reload failed after host-offline hold",
                         runner_id,
                         exc_info=True,
                     )
-                    affected = held
+                    bound = [(conv, None) for conv in held]
+                # The runner may reconnect during those reads, here or on another replica.
+                if tunnel_registry.get(runner_id) is not None:
+                    _logger.info(
+                        "Runner %s reconnected as its host-offline hold ended; "
+                        "skipping offline-marking",
+                        runner_id,
+                    )
+                    return
+                if any(
+                    _runner_stamp_is_live_elsewhere(stamp=stamp, reference_stamp=reference_stamp)
+                    for _, stamp in bound
+                ):
+                    for conv, _ in bound:
+                        _relinquish_session_live_state(conv.id)
+                    _logger.info(
+                        "Runner %s is live on another replica as its host-offline hold ended; "
+                        "skipping offline-marking",
+                        runner_id,
+                    )
+                    return
+                affected = [conv for conv, _ in bound]
                 if outcome == "expired":
                     error = ErrorDetail(
                         code="runner_disconnected",
