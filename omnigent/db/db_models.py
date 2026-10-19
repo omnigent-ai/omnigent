@@ -701,6 +701,9 @@ class SqlConversationMetadata(OmnigentBase):
         Index("ix_conversation_metadata_host_id", "workspace_id", "host_id", "id"),
         # "list sessions in project X" + per-project counts (GROUP BY project_id).
         Index("ix_conversation_metadata_project_id", "workspace_id", "project_id", "id"),
+        # Cross-workspace interrupted-session recovery scan, keyset-paged by
+        # (live_status, workspace_id, id) over the mid-turn and failed codes.
+        Index("ix_conversation_metadata_live_status", "live_status", "workspace_id", "id"),
     )
 
 

@@ -26,6 +26,7 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.runner import create_runner_app
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runner.session_init_protocol import (
@@ -94,6 +95,15 @@ class _HistoryServerClient:
         return self._Resp({})
 
 
+class _SnapshotServerClient(_HistoryServerClient):
+    """Also answers the session snapshot, so resource routes can resolve the agent."""
+
+    async def get(self, url: str, **kwargs: Any) -> _HistoryServerClient._Resp:
+        if url.rstrip("/").endswith(f"/sessions/{SESSION_ID}"):
+            return self._Resp({"agent_id": AGENT_ID, "created_at": 0})
+        return await super().get(url, **kwargs)
+
+
 class _CatchUpServerClient(_HistoryServerClient):
     """Return no history until the test exposes a missed user item."""
 
@@ -113,8 +123,9 @@ class _CatchUpServerClient(_HistoryServerClient):
 def _build_sdk_app(
     server_client: Any,
     resource_registry: SessionResourceRegistry | None = None,
+    spec: AgentSpec | None = None,
 ) -> tuple[FastAPI, _FakeProcessManager, _ScriptedHarnessClient]:
-    spec = AgentSpec(spec_version=1, name="t")
+    spec = spec or AgentSpec(spec_version=1, name="t")
     sse_frames = [
         _sse({"type": "response.created", "response": {"id": "resp_1"}}),
         _sse({"type": "response.output_text.delta", "delta": "hi"}),
@@ -412,6 +423,88 @@ async def test_explicit_recovery_deduplicates_history_heuristic(
     rows = _init_rows(caplog)
     assert [row["recovery_turn"] for row in rows] == ["recovery_prompt", "none"]
     assert [row["recovery_id"] for row in rows] == ["same-interruption"] * 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("recovery_prompt", "expected"),
+    [
+        ("The host machine restarted; resume the task.", "The host machine restarted"),
+        (None, "Your runner was interrupted while this task was active."),
+    ],
+)
+async def test_recovery_turn_uses_server_prompt_or_default(
+    recovery_prompt: str | None, expected: str
+) -> None:
+    """A server-supplied continuation replaces the default; ``None`` keeps it."""
+    app, _pm, harness = _build_sdk_app(_HistoryServerClient())
+    payload = _session_init_payload(suppress_recovery_turn=False)
+    payload["session_init"].update(
+        resume_interrupted_turn=True,
+        recovery_id="host-restart",
+        recovery_prompt=recovery_prompt,
+    )
+    async with _runner_client(app) as client:
+        response = await client.post("/v1/sessions", json=payload)
+        assert response.status_code == 201
+        assert response.json()["status"] == "running"
+        turn = app.state.active_turns.get(SESSION_ID)
+        if turn is not None:
+            await asyncio.wait_for(turn, timeout=5)
+    assert len(harness.posted_bodies) == 1
+    content = str(harness.posted_bodies[0]["content"])
+    assert expected in content
+    if recovery_prompt is not None:
+        assert "Your runner was interrupted" not in content
+
+
+@pytest.mark.asyncio
+async def test_host_restart_prompt_skipped_when_the_runner_survived() -> None:
+    """A runner that already served the session did not restart with its host."""
+    app, _pm, harness = _build_sdk_app(_HistoryServerClient())
+    async with _runner_client(app) as client:
+        first = _session_init_payload(suppress_recovery_turn=True)
+        assert (await client.post("/v1/sessions", json=first)).status_code == 201
+        payload = _session_init_payload(suppress_recovery_turn=False)
+        payload["session_init"].update(
+            resume_interrupted_turn=True,
+            recovery_id="blip",
+            recovery_prompt="The host machine restarted; resume the task.",
+        )
+        response = await client.post("/v1/sessions", json=payload)
+        assert response.status_code == 201
+        turn = app.state.active_turns.get(SESSION_ID)
+        if turn is not None:
+            await asyncio.wait_for(turn, timeout=5)
+    assert "The host machine restarted" not in str(harness.posted_bodies)
+
+
+@pytest.mark.asyncio
+async def test_host_restart_prompt_fires_after_a_resource_request_registers_the_session() -> None:
+    """Resource traffic before the resume init does not make a fresh runner look survived."""
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        os_env=OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="none")),
+    )
+    app, _pm, harness = _build_sdk_app(_SnapshotServerClient(), spec=spec)
+    async with _runner_client(app) as client:
+        # Registers the session in the start cache before any session init.
+        await client.get(f"/v1/sessions/{SESSION_ID}/resources/environments/default/changes")
+        assert harness.posted_bodies == []
+        payload = _session_init_payload(suppress_recovery_turn=False)
+        payload["session_init"].update(
+            resume_interrupted_turn=True,
+            recovery_id="host-restart",
+            recovery_prompt="The host machine restarted; resume the task.",
+        )
+        response = await client.post("/v1/sessions", json=payload)
+        assert response.status_code == 201
+        assert response.json()["status"] == "running"
+        turn = app.state.active_turns.get(SESSION_ID)
+        if turn is not None:
+            await asyncio.wait_for(turn, timeout=5)
+    assert "The host machine restarted" in str(harness.posted_bodies)
 
 
 @pytest.mark.asyncio
