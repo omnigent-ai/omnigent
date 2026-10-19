@@ -29,7 +29,8 @@ available through the CLI or UI yet.
 `harness=<harness>` saves a user default. Omit `--global` to save in the current
 project. Use `omnigent config list` to inspect the files and
 `omnigent config unset [--global] model` to remove a value. Startup commands
-and argument lists are configured in the files' per-harness mappings.
+and argument lists are configured in the user file's per-harness mappings;
+`config list` names any project-file entries it ignores.
 
 **Launch:** run `omnigent run` with an agent/default agent and optional model
 or harness flags, or use a native command such as `omnigent codex` with

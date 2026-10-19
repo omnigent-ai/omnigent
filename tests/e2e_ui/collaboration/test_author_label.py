@@ -291,8 +291,8 @@ def test_terminal_typed_message_shows_author_badge_to_peers(
 
             # The badge must be present with Alice's email as its accessible
             # label: sessionOwner=Alice ≠ viewerId=Bob → shared, and the
-            # author (Alice) differs from the viewer (Bob). Before the
-            # created_by fix the badge was absent because created_by was None.
+            # author (Alice) differs from the viewer (Bob). Without
+            # ``created_by``, the badge is absent.
             badge = bubble.get_by_test_id("message-author")
             expect(badge).to_be_visible()
             expect(badge).to_have_attribute("aria-label", _ALICE)

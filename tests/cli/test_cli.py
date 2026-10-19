@@ -5646,23 +5646,32 @@ def test_config_set_requires_global_for_server_settings(
     assert yaml.safe_load((config_home / "config.yaml").read_text())[key] == value
 
 
-def test_config_list_warns_about_project_local_session_title_instructions(
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("session_title_instructions", "Prefix titles with the current date."),
+        ("server", "http://project.example.invalid"),
+    ],
+)
+def test_config_list_warns_about_project_local_user_level_settings(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    key: str,
+    value: str,
 ) -> None:
     monkeypatch.chdir(tmp_path)
     local_path = tmp_path / ".omnigent" / "config.yaml"
     local_path.parent.mkdir()
-    local_path.write_text("session_title_instructions: Prefix titles with the current date.\n")
+    local_path.write_text(f"{key}: {value}\n")
     monkeypatch.setattr("omnigent.cli._load_global_config", dict)
     monkeypatch.setattr("omnigent.cli._print_credentials_by_harness", lambda: None)
 
     result = CliRunner().invoke(cli, ["config", "list"])
 
     assert result.exit_code == 0, result.output
-    assert "ignored user-level-only setting(s): session_title_instructions" in result.output
+    assert f"ignored user-level-only setting(s): {key}" in result.output
     assert "set with --global" in result.output
-    assert "  session_title_instructions=" not in result.output
+    assert f"  {key}=" not in result.output
 
 
 def test_config_set_global_reports_effective_config_home(

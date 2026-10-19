@@ -35,7 +35,8 @@ implements them separately, so a fix for one harness does not reach the others.
   Settings (or its card's gear). One Startup configuration block shows Command,
   Environment, and Arguments, unmasked and read-only, with the selected host's source.
   Env wrappers are split into these fields, without a duplicate raw invocation.
-  Session and workspace config can add to or override these host defaults.
+  Sessions can add to or override these host defaults. Project config can
+  choose the default harness, but commands and arguments come only from user config.
   Other harnesses keep their credential card only.
 - `skill-contents`: open plain or plugin skills to read their SKILL.md markdown,
   with loading, truncation, unavailable-host, and older-server states.
