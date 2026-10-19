@@ -97,12 +97,13 @@ def test_recording_action_navigation(
     session = seeded_session
     reads = _seed_video(session, recording)
     api = f"/v1/sessions/{session.session_id}/resources/environments/default"
+    # Playwright can emit a 0.96s fallback clip when no compositor frame arrives.
     content = (
         "WEBVTT\n\n"
         "00:00.000 --> 00:00.400\nOpen the app\n\n"
         "00:00.500 --> 00:10.000\nVerify the result\n\n"
         + "".join(
-            f"00:00.{600 + i * 20:03d} --> 00:00.{619 + i * 20:03d}\n"
+            f"00:00.{600 + i * 10:03d} --> 00:00.{609 + i * 10:03d}\n"
             f"Recorded action {i + 1}: verify the application responds correctly\n\n"
             for i in range(20)
         )
@@ -166,10 +167,11 @@ def test_recording_action_navigation(
     else:
         assert scrolling.bounding_box()["height"] <= 288
     last = scrolling.get_by_role("button", name=re.compile("Recorded action 20:"))
+    expect(last).to_be_enabled()
     last.focus()
     last.press("Enter")
     page.wait_for_function(
-        "el => !el.seeking && Math.abs(el.currentTime - 0.98) < 0.05", arg=player.element_handle()
+        "el => !el.seeking && Math.abs(el.currentTime - 0.79) < 0.05", arg=player.element_handle()
     )
     assert scrolling.evaluate("el => el.scrollTop > 0"), "Keyboard focus scrolls to later actions"
     expect(last).to_have_attribute("aria-current", "step")
