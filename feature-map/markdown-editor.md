@@ -107,7 +107,8 @@ This does not cover every Markdown shape or establish a safe 1 MiB limit.
   prefix must render read-only, and downloading must preserve the entire file.
 - `direct-link`, `edit-save`:
   `tests/e2e_ui/files/test_file_autosave.py::test_markdown_edit_autosaves`
-  confirms the edit through a fresh filesystem API read from the real server.
+  confirms the edit, undo, and redo through fresh filesystem API reads from
+  the real server, then reloads the saved edit.
 - `files`, `review`:
   `tests/e2e_ui/comments/test_markdown_editor_comments.py::test_markdown_rich_text_editor_add_comment`
   submits a comment and checks its stored anchor. The heading variant is
@@ -141,8 +142,9 @@ instead of treating one comparison clip as complete feature verification.
   TipTap 3.31.4. `web/src/shell/tiptapBoundedTokenizers.test.ts` checks upstream
   token compatibility and line-splitting volume using the CUJ fixture. Remove
   these bounds when upstream avoids the repeated whole-remainder scans.
-- Load measurements do not establish typing latency. The editor currently
-  serializes the full document on each edit to detect unsaved changes.
+- Load measurements do not establish typing latency. Dirty detection compares
+  immutable editor documents; autosave still serializes the whole document.
+  Changes that serialize identically become clean when autosave checks them.
 - Setext-heading detection uses a line scanner with marked 17 interruption
   rules. Compatibility tests compare it with upstream; remove the workaround
   when upstream handles long lines without exhausting the regex stack.
