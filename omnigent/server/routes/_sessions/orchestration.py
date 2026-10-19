@@ -8046,9 +8046,10 @@ _MID_TURN_STATUSES = ("running", "waiting")
 
 
 # A sleeping or offline laptop takes its runner with it and usually returns
-# minutes to hours later with the turn still running, so a turn interrupted
-# that way waits this long for its host before it fails.
-HOST_OFFLINE_HOLD_S: float = 6 * 3600.0
+# minutes to hours later (a laptop closed overnight, the next morning) with
+# the turn still running, so a turn interrupted that way waits this long for
+# its host before it fails.
+HOST_OFFLINE_HOLD_S: float = 24 * 3600.0
 # How often a held runner re-checks its host and cross-replica liveness.
 _HOST_OFFLINE_RECHECK_S: float = 60.0
 
