@@ -235,11 +235,14 @@ class _SignInHold:
     :param deadline: ``time.monotonic()`` at which the wait gives up.
     :param holds: Refusals absorbed so far.
     :param waiting: Whether the queue is paused until the sign-in completes.
+    :param releasing: Whether the sign-in watcher saw the agent ready and is
+        announcing the resend; until it resumes the queue, the deadline can't.
     """
 
     deadline: float
     holds: int = 0
     waiting: bool = False
+    releasing: bool = False
 
 
 def _sign_in_hold_deadline(body: Mapping[str, Any]) -> float:
@@ -3841,7 +3844,7 @@ def create_runner_app(
         _background_tasks=_background_tasks,
         _session_harness_name=_session_harness_name,
         # Late-bound: the queue helpers that own the hold are defined further down.
-        _message_held_for_sign_in=lambda conv_id: _message_held_for_sign_in(conv_id),
+        _claim_sign_in_release=lambda conv_id: _claim_sign_in_release(conv_id),
         _release_sign_in_hold=lambda conv_id: _release_sign_in_hold(conv_id),
         _sign_in_watchers=_sign_in_watchers,
         resource_registry=resource_registry,
@@ -3947,8 +3950,11 @@ def create_runner_app(
             if normalized_error.get("code") == "databricks_sign_in_pending":
                 _start_sign_in_watch(conv_id)
         else:
-            # A delivered turn proves the pane takes input, so any sign-in wait is over.
+            # A delivered turn proves the pane takes input, so any sign-in wait is over,
+            # and a watcher still polling could only ask for a resend that already happened.
             _sign_in_holds.pop(conv_id, None)
+            if (watcher := _sign_in_watchers.pop(conv_id, None)) is not None:
+                watcher.cancel()
             if not has_buffered and not _suppress_status:
                 children = _subagent_work_by_parent.get(conv_id, set())
                 has_running_children = any(
@@ -4443,18 +4449,27 @@ def create_runner_app(
         hold = _sign_in_holds.get(conv_id)
         return hold is not None and hold.waiting
 
+    def _claim_sign_in_release(conv_id: str) -> bool:
+        """Return whether a message waits on the sign-in; if so, only the watcher resumes it."""
+        hold = _sign_in_holds.get(conv_id)
+        if hold is None or not hold.waiting:
+            return False
+        hold.releasing = True
+        return True
+
     def _release_sign_in_hold(conv_id: str) -> None:
         """Resume a queue paused for a sign-in."""
         hold = _sign_in_holds.get(conv_id)
         if hold is not None:
             hold.waiting = False
+            hold.releasing = False
 
     def _sign_in_hold_waiting(session_id: str) -> bool:
         """Return whether queued input still waits on a sign-in; an expired wait resumes."""
         hold = _sign_in_holds.get(session_id)
         if hold is None or not hold.waiting:
             return False
-        if time.monotonic() < hold.deadline:
+        if hold.releasing or time.monotonic() < hold.deadline:
             return True
         hold.waiting = False
         _logger.warning(

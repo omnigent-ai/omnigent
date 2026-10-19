@@ -32,7 +32,7 @@ def build_sign_in_watch(
     *,
     _background_tasks: set[asyncio.Task[Any]],
     _session_harness_name: Callable[[str], str | None],
-    _message_held_for_sign_in: Callable[[str], bool],
+    _claim_sign_in_release: Callable[[str], bool],
     _release_sign_in_hold: Callable[[str], None],
     _sign_in_watchers: dict[str, asyncio.Task[None]],
     resource_registry: SessionResourceRegistry,
@@ -110,9 +110,10 @@ def build_sign_in_watch(
                 if any(detect_sign_in_prompt(screen) is not None for screen in screens):
                     continue
                 if _sign_in_agent_ready(conv_id, harness, screens):
-                    # Post before the release on exit, so a resend refused again can rewatch.
+                    # Post before the release on exit, so the notice lands before the resend
+                    # and a resend refused again can rewatch.
                     await _post_sign_in_completed_notice(
-                        conv_id, harness, held=_message_held_for_sign_in(conv_id)
+                        conv_id, harness, held=_claim_sign_in_release(conv_id)
                     )
                     return
         finally:

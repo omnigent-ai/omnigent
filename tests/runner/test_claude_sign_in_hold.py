@@ -348,7 +348,7 @@ def test_hold_notice_keeps_the_sign_in_step_without_asking_for_a_resend() -> Non
     watch = sign_in_watch.build_sign_in_watch(
         _background_tasks=set(),
         _session_harness_name=lambda _conv: "claude-native",
-        _message_held_for_sign_in=lambda _conv: False,
+        _claim_sign_in_release=lambda _conv: False,
         _release_sign_in_hold=lambda _conv: None,
         _sign_in_watchers={},
         resource_registry=None,  # type: ignore[arg-type]
@@ -539,11 +539,14 @@ async def test_a_failing_sign_in_watch_still_releases_the_held_message(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("wait_ends", ["later", "during-notice"])
 async def test_ready_notice_lands_before_the_held_message_is_resent(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, wait_ends: str
 ) -> None:
-    """The queue stays paused while the "signed in" notice posts, so a resend can't race it."""
+    """The queue stays paused while the "signed in" notice posts, even past the wait's end."""
     monkeypatch.setattr(sign_in_watch, "_SIGN_IN_WATCH_INTERVAL_S", 0.01)
+    if wait_ends == "during-notice":
+        monkeypatch.setattr(runner_app, "_SIGN_IN_HOLD_MAX_S", 0.1)
     sid = uuid.uuid4().hex
 
     async def read(scrollback: int = 0, *, join_wrapped: bool = False) -> dict[str, object]:
@@ -556,7 +559,7 @@ async def test_ready_notice_lands_before_the_held_message_is_resent(
 
     async def slow_ready_notice(body: Any) -> None:
         if _notice_code(body) == "databricks_sign_in_completed":
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.3)
             resent_during_notice.append(len(harness.posted_bodies) - 1)
 
     server.while_posting = slow_ready_notice
@@ -574,6 +577,34 @@ async def test_ready_notice_lands_before_the_held_message_is_resent(
     assert resent_during_notice == [0]
     (ready,) = server.notices("databricks_sign_in_completed")
     assert ready["message"] == "Claude Code is ready. Sending your message now."
+    assert [_sent_text(body) for body in harness.posted_bodies] == ["first", "first"]
+
+
+@pytest.mark.asyncio
+async def test_message_resent_when_its_wait_ran_out_gets_no_resend_notice(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A message delivered once the wait ran out isn't followed by "send your message again"."""
+    monkeypatch.setattr(runner_app, "_SIGN_IN_HOLD_MAX_S", 0.05)
+    monkeypatch.setattr(sign_in_watch, "_SIGN_IN_WATCH_INTERVAL_S", 0.3)
+    sid = uuid.uuid4().hex
+
+    async def read(scrollback: int = 0, *, join_wrapped: bool = False) -> dict[str, object]:
+        return {"screen": _READY_SCREEN}
+
+    app, harness, server = _build_app(
+        [_REFUSED, _DELIVERED], terminal_registry=_claude_pane(sid, tmp_path, read)
+    )
+    async with _runner_client(app) as client:
+        await _create_session(client, sid)
+        await client.post(f"/v1/sessions/{sid}/events", json=_message("first"))
+        await _until(lambda: len(harness.posted_bodies) == 2 and sid not in app.state.active_turns)
+        # Past the watcher's next poll of the now-ready pane.
+        await asyncio.sleep(0.5)
+
+    assert [_sent_text(body) for body in harness.posted_bodies] == ["first", "first"]
+    assert not server.notices("databricks_sign_in_completed")
+    assert sid not in app.state.sign_in_holds
 
 
 @pytest.mark.asyncio
