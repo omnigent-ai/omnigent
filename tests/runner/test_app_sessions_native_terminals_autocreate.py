@@ -1372,9 +1372,14 @@ async def test_auto_create_claude_terminal_passes_session_effort(
     workspace = tmp_path / "workspace"
     (workspace / ".omnigent").mkdir(parents=True)
     (workspace / ".omnigent" / "config.yaml").write_text(
-        "harness:\n  claude-native:\n    command: workspace-claude\n"
+        "harness:\n  default: claude-native\n  claude-native:\n    command: workspace-claude\n"
     )
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        "harness:\n  claude-native:\n    command: user-claude\n"
+    )
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
     monkeypatch.delenv("OMNIGENT_CLAUDE_PATH", raising=False)
 
@@ -1436,7 +1441,7 @@ async def test_auto_create_claude_terminal_passes_session_effort(
 
     args = captured["spec"].args
     assert captured["spec"].os_env.cwd == str(workspace)
-    assert captured["spec"].command == "workspace-claude"
+    assert captured["spec"].command == "user-claude"
     assert "--effort" in args
     effort_idx = args.index("--effort")
     assert args[effort_idx + 1] == "high"
@@ -4834,11 +4839,11 @@ class _RecordingCodexRegistry:
 
 
 @pytest.mark.asyncio
-async def test_codex_tui_launch_reads_project_config_from_session_workspace(
+async def test_codex_tui_launch_keeps_user_config_when_process_cwd_is_gone(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A Codex TUI relaunch reads the session workspace's config after the runner cwd is gone."""
+    """A Codex TUI relaunch retains user launch settings after the runner cwd is gone."""
     from omnigent.runner.native.orchestration import (
         _CodexNativeLaunchConfig,
         _launch_codex_native_tui,
@@ -4848,6 +4853,11 @@ async def test_codex_tui_launch_reads_project_config_from_session_workspace(
     (workspace / ".omnigent").mkdir(parents=True)
     (workspace / ".omnigent" / "config.yaml").write_text(
         "harness:\n  codex-native:\n    command: workspace-codex\n    args: [--workspace-arg]\n"
+    )
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        "harness:\n  codex-native:\n    command: user-codex\n    args: [--user-arg]\n"
     )
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
 
@@ -4887,8 +4897,8 @@ async def test_codex_tui_launch_reads_project_config_from_session_workspace(
     )
 
     spec = captured["spec"]
-    assert spec.command == "workspace-codex"
-    assert spec.args[0] == "--workspace-arg"
+    assert spec.command == "user-codex"
+    assert spec.args[0] == "--user-arg"
     assert spec.os_env.cwd == str(workspace)
 
 

@@ -57,6 +57,8 @@ from omnigent.cli_native import register_native_commands as _register_native_com
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
 from omnigent.cli_sandbox import sandbox as _sandbox_group
 from omnigent.config import (
+    _ignored_project_harness_keys,
+    _merge_effective_config,
     global_config_path,
     load_global_config,
     load_local_config,
@@ -824,14 +826,9 @@ def _load_effective_config() -> dict[str, Any]:  # type: ignore[explicit-any]
     """
     Merge global and project-level config.
 
-    Precedence (highest last): global (``~/.omnigent/config.yaml``)
-    → local (``.omnigent/config.yaml`` in cwd).  Project config
-    always wins so per-repo settings override user defaults.
-
-    The ``harness`` mapping is deep-merged (per-harness sub-keys, local
-    winning per-field) via :func:`omnigent.config.resolve_effective_config`
-    so a project's per-harness overrides augment — rather than replace —
-    the user's global ones. Every other key is a shallow replace.
+    Project defaults override user defaults, except harness executables and
+    arguments, which remain user-owned. Projects may select the default harness.
+    :func:`omnigent.config._merge_effective_config` applies this boundary.
 
     :returns: Merged config dict.
     """
@@ -8643,8 +8640,8 @@ def run(
     if smart_routing:
         raise click.ClickException(_run_smart_routing_removed())
     # Apply config defaults for any value the user did not pass explicitly.
-    # Explicit CLI args always take precedence; project-local config overrides
-    # global config, which provides user-level defaults.
+    # Explicit CLI args always take precedence; project defaults override
+    # user defaults except for user-owned harness launch settings.
     server_source = click.get_current_context().get_parameter_source("server")
     server_from_cli = server_source is not None and server_source.name == "COMMANDLINE"
     # ``--server local`` (or ``--server ""``) is the documented "ignore any
@@ -11059,7 +11056,8 @@ def _print_config_defaults() -> None:
     """Print the effective CLI defaults (user + project-level).
 
     The ``KEY=VALUE`` defaults from ``~/.omnigent/config.yaml`` (user) and
-    ``.omnigent/config.yaml`` in the cwd (project, takes precedence).
+    ``.omnigent/config.yaml`` in the cwd (project defaults). Harness launch
+    overrides are user-owned; project configuration can select the default.
     Used by ``omnigent config list``.
 
     :returns: None. Side effect: writes to stdout.
@@ -11075,12 +11073,15 @@ def _print_config_defaults() -> None:
     ignored_local_keys = (
         [] if local_is_global else sorted(raw_local_cfg.keys() & _USER_LEVEL_ONLY_CONFIG_KEYS)
     )
+    ignored_harness_keys = [] if local_is_global else _ignored_project_harness_keys(raw_local_cfg)
     local_cfg = {
         k: v
         for k, v in raw_local_cfg.items()
         if local_is_global or k not in _USER_LEVEL_ONLY_CONFIG_KEYS
     }
-    if not global_cfg and not local_cfg and not ignored_local_keys:
+    if not local_is_global:
+        local_cfg = _merge_effective_config({}, local_cfg)
+    if not global_cfg and not local_cfg and not ignored_local_keys and not ignored_harness_keys:
         click.echo(
             f"  (none set — `{cli_invocation()} config set key=value` for project,\n"
             f"   or `{cli_invocation()} config set --global key=value` for user-level)"
@@ -11103,6 +11104,11 @@ def _print_config_defaults() -> None:
         click.echo(
             "  # ignored user-level-only setting(s): "
             f"{', '.join(ignored_local_keys)} (set with --global)"
+        )
+    if ignored_harness_keys:
+        click.echo(
+            f"  # ignored project harness launch overrides: {', '.join(ignored_harness_keys)} "
+            f"(move to {_display_config_path(global_path)})"
         )
 
 
@@ -11399,7 +11405,8 @@ def config_set(is_global: bool, settings: tuple[str, ...]) -> None:
     Without ``--global``, pairs are written to ``.omnigent/config.yaml``
     in the current directory (project-level, like ``.git/config``); with
     ``--global`` to ``~/.omnigent/config.yaml`` (user-level, like
-    ``~/.gitconfig``). Project values take precedence.
+    ``~/.gitconfig``). Project defaults take precedence except for harness
+    executables and arguments, which are user-owned.
 
     Supported keys: auto_open_conversation, default_agent, harness,
     model, server, session_title_instructions. Server selection and session

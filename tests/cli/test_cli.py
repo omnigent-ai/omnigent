@@ -5885,6 +5885,31 @@ def test_config_list_shows_harness_default_and_override_note(
     assert "codex" in result.output
 
 
+def test_config_list_ignores_project_harness_launch_overrides(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_home = tmp_path / "home"
+    project = tmp_path / "project"
+    config_home.mkdir()
+    (project / ".omnigent").mkdir(parents=True)
+    (config_home / "config.yaml").write_text("harness: claude-sdk\n")
+    (project / ".omnigent" / "config.yaml").write_text(
+        "harness:\n  default: codex\n  pi:\n    command: project-pi\n    args: [--project-arg]\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    monkeypatch.chdir(project)
+    # Credential-provider discovery is unrelated to configuration display.
+    monkeypatch.setattr("omnigent.cli._print_credentials_by_harness", lambda: None)
+    result = CliRunner().invoke(cli, ["config", "list"])
+    assert result.exit_code == 0, result.output
+    assert "harness=codex" in result.output
+    assert "per-harness overrides" not in result.output
+    assert "ignored project harness launch overrides: harness.pi" in result.output
+    assert str(config_home / "config.yaml") in result.output
+    assert "project-pi" not in result.output
+    assert "--project-arg" not in result.output
+
+
 def test_config_list_shows_scalar_harness_without_note(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -5929,25 +5954,30 @@ def test_config_unset_removes_key(
     assert cfg["default_agent"] == "examples/hello_world.yaml"
 
 
+@pytest.mark.parametrize("key", ["unknown", "harness.pi.command", "harness.pi.args"])
+@pytest.mark.parametrize("global_scope", [False, True])
 def test_config_unknown_key_raises_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    key: str,
+    global_scope: bool,
 ) -> None:
-    """
-    ``omnigent config set --global unknown=value`` rejects keys that are
-    not in ``_GLOBAL_CONFIG_KEYS``.
+    """Unsupported keys, including dotted launch settings, never write config."""
+    global_path = tmp_path / "config.yaml"
+    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", global_path)
+    monkeypatch.chdir(tmp_path)
+    args = ["config", "set"]
+    if global_scope:
+        args.append("--global")
+    args.append(f"{key}=value")
 
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :param tmp_path: Temporary directory standing in for ~/.omnigent.
-    """
-    monkeypatch.setattr("omnigent.cli._GLOBAL_CONFIG_PATH", tmp_path / "config.yaml")
-
-    result = CliRunner().invoke(cli, ["config", "set", "--global", "unknown=value"])
+    result = CliRunner().invoke(cli, args)
 
     assert result.exit_code != 0
-    # Must name the bad key and the supported ones
-    assert "unknown" in result.output
+    assert key in result.output
     assert any(k in result.output for k in _GLOBAL_CONFIG_KEYS)
+    assert not global_path.exists()
+    assert not (tmp_path / ".omnigent" / "config.yaml").exists()
 
 
 def test_config_set_profile_rejected_as_unknown_key(
