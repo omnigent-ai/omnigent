@@ -24,7 +24,7 @@ from omnigent.entities import MessageData, NewConversationItem
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
-from omnigent.server.auth import LEVEL_EDIT
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER
 from omnigent.server.routes._auth_helpers import attribution_user
 from omnigent.server.routes.sessions import _build_new_item
 from omnigent.server.schemas import SessionEventInput
@@ -527,7 +527,8 @@ async def test_external_conversation_item_direct_terminal_attributes_request_act
     """
     from omnigent.runtime import pending_inputs
 
-    session_id = _seed_shared_session(db_uri, {"alice@example.com": LEVEL_EDIT})
+    # External transcripts require session ownership or a bound runner.
+    session_id = _seed_shared_session(db_uri, {"alice@example.com": LEVEL_OWNER})
 
     # Ensure no stale pending entry exists for this session — the fix only
     # fires on the no-pending-entry branch, so a leftover entry would mask

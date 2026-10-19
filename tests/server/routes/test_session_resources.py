@@ -5525,7 +5525,7 @@ async def test_claude_native_mirror_without_text_match_drains_the_oldest_entry()
         )
 
         assert [item.type for item in store.appended_items] == ["message"]
-        assert store.appended_items[0].created_by == "a@example.com"
+        assert store.appended_items[0].created_by is None
         assert pending_inputs.snapshot_for(sid) == []
         assert pending_id  # the drained entry was the reformatted message itself
     finally:
