@@ -361,6 +361,12 @@ def _create_engine(db_uri: str) -> Engine:
     }
     if is_crdb:
         engine_kwargs["isolation_level"] = "READ COMMITTED"
+    if db_uri.startswith("mysql"):
+        # Every checkout already ends its transaction (managed sessions commit
+        # or roll back; ``Connection.close`` rolls back), so the pool's return
+        # ROLLBACK is a wasted round trip. MySQL only: its pre-ping is a
+        # protocol ping, while Postgres pings with a SELECT that opens one.
+        engine_kwargs["pool_reset_on_return"] = None
     try:
         engine = create_engine(db_uri, **engine_kwargs)
     except (ImportError, NoSuchModuleError) as exc:

@@ -362,6 +362,39 @@ async def test_health_batch_reports_strict_runner_and_host_liveness(
 
 
 @pytest.mark.asyncio
+async def test_health_batch_liveness_reads_share_one_pool_checkout(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """The batch's connectivity, label, and online-host reads share a single
+    pool checkout instead of one per store call."""
+    from sqlalchemy import event
+
+    from omnigent.db.utils import get_or_create_engine
+
+    wired = _build_liveness_app(db_uri, tmp_path)
+    conv = wired.conversation_store.create_conversation(
+        runner_id="rnr_dead", host_id="2fd786c75c03cfbbec099a6820c08b62", workspace="/tmp/ws"
+    )
+    checkouts: list[int] = []
+
+    def _on_checkout(_dbapi: object, _record: object, _proxy: object) -> None:
+        checkouts.append(1)
+
+    engine = get_or_create_engine(db_uri)
+    event.listen(engine, "checkout", _on_checkout)
+    try:
+        transport = httpx.ASGITransport(app=wired.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            resp = await c.get(f"/health?session_ids={conv.id}")
+    finally:
+        event.remove(engine, "checkout", _on_checkout)
+
+    assert resp.json()["sessions"][conv.id]["host_online"] is True
+    assert len(checkouts) == 1
+
+
+@pytest.mark.asyncio
 async def test_health_single_session_reports_both_liveness_fields(
     db_uri: str,
     tmp_path: Path,
