@@ -1314,14 +1314,16 @@ export function AppShell() {
   // Validate the latest selection, including a tab queued by session restoration.
   useEffect(() => {
     setRightRailTab((tab) => {
+      const fallbackTab =
+        openPanels.filter((panel) => railTabsAvailable[panel]).at(-1) ?? fallbackWorkspaceTab;
       // "sidechat" is a dynamic mode (a side-chat tab is selected), not a
       // gated nav tab — always valid, and never a fallback target.
-      if (tab === null) return fallbackWorkspaceTab;
+      if (tab === null) return fallbackTab;
       if (tab === "sidechat") return tab;
       if (railTabsAvailable[tab]) return tab;
-      return fallbackWorkspaceTab;
+      return fallbackTab;
     });
-  }, [railTabsAvailable, rightRailTab, fallbackWorkspaceTab]);
+  }, [railTabsAvailable, rightRailTab, openPanels, fallbackWorkspaceTab]);
 
   // Closing a file must not reveal an unpinned scope that was never opened.
   useEffect(() => {

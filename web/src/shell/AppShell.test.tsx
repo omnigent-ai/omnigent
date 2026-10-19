@@ -3165,6 +3165,30 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("tab", { name: "Files" })).toHaveAttribute("aria-selected", "true");
   });
 
+  it("selects an available open page when the active workspace page becomes unavailable", () => {
+    writePinnedWorkspaceTabs(["files"]);
+    writeSessionWorkspaceState("conv_workspace_unavailable", {
+      rightRailTab: "changes",
+      openPanels: ["changes", "subagents"],
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true },
+      isLoading: false,
+    } as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_workspace_unavailable", permission_level: null }]);
+    renderShell("/c/conv_workspace_unavailable", undefined, { rerenderable: true });
+    expect(screen.getByRole("tab", { name: "Changes" })).toHaveAttribute("aria-selected", "true");
+
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false },
+      isLoading: false,
+    } as ReturnType<typeof useWorkspaceEnvironment>);
+    fireEvent.click(screen.getByTestId("rerender-shell"));
+
+    expect(screen.getByRole("tab", { name: "Agents" })).toHaveAttribute("aria-selected", "true");
+    expect(readSessionWorkspaceState("conv_workspace_unavailable").rightRailTab).toBe("subagents");
+  });
+
   it("restores unpinned page tabs across session switches and reloads", () => {
     writePinnedWorkspaceTabs(["files"]);
     writeSessionWorkspaceState("conv_to", {
