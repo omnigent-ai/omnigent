@@ -31,6 +31,8 @@ def poll_until(
         if predicate():
             return
         time.sleep(interval_s)
+    if predicate():
+        return
     raise AssertionError(f"condition not met within {timeout_s:g}s")
 
 
@@ -54,4 +56,6 @@ async def poll_until_async(
         if predicate():
             return
         await asyncio.sleep(interval_s)
+    if predicate():
+        return
     raise AssertionError(f"condition not met within {timeout_s:g}s")
