@@ -34,6 +34,7 @@ from omnigent.host.connect import (
     ModelOptionsResult,
     _build_runner_env,
     _exit_if_runtime_gone,
+    _interpreter_missing,
     _interpreter_runs,
     _runner_exit_error,
     _RunnerHandle,
@@ -1131,7 +1132,7 @@ async def test_launch_on_deleted_runtime_retires_host_after_reply_is_sent(
             assert not host.lifecycle_lost
             assert tunnel.closed_after_sent is None
             tunnel.release.set()
-            await asyncio.wait_for(_drain_frame_tasks_and_followups(host), timeout=10.0)
+            await asyncio.wait_for(_drain_frame_tasks(host), timeout=10.0)
 
         replies = {
             reply.request_id: reply
@@ -1212,7 +1213,7 @@ async def test_received_launch_is_answered_before_runtime_gone_retirement(
     # Wake the first reply's send, then receive the second launch behind it.
     tunnel.release.set()
     host._start_frame_task(tunnel, encode_host_frame(second))  # type: ignore[arg-type]
-    await asyncio.wait_for(_drain_frame_tasks_and_followups(host), timeout=10.0)
+    await asyncio.wait_for(_drain_frame_tasks(host), timeout=10.0)
 
     replies = [decode_host_frame(sent) for sent in tunnel.sent]
     assert [reply.request_id for reply in replies] == ["req_first", "req_second"]  # type: ignore[union-attr]
@@ -1603,14 +1604,6 @@ class _GatedTunnel(_FakeTunnel):
         self.send_started.set()
         await self.release.wait()
         await super().send(data)
-
-
-async def _drain_frame_tasks_and_followups(host: HostProcess) -> None:
-    """Await frame tasks until none remain, including ones they schedule."""
-    while host._frame_tasks:
-        await asyncio.gather(*list(host._frame_tasks))
-        # Gathering finished tasks doesn't yield; let their done callbacks run.
-        await asyncio.sleep(0)
 
 
 class _ConnectionErrorTunnel:
@@ -3693,7 +3686,9 @@ async def test_runtime_probe_keeps_its_exit_status_from_the_orphan_reaper(
     host._ws = _FakeTunnel()  # type: ignore[assignment] — duck-typed ws
 
     retire = asyncio.create_task(host._retire_if_runtime_gone())
+    deadline = time.monotonic() + 5.0
     while not pid_file.exists() or not pid_file.read_text().strip():
+        assert time.monotonic() < deadline, "the stand-in interpreter never started"
         await asyncio.sleep(0.01)
     probe_pid = int(pid_file.read_text())
     gate.touch()
@@ -3728,6 +3723,36 @@ async def test_runtime_probe_kills_and_reaps_an_interpreter_that_hangs(
     # Killed and reaped: the pid is gone rather than left as a zombie.
     with pytest.raises(ProcessLookupError):
         os.kill(probe_pid, 0)
+
+
+@pytest.mark.parametrize(
+    ("stat_error", "missing"),
+    [
+        (None, False),
+        (FileNotFoundError(errno.ENOENT, "No such file or directory"), True),
+        (NotADirectoryError(errno.ENOTDIR, "Not a directory"), True),
+        (PermissionError(errno.EACCES, "Permission denied"), False),
+        (OSError(errno.EIO, "Input/output error"), False),
+    ],
+    ids=["present", "absent", "parent_not_a_dir", "permission_denied", "io_error"],
+)
+def test_interpreter_missing_only_for_absence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stat_error: OSError | None, missing: bool
+) -> None:
+    """Only an absent path reads as a deleted interpreter; other stat errors don't."""
+    interpreter = tmp_path / "venv" / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.touch()
+    real_stat = os.stat
+
+    def _stat(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        if stat_error is not None and os.fspath(path) == str(interpreter):  # type: ignore[arg-type]
+            raise stat_error
+        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "stat", _stat)
+
+    assert _interpreter_missing(str(interpreter)) is missing
 
 
 @pytest.mark.parametrize("retired", [False, True])
@@ -7711,8 +7736,14 @@ class _CollectingWs:
 
 
 async def _drain_frame_tasks(host: HostProcess) -> None:
-    """Await every in-flight frame task (handler failures are contained)."""
-    await asyncio.gather(*list(host._frame_tasks))
+    """Await in-flight frame tasks, including ones their callbacks schedule.
+
+    Handler failures are contained, so gathering never raises.
+    """
+    while host._frame_tasks:
+        await asyncio.gather(*list(host._frame_tasks))
+        # Gathering finished tasks doesn't yield; let their done callbacks run.
+        await asyncio.sleep(0)
 
 
 @contextlib.contextmanager
