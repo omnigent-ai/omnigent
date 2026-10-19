@@ -7,6 +7,7 @@
 // effect drops keys whose PTY has gone away once the terminal list loads.
 
 import type { RightRailTab } from "@/shell/railTabs";
+import type { DefaultWorkspaceTab } from "./workspaceTabPreferences";
 
 const RAIL_TABS: readonly RightRailTab[] = [
   "files",
@@ -23,7 +24,9 @@ export interface SessionWorkspaceState {
   /** User-chosen rail width (px) for this session. */
   widthPx?: number;
   /** The selected Workspace navigation tab. */
-  rightRailTab?: RightRailTab;
+  rightRailTab?: RightRailTab | null;
+  /** Unpinned built-in pages explicitly opened from the Workspace menu. */
+  openPanels?: DefaultWorkspaceTab[];
   /** Ordered list of open file tabs. */
   openFiles?: string[];
   /** The active file tab (null = a scope view is active). */
@@ -79,7 +82,19 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   const state: SessionWorkspaceState = {};
   if (typeof record.open === "boolean") state.open = record.open;
   if (isValidWidth(record.widthPx)) state.widthPx = record.widthPx;
-  if (isRailTab(record.rightRailTab)) state.rightRailTab = record.rightRailTab;
+  if (record.rightRailTab === null || isRailTab(record.rightRailTab)) {
+    state.rightRailTab = record.rightRailTab;
+  }
+  if (Array.isArray(record.openPanels)) {
+    state.openPanels = [
+      ...new Set(
+        record.openPanels.filter(
+          (value): value is DefaultWorkspaceTab =>
+            isRailTab(value) && value !== "browser" && value !== "sidechat",
+        ),
+      ),
+    ];
+  }
   if (Array.isArray(record.openFiles) && record.openFiles.every((p) => typeof p === "string")) {
     state.openFiles = record.openFiles as string[];
   }
@@ -194,10 +209,11 @@ export function writeSessionWorkspaceState(
 }
 
 /** Let existing chats follow a changed default while keeping their open tabs and layout. */
-export function resetSessionWorkspaceTabSelections(): void {
+export function resetSessionWorkspaceTabSelections(clearOpenPanels = false): void {
   const store = readStore();
   for (const { state } of store) {
     delete state.rightRailTab;
+    if (clearOpenPanels) delete state.openPanels;
     delete state.selectedFilePath;
     delete state.selectedTerminalKey;
     delete state.selectedBrowserId;

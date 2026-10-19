@@ -646,6 +646,28 @@ describe("SettingsPage", () => {
     );
   });
 
+  it("lets every workspace page be unpinned, remembers the choice, and selects a pinned default", () => {
+    const page = renderPage("/settings/appearance");
+    for (const label of ["Files", "Changes", "Pull Requests", "Agents"]) {
+      const toggle = screen.getByRole("switch", { name: `Pin ${label}` });
+      expect(toggle).toBeChecked();
+      fireEvent.click(toggle);
+      expect(toggle).not.toBeChecked();
+    }
+    expect(screen.queryByRole("radiogroup", { name: "Default Workspace tab" })).toBeNull();
+    expect(localStorage.getItem("omnigent:pinned-workspace-tabs")).toBe("[]");
+
+    page.unmount();
+    renderPage("/settings/appearance");
+    expect(screen.getByRole("switch", { name: "Pin Files" })).not.toBeChecked();
+    fireEvent.click(screen.getByRole("switch", { name: "Pin Changes" }));
+    expect(screen.getByTestId("workspace-tab-default-changes")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(localStorage.getItem("omnigent:default-workspace-tab")).toBe("changes");
+  });
+
   it("renders the color theme dropdown, defaults to Omnigent, and applies a palette on change", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
@@ -845,6 +867,7 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByTestId("transcript-view-default-terminal"));
     fireEvent.click(screen.getByTestId("workspace-panel-default-open"));
     fireEvent.click(screen.getByTestId("workspace-tab-default-subagents"));
+    fireEvent.click(screen.getByRole("switch", { name: "Pin Changes" }));
     fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
@@ -905,6 +928,8 @@ describe("SettingsPage", () => {
       "true",
     );
     expect(localStorage.getItem("omnigent:default-workspace-tab")).toBeNull();
+    expect(localStorage.getItem("omnigent:pinned-workspace-tabs")).toBeNull();
+    expect(screen.getByRole("switch", { name: "Pin Changes" })).toBeChecked();
     expect(screen.getByTestId("hide-unconfigured-harnesses-toggle")).toHaveAttribute(
       "aria-checked",
       "false",

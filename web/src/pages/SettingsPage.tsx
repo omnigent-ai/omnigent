@@ -194,8 +194,12 @@ import {
 } from "@/lib/transcriptViewPreferences";
 import {
   DEFAULT_WORKSPACE_TAB,
+  defaultWorkspaceTabs,
+  PINNED_WORKSPACE_TABS_STORAGE_KEY,
   readDefaultWorkspaceTab,
+  readPinnedWorkspaceTabs,
   writeDefaultWorkspaceTab,
+  writePinnedWorkspaceTabs,
   type DefaultWorkspaceTab,
 } from "@/lib/workspaceTabPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
@@ -592,33 +596,79 @@ function WorkspacePanelDefaultControl() {
   );
 }
 
-/** Fallback tab for sessions without a remembered Workspace tab. */
-function WorkspaceTabDefaultControl() {
+/** Pinned pages and the first tab for sessions without a remembered selection. */
+function WorkspaceTabsControl() {
   const [value, setValue] = useState(() => readDefaultWorkspaceTab());
+  const [pinned, setPinned] = useState(() => readPinnedWorkspaceTabs());
   const labelId = useId();
+  const pinnedLabelId = useId();
   const choose = useCallback((next: DefaultWorkspaceTab) => {
     setValue(next);
     writeDefaultWorkspaceTab(next);
   }, []);
+  const togglePin = (tab: DefaultWorkspaceTab, checked: boolean) => {
+    const next = defaultWorkspaceTabs.filter((item) =>
+      item === tab ? checked : pinned.includes(item),
+    );
+    setPinned(next);
+    writePinnedWorkspaceTabs(next);
+    if (!next.includes(value)) choose(next[0] ?? DEFAULT_WORKSPACE_TAB);
+  };
   return (
-    <ThemeSubsection
-      labelId={labelId}
-      title="Default Workspace tab"
-      helper="Shown first in Workspace. Changing this also updates existing chats when reopened or refreshed. Later tab choices are remembered. File links still open the linked file."
-    >
-      <CardRadioGroup<DefaultWorkspaceTab>
-        labelledBy={labelId}
-        value={value}
-        onSelect={choose}
-        className="grid grid-cols-2 gap-3 sm:grid-cols-4"
-        cardClassName="items-center gap-2 p-4"
-        items={workspaceTabCards.map((card) => ({
-          value: card.value,
-          testId: `workspace-tab-default-${card.value}`,
-          body: iconCardBody(card.icon, card.label),
-        }))}
-      />
-    </ThemeSubsection>
+    <div className="flex flex-col gap-4">
+      <ThemeSubsection
+        labelId={pinnedLabelId}
+        title="Pinned tabs"
+        helper="Keep your go-to pages in the right sidebar. Unpinned pages open from the + menu as closable tabs."
+      >
+        <div role="group" aria-labelledby={pinnedLabelId} className="divide-y divide-border">
+          {workspaceTabCards.map(({ value: tab, label, icon: Icon }) => (
+            <label key={tab} className="flex cursor-pointer items-center gap-3 py-3">
+              <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+              <span className="flex-1 text-ui">{label}</span>
+              <span aria-hidden="true" className="text-sm text-muted-foreground">
+                {pinned.includes(tab) ? "Pinned" : "In + menu"}
+              </span>
+              <Switch
+                aria-label={`Pin ${label}`}
+                checked={pinned.includes(tab)}
+                onCheckedChange={(checked) => togglePin(tab, checked)}
+                componentId={`settings.appearance.pin_workspace_${tab}`}
+              />
+            </label>
+          ))}
+        </div>
+      </ThemeSubsection>
+      {pinned.length > 0 && (
+        <div className="border-t border-border pt-4">
+          <ThemeSubsection
+            labelId={labelId}
+            title="Default Workspace tab"
+            helper="Shown first in Workspace. Changing this also updates existing chats when reopened or refreshed. Later tab choices are remembered. File links still open the linked file."
+          >
+            <CardRadioGroup<DefaultWorkspaceTab>
+              labelledBy={labelId}
+              value={pinned.includes(value) ? value : pinned[0]}
+              onSelect={choose}
+              className={cn(
+                "grid gap-3",
+                pinned.length > 1 && "grid-cols-2",
+                pinned.length === 3 && "sm:grid-cols-3",
+                pinned.length === 4 && "sm:grid-cols-4",
+              )}
+              cardClassName="items-center gap-2 p-4"
+              items={workspaceTabCards
+                .filter((card) => pinned.includes(card.value))
+                .map((card) => ({
+                  value: card.value,
+                  testId: `workspace-tab-default-${card.value}`,
+                  body: iconCardBody(card.icon, card.label),
+                }))}
+            />
+          </ThemeSubsection>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -856,6 +906,7 @@ function AppearanceSection() {
     writeWorkspacePanelDefault(WORKSPACE_PANEL_DEFAULT);
 
     writeDefaultWorkspaceTab(DEFAULT_WORKSPACE_TAB);
+    writePinnedWorkspaceTabs(defaultWorkspaceTabs);
 
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
 
@@ -883,6 +934,7 @@ function AppearanceSection() {
           "omnigent:default-transcript-view",
           "omnigent:default-workspace-panel",
           "omnigent:default-workspace-tab",
+          PINNED_WORKSPACE_TABS_STORAGE_KEY,
           "omnigent:hide-unconfigured-harnesses",
         ]) {
           window.localStorage.removeItem(key);
@@ -989,13 +1041,14 @@ function AppearanceSection() {
           <SettingsGroup title="Chat defaults" testId="settings-group-chat">
             <TranscriptViewDefaultControl />
             <div className="mt-4 border-t border-border pt-4">
-              <WorkspacePanelDefaultControl />
-            </div>
-            <div className="mt-4 border-t border-border pt-4">
-              <WorkspaceTabDefaultControl />
-            </div>
-            <div className="mt-4 border-t border-border pt-4">
               <HideUnconfiguredHarnessesControl />
+            </div>
+          </SettingsGroup>
+
+          <SettingsGroup title="Workspace" testId="settings-group-workspace">
+            <WorkspacePanelDefaultControl />
+            <div className="mt-4 border-t border-border pt-4">
+              <WorkspaceTabsControl />
             </div>
           </SettingsGroup>
 

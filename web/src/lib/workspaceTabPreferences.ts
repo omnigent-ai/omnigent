@@ -4,6 +4,7 @@
 import { resetSessionWorkspaceTabSelections } from "./sessionWorkspaceState";
 
 const STORAGE_KEY = "omnigent:default-workspace-tab";
+export const PINNED_WORKSPACE_TABS_STORAGE_KEY = "omnigent:pinned-workspace-tabs";
 
 export const defaultWorkspaceTabs = ["files", "changes", "github", "subagents"] as const;
 export type DefaultWorkspaceTab = (typeof defaultWorkspaceTabs)[number];
@@ -50,4 +51,45 @@ export function writeDefaultWorkspaceTab(value: DefaultWorkspaceTab): void {
   } catch {
     // localStorage quota or access errors shouldn't break settings.
   }
+}
+
+/** Built-in pages stay pinned unless the user chooses otherwise on this device. */
+export function readPinnedWorkspaceTabs(): DefaultWorkspaceTab[] {
+  try {
+    const raw = window.localStorage.getItem(PINNED_WORKSPACE_TABS_STORAGE_KEY);
+    if (raw !== null) {
+      const value: unknown = JSON.parse(raw);
+      if (
+        Array.isArray(value) &&
+        value.every((tab) => typeof tab === "string" && isDefaultWorkspaceTab(tab))
+      ) {
+        return defaultWorkspaceTabs.filter((tab) => value.includes(tab));
+      }
+    }
+  } catch {
+    // Missing or inaccessible storage keeps the product defaults.
+  }
+  return [...defaultWorkspaceTabs];
+}
+
+export function writePinnedWorkspaceTabs(tabs: readonly DefaultWorkspaceTab[]): void {
+  try {
+    const next = defaultWorkspaceTabs.filter((tab) => tabs.includes(tab));
+    const previous = readPinnedWorkspaceTabs();
+    if (next.length === defaultWorkspaceTabs.length) {
+      window.localStorage.removeItem(PINNED_WORKSPACE_TABS_STORAGE_KEY);
+    } else {
+      window.localStorage.setItem(PINNED_WORKSPACE_TABS_STORAGE_KEY, JSON.stringify(next));
+    }
+    if (next.join() !== previous.join()) resetSessionWorkspaceTabSelections(true);
+  } catch {
+    // Storage failures must not break settings.
+  }
+}
+
+/** Unpinned pages only open after an explicit selection or deep link. */
+export function readInitialWorkspaceTab(): DefaultWorkspaceTab | null {
+  const pinned = readPinnedWorkspaceTabs();
+  const preferred = readDefaultWorkspaceTab();
+  return pinned.includes(preferred) ? preferred : (pinned[0] ?? null);
 }

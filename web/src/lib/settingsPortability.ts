@@ -8,6 +8,12 @@
 
 import { DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY } from "./archiveWorktreePreferences";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
+import { resetSessionWorkspaceTabSelections } from "./sessionWorkspaceState";
+import {
+  PINNED_WORKSPACE_TABS_STORAGE_KEY,
+  readDefaultWorkspaceTab,
+  readPinnedWorkspaceTabs,
+} from "./workspaceTabPreferences";
 
 /** localStorage keys that constitute exportable user preferences. */
 const EXPORTABLE_KEYS = [
@@ -20,6 +26,8 @@ const EXPORTABLE_KEYS = [
   "omnigent:ui-theme-palette",
   "omnigent:custom-theme",
   "omnigent:default-workspace-panel",
+  "omnigent:default-workspace-tab",
+  PINNED_WORKSPACE_TABS_STORAGE_KEY,
   "omnigent:default-transcript-view",
   "omnigent:hide-unconfigured-harnesses",
   "omnigent:default-base-branch",
@@ -119,6 +127,8 @@ export function readSettingsFile(file: File): Promise<ExportedSettings> {
 export function applyImportedSettings(imported: ExportedSettings): number {
   if (typeof window === "undefined") return 0;
   const allowedKeys = new Set<string>(EXPORTABLE_KEYS);
+  const previousPins = readPinnedWorkspaceTabs().join();
+  const previousDefault = readDefaultWorkspaceTab();
 
   // Clear all exportable keys first to honor the "overwrite" contract.
   for (const key of EXPORTABLE_KEYS) {
@@ -139,6 +149,10 @@ export function applyImportedSettings(imported: ExportedSettings): number {
     } catch {
       // Swallow individual write failures.
     }
+  }
+  const pinsChanged = previousPins !== readPinnedWorkspaceTabs().join();
+  if (pinsChanged || previousDefault !== readDefaultWorkspaceTab()) {
+    resetSessionWorkspaceTabSelections(pinsChanged);
   }
   return count;
 }

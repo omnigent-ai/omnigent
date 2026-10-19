@@ -1,9 +1,14 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   DEFAULT_WORKSPACE_TAB,
+  defaultWorkspaceTabs,
   normalizeDefaultWorkspaceTab,
+  PINNED_WORKSPACE_TABS_STORAGE_KEY,
   readDefaultWorkspaceTab,
+  readInitialWorkspaceTab,
+  readPinnedWorkspaceTabs,
   writeDefaultWorkspaceTab,
+  writePinnedWorkspaceTabs,
 } from "./workspaceTabPreferences";
 
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "./sessionWorkspaceState";
@@ -15,6 +20,33 @@ afterEach(() => {
 });
 
 describe("workspaceTabPreferences — read/write", () => {
+  it("persists pins, clears stale selections, and never defaults to an unpinned page", () => {
+    expect(readPinnedWorkspaceTabs()).toEqual(defaultWorkspaceTabs);
+    writeSessionWorkspaceState("conv", { rightRailTab: "files", open: true });
+    writePinnedWorkspaceTabs(["subagents", "github", "github"]);
+    expect(readPinnedWorkspaceTabs()).toEqual(["github", "subagents"]);
+    expect(readInitialWorkspaceTab()).toBe("github");
+    expect(readSessionWorkspaceState("conv")).toEqual({ open: true });
+
+    writeDefaultWorkspaceTab("subagents");
+    expect(readInitialWorkspaceTab()).toBe("subagents");
+    writePinnedWorkspaceTabs([]);
+    expect(readPinnedWorkspaceTabs()).toEqual([]);
+    expect(readInitialWorkspaceTab()).toBeNull();
+
+    writePinnedWorkspaceTabs(defaultWorkspaceTabs);
+    expect(localStorage.getItem(PINNED_WORKSPACE_TABS_STORAGE_KEY)).toBeNull();
+    expect(readPinnedWorkspaceTabs()).toEqual(defaultWorkspaceTabs);
+  });
+
+  it.each(["invalid-json", "null", "{}", '["unknown"]'])(
+    "keeps the default pins for invalid storage: %s",
+    (stored) => {
+      localStorage.setItem(PINNED_WORKSPACE_TABS_STORAGE_KEY, stored);
+      expect(readPinnedWorkspaceTabs()).toEqual(defaultWorkspaceTabs);
+    },
+  );
+
   it("returns files when nothing is stored", () => {
     expect(readDefaultWorkspaceTab()).toBe(DEFAULT_WORKSPACE_TAB);
     expect(localStorage.getItem(STORAGE_KEY)).toBeNull();

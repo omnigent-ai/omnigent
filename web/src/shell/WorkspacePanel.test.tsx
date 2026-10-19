@@ -12,7 +12,11 @@ import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
-import { writeDefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
+import {
+  type DefaultWorkspaceTab,
+  writeDefaultWorkspaceTab,
+  writePinnedWorkspaceTabs,
+} from "@/lib/workspaceTabPreferences";
 import { WorkspacePanel } from "./WorkspacePanel";
 
 // The rail's content children are exercised by their own suites; stub them so
@@ -96,7 +100,9 @@ afterEach(() => {
  */
 function renderWorkspace(
   overrides: {
-    rightRailTab?: RightRailTab;
+    rightRailTab?: RightRailTab | null;
+    openPanels?: DefaultWorkspaceTab[];
+    showFilesPanel?: boolean;
     selectedFilePath?: string | null;
     openFiles?: string[];
     changedCount?: number;
@@ -117,6 +123,7 @@ function renderWorkspace(
   const openFileViewer = vi.fn();
   const onCloseFile = vi.fn();
   const onRightRailTabChange = vi.fn();
+  const onClosePanel = vi.fn();
   const onBrowserTabOpened = vi.fn();
   const openTerminalTab = vi.fn();
   const onCloseTerminal = vi.fn();
@@ -138,9 +145,11 @@ function renderWorkspace(
           onMouseDown: vi.fn(),
           onKeyDown: vi.fn(),
         }}
-        rightRailTab={overrides.rightRailTab ?? "files"}
+        rightRailTab={overrides.rightRailTab === undefined ? "files" : overrides.rightRailTab}
         onRightRailTabChange={onRightRailTabChange}
-        showFilesPanel
+        openPanels={overrides.openPanels ?? []}
+        onClosePanel={onClosePanel}
+        showFilesPanel={overrides.showFilesPanel ?? true}
         showGithubTab={overrides.showGithubTab ?? false}
         showBrowserTab={overrides.showBrowserTab ?? false}
         onBrowserTabOpened={onBrowserTabOpened}
@@ -176,6 +185,7 @@ function renderWorkspace(
     openFileViewer,
     onCloseFile,
     onRightRailTabChange,
+    onClosePanel,
     onBrowserTabOpened,
     openTerminalTab,
     onCloseTerminal,
@@ -186,6 +196,49 @@ function renderWorkspace(
 }
 
 describe("WorkspacePanel surface presentation", () => {
+  it("offers unpinned pages in + without requiring shell or browser support", () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const { onRightRailTabChange } = renderWorkspace({ showGithubTab: true });
+
+    expect(screen.queryByRole("tab", { name: "Changes" })).toBeNull();
+    expect(screen.getByRole("tab", { name: "Agents 1" })).toHaveAttribute("aria-keyshortcuts", "2");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "Pull Requests" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Files" })).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Changes" }));
+    expect(onRightRailTabChange).toHaveBeenCalledWith("changes");
+  });
+
+  it("renders opened unpinned pages as closable tabs alongside files", () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const { onClosePanel } = renderWorkspace({
+      rightRailTab: "changes",
+      openPanels: ["changes"],
+      openFiles: ["README.md"],
+    });
+
+    expect(screen.getByRole("tab", { name: "Changes" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-flat-view", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Close Changes" }));
+    expect(onClosePanel).toHaveBeenCalledWith("changes");
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "Changes" })).toBeInTheDocument();
+  });
+
+  it("keeps + available with no pinned pages and hides unavailable pages", () => {
+    writePinnedWorkspaceTabs([]);
+    renderWorkspace({ rightRailTab: null, showFilesPanel: false });
+
+    expect(screen.queryByRole("tab")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Select panel" })).toBeNull();
+    expect(screen.queryByTestId("files-panel-stub")).toBeNull();
+    expect(screen.getByText("Open a Workspace tab from the + menu.")).toBeInTheDocument();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "Agents" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Files" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Pull Requests" })).toBeNull();
+  });
+
   it("sits flush to the window edge with a left divider, no floating card frame", () => {
     renderWorkspace();
 

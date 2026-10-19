@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { readSessionWorkspaceState, writeSessionWorkspaceState } from "./sessionWorkspaceState";
+import {
+  readSessionWorkspaceState,
+  resetSessionWorkspaceTabSelections,
+  writeSessionWorkspaceState,
+} from "./sessionWorkspaceState";
 
 const STORAGE_KEY = "omnigent:session-workspace-state";
 // Mirrors MAX_SESSIONS in the source; the pruning tests below seed exactly this
@@ -33,6 +37,36 @@ describe("sessionWorkspaceState", () => {
   it("remembers a selected GitHub tab", () => {
     writeSessionWorkspaceState("conv_github", { rightRailTab: "github" });
     expect(readSessionWorkspaceState("conv_github").rightRailTab).toBe("github");
+  });
+
+  it("remembers opened built-in pages and an empty selection", () => {
+    writeSessionWorkspaceState("conv_panels", {
+      rightRailTab: null,
+      openPanels: ["changes", "github"],
+    });
+    expect(readSessionWorkspaceState("conv_panels")).toEqual({
+      rightRailTab: null,
+      openPanels: ["changes", "github"],
+    });
+
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify([
+        {
+          id: "conv_panels",
+          state: { openPanels: ["changes", "browser", "changes", null, "bad"] },
+        },
+      ]),
+    );
+    expect(readSessionWorkspaceState("conv_panels").openPanels).toEqual(["changes"]);
+  });
+
+  it("preserves opened pages for a default change and clears them for a pin change", () => {
+    writeSessionWorkspaceState("conv_panels", { rightRailTab: "changes", openPanels: ["changes"] });
+    resetSessionWorkspaceTabSelections();
+    expect(readSessionWorkspaceState("conv_panels")).toEqual({ openPanels: ["changes"] });
+    resetSessionWorkspaceTabSelections(true);
+    expect(readSessionWorkspaceState("conv_panels")).toEqual({});
   });
 
   it("keeps sessions isolated by id", () => {
