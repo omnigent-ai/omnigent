@@ -39,7 +39,7 @@ def test_a_long_text_keeps_its_whole_lines_before_the_prefix_bound() -> None:
 
 
 def test_the_left_out_count_stays_positive_when_redaction_shrinks_the_text() -> None:
-    # Terminal escapes the sanitizer strips leave the kept text far shorter than the clip.
-    message = "boom\n" + "\x1b[31m" * 820
+    # The kept line loses an escape to the sanitizer, so it ends up shorter than the clip.
+    message = "boom\x1b[31m\n" + "x" * 4087
 
-    assert _error_item_log_text(message) == f"boom… (+{len(message) - 4} chars)"
+    assert _error_item_log_text(message) == "boom… (+4088 chars)"
