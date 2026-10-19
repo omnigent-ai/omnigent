@@ -185,9 +185,11 @@ HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY = "omnigent.host_offline_hold_until"
 #     labels would route the new context's terminal + web injection to the
 #     SOURCE's claude/codex bridge (whose active-session marker isn't the
 #     clone → "session no longer active"); the context-size metrics would
-#     display the source's last usage. The bridge-id literals mirror the
-#     harness modules' ``*_BRIDGE_ID_LABEL_KEY`` constants; a store test
-#     cross-checks them so a rename in those modules fails loudly here.
+#     display the source's last usage; the host-offline hold deadline would
+#     keep orphan cleanup off the new context's turns. The bridge-id
+#     literals mirror the harness modules' ``*_BRIDGE_ID_LABEL_KEY``
+#     constants; a store test cross-checks them so a rename in those
+#     modules fails loudly here.
 #
 #   * Per-context safety opt-in — the DANGEROUS codex full-bypass directive
 #     (:data:`CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY`). Letting it ride into a
@@ -203,6 +205,7 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
         "omnigent.last_context_tokens",
         "omnigent.last_context_window",
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+        HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY,
     }
 )
 

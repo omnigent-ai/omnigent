@@ -191,13 +191,26 @@ async def test_relay_finds_an_offline_host_through_a_side_chats_source(
     assert result is expected
 
 
+_FURTHEST_DEADLINE = (
+    1500.0 + orchestration.HOST_OFFLINE_HOLD_S + orchestration._HOST_OFFLINE_HOLD_SKEW_S
+)
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
-    [("2000", True), ("1000", False), ("not-a-time", False), (None, False)],
+    [
+        ("2000", True),
+        ("1000", False),
+        ("1500", False),
+        (str(_FURTHEST_DEADLINE), True),
+        (str(_FURTHEST_DEADLINE + 1), False),
+        ("not-a-time", False),
+        (None, False),
+    ],
 )
 def test_host_offline_hold_active_reads_an_unexpired_deadline(
     value: str | None, expected: bool
 ) -> None:
-    """Only a deadline still ahead marks a held session; anything else reads as no hold."""
+    """Only a deadline ahead, and no further out than one hold plus skew, marks a hold."""
     labels = {} if value is None else {orchestration.HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY: value}
     assert orchestration.host_offline_hold_active(labels, now=1500.0) is expected

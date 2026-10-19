@@ -5471,6 +5471,8 @@ def test_fork_conversation_drops_instance_scoped_labels(
             "omnigent.last_context_window": "1000000",
             # The dangerous bypass opt-in must NOT ride into the fork.
             "omnigent.codex_native.bypass_sandbox": "1",
+            # The source's host-offline hold deadline protects only its own turn.
+            "omnigent.host_offline_hold_until": "4102444800",
             # An ordinary, non-instance label that SHOULD carry over.
             "omnigent.wrapper": "claude-code-native-ui",
         },

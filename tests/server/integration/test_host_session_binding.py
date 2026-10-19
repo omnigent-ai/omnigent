@@ -2188,17 +2188,23 @@ async def test_runner_exited_after_connect_fails_mid_turn_session(
     assert attributes["fail_idle_top_level"] is False
 
 
+@pytest.mark.parametrize("block_label_write", [False, True])
 async def test_runner_exited_during_host_offline_hold_fails_turn_and_ends_hold(
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    block_label_write: bool,
 ) -> None:
     """
     A crash report for a runner held while its host is offline fails the turn.
 
     The report is authoritative, so it cancels the hold; the hold still logs
-    its end so every start row has a matching end row.
+    its end so every start row has a matching end row. A report that lands
+    while the hold's first label write is still running waits for that write,
+    so no deadline outlives the hold.
     """
+    import threading
+
     from omnigent.server.routes import sessions as sessions_module
     from tests.debug_log_helpers import capture_debug_rows
     from tests.server.integration.test_sessions_tunnel_three_layer import (
@@ -2216,6 +2222,18 @@ async def test_runner_exited_during_host_offline_hold_fails_turn_and_ends_hold(
     _stub_connect_hook_for_pumpless_ws(app, monkeypatch)
     runner_id = "runner_held_then_crashed"
     conv = conv_store.create_conversation(agent_id=None, runner_id=runner_id)
+    write_started = threading.Event()
+    release_write = threading.Event()
+    if block_label_write:
+        set_labels = conv_store.set_labels
+
+        def blocked_set_labels(conversation_id: str, updates: dict[str, str], *args, **kwargs):  # type: ignore[no-untyped-def]
+            if sessions_module.HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY in updates:
+                write_started.set()
+                release_write.wait(timeout=10.0)
+            return set_labels(conversation_id, updates, *args, **kwargs)
+
+        monkeypatch.setattr(conv_store, "set_labels", blocked_set_labels)
     runner = await _connect_runner_tunnel(app, runner_id)
     await _send_hello_and_wait(runner, app, runner_id, harnesses=[])
     sessions_module._session_status_cache[conv.id] = "running"
@@ -2231,14 +2249,39 @@ async def test_runner_exited_during_host_offline_hold_fails_turn_and_ends_hold(
                 while not _seen(rows, "runner_disconnect_held_host_offline"):
                     await asyncio.sleep(0.01)
             assert _persisted_task_error(conv_store, conv.id) is None
+            if block_label_write:
+                async with asyncio.timeout(5.0):
+                    while not write_started.is_set():
+                        await asyncio.sleep(0.01)
 
             _comm = await _report_runner_exited(app, runner_id, had_connected=True)
+            if block_label_write:
+                # The report cancels the hold mid-write; the write lands afterwards.
+                await asyncio.sleep(0.2)
+                release_write.set()
             async with asyncio.timeout(5.0):
                 while (
                     not _seen(rows, "runner_disconnect_hold_ended")
                     or _persisted_task_error(conv_store, conv.id) is None
                 ):
                     await asyncio.sleep(0.01)
+
+            async def _label_cleared() -> None:
+                while True:
+                    current = conv_store.get_conversation(conv.id)
+                    if current is not None and (
+                        sessions_module.HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY not in current.labels
+                    ):
+                        return
+                    await asyncio.sleep(0.01)
+
+            async with asyncio.timeout(5.0):
+                await _label_cleared()
+            # No late write brings the deadline back.
+            await asyncio.sleep(0.2)
+            current = conv_store.get_conversation(conv.id)
+            assert current is not None
+            assert sessions_module.HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY not in current.labels
 
         ended = [r for r in rows if r["event_name"] == "runner_disconnect_hold_ended"]
         assert [(r["session_id"], r["attributes"]["outcome"]) for r in ended] == [  # type: ignore[index]
@@ -2248,6 +2291,7 @@ async def test_runner_exited_during_host_offline_hold_fails_turn_and_ends_hold(
         assert error is not None
         assert error["code"] == "runner_failed_to_start"
     finally:
+        release_write.set()
         sessions_module._session_status_cache.pop(conv.id, None)
 
 
@@ -2362,7 +2406,7 @@ async def test_runner_exited_keeps_existing_failure_cause(
         assert _persisted_task_error(conv_store, session_id) == original_error
 
         collector = await start_session_stream_collector(session_id)
-        caplog.set_level("INFO", logger="omnigent")
+        caplog.set_level("WARNING", logger="omnigent")
         _comm = await _report_runner_exited(app, runner_id)
         async with asyncio.timeout(5.0):
             while not _disconnect_decisions(caplog, session_id):
@@ -2407,7 +2451,7 @@ async def test_session_response_keeps_existing_failure_cause_while_exit_report_i
             _host,
         ) = await _failed_native_session_on_never_connected_runner(app, client)
 
-        caplog.set_level("INFO", logger="omnigent")
+        caplog.set_level("WARNING", logger="omnigent")
         _comm = await _report_runner_exited(app, runner_id, had_connected=True)
         async with asyncio.timeout(5.0):
             while not _disconnect_decisions(caplog, session_id):

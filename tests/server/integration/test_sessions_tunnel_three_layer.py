@@ -2455,7 +2455,9 @@ async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
         "list_during_hold",
         "remote_live_at_expiry",
         "label_write_retry",
+        "label_clear_retry",
         "shutdown_keeps_label",
+        "final_read_recovers",
     ],
 )
 async def test_runner_disconnect_holds_turn_while_host_offline(
@@ -2486,6 +2488,7 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
         "host_back_without_runner": 30.0,
         "list_during_hold": 30.0,
         "label_write_retry": 30.0,
+        "label_clear_retry": 30.0,
         "shutdown_keeps_label": 30.0,
     }.get(scenario, 0.6)
     monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
@@ -2585,6 +2588,19 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             return get_liveness(conversation_id)
 
         monkeypatch.setattr(store, "get_runner_liveness", remote_live_during_final_read)
+    final_read_failures: list[bool] = []
+    if scenario == "final_read_recovers":
+        get_liveness = store.get_runner_liveness
+
+        def store_down_after_hold(conversation_id: str):  # type: ignore[no-untyped-def]
+            # The store stays down for more reads than any fixed retry budget.
+            hold_over = any(r["event_name"] == "runner_disconnect_hold_ended" for r in rows)
+            if hold_over and len(final_read_failures) < 8:
+                final_read_failures.append(True)
+                raise RuntimeError("store unavailable")
+            return get_liveness(conversation_id)
+
+        monkeypatch.setattr(store, "get_runner_liveness", store_down_after_hold)
     label_writes_failed: list[bool] = []
     if scenario == "label_write_retry":
         set_labels = store.set_labels
@@ -2599,6 +2615,20 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             return set_labels(conversation_id, updates, *args, **kwargs)
 
         monkeypatch.setattr(store, "set_labels", flaky_set_labels)
+    label_clears_failed: list[bool] = []
+    if scenario == "label_clear_retry":
+        delete_label = store.delete_label
+
+        def flaky_delete_label(conversation_id: str, key: str, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if (
+                key == sessions_module.HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY
+                and not label_clears_failed
+            ):
+                label_clears_failed.append(True)
+                raise RuntimeError("store unavailable")
+            return delete_label(conversation_id, key, *args, **kwargs)
+
+        monkeypatch.setattr(store, "delete_label", flaky_delete_label)
 
     communicator = await _connect_runner_tunnel(ap_app, runner_id)
     await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
@@ -2648,7 +2678,7 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
                         await asyncio.sleep(0.02)
 
                 await asyncio.wait_for(_label_cleared(), timeout=budget(5.0))
-            elif scenario in ("label_write_retry", "shutdown_keeps_label"):
+            elif scenario in ("label_write_retry", "label_clear_retry", "shutdown_keeps_label"):
 
                 async def _labeled() -> None:
                     while True:
@@ -2663,10 +2693,26 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
                 await asyncio.wait_for(_labeled(), timeout=budget(5.0))
                 if scenario == "label_write_retry":
                     assert label_writes_failed
+                if scenario in ("label_write_retry", "label_clear_retry"):
                     reconnect = await _connect_runner_tunnel(ap_app, runner_id)
                     await _send_hello_and_wait(
                         reconnect, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
                     )
+                    if scenario == "label_clear_retry":
+
+                        async def _unlabeled() -> None:
+                            while True:
+                                row = store.get_conversation(held_id)
+                                if row is not None and (
+                                    sessions_module.HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY
+                                    not in row.labels
+                                ):
+                                    return
+                                await asyncio.sleep(0.02)
+
+                        # A failed clear is retried, so no deadline outlives the hold.
+                        await asyncio.wait_for(_unlabeled(), timeout=budget(5.0))
+                        assert label_clears_failed
                 else:
                     from omnigent.server import shutdown_state
 
@@ -2744,6 +2790,9 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
                         await asyncio.sleep(0.02)
 
                 error = await asyncio.wait_for(_persisted_error(), timeout=budget(5.0))
+                if scenario == "final_read_recovers":
+                    # The task kept owning the turn until the store came back.
+                    assert len(final_read_failures) == 8
                 assert error["code"] == "runner_disconnected"
                 if scenario == "host_back_without_runner":
                     assert error["message"] == "Runner disconnected unexpectedly."
@@ -2770,7 +2819,9 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             "list_during_hold": "runner_reconnected",
             "remote_live_at_expiry": "expired",
             "label_write_retry": "runner_reconnected",
+            "label_clear_retry": "runner_reconnected",
             "shutdown_keeps_label": "server_shutdown",
+            "final_read_recovers": "expired",
         }[scenario]
         assert [r["attributes"]["outcome"] for r in ended] == [expected_outcome]
     finally:

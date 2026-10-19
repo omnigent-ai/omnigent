@@ -159,9 +159,6 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 _RECONNECT_BINDING_BATCH_SIZE = 128
-# Tries of the read that decides which sessions an expired host-offline hold
-# fails; a session is failed only after its binding was read successfully.
-_HOST_OFFLINE_FINAL_READ_ATTEMPTS = 5
 
 
 class SmartRoutingSourcesInfo(BaseModel):
@@ -3644,7 +3641,10 @@ def create_app(
                 host_id = await _session_host_id(held[0], conversation_store)
             if held and await _host_offline_state(host_id) is True:
                 await _mark_runner_sessions_offline(settle_now, error, conversation_store)
-                outcome = await _hold_while_host_offline(runner_id, host_id, held, reference_stamp)
+                hold_until = time.time() + HOST_OFFLINE_HOLD_S
+                outcome = await _hold_while_host_offline(
+                    runner_id, host_id, held, reference_stamp, hold_until
+                )
                 if outcome not in ("expired", "host_back_without_runner"):
                     return
                 try:
@@ -3661,7 +3661,7 @@ def create_app(
                         )
                     await _mark_runner_sessions_offline(to_fail, error, conversation_store)
                 finally:
-                    await asyncio.shield(_mark_hold(held, None))
+                    await asyncio.shield(_clear_hold_labels(held, hold_until))
                 return
         await _mark_runner_sessions_offline(affected, error, conversation_store)
 
@@ -3670,9 +3670,9 @@ def create_app(
     ) -> "list[Conversation]":
         """Return the held sessions an expired hold fails, after a verified read.
 
-        A failed read is retried instead of settling rows it never saw, and
-        nothing fails when the runner is back here or live on another replica,
-        so a turn that resumed while the hold ended keeps running.
+        A failed read is retried until one succeeds, so this task keeps owning
+        the turns instead of settling rows it never saw or abandoning them, and
+        nothing fails when the runner is back here or live on another replica.
 
         :param runner_id: The dropped runner.
         :param held: The sessions the hold kept running.
@@ -3688,27 +3688,25 @@ def create_app(
         )
 
         bound: list[tuple[Conversation, int | None]] | None = None
-        for attempt in range(1, _HOST_OFFLINE_FINAL_READ_ATTEMPTS + 1):
+        attempt = 0
+        while bound is None:
+            attempt += 1
             try:
                 bound = await _held_still_bound(runner_id, held)
-                break
             except Exception:  # noqa: BLE001 — retried; nothing fails unread
                 _logger.warning(
                     "Runner %s: final binding read after host-offline hold failed "
-                    "(attempt %d of %d)",
+                    "(attempt %d); retrying",
                     runner_id,
                     attempt,
-                    _HOST_OFFLINE_FINAL_READ_ATTEMPTS,
                     exc_info=True,
                 )
-                if attempt < _HOST_OFFLINE_FINAL_READ_ATTEMPTS:
-                    await asyncio.sleep(_HOST_OFFLINE_RECHECK_S)
-        if bound is None:
-            _logger.warning(
-                "Runner %s: could not verify held sessions after host-offline hold; failing none",
-                runner_id,
-            )
-            return []
+                # A returning runner or a stopping server ends the wait unread.
+                if tunnel_registry.get(runner_id) is not None:
+                    return []
+                if shutdown_state.server_shutting_down():
+                    return []
+                await asyncio.sleep(_HOST_OFFLINE_RECHECK_S)
         # The runner may reconnect during those reads, here or on another replica.
         if tunnel_registry.get(runner_id) is not None:
             _logger.info(
@@ -3750,6 +3748,7 @@ def create_app(
         host_id: str | None,
         held: "list[Conversation]",
         reference_stamp: int | None,
+        hold_until: float,
     ) -> str:
         """Wait for a runner whose host went offline mid-turn, and report how it ended.
 
@@ -3765,6 +3764,7 @@ def create_app(
         :param host_id: The offline host the runner ran on.
         :param held: The interrupted sessions being held.
         :param reference_stamp: This replica's last liveness stamp for the runner.
+        :param hold_until: Epoch-seconds deadline written to the held sessions.
         :returns: ``"runner_reconnected"``, ``"live_elsewhere"``, ``"rebound"``
             or ``"server_shutdown"`` when nothing should fail, else ``"expired"``
             or ``"host_back_without_runner"``.
@@ -3795,12 +3795,13 @@ def create_app(
         )
         # A crash report cancels the hold; its end still gets a row.
         outcome = "cancelled"
-        hold_labels = {
-            HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY: str(int(time.time() + HOST_OFFLINE_HOLD_S))
-        }
-        # Retried on every re-check until each held session carries its deadline.
-        unlabeled = await _mark_hold(held, hold_labels)
+        hold_labels = {HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY: str(int(hold_until))}
+        # A task, so a crash report's cancel leaves the write for the cleanup
+        # below to wait on; retried on every re-check until each held session
+        # carries its deadline.
+        label_write = asyncio.ensure_future(_mark_hold(held, hold_labels))
         try:
+            unlabeled = await asyncio.shield(label_write)
             while True:
                 now = loop.time()
                 wait_until = deadline
@@ -3819,7 +3820,8 @@ def create_app(
                     outcome = "server_shutdown"
                     break
                 if unlabeled:
-                    unlabeled = await _mark_hold(unlabeled, hold_labels)
+                    label_write = asyncio.ensure_future(_mark_hold(unlabeled, hold_labels))
+                    unlabeled = await asyncio.shield(label_write)
                 try:
                     bound = await _held_still_bound(runner_id, held)
                 except Exception:  # noqa: BLE001 — keep holding; the next check retries
@@ -3854,12 +3856,40 @@ def create_app(
             )
             # An expired hold's caller clears the label once it has settled the
             # turns. A replica shutting down keeps it, so other replicas leave
-            # the turns running until the deadline. Shielded against a crash
-            # report's cancel.
+            # the turns running until the deadline.
             concluded = outcome not in ("expired", "host_back_without_runner")
-            if concluded and not shutdown_state.server_shutting_down():
-                await asyncio.shield(_mark_hold(held, None))
+            await asyncio.shield(
+                _settle_hold_labels(label_write, held, hold_until, clear=concluded)
+            )
         return outcome
+
+    async def _settle_hold_labels(
+        write: "asyncio.Future[list[Conversation]]",
+        held: "list[Conversation]",
+        hold_until: float,
+        *,
+        clear: bool,
+    ) -> None:
+        """Let an in-flight hold-label write land, then clear the labels if *clear*.
+
+        Run shielded as one step, so no cancel can skip the clear or let the
+        write land after it.
+        """
+        await write
+        if clear and not shutdown_state.server_shutting_down():
+            await _clear_hold_labels(held, hold_until)
+
+    async def _clear_hold_labels(held: "list[Conversation]", hold_until: float) -> None:
+        """Clear the hold labels, retrying failed deletes until the deadline lapses.
+
+        A deadline already past is inert, so the retries stop there.
+        """
+        from omnigent.server.routes.sessions import _HOST_OFFLINE_RECHECK_S
+
+        pending = await _mark_hold(held, None)
+        while pending and time.time() < hold_until and not shutdown_state.server_shutting_down():
+            await asyncio.sleep(_HOST_OFFLINE_RECHECK_S)
+            pending = await _mark_hold(pending, None)
 
     async def _mark_hold(
         held: "list[Conversation]", labels: dict[str, str] | None
