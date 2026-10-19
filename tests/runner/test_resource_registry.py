@@ -162,12 +162,16 @@ async def test_claude_program_status_real_launch_and_fallback(
         assert statuses == [("running", None)]
         await instance.send(keys="b")
         await wait_status("running", "permission prompt")
-        registry.resync_session_statuses()
-        before = len(statuses)
-        async with asyncio.timeout(5):
-            while len(statuses) == before:
-                await asyncio.sleep(0.02)
-        assert statuses[-1] == ("running", "permission prompt")
+        for source in ("reconnect", "forwarded_idle"):
+            before = len(statuses)
+            if source == "reconnect":
+                registry.resync_session_statuses()
+            else:
+                registry.note_external_session_status("osc-test", "idle")
+            async with asyncio.timeout(5):
+                while len(statuses) == before:
+                    await asyncio.sleep(0.02)
+            assert statuses[-1] == ("running", "permission prompt")
         for key, state in (("d", "idle"), ("w", "running"), ("i", "idle"), ("e", "failed")):
             await instance.send(keys=key)
             await wait_status(state)

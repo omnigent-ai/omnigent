@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 
 from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
@@ -27,6 +28,8 @@ class ClaudeProgramStatusPoller:
         self._last: ProgramStatus | None = None
         self._using_osc = False
         self._retired = False
+        self._resync_lock = threading.Lock()
+        self._resync_requested = False
 
     @property
     def active(self) -> bool:
@@ -45,6 +48,11 @@ class ClaudeProgramStatusPoller:
         """Publish changed reports; never interpret silence as completion."""
         if self._retired:
             return
+        with self._resync_lock:
+            requested = self._resync_requested
+            self._resync_requested = False
+        if requested:
+            self._last = None
         report = self._reader.status
         if report is not None:
             self._using_osc = True
@@ -66,8 +74,9 @@ class ClaudeProgramStatusPoller:
             self._fallback.tick()
 
     def resync(self) -> None:
-        """Replay the cached state after the runner tunnel reconnects."""
-        self._last = None
+        """Re-arm the next poll after a reconnect or a forwarded idle edge."""
+        with self._resync_lock:
+            self._resync_requested = True
         self._fallback.resync()
 
     def retire(self) -> None:

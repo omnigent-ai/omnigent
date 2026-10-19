@@ -20,7 +20,7 @@ A display status report cannot replace those messages.
 The file API is undocumented. Screen inference can mistake a quiet model/tool
 operation for idle, or a prompt repaint for work. OSC 7501 explicitly distinguishes
 idle, working, done, blocked and error, with optional reasons and child records.
-Claude Code 2.1.295 introduced support; the standard CI pin is still 2.1.266
+Claude Code 2.1.295 introduced support; the standard CI pin is still 2.1.283
 (the separate billing-notice lane uses 2.1.278).
 
 ## Transport decision
@@ -91,7 +91,9 @@ status consumer, not a complete general-purpose terminal record implementation:
 child-record display, progress and durable done/error notifications are deferred.
 
 A valid root snapshot persists through silence; no heartbeat or freshness timeout
-is imposed. Tunnel resync republishes it. OSC 133 A clears working/blocked/idle;
+is imposed. Tunnel reconnects and forwarded idle edges re-arm the next poll;
+requests during a read remain pending for the following tick.
+OSC 133 A clears working/blocked/idle;
 RIS clears all state. Relay/process exit releases observation to the existing
 terminal-exit handling. The legacy file lookup uses the inner command PID instead
 of the relay's pane PID, retaining the existing Claude session-ID scan fallback.
@@ -114,6 +116,7 @@ uv run --no-sync pytest \
   tests/inner/test_terminal.py \
   tests/terminals/test_launch_failure_cleanup.py \
   tests/harnesses/claude_native/test_claude_native_status_file.py \
+  tests/harnesses/claude_native/test_claude_native_program_status.py \
   tests/server/test_feature_flags.py \
   tests/cli/test_host_daemon_env.py \
   --reruns 0 -n 4 --dist loadfile -q
@@ -125,7 +128,9 @@ capability query and device-attributes query together and requires the OSC reply
 first. It covers the disabled flag without a relay, a non-emitting peer with
 the flag enabled, conflicting legacy state, elapsed-time
 silence, blocked input, resize/input forwarding, root/child isolation, clear,
-error, resync and process exit. Existing terminal scenarios cover final output,
+error, reconnect/forwarded-idle resync and process exit. A harness-level test
+pauses an actual snapshot read to check that a concurrent resync survives it.
+Existing terminal scenarios cover final output,
 exit codes and cancellation with and without the relay. Parser matrices stay at
 the byte-stream layer. Environment-boundary tests feed the CLI daemon and
 runner environment builders into registry startup in local/remote server modes;
@@ -147,7 +152,7 @@ Before activation, verify with Claude 2.1.295 or later in an isolated dev runner
    the existing fallback. Do not set `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` when
    testing OSC: Claude also disables program status with that setting.
 
-The draft PR records the exact candidate, actual CLI checks and remaining gaps.
+The PR records the exact candidate, actual CLI checks and remaining gaps.
 Production acceptance requires Linux/bwrap, managed credential/proxy settings,
 real-provider turns, and web/desktop/mobile viewer checks. This prototype does
 not claim those paths from local parser or tmux results. A separate change should
