@@ -1025,7 +1025,14 @@ async def test_handle_launch_attributes_spawn_failure_to_host(
 
 
 @pytest.mark.parametrize(
-    "scenario", ["idle", "live_runner", "queued_launch_fails", "queued_launch_after_restore"]
+    "scenario",
+    [
+        "idle",
+        "live_runner",
+        "queued_launch_fails",
+        "queued_launch_after_restore",
+        "queued_launch_after_unusable_restore",
+    ],
 )
 async def test_launch_on_deleted_runtime_retires_host_after_reply_is_sent(
     monkeypatch: pytest.MonkeyPatch,
@@ -1037,21 +1044,27 @@ async def test_launch_on_deleted_runtime_retires_host_after_reply_is_sent(
     Every later spawn would fail the same way, so the host exits for a restart
     on a fresh runtime, but only after every accepted launch is answered and
     only once no live runner would be torn down. A launch queued behind the
-    failed one that spawns after the runtime is restored keeps its runner.
+    failed one that spawns after the runtime is restored keeps its runner; an
+    unusable file left at the old path doesn't count as restored.
     """
 
     host = _make_host_process()
     missing = tmp_path / "deleted-venv" / "bin" / "python"
+    working_python = os.path.realpath(sys.executable)
     original_popen = subprocess.Popen
     original_spawn = host._spawn_runner_proc
     spawn_calls: list[int] = []
 
     def _spawn(*args: object, **kwargs: object) -> tuple[subprocess.Popen[bytes], Path]:
         spawn_calls.append(len(spawn_calls))
-        if len(spawn_calls) == 2 and scenario == "queued_launch_after_restore":
+        if len(spawn_calls) == 2 and scenario.startswith("queued_launch_after"):
             missing.parent.mkdir(parents=True)
+            if scenario == "queued_launch_after_restore":
+                missing.symlink_to(working_python)
+                return original_spawn(*args, **kwargs)  # type: ignore[arg-type]
+            # An empty file at the old path can't be executed.
             missing.touch()
-            return original_spawn(*args, **kwargs)  # type: ignore[arg-type]
+            raise PermissionError(errno.EACCES, "Permission denied", str(missing))
         raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(missing))
 
     def _sleeping_popen(_args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
@@ -1079,8 +1092,14 @@ async def test_launch_on_deleted_runtime_retires_host_after_reply_is_sent(
         for index in range(2 if scenario.startswith("queued") else 1)
     ]
 
+    # Only the restored runtime really spawns; the interpreter probe must not be patched.
+    spawn_patch = (
+        patch("omnigent.host.connect.subprocess.Popen", side_effect=_sleeping_popen)
+        if scenario == "queued_launch_after_restore"
+        else contextlib.nullcontext()
+    )
     try:
-        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_sleeping_popen):
+        with spawn_patch:
             # The second launch queues on the lifecycle lock behind the first.
             for frame in frames:
                 host._start_frame_task(tunnel, encode_host_frame(frame))  # type: ignore[arg-type]
@@ -1109,7 +1128,11 @@ async def test_launch_on_deleted_runtime_retires_host_after_reply_is_sent(
             assert reply.status == "failed"
             assert str(missing) in (reply.error or "")
             assert "was deleted" in (reply.error or "")
-        retires = scenario in {"idle", "queued_launch_fails"}
+        retires = scenario in {
+            "idle",
+            "queued_launch_fails",
+            "queued_launch_after_unusable_restore",
+        }
         assert host.runtime_gone is retires
         # Retiring closes the tunnel gracefully after every reply, never before one.
         assert tunnel.closed_after_sent == (len(frames) if retires else None)

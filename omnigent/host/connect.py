@@ -458,6 +458,8 @@ try:
     _LIFECYCLE_POLL_INTERVAL_S = float(os.environ.get("OMNIGENT_HOST_LIFECYCLE_POLL_S", "60"))
 except ValueError:
     _LIFECYCLE_POLL_INTERVAL_S = 60.0
+# How long a deleted-then-replaced interpreter gets to prove it runs again.
+_RUNTIME_PROBE_TIMEOUT_S = 10.0
 # Keep first startup tolerant of a cold server, but do not spend the library's
 # full default timeout on each reconnect after an established tunnel drops.
 _INITIAL_CONNECT_OPEN_TIMEOUT_S = 10.0
@@ -2027,7 +2029,7 @@ class HostProcess:
                 task.add_done_callback(self._runner_stop_tasks.discard)
                 raise
             except OSError as exc:
-                if not os.path.exists(sys.executable):
+                if self._runtime_gone or not os.path.exists(sys.executable):
                     self._note_runtime_gone()
                     return self._launch_failed(
                         frame,
@@ -4092,25 +4094,32 @@ class HostProcess:
 
         :returns: None.
         """
-        ws = self._ws
-        if (
-            not self._runtime_gone
-            or self._runners
-            or self._launches_in_flight
-            or self._lifecycle_lost.is_set()
-            or ws is None
-            or self._unreported_exits
-        ):
+        if not self._runtime_gone_retirement_due():
             return
-        if os.path.exists(sys.executable):
-            # The interpreter was recreated at the same path, so spawns work again.
-            _logger.info("Host runtime %s is back; the host stays up.", sys.executable)
+        if await _interpreter_runs(sys.executable):
+            # The interpreter was reinstalled at the same path, so spawns work again.
+            _logger.info("Host runtime %s runs again; the host stays up.", sys.executable)
             self._runtime_gone = False
+            return
+        ws = self._ws
+        # A launch may have arrived, or the tunnel dropped, during the probe.
+        if ws is None or not self._runtime_gone_retirement_due():
             return
         _logger.warning("Host runtime is gone and no runner is live; exiting for a restart.")
         self._retired_for_runtime_gone = True
         self._lifecycle_lost.set()
         await ws.close()
+
+    def _runtime_gone_retirement_due(self) -> bool:
+        """Whether a deleted-runtime host has nothing left to serve or report."""
+        return bool(
+            self._runtime_gone
+            and not self._runners
+            and not self._launches_in_flight
+            and not self._lifecycle_lost.is_set()
+            and self._ws is not None
+            and not self._unreported_exits
+        )
 
     @property
     def runtime_gone(self) -> bool:
@@ -5519,6 +5528,31 @@ def _serve_host_until_exit(
         raise SystemExit(HOST_FATAL_EXIT_CODE) from exc
     _exit_if_runtime_gone(host)
     return host.lifecycle_lost
+
+
+async def _interpreter_runs(executable: str) -> bool:
+    """Whether ``executable`` starts and exits cleanly as a Python interpreter.
+
+    :param executable: Interpreter path, e.g. ``sys.executable``.
+    :returns: True only if ``<executable> -c pass`` exits 0 within the probe timeout.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            executable,
+            "-c",
+            "pass",
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return False
+    try:
+        return await asyncio.wait_for(proc.wait(), timeout=_RUNTIME_PROBE_TIMEOUT_S) == 0
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return False
 
 
 def _exit_if_runtime_gone(host: HostProcess) -> None:
