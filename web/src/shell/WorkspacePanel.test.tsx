@@ -344,12 +344,14 @@ describe("WorkspacePanel surface presentation", () => {
       button: 0,
       ctrlKey: false,
     });
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Content search" }));
-    expect(enabled.onRightRailTabChange).toHaveBeenCalledTimes(2);
+    const searchMenuItem = await screen.findByRole("menuitem", { name: "Content search" });
+    enabled.onRightRailTabChange.mockClear();
+    fireEvent.click(searchMenuItem);
+    expect(enabled.onRightRailTabChange).toHaveBeenCalledWith("content-search");
     const searchTab = screen.getByRole("tab", { name: "Content search" });
     expect(searchTab).toHaveAttribute("aria-keyshortcuts", expect.stringContaining(" 5"));
+    enabled.onRightRailTabChange.mockClear();
     fireEvent.keyDown(searchTab, { key: "5" });
-    expect(enabled.onRightRailTabChange).toHaveBeenCalledTimes(3);
     expect(enabled.onRightRailTabChange).toHaveBeenLastCalledWith("content-search");
   });
 
