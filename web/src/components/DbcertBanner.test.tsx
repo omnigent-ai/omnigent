@@ -1,13 +1,19 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DbcertBanner } from "./DbcertBanner";
 import type * as HostModule from "@/lib/host";
 import { isDatabricksWorkspace } from "@/lib/host";
 import type * as HostDbcertModule from "@/lib/hostDbcert";
-import { readHostDbcertExpiry, startHostDbcertRefresh } from "@/lib/hostDbcert";
+import {
+  HOST_DBCERT_REFRESH_MS,
+  readHostDbcertExpiry,
+  startHostDbcertRefresh,
+} from "@/lib/hostDbcert";
 
 const NOW = Date.UTC(2026, 9, 18, 21);
 const EXPIRED = Date.UTC(2026, 9, 18, 20, 8, 15);
+const EXPIRED_LATER = Date.UTC(2026, 9, 18, 20, 30);
 const RENEWED = Date.UTC(2026, 9, 19, 17);
 interface TestHost {
   host_id: string;
@@ -43,8 +49,13 @@ async function settle(ms = 0) {
   await act(() => vi.advanceTimersByTimeAsync(ms));
 }
 
+// StrictMode, as main.tsx renders the app: its simulated remount must not drop reads.
 function renderBanner() {
-  return render(<DbcertBanner conversationId="conv" hostId="arca" />);
+  return render(
+    <StrictMode>
+      <DbcertBanner conversationId="conv" hostId="arca" />
+    </StrictMode>,
+  );
 }
 
 beforeEach(() => {
@@ -72,11 +83,12 @@ describe("DbcertBanner", () => {
   });
 
   it("stays hidden while the cert is valid or the host has none", async () => {
-    vi.mocked(readHostDbcertExpiry).mockResolvedValueOnce(RENEWED).mockResolvedValueOnce(null);
+    vi.mocked(readHostDbcertExpiry).mockResolvedValue(RENEWED);
     renderBanner();
     await settle();
     expect(screen.queryByText(/has expired/)).toBeNull();
     cleanup();
+    vi.mocked(readHostDbcertExpiry).mockResolvedValue(null);
     renderBanner();
     await settle();
     expect(screen.queryByText(/has expired/)).toBeNull();
@@ -139,7 +151,7 @@ describe("DbcertBanner", () => {
     renderBanner();
     await settle();
     fireEvent.click(screen.getByRole("button", { name: "Refresh dbcert" }));
-    await settle(300_000);
+    await settle(HOST_DBCERT_REFRESH_MS);
     expect(screen.getByText(/Click dbcert in the Arca Companion menu/)).toBeTruthy();
   });
 
@@ -167,5 +179,23 @@ describe("DbcertBanner", () => {
     expect(screen.queryByText(/has expired/)).toBeNull();
     await settle(60_000);
     expect(screen.queryByText(/has expired/)).toBeNull();
+  });
+
+  it("starts fresh for a later expired cert after a failed refresh and a dismissal", async () => {
+    vi.mocked(startHostDbcertRefresh).mockResolvedValue(false);
+    renderBanner();
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh dbcert" }));
+    await settle();
+    expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    // Renewed elsewhere, then expired again.
+    vi.mocked(readHostDbcertExpiry).mockResolvedValue(RENEWED);
+    await settle(60_000);
+    vi.mocked(readHostDbcertExpiry).mockResolvedValue(EXPIRED_LATER);
+    await settle(5 * 60_000);
+    expect(screen.getByText(/The dbcert on jackson's arca has expired/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Refresh dbcert" })).toBeTruthy();
+    expect(screen.queryByText(/Couldn't refresh it from here/)).toBeNull();
   });
 });

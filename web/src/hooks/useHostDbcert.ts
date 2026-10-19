@@ -50,21 +50,24 @@ export function useHostDbcert(
   } | null>(null);
   const phase = refreshState?.sessionId === sessionId ? refreshState.phase : "idle";
   const [dismissedExpiry, setDismissedExpiry] = useState<number | null>(null);
-  // The session a pending refresh loop belongs to; null once this unmounts.
-  const currentSession = useRef(sessionId);
-  currentSession.current = sessionId;
-  useEffect(
-    () => () => {
+  // The session pending reads and refresh loops belong to; null once the view
+  // moves on. Set in an effect, not during render, so StrictMode's simulated
+  // remount restores it.
+  const currentSession = useRef<string | null>(null);
+  useEffect(() => {
+    currentSession.current = sessionId;
+    return () => {
       currentSession.current = null;
-    },
-    [],
-  );
+    };
+  }, [sessionId]);
 
   const check = useCallback(async () => {
     if (!sessionId) return undefined;
     const next = await readHostDbcertExpiry(sessionId);
     if (next !== undefined && currentSession.current === sessionId) {
       setCert(next === null ? null : { sessionId, expiresAt: next });
+      // A valid cert ends an earlier failed refresh, so a later expiry starts fresh.
+      if (next !== null && next > Date.now()) setRefreshState(null);
     }
     return next;
   }, [sessionId]);
