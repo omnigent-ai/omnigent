@@ -88,7 +88,7 @@ jobs:
       dependency: ${{ steps.scope.outputs.dependency }}
     steps:
       - name: Check out CI scripts
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # Triggering ref (not main): the script must exist on it, and it
           # only shards tests -- no secrets exposure, so the PR's copy is fine.
@@ -133,7 +133,7 @@ jobs:
       - name: Checkout
         # The default is the PR merge commit for pull_request and the workflow
         # ref for schedule/dispatch, keeping checked-out code in its cache scope.
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       # Steps below are shared verbatim with server-compat.yml's backcompat-e2e
       # job via the composite action, so the two never drift. server_version
