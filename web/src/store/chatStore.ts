@@ -135,7 +135,12 @@ import { fetchHarnessCatalog, type HarnessCatalog } from "@/lib/agentLabels";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
 import { codexPlanModeFromSession, isCodexNativeSession } from "@/lib/codexPlanMode";
-import { getCurrentAuthorId, resolveSessionHost, subscribeIdentity } from "@/lib/identity";
+import {
+  getCurrentAuthorId,
+  getCurrentUserId,
+  resolveSessionHost,
+  subscribeIdentity,
+} from "@/lib/identity";
 import { getOmnigentHostConfig, isDatabricksWorkspace } from "@/lib/host";
 // Routing-free emit primitive (not "@/lib/analytics", which pulls in useLocation
 // and would form a routing↔store import cycle).
@@ -2605,11 +2610,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       postedSessionId = sessionId;
       // Until this send settles, the server may hold the message without persisting
       // it, so keep its text where a reload can find it (see `unsentSendToRestore`).
-      if (!compacts && sentOnScreen && text.trim()) {
+      // Only once identity names the sender: unlike `getCurrentAuthorId`, this id
+      // tells the single-user `local` viewer apart from one not yet resolved.
+      const senderId = getCurrentUserId();
+      if (!compacts && sentOnScreen && senderId !== null && text.trim()) {
         rememberUnsentSend(sessionId, {
           stableId,
           text,
-          authorId: getCurrentAuthorId(),
+          authorId: senderId,
           ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
         });
       }
@@ -7003,15 +7011,15 @@ function unsentSendToRestore(
   const unsent = peekUnsentSend(conversationId);
   // A send still open in this tab settles on its own.
   if (unsent === null || inFlightSends.has(unsent.stableId)) return null;
-  const authorId = getCurrentAuthorId();
-  // The sender can't be checked before identity resolves; try again once it does.
-  if (authorId === null && unsent.authorId !== null) {
+  const viewerId = getCurrentUserId();
+  // The viewer can't be checked before identity resolves; try again once it does.
+  if (viewerId === null) {
     restoreUnsentSendOnceIdentified(conversationId, items);
     return null;
   }
   forgetUnsentSend(conversationId, unsent.stableId);
   // Another account has signed in to this tab since.
-  if (unsent.authorId !== authorId) return null;
+  if (unsent.authorId !== viewerId) return null;
   if (items.some((item) => item.id === unsent.stableId)) return null;
   return {
     conversationId,
@@ -7036,7 +7044,7 @@ function restoreUnsentSendOnceIdentified(
   items: readonly { id: string }[],
 ): void {
   const unsubscribe = subscribeIdentity(() => {
-    if (getCurrentAuthorId() === null) return;
+    if (getCurrentUserId() === null) return;
     unsubscribe();
     // An evicted session keeps the record for its next bind.
     if (isConversationDisposed(conversationId)) return;

@@ -43,7 +43,7 @@ import {
   promoteSessionDraft,
   setSessionDraft,
 } from "@/lib/sessionDrafts";
-import { getCurrentAuthorId, subscribeIdentity } from "@/lib/identity";
+import { getCurrentAuthorId, getCurrentUserId, subscribeIdentity } from "@/lib/identity";
 import { PRESENCE_IDLE_AFTER_MS } from "@/lib/presenceIdle";
 import { getSessionHost, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import {
@@ -116,6 +116,7 @@ vi.mock("@/lib/identity", async (importOriginal) => {
   return {
     ...actual,
     getCurrentAuthorId: vi.fn<() => string | null>(() => null),
+    getCurrentUserId: vi.fn<() => string | null>(() => null),
     subscribeIdentity: vi.fn(actual.subscribeIdentity),
   };
 });
@@ -19509,8 +19510,14 @@ describe("chatStore — one error card per failed turn", () => {
 });
 
 describe("a send cut off by a reload", () => {
-  beforeEach(clearUnsentSends);
-  afterEach(clearUnsentSends);
+  beforeEach(() => {
+    clearUnsentSends();
+    vi.mocked(getCurrentUserId).mockReturnValue("user_a");
+  });
+  afterEach(() => {
+    clearUnsentSends();
+    vi.mocked(getCurrentUserId).mockReturnValue(null);
+  });
 
   it("records the message while its POST is open and forgets it once answered", async () => {
     useChatStore.setState({
@@ -19532,7 +19539,7 @@ describe("a send cut off by a reload", () => {
     expect(peekUnsentSend("conv_existing")).toEqual({
       stableId: expect.any(String),
       text: "rerun the failing test",
-      authorId: null,
+      authorId: "user_a",
     });
     answer!();
     await sending;
@@ -19559,6 +19566,30 @@ describe("a send cut off by a reload", () => {
     });
     await vi.waitFor(() => expect(answer).toBeDefined());
     expect(peekUnsentSend("conv_child")).toBeNull();
+    answer!();
+    await sending;
+  });
+
+  it("doesn't keep a send made before identity resolves", async () => {
+    // Its sender could never be checked against the next page's viewer.
+    vi.mocked(getCurrentUserId).mockReturnValue(null);
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    let answer: (() => void) | undefined;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
+        return new Promise<Response>((resolve) => {
+          answer = () => resolve(mockResponse({ queued: true, item_id: "ci_mock" }));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const sending = useChatStore.getState().send("rerun the failing test", "agent_xyz");
+    await vi.waitFor(() => expect(answer).toBeDefined());
+    expect(peekUnsentSend("conv_existing")).toBeNull();
     answer!();
     await sending;
   });
@@ -19618,7 +19649,7 @@ describe("a send cut off by a reload", () => {
     rememberUnsentSend("conv_reload", {
       stableId: "stable_reload",
       text: "rerun the failing test",
-      authorId: null,
+      authorId: "user_a",
     });
 
     await useChatStore.getState().switchTo("conv_reload");
@@ -19640,7 +19671,7 @@ describe("a send cut off by a reload", () => {
     rememberUnsentSend("conv_reload", {
       stableId: "stable_reload",
       text: "rerun the failing test",
-      authorId: null,
+      authorId: "user_a",
     });
 
     await useChatStore.getState().switchTo("conv_reload");
@@ -19661,7 +19692,7 @@ describe("a send cut off by a reload", () => {
     rememberUnsentSend("conv_reload", {
       stableId: "stable_reload",
       text: "rerun the failing test",
-      authorId: null,
+      authorId: "user_a",
     });
 
     await useChatStore.getState().switchTo("conv_reload");
@@ -19679,7 +19710,7 @@ describe("a send cut off by a reload", () => {
       text: "rerun the failing test",
       authorId: "user_a",
     });
-    vi.mocked(getCurrentAuthorId).mockReturnValue("user_b");
+    vi.mocked(getCurrentUserId).mockReturnValue("user_b");
 
     await useChatStore.getState().switchTo("conv_reload");
 
@@ -19688,6 +19719,7 @@ describe("a send cut off by a reload", () => {
   });
 
   it("restores a send once identity resolves", async () => {
+    vi.mocked(getCurrentUserId).mockReturnValue(null);
     seedSession("conv_reload", []);
     rememberUnsentSend("conv_reload", {
       stableId: "stable_reload",
@@ -19709,7 +19741,7 @@ describe("a send cut off by a reload", () => {
     identityChanged!();
     expect(useChatStore.getState().failedSendDraft).toBeNull();
 
-    vi.mocked(getCurrentAuthorId).mockReturnValue("user_a");
+    vi.mocked(getCurrentUserId).mockReturnValue("user_a");
     identityChanged!();
 
     expect(useChatStore.getState().failedSendDraft).toMatchObject({
@@ -19717,6 +19749,28 @@ describe("a send cut off by a reload", () => {
       text: "rerun the failing test",
       stableId: "stable_reload",
     });
+    expect(peekUnsentSend("conv_reload")).toBeNull();
+  });
+
+  it("drops a waiting send once identity names another account", async () => {
+    vi.mocked(getCurrentUserId).mockReturnValue(null);
+    seedSession("conv_reload", []);
+    rememberUnsentSend("conv_reload", {
+      stableId: "stable_reload",
+      text: "rerun the failing test",
+      authorId: "user_a",
+    });
+    let identityChanged: (() => void) | undefined;
+    vi.mocked(subscribeIdentity).mockImplementationOnce((listener) => {
+      identityChanged = listener;
+      return () => {};
+    });
+
+    await useChatStore.getState().switchTo("conv_reload");
+    vi.mocked(getCurrentUserId).mockReturnValue("user_b");
+    identityChanged!();
+
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
     expect(peekUnsentSend("conv_reload")).toBeNull();
   });
 });

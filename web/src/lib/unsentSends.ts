@@ -7,8 +7,8 @@ export interface UnsentSend {
   stableId: string;
   text: string;
   replyDraft?: StoredReplyDraft;
-  /** The sender (`getCurrentAuthorId`), so another account in this tab can't recover it. */
-  authorId: string | null;
+  /** The sender (`getCurrentUserId`), so another account in this tab can't recover it. */
+  authorId: string;
 }
 
 const UNSENT_SENDS_KEY = "omnigent.unsentSends";
@@ -36,12 +36,9 @@ function read(): Record<string, UnsentSend> {
       const draft = readComposerDraft(entry);
       if (!draft?.text || typeof entry !== "object" || entry === null) continue;
       const { stableId, authorId } = entry as { stableId?: unknown; authorId?: unknown };
-      if (typeof stableId !== "string") continue;
-      sends[conversationId] = {
-        ...draft,
-        stableId,
-        authorId: typeof authorId === "string" ? authorId : null,
-      };
+      // A record with no sender can't be matched to the viewer.
+      if (typeof stableId !== "string" || typeof authorId !== "string") continue;
+      sends[conversationId] = { ...draft, stableId, authorId };
     }
     return sends;
   } catch {
