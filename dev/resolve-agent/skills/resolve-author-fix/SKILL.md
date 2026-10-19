@@ -198,6 +198,12 @@ fallback if rendering is blocked; keep any usable footage.
 - Record the user action and the corrected product behavior. Tests may drive
   and verify the interaction, but the clip must show the product, not pytest,
   assertions, debug logs, or test source.
+- Before captioning, inspect the raw clip's last frame. A teardown state — the
+  terminal pane greyed out behind "Bridge closed: terminal session ended", a
+  deleted session, a list emptied by cleanup — means the clip outlived the
+  state it claims to prove: fix the stop point (close the recorded page before
+  the test body returns or its cleanup runs) and re-record. Do not caption
+  around it or declare such a clip as the after-clip.
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the corrected error message.

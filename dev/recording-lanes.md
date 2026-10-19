@@ -175,10 +175,23 @@ results found" as the fixture deletes the sessions it had just listed. When
 recording is requested (`OMNIGENT_E2E_RECORD_DIR`, `--video`, or a
 `record_video_dir` in `browser_context_args`), the e2e_ui conftest therefore
 closes the pytest-playwright context as soon as the test body finishes, before
-any fixture teardown runs. A test that opens its
-own pages or contexts must close them itself before its body returns, for the
-same reason, and a fixture that touches `page` after `yield` must skip that
-work when `page.is_closed()`. Recording configured with a
+any fixture teardown runs. With `OMNIGENT_E2E_RECORD_DIR` set, every page or
+context opened through `browser.new_page()` / `browser.new_context()` (sync or
+async API) while the test runs — by its body or its function-scoped fixtures —
+is closed at the same point, so a driver that forgets to close its own page
+cannot film teardown either; close it yourself when the clip should end
+earlier. A context that a session- or module-scoped fixture opened before the
+test is not registered and stays open, and a page opened with
+`record_video_dir=None` is not recording and is left to its owner. An async-API
+context is closed on
+the event loop that opened it, which must still be open and not running when
+the test body ends (a pytest-asyncio test loop is); a context whose loop has
+already closed or is still running is left to its owner, with a pytest
+warning. A fixture that touches a page after
+`yield` must skip that work when `page.is_closed()`. Cleanup inside the test
+body still films: a driver that deletes its session or stops its runner in its
+own `finally:` while the recorded page is open ends on "Bridge closed" — close
+the page first or move that cleanup into a fixture. Recording configured with a
 `@pytest.mark.browser_context_args(record_video_dir=...)` marker follows the
 same stop point.
 
@@ -341,7 +354,11 @@ demonstrated state its caption describes — the failure for a `before` clip, th
 healthy state for a `fixed`/`after` clip; a final frame that shows teardown — the
 pane greyed out behind "Bridge closed: terminal session ended", a deleted
 session, a result list emptied by fixture cleanup — means the recording outlived
-the test body. Fix the stop point and re-record; do not caption around it.
+the test body. Fix the stop point and re-record; do not caption around it. Look
+at the extracted frame itself (for example
+`ffmpeg -sseof -1 -i recordings/<slug>/raw/<kind>-<facet>.webm -update 1 -frames:v 1 last.png`);
+a brightness or colour statistic cannot tell a live pane from the greyed-out
+overlay.
 
 Base screen claims on inspected frames or visible-state assertions from that
 recording. Backend logs and transcript storage can differ from what the UI has

@@ -240,6 +240,58 @@ def test_journey(context):
         assert "original journey assertion" in output
 
 
+def test_an_unavailable_async_loop_or_failing_close_is_reported_without_failing_the_test(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _configure(pytester, monkeypatch, record_dir=tmp_path / "raw")
+    pytester.makepyfile(
+        _FAKE_CONTEXT
+        + """
+import asyncio
+
+from tests.e2e_ui.conftest import _close_recorded_context
+
+
+class AsyncContext(FakeContext):
+    async def close(self):
+        self.closed = True
+
+
+class BrokenAsyncContext(FakeContext):
+    async def close(self):
+        raise RuntimeError("driver gone")
+
+
+@pytest.mark.parametrize("state", ["closed", "running", "raises"])
+def test_journey(request, state):
+    context = BrokenAsyncContext() if state == "raises" else AsyncContext()
+    loop = asyncio.new_event_loop()
+    try:
+        if state == "closed":
+            loop.close()
+            _close_recorded_context(request.node, context, loop)
+        elif state == "running":
+
+            async def probe():
+                _close_recorded_context(request.node, context, asyncio.get_running_loop())
+
+            loop.run_until_complete(probe())
+        else:
+            _close_recorded_context(request.node, context, loop)
+    finally:
+        loop.close()
+    assert not context.closed
+"""
+    )
+
+    result = pytester.runpytest_subprocess("-q", "-W", "error")
+    result.assert_outcomes(passed=3)
+    output = result.stdout.str() + result.stderr.str()
+    assert "Could not finalize recording for" in output
+    assert "its event loop is no longer available" in output
+    assert "driver gone" in output
+
+
 def test_record_dir_films_the_page_fixture(
     pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
