@@ -151,7 +151,10 @@ def test_a_settings_command_behind_such_a_dialog_is_refused_without_a_key(
 ) -> None:
     sent = _show(monkeypatch, _SETTINGS_ERROR)
 
-    with pytest.raises(ClaudeTerminalDialog, match="occupied by an overlay"):
+    # The command waits for the prompt like a message, so the readiness gate names the dialog.
+    with pytest.raises(
+        ClaudeTerminalDialog, match=r"waiting for an answer in its terminal \(Settings Error\)"
+    ):
         inject_slash_command(bridge_dir, command="/effort high")
 
     assert sent == []
