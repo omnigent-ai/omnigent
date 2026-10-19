@@ -229,6 +229,7 @@ from omnigent.server.routes._sessions.helpers import (
     require_filesystem_attachment_runtime,
 )
 from omnigent.server.routes._sessions.orchestration import (
+    HostLaunchRefusedError,
     _best_effort_stop,
     _cancel_runner_relays,
     _child_session_summaries_from_conversations,
@@ -241,6 +242,8 @@ from omnigent.server.routes._sessions.orchestration import (
     _evaluate_input_policy,
     _evaluate_tool_call_policy,
     _heal_subagent_runner_binding_via_parent,
+    _host_launch_refusal_detail,
+    _host_launch_refusal_message,
     _is_native_terminal_session,
     _mark_dispatch_in_flight,
     _maybe_relaunch_managed_sandbox,
@@ -544,11 +547,44 @@ async def _session_host_offline(conv: Conversation, app_state: Any) -> bool:
     return host is not None and host.sandbox_provider is None and not host_is_live(host)
 
 
-def _host_offline_message() -> str:
-    """Return the failure text for a send that found its session's host offline."""
+def _host_offline_message(next_step: str = "send the message again") -> str:
+    """Return the failure text for a send or retry that found its session's host offline."""
     return (
         "The host for this session is offline. "
-        f"Start it with `{cli_invocation()} host` (or reconnect it) and send the message again."
+        f"Start it with `{cli_invocation()} host` (or reconnect it) and {next_step}."
+    )
+
+
+async def _retry_unavailable_message(
+    conv: Conversation, app_state: Any, conversation_store: ConversationStore
+) -> str:
+    """
+    Explain why Retry found no runner to recover, with the next step to take.
+
+    :raises OmnigentError: ``WRONG_REPLICA`` when the host or runner reconnected
+        to a sibling replica during the recovery wait.
+    """
+    await _raise_if_runner_on_another_replica(conv, app_state, conversation_store)
+    await _raise_if_runner_re_tunnelled_to_another_replica(
+        conv.id, conv.runner_id, conversation_store
+    )
+    if conv.host_id is None:
+        return (
+            "This session has no host to relaunch its runner on. "
+            "Reconnect the client that started it, then retry."
+        )
+    if await _session_host_offline(conv, app_state):
+        return _host_offline_message(next_step="retry")
+    host_registry = getattr(app_state, "host_registry", None)
+    if host_registry is not None and host_registry.get(conv.host_id) is None:
+        # A host row that is missing or managed: nothing here can start it.
+        return (
+            "The host for this session is not connected to this server. "
+            "Retry in a moment; if it keeps failing, reconnect the host."
+        )
+    return (
+        "The host was asked to start a runner for this session, but none "
+        "connected to the server. Check the runner log on the host, then retry."
     )
 
 
@@ -608,7 +644,7 @@ async def _recover_retry_session(
             )
         if runner_client is None:
             raise OmnigentError(
-                "No runner is available to recover this session.",
+                await _retry_unavailable_message(conv, request.app.state, conversation_store),
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
         runner_relaunched = conv.runner_id != original_runner_id
@@ -1179,7 +1215,7 @@ def register_events_routes(
                 code=ErrorCode.CONFLICT,
             )
         if body.type == _RETRY_SESSION_TYPE:
-            return await _retry_session_single_flight(
+            recovery = _retry_session_single_flight(
                 request=cast("Request", request),
                 session_id=session_id,
                 conversation=conv,
@@ -1188,6 +1224,11 @@ def register_events_routes(
                 user_id=user_id,
                 permission_store=permission_store,
             )
+            try:
+                return await recovery
+            except HostLaunchRefusedError as exc:
+                # The recovery is shared; only the host owner sees the host's text.
+                raise exc.for_viewer(user_id) from exc
         # ── Policy evaluation (path-agnostic) ────────────────
         # Evaluate policies BEFORE persistence/runner forwarding so
         # enforcement fires on both paths. On DENY, persist the
@@ -2794,6 +2835,10 @@ def register_events_routes(
                     raise OmnigentError(_host_offline_hold_message(), code=ErrorCode.HOST_OFFLINE)
                 if exit_cause:
                     failure_message = exit_cause
+                elif relaunched_launch_refused:
+                    failure_message = _host_launch_refusal_message(
+                        relaunch_refusal_reason, visible=relaunch_refusal_visible
+                    )
                 elif host_offline:
                     failure_message = _host_offline_message()
                     _logger.warning(
@@ -2855,19 +2900,12 @@ def register_events_routes(
                     log_detail = "the host reported the launch failed" + (
                         f": {relaunch_refusal_reason}" if relaunch_refusal_reason else ""
                     )
-                    if relaunch_refusal_reason and relaunch_refusal_visible:
-                        launch_detail = (
-                            f"the host reported the launch failed: {relaunch_refusal_reason}"
-                        )
-                    else:
-                        launch_detail = (
-                            "the host reported the launch failed. The reason "
-                            "is in the daemon log on the host, visible to the "
-                            "host owner."
-                        )
+                    launch_detail = _host_launch_refusal_detail(
+                        relaunch_refusal_reason, visible=relaunch_refusal_visible
+                    )
                     launch_message = (
                         f"The host could not start runner {relaunched_runner_id} "
-                        f"for this session — {launch_detail}"
+                        f"for this session — {launch_detail}."
                     )
                 elif exit_report:
                     event_name = "runner_never_connected"
