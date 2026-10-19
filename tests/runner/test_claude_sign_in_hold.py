@@ -7,6 +7,7 @@ import contextlib
 import copy
 import json
 import logging
+import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
@@ -59,6 +60,16 @@ _REFUSED = [_sse({"type": "response.created", "response": {"id": "resp_1"}}), _s
 _DELIVERED = [
     _sse({"type": "response.created", "response": {"id": "resp_2"}}),
     _sse({"type": "response.completed", "response": {"id": "resp_2"}}),
+]
+_FAILED_OTHERWISE = [
+    _sse({"type": "response.created", "response": {"id": "resp_3"}}),
+    _sse(
+        {
+            "type": "response.failed",
+            "response": {"status": "failed"},
+            "error": {"code": "native_turn_error", "message": "Claude Code stopped responding."},
+        }
+    ),
 ]
 
 
@@ -220,7 +231,9 @@ async def test_sign_in_refusal_holds_the_message_and_sends_it_after_sign_in() ->
             e for e in published if e.get("type") == "session.status" and e["status"] == "failed"
         ]
         assert len(harness.posted_bodies) == 1
-        assert [_sent_text(_message_as_body(m)) for m in app.state.session_message_buffers[sid]]
+        assert [m["content"][0]["text"] for m in app.state.session_message_buffers[sid]] == [
+            "first"
+        ]
         (notice,) = server.notices("databricks_sign_in_pending")
         assert notice["level"] == "info"
         assert notice["remediation"] == _HELD_SIGN_IN_STEP
@@ -249,10 +262,6 @@ async def test_sign_in_refusal_holds_the_message_and_sends_it_after_sign_in() ->
     resent_history = [item for item in harness.posted_bodies[1]["content"] if "content" in item]
     assert [item["content"][0]["text"] for item in resent_history].count("first") == 1
     assert sid not in app.state.sign_in_holds
-
-
-def _message_as_body(message: dict[str, Any]) -> dict[str, Any]:
-    return {"content": [message]}
 
 
 @pytest.mark.asyncio
@@ -370,6 +379,48 @@ def test_sign_in_wait_ends_while_the_server_still_has_the_message() -> None:
     """A refusal that outlasts the wait must still find its queued message on the server."""
     # Leave the resend and its refusal time to reach the server before the entry expires.
     assert runner_app._SIGN_IN_HOLD_MAX_S <= pending_inputs._TTL_S - 60
+
+
+@pytest.mark.asyncio
+async def test_wait_is_shortened_by_the_time_the_server_already_queued_the_message() -> None:
+    """A message whose delivery started late still settles before the server forgets it."""
+    app, _harness, _server = _build_app([_REFUSED])
+    sid = uuid.uuid4().hex
+    async with _runner_client(app) as client:
+        await _create_session(client, sid)
+        await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={**_message("first"), "input_enqueued_at_ms": int((time.time() - 100) * 1000)},
+        )
+        await _until(lambda: sid in app.state.sign_in_holds)
+        remaining = app.state.sign_in_holds[sid].deadline - time.monotonic()
+
+    assert runner_app._SIGN_IN_HOLD_MAX_S - 110 < remaining <= runner_app._SIGN_IN_HOLD_MAX_S - 100
+
+
+@pytest.mark.asyncio
+async def test_message_the_server_queued_longer_than_the_wait_fails_at_once() -> None:
+    """With no time left to wait, the refusal stands while the server can still record it."""
+    app, harness, server = _build_app([_REFUSED])
+    sid = uuid.uuid4().hex
+    queued_at_ms = int((time.time() - runner_app._SIGN_IN_HOLD_MAX_S - 1) * 1000)
+    async with _runner_client(app) as client:
+        await _create_session(client, sid)
+        await client.post(
+            f"/v1/sessions/{sid}/events",
+            json={**_message("first"), "input_enqueued_at_ms": queued_at_ms},
+        )
+        await _until(lambda: len(harness.posted_bodies) == 1 and sid not in app.state.active_turns)
+        await asyncio.sleep(0.05)
+
+    failed = [
+        e
+        for e in _published(app, sid)
+        if e.get("type") == "session.status" and e.get("status") == "failed"
+    ]
+    assert [e["error"]["code"] for e in failed] == ["databricks_sign_in_pending"]
+    assert sid not in app.state.sign_in_holds
+    assert not server.notices("databricks_sign_in_pending")
 
 
 @pytest.mark.asyncio
@@ -561,9 +612,14 @@ async def test_held_message_is_sent_after_a_failed_bridge_lookup(
 
 
 @pytest.mark.asyncio
-async def test_delivered_turn_ends_the_wait_even_with_messages_still_queued() -> None:
-    """Once a message gets through, a later refusal starts a fresh wait with its own notice."""
-    app, harness, server = _build_app([_REFUSED, _DELIVERED, _REFUSED])
+@pytest.mark.parametrize(
+    "resend", [_DELIVERED, _FAILED_OTHERWISE], ids=["delivered", "failed-otherwise"]
+)
+async def test_resend_that_is_not_refused_ends_the_wait_even_with_messages_still_queued(
+    resend: list[str],
+) -> None:
+    """Once the held message ends any other way, a later refusal waits afresh with a notice."""
+    app, harness, server = _build_app([_REFUSED, resend, _REFUSED])
     sid = uuid.uuid4().hex
     async with _runner_client(app) as client:
         await _create_session(client, sid)

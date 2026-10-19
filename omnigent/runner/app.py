@@ -219,8 +219,9 @@ _SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
 # Pending questions outlive prompt delivery; poll outside the turn watchdog.
 _CLAUDE_PENDING_PROMPT_POLL_S = 0.5
 
-# How long a message refused by a launcher sign-in waits for it. Must stay inside the
-# server's pending-input lifetime, so a refusal that outlasts the wait is still recorded and shown.
+# How long a message refused by a launcher sign-in may wait, including the time the server
+# already had it queued. Must stay inside the server's pending-input lifetime, so a refusal
+# that outlasts the wait is still recorded and shown.
 _SIGN_IN_HOLD_MAX_S = 8 * 60.0
 # Refusals one sign-in wait absorbs; a pane that keeps asking after it looked ready fails.
 _SIGN_IN_HOLD_MAX_REPEATS = 3
@@ -231,14 +232,32 @@ class _SignInHold:
     """
     One session's wait for a launcher sign-in that refused its queued message.
 
-    :param started: ``time.monotonic()`` of the first refusal in this wait.
+    :param deadline: ``time.monotonic()`` at which the wait gives up.
     :param holds: Refusals absorbed so far.
     :param waiting: Whether the queue is paused until the sign-in completes.
     """
 
-    started: float
+    deadline: float
     holds: int = 0
     waiting: bool = False
+
+
+def _sign_in_hold_deadline(body: Mapping[str, Any]) -> float:
+    """
+    Return when a sign-in wait for the refused message *body* gives up.
+
+    The wait gets :data:`_SIGN_IN_HOLD_MAX_S`, less the time the server says the
+    message was already queued, e.g. behind a slow start.
+
+    :param body: The refused message, carrying the server's ``input_enqueued_at_ms``
+        when the server sent one.
+    :returns: A ``time.monotonic()`` deadline, in the past when no time is left.
+    """
+    enqueued_at_ms = input_attributes(body).get("input_enqueued_at_ms")
+    queued_s = 0.0
+    if isinstance(enqueued_at_ms, int):
+        queued_s = max(0.0, time.time() - enqueued_at_ms / 1000)
+    return time.monotonic() + _SIGN_IN_HOLD_MAX_S - queued_s
 
 
 def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> None:
@@ -3912,8 +3931,9 @@ def create_runner_app(
             # Nothing failed: the queued message is sent once the sign-in completes.
             pass
         elif error is not None:
-            if not has_buffered:
-                # Nothing queued waits behind this failure, so a later refusal waits afresh.
+            if not has_buffered or error.get("code") != "databricks_sign_in_pending":
+                # Only a refusal that ended the wait fails the queue behind it too; after
+                # any other end, a later refusal waits afresh.
                 _sign_in_holds.pop(conv_id, None)
             normalized_error = _normalize_turn_error(error)
             if not _suppress_status:
@@ -4374,10 +4394,10 @@ def create_runner_app(
         ):
             return False
         hold = _sign_in_holds.get(conv_id)
-        if hold is not None and (
-            hold.holds >= _SIGN_IN_HOLD_MAX_REPEATS
-            or time.monotonic() - hold.started >= _SIGN_IN_HOLD_MAX_S
-        ):
+        if hold is None:
+            # A message the server queued too long ago fails while it can still be recorded.
+            return time.monotonic() < _sign_in_hold_deadline(_turn_message_bodies[conv_id])
+        if hold.holds >= _SIGN_IN_HOLD_MAX_REPEATS or time.monotonic() >= hold.deadline:
             # The wait ran out, or the pane kept asking after it looked signed in: this
             # refusal stands, and so do those of the messages queued during the wait.
             return False
@@ -4399,7 +4419,9 @@ def create_runner_app(
             # The queue records the message again when it sends it.
             history.pop()
         _session_message_buffers.setdefault(conv_id, []).insert(0, body)
-        hold = _sign_in_holds.setdefault(conv_id, _SignInHold(started=time.monotonic()))
+        hold = _sign_in_holds.get(conv_id)
+        if hold is None:
+            hold = _sign_in_holds[conv_id] = _SignInHold(deadline=_sign_in_hold_deadline(body))
         hold.holds += 1
         hold.waiting = True
         _logger.info(
@@ -4432,13 +4454,13 @@ def create_runner_app(
         hold = _sign_in_holds.get(session_id)
         if hold is None or not hold.waiting:
             return False
-        if time.monotonic() - hold.started < _SIGN_IN_HOLD_MAX_S:
+        if time.monotonic() < hold.deadline:
             return True
         hold.waiting = False
         _logger.warning(
-            "Databricks sign-in for %s did not complete within %.0fs; resending its message",
+            "Databricks sign-in for %s did not complete before its wait ran out; "
+            "resending its message",
             session_id,
-            _SIGN_IN_HOLD_MAX_S,
             extra={"session_id": session_id},
         )
         return False
