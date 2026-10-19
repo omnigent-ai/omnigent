@@ -47,11 +47,10 @@ in, keeping every heading and checkbox row:
   *CUJs not covered (and why)*.
 - **Test Plan:** each covered CUJ with the tests that exercise it, plus the
   impact-assessment checks, as short bullets.
-- **Demo:** the recordings for each covered CUJ, labelled by CUJ ID. Upload them
-  as GitHub attachments when your environment can, otherwise link where they
-  live (the CI artifact bundle). For a CUJ with a blocked recording, give the
-  blocker and the manual test steps instead. When a Linear key is available,
-  also attach the recordings to the ticket (GraphQL `fileUpload` +
+- **Demo:** a `### CUJ-n` heading for each covered CUJ, with its uploaded
+  recordings (see "Upload the demo" below). For a CUJ with a blocked recording,
+  give the blocker and the manual test steps instead. When a Linear key is
+  available, also attach the recordings to the ticket (GraphQL `fileUpload` +
   `attachmentCreate`).
 - Check **Feature**, plus **UI / frontend change** when the UI changes.
 
@@ -59,6 +58,22 @@ Aim for fewer than 800 visible words. If the checkout has
 `.github/scripts/pr-template/validate.py`, run it with
 `PR_BODY="$(cat .omnigent/pr-body.md)"` and fix every error. Then publish with
 `gh pr create --body-file .omnigent/pr-body.md`, or the helper in checked mode.
+
+## Upload the demo
+
+`gh pr create` and `gh pr edit` cannot attach files, so upload the clips in a PR
+comment, then copy their URLs into the description:
+
+1. Write a comment body with a `### CUJ-n` heading per covered CUJ, each
+   followed by `![CUJ-n](<path to the rendered clip>)`.
+2. Post it with `gh pr comment <pr> --body-file <file> --attach <clip> …`, or
+   with the helper's `comment --attach` in checked mode. Each reference becomes
+   a `https://github.com/user-attachments/assets/…` URL that plays inline.
+3. Put those URLs under the matching `### CUJ-n` headings in the Demo section,
+   and update the description with `gh pr edit --body-file` or the helper.
+
+Only these uploaded URLs count as recordings. Local `recordings/` paths and CI
+artifact links do not.
 
 ## Drive the PR (direct publication)
 

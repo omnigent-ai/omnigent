@@ -379,16 +379,37 @@ async def test_auto_create_pi_terminal_surfaces_credential_warning(
 
 
 @pytest.mark.asyncio
-async def test_auto_create_pi_terminal_effort_notice_posts_info_level(
+@pytest.mark.parametrize(
+    ("effort_warning", "model_notice", "expected_code"),
+    [
+        (
+            "effort ignored for gateway-routed model system.ai.placeholder-model-xyz: "
+            "thinking disabled to keep text surfacing",
+            None,
+            "pi_native_effort_ignored",
+        ),
+        (
+            None,
+            "The model override 'other-gw/system.ai.placeholder-model-xyz' names provider "
+            "'other-gw', but this Pi session is served by provider 'gw'; the model "
+            "'system.ai.placeholder-model-xyz' was requested from 'gw' instead.",
+            "pi_native_model_rerouted",
+        ),
+    ],
+)
+async def test_auto_create_pi_terminal_informational_notice_posts_info_level(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    effort_warning: str | None,
+    model_notice: str | None,
+    expected_code: str,
 ) -> None:
-    """An ignored effort setting posts a neutral info-level notice, not an error.
+    """An informational launch notice posts at info level, not as an error.
 
-    When a gateway-routed model disables thinking to keep text surfacing, the
-    effort setting is silently dropped. This is informational (the session still
-    works), so it must arrive as level=info with its own code, not as the
-    destructive pi_credentials_unresolved banner.
+    An effort setting dropped for a gateway-routed model, or a pick qualified by
+    another configured provider that is requested from the serving one, leaves
+    the session working. Each must arrive as level=info with its own code, not
+    as the destructive pi_credentials_unresolved banner that counts as a failure.
     """
     import omnigent.harnesses.pi_native.bridge as pi_native_bridge
     import omnigent.harnesses.pi_native.credentials as pi_native_credentials
@@ -405,6 +426,7 @@ async def test_auto_create_pi_terminal_effort_notice_posts_info_level(
         model="system.ai.placeholder-model-xyz",
         api_key="managed-token",
         auth_header=True,
+        model_notice=model_notice,
     )
     monkeypatch.setattr(
         pi_native_credentials, "resolve_pi_native_provider", lambda **_kwargs: provider
@@ -413,14 +435,7 @@ async def test_auto_create_pi_terminal_effort_notice_posts_info_level(
         pi_native_credentials,
         "pi_native_provider_launch",
         lambda _agent_dir, _provider, _effort=None, **_kwargs: (
-            pi_native_credentials.PiNativeLaunch(
-                env={},
-                args=[],
-                effort_warning=(
-                    "effort ignored for gateway-routed model system.ai.placeholder-model-xyz: "
-                    "thinking disabled to keep text surfacing"
-                ),
-            )
+            pi_native_credentials.PiNativeLaunch(env={}, args=[], effort_warning=effort_warning)
         ),
     )
 
@@ -471,10 +486,9 @@ async def test_auto_create_pi_terminal_effort_notice_posts_info_level(
     assert len(notice_posts) == 1
     data = notice_posts[0]["data"]
     assert data["item_type"] == "error"
-    assert data["item_data"]["code"] == "pi_native_effort_ignored"
+    assert data["item_data"]["code"] == expected_code
+    assert data["item_data"]["message"] == (effort_warning or model_notice)
     assert data["item_data"]["level"] == "info"
-    # The credential error code must not appear on a notice-only post.
-    assert data["item_data"]["code"] != "pi_credentials_unresolved"
 
 
 @pytest.mark.asyncio

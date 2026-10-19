@@ -72,6 +72,11 @@ from omnigent.harnesses.claude_native import delivery_diagnostics
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
+from omnigent.harnesses.claude_native.submit_verification import (
+    SubmitBoundary,
+    capture_submit_boundary,
+    has_matching_hook_refusal,
+)
 from omnigent.harnesses.diagnostics import (
     detect_sign_in_prompt,
     sign_in_next_step,
@@ -411,6 +416,14 @@ _OVERLAY_SURFACE = "an overlay"
 # e.g. a launch wrapper's output before Claude Code has drawn its input box —
 # and an Escape cannot clear it.
 _ESCAPE_DISMISS_HINT = re.compile(r"\b(?:\w+/)*Esc(?:/\w+)* to \w", re.IGNORECASE)
+# Headlines of startup dialogs whose "Esc to cancel" quits Claude Code rather
+# than closing the dialog (2.1.299: the settings error exits 1, the folder-trust
+# question exits 0). Only the person may answer them.
+_ESCAPE_QUITS_DIALOG_HEADLINES = (
+    "Settings Error",
+    "Accessing workspace",
+    "Do you trust the files in this folder",
+)
 # Titles of the confirmation dialog Claude Code pops when a switch invalidates
 # the prompt cache — one component, titled for what is being switched. It only
 # appears on a session with history, and it took ~1.9s to render on a warm
@@ -634,6 +647,10 @@ class ClaudeUserPromptPending(RuntimeError):
 
 class ClaudeMessageNotAccepted(RuntimeError):
     """The submitted draft remained in Claude's input box until the deadline."""
+
+
+class ClaudeSubmitBlockedUnconfirmed(RuntimeError):
+    """A fresh matching native refusal stops retries without proving web ownership."""
 
 
 @contextlib.contextmanager
@@ -4385,6 +4402,13 @@ def _paste_and_submit(
             "Claude is waiting for an explicit answer; message not sent."
         )
     delivery_diagnostics.set_stage("submitting")
+    transcript_path = read_transcript_path(bridge_dir)
+    native_session_id = read_claude_session_id(bridge_dir)
+    submit_boundary = (
+        capture_submit_boundary(transcript_path, native_session_id)
+        if transcript_path is not None and native_session_id is not None
+        else None
+    )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     delivery_diagnostics.record_details(submit_sent=True)
     if not draft_seen:
@@ -4406,6 +4430,8 @@ def _paste_and_submit(
             needle=needle,
             what="submitted message",
             bridge_dir=bridge_dir,
+            submit_boundary=submit_boundary,
+            submitted_text=text,
         )
     except ClaudeUserPromptPending as exc:
         # The Enter already went out, so the prompt may belong to this message's own turn.
@@ -4428,6 +4454,8 @@ def _verify_submit_accepted(
     needle: str,
     what: str,
     bridge_dir: Path | None = None,
+    submit_boundary: SubmitBoundary | None = None,
+    submitted_text: str | None = None,
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
@@ -4447,8 +4475,12 @@ def _verify_submit_accepted(
     :param needle: Draft marker from :func:`_submit_needle`.
     :param what: Label for log lines, e.g. ``"submitted message"``.
     :param bridge_dir: Bridge whose pending questions protect submit retries.
+    :param submit_boundary: Native transcript boundary captured before Enter.
+    :param submitted_text: Full submitted text; a marker alone cannot identify a refusal.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
+    :raises ClaudeSubmitBlockedUnconfirmed: A fresh matching refusal appeared;
+        ownership of the web input remains unconfirmed.
     """
     start = time.monotonic()
     last_enter = start
@@ -4461,6 +4493,26 @@ def _verify_submit_accepted(
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
         pane = _capture_pane(socket_path, tmux_target)
         polls += 1
+        if (
+            bridge_dir is not None
+            and submit_boundary is not None
+            and submitted_text is not None
+            and _fresh_matching_hook_block(bridge_dir, submit_boundary, submitted_text)
+        ):
+            delivery_diagnostics.record_verification(
+                draft_still_present=_draft_in_input_box(pane, needle),
+                pane=pane,
+                needle=needle,
+                prompt_glyph=_CLAUDE_PROMPT_GLYPH,
+                start=start,
+                retries=retries,
+                polls=polls,
+            )
+            delivery_diagnostics.record_details(verification="hook_block_unowned")
+            raise ClaudeSubmitBlockedUnconfirmed(
+                "A hook blocked a matching prompt in Claude's terminal. Web message delivery "
+                "could not be confirmed; inspect the terminal before retrying."
+            )
         if not _draft_in_input_box(pane, needle):
             delivery_diagnostics.record_verification(
                 draft_still_present=False,
@@ -4505,6 +4557,23 @@ def _verify_submit_accepted(
         polls=polls,
     )
     return False
+
+
+def _fresh_matching_hook_block(
+    bridge_dir: Path, boundary: SubmitBoundary, submitted_text: str
+) -> bool:
+    """A matching refusal prevents retries; it never establishes input ownership."""
+    if read_claude_session_id(bridge_dir) != boundary.native_session_id:
+        return False
+    path = read_transcript_path(bridge_dir)
+    try:
+        if path is None or path.resolve() != boundary.path:
+            return False
+    except (OSError, ValueError, RuntimeError):
+        return False
+    return has_matching_hook_refusal(
+        boundary, submitted_text, normalize_prompt=_unwrap_pasted_content_markers
+    )
 
 
 def _count_unknown_command_rejections(pane: str, needle: str) -> int:
@@ -5769,7 +5838,9 @@ def _restore_occupied_input(
     the web-UI message wins the pane.
 
     Questions and permission prompts are protected by their hook wait markers
-    and visible decision controls; they require an explicit answer.
+    and visible decision controls; they require an explicit answer. So are the
+    startup dialogs whose Escape quits Claude Code instead of closing them
+    (:func:`_escape_quits_claude`): they are left for the person to answer.
 
     Escape is only sent while the surface is verifiably on screen —
     never blind, because on the bare composer Escape interrupts an
@@ -5825,8 +5896,10 @@ def _restore_occupied_input(
             )
             return surface
         # Nothing an Escape can clear: launcher output before the input box
-        # mounts, or a dialog that offers no dismissal.
-        unclearable = surface == _OVERLAY_SURFACE and not _ESCAPE_DISMISS_HINT.search(pane)
+        # mounts, a dialog that offers no dismissal, or one Escape would quit.
+        unclearable = surface == _OVERLAY_SURFACE and (
+            not _ESCAPE_DISMISS_HINT.search(pane) or _escape_quits_claude(pane)
+        )
         if not confirmed:
             # One sighting is not enough to spend an Escape on: on a bare
             # composer Escape interrupts the running turn, and a single frame
@@ -5845,6 +5918,18 @@ def _restore_occupied_input(
             last_escape = now
         unclearable_seen = unclearable
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+
+
+def _escape_quits_claude(pane: str) -> bool:
+    """
+    Return whether the dialog on screen quits Claude Code on Escape.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` for a startup dialog named in
+        :data:`_ESCAPE_QUITS_DIALOG_HEADLINES`.
+    """
+    headline = _terminal_dialog_headline(pane)
+    return headline is not None and headline.startswith(_ESCAPE_QUITS_DIALOG_HEADLINES)
 
 
 def _occupying_surface(pane: str) -> str | None:

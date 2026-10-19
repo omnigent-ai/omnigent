@@ -2616,6 +2616,129 @@ def test_reattach_reauths_again_after_a_held_poll_sever(monkeypatch: pytest.Monk
     assert seen_auth == ["Bearer stale", "Bearer fresh1", "Bearer fresh1", "Bearer fresh2"]
 
 
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("parked", [True, False], ids=["parked", "never-parked"])
+def test_reattach_auth_rejection_without_renewal(
+    monkeypatch: pytest.MonkeyPatch, status: int, parked: bool
+) -> None:
+    """
+    A parked prompt outlives a login that can't be renewed yet; a new one fails fast.
+
+    After a held poll the server has accepted this hook, so a rejection it
+    can't re-mint past is a lapse: retry until a credential is available.
+    Before any held poll the same rejection is final.
+    """
+    floor = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S
+    clock = {"t": 0.0}
+    monkeypatch.setattr(claude_native_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(claude_native_hook.time, "sleep", lambda _s: None)
+    script = [("severed", floor + 290.0)] if parked else []
+    script += [("rejected", 0.0)] * 3 + [("ok", 0.0)]
+    seen_auth: list[str] = []
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del timeout
+            self._headers = headers
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            seen_auth.append(self._headers.get("Authorization", ""))
+            kind, held_s = script[len(seen_auth) - 1]
+            clock["t"] += held_s
+            req = httpx.Request("POST", url)
+            if kind == "severed":
+                raise httpx.RemoteProtocolError("gateway severed the poll", request=req)
+            if kind == "rejected":
+                return httpx.Response(status, request=req)
+            return httpx.Response(200, json={"ok": True}, request=req)
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+    failed_mints = {"left": 2}
+
+    def _reauth() -> dict[str, str] | None:
+        """
+        Fail to mint until the user has signed in again.
+
+        :returns: Fresh headers once signed in, else ``None``.
+        """
+        failed_mints["left"] -= 1
+        return None if failed_mints["left"] >= 0 else {"Authorization": "Bearer fresh"}
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={"Authorization": "Bearer stale"},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+        reauth=_reauth,
+    )
+
+    if parked:
+        assert resp is not None and resp.status_code == 200
+        assert seen_auth == ["Bearer stale"] * 4 + ["Bearer fresh"], seen_auth
+    else:
+        assert resp is None
+        assert seen_auth == ["Bearer stale"], "a rejection before any held poll must not retry"
+
+
+def test_reattach_auth_lapse_retry_stops_at_deadline(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A parked prompt whose login is never renewed backs off, capped, until the deadline."""
+    floor = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S
+    clock = {"t": 0.0}
+    sleeps: list[float] = []
+
+    def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["t"] += seconds
+
+    monkeypatch.setattr(claude_native_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(claude_native_hook.time, "sleep", _sleep)
+    attempts = {"n": 0}
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            attempts["n"] += 1
+            req = httpx.Request("POST", url)
+            if attempts["n"] == 1:
+                clock["t"] += floor + 290.0
+                raise httpx.RemoteProtocolError("gateway severed the poll", request=req)
+            return httpx.Response(401, request=req)
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={"Authorization": "Bearer stale"},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+        reauth=lambda: None,
+    )
+
+    assert resp is None
+    assert clock["t"] >= claude_native_hook._PERMISSION_TIMEOUT_S
+    assert sleeps[:6] == [1.0, 2.0, 4.0, 8.0, 16.0, 30.0], sleeps[:6]
+    assert max(sleeps) == claude_native_hook._PERMISSION_RETRY_MAX_BACKOFF_S
+    assert "retry budget exhausted" in capsys.readouterr().err
+
+
 def test_reattach_fast_flapping_connection_is_hard_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
