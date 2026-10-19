@@ -95,7 +95,7 @@
     "remark-emoji": "^5.0.2",
     "remark-gfm": "^4.0.1",
     "rrule": "^2.8.1",
-    "shadcn": "0.0.0-beta.9d3f70e54",
+    "shadcn": "0.0.0-rc-20261007105214",
     "shiki": "^4.0.2",
     "sonner": "^2.0.8",
     "streamdown": "^2.5.0",
