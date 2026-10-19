@@ -1231,28 +1231,57 @@ def build_native_controls(
         apply: Callable[[_ClaudeControlDeadline], Coroutine[Any, Any, None]],
     ) -> None:
         """Run ``apply`` once the question or permission prompt that refused it is answered."""
-        from omnigent.harnesses.claude_native.bridge import has_pending_user_prompt
+        from omnigent.harnesses.claude_native.bridge import (
+            ClaudeUserPromptPending,
+            has_pending_user_prompt,
+        )
+
+        check_failed = False
+
+        async def _prompt_pending() -> bool:
+            nonlocal check_failed
+            try:
+                return await asyncio.to_thread(has_pending_user_prompt, bridge_dir)
+            except (OSError, RuntimeError):
+                # Can't tell, so keep waiting rather than type into a prompt.
+                if not check_failed:
+                    _logger.warning(
+                        "claude-native %s change for session=%s could not check for a "
+                        "pending prompt; retrying",
+                        kind,
+                        conv_id,
+                        exc_info=True,
+                        extra={"session_id": conv_id},
+                    )
+                check_failed = True
+                return True
 
         async def _wait_then_apply() -> None:
             deadline = time.monotonic() + _CLAUDE_SETTINGS_AFTER_PROMPT_BUDGET_S
             try:
-                while await asyncio.to_thread(has_pending_user_prompt, bridge_dir):
-                    if time.monotonic() >= deadline:
-                        _logger.warning(
-                            "claude-native %s change for session=%s dropped: the pending "
-                            "prompt was not answered within %.0fs",
-                            kind,
-                            conv_id,
-                            _CLAUDE_SETTINGS_AFTER_PROMPT_BUDGET_S,
-                            extra={"session_id": conv_id},
-                        )
+                while True:
+                    while await _prompt_pending():
+                        if time.monotonic() >= deadline:
+                            _logger.warning(
+                                "claude-native %s change for session=%s dropped: the pending "
+                                "prompt was not answered within %.0fs",
+                                kind,
+                                conv_id,
+                                _CLAUDE_SETTINGS_AFTER_PROMPT_BUDGET_S,
+                                extra={"session_id": conv_id},
+                            )
+                            return
+                        await asyncio.sleep(_CLAUDE_SETTINGS_AFTER_PROMPT_POLL_S)
+                    queued.applying = True
+                    await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
+                    # The request's budget is long spent; the switch gets one of its own.
+                    queued.budget = _ClaudeControlDeadline()
+                    try:
+                        await apply(queued.budget)
                         return
-                    await asyncio.sleep(_CLAUDE_SETTINGS_AFTER_PROMPT_POLL_S)
-                queued.applying = True
-                await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
-                # The request's budget is long spent; the switch gets one of its own.
-                queued.budget = _ClaudeControlDeadline()
-                await apply(queued.budget)
+                    except ClaudeUserPromptPending:
+                        # Another prompt opened first; wait for that answer too.
+                        queued.applying, queued.budget = False, None
             except Exception:  # noqa: BLE001 — best-effort; the forwarder's report reconciles
                 _logger.warning(
                     "claude-native %s change for session=%s failed after the prompt was answered",
@@ -1435,7 +1464,6 @@ def build_native_controls(
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-        await _retire_settings_after_prompt(conv_id, "model", deadline)
         await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
         selected_model = model.strip()
         claude_config = await _resolve_session_claude_launch_config(conv_id)
@@ -1484,6 +1512,8 @@ def build_native_controls(
                     ),
                 },
             )
+        # Only a pick the pane can take replaces one queued behind a prompt.
+        await _retire_settings_after_prompt(conv_id, "model", deadline)
         command = f"/model {model_arg}"
         # Expected spellings come from this session's own catalog rows (every
         # row's ``model`` is the harness's own resolution), plus the typed arg

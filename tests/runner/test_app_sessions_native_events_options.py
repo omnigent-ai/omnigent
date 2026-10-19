@@ -2396,6 +2396,100 @@ async def test_events_newer_pick_lands_after_a_queued_switch_that_is_typing(
 
 
 @pytest.mark.asyncio
+async def test_events_settings_change_waits_again_when_a_second_prompt_opens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prompt that opens as the queued switch starts is waited out, then the switch applies."""
+    prompt_open = [True]
+    commands = _patch_settings_behind_prompt(monkeypatch, prompt_open)
+    second_prompt = [True]
+    inject = claude_native_bridge.inject_slash_command
+
+    def _inject_into_a_second_prompt(bridge_dir: Any, *, command: str, **kwargs: Any) -> None:
+        if not prompt_open[0] and second_prompt[0]:
+            # Back-to-back permissions: the next one opens before the switch is typed.
+            second_prompt[0] = False
+            prompt_open[0] = True
+        inject(bridge_dir, command=command, **kwargs)
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _inject_into_a_second_prompt)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    url = f"/v1/sessions/{_PROMPT_SESSION_ID}/events"
+    async with _runner_client(app) as client:
+        await _create_prompt_session(client)
+        resp = await client.post(url, json={"type": "effort_change", "effort": "high"})
+        assert resp.status_code == 204, resp.text
+        prompt_open[0] = False
+        for _ in range(300):
+            if not second_prompt[0]:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+        assert prompt_open[0], "the second prompt should be open"
+        assert commands == []
+        prompt_open[0] = False
+        await _wait_for_commands(commands, 1)
+    assert commands == ["/effort high"]
+
+
+@pytest.mark.asyncio
+async def test_events_unsupported_model_pick_keeps_the_queued_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newer pick the pane can't take is refused without dropping the queued switch."""
+    prompt_open = [True]
+    commands = _patch_settings_behind_prompt(monkeypatch, prompt_open)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "read_model_env",
+        lambda _bridge_dir: {"ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-7"},
+    )
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    url = f"/v1/sessions/{_PROMPT_SESSION_ID}/events"
+    async with _runner_client(app) as client:
+        await _create_prompt_session(client)
+        resp = await client.post(url, json={"type": "model_change", "model": "opus"})
+        assert resp.status_code == 204, resp.text
+        resp = await client.post(url, json={"type": "model_change", "model": "gpt-5.4"})
+        assert resp.status_code == 503, resp.text
+        assert resp.json()["error"] == "claude_native_model_unsupported"
+        prompt_open[0] = False
+        await _wait_for_commands(commands, 1)
+    assert commands == ["/model opus"]
+
+
+@pytest.mark.asyncio
+async def test_events_settings_change_survives_a_failed_prompt_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prompt check that errors keeps the switch waiting instead of ending it."""
+    prompt_open = [True]
+    commands = _patch_settings_behind_prompt(monkeypatch, prompt_open)
+    failures = [1]
+
+    def _flaky_pending(_bridge_dir: Any) -> bool:
+        if failures[0]:
+            failures[0] -= 1
+            raise RuntimeError("tmux capture failed")
+        return prompt_open[0]
+
+    monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", _flaky_pending)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    async with _runner_client(app) as client:
+        await _create_prompt_session(client)
+        resp = await client.post(
+            f"/v1/sessions/{_PROMPT_SESSION_ID}/events",
+            json={"type": "effort_change", "effort": "high"},
+        )
+        assert resp.status_code == 204, resp.text
+        await asyncio.sleep(0.05)
+        assert failures == [0]
+        prompt_open[0] = False
+        await _wait_for_commands(commands, 1)
+    assert commands == ["/effort high"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("method", "path", "body"),
     [
