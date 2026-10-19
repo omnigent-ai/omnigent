@@ -165,6 +165,7 @@ from omnigent.runner.identity import (
     RUNNER_AUTH_REJECTED_EXIT_CODE,
     RUNNER_CONNECT_MARKER_ENV_VAR,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
+    RUNNER_FINISH_WORK_SIGNAL,
     RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR,
     RUNNER_ID_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
@@ -1099,6 +1100,8 @@ class _RunnerHandle:
         ``None`` disables the watchdog.
     :param stop_requested: Suppress diagnostics for intentional stops
         or superseded launches, even after the exit watcher pops them.
+    :param create_time: Process start time recorded while the runner was
+        alive, used to reject a reused PID before signalling a forked runner.
     """
 
     proc: subprocess.Popen[bytes] | ZygoteRunnerProc
@@ -1106,6 +1109,7 @@ class _RunnerHandle:
     session_id: str | None = None
     connect_marker: Path | None = None
     stop_requested: bool = False
+    create_time: float | None = None
 
 
 @dataclass(frozen=True)
@@ -1365,19 +1369,27 @@ class HostProcess:
     def signal_runners_finish_work(self, kill: Callable[[int, int], None] = os.kill) -> None:
         """Tell live runners to finish in-flight work once this host exits.
 
-        Runs on the hangup signal-exit thread, so it only snapshots handles and
-        sends signals; the zygote is not a runner and is never signalled.
+        Runs on the hangup signal-exit thread, so it only reads process state
+        and sends signals; the zygote is not a runner and is never signalled.
+        A direct child is filtered by a non-blocking poll(), which keeps its
+        PID reserved while the host remains its parent. A zygote-forked runner,
+        which the host does not reap, is validated against the start identity
+        recorded at launch so a reused PID is never signalled.
 
         :param kill: Signal sender, defaults to :func:`os.kill`; injectable for tests.
         """
-        from omnigent.runner.identity import RUNNER_FINISH_WORK_SIGNAL
-
         if RUNNER_FINISH_WORK_SIGNAL is None:
             return
         zygote_pid = self._zygote.unreaped_pid if self._zygote is not None else None
         for handle in list(self._runners.values()):
-            pid = handle.proc.pid
-            if handle.proc.returncode is not None or pid == zygote_pid:
+            proc = handle.proc
+            pid = proc.pid
+            code = proc.returncode if isinstance(proc, ZygoteRunnerProc) else proc.poll()
+            if code is not None or pid == zygote_pid:
+                continue
+            if isinstance(proc, ZygoteRunnerProc) and (
+                handle.create_time is None or _proc.process_create_time(pid) != handle.create_time
+            ):
                 continue
             with contextlib.suppress(OSError):
                 kill(pid, RUNNER_FINISH_WORK_SIGNAL)
@@ -2074,6 +2086,7 @@ class HostProcess:
             log_path=log_path,
             session_id=frame.session_id or None,
             connect_marker=_connect_marker_path(log_path),
+            create_time=_proc.process_create_time(proc.pid),
         )
         watcher = asyncio.create_task(self._watch_runner(runner_id))
         self._watcher_tasks.add(watcher)
@@ -2235,6 +2248,9 @@ class HostProcess:
                     stdin=subprocess.DEVNULL,
                     stdout=log_fh,
                     stderr=log_fh,
+                    # Own session: a hangup of the daemon's terminal reaches only
+                    # the daemon, which asks its runners to finish in-flight work.
+                    **_proc.spawn_kwargs(),
                     **logging_kwargs,
                 )
             return proc, log_path
@@ -5393,4 +5409,8 @@ def _serve_host_until_exit(
             flush=True,
         )
         raise SystemExit(HOST_FATAL_EXIT_CODE) from exc
+    finally:
+        # Serving is over: drop the callback so a hangup during the exit-drain
+        # window cannot signal runners through a torn-down host.
+        crash_reporting.set_hangup_callback(None)
     return host.lifecycle_lost

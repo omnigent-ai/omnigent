@@ -222,6 +222,32 @@ def _walk_descendants(pid: int) -> list[psutil.Process]:
     return procs
 
 
+def _process_start_stamp(proc: psutil.Process) -> float:
+    """Return ``proc``'s creation time on a clock that wall-clock steps can't move.
+
+    Linux ``create_time()`` adds ``/proc/stat`` btime, which shifts when NTP or a
+    hypervisor steps the clock; psutil 7 exposes the boot-relative start instead.
+    """
+    platform_create_time = getattr(getattr(proc, "_proc", None), "create_time", None)
+    if callable(platform_create_time):
+        with suppress(TypeError):  # psutil < 7 and non-Linux take no monotonic flag
+            stamp = platform_create_time(monotonic=True)
+            if isinstance(stamp, float):
+                return stamp
+    return proc.create_time()
+
+
+def process_create_time(pid: int) -> float | None:
+    """Return the OS start time identifying the process at *pid*, or ``None``.
+
+    Pairs with the PID to detect reuse: a recycled PID reports a different
+    start time, letting a caller reject a stale PID before acting on it.
+    """
+    with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+        return psutil.Process(pid).create_time()
+    return None
+
+
 def _snapshot_identities(pid: int) -> dict[int, float]:
     """Snapshot a process tree using PID plus creation time identity."""
     identities: dict[int, float] = {}
@@ -229,7 +255,7 @@ def _snapshot_identities(pid: int) -> dict[int, float]:
         if proc.pid <= 1 or proc.pid == os.getpid():
             continue
         with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-            identities[proc.pid] = proc.create_time()
+            identities[proc.pid] = _process_start_stamp(proc)
     return identities
 
 
@@ -259,7 +285,7 @@ def _signal_identities(identities: dict[int, float], *, force: bool) -> None:
             continue
         try:
             proc = psutil.Process(pid)
-            if proc.create_time() != create_time:
+            if _process_start_stamp(proc) != create_time:
                 continue
             if force:
                 proc.kill()
@@ -276,7 +302,7 @@ def _identity_in_group(identities: dict[int, float], pgid: int) -> bool:
     for pid, create_time in identities.items():
         try:
             proc = psutil.Process(pid)
-            if proc.create_time() == create_time and _getpgid_fn(pid) == pgid:
+            if _process_start_stamp(proc) == create_time and _getpgid_fn(pid) == pgid:
                 return True
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             continue

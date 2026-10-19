@@ -292,6 +292,27 @@ def test_process_alive_false_for_bogus_pid() -> None:
     assert _proc.process_alive(-1) is False
 
 
+def test_process_create_time_matches_psutil_for_a_live_process() -> None:
+    proc = subprocess.Popen(_spin_cmd(), **_proc.spawn_kwargs())
+    try:
+        assert _proc.process_create_time(proc.pid) == psutil.Process(proc.pid).create_time()
+    finally:
+        _proc.kill_tree(proc)
+        proc.wait(timeout=5)
+
+
+def test_process_create_time_is_none_for_a_bogus_pid() -> None:
+    assert _proc.process_create_time(2_000_000_000) is None
+
+
+def test_process_create_time_swallows_access_denied(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _deny(pid: int) -> psutil.Process:
+        raise psutil.AccessDenied(pid)
+
+    monkeypatch.setattr(_proc.psutil, "Process", _deny)
+    assert _proc.process_create_time(1234) is None
+
+
 def test_killpg_refuses_the_broadcast_group(monkeypatch: pytest.MonkeyPatch) -> None:
     """A target pgid of 1 must never be signalled.
 
@@ -404,6 +425,53 @@ def test_kill_tree_reaps_descendant_that_left_process_group(tmp_path: Path) -> N
         if child_pid is not None and _proc.process_alive(child_pid):
             with contextlib.suppress(psutil.Error):
                 psutil.Process(child_pid).kill()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="/proc/stat btime is Linux-only")
+@pytest.mark.parametrize("step", [-1.0, 1.0])
+def test_kill_tree_survives_a_wall_clock_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, step: float
+) -> None:
+    """An NTP/hypervisor clock step moves btime; kill_tree must still reap the tree."""
+    import psutil._pslinux as pslinux
+
+    child_pid_path = tmp_path / "setsid-child.pid"
+    script = (
+        "import os, pathlib, time\n"
+        "path = pathlib.Path(os.environ['CHILD_PID_PATH'])\n"
+        "if os.fork() == 0:\n"
+        "    os.setsid()\n"
+        "    pending = path.with_suffix('.pending')\n"
+        "    pending.write_text(str(os.getpid()))\n"
+        "    pending.replace(path)\n"
+        "    while True: time.sleep(1)\n"
+        "while True: time.sleep(1)\n"
+    )
+    env = {**os.environ, "CHILD_PID_PATH": str(child_pid_path)}
+    proc = subprocess.Popen([sys.executable, "-c", script], env=env, **_proc.spawn_kwargs())
+    _proc.remember_process_group(proc)
+    child: psutil.Process | None = None
+    try:
+        deadline = time.monotonic() + 10
+        while not child_pid_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        child = psutil.Process(int(child_pid_path.read_text()))
+        _proc.refresh_process_tree(proc)
+        real_boot_time = pslinux.boot_time
+        monkeypatch.setattr(pslinux, "boot_time", lambda: real_boot_time() + step)
+
+        _proc.kill_tree(proc)
+
+        proc.wait(timeout=5)
+        child.wait(timeout=5)
+    finally:
+        monkeypatch.undo()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        if child is not None:
+            with contextlib.suppress(psutil.Error):
+                child.kill()
 
 
 # --------------------------------------------------------------------------

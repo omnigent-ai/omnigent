@@ -2310,6 +2310,7 @@ def _codex_rollout_records_from_session_items(
         items,
         interrupted_response_ids=interrupted_response_ids,
     )
+    items = _codex_items_with_outputs_in_call_order(items)
     for index, item in enumerate(items):
         if _session_item_response_id(item) in interrupted_response_ids:
             continue
@@ -2413,6 +2414,49 @@ def _codex_rollout_records_from_session_items(
         if event_msg is not None:
             records.append(event_msg)
     return records
+
+
+def _codex_items_with_outputs_in_call_order(
+    items: list[_JsonObject],
+) -> list[_JsonObject]:
+    """
+    Reorder each contiguous run of tool outputs to match their calls' order.
+
+    Parallel tool outputs are stored in completion order, but Codex keeps them
+    in call order, and providers that pair outputs by position reject the swap.
+
+    :param items: Flat Omnigent item dicts in chronological order.
+    :returns: Items with every run of ``function_call_output`` items sorted by
+        the position of its ``function_call``; unmatched outputs keep their
+        relative order at the end of the run.
+    """
+    call_positions: dict[str, int] = {}
+    for position, item in enumerate(items):
+        call_id = item.get("call_id")
+        if item.get("type") == "function_call" and isinstance(call_id, str):
+            call_positions.setdefault(call_id, position)
+    ordered: list[_JsonObject] = []
+    run: list[_JsonObject] = []
+
+    def flush_run() -> None:
+        run.sort(
+            key=lambda output: (
+                (0, call_positions[call_id])
+                if isinstance(call_id := output.get("call_id"), str) and call_id in call_positions
+                else (1, 0)
+            )
+        )
+        ordered.extend(run)
+        run.clear()
+
+    for item in items:
+        if item.get("type") == "function_call_output":
+            run.append(item)
+            continue
+        flush_run()
+        ordered.append(item)
+    flush_run()
+    return ordered
 
 
 def _codex_function_output_counts(

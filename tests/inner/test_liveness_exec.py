@@ -103,7 +103,7 @@ def test_refresh_census_records_live_descendants_by_identity() -> None:
     try:
         census: dict[int, float] = {}
         _liveness_exec._refresh_census(child, census)
-        assert census[child.pid] == psutil.Process(child.pid).create_time()
+        assert census[child.pid] == _liveness_exec._start_stamp(psutil.Process(child.pid))
         assert os.getpid() not in census
         # A root whose recorded identity no longer matches (pid reuse) is not
         # re-walked: the pass bails out and the census is left exactly as it was.
@@ -145,6 +145,29 @@ def test_census_alive_and_signal_census_follow_process_identity() -> None:
         assert _liveness_exec._census_alive(census) is False
         # Entries that never existed, or belong to the caller, are skipped.
         _liveness_exec._signal_census({0: 0.0, os.getpid(): 0.0, 2**22 - 1: 0.0}, signal.SIGKILL)
+    finally:
+        child.kill()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="/proc/stat btime is Linux-only")
+@pytest.mark.parametrize("step", [-1.0, 1.0])
+def test_census_identity_survives_a_wall_clock_step(
+    monkeypatch: pytest.MonkeyPatch, step: float
+) -> None:
+    """An NTP/hypervisor clock step moves btime; the census must still match the worker."""
+    import psutil._pslinux as pslinux
+
+    child = _sleeper()
+    try:
+        census: dict[int, float] = {}
+        _liveness_exec._refresh_census(child, census)
+        real_boot_time = pslinux.boot_time
+        monkeypatch.setattr(pslinux, "boot_time", lambda: real_boot_time() + step)
+
+        assert _liveness_exec._census_alive(census) is True
+        _liveness_exec._signal_census(census, signal.SIGKILL)
+        _wait_gone(child)
+        assert child.returncode == -signal.SIGKILL
     finally:
         child.kill()
 

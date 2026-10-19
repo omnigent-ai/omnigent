@@ -7197,12 +7197,15 @@ def _spawn_with_fake_zygote(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     zygote: _FakeZygote,
+    popen_kwargs: list[dict[str, object]] | None = None,
 ) -> tuple[HostProcess, list[list[str]]]:
     """Drive ``_spawn_runner_proc`` with *zygote* and a stubbed direct Popen.
 
     :param monkeypatch: The pytest monkeypatch fixture.
     :param tmp_path: Holds the fake runner log file.
     :param zygote: The scripted zygote installed on the host.
+    :param popen_kwargs: Optional sink for the keyword arguments of every
+        direct ``Popen`` call.
     :returns: The host and the argv of every direct ``Popen`` call.
     """
     host = _make_host_process()
@@ -7221,14 +7224,35 @@ def _spawn_with_fake_zygote(
         return log_path, open(log_path, "ab", buffering=0)
 
     def _fake_popen(argv: list[str], **kwargs: object) -> _FakeSpawnedProc:
-        del kwargs
         popen_argvs.append(list(argv))
+        if popen_kwargs is not None:
+            popen_kwargs.append(kwargs)
         return _FakeSpawnedProc()
 
     monkeypatch.setattr("omnigent.host.connect.open_process_log_file", _fake_open_log)
     monkeypatch.setattr("omnigent.host.connect.subprocess.Popen", _fake_popen)
     host._spawn_runner_proc({}, "slug", tmp_path)
     return host, popen_argvs
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX sessions")
+def test_direct_runner_spawn_starts_its_own_session(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A directly spawned runner leaves the daemon's terminal session.
+
+    A hangup of that terminal would otherwise reach the runner and its harness
+    children mid-turn instead of only the daemon.
+    """
+    popen_kwargs: list[dict[str, object]] = []
+    _spawn_with_fake_zygote(
+        monkeypatch, tmp_path, _FakeZygote(fail_at="start", running=False), popen_kwargs
+    )
+
+    assert len(popen_kwargs) == 1
+    assert popen_kwargs[0]["start_new_session"] is True
+    assert popen_kwargs[0]["stdin"] is subprocess.DEVNULL
 
 
 def test_dead_zygote_is_reaped_and_respawnable(
