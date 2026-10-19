@@ -80,6 +80,7 @@ from tests.helpers.ui_configuration import (
     _ALLOW_DEV_BASE_URL_ENV,
     ServerState,
     prepared_repro_environment,
+    validate_native_claude_mock_routing,
 )
 from tests.helpers.ui_configuration import (
     _CLAUDE_MOCK_MODEL as _CLAUDE_MOCK_MODEL,
@@ -2829,7 +2830,9 @@ def native_claude_mock_session_context(
     Workflow-owned runners are already configured. Standalone tests temporarily
     install a mock provider regardless of ambient credential placeholders.
     ``terminal_launch_args`` are persisted on the session and passed to ``claude``.
+    Callers request ``claude_managed_settings`` to expose real machine routing.
     """
+    validate_native_claude_mock_routing(mock_llm_server_url)
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
     with _temp_omnigent_mock_config(
@@ -2858,6 +2861,7 @@ def native_claude_mock_session(
     live_server: str,
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
+    claude_managed_settings: None,
 ) -> Iterator[tuple[str, str]]:
     """A real Claude CLI using an explicitly configured mock provider."""
     with native_claude_mock_session_context(

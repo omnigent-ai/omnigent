@@ -110,6 +110,15 @@ mock model there. For any other harness, install its CLI, sign in with a test
 account, and run its tests with plain `uv run pytest` instead, or follow its dev
 skill when one is linked above.
 
+Claude Code also reads machine-wide managed settings outside `CLAUDE_CONFIG_DIR`.
+Native Claude mock fixtures reject a managed `ANTHROPIC_BASE_URL` pointing away
+from the mock before creating the session, including in workflow-owned runs.
+This is a blocked prerequisite, not a skipped or passing acceptance check. Use
+a clean container or CI runner without that override; do not edit machine policy.
+The render-parity journey additionally requires each web and terminal prompt
+marker to reach the mock under the configured model. A rendered reply or a
+background request alone is not routing evidence.
+
 Apply the shared [harness acceptance checklist](./harness-acceptance.md) to
 affected harnesses and entry points. The matrix above locates existing tests;
 it is not a coverage verdict. Use the existing harness bench where applicable
