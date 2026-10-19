@@ -590,9 +590,12 @@ terminals:
     os_env: inherit
 ```
 
-For a public DNS name, omit `allowed_cidrs`; private answers require the
-smallest relevant CIDR. When specified, **every** A/AAAA answer must match
-one of the CIDRs; a public answer outside them also denies the route.
+The parent resolves DNS on every connection. A public DNS name that resolves
+to a private address is **denied by default**; permit the smallest relevant
+private CIDR explicitly with `allowed_cidrs`. **Every** A/AAAA answer must
+match the CIDRs when specified; a mixed public/private answer is denied unless
+every address is explicitly allowed. The chosen IP is pinned for the dial,
+so a later DNS change cannot redirect an established connection.
 Loopback, link-local, metadata, cloud control addresses, and mixed
 allowed/blocked DNS answers remain denied. The broker permits up to eight
 concurrent streams per sandbox. Each stream has a 30-minute lifetime, a

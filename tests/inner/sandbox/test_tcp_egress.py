@@ -212,6 +212,71 @@ def test_tcp_route_rejects_mixed_dns_and_blocked_addresses(
         resolve_pinned_address(ipv6_metadata)
 
 
+@pytest.mark.parametrize("private_address", ["10.42.7.9", "fd42::9"])
+def test_tcp_dns_private_answer_requires_explicit_cidr(
+    private_address: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    address = ipaddress.ip_address(private_address)
+    family = socket.AF_INET6 if address.version == 6 else socket.AF_INET
+    if family == socket.AF_INET6:
+        sockaddr = (private_address, 5432, 0, 0)
+    else:
+        sockaddr = (private_address, 5432)
+    queries: list[tuple[str, int]] = []
+
+    def resolve(host: str, port: int, **_kwargs: object) -> list[tuple[object, ...]]:
+        queries.append((host, port))
+        return [(family, socket.SOCK_STREAM, 6, "", sockaddr)]
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+    route = TcpEgressRoute("db", "db.example.test", 5432)
+    with pytest.raises(TcpEgressDenied, match="outside allowed addresses"):
+        resolve_pinned_address(route)
+
+    permitted = TcpEgressRoute(
+        "db", route.host, route.port, (f"{address}/{address.max_prefixlen}",)
+    )
+    assert resolve_pinned_address(permitted) == private_address
+    assert queries == [(route.host, route.port)] * 2
+
+
+def test_tcp_broker_rejects_mixed_public_and_private_dns_without_dial(
+    broker_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    route = TcpEgressRoute("db", "db.example.test", 5432)
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 5432)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.42.7.9", 5432)),
+        ],
+    )
+    broker = start_tcp_egress_broker([route], broker_dir)
+    dials: list[tuple[str, int]] = []
+
+    def dial(address: str, port: int) -> socket.socket:
+        dials.append((address, port))
+        raise AssertionError("a mixed DNS answer must not reach the upstream dial")
+
+    monkeypatch.setattr(broker, "_dial_pinned", dial)
+    env = os.environ.copy()
+    apply_tcp_egress_env(env, broker)
+    try:
+        result = subprocess.run(
+            ["omnigent-egress-connect", route.name],
+            input=b"",
+            capture_output=True,
+            env=env,
+            timeout=10,
+        )
+        assert result.returncode != 0
+        assert b"outside allowed addresses" in result.stderr
+        assert not dials
+    finally:
+        broker.stop()
+
+
 def test_tcp_global_resolver_limit_fails_closed(
     tcp_route: TcpEgressRoute, monkeypatch: pytest.MonkeyPatch
 ) -> None:
