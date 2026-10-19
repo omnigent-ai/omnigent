@@ -5,10 +5,31 @@ import json
 import pytest
 
 from omnigent.native.failure_telemetry import (
+    exception_code_origin,
     failure_log_attributes,
     normalize_failure_context,
     provider_error_context_from_text,
 )
+
+
+@pytest.mark.parametrize("prefer_framework", [False, True])
+def test_code_origin_can_name_the_caller_instead_of_a_library_leaf(prefer_framework: bool) -> None:
+    with pytest.raises(ValueError) as raised:
+        json.loads("private-runner-data")
+    origin = exception_code_origin(
+        raised.value, prefer_module_prefix=__name__ if prefer_framework else None
+    )
+    assert origin is not None
+    assert origin.startswith(__name__ if prefer_framework else "json.")
+    assert origin.rsplit(":", 1)[1].isdigit()
+    assert len(origin) <= 256
+    assert "private-runner-data" not in origin
+    assert __file__ not in origin
+
+
+def test_code_origin_does_not_invent_a_traceback() -> None:
+    assert exception_code_origin(RuntimeError("private-runner-data")) is None
+    assert exception_code_origin(None) is None
 
 
 @pytest.mark.parametrize("nested", [False, True])
@@ -74,6 +95,14 @@ def test_provider_error_json_stops_after_three_envelopes_and_redacts_fields() ->
 @pytest.mark.parametrize("value", [None, [], "bad", 17, {"http_status": True}])
 def test_malformed_metadata_is_ignored(value: object) -> None:
     assert normalize_failure_context(value) == {}
+
+
+@pytest.mark.parametrize("field", ["control_model_requested", "control_model_command_arg"])
+def test_request_argument_fields_are_not_retained(field: str) -> None:
+    context = normalize_failure_context(
+        {field: "submitted-model-sentinel", "control_failure_reason": "model_unconfirmed"}
+    )
+    assert context == {"control_failure_reason": "model_unconfirmed"}
 
 
 def test_context_is_bounded_redacted_and_cannot_override_canonical_fields() -> None:

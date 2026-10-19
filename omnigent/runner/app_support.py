@@ -5,22 +5,29 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypeAlias, overload
 
 import httpx
 
-from omnigent.debug_logging import runner_primary_session_id
+from omnigent.debug_logging import current_session_id, debug_event, runner_primary_session_id
 from omnigent.inner.native_attachments import (
     framework_notice_block,
     has_unresolved_file_id,
     resolve_file_id_block,
 )
+from omnigent.native.failure_telemetry import (
+    exception_code_origin,
+    failure_log_attributes,
+    normalize_failure_context,
+)
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.native import ResolvedSpec
 from omnigent.spec.types import AgentSpec
 from omnigent.util.json_types import JsonObject as _JsonObject
+from omnigent.version import VERSION
 
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.bridge import ClaudeNativeToolRelay
@@ -28,7 +35,13 @@ if TYPE_CHECKING:
 _logger = logging.getLogger("omnigent.runner.app")
 
 
-def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
+def _client_safe_error_detail(
+    exc: BaseException,
+    *,
+    context: str,
+    session_id: str | None = None,
+    failure_context: object = None,
+) -> str:
     """
     Log *exc* in full and return a generic detail string safe for clients.
 
@@ -47,6 +60,8 @@ def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
         spawn or an ``InvalidPath`` from path validation.
     :param context: Short operator-facing label for the failing operation,
         e.g. ``"harness spawn"``. Appears only in the server log.
+    :param session_id: Explicit request session, otherwise the active request scope.
+    :param failure_context: Optional bounded evidence shared with the HTTP caller.
     :returns: A non-sensitive string safe to return to clients, e.g.
         ``"Request failed on the runner; see the runner log for details:
         ~/.omnigent/logs/runner/runner-conv_ab12.log"``.
@@ -56,10 +71,52 @@ def _client_safe_error_detail(exc: BaseException, *, context: str) -> str:
         context,
         exc,
         exc_info=exc,
-        extra={"session_id": runner_primary_session_id()},
+        extra=debug_event(
+            "runner_request_failed",
+            session_id=session_id or current_session_id() or runner_primary_session_id(),
+            **failure_log_attributes(failure_context),
+        ),
     )
     log_reference = process_log_reference("runner")
     return f"Request failed on the runner; see the runner log for details: {log_reference}"
+
+
+def _client_safe_error_payload(
+    exc: BaseException,
+    *,
+    context: str,
+    session_id: str | None = None,
+    route: str | None = None,
+) -> _JsonObject:
+    """Keep bounded failure evidence on HTTP responses when local logs are unavailable."""
+    from omnigent.runner.native.orchestration import _os_error_with_errno
+
+    os_error = _os_error_with_errno(exc)
+    cause = exc.__cause__
+    context_error = exc.__context__
+    failure_context = normalize_failure_context(
+        {
+            "failure_id": f"err_{uuid.uuid4().hex}",
+            "failure_source": "runner_request",
+            "runner_version": VERSION,
+            "runner_request_exception_type": type(exc).__name__,
+            "runner_request_cause_type": type(cause).__name__ if cause is not None else None,
+            "runner_request_context_type": type(context_error).__name__
+            if context_error is not None
+            else None,
+            "runner_request_origin": exception_code_origin(exc),
+            "runner_request_cause_origin": exception_code_origin(cause or context_error),
+            "runner_request_operation": context,
+            "runner_request_route": route,
+            "runner_request_os_errno": os_error.errno if os_error is not None else None,
+        }
+    )
+    return {
+        "detail": _client_safe_error_detail(
+            exc, context=context, session_id=session_id, failure_context=failure_context
+        ),
+        "failure_context": failure_context,
+    }
 
 
 _SpecEntry: TypeAlias = AgentSpec | ResolvedSpec

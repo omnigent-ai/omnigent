@@ -2152,11 +2152,40 @@ async def test_events_model_change_unconfirmed_switch_answers_503(
     resp = await _post_model_change_with_status_sequence(
         monkeypatch,
         ["claude-opus-4-6"],
+        pane_status="idle",
     )
     assert resp.status_code == 503, resp.text
     body = resp.json()
     assert body["error"] == "claude_native_model_unconfirmed"
     assert "did not confirm" in body["detail"]
+    context = body["failure_context"]
+    assert context["failure_source"] == "native_control"
+    assert context["control_failure_reason"] == "model_unconfirmed"
+    assert context["control_model_before"] == "claude-opus-4-6"
+    assert context["control_model_observed"] == "claude-opus-4-6"
+    # The submitted model is a request argument: never retained.
+    assert "control_model_requested" not in context
+    assert "claude-opus-4-7" not in str(context)
+    assert context["control_pane_status_snapshot"] == "idle"
+    assert context["control_confirmation_budget_ms"] == 300
+    assert "control_model_command_arg" not in context
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_unconfirmed_switch_reports_its_capped_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reported confirmation budget is the window the request had left, not the default."""
+    monkeypatch.setattr(native_controls, "_CLAUDE_CONTROL_BUDGET_S", 0.2)
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6"],
+        pane_status="idle",
+    )
+    assert resp.status_code == 503, resp.text
+    context = resp.json()["failure_context"]
+    assert context["control_failure_reason"] == "model_unconfirmed"
+    assert 0 < context["control_confirmation_budget_ms"] <= 200
 
 
 @pytest.mark.asyncio

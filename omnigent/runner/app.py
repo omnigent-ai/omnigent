@@ -88,6 +88,7 @@ from omnigent.runner.acp_subagent_sessions import (
 from omnigent.runner.app_support import (
     SpecResolver,
     _client_safe_error_detail,
+    _client_safe_error_payload,
     _CommentRelayBinding,
     _require_full_native_lock_coverage,
     _resolve_forwarded_message_content,
@@ -1204,7 +1205,10 @@ def create_runner_app(
 
     app = FastAPI(title="omnigent-runner")
 
-    from omnigent.runner.logging_context import RunnerLogContextMiddleware
+    from omnigent.runner.logging_context import (
+        RunnerLogContextMiddleware,
+        request_path_session_id,
+    )
 
     app.add_middleware(RunnerLogContextMiddleware)
     mcp_execution_registry = McpExecutionRegistry()
@@ -2186,6 +2190,24 @@ def create_runner_app(
         return JSONResponse(
             status_code=exc.http_status,
             content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    @app.exception_handler(Exception)
+    async def _handle_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+        route = getattr(request.scope.get("route"), "path", None)
+        # Starlette runs this handler outside RunnerLogContextMiddleware's scope,
+        # so the request's session is re-read from the path, not the context.
+        payload = _client_safe_error_payload(
+            exc,
+            context="runner HTTP request",
+            session_id=request_path_session_id(request.scope.get("path", "")),
+            route=route if isinstance(route, str) else None,
+        )
+        # An error object without a ``code``: servers read a coded error as a typed
+        # failure (a terminal start's cause, say), so this keeps their fallback.
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"message": payload["detail"]}, **payload},
         )
 
     @app.exception_handler(ValueError)

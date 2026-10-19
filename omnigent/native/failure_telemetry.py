@@ -30,6 +30,18 @@ _TEXT_FIELDS = frozenset(
         "native_record_id",
         "native_hook_event",
         "runner_version",
+        "control_failure_reason",
+        "control_pane_status_snapshot",
+        "control_model_before",
+        "control_model_observed",
+        "control_backend_returncode",
+        "runner_request_exception_type",
+        "runner_request_cause_type",
+        "runner_request_context_type",
+        "runner_request_origin",
+        "runner_request_cause_origin",
+        "runner_request_operation",
+        "runner_request_route",
         "native_cli_version",
         "native_model",
         "native_request_id",
@@ -52,6 +64,9 @@ _TEXT_FIELDS = frozenset(
 _BOOL_FIELDS = frozenset(
     {
         "native_api_error_message",
+        "control_wait_timed_out",
+        "control_terminal_registered",
+        "control_backend_registered",
         "diagnostic_capture_enabled",
         "diagnostic_marker_present",
         "diagnostic_file_present",
@@ -63,6 +78,8 @@ _INT_FIELDS = frozenset(
         "native_hook_cursor",
         "native_hook_offset",
         "http_status",
+        "control_confirmation_budget_ms",
+        "runner_request_os_errno",
         "diagnostic_read_offset",
         "diagnostic_lines_omitted",
         "diagnostic_bytes_omitted",
@@ -194,3 +211,24 @@ def native_failure_id(source: str, *identity: str | int | float | None) -> str:
     """Derive an observation ID from durable source identity, never a retry timestamp."""
     key = json.dumps([source, *identity], separators=(",", ":"), ensure_ascii=True)
     return str(uuid.uuid5(uuid.NAMESPACE_URL, "omnigent:native-failure:" + key))
+
+
+def exception_code_origin(
+    exc: BaseException | None, *, prefer_module_prefix: str | None = None
+) -> str | None:
+    """Identify code from at most 64 frames without exporting paths or exception text."""
+    traceback = exc.__traceback__ if exc is not None else None
+    preferred: str | None = None
+    fallback: str | None = None
+    for _ in range(64):
+        if traceback is None:
+            break
+        frame = traceback.tb_frame
+        module = frame.f_globals.get("__name__", "")
+        module = module if isinstance(module, str) else ""
+        fallback = f"{module}.{frame.f_code.co_qualname}:{traceback.tb_lineno}"
+        if prefer_module_prefix is None or module.startswith(prefer_module_prefix):
+            preferred = fallback
+        traceback = traceback.tb_next
+    origin = preferred or fallback
+    return redact_log_text(origin, include_whitespace_credentials=True)[:256] if origin else None
