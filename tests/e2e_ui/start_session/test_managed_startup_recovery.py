@@ -14,7 +14,6 @@ import httpx
 import pytest
 
 from tests._helpers.async_thread import run_in_fresh_loop
-from tests.e2e_ui.conftest import configure_mock_llm
 from tests.e2e_ui.start_session.test_managed_first_message_routing import (
     ManagedReplicas,
     _poll,
@@ -22,7 +21,6 @@ from tests.e2e_ui.start_session.test_managed_first_message_routing import (
 )
 
 _PROMPT = "Acknowledge this saved first message."
-_REPLY = "The saved first message arrived."
 _CROSS_REPLICA = pytest.mark.parametrize("managed_replicas", [(True, True)], indirect=True)
 
 
@@ -80,15 +78,8 @@ async def _drive_no_prompt(rig: ManagedReplicas) -> None:
 @_CROSS_REPLICA
 def test_failed_launch_is_reported_on_the_replica_without_its_tracker(
     managed_replicas: ManagedReplicas,  # noqa: F811 — pytest injects the imported fixture
-    mock_llm_server_url: str,
 ) -> None:
     """A failed create launch fails its saved first message everywhere, not just on A."""
-    configure_mock_llm(
-        mock_llm_server_url,
-        [{"text": _REPLY, "stream": True}],
-        key="managed-startup-failed-launch",
-        match=_PROMPT,
-    )
     run_in_fresh_loop(_drive_failed_launch(managed_replicas))
 
 
@@ -110,7 +101,10 @@ async def _drive_failed_launch(rig: ManagedReplicas) -> None:
         snapshot = await _poll(
             client,
             rig.b + path,
-            lambda body: (body.get("labels") or {}).get("omnigent.startup") == "failed",
+            lambda body: (
+                (body.get("labels") or {}).get("omnigent.startup") == "failed"
+                and any(item["type"] == "error" for item in body["items"])
+            ),
             timeout=60,
         )
         assert snapshot["pending_inputs"] == []
@@ -121,10 +115,14 @@ async def _drive_failed_launch(rig: ManagedReplicas) -> None:
             and "managed sandbox launch" in item["data"]["message"]
             for item in errors
         ), errors
+        assert not any(
+            "injected sandbox allocation failure" in item["data"]["message"] for item in errors
+        )
         message = {
             "type": "message",
             "data": {"role": "user", "content": [{"type": "input_text", "text": "still there?"}]},
         }
         late = await client.post(f"{rig.b}{path}/events", json=message)
-        assert late.status_code != 202, "a failed launch must not hold new messages"
-        assert "queued" not in late.text, late.text
+        # A failed launch doesn't hold new messages; they take the normal no-runner path.
+        assert late.status_code == 503, late.text
+        assert late.json()["error"]["code"] == "runner_unavailable", late.text

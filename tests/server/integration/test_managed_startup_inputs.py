@@ -308,12 +308,16 @@ async def test_cancelled_worker_leaves_unsent_input_for_restart(startup_env: _En
 
 
 @pytest.mark.parametrize("control", ["interrupt", "stop_session"])
-async def test_stop_before_host_ready_cancels_first_input(
+async def test_stop_before_host_ready_cancels_all_saved_inputs(
     startup_env: _Env, control: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     env = startup_env
     session_id = await _create(env)
     startup = env.app.state.startup_inputs
+    for _ in range(2):
+        followup = await env.client.post(f"/v1/sessions/{session_id}/events", json=_INPUT)
+        assert followup.status_code == 202, followup.text
+    assert len(env.conv_store.list_pending_inputs(session_id)) == 3
     entry = env.conv_store.list_pending_inputs(session_id)[0]
     response = await env.client.post(f"/v1/sessions/{session_id}/events", json={"type": control})
     assert response.status_code == 202, response.text
