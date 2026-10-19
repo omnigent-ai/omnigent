@@ -980,7 +980,9 @@ Request body matches `SessionEventInput`:
                                   preserved. On native-terminal sessions
                                   the web messages still queued are
                                   settled as for `interrupt` (see below).
-                                  Returns `{queued: false}`.
+                                  Returns `{queued: false}`, plus
+                                  `settled_pending_ids` naming those
+                                  messages when it settled any.
       - "external_conversation_item"
                                 — internal terminal-observed item
                                   envelope; appends/broadcasts without
@@ -1081,6 +1083,7 @@ Request body matches `SessionEventInput`:
 {"queued": false}                           # "interrupt" and status/control bypasses
 {"queued": false, "item_id": "item_..."}    # "external_conversation_item"
 {"queued": true, "pending_id": "pending_..."} # native-terminal "message" (see below)
+{"queued": false, "settled_pending_ids": ["pending_..."]} # "stop_session" that settled queued messages
 [{"queued": false, "item_id": "item_..."}, ...] # top-level event array
 
 400 Bad Request — unknown `type`, or `data` fails the per-type schema
@@ -1117,7 +1120,10 @@ transcript mirror that jumps over one drains it without persisting a
 `native_prompt_not_recorded` error (an exact mirror of it still drains
 it normally, since the agent did record it). A message sent after the
 Stop, or an interrupt or stop that did not land, leaves the queue as it
-was. The internal terminal-observed
+was. A settled message gets no `session.input.consumed` unless that
+exact mirror arrives, so a `stop_session` response lists the ids it
+settled in `settled_pending_ids` for the client to drop their bubbles.
+The internal terminal-observed
 envelopes also bypass the queue: `external_conversation_item`
 appends/broadcasts an already-observed item and returns its stored
 `item_id`, while `external_output_text_delta` publishes a transient

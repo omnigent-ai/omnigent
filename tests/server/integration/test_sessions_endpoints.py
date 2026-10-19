@@ -10942,6 +10942,8 @@ async def test_stop_session_settles_native_messages_queued_before_it(
         response = await _press_stop_session(client, session_id)
 
         assert response.status_code == 202, response.text
+        # Named so the web can drop its bubble: no consumed receipt will.
+        assert response.json() == {"queued": False, "settled_pending_ids": [queued_before_stop]}
         # Flagged, not dropped: hidden from a reload and from the session's "working" state.
         assert pending_inputs.pending_ids(session_id) == [queued_before_stop]
         assert pending_inputs.snapshot_for(session_id) == []
@@ -10990,6 +10992,7 @@ async def test_message_sent_while_stop_session_is_in_flight_stays_live(
 
             assert response.status_code == 202, response.text
             assert len(sent_during_stop) == 1
+            assert response.json()["settled_pending_ids"] == [queued_before_stop]
             snapshot = pending_inputs.snapshot_for(session_id)
             assert [entry["pending_id"] for entry in snapshot] == sent_during_stop
             assert pending_inputs.has_pending(session_id)
@@ -11027,6 +11030,7 @@ async def test_native_message_recorded_before_stop_session_drains_as_matched(
         recorded = _queue_web_message(session_id, "write it down")
         response = await _press_stop_session(client, session_id)
         assert response.status_code == 202, response.text
+        assert response.json()["settled_pending_ids"] == [recorded]
 
         await _mirror_user_message(client, session_id, "write it down", "codex:write-it-down:0")
 
@@ -11084,6 +11088,9 @@ async def test_stop_session_that_did_not_land_keeps_queued_native_messages_pendi
         response = await _press_stop_session(client, session_id)
 
         assert response.status_code == expected_status, response.text
+        if expected_status == 202:
+            # Nothing settled, so nothing named: the web keeps the bubble.
+            assert response.json() == {"queued": False}
         snapshot = pending_inputs.snapshot_for(session_id)
         assert [entry["pending_id"] for entry in snapshot] == [queued]
         assert pending_inputs.has_pending(session_id)

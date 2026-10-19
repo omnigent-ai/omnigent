@@ -907,7 +907,7 @@ def test_mark_interrupted_leaves_entries_recorded_after_the_snapshot_alone() -> 
     after_stop = pending_inputs.record("conv_a", [_text_block("after stop")])
     newest = pending_inputs.record("conv_a", [_text_block("newest")])
 
-    pending_inputs.mark_interrupted("conv_a", queued_at_stop)
+    assert pending_inputs.mark_interrupted("conv_a", queued_at_stop) == [before_stop]
 
     assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [
         after_stop,
@@ -921,14 +921,14 @@ def test_mark_interrupted_leaves_entries_recorded_after_the_snapshot_alone() -> 
 
 
 def test_mark_interrupted_skips_held_and_unknown_entries() -> None:
-    """Only entries still queued and unheld are flagged; anything else is ignored."""
+    """Only entries still queued and unheld are flagged and returned; anything else is ignored."""
     held = pending_inputs.record("conv_a", [_text_block("held")])
     queued = pending_inputs.record("conv_a", [_text_block("queued")])
     drained = pending_inputs.resolve_oldest("conv_a", hold=True)
     assert drained is not None and drained.pending_id == held
 
-    pending_inputs.mark_interrupted("conv_a", [held, queued, "pending_unknown"])
-    pending_inputs.mark_interrupted("conv_unknown", [held, queued])
+    assert pending_inputs.mark_interrupted("conv_a", [held, queued, "pending_unknown"]) == [queued]
+    assert pending_inputs.mark_interrupted("conv_unknown", [held, queued]) == []
     # The held entry is being mirrored, so the Stop did not cancel it: if its
     # persist is rolled back it returns to the queue as an ordinary entry.
     pending_inputs.restore("conv_a", drained)

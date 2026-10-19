@@ -315,6 +315,8 @@ from omnigent.util.session_lifecycle import (
 _retry_recovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
+# A session event's acknowledgement, e.g. ``{"queued": True, "pending_id": "pending_a1b2c3"}``.
+_EventAck = Mapping[str, bool | str | list[str]]
 # One shared Resume attempt per session, split by caller for side chats; see
 # _retry_session_single_flight.
 _RetryFlight = tuple[str, str | None]
@@ -798,7 +800,7 @@ def register_events_routes(
         request: Request,
         session_id: str,
         body: SessionEventInput | list[SessionEventInput],
-    ) -> dict[str, bool | str] | list[dict[str, bool | str]]:
+    ) -> _EventAck | list[_EventAck]:
         """
         Route entry for :func:`_post_event_impl`.
 
@@ -827,7 +829,7 @@ def register_events_routes(
                 # per-append overhead outlasts that. Each run of batchable entries is
                 # authorized once and appended in one store call; every other entry
                 # keeps the per-entry path, in order.
-                acks: list[dict[str, bool | str]] = []
+                acks: list[_EventAck] = []
                 for batchable, run in itertools.groupby(body, key=_is_batchable_external_item):
                     if not batchable:
                         for event in run:
@@ -934,7 +936,7 @@ def register_events_routes(
         session_id: str,
         body: SessionEventInput,
         in_flight: contextlib.ExitStack | None = None,
-    ) -> dict[str, bool | str]:
+    ) -> _EventAck:
         """
         Submit a session event (input message, tool output,
         approval, or interrupt).
@@ -1691,9 +1693,12 @@ def register_events_routes(
                         conversation_store,
                         int(time.time()) - RUNNER_LIVENESS_TTL_S,
                     )
+            settled_pending_ids: list[str] = []
             if stop_delivered:
                 # What the stopped CLI had not yet recorded is cancelled, not undelivered.
-                pending_inputs.mark_interrupted(session_id, queued_pending_ids)
+                settled_pending_ids = pending_inputs.mark_interrupted(
+                    session_id, queued_pending_ids
+                )
             # Stop is non-sticky: no persistent marker is written. The
             # runner tunnel dropping above flips ``runner_online`` to false
             # honestly, and the next message auto-relaunches the session on
@@ -1711,6 +1716,10 @@ def register_events_routes(
                 )
             except Exception:
                 pass
+            if settled_pending_ids:
+                # Settled messages get no consumed receipt; naming them lets the
+                # web drop exactly their bubbles.
+                return {"queued": False, "settled_pending_ids": settled_pending_ids}
             return {"queued": False}
         if body.type == _APPROVAL_TYPE:
             # Deliver the verdict through the shared resolver: it
