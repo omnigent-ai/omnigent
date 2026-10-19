@@ -1633,8 +1633,8 @@ def _validate_agent_policy_functions(  # type: ignore[explicit-any]  # spec type
 
     Walks the root spec and all sub-agents. For each function policy
     it resolves ``function.path`` with the same importer the runtime
-    uses at evaluation time (``_resolve_dotted_path``) — resolution
-    behavior is unchanged; this only surfaces a failure early. The
+    uses at evaluation time (``_resolve_dotted_path``). The callable
+    must be installed in the CLI environment as well as the runtime. The
     factory (if any) is not invoked; this checks import + attribute
     lookup only.
 
@@ -1664,9 +1664,10 @@ def _validate_agent_policy_functions(  # type: ignore[explicit-any]  # spec type
                     f"--agent {agent_source}: agent {current.name!r} policy "
                     f"{policy.name!r} references function {path!r}, which "
                     f"cannot be resolved from sys.path "
-                    f"({type(exc).__name__}: {exc}). Every message on this "
-                    f"agent would be denied; ship the module on the server's "
-                    f"sys.path or fix the policy path.",
+                    f"({type(exc).__name__}: {exc}). Install the trusted callable "
+                    f"package in both the Omnigent CLI and server/runtime environments, "
+                    f"or correct the policy path. CLI preflight does not import "
+                    f"modules from the workspace directory.",
                 ) from exc
 
 
@@ -2227,14 +2228,6 @@ def main() -> None:
     shape (``omnigent [--flags] [prompt]``) is rejected here so it
     cannot fall back to the legacy in-process runner path.
 
-    Also inserts the current working directory at ``sys.path[0]``
-    so dotted callables declared in user YAMLs (``callable:
-    mypackage.mymodule.my_fn``) resolve against the user's project,
-    not the console-script's install directory. Console entry
-    points put the script's own directory at sys.path[0] by
-    default, which is almost never what a CLI that imports
-    user-authored modules wants.
-
     Sets up the always-on CLI diagnostics log before Click dispatch
     so unhandled exceptions are captured even when the user didn't
     enable ``--log`` or ``--debug-events``.
@@ -2253,10 +2246,6 @@ def main() -> None:
     # setting OMNIGENT_REQUIRE_WRAPPER; the wrapper sets OMNIGENT_WRAPPER_BYPASS
     # to pass through. Refuse naked calls before any work happens.
     _enforce_wrapper_guard()
-
-    cwd = os.getcwd()
-    if cwd not in sys.path:
-        sys.path.insert(0, cwd)
 
     # Legacy-codepage stdio (Windows ANSI, C locale, PYTHONIOENCODING)
     # can't encode the CLI's glyphs; harden the streams before any command
@@ -11188,7 +11177,7 @@ def _slack_installed() -> bool:
 
 def _slack_argv() -> list[str]:
     """Argv that runs the Slack bot in the current interpreter."""
-    return [sys.executable, "-m", _SLACK_PACKAGE]
+    return [sys.executable, "-P", "-m", _SLACK_PACKAGE]
 
 
 def _integration_state_dir() -> Path:
@@ -14118,8 +14107,4 @@ _register_native_commands(cli)
 
 
 if __name__ == "__main__":
-    # Omnigent is already loaded from the selected installation. Restore the
-    # workspace path for local tools, matching the console entry point.
-    if (_cwd := os.getcwd()) not in sys.path:
-        sys.path.insert(0, _cwd)
     cli()
