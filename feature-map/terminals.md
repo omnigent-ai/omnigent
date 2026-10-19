@@ -32,6 +32,10 @@ reattach when the session moves to another host.
 
 **Agent terminal** (sessions whose harness has a terminal):
 
+Native subagents that share a parent's terminal show their work in chat and have
+no Chat/Terminal switcher. Open the parent session to use its terminal. Children
+with their own terminal retain the switcher.
+
 - Use the Chat/Terminal switcher in the session header.
 - Press ⌘/Ctrl+Alt+\ to toggle between Chat and Terminal view. The chord is
   off while a rail-opened shell owns the main view.
@@ -74,6 +78,11 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/e2e_ui/shells/test_new_shell.py::test_empty_terminal_view_remains_selectable_and_resumable`
   kills the session's runner, so it fails under `verify-env run`; run it with
   plain `uv run pytest`.
+  Native child ownership and live output (opt-in, own environment):
+  `tests/e2e/test_codex_native_child_visibility_e2e.py`.
+  This uses real Codex credentials and holds a child command open while checking
+  the parent terminal and child chat; see the prerequisites in
+  `tests/harnesses/codex_native/forwarder/README.md`.
 - **`user-shell`:**
   `tests/e2e_ui/shells/test_new_shell.py::test_new_shell_launches_and_opens`,
   `tests/e2e_ui/shells/test_new_shell.py::test_new_shell_accepts_typed_command`.

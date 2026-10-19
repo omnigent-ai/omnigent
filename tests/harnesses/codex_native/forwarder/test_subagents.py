@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -417,6 +419,57 @@ class CodexChildForwarderTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 self.events_of_type("external_tool_output_delta", session)[0]["delta"],
                 text,
+            )
+        self.assertEqual((self.bridge_dir / "state.json").read_bytes(), self.parent_bridge)
+        self.assertFalse(any(path == "/v1/sessions/parent/events" for path, _ in self.posts))
+
+    async def test_child_file_changes_reach_shared_observer_without_parent_state_changes(self):
+        (self.bridge_dir / "tool_relay.json").write_text(
+            json.dumps({"url": "http://relay.local", "token": "test-relay-token"})
+        )
+        # Substitute only the runner's HTTP endpoint; observation payloads,
+        # routing, completed-item deduplication, and the bridge remain real.
+        with patch.object(
+            fwd.urllib.request, "urlopen", side_effect=lambda *_args, **_kwargs: io.BytesIO(b"{}")
+        ) as observer:
+            for thread, turn, session, path in (
+                ("child-a", "turn-a", "session-a", "/repo/alpha.py"),
+                ("child-b", "turn-b", "session-b", "/repo/beta.py"),
+            ):
+                changes = [{"path": path, "kind": {"type": "add"}, "diff": "new\n"}]
+                item = {
+                    "type": "fileChange",
+                    "id": "shared-patch-id",
+                    "status": "completed",
+                    "changes": changes,
+                }
+                await self.event("item/completed", thread, turn, item=item)
+                await self.event("item/completed", thread, turn, item=item)
+                items = self.events_of_type("external_conversation_item", session)
+                self.assertEqual(
+                    [item["item_type"] for item in items],
+                    ["function_call", "function_call_output"],
+                )
+                self.assertEqual(
+                    json.loads(items[0]["item_data"]["arguments"]), {"changes": changes}
+                )
+                self.assertEqual(items[1]["item_data"]["output"], f"add {path}")
+
+        self.assertEqual(observer.call_count, 2)
+        for call, path in zip(
+            observer.call_args_list, ("/repo/alpha.py", "/repo/beta.py"), strict=True
+        ):
+            request = call.args[0]
+            self.assertEqual(request.full_url, "http://relay.local/hook/observe-tool")
+            self.assertEqual(request.headers["Authorization"], "Bearer test-relay-token")
+            self.assertEqual(
+                json.loads(request.data),
+                {
+                    "hook_event_name": "PostToolUse",
+                    "tool_name": "apply_patch",
+                    "tool_input": {"changes": [{"path": path, "kind": {"type": "add"}}]},
+                    "tool_response": {"type": "success"},
+                },
             )
         self.assertEqual((self.bridge_dir / "state.json").read_bytes(), self.parent_bridge)
         self.assertFalse(any(path == "/v1/sessions/parent/events" for path, _ in self.posts))

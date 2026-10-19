@@ -3248,6 +3248,7 @@ async def _handle_event(
             delta_coalescer=delta_coalescer,
             forwarder_state=item_state,
             bridge_dir=event_bridge_dir,
+            file_observer_bridge_dir=bridge_dir,
         )
 
 
@@ -4031,6 +4032,7 @@ async def _handle_completed_event(
     delta_coalescer: _OutputTextDeltaCoalescer | None,
     forwarder_state: _CodexForwarderState | None,
     bridge_dir: Path | None = None,
+    file_observer_bridge_dir: Path | None = None,
 ) -> None:
     """
     Flush pending text and mirror one completed Codex item.
@@ -4042,6 +4044,7 @@ async def _handle_completed_event(
         before the completed item.
     :param forwarder_state: Optional state that records completed
         Plan-mode items.
+    :param file_observer_bridge_dir: Runner relay directory shared by native children.
     :returns: None.
     """
     if delta_coalescer is not None:
@@ -4049,7 +4052,12 @@ async def _handle_completed_event(
     if forwarder_state is not None:
         forwarder_state.record_completed_plan(params)
     await _handle_completed_item(
-        client, session_id, params, forwarder_state=forwarder_state, bridge_dir=bridge_dir
+        client,
+        session_id,
+        params,
+        forwarder_state=forwarder_state,
+        bridge_dir=bridge_dir,
+        file_observer_bridge_dir=file_observer_bridge_dir,
     )
 
 
@@ -5282,6 +5290,7 @@ async def _handle_completed_item(
     *,
     forwarder_state: _CodexForwarderState | None = None,
     bridge_dir: Path | None = None,
+    file_observer_bridge_dir: Path | None = None,
 ) -> None:
     """Serialize and forward one completed Codex transcript item."""
     async with _conversation_item_delivery_scope(session_id):
@@ -5291,6 +5300,7 @@ async def _handle_completed_item(
             params,
             forwarder_state=forwarder_state,
             bridge_dir=bridge_dir,
+            file_observer_bridge_dir=file_observer_bridge_dir,
         )
 
 
@@ -5301,6 +5311,7 @@ async def _handle_completed_item_inner(
     *,
     forwarder_state: _CodexForwarderState | None = None,
     bridge_dir: Path | None = None,
+    file_observer_bridge_dir: Path | None = None,
 ) -> None:
     """
     Forward one Codex completed item event when it maps to Omnigent history.
@@ -5397,7 +5408,10 @@ async def _handle_completed_item_inner(
         return
     if item_type in _TOOL_ITEM_TYPES:
         if item_type == "fileChange":
-            await _observe_file_change(bridge_dir, item)
+            await _observe_file_change(
+                file_observer_bridge_dir if file_observer_bridge_dir is not None else bridge_dir,
+                item,
+            )
         await _post_tool_item(
             client,
             session_id,

@@ -17,7 +17,7 @@ parameterization produces additional collected cases.
 | [test_replay_order.py](test_replay_order.py) | Replay order | 4 |
 | [test_settings.py](test_settings.py) | Settings | 20 |
 | [test_side_chat.py](test_side_chat.py) | Side chat | 1 |
-| [test_subagents.py](test_subagents.py) | Subagents | 15 |
+| [test_subagents.py](test_subagents.py) | Subagents | 16 |
 | [test_turn_errors.py](test_turn_errors.py) | Turn errors | 21 |
 | [test_usage.py](test_usage.py) | Usage | 2 |
 | [test_user_messages.py](test_user_messages.py) | User messages | 4 |
@@ -38,7 +38,9 @@ publishes idle. They also cover UTF-8, JSON escaping, and the exact byte boundar
 
 The child-stream cases check live command starts and output, sibling isolation,
 interrupted text, late deltas, terminal errors, completion deduplication, and
-shutdown draining without changing the parent's bridge state.
+shutdown draining without changing the parent's bridge state. Child file edits
+still reach the shared runner's file observer, including when siblings use the
+same completed-item ID.
 
 ## Live child visibility
 
