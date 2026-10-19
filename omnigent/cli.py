@@ -2230,13 +2230,12 @@ def main() -> None:
     shape (``omnigent [--flags] [prompt]``) is rejected here so it
     cannot fall back to the legacy in-process runner path.
 
-    Also inserts the current working directory at ``sys.path[0]``
-    so dotted callables declared in user YAMLs (``callable:
-    mypackage.mymodule.my_fn``) resolve against the user's project,
-    not the console-script's install directory. Console entry
-    points put the script's own directory at sys.path[0] by
-    default, which is almost never what a CLI that imports
-    user-authored modules wants.
+    Also moves the current working directory to the end of
+    ``sys.path`` so dotted callables declared in user YAMLs
+    (``callable: mypackage.mymodule.my_fn``) resolve against the
+    user's project without taking precedence over the import paths
+    the interpreter already has, even when ``python -m`` put the
+    directory first.
 
     Sets up the always-on CLI diagnostics log before Click dispatch
     so unhandled exceptions are captured even when the user didn't
@@ -2258,8 +2257,8 @@ def main() -> None:
     _enforce_wrapper_guard()
 
     cwd = os.getcwd()
-    if cwd not in sys.path:
-        sys.path.insert(0, cwd)
+    sys.path[:] = [entry for entry in sys.path if entry != cwd]
+    sys.path.append(cwd)
 
     # Legacy-codepage stdio (Windows ANSI, C locale, PYTHONIOENCODING)
     # can't encode the CLI's glyphs; harden the streams before any command
@@ -14110,8 +14109,9 @@ _register_native_commands(cli)
 
 
 if __name__ == "__main__":
-    # Omnigent is already loaded from the selected installation. Restore the
-    # workspace path for local tools, matching the console entry point.
-    if (_cwd := os.getcwd()) not in sys.path:
-        sys.path.insert(0, _cwd)
+    # Omnigent is already loaded from the selected installation. Put the
+    # workspace path last for local tools, matching the console entry point.
+    _cwd = os.getcwd()
+    sys.path[:] = [_path for _path in sys.path if _path != _cwd]
+    sys.path.append(_cwd)
     cli()
