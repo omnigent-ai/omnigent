@@ -1,7 +1,7 @@
 # Claude program status prototype
 
 OMNI-12244 proposes using Claude Code's OSC 7501 reports to drive the working
-indicator. This prototype is disabled by default. It does not replace completion
+indicator. It is enabled by default with a startup kill switch. It does not replace completion
 hooks or enable the protocol for other harnesses.
 
 ## What determines working status today
@@ -50,30 +50,33 @@ reports for capable viewers. It forwards stdin, terminal dimensions and signals,
 reaps the command, and preserves its numeric exit code. It uses the runner's
 Python interpreter and a standard-library-only script.
 
-This adds a process and a PTY to an opted-in terminal. The tradeoff is reliable
+This adds a process and a PTY to each newly launched Claude-native terminal. The tradeoff is reliable
 negotiation with unmodified tmux and no dependency on browser attachment. A
 future tmux implementation of OSC 7501 could remove that need.
 
 ## Ownership and fallback
 
-Add `claude_osc_status` to the standard `OMNIGENT_FEATURES` enabled set in the
-**host/runner environment**, preserving any other enabled features:
+Claude OSC status is enabled by default, including when `OMNIGENT_FEATURES` is
+unset, empty, or contains only unrelated features. To disable it, add the
+negative override to the **host/runner environment**, preserving other entries:
 
 ```sh
-OMNIGENT_FEATURES=claude_osc_status
+OMNIGENT_FEATURES=-claude_osc_status
 ```
+
+Explicit disables win even if the positive name is also present.
 
 Restart the host and affected runners, then create a new Claude-native session.
 The host forwards the feature set through CLI → daemon → runner. Setting it only
-on a remote server does not enable it on separately running hosts. Directly
+on a remote server does not change it on separately running hosts. Directly
 launched runners read their own environment.
 
-The flag defaults off and is resolved once when the runner resource registry
+The flag is resolved once when the runner resource registry
 starts. It applies only to the Claude terminal role; it is neither a frontend
 capability nor part of portable agent specs. Existing terminals retain their
-launch configuration; this is not a hot switch for an active session. To roll
-back, remove only `claude_osc_status` from `OMNIGENT_FEATURES`, restart the
-host/runners, and launch a fresh terminal. The draft's earlier
+launch configuration; this is not a hot switch for an active session. To
+re-enable, remove `-claude_osc_status`, restart the host/runners, and launch a
+fresh terminal. The draft's earlier
 `OMNIGENT_CLAUDE_OSC_STATUS` toggle is replaced and no longer enables the relay.
 Review the temporary flag by release 0.20.0.
 
@@ -119,6 +122,7 @@ uv run --no-sync pytest \
   tests/harnesses/claude_native/test_claude_native_program_status.py \
   tests/server/test_feature_flags.py \
   tests/cli/test_host_daemon_env.py \
+  tests/host/test_local_server.py \
   --reruns 0 -n 4 --dist loadfile -q
 ```
 
@@ -137,10 +141,10 @@ runner environment builders into registry startup in local/remote server modes;
 they do not spawn a host daemon. These peers do not substitute for a real Claude
 canary.
 
-Before activation, verify with Claude 2.1.295 or later in an isolated dev runner:
+Verify with Claude 2.1.295 or later in an isolated dev runner:
 
-1. Add `claude_osc_status` to `OMNIGENT_FEATURES` on the host/runner, restart
-   those processes, and start a new Claude-native session.
+1. Leave `OMNIGENT_FEATURES` unset on the isolated host/runner to exercise the
+   default, restart those processes, and start a new Claude-native session.
 2. Submit a task with a long quiet tool operation. The indicator should stay
    working while the operation runs, including after closing and reopening the
    terminal viewer.
@@ -148,15 +152,17 @@ Before activation, verify with Claude 2.1.295 or later in an isolated dev runner
    answer it and confirm work resumes. Cancel another turn and confirm idle.
 4. Complete a turn and verify both idle display and the normal final message.
    Reconnect the runner tunnel and verify the state is restored.
-5. Repeat without the flag and with an older/non-emitting Claude version to check
-   the existing fallback. Do not set `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` when
+5. Repeat with `OMNIGENT_FEATURES=-claude_osc_status` to verify the kill switch,
+   and separately with an older/non-emitting Claude version under the default
+   to check the existing fallback. Do not set `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` when
    testing OSC: Claude also disables program status with that setting.
 
 The PR records the exact candidate, actual CLI checks and remaining gaps.
-Production acceptance requires Linux/bwrap, managed credential/proxy settings,
-real-provider turns, and web/desktop/mobile viewer checks. This prototype does
-not claim those paths from local parser or tmux results. A separate change should
-upgrade CI's Claude pin and decide activation after that evidence is available.
+Remaining acceptance includes actual Claude in Linux/bwrap, older-CLI fallback,
+managed Omnigent/broker-proxy settings, and wider desktop/mobile entry points.
+Local live-provider smoke and protocol-peer sandbox tests do not establish those
+paths. Default activation follows local smoke and manual feedback; the kill
+switch remains available. A separate change should upgrade CI's Claude pin.
 
 ## Sources
 

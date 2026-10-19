@@ -169,7 +169,7 @@ Cross-harness journeys:
 - **`working-status`, Claude (component and real-process checks):** run with
   plain `uv run --no-sync pytest`, `--reruns 0 -n 0`:
   `tests/runner/test_resource_registry.py::test_claude_program_status_real_launch_and_fallback`,
-  `tests/runner/test_resource_registry.py::test_program_status_is_opt_in_and_claude_only`,
+  `tests/runner/test_resource_registry.py::test_program_status_respects_flag_and_claude_role`,
   `tests/runner/test_resource_registry.py::test_queued_turn_republishes_running_after_stop`,
   `tests/runner/test_resource_registry.py::test_failed_hook_does_not_republish_stale_running_status`,
   `tests/harnesses/claude_native/test_claude_native_program_status.py`, and
@@ -181,8 +181,8 @@ Cross-harness journeys:
   tests pause real file reads; they are not elapsed-time or live-Claude canaries.
   Legacy-file and role-gating results do not prove other vendor CLIs ran.
 - **`working-status`, Claude (real CLI and browser):** requires Claude Code
-  2.1.295+ for OSC. In an isolated host/runner, add `claude_osc_status` to
-  `OMNIGENT_FEATURES`, restart and launch a fresh session. Do not set
+  2.1.295+ for OSC. In an isolated host/runner, leave `OMNIGENT_FEATURES` unset
+  to exercise the enabled default, restart and launch a fresh session. Do not set
   `CLAUDE_CODE_DISABLE_TERMINAL_TITLE`, which also suppresses program status.
   Confirm OSC negotiation and emitted Claude root state in the terminal evidence;
   flag-on alone does not prove the OSC path was exercised. Run the matrix's
@@ -196,8 +196,8 @@ Cross-harness journeys:
   Separately interrupt active work and complete a follow-up; queue a follow-up
   across completion and check it runs once. Compare Chat with the session REST
   status and keep a recording plus terminal transcript. Restart the isolated
-  runner and repeat with the flag off, and separately with a pre-2.1.295 CLI
-  with the flag on. Record each version, gate, sandbox and surface separately.
+  runner and repeat with `OMNIGENT_FEATURES=-claude_osc_status` (the kill
+  switch), and separately with a pre-2.1.295 CLI under the default. Record each version, gate, sandbox and surface separately.
   Machine-managed Claude provider settings can prevent the scripted endpoint
   from being used: report that blocker or use an isolated test container.
   Do not change machine policy to obtain a passing run.

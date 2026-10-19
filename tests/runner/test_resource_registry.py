@@ -59,7 +59,9 @@ async def test_claude_program_status_real_launch_and_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, protocol: str, sandbox_type: str
 ) -> None:
     """Exercise startup negotiation, raw PTY transport, status arbitration and cleanup."""
-    monkeypatch.setenv("OMNIGENT_FEATURES", "claude_osc_status" if protocol != "disabled" else "")
+    monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    if protocol == "disabled":
+        monkeypatch.setenv("OMNIGENT_FEATURES", "-claude_osc_status")
     config = tmp_path / "claude-config"
     sessions = config / "sessions"
     sessions.mkdir(parents=True)
@@ -201,22 +203,35 @@ async def test_claude_program_status_real_launch_and_fallback(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("role", "enabled", "expected"),
+    ("role", "features", "expected"),
     [
-        (CLAUDE_NATIVE_TERMINAL_ROLE, False, None),
-        (PI_NATIVE_TERMINAL_ROLE, True, None),
-        (CLAUDE_NATIVE_TERMINAL_ROLE, True, "claude-code"),
+        (CLAUDE_NATIVE_TERMINAL_ROLE, None, "claude-code"),
+        (CLAUDE_NATIVE_TERMINAL_ROLE, "", "claude-code"),
+        (CLAUDE_NATIVE_TERMINAL_ROLE, "usage_page", "claude-code"),
+        (CLAUDE_NATIVE_TERMINAL_ROLE, "claude_osc_status", "claude-code"),
+        (CLAUDE_NATIVE_TERMINAL_ROLE, "-claude_osc_status", None),
+        (PI_NATIVE_TERMINAL_ROLE, None, None),
+        (CODEX_NATIVE_TERMINAL_ROLE, None, None),
+        (None, None, None),
     ],
 )
-async def test_program_status_is_opt_in_and_claude_only(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, role: str, enabled: bool, expected: str | None
+async def test_program_status_respects_flag_and_claude_role(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    role: str | None,
+    features: str | None,
+    expected: str | None,
 ) -> None:
-    monkeypatch.setenv("OMNIGENT_FEATURES", "claude_osc_status" if enabled else "")
+    monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    if features is not None:
+        monkeypatch.setenv("OMNIGENT_FEATURES", features)
     monkeypatch.setenv("OMNIGENT_CLAUDE_OSC_STATUS", "1")
     terminals = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminals)
     # Like server release flags, the runner keeps one startup snapshot.
-    monkeypatch.setenv("OMNIGENT_FEATURES", "" if enabled else "claude_osc_status")
+    monkeypatch.setenv(
+        "OMNIGENT_FEATURES", "-claude_osc_status" if expected else "claude_osc_status"
+    )
     seen = []
 
     async def launch(**kwargs):
