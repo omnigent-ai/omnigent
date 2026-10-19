@@ -117,6 +117,13 @@ Other harnesses use the owning scenario's isolated setup. A missing vendor CLI
 or credential must remain visible. Do not change global rollout settings or
 reuse a developer daemon to obtain a passing result.
 
+For mock journeys, verify that the test's unique user prompt reaches the mock
+under the intended model. A reply that echoes an expected token, or a nonzero
+background-request count, is insufficient. Native Claude mock sessions reject
+conflicting machine-managed routing before launch; isolated user directories
+do not override machine policy. Run on a clean container/CI host and record the
+blocked local attempt separately (see [native prerequisites](./native-harnesses.md#driving-it-with-the-repro-environment)).
+
 For an **authorized** live bench slice, use an explicit harness/model and require
 observations. This example runs SDK Pi; select `pi-native` separately for native:
 

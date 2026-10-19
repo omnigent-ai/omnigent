@@ -90,6 +90,14 @@ def test_workspace_tab_overflow(page: Page, seeded_session: BrowserSession, widt
     page.screenshot(path=f"/tmp/omnigent-tab-picker-{width}.png")
     page.get_by_role("menuitem", name=paths[-1], exact=True).click()
     expect(page.locator('[data-testid="file-viewer"]:visible')).to_contain_text("Panel 11")
+    # Radix refocuses the trigger from a timer queued after the menu unmounts; a
+    # mouse pick must skip that or the tooltip re-opens. Give that timer a short,
+    # bounded window before asserting that focus and the tooltip stayed away.
+    expect(page.get_by_role("menu")).to_have_count(0)
+    page.mouse.move(500, 500)
+    page.wait_for_timeout(100)
+    expect(toolbar.get_by_role("button", name="Select panel")).not_to_be_focused()
+    expect(page.get_by_role("tooltip")).to_have_count(0)
     active_tab = viewport.locator('[role="button"][aria-current="true"]')
     assert active_tab.evaluate(
         """el => {

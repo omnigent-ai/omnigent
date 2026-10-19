@@ -10,6 +10,10 @@ description: >
   the gate tests refs/pull/N/merge; backcompat needs fetch-depth 0 for tags).
 
 inputs:
+  dependency_smoke:
+    description: Run the existing cross-component compatibility smoke suite.
+    required: false
+    default: "false"
   shard_id:
     description: "pytest-shard shard index"
     required: true
@@ -191,6 +195,7 @@ runs:
         SHARD_ID: ${{ inputs.shard_id }}
         NUM_SHARDS: ${{ inputs.num_shards }}
         NIGHTLY_FULL: ${{ inputs.nightly_full }}
+        DEPENDENCY_SMOKE: ${{ inputs.dependency_smoke }}
         E2E_TMP_BASE: /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}
         PYTEST_PROGRESS_LOG_DIR: /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/progress
         OMNIGENT_TOKEN_USAGE_JSON: /tmp/omnigent-e2e-${{ github.run_id }}-shard${{ inputs.shard_id }}/tokens.json
@@ -205,7 +210,9 @@ runs:
         mkdir -p "$E2E_TMP_BASE"
 
         EXTRA_ARGS=()
-        if [[ "$NIGHTLY_FULL" != "true" ]]; then
+        if [[ "$DEPENDENCY_SMOKE" == "true" ]]; then
+          EXTRA_ARGS+=(-m "compat_smoke and not nightly" -p tests._helpers.required_tests)
+        elif [[ "$NIGHTLY_FULL" != "true" ]]; then
           EXTRA_ARGS+=(-m "not nightly")
         fi
 
@@ -227,7 +234,7 @@ runs:
           --junitxml="$E2E_TMP_BASE/junit.xml" \
           -v --tb=long --showlocals --log-level=INFO -r a \
           "${EXTRA_ARGS[@]}" \
-          || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
+          || { rc=$?; [ "$rc" -eq 5 ] && [ "$DEPENDENCY_SMOKE" != "true" ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
 
     - name: Upload server logs on failure
       # cancelled() too: failure() misses step timeouts (#426).
