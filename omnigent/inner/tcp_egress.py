@@ -147,7 +147,9 @@ class _TcpHandler(socketserver.BaseRequestHandler):
             if not isinstance(request, dict) or set(request) != {"token", "route"}:
                 raise TcpEgressDenied("TCP egress request must name only one route")
             token = request.get("token")
-            if not isinstance(token, str) or not hmac.compare_digest(token, broker.token):
+            if not isinstance(token, str) or not hmac.compare_digest(
+                token.encode(), broker.token.encode()
+            ):
                 raise TcpEgressDenied("TCP egress capability is invalid")
             requested_route = request.get("route")
             if not isinstance(requested_route, str) or requested_route not in broker.routes:

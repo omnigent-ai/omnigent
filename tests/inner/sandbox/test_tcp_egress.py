@@ -526,6 +526,22 @@ def test_tcp_route_cannot_use_other_brokers_token(
         second.stop()
 
 
+def test_tcp_broker_rejects_non_ascii_capability(
+    tcp_route: TcpEgressRoute, broker_dir: Path
+) -> None:
+    broker = start_tcp_egress_broker([tcp_route], broker_dir)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(3)
+            client.connect(str(broker.socket_path))
+            request = json.dumps({"token": "not-\u00e9-valid", "route": tcp_route.name}).encode()
+            client.sendall(struct.pack("!I", len(request)) + request)
+            assert client.recv(1) == b"\x01"
+            assert b"capability is invalid" in client.recv(1024)
+    finally:
+        broker.stop()
+
+
 def test_tcp_broker_does_not_accept_client_selected_port(
     tcp_route: TcpEgressRoute, broker_dir: Path
 ) -> None:
