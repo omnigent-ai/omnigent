@@ -70,6 +70,14 @@ def test_hook_refusal_sends_one_enter_and_keeps_delivery_unconfirmed(
             snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=15).json()
             bridge_id = snapshot["labels"].get(bridge.BRIDGE_ID_LABEL_KEY) or session_id
             native = bridge.bridge_dir_for_bridge_id(bridge_id)
+            # The retry guard needs native identity before capturing the submit boundary.
+            deadline = time.monotonic() + 60
+            while (
+                bridge.read_claude_session_id(native) is None
+                or bridge.read_transcript_path(native) is None
+            ):
+                assert time.monotonic() < deadline, "Claude did not publish its session identity"
+                time.sleep(0.05)
             original_tmux = bridge._run_tmux
             submit_enters = 0
 
