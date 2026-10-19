@@ -45,6 +45,7 @@ from tests.server.conftest import ControllableMockClient
 from tests.server.helpers import (
     build_agent_bundle,
     create_test_agent,
+    register_test_runner,
     start_session_stream_collector,
 )
 
@@ -54,23 +55,8 @@ pytestmark = pytest.mark.asyncio
 # ── Fixtures ─────────────────────────────────────────────────
 
 
-@pytest.fixture()
-def auth_app(
-    runtime_init: None,
-    db_uri: str,
-    tmp_path: Path,
-) -> FastAPI:
-    """App fixture with permission store enabled.
-
-    Mirrors the shared ``app`` fixture from ``conftest.py`` but adds
-    a :class:`SqlAlchemyPermissionStore` so
-    :class:`UnifiedAuthProvider` and permission checks are active on
-    all session routes.
-
-    :param runtime_init: Fixture that initializes the runtime with a mock LLM.
-    :param db_uri: Test database URI.
-    :param tmp_path: Pytest temporary directory fixture.
-    """
+def _build_auth_app(db_uri: str, tmp_path: Path, **extra: Any) -> FastAPI:
+    """Permission-store app in strict header mode; *extra* goes to ``create_app``."""
     from omnigent.server.auth import UnifiedAuthProvider
 
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
@@ -91,7 +77,31 @@ def auth_app(
         # create_auth_provider() so ambient OMNIGENT_* env vars in
         # the test runner can't flip the mode.
         auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        **extra,
     )
+
+
+@pytest.fixture()
+def auth_app(
+    request: pytest.FixtureRequest,
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+) -> FastAPI:
+    """App fixture with permission store enabled.
+
+    Mirrors the shared ``app`` fixture from ``conftest.py`` but adds
+    a :class:`SqlAlchemyPermissionStore` so
+    :class:`UnifiedAuthProvider` and permission checks are active on
+    all session routes. Indirect parametrization may pass extra
+    ``create_app`` keyword arguments.
+
+    :param request: Fixture request carrying optional ``create_app`` overrides.
+    :param runtime_init: Fixture that initializes the runtime with a mock LLM.
+    :param db_uri: Test database URI.
+    :param tmp_path: Pytest temporary directory fixture.
+    """
+    return _build_auth_app(db_uri, tmp_path, **getattr(request, "param", {}))
 
 
 @pytest.fixture()
@@ -664,6 +674,214 @@ async def test_edit_grant_blocked_from_stop_session_requires_owner(
         f"The session owner should pass the stop_session owner gate "
         f"and get 202, got {resp.status_code}: {resp.text}"
     )
+
+
+_CODEX_FULL_ACCESS_EVENT = {
+    "type": "external_codex_approval_mode_change",
+    "data": {
+        "terminal_launch_args": ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
+        "approval_mode": "full-access",
+    },
+}
+_CLAUDE_BYPASS_EVENT = {
+    "type": "external_permission_mode_change",
+    "data": {"permission_mode": "bypassPermissions", "initial_observation": False},
+}
+_BOUND_RUNNER_TOKEN = "repro-bound-runner-token"
+_UNRELATED_RUNNER_TOKEN = "repro-unrelated-runner-token"
+_POOL_RUNNER_TOKEN = "pool-runner-token"
+
+
+async def _snapshot_as(client: httpx.AsyncClient, session_id: str, user: str) -> dict[str, Any]:
+    resp = await client.get(f"/v1/sessions/{session_id}", headers={"X-Forwarded-Email": user})
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+async def _bind_token_runner(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    session_id: str,
+    *,
+    owner: str,
+    binding_token: str,
+) -> None:
+    """Register an online runner for *binding_token* and bind the session to it as *owner*.
+
+    The runner is only a tunnel-registry entry; the bind-time runner client is stubbed out.
+    """
+    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.server.routes import sessions as sessions_module
+
+    runner_id = token_bound_runner_id(binding_token)
+    register_test_runner(app, runner_id, harnesses=["claude-native", "codex-native"], owner=owner)
+
+    async def _no_runner_client(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    with monkeypatch.context() as bind_scope:
+        bind_scope.setattr(sessions_module, "_get_runner_client", _no_runner_client)
+        resp = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"runner_id": runner_id},
+            headers={"X-Forwarded-Email": owner},
+        )
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.parametrize(
+    ("event", "label_key"),
+    [
+        pytest.param(
+            _CODEX_FULL_ACCESS_EVENT, "omnigent.codex_native.approval_mode", id="codex-approval"
+        ),
+        pytest.param(
+            _CLAUDE_BYPASS_EVENT, "omnigent.claude_native.permission_mode", id="claude-permission"
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("grant_level", "runner_token"),
+    [
+        pytest.param(LEVEL_EDIT, None, id="editor"),
+        pytest.param(LEVEL_MANAGE, None, id="manager"),
+        pytest.param(LEVEL_EDIT, _UNRELATED_RUNNER_TOKEN, id="editor-unbound-runner-token"),
+    ],
+)
+async def test_collaborator_cannot_persist_native_approval_settings_via_events(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    event: dict[str, Any],
+    label_key: str,
+    grant_level: int,
+    runner_token: str | None,
+) -> None:
+    """Native approval-settings events need the owner or the session's bound runner.
+
+    Rewrites ``terminal_launch_args``: an Edit/Manage grant or unbound runner token is not enough.
+    """
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+
+    agent = await create_test_agent(auth_client, user="bryan")
+    session_id = (await _create_session_as(auth_client, agent["id"], "user-a"))["id"]
+    resp = await _grant_permission(
+        auth_client, session_id, granter="user-a", target_user="user-b", level=grant_level
+    )
+    assert resp.status_code == 200
+    await _bind_token_runner(
+        auth_app,
+        auth_client,
+        monkeypatch,
+        session_id,
+        owner="user-a",
+        binding_token=_BOUND_RUNNER_TOKEN,
+    )
+    before = await _snapshot_as(auth_client, session_id, "user-a")
+    headers = {"X-Forwarded-Email": "user-b"}
+    if runner_token is not None:
+        headers[RUNNER_TUNNEL_TOKEN_HEADER] = runner_token
+
+    collector = await start_session_stream_collector(session_id)
+    try:
+        resp = await auth_client.post(
+            f"/v1/sessions/{session_id}/events", json=event, headers=headers
+        )
+
+        assert resp.status_code == 403, (
+            f"user-b (level {grant_level}, runner token {runner_token!r}) should be blocked "
+            f"from {event['type']}, got {resp.status_code}: {resp.text}"
+        )
+        after = await _snapshot_as(auth_client, session_id, "user-a")
+        assert after["terminal_launch_args"] == before["terminal_launch_args"]
+        assert label_key not in after["labels"]
+        # A rejected event must not move the owner's live picker either.
+        await collector.assert_no_event(within=0.2)
+    finally:
+        await collector.stop()
+
+
+async def test_owner_and_bound_runner_persist_native_approval_settings_via_events(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The owner-authenticated forwarder and the bound runner keep persisting."""
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+
+    agent = await create_test_agent(auth_client, user="bryan")
+    session_id = (await _create_session_as(auth_client, agent["id"], "user-a"))["id"]
+    events = f"/v1/sessions/{session_id}/events"
+
+    resp = await auth_client.post(
+        events, json=_CLAUDE_BYPASS_EVENT, headers={"X-Forwarded-Email": "user-a"}
+    )
+    assert resp.status_code == 202, resp.text
+    snapshot = await _snapshot_as(auth_client, session_id, "user-a")
+    assert snapshot["terminal_launch_args"] == ["--permission-mode", "bypassPermissions"]
+    assert snapshot["labels"]["omnigent.claude_native.permission_mode"] == "bypassPermissions"
+
+    # A guest runner on a shared host posts as a non-owner collaborator but
+    # proves itself with the tunnel token bound to this session's runner id.
+    resp = await _grant_permission(
+        auth_client, session_id, granter="user-a", target_user="user-b", level=LEVEL_EDIT
+    )
+    assert resp.status_code == 200
+    await _bind_token_runner(
+        auth_app,
+        auth_client,
+        monkeypatch,
+        session_id,
+        owner="user-a",
+        binding_token=_BOUND_RUNNER_TOKEN,
+    )
+    resp = await auth_client.post(
+        events,
+        json=_CODEX_FULL_ACCESS_EVENT,
+        headers={"X-Forwarded-Email": "user-b", RUNNER_TUNNEL_TOKEN_HEADER: _BOUND_RUNNER_TOKEN},
+    )
+    assert resp.status_code == 202, resp.text
+    snapshot = await _snapshot_as(auth_client, session_id, "user-a")
+    assert snapshot["terminal_launch_args"] == [
+        "--permission-mode",
+        "bypassPermissions",
+        *_CODEX_FULL_ACCESS_EVENT["data"]["terminal_launch_args"],
+    ]
+    assert snapshot["labels"]["omnigent.codex_native.approval_mode"] == "full-access"
+
+
+@pytest.mark.parametrize(
+    "auth_app",
+    [{"runner_tunnel_tokens": frozenset({_POOL_RUNNER_TOKEN})}],
+    indirect=True,
+    ids=["pool-token"],
+)
+async def test_pool_runner_token_persists_native_approval_settings_via_events(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """A runner presenting a server-configured tunnel token has runner authority."""
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+
+    client = auth_client
+    agent = await create_test_agent(client, user="bryan")
+    session_id = (await _create_session_as(client, agent["id"], "user-a"))["id"]
+    resp = await _grant_permission(
+        client, session_id, granter="user-a", target_user="user-b", level=LEVEL_EDIT
+    )
+    assert resp.status_code == 200
+    events = f"/v1/sessions/{session_id}/events"
+    headers = {"X-Forwarded-Email": "user-b", RUNNER_TUNNEL_TOKEN_HEADER: "not-the-pool-token"}
+
+    resp = await client.post(events, json=_CLAUDE_BYPASS_EVENT, headers=headers)
+    assert resp.status_code == 403, resp.text
+
+    headers[RUNNER_TUNNEL_TOKEN_HEADER] = _POOL_RUNNER_TOKEN
+    resp = await client.post(events, json=_CLAUDE_BYPASS_EVENT, headers=headers)
+    assert resp.status_code == 202, resp.text
+    snapshot = await _snapshot_as(client, session_id, "user-a")
+    assert snapshot["terminal_launch_args"] == ["--permission-mode", "bypassPermissions"]
+    assert snapshot["labels"]["omnigent.claude_native.permission_mode"] == "bypassPermissions"
 
 
 async def test_share_workspace_files_requires_manage_and_reflects_in_snapshot(

@@ -725,6 +725,15 @@ _RUNNER_EVENT_TYPES = frozenset(
     }
 )
 
+# These rewrite the approval/sandbox ``terminal_launch_args`` the next relaunch
+# runs with, so an Edit/Manage grant is not enough to post them.
+_NATIVE_APPROVAL_SETTINGS_EVENT_TYPES = frozenset(
+    {
+        _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
+        _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
+    }
+)
+
 
 def register_events_routes(
     router: APIRouter,
@@ -988,8 +997,13 @@ def register_events_routes(
         - ``"external_codex_collaboration_mode_change"`` persists the
           Codex app-server collaboration mode kind as an internal session label
           (``omnigent.codex_native.collaboration_mode``).
-        - ``"external_codex_approval_mode_change"`` persists Codex
-          approval/sandbox ``terminal_launch_args``.
+        - ``"external_permission_mode_change"`` /
+          ``"external_codex_approval_mode_change"`` persist the
+          pane-observed Claude permission mode / Codex approval+sandbox
+          settings into ``terminal_launch_args`` and a mode label. Only
+          the owner or a runner-authorized caller (a tunnel token bound to
+          the session's runner, or a server-configured runner token) may
+          post them.
         - ``"stop_session"`` terminates the live session without
           deleting the conversation (owner-only). Forwarded
           harness-agnostically to the runner, which hard-kills the
@@ -1025,6 +1039,13 @@ def register_events_routes(
         :raises OmnigentError: 404 if no session exists.
         """
         user_id, conv = await _authorized_conversation(request, session_id)
+        if (
+            body.type in _NATIVE_APPROVAL_SETTINGS_EVENT_TYPES
+            and not _has_runner_created_by_authority(request, conv)
+        ):
+            await _require_access(
+                user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+            )
         if in_flight is not None:
             # Marked only after authorization, so an unauthorized caller
             # cannot flip a session to "running" even transiently.
