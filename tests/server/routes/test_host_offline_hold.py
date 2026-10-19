@@ -186,3 +186,15 @@ async def test_relay_finds_an_offline_host_through_a_side_chats_source(
     monkeypatch.setattr(orchestration, "get_server_host_registry", lambda: _FakeRegistry(False))
 
     assert await orchestration._relay_host_offline("side", store) is expected  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("2000", True), ("1000", False), ("not-a-time", False), (None, False)],
+)
+def test_host_offline_hold_active_reads_an_unexpired_deadline(
+    value: str | None, expected: bool
+) -> None:
+    """Only a deadline still ahead marks a held session; anything else reads as no hold."""
+    labels = {} if value is None else {orchestration.HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY: value}
+    assert orchestration.host_offline_hold_active(labels, now=1500.0) is expected

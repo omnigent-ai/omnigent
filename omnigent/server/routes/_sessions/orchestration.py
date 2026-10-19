@@ -8052,6 +8052,25 @@ _MID_TURN_STATUSES = ("running", "waiting")
 HOST_OFFLINE_HOLD_S: float = 24 * 3600.0
 # How often a held runner re-checks its host and cross-replica liveness.
 _HOST_OFFLINE_RECHECK_S: float = 60.0
+# Label holding a held session's deadline (epoch seconds). Other replicas
+# have neither the hold nor the runner's tunnel, so the label is how their
+# orphan cleanup tells a held turn from an abandoned one.
+HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY = "omnigent.host_offline_hold_until"
+
+
+def host_offline_hold_active(labels: Mapping[str, str], now: float) -> bool:
+    """
+    Report whether a session's labels carry an unexpired host-offline hold.
+
+    :param labels: The session's labels.
+    :param now: Epoch seconds to compare the deadline against.
+    :returns: ``True`` while the hold's deadline is in the future.
+    """
+    raw = labels.get(HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY)
+    try:
+        return raw is not None and float(raw) > now
+    except ValueError:
+        return False
 
 
 async def _host_offline_state(host_id: str | None) -> bool | None:

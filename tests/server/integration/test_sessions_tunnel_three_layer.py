@@ -2451,6 +2451,7 @@ async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
         "recheck_error",
         "nested",
         "reconnect_at_expiry",
+        "list_during_hold",
     ],
 )
 async def test_runner_disconnect_holds_turn_while_host_offline(
@@ -2476,7 +2477,9 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
     ap_app = tunnel_three_layer_stack.ap_app
     grace = 0.2
     # Long holds for outcomes that must not race the deadline.
-    hold = {"reconnect": 1.0, "host_back_without_runner": 30.0}.get(scenario, 0.6)
+    hold = {"reconnect": 1.0, "host_back_without_runner": 30.0, "list_during_hold": 30.0}.get(
+        scenario, 0.6
+    )
     monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
     monkeypatch.setattr("omnigent.server.routes.sessions.HOST_OFFLINE_HOLD_S", hold)
     monkeypatch.setattr("omnigent.server.routes.sessions._HOST_OFFLINE_RECHECK_S", 0.05)
@@ -2582,6 +2585,33 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
                 )
                 await asyncio.sleep(hold * 1.5)
                 assert sessions_module._session_status_cache.get(session_id) == "running"
+            elif scenario == "list_during_hold":
+                # Another replica serving the owner's list has neither the hold
+                # nor a cached status, and the runner's stamp was cleared.
+                store.set_session_live_status(held_id, "running")
+                sessions_module._session_status_cache.pop(held_id, None)
+                listed = await ap_client.get("/v1/sessions")
+                assert listed.status_code == 200, listed.text
+                refreshed = store.get_conversation(held_id)
+                assert refreshed is not None
+                assert refreshed.live_status == "running"
+                assert sessions_module.HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY in refreshed.labels
+                # The runner returns, so the hold ends and takes its label with it.
+                reconnect = await _connect_runner_tunnel(ap_app, runner_id)
+                await _send_hello_and_wait(
+                    reconnect, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
+                )
+
+                async def _label_cleared() -> None:
+                    while True:
+                        row = store.get_conversation(held_id)
+                        if row is not None and (
+                            sessions_module.HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY not in row.labels
+                        ):
+                            return
+                        await asyncio.sleep(0.02)
+
+                await asyncio.wait_for(_label_cleared(), timeout=budget(5.0))
             elif scenario == "reconnect_at_expiry":
 
                 async def _reconnected() -> None:
@@ -2640,6 +2670,7 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             "recheck_error": "expired",
             "nested": "expired",
             "reconnect_at_expiry": "expired",
+            "list_during_hold": "runner_reconnected",
         }[scenario]
         assert [r["attributes"]["outcome"] for r in ended] == [expected_outcome]
     finally:

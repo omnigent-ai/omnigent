@@ -606,6 +606,8 @@ from omnigent.server.routes._sessions.helpers import (
 # native-terminal launch, MCP tool calls) live in _sessions.orchestration.
 from omnigent.server.routes._sessions.orchestration import (
     HOST_OFFLINE_HOLD_S as HOST_OFFLINE_HOLD_S,
+    HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY as HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY,
+    host_offline_hold_active as host_offline_hold_active,
     RUNNER_DISCONNECT_GRACE_S as RUNNER_DISCONNECT_GRACE_S,
     _HOST_OFFLINE_RECHECK_S as _HOST_OFFLINE_RECHECK_S,
     _host_offline_state as _host_offline_state,

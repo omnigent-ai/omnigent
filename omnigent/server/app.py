@@ -3722,6 +3722,7 @@ def create_app(
         from omnigent.server.routes.sessions import (
             _HOST_OFFLINE_RECHECK_S,
             HOST_OFFLINE_HOLD_S,
+            HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY,
             RUNNER_DISCONNECT_GRACE_S,
             _host_offline_state,
             _log_host_offline_hold,
@@ -3741,6 +3742,8 @@ def create_app(
         )
         # A crash report cancels the hold; its end still gets a row.
         outcome = "cancelled"
+        hold_until = str(int(time.time() + HOST_OFFLINE_HOLD_S))
+        await _mark_hold(held, {HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY: hold_until})
         try:
             while True:
                 now = loop.time()
@@ -3791,7 +3794,35 @@ def create_app(
                 outcome=outcome,
                 held_s=round(loop.time() - started, 3),
             )
+            # Shielded so a crash report's cancel can't strand the label.
+            await asyncio.shield(_mark_hold(held, None))
         return outcome
+
+    async def _mark_hold(held: "list[Conversation]", labels: dict[str, str] | None) -> None:
+        """Set or clear the host-offline hold label on each held session.
+
+        Best-effort: an expired label is ignored anyway, so a failed write only
+        delays the next replica's orphan cleanup to the deadline.
+        """
+        from omnigent.server.routes.sessions import HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY
+
+        for conv in held:
+            try:
+                if labels is None:
+                    await asyncio.to_thread(
+                        conversation_store.delete_label,
+                        conv.id,
+                        HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY,
+                    )
+                else:
+                    await asyncio.to_thread(conversation_store.set_labels, conv.id, labels)
+            except Exception:  # noqa: BLE001 — the label only advises other replicas
+                _logger.warning(
+                    "Host-offline hold label write failed for session=%s",
+                    conv.id,
+                    exc_info=True,
+                    extra={"session_id": conv.id},
+                )
 
     async def _on_runner_disconnect(runner_id: str, connection: RunnerSession) -> None:
         """Schedule offline-marking for the turns *this* runner interrupted.

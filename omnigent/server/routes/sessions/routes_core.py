@@ -186,6 +186,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _spawn_archive_stop,
     _validate_session_model_selection,
     ensure_runner_connected,
+    host_offline_hold_active,
 )
 from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
@@ -1711,6 +1712,7 @@ def register_core_routes(
         # through to liveness_lookup, which additionally rules out a runner
         # whose tunnel is live on THIS replica before we settle.
         if liveness_lookup is not None:
+            now = time.time()
             orphan_suspects = [
                 conv
                 for conv in page.data
@@ -1719,6 +1721,8 @@ def register_core_routes(
                 and conv.live_status in ("running", "waiting")
                 and _session_status_cache.get(conv.id) is None
                 and not runner_seen_is_fresh(conv.runner_last_seen)
+                # Another replica is holding this turn for its offline host.
+                and not host_offline_hold_active(conv.labels, now)
                 and (
                     permission_store is None
                     or _permission_level_from_grants(
