@@ -880,3 +880,32 @@ async def test_sign_in_refusal_is_reported_when_the_stream_breaks_after_it(
     assert sid not in app.state.sign_in_holds
     assert not app.state.session_message_buffers.get(sid)
     assert not server.notices("databricks_sign_in_pending")
+
+
+@pytest.mark.asyncio
+async def test_sign_in_refusal_is_reported_when_a_resync_cancels_the_turn() -> None:
+    """A respawn or model-switch resync that ends the refused turn still reports it undelivered."""
+    harness = _PausedStreamHarness([_REFUSED, _DELIVERED])
+    app, _harness, server = _build_app([], harness=harness)
+    sid = uuid.uuid4().hex
+    async with _runner_client(app) as client:
+        await _create_session(client, sid)
+        await client.post(
+            f"/v1/sessions/{sid}/events", json={**_message("first"), "stable_id": _STABLE_ID}
+        )
+        async with asyncio.timeout(5):
+            await harness.frames_sent.wait()
+        await app.state.resync_turn_state(
+            sid, "harness_respawn_model_switch", owner_response_id="resp_1"
+        )
+        await _until(lambda: sid not in app.state.active_turns)
+        await asyncio.sleep(0.05)
+
+    (refusal,) = [e for e in _published(app, sid) if e.get("type") == "response.failed"]
+    assert refusal["error"]["code"] == "databricks_sign_in_pending"
+    assert refusal["error"]["undelivered"] is True
+    assert refusal["input_stable_id"] == _STABLE_ID
+    assert len(harness.posted_bodies) == 1
+    assert sid not in app.state.sign_in_holds
+    assert not app.state.session_message_buffers.get(sid)
+    assert not server.notices("databricks_sign_in_pending")

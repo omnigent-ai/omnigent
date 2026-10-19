@@ -6467,16 +6467,19 @@ def create_runner_app(
                         # A newer turn took the session, or an interrupt or Stop cancelled
                         # this one meanwhile: report the refusal as usual.
                         _report_held_refusal()
-                    if _held_refusal is not None and _stream_failed_error is not None:
+                    _holding = _held_refusal is not None and _stream_failed_error is not None
+                    if _holding:
                         _hold_message_for_sign_in(conv_id, _stream_failed_error)
+                        # Queued again: there is nothing left to report however the turn ends.
+                        _held_refusal = None
                     # _on_proxy_stream_end clears any claude-sdk `/compact`
                     # spinner (publishing `failed` when no compaction landed);
                     # it is the single convergence point for every turn-end path.
                     _on_proxy_stream_end(
                         conv_id,
-                        error=None if _held_refusal is not None else _stream_failed_error,
+                        error=None if _holding else _stream_failed_error,
                         owner_response_id=_response_id,
-                        sign_in_hold=_held_refusal is not None,
+                        sign_in_hold=_holding,
                     )
 
             except _ContextWindowOverflow as overflow:
@@ -6565,6 +6568,14 @@ def create_runner_app(
                     source="harness",
                     input_stable_id=turn_input_stable_id,
                 )
+
+            except asyncio.CancelledError:
+                if conv_id in _desynced_sessions:
+                    # A respawn or model-switch resync tore the turn down: a kept refusal
+                    # still reports its message undelivered. Stop and interrupt don't cancel
+                    # this stream; they drop the message and finalization reports it.
+                    _report_held_refusal()
+                raise
 
         return StreamingResponse(
             proxy_stream(),
