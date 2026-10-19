@@ -200,7 +200,7 @@ function createArcaConnectFlow({
             runCommand();
             return;
           }
-          // The user's Connect click covers sign-in, so start it without a second prompt.
+          // The user's Connect click covers sign-in, so it starts without its own prompt.
           if (!login && result.authError && !loginAttempted) {
             loginAttempted = true;
             log(`arca connect: ${serverUrl} needs sign-in; starting it`);

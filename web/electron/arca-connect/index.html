@@ -55,6 +55,11 @@
         background: Canvas;
         user-select: none;
       }
+      /* The consent card grows with its copy, so the measured height keeps its bottom padding. */
+      body[data-phase="asking"] {
+        height: auto;
+        min-height: 100%;
+      }
       h1 {
         margin: 0;
         font-size: 15px;

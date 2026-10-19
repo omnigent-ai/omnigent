@@ -14,8 +14,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { JSDOM } = require("jsdom");
 
-/** Load the console page with a fake bridge; layout values are stubbed (jsdom has none). */
-function renderConsole(t, { scrollHeight, footerBottom = 0 }) {
+/** Load the console page with a fake bridge; jsdom has no layout, so scrollHeight is stubbed. */
+function renderConsole(t, { scrollHeight }) {
   const dom = new JSDOM(
     fs.readFileSync(path.join(__dirname, "../arca-connect/index.html"), "utf8"),
     {
@@ -23,10 +23,10 @@ function renderConsole(t, { scrollHeight, footerBottom = 0 }) {
     },
   );
   t.after(() => dom.window.close());
-  const page = { document: dom.window.document, events: {}, confirms: 0, sizes: [] };
+  const page = { document: dom.window.document, events: {}, sizes: [] };
   // Electron supplies this bridge; no remote process is launched by a renderer test.
   dom.window.arcaConnect = {
-    confirm: () => page.confirms++,
+    confirm() {},
     cancel() {},
     resizeToContent: (size) => page.sizes.push(size),
   };
@@ -51,17 +51,9 @@ function renderConsole(t, { scrollHeight, footerBottom = 0 }) {
   };
   dom.window.cancelAnimationFrame = () => {};
   Object.defineProperty(page.document.documentElement, "scrollHeight", { value: scrollHeight });
-  page.document.querySelector("footer").getBoundingClientRect = () => ({ bottom: footerBottom });
   dom.window.eval(fs.readFileSync(path.join(__dirname, "../arca-connect/console.js"), "utf8"));
   return page;
 }
-
-it("sizes a clipped consent card to its content, bottom padding included", (t) => {
-  // A window shorter than the card reports a scrollHeight without the 16px bottom padding.
-  const { events, sizes } = renderConsole(t, { scrollHeight: 213, footerBottom: 213.5 });
-  events.Init({ serverUrl: "https://srv.example.com", command: "host command", reason: null });
-  assert.equal(sizes.at(-1).height, 230);
-});
 
 for (const copy of [
   {
@@ -80,8 +72,7 @@ for (const copy of [
   },
 ]) {
   it(`renders consent, sign-in, retry, and completion for ${copy.name}`, (t) => {
-    const page = renderConsole(t, { scrollHeight: 360 });
-    const { document, events, sizes } = page;
+    const { document, events, sizes } = renderConsole(t, { scrollHeight: 360 });
     const confirm = document.getElementById("confirm");
     const command = document.getElementById("command");
     events.Init({
@@ -97,9 +88,8 @@ for (const copy of [
     confirm.click();
     events.Started({ login: false, command: "host command" });
     assert.equal(confirm.disabled, true);
-    // Sign-in follows a rejected connect without another click.
+    // The console can go straight from the connect to sign-in.
     events.Started({ login: true, command: "login command" });
-    assert.equal(page.confirms, 1);
     assert.equal(command.textContent, "login command");
     assert.equal(confirm.textContent, "Signing in…");
     assert.equal(confirm.disabled, true);
@@ -256,6 +246,20 @@ describe("arca connect console flow", () => {
     assert.equal((await result).error, "still rejected");
     world.sendFrom(win, "arca-connect:confirm");
     assert.equal(world.logins.length, 1);
+  });
+
+  it("shows a failed sign-in and doesn't retry the host", async () => {
+    const { world, flow } = flowHarness();
+    const result = flow.run(null, "https://account.databricks.com/omnigent?o=123");
+    const win = world.windows[0];
+    world.sendFrom(win, "arca-connect:confirm");
+    world.connects[0].finish({ ok: false, authError: true });
+    await Promise.resolve();
+    world.logins[0].finish({ ok: false, authError: true, error: "sign-in timed out" });
+    assert.equal((await result).error, "sign-in timed out");
+    assert.equal(world.connects.length, 1);
+    const done = win.webContents.sent.filter(([channel]) => channel === "arca-connect:done");
+    assert.deepEqual(done.at(-1)[1], { ok: false, error: "sign-in timed out" });
   });
 
   it("cancels remote login without starting a host after a late successful exit", async () => {

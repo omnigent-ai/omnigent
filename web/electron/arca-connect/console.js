@@ -11,15 +11,6 @@ const terminalEl = document.getElementById("terminal");
 const statusEl = document.getElementById("status");
 const confirmBtn = document.getElementById("confirm");
 const cancelBtn = document.getElementById("cancel");
-const footerEl = document.querySelector("footer");
-
-/** Height the page needs, even while a too-short window clips it. */
-function contentHeight() {
-  // A clipped full-height body leaves its bottom padding out of scrollHeight.
-  const paddingBottom = parseFloat(getComputedStyle(document.body).paddingBottom) || 0;
-  const footerBottom = footerEl.getBoundingClientRect().bottom + window.scrollY;
-  return Math.max(document.documentElement.scrollHeight, Math.ceil(footerBottom + paddingBottom));
-}
 
 let resizeFrame = null;
 function resizeToContent() {
@@ -27,7 +18,7 @@ function resizeToContent() {
   resizeFrame = requestAnimationFrame(() => {
     resizeFrame = null;
     window.arcaConnect.resizeToContent({
-      height: contentHeight(),
+      height: document.documentElement.scrollHeight,
       phase: document.body.dataset.phase,
     });
   });
@@ -72,7 +63,7 @@ window.arcaConnect.onStarted(({ login, command }) => {
   confirmBtn.textContent = login ? "Signing in…" : "Connecting…";
   statusEl.dataset.kind = "";
   statusEl.textContent = login
-    ? "Complete sign-in in your browser. Credentials stay on the Arca instance."
+    ? "Complete sign-in in your browser. If no browser opened, check that Arca Companion is running. Credentials stay on the Arca instance."
     : "A cold instance can take a few minutes to start.";
 });
 
