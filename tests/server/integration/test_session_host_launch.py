@@ -1208,6 +1208,46 @@ async def test_offline_host_gets_real_grace_before_native_failure(
         if record.__dict__.get("event_name") == "runner_client_wait"
     ]
     assert wait_event.attributes["outcome"] == "host_offline"
+
+
+async def test_offline_host_send_held_by_client_records_nothing(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A client that resends after reconnect gets a refusal, not a failed turn."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = await _offline_native_host_session(client, app)
+    set_runner_client(None)
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", 0.05)
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
+
+    response = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        headers={"x-omnigent-hold-when-host-offline": "on"},
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        },
+    )
+
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "host_offline"
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    assert [item for item in items if item["type"] == "error"] == []
+    assert [item for item in items if item.get("role") == "user"] == []
+    session = (await client.get(f"/v1/sessions/{session_id}")).json()
+    assert session.get("status") != "failed"
+    [wait_event] = [
+        record
+        for record in caplog.records
+        if record.__dict__.get("event_name") == "runner_client_wait"
+    ]
+    assert wait_event.attributes["outcome"] == "host_offline_held"
     assert wait_event.attributes["attempts"] == 0
 
 

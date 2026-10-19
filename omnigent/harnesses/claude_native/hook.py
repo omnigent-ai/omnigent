@@ -761,8 +761,9 @@ def _post_hook_with_reattach(
         or returns ``401`` — i.e. the one-shot ``ap_auth_headers`` token lapsed.
         Called at most once per accepted poll: new headers trigger an immediate
         retry, and a poll the server then held past the floor re-arms it, so a
-        wait longer than the token lifetime survives every lapse while two
-        rejections in a row still fail-ask. ``None`` keeps the legacy behavior.
+        wait longer than the token lifetime survives every lapse. Two rejections
+        in a row fail-ask until a poll has been held; after that, the hook keeps
+        retrying until the deadline. ``None`` keeps the legacy behavior.
     :param wait_marker: Approval-wait marker held fresh for the life of the
         wait (see :func:`hold_approval_wait_marker`), from
         :func:`approval_wait_marker_path`, so the idle pane reaper spares a
@@ -828,6 +829,28 @@ def _post_hook_with_reattach(
                     resp.raise_for_status()
                     return resp
             except httpx.HTTPStatusError as exc:
+                if (
+                    reauth is not None
+                    and parked
+                    and _is_login_redirect_or_unauthorized(exc.response)
+                ):
+                    # A parked prompt may outlive login; retry reauth until its deadline.
+                    print(
+                        f"omnigent {hook_label} hook: Omnigent auth lapsed and "
+                        f"could not be renewed; retrying: {exc}",
+                        file=sys.stderr,
+                    )
+                    reauthed = False
+                    time.sleep(backoff_s)
+                    backoff_s = min(backoff_s * 2, _PERMISSION_RETRY_MAX_BACKOFF_S)
+                    if time.monotonic() >= deadline:
+                        print(
+                            f"omnigent {hook_label} hook: retry budget exhausted "
+                            f"({_PERMISSION_TIMEOUT_S:.0f}s) — failing ask",
+                            file=sys.stderr,
+                        )
+                        return None
+                    continue
                 if exc.response.status_code < 500:
                     print(
                         f"omnigent {hook_label} hook: Omnigent request rejected: {exc}",

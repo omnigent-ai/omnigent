@@ -168,6 +168,9 @@ function QueuedRow({
       {message.requiresRetry && (
         <span className="shrink-0 text-xs text-destructive">Send failed</span>
       )}
+      {message.waitingForHost && !message.requiresRetry && (
+        <span className="shrink-0 text-xs text-muted-foreground">Waiting for host</span>
+      )}
       {/* Always visible (not hover-gated) so the actions are discoverable;
           they brighten on hover/focus. */}
       <span className="flex shrink-0 items-center gap-0">
