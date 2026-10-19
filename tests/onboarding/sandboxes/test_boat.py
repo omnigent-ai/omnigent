@@ -154,7 +154,7 @@ def test_attach_resumes_and_waits(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("omnigent.onboarding.sandboxes.boat.time.sleep", lambda _: None)
     BoatSandboxLauncher().attach("bx_test")
     assert calls[2][0] == "POST" and calls[2][1].endswith("/resume")
-    assert calls[2][2]["json"] == {"ttlSeconds": None}
+    assert calls[2][2]["json"] == {"noEnv": True, "ttlSeconds": None}
     assert len(calls) == 5
 
 
@@ -252,6 +252,24 @@ def test_resume_preserves_recoverable_error(monkeypatch: pytest.MonkeyPatch) -> 
         BoatSandboxLauncher().resume("bx_test")
     assert not isinstance(error.value, SandboxGoneError)
     assert calls == ["GET", "POST"]
+
+
+def test_resume_after_snapshot_expiry_raises_sandbox_gone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Boat deletes a stopped sandbox's disk after 14 days, then rejects resume with
+    409 snapshot_data_expired; that is a definitive absence, so a replacement is provisioned."""
+    monkeypatch.setenv("BOAT_API_KEY", "test-secret")
+    calls = []
+
+    def request(method, url, **kwargs):
+        calls.append(method)
+        if method == "GET":
+            return httpx.Response(200, json={"ok": True, "sandbox": {"state": "archived"}})
+        return httpx.Response(409, json={"ok": False, "code": "snapshot_data_expired"})
+
+    _patch_request(monkeypatch, request)
+    with pytest.raises(SandboxGoneError, match="expired"):
+        BoatSandboxLauncher().attach("bx_test")
+    assert calls == ["GET", "GET", "POST"]
 
 
 def test_resume_active_sandbox_does_not_restart_it(monkeypatch: pytest.MonkeyPatch) -> None:
