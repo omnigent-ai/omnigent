@@ -10,6 +10,7 @@ import errno
 import json
 import logging
 import os
+import queue as sync_queue
 import shutil
 import stat
 import subprocess
@@ -435,6 +436,10 @@ class _HelperProcessClient:
         self._git_ssh_broker: GitSshBroker | None = None
         self._lock = threading.Lock()
         self._closed = False
+        self._launch_thread: threading.Thread | None = None
+        self._launch_requests: sync_queue.Queue[sync_queue.Queue[BaseException | None] | None] = (
+            sync_queue.Queue()
+        )
         atexit.register(self.close)
 
     def request(self, payload: OpRequest) -> OpResult:
@@ -442,9 +447,22 @@ class _HelperProcessClient:
             return self._request_locked(payload, allow_retry=True)
 
     def close(self) -> None:
-        with self._lock:
-            self._closed = True
-            self._stop_locked()
+        owner: threading.Thread | None = None
+        try:
+            with self._lock:
+                self._closed = True
+                try:
+                    self._stop_locked()
+                finally:
+                    owner = self._launch_thread
+                    if owner is not None:
+                        self._launch_requests.put(None)
+        finally:
+            if owner is not None and owner is not threading.current_thread():
+                owner.join()
+                with self._lock:
+                    if self._launch_thread is owner:
+                        self._launch_thread = None
 
     def _request_locked(
         self,
@@ -470,24 +488,74 @@ class _HelperProcessClient:
             if isinstance(result, dict):
                 return result
             return {"error": f"Helper returned non-object response: {result!r}"}
-        except Exception as exc:  # noqa: BLE001 — helper IO failures are retried or surfaced via error dict
+        except Exception as exc:  # noqa: BLE001 — only reads may be resent after an uncertain reply
             self._stop_locked()
+            if payload.get("op") != "read":
+                return {
+                    "error": (
+                        "OS environment helper response was not confirmed; the operation "
+                        f"may have completed and was not retried: {exc}"
+                    ),
+                    "code": "operation_unconfirmed",
+                    "cause_type": type(exc).__name__,
+                }
             if allow_retry and not self._closed:
                 self._ensure_started_locked()
                 return self._request_locked(payload, allow_retry=False)
             return {"error": f"os_env helper failed: {exc}"}
 
     def _ensure_started_locked(self) -> None:
-        if self._proc is not None and self._proc.poll() is None:
-            return
+        if self._proc is not None:
+            if self._proc.poll() is None:
+                return
+            self._stop_locked()
         self._start_locked()
 
     def _start_locked(self) -> None:
         try:
-            self._start_unchecked_locked()
+            self._start_on_owner_locked()
         except BaseException:
             self._stop_locked()
             raise
+
+    def _start_on_owner_locked(self) -> None:
+        # Linux parent-death signals follow the spawning thread. Keep that
+        # owner alive until the client has stopped its helper.
+        if self._launch_thread is None:
+            owner = threading.Thread(
+                target=self._run_launch_requests, name="os-env-helper-launch", daemon=True
+            )
+            self._launch_thread = owner
+            try:
+                owner.start()
+            except BaseException:
+                self._launch_thread = None
+                raise
+        completed: sync_queue.Queue[BaseException | None] = sync_queue.Queue(maxsize=1)
+        self._launch_requests.put(completed)
+        interrupted: BaseException | None = None
+        while True:
+            try:
+                error = completed.get()
+                break
+            except BaseException as exc:  # noqa: BLE001 — drain owned startup before cleanup
+                interrupted = exc
+        if interrupted is not None:
+            raise interrupted
+        if error is not None:
+            raise error
+
+    def _run_launch_requests(self) -> None:
+        while True:
+            completed = self._launch_requests.get()
+            if completed is None:
+                return
+            try:
+                self._start_unchecked_locked()
+            except BaseException as exc:  # noqa: BLE001 — forward startup failures to the caller
+                completed.put(exc)
+            else:
+                completed.put(None)
 
     def _start_unchecked_locked(self) -> None:
         sandbox = self.sandbox
