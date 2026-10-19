@@ -96,7 +96,7 @@
     "remark-gfm": "^4.0.1",
     "rrule": "^2.8.1",
     "shadcn": "0.0.0-rc-20261007105214",
-    "shiki": "^4.0.2",
+    "shiki": "^4.5.0",
     "sonner": "^2.0.8",
     "streamdown": "^2.5.0",
     "tailwind-merge": "^3.5.0",
