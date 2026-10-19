@@ -34,6 +34,7 @@ from omnigent.host.connect import (
     ModelOptionsResult,
     _build_runner_env,
     _exit_if_runtime_gone,
+    _interpreter_runs,
     _runner_exit_error,
     _RunnerHandle,
     run_host_process,
@@ -986,28 +987,46 @@ async def test_host_boot_skips_managed_gateway_with_malformed_profile(
     assert not any(record.exc_info for record in caplog.records)
 
 
+@pytest.mark.parametrize("failure", ["disk_full", "interpreter_unreadable"])
 async def test_handle_launch_attributes_spawn_failure_to_host(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     tmp_path: Path,
+    failure: str,
 ) -> None:
-    """A spawn OSError (e.g. a full disk) is a host fault, not an unattributed one."""
-    host = _make_host_process()
+    """A spawn OSError (e.g. a full disk) is a host fault, not an unattributed one.
 
-    def _disk_full(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
-        raise OSError(errno.ENOSPC, "No space left on device", str(tmp_path / "runner.log"))
+    An interpreter that is present but unreadable, e.g. under a directory that
+    lost its search permission, is an ordinary spawn failure, not a deleted one.
+    """
+    host = _make_host_process()
+    locked_dir = tmp_path / "locked-venv"
+    spawn_error = OSError(errno.ENOSPC, "No space left on device", str(tmp_path / "runner.log"))
+    if failure == "interpreter_unreadable":
+        (locked_dir / "bin").mkdir(parents=True)
+        (locked_dir / "bin" / "python").touch()
+        monkeypatch.setattr(sys, "executable", str(locked_dir / "bin" / "python"))
+        locked_dir.chmod(0)
+        spawn_error = PermissionError(errno.EACCES, "Permission denied", sys.executable)
+
+    def _spawn_fails(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
+        raise spawn_error
 
     monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
-    monkeypatch.setattr(host, "_spawn_runner_proc", _disk_full)
+    monkeypatch.setattr(host, "_spawn_runner_proc", _spawn_fails)
     frame = HostLaunchRunnerFrame(
-        request_id="req_disk_full",
-        binding_token="token_disk_full",
+        request_id="req_spawn_failure",
+        binding_token="token_spawn_failure",
         workspace=str(tmp_path),
-        session_id="session_disk_full",
+        session_id="session_spawn_failure",
     )
 
-    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
-        result = await host._handle_launch(frame)
+    try:
+        with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+            result = await host._handle_launch(frame)
+    finally:
+        if locked_dir.exists():
+            locked_dir.chmod(0o700)
 
     assert isinstance(result, HostLaunchRunnerResultFrame)
     assert result.status == "failed"
@@ -1022,6 +1041,7 @@ async def test_handle_launch_attributes_spawn_failure_to_host(
     assert failure.attributes["error_phase"] == "runner_launch"
     # The interpreter still exists, so this is an ordinary spawn failure.
     assert not host._runtime_gone
+    assert "was deleted" not in (result.error or "")
 
 
 @pytest.mark.parametrize(
@@ -3647,6 +3667,67 @@ async def test_handle_stop_terminates_process(tmp_path: Path) -> None:
     assert proc.poll() is not None, "Runner process should be terminated after stop"
     # Runner should be removed from tracking.
     assert "runner_aaa" not in host._runners
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc for the probe state")
+async def test_runtime_probe_keeps_its_exit_status_from_the_orphan_reaper(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An orphan sweep during the probe can't make a restored runtime look broken.
+
+    The sweep runs after the probe's child exited but before asyncio collected
+    it; stealing that status would report 255 and retire a working host.
+    """
+    pid_file = tmp_path / "probe.pid"
+    gate = tmp_path / "probe.gate"
+    interpreter = tmp_path / "restored-venv" / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    # Stands in for a reinstalled interpreter that exits 0 once released.
+    interpreter.write_text(
+        f'#!/bin/sh\necho $$ > "{pid_file}"\nwhile [ ! -e "{gate}" ]; do sleep 0.01; done\n'
+    )
+    interpreter.chmod(0o755)
+    monkeypatch.setattr(sys, "executable", str(interpreter))
+    host = _make_host_process()
+    host._runtime_gone = True
+    host._ws = _FakeTunnel()  # type: ignore[assignment] — duck-typed ws
+
+    retire = asyncio.create_task(host._retire_if_runtime_gone())
+    while not pid_file.exists() or not pid_file.read_text().strip():
+        await asyncio.sleep(0.01)
+    probe_pid = int(pid_file.read_text())
+    gate.touch()
+    # Block the loop until the probe is a zombie, so asyncio can't collect it first.
+    deadline = time.monotonic() + 5.0
+    while Path(f"/proc/{probe_pid}/stat").read_text().split(")")[-1].split()[0] != "Z":
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    host._reap_orphans_once([probe_pid])
+    await asyncio.wait_for(retire, timeout=10.0)
+
+    assert not host._runtime_gone
+    assert not host.lifecycle_lost
+    assert not host.runtime_gone
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell stand-in interpreter")
+async def test_runtime_probe_kills_and_reaps_an_interpreter_that_hangs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A probe that doesn't finish in time fails, and its child doesn't linger."""
+    pid_file = tmp_path / "probe.pid"
+    interpreter = tmp_path / "hung-venv" / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text(f'#!/bin/sh\necho $$ > "{pid_file}"\nexec sleep 60\n')
+    interpreter.chmod(0o755)
+    monkeypatch.setattr("omnigent.host.connect._RUNTIME_PROBE_TIMEOUT_S", 0.5)
+
+    assert not await _interpreter_runs(str(interpreter))
+
+    probe_pid = int(pid_file.read_text())
+    # Killed and reaped: the pid is gone rather than left as a zombie.
+    with pytest.raises(ProcessLookupError):
+        os.kill(probe_pid, 0)
 
 
 @pytest.mark.parametrize("retired", [False, True])

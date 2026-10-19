@@ -2029,7 +2029,7 @@ class HostProcess:
                 task.add_done_callback(self._runner_stop_tasks.discard)
                 raise
             except OSError as exc:
-                if self._runtime_gone or not os.path.exists(sys.executable):
+                if self._runtime_gone or _interpreter_missing(sys.executable):
                     self._note_runtime_gone()
                     return self._launch_failed(
                         frame,
@@ -4096,7 +4096,10 @@ class HostProcess:
         """
         if not self._runtime_gone_retirement_due():
             return
-        if await _interpreter_runs(sys.executable):
+        # Own the probe's child so the orphan reaper can't take its exit status.
+        with self._host_subprocess_op():
+            usable = await _interpreter_runs(sys.executable)
+        if usable:
             # The interpreter was reinstalled at the same path, so spawns work again.
             _logger.info("Host runtime %s runs again; the host stays up.", sys.executable)
             self._runtime_gone = False
@@ -5528,6 +5531,21 @@ def _serve_host_until_exit(
         raise SystemExit(HOST_FATAL_EXIT_CODE) from exc
     _exit_if_runtime_gone(host)
     return host.lifecycle_lost
+
+
+def _interpreter_missing(executable: str) -> bool:
+    """Whether ``executable`` is absent, as opposed to present but unreadable.
+
+    :param executable: Interpreter path, e.g. ``sys.executable``.
+    :returns: True only when the path, or a directory on it, doesn't exist.
+    """
+    try:
+        os.stat(executable)
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+    return False
 
 
 async def _interpreter_runs(executable: str) -> bool:
