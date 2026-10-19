@@ -22,6 +22,7 @@ import pytest
 import omnigent.inner.os_env as os_env_module
 import omnigent.inner.terminal as terminal_module
 from omnigent.errors import OmnigentError
+from omnigent.inner import tcp_egress_wire
 from omnigent.inner.bwrap_sandbox import _dotfile_and_symlink_mask_args
 from omnigent.inner.datamodel import (
     GitSshBinding,
@@ -273,6 +274,46 @@ def test_tcp_broker_rejects_mixed_public_and_private_dns_without_dial(
         assert result.returncode != 0
         assert b"outside allowed addresses" in result.stderr
         assert not dials
+    finally:
+        broker.stop()
+
+
+def test_tcp_connector_wire_rejects_oversized_and_truncated_frames() -> None:
+    sender, receiver = socket.socketpair()
+    with sender, receiver:
+        tcp_egress_wire._write_frame(sender, b"O", b"response")
+        assert tcp_egress_wire._read_frame(receiver) == (b"O", b"response")
+        with pytest.raises(OSError, match="size limit"):
+            tcp_egress_wire._write_frame(sender, b"I", b"x" * (tcp_egress_wire.MAX_FRAME + 1))
+        sender.sendall(b"O" + struct.pack("!I", tcp_egress_wire.MAX_FRAME + 1))
+        with pytest.raises(OSError, match="size limit"):
+            tcp_egress_wire._read_frame(receiver)
+        sender.shutdown(socket.SHUT_WR)
+        with pytest.raises(OSError, match="disconnected"):
+            tcp_egress_wire._read_frame(receiver)
+
+
+def test_tcp_connector_reports_missing_and_denied_routes(
+    tcp_route: TcpEgressRoute,
+    broker_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(ValueError, match="at least one route"):
+        start_tcp_egress_broker([], broker_dir)
+    assert tcp_egress_wire.main([]) == 2
+    assert "Usage:" in capsys.readouterr().err
+    monkeypatch.delenv(tcp_egress_wire.SOCKET_ENV, raising=False)
+    monkeypatch.delenv(tcp_egress_wire.TOKEN_ENV, raising=False)
+    assert tcp_egress_wire.main(["echo"]) == 1
+    assert "unavailable" in capsys.readouterr().err
+
+    broker = start_tcp_egress_broker([tcp_route], broker_dir)
+    monkeypatch.setenv(tcp_egress_wire.SOCKET_ENV, str(broker.socket_path))
+    monkeypatch.setenv(tcp_egress_wire.TOKEN_ENV, broker.token)
+    try:
+        assert tcp_egress_wire.main(["not-granted"]) == 1
+        assert "not allowed" in capsys.readouterr().err
     finally:
         broker.stop()
 
