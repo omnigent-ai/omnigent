@@ -50,13 +50,24 @@ async function settle(ms = 0) {
 }
 
 // StrictMode, as main.tsx renders the app: its simulated remount must not drop reads.
-function renderBanner() {
-  return render(
+function banner(hostId = "arca") {
+  return (
     <StrictMode>
-      <DbcertBanner conversationId="conv" hostId="arca" />
-    </StrictMode>,
+      <DbcertBanner conversationId="conv" hostId={hostId} />
+    </StrictMode>
   );
 }
+
+function renderBanner() {
+  return render(banner());
+}
+
+const ARCLET: TestHost = {
+  host_id: "arclet",
+  name: "omnigent-arclet-891349936151385",
+  status: "online",
+  sandbox_provider: "arclet",
+};
 
 beforeEach(() => {
   vi.useFakeTimers();
@@ -195,6 +206,43 @@ describe("DbcertBanner", () => {
     vi.mocked(readHostDbcertExpiry).mockResolvedValue(EXPIRED_LATER);
     await settle(5 * 60_000);
     expect(screen.getByText(/The dbcert on jackson's arca has expired/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Refresh dbcert" })).toBeTruthy();
+    expect(screen.queryByText(/Couldn't refresh it from here/)).toBeNull();
+  });
+
+  it("follows a host switch within the same session right away", async () => {
+    state.hosts.push(ARCLET);
+    const view = renderBanner();
+    await settle();
+    expect(screen.getByText(/The dbcert on jackson's arca has expired/)).toBeTruthy();
+    // Expired to valid: no stale warning from the previous host.
+    vi.mocked(readHostDbcertExpiry).mockResolvedValue(RENEWED);
+    view.rerender(banner("arclet"));
+    expect(screen.queryByText(/has expired/)).toBeNull();
+    await settle();
+    expect(screen.queryByText(/has expired/)).toBeNull();
+    // Valid to expired: reported without waiting for the next poll.
+    vi.mocked(readHostDbcertExpiry).mockResolvedValue(EXPIRED);
+    view.rerender(banner("arca"));
+    await settle();
+    expect(screen.getByText(/The dbcert on jackson's arca has expired/)).toBeTruthy();
+  });
+
+  it("drops a refresh still running for the previous host", async () => {
+    state.hosts.push(ARCLET);
+    const view = renderBanner();
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh dbcert" }));
+    await settle();
+    expect(screen.getByRole("button", { name: "Refreshing…" })).toBeTruthy();
+    vi.mocked(readHostDbcertExpiry).mockResolvedValue(EXPIRED_LATER);
+    view.rerender(banner("arclet"));
+    await settle();
+    expect(
+      screen.getByText(/The dbcert on omnigent-arclet-891349936151385 has expired/),
+    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Refresh dbcert" })).toBeTruthy();
+    await settle(HOST_DBCERT_REFRESH_MS);
     expect(screen.getByRole("button", { name: "Refresh dbcert" })).toBeTruthy();
     expect(screen.queryByText(/Couldn't refresh it from here/)).toBeNull();
   });

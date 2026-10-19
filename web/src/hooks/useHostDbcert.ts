@@ -39,44 +39,47 @@ export function useHostDbcert(
   const host = hosts?.find((candidate) => candidate.host_id === hostId);
   const sessionId =
     onDatabricks && conversationId && host?.status === "online" ? conversationId : null;
-  const [cert, setCert] = useState<{ sessionId: string; expiresAt: number } | null>(null);
-  const expiresAt = cert?.sessionId === sessionId ? cert.expiresAt : null;
+  // Cert and refresh state belong to the session's current host. "Switch host…"
+  // keeps the session id, so key them by both.
+  const target = sessionId && host ? `${sessionId} ${host.host_id}` : null;
+  const [cert, setCert] = useState<{ target: string; expiresAt: number } | null>(null);
+  const expiresAt = cert?.target === target ? cert.expiresAt : null;
   const expired = useNowSelector((now) => expiresAt !== null && expiresAt <= now.getTime(), {
     enabled: expiresAt !== null,
   });
   const [refreshState, setRefreshState] = useState<{
-    sessionId: string;
+    target: string;
     phase: DbcertRefreshPhase;
   } | null>(null);
-  const phase = refreshState?.sessionId === sessionId ? refreshState.phase : "idle";
+  const phase = refreshState?.target === target ? refreshState.phase : "idle";
   const [dismissedExpiry, setDismissedExpiry] = useState<number | null>(null);
-  // The session pending reads and refresh loops belong to; null once the view
-  // moves on. Set in an effect, not during render, so StrictMode's simulated
-  // remount restores it.
-  const currentSession = useRef<string | null>(null);
+  // The session and host that pending reads and refresh loops belong to; null
+  // once the view moves on. Set in an effect, not during render, so
+  // StrictMode's simulated remount restores it.
+  const currentTarget = useRef<string | null>(null);
   useEffect(() => {
-    currentSession.current = sessionId;
+    currentTarget.current = target;
     return () => {
-      currentSession.current = null;
+      currentTarget.current = null;
     };
-  }, [sessionId]);
+  }, [target]);
 
   const check = useCallback(async () => {
-    if (!sessionId) return undefined;
+    if (!sessionId || !target) return undefined;
     const next = await readHostDbcertExpiry(sessionId);
-    if (next !== undefined && currentSession.current === sessionId) {
-      setCert(next === null ? null : { sessionId, expiresAt: next });
+    if (next !== undefined && currentTarget.current === target) {
+      setCert(next === null ? null : { target, expiresAt: next });
       // A valid cert ends an earlier failed refresh, so a later expiry starts fresh.
       if (next !== null && next > Date.now()) setRefreshState(null);
     }
     return next;
-  }, [sessionId]);
+  }, [sessionId, target]);
 
   // Re-read on open, when the tab comes back, and periodically. `expired` is a
   // dependency so the expiry moment itself triggers a read: Companion may have
   // already replaced the cert.
   useEffect(() => {
-    if (!sessionId) return;
+    if (!target) return;
     const checkIfVisible = () => {
       if (document.visibilityState === "visible") void check();
     };
@@ -90,18 +93,18 @@ export function useHostDbcert(
       document.removeEventListener("visibilitychange", checkIfVisible);
       clearInterval(timer);
     };
-  }, [sessionId, check, expired]);
+  }, [target, check, expired]);
 
   const refresh = useCallback(async () => {
-    if (!sessionId) return;
-    setRefreshState({ sessionId, phase: "running" });
+    if (!sessionId || !target) return;
+    setRefreshState({ target, phase: "running" });
     const onLaptop =
       hasDbcertRefreshBridge() && (await getDesktopFeatures())?.canRefreshDbcert === true;
     const started = onLaptop ? (await refreshDbcert()).ok : await startHostDbcertRefresh(sessionId);
     const deadline = Date.now() + (onLaptop ? LAPTOP_SYNC_WAIT_MS : HOST_DBCERT_REFRESH_MS);
     // Poll the host until the renewed cert lands, the wait runs out, or the view moves on.
     const renewed = async (): Promise<boolean> => {
-      if (currentSession.current !== sessionId || Date.now() >= deadline) return false;
+      if (currentTarget.current !== target || Date.now() >= deadline) return false;
       const next = await check();
       if (typeof next === "number" && next > Date.now()) return true;
       await new Promise<void>((resolve) => {
@@ -110,8 +113,8 @@ export function useHostDbcert(
       return renewed();
     };
     const outcome = started && (await renewed()) ? "idle" : "failed";
-    if (currentSession.current === sessionId) setRefreshState({ sessionId, phase: outcome });
-  }, [sessionId, check]);
+    if (currentTarget.current === target) setRefreshState({ target, phase: outcome });
+  }, [sessionId, target, check]);
 
   return {
     show: expired && expiresAt !== dismissedExpiry,
