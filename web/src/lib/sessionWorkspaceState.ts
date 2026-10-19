@@ -6,16 +6,9 @@
 // Shell tabs restore to whichever terminals still exist — the AppShell prune
 // effect drops keys whose PTY has gone away once the terminal list loads.
 
-import type { RightRailTab } from "@/shell/railTabs";
+import { RIGHT_RAIL_TABS as STATIC_RIGHT_RAIL_TABS, type RightRailTab } from "@/shell/railTabs";
 
-const RAIL_TABS: readonly RightRailTab[] = [
-  "files",
-  "changes",
-  "github",
-  "subagents",
-  "browser",
-  "sidechat",
-];
+const RIGHT_RAIL_TABS: readonly RightRailTab[] = [...STATIC_RIGHT_RAIL_TABS, "sidechat"];
 
 export interface SessionWorkspaceState {
   /** Whether the rail was left open in this session. */
@@ -56,7 +49,7 @@ function isValidWidth(value: unknown): value is number {
 }
 
 function isRailTab(value: unknown): value is RightRailTab {
-  return typeof value === "string" && (RAIL_TABS as readonly string[]).includes(value);
+  return typeof value === "string" && (RIGHT_RAIL_TABS as readonly string[]).includes(value);
 }
 
 /**
