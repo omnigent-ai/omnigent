@@ -126,7 +126,7 @@
     "jsdom": "^29.1.1",
     "lightningcss": "^1.29.1",
     "oxlint": "^1.62.0",
-    "postcss": "^8.5.23",
+    "postcss": "^8.5.29",
     "prettier": "^3.8.3",
     "storybook": "^10.6.1",
     "tailwindcss": "^4.2.4",
