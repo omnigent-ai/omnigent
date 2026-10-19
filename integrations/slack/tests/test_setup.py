@@ -4,6 +4,7 @@ from typing import Any
 import httpx
 import pytest
 import respx
+from fakes import resolve_test_auth
 from omnigent_slack.models import ThreadKey, UserConfig
 from omnigent_slack.omnigent import OmnigentClientPool
 from omnigent_slack.setup import (
@@ -235,7 +236,7 @@ async def test_setup_advances_to_select_modal_with_host_home_workspace(
         )
     )
     _mock_info()
-    pool = OmnigentClientPool()
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
     flow = _flow(await _store(tmp_path), pool)
     client = FakeSetupClient()
 
@@ -263,7 +264,7 @@ async def test_setup_shows_no_host_guidance_when_no_online_host(tmp_path: Path) 
         return_value=httpx.Response(200, json={"hosts": [{"host_id": "h", "status": "offline"}]})
     )
     _mock_info(managed=False)
-    pool = OmnigentClientPool()
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
     flow = _flow(await _store(tmp_path), pool)
     client = FakeSetupClient()
 
@@ -293,7 +294,7 @@ async def test_setup_offers_managed_sandbox_instead_of_dead_end(tmp_path: Path) 
         return_value=httpx.Response(200, json={"hosts": [{"host_id": "h", "status": "offline"}]})
     )
     _mock_info(managed=True, provider="modal")
-    pool = OmnigentClientPool()
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
     flow = _flow(await _store(tmp_path), pool)
     client = FakeSetupClient()
 
@@ -321,7 +322,7 @@ async def test_setup_shows_no_agents_guidance_when_server_has_no_agents(tmp_path
         )
     )
     _mock_info()
-    pool = OmnigentClientPool()
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
     flow = _flow(await _store(tmp_path), pool)
     client = FakeSetupClient()
 
@@ -353,16 +354,9 @@ async def test_setup_shows_login_in_modal_and_advances_on_approval(tmp_path: Pat
     respx.get(_SERVER + "/v1/me").mock(
         return_value=httpx.Response(401, json={"login_url": "/login"})
     )
-    # First /v1/agents (pre-login probe) 401s; after login it returns agents.
-    agents_calls = {"n": 0}
-
-    def _agents(request: httpx.Request) -> httpx.Response:
-        agents_calls["n"] += 1
-        if agents_calls["n"] == 1:
-            return httpx.Response(401)
-        return httpx.Response(200, json={"data": [{"id": "ag_1", "name": "Helper"}]})
-
-    respx.get(_SERVER + "/v1/agents").mock(side_effect=_agents)
+    agents = respx.get(_SERVER + "/v1/agents").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "ag_1", "name": "Helper"}]})
+    )
     respx.get(_SERVER + "/v1/hosts").mock(
         return_value=httpx.Response(
             200, json={"hosts": [{"host_id": "h1", "name": "H", "status": "online"}]}
@@ -411,6 +405,7 @@ async def test_setup_shows_login_in_modal_and_advances_on_approval(tmp_path: Pat
         waiting = client.updated_views[0]["view"]["blocks"][0]["text"]["text"]
         assert "ABCD-2345" in waiting
         assert client.posts == []  # no DM sent
+        assert not agents.called
 
         # client_id sent to the server is qualified by the workspace name
         # (from team.info → "Acme Corp").
@@ -452,20 +447,24 @@ async def test_setup_auth_required_but_login_disabled(tmp_path: Path) -> None:
     assert client.posts == []
 
 
+@pytest.mark.parametrize("anonymous", [False, True])
 @respx.mock
-async def test_setup_reports_device_grant_disabled(tmp_path: Path) -> None:
-    """Accounts server with the device grant OFF (/oauth/* unmounted → 405):
-    the modal must tell the user to contact the admin, not "try again shortly"."""
+async def test_setup_reports_unavailable_login(tmp_path: Path, anonymous: bool) -> None:
+    """A permanent server-auth configuration problem needs administrator action."""
     from cryptography.fernet import Fernet
     from omnigent_slack.auth_manager import AuthManager
     from omnigent_slack.tokens import EncryptedTokenStore
 
     respx.get(_SERVER + "/health").mock(return_value=httpx.Response(200, json={"status": "ok"}))
-    # /v1/me → accounts mode; the pre-login agents probe 401s so login starts.
+    # Login discovery stays available before the user has delegated credentials.
     respx.get(_SERVER + "/v1/me").mock(
-        return_value=httpx.Response(401, json={"login_url": "/login"})
+        return_value=(
+            httpx.Response(200, json={"user_id": "local", "is_admin": False})
+            if anonymous
+            else httpx.Response(401, json={"login_url": "/login"})
+        )
     )
-    respx.get(_SERVER + "/v1/agents").mock(return_value=httpx.Response(401))
+    agents = respx.get(_SERVER + "/v1/agents")
     # Device grant disabled → authorize falls through to the SPA catch-all (405).
     respx.post(_SERVER + "/oauth/device/authorize").mock(return_value=httpx.Response(405))
 
@@ -483,9 +482,12 @@ async def test_setup_reports_device_grant_disabled(tmp_path: Path) -> None:
         await pool.aclose_all()
 
     body = _last_update(client)["blocks"][0]["text"]["text"].lower()
-    assert "device authorization grant" in body
+    assert (
+        "enable accounts or oidc authentication" if anonymous else "device authorization grant"
+    ) in body
     assert "administrator" in body
     assert "try again shortly" not in body
+    assert not agents.called
 
 
 @respx.mock
@@ -494,7 +496,7 @@ async def test_unknown_argument_opens_setup_modal(tmp_path: Path) -> None:
     # The server is unreachable here; setup still opens the connecting modal
     # first, then updates it to a failure screen.
     respx.get(_SERVER + "/health").mock(return_value=httpx.Response(500))
-    pool = OmnigentClientPool()
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
     flow = _flow(await _store(tmp_path), pool)
     client = FakeSetupClient()
     command = {
@@ -739,7 +741,7 @@ async def test_post_enrollment_validate_failure_shows_error_not_hang(tmp_path: P
 @respx.mock
 async def test_setup_reports_unreachable(tmp_path: Path) -> None:
     respx.get(_SERVER + "/health").mock(return_value=httpx.Response(500))
-    pool = OmnigentClientPool()
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
     flow = _flow(await _store(tmp_path), pool)
     client = FakeSetupClient()
 
@@ -750,6 +752,23 @@ async def test_setup_reports_unreachable(tmp_path: Path) -> None:
 
     body = _last_update(client)["blocks"][0]["text"]["text"]
     assert "reach" in body.lower()
+
+
+@respx.mock
+async def test_tokenless_setup_reports_login_connection_failure(tmp_path: Path) -> None:
+    respx.get(_SERVER + "/v1/me").mock(side_effect=httpx.ConnectError("unavailable"))
+    agents = respx.get(_SERVER + "/v1/agents")
+    pool, auth = await _authenticated_pool(tmp_path, token=None)
+    flow = _flow(await _store(tmp_path), pool, auth)
+    client = FakeSetupClient()
+    try:
+        await flow._begin_setup(client, team_id="T1", user_id="U1", view_id="V1")
+    finally:
+        await pool.aclose_all()
+    body = _last_update(client)["blocks"][0]["text"]["text"]
+    assert "Could not start login" in body
+    assert "Try again shortly" in body
+    assert not agents.called
 
 
 async def test_select_submit_persists_config(tmp_path: Path) -> None:
@@ -1110,7 +1129,7 @@ async def test_setup_settles_modal_before_first_update(tmp_path: Path, monkeypat
 
     monkeypatch.setattr(setup_mod.asyncio, "sleep", _tracking_sleep)
 
-    pool = OmnigentClientPool()
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
     flow = _flow(await _store(tmp_path), pool)
 
     class _RecordingClient(FakeSetupClient):
@@ -1536,7 +1555,7 @@ async def test_unreachable_server_is_not_reported_as_an_unavailable_default(
     # A network failure says nothing about whether the configured agent exists,
     # so it must still be the try-again screen — never "your default is gone".
     respx.get(_SERVER + "/health").mock(return_value=httpx.Response(500))
-    pool = OmnigentClientPool()
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
     flow = _flow(
         await _store(tmp_path), pool, default_agent_id="ag_1", default_host_type="managed"
     )
@@ -1566,7 +1585,7 @@ async def test_a_server_with_no_agents_still_shows_the_no_agents_screen(tmp_path
         )
     )
     _mock_info()
-    pool = OmnigentClientPool()
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
     flow = _flow(await _store(tmp_path), pool, default_agent_id="ag_1")
     client = FakeSetupClient()
 
@@ -1781,7 +1800,7 @@ async def test_an_unreachable_capability_probe_does_not_claim_non_support(
         )
     )
     respx.get(_SERVER + "/v1/info").mock(return_value=httpx.Response(500))
-    pool = OmnigentClientPool()
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
     flow = _flow(await _store(tmp_path), pool, default_host_type="managed")
     client = FakeSetupClient()
 

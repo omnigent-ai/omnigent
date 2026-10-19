@@ -25,7 +25,8 @@ import {
 import { useChatStore } from "@/store/chatStore";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
-import { StreamBudgetBanner } from "@/components/StreamBudgetBanner";
+import { FloatingBannerStack, StreamBudgetBanner } from "@/components/StreamBudgetBanner";
+import { DbcertBanner } from "@/components/DbcertBanner";
 import { ArcaShutdownBanner } from "@/components/ArcaShutdownBanner";
 import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
 import { useSearchParams } from "@/lib/routing";
@@ -433,8 +434,11 @@ function TranscriptImpl({
           scroller={scroller}
           hasMoreHistory={display.hasMoreHistory}
         />
-        {/* Too-many-tabs warning, a sibling of Conversation. */}
-        <StreamBudgetBanner />
+        {/* Too-many-tabs and expired-dbcert warnings, siblings of Conversation. */}
+        <FloatingBannerStack>
+          <StreamBudgetBanner />
+          <DbcertBanner conversationId={conversationId} hostId={hostId} />
+        </FloatingBannerStack>
         {/* Left-edge minimap: one tick per turn. Desktop-only. */}
         {!isMobileViewport && (
           <TurnRail

@@ -23,6 +23,7 @@ from omnigent.server.routes.sessions import create_sessions_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests.budgets import budget
 
 _OWNER = "owner@example.com"
 _READER = "reader@example.com"
@@ -392,7 +393,7 @@ async def test_slow_usage_request_does_not_hold_session_metadata(
 
     def delayed_usage(*args: Any, **kwargs: Any) -> dict[str, Any]:
         loop.call_soon_threadsafe(usage_started.set)
-        assert release_usage.wait(timeout=10), "test did not release the usage read"
+        assert release_usage.wait(timeout=budget(10)), "test did not release the usage read"
         return original_loader(*args, **kwargs)
 
     monkeypatch.setattr(orchestration, "load_session_usage", delayed_usage)
@@ -400,13 +401,13 @@ async def test_slow_usage_request_does_not_hold_session_metadata(
         usage_client.get(f"/v1/sessions/{usage_app.parent_id}", params=_USAGE_SNAPSHOT_PARAMS)
     )
     try:
-        await asyncio.wait_for(usage_started.wait(), timeout=3)
+        await asyncio.wait_for(usage_started.wait(), timeout=budget(3))
         snapshot = await asyncio.wait_for(
             usage_client.get(
                 f"/v1/sessions/{usage_app.parent_id}",
                 params={**_USAGE_SNAPSHOT_PARAMS, "include_usage": "false"},
             ),
-            timeout=3,
+            timeout=budget(3),
         )
         assert snapshot.status_code == 200, snapshot.text
         assert snapshot.json()["usage_included"] is False
