@@ -5616,6 +5616,18 @@
             "description": "Failure detail when `stage == \"failed\"`, e.g. `\"managed sandbox launch failed: spend limit reached\"`. `None` otherwise.",
             "title": "Error"
           },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Sandbox provider being launched, e.g. `\"arclet\"`, or `None` when unknown.",
+            "title": "Provider"
+          },
           "stage": {
             "description": "Current launch stage, e.g. `\"provisioning\"` \u2014 one of `SandboxLaunchStage`, in pipeline order: `provisioning` (creating the sandbox) \u2192 `cloning` (cloning the repository workspace; skipped when the session has none) \u2192 `starting` (starting the in-sandbox host) \u2192 `connecting` (launching the agent runner) \u2192 `ready` / `failed`.",
             "enum": [
@@ -8195,6 +8207,19 @@
             "default": null,
             "description": "Failure detail when `stage == \"failed\"`, e.g. `\"managed sandbox launch failed: spend limit reached\"`. `None` otherwise. Category: **transient** (SSE-only). On reconnect, clients seed the progress indicator from the session snapshot's `sandbox_status` field, which is populated by `_session_sandbox_status_cache` at snapshot build time.",
             "title": "Error"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Sandbox provider being launched, e.g. `\"arclet\"`, or `None` when unknown.",
+            "title": "Provider"
           },
           "sequence_number": {
             "anyOf": [

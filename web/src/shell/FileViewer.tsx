@@ -319,6 +319,8 @@ interface FileViewerProps {
    * when the viewer is embedded inside the inline right panel.
    */
   frameless?: boolean;
+  /** The same frameless viewer fills the mobile viewport without remounting. */
+  mobileOverlay?: boolean;
   /** Only the active viewport mounts the diff editor and synchronizes the URL. */
   viewport?: "desktop" | "mobile";
   /** Called when the user presses Escape to close the active file tab. */
@@ -362,6 +364,7 @@ function FileViewerBody({
   onNavigateTo,
   permissionLevel,
   frameless,
+  mobileOverlay = false,
   viewport,
   onCommentsOpenChange,
   sort = "recent",
@@ -398,9 +401,8 @@ function FileViewerBody({
   // (useIOSViewportLock) — which only resizes flow content inside .app-shell —
   // doesn't lift it above the soft keyboard. Pad the overlay's bottom by the
   // keyboard inset so the comments panel and its (auto-focused) textarea stay
-  // visible. No-op off iOS / with the keyboard closed. Not needed frameless
-  // (embedded in the desktop aside, never a fixed overlay).
-  const keyboardInset = useIOSNativeKeyboardInset(!frameless && open);
+  // visible. No-op off iOS / with the keyboard closed or in the desktop rail.
+  const keyboardInset = useIOSNativeKeyboardInset((!frameless || mobileOverlay) && open);
   const fileQuery = useFileContent(conversationId, path);
   const changedFiles = useWorkspaceChangedFiles(conversationId);
 
@@ -1268,7 +1270,7 @@ function FileViewerBody({
     // path-aware title reserve). Each shifts the constants the effect reads.
     [
       toolbarActions.map((a) => a.key).join(","),
-      `back:${!frameless}`,
+      `back:${!frameless || mobileOverlay}`,
       `chip:${saveStatus !== "idle"}`,
       `nav:${showNavButtons}`,
       `path:${path}`,
@@ -1394,7 +1396,7 @@ function FileViewerBody({
               overlay only. On desktop the viewer is embedded in the tabbed
               Files rail, where tabs (and their x buttons) own open/close, so
               the back button would be a redundant "exit viewer" mode. */}
-          {!frameless && (
+          {(!frameless || mobileOverlay) && (
             <div ref={toolbarBackRef} className="shrink-0">
               <TooltipProvider>
                 <Tooltip>
@@ -1808,7 +1810,11 @@ function FileViewerBody({
       <div
         ref={setViewerRoot}
         data-testid="file-viewer"
-        className="flex flex-col flex-1 min-h-0 overflow-hidden bg-card"
+        style={{ paddingBottom: keyboardInset || undefined }}
+        className={cn(
+          "flex flex-col flex-1 min-h-0 overflow-hidden bg-card",
+          mobileOverlay && "fixed inset-0 z-50 shadow-lg",
+        )}
       >
         {innerContent}
       </div>

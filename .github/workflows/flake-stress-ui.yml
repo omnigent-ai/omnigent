@@ -160,7 +160,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ github.event.inputs.target_branch }}
       - name: Set up Rust toolchain
@@ -206,7 +206,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ github.event.inputs.target_branch }}
 
@@ -276,12 +276,12 @@ jobs:
           pnpm --filter web run build
 
       - name: Install Claude Code CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@4f403d71435055cf820984e829cb630cbc73da53
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@395b8b175c17c1d8f393f82dddd15222c6200e74
         with:
           harness: claude
 
       - name: Install Codex CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@4f403d71435055cf820984e829cb630cbc73da53
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@395b8b175c17c1d8f393f82dddd15222c6200e74
         with:
           harness: codex
 

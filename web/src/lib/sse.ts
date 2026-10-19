@@ -783,6 +783,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       stage,
       error: typeof data.error === "string" ? data.error : null,
+      provider: typeof data.provider === "string" ? data.provider : undefined,
     } satisfies SessionSandboxStatusEvent;
   }
   if (eventType === "session.mcp_startup") {

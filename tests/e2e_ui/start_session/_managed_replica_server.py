@@ -307,7 +307,14 @@ def main() -> None:
     # A sandbox host that keys by its id regardless of the launch (one whose
     # omnigent predates the per-launch setting, on a sharded mount).
     parser.add_argument("--legacy-host", action="store_true")
+    # Shortens how long a message waits on an in-flight launch, so a test can
+    # outlast it without holding provisioning for minutes.
+    parser.add_argument("--message-launch-wait-s", type=float)
     args = parser.parse_args()
+    if args.message_launch_wait_s is not None:
+        import omnigent.server.managed_hosts as managed_hosts
+
+        managed_hosts.MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S = args.message_launch_wait_s
     launcher = None
     if args.role == "ingress":
         app = ingress_app(args.replica_a, args.replica_b, strip_host_id=args.strip_host_id)

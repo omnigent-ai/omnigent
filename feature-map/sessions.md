@@ -26,7 +26,9 @@ the header menu), and each place is a separate entry point.
   and sub-agents sharing that runner. Conversation histories are kept.
 - `side-chat-lifecycle`: generic side chats reuse their parent's live runner;
   closing one stops only that chat. Starting one from a stopped generic hosted
-  parent relaunches the parent first, then shares its replacement runner.
+  parent relaunches the parent first, then shares its replacement runner. An
+  existing side chat whose shared runner exited does the same on its next
+  message or Resume.
 - `side-chat-quotes`: Ask in side chat adds selected parent text to the visible,
   writable side chat; Reply on side-chat text quotes it in that chat. Both keep
   the existing draft and attachments, and quotes can be removed before sending.
@@ -71,7 +73,9 @@ the header menu), and each place is a separate entry point.
   unchanged.
 - `message-recovery`: a message racing initial runner binding or replacement
   reaches the available runner without a false failed turn. Native sessions
-  initialize before delivery; SDK sub-agents reuse their loaded session state.
+  initialize before delivery, including when an idle reconnect already restored
+  the tunnel. Later messages reuse that generation's completed initialization;
+  SDK sub-agents reuse their loaded session state.
 - `import-progress`: import recent sessions or one session by ID from an online
   machine. Settings shows a spinner and count; the sidebar heading retains
   progress after leaving Settings. Results stay compact, with expandable failure
@@ -259,7 +263,10 @@ parent composer, or choose **Start a new side chat** from the composer's add
 tray. Selecting assistant text also offers **Ask in side chat**. On mobile,
 side chats open in a drawer; the header's **Conversation actions → Side
 chats** reopens it. A generic hosted parent can start a new side chat
-after stopping; this relaunches the parent and both use one runner. Close a side
+after stopping; this relaunches the parent and both use one runner. Sending to
+an existing side chat or choosing Resume after the parent's runner exited (for
+example, on its idle timeout) also relaunches the parent, then moves the side
+chat to that runner. Close a side
 chat with its tab's close button; the parent and sibling chats keep running. A
 chat-only side chat can also send messages from its direct `/c/<child_id>` URL
 without choosing a workspace. The side-chat composer opens the same `/` menu
@@ -491,6 +498,21 @@ plain `uv run pytest`, which starts a private server for the test.
   all histories. An unrelated session stays online, and a new side chat
   relaunches its parent before both share the replacement runner.
   Only model replies are scripted.
+- **`side-chat-lifecycle`, shared-runner recovery (server integration, plain `uv run pytest`):**
+  `tests/server/integration/test_session_host_launch.py::test_side_chat_message_relaunches_exited_source_runner`,
+  `tests/server/integration/test_session_host_launch.py::test_side_chat_retry_relaunches_exited_source_runner`,
+  and
+  `tests/server/integration/test_session_host_launch.py::test_side_chat_message_rebinds_to_already_relaunched_source_runner`
+  use a mock host. After the parent's runner exits, a side-chat message or
+  Resume relaunches the parent on its host and initializes the side chat on the
+  replacement runner. A parent that already has a replacement is reused
+  without another launch.
+- **`side-chat-lifecycle`, shared-runner recovery (real host, plain `uv run pytest`):**
+  `tests/e2e/test_host_e2e.py::test_host_side_chat_recovers_after_shared_runner_exits`
+  kills the shared runner while the host stays connected. The side chat's next
+  message relaunches the parent's runner and both continue on it; after a
+  second kill, Resume on the side chat does the same. Only model replies are
+  scripted.
 - **`side-chat-lifecycle`, creation entry points:**
   `tests/e2e_ui/chat/test_side_chat_entrypoints.py` covers `/side`, the Workspace
   menu, the composer add tray, selected text's Ask in side chat action, and the
@@ -541,6 +563,16 @@ plain `uv run pytest`, which starts a private server for the test.
   distinguishes a replacement live on another replica from a failed launch
   with an old heartbeat or a local heartbeat. This controls liveness evidence;
   it does not drive an actual cross-replica host migration.
+- **`message-recovery`, already-connected native runner (server integration):**
+  `tests/server/integration/test_session_host_launch.py::test_relaunch_posts_session_init_before_forwarding_message`
+  checks Claude and Codex first-input initialization, suppression of replaying
+  persisted input, and reuse on the next message without repeating child recovery.
+- **`message-recovery`, rotated Codex session (own environment):**
+  `tests/e2e/test_codex_rotated_bridge_relaunch_e2e.py::test_rotated_codex_session_relaunches_into_its_bridge_directory`
+  drives `/new` in real Codex, stops that session's host-launched runner, then
+  sends a chat message to relaunch it. Chat and terminal replies must both
+  reach the rotated conversation with retained or missing bridge state. Only
+  model replies are scripted; no browser interaction is claimed.
 - **`message-recovery`, SDK sub-agent (server integration, plain `uv run pytest`):**
   `tests/server/integration/test_sessions_child_sessions.py::test_sdk_subagent_recovery_skips_session_init`
   covers recovery during ancestor healing and during the final binding refresh,
@@ -577,6 +609,8 @@ plain `uv run pytest`, which starts a private server for the test.
   Grouping, feature gating, drag persistence, and live updates also run in
   `tests/e2e_ui/sessions/test_canvas_page.py`, with selection churn in
   `tests/e2e_ui/sessions/test_canvas_selected_highlight_persists.py::test_clicked_card_keeps_selected_highlight_across_live_updates`.
+  The selection journey covers duplicate titles and a long list whose nodes
+  move outside the rendered viewport after a live update.
   Unit tests in `web/src/canvas/canvasNavigation.test.ts` distinguish Canvas
   from similarly named routes under standalone and embedded mount paths.
   `web/src/canvas/CanvasWorkspace.test.tsx` verifies that dismissing a nested
@@ -647,6 +681,11 @@ plain `uv run pytest`, which starts a private server for the test.
   Hostless CLI Stop keeps its existing per-conversation behavior.
 - Starting a side chat after its parent stopped relaunches the parent. The new
   chat shares that replacement runner and stops with the parent again.
+- A side chat has no host of its own. When its shared runner is gone, recovery
+  goes through the parent. It requires edit access to the parent and, as for
+  attaching a runner, ownership of the parent's runner. Another editor gets an
+  error saying the parent runs on another user's runner, and their side chat
+  stays unbound.
 - Ask in side chat reuses only a visible, writable tab belonging to the current
   parent. Hidden, ended, and currently starting tabs are ineligible; another
   selection opens a new unsent tab. Ended chats do not offer Reply.

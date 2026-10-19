@@ -2039,6 +2039,8 @@ class SandboxStatus(BaseModel):
         has none) → ``starting`` (starting the in-sandbox host) →
         ``connecting`` (launching the agent runner) → ``ready`` /
         ``failed``.
+    :param provider: Sandbox provider being launched, e.g. ``"arclet"``,
+        or ``None`` when unknown.
     :param error: Failure detail when ``stage == "failed"``, e.g.
         ``"managed sandbox launch failed: spend limit reached"``.
         ``None`` otherwise.
@@ -2046,6 +2048,7 @@ class SandboxStatus(BaseModel):
 
     stage: SandboxLaunchStage
     error: str | None = None
+    provider: str | None = None
 
 
 class ModelUsage(BaseModel):
@@ -3618,6 +3621,8 @@ class SessionSandboxStatusEvent(_SSEEventBase):
     :param stage: The launch stage just entered, e.g.
         ``"provisioning"`` — see :class:`SandboxStatus` for the full
         pipeline order.
+    :param provider: Sandbox provider being launched, e.g. ``"arclet"``,
+        or ``None`` when unknown.
     :param error: Failure detail when ``stage == "failed"``, e.g.
         ``"managed sandbox launch failed: spend limit reached"``.
         ``None`` otherwise.
@@ -3632,6 +3637,7 @@ class SessionSandboxStatusEvent(_SSEEventBase):
     conversation_id: str
     stage: SandboxLaunchStage
     error: str | None = None
+    provider: str | None = None
 
 
 class McpServerStartup(BaseModel):

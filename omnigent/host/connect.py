@@ -174,6 +174,7 @@ from omnigent.runner.identity import (
     RUNNER_SLICE_KEY_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     RUNNER_WORKSPACE_ENV_VAR,
+    runner_sign_in_is_pending,
     token_bound_runner_id,
 )
 from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
@@ -294,9 +295,9 @@ _LOG_TAIL_MAX_LINES = 15
 # so a crashed runner is reported within about one client poll.
 _RUNNER_WATCH_INTERVAL_S = 0.5
 
-# The server's 30s send wait handles user feedback; this host check also
-# covers create-time launches and stays inside the 5m triage window.
-_RUNNER_CONNECT_DEADLINE_S = 120.0
+# The server's 30s send wait handles user feedback; this host check also covers
+# create-time launches and outlasts the runner's 150s pending-sign-in wait.
+_RUNNER_CONNECT_DEADLINE_S = 180.0
 
 
 def _connect_marker_path(log_path: Path) -> Path:
@@ -2398,7 +2399,7 @@ class HostProcess:
         two cases.
 
         :param frame: The status query frame.
-        :returns: Result frame with ``alive`` / ``dead`` / ``unknown``.
+        :returns: Liveness, or ``sign_in_pending`` for an exact bounded startup wait.
         """
         while pending := self._pending_runner_launches.get(frame.runner_id):
             # Shield shared completions from a status request's cancellation.
@@ -2413,6 +2414,17 @@ class HostProcess:
             # zygote-forked one — so run it off the loop, matching
             # _watch_runner / _handle_stop, lest a slow zygote stall the daemon.
             status = "alive" if await asyncio.to_thread(handle.proc.poll) is None else "dead"
+            if (
+                status == "alive"
+                and not handle.stop_requested
+                and handle.connect_marker is not None
+                and await asyncio.to_thread(
+                    runner_sign_in_is_pending, handle.connect_marker, frame.runner_id
+                )
+                and self._runners.get(frame.runner_id) is handle
+                and not handle.stop_requested
+            ):
+                status = "sign_in_pending"
         return HostRunnerStatusResultFrame(
             request_id=frame.request_id,
             status=status,

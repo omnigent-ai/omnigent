@@ -7,6 +7,7 @@ Resume uses the same verdict. Empty turns warn and stay idle, as do clean turns.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -117,6 +118,37 @@ def test_classify_codex_error_budget_exhausted_not_auth() -> None:
         fwd._classify_codex_error({"codexErrorInfo": {"httpStatusCode": 403}}, "access denied")
         == auth
     )
+
+
+@pytest.mark.parametrize(
+    "request_id",
+    [
+        "0000a401-0000-4000-8000-000000000000",
+        "00000000-4030-4000-8000-000000000000",
+        "00000000-0000-4000-8000-0000000c4013",
+    ],
+)
+def test_classify_codex_error_rate_limit_request_id_not_auth(request_id: str) -> None:
+    """A 429 whose request id happens to contain "401"/"403" is not auth.
+
+    The message fallback must match the status only as a standalone token,
+    and an explicit rate limit never asks the user to sign in again.
+    """
+    message = f"exceeded retry limit, last status: 429 Too Many Requests, request id: {request_id}"
+    assert fwd._classify_codex_error({}, message) == fwd._CODEX_ERROR_KIND_GENERIC
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "unexpected status 401 Unauthorized: token expired",
+        "unexpected status 403 Forbidden: missing scope",
+        "stream error: status 401, request id: 00000000-0000-4000-8000-000000000000",
+    ],
+)
+def test_classify_codex_error_standalone_auth_status_is_auth(message: str) -> None:
+    """A real 401/403 status in the message still classifies as auth."""
+    assert fwd._classify_codex_error({}, message) == fwd._CODEX_ERROR_KIND_AUTH
 
 
 def test_terminal_error_from_turn_reads_and_classifies_turn_error() -> None:
@@ -1018,6 +1050,48 @@ _CERTIFICATE_LINE = (
 )
 
 
+@pytest.mark.parametrize(
+    ("message", "turn_id", "reason"),
+    [
+        ("Failed to shutdown thread persistence", None, "thread_persistence_shutdown"),
+        ("private-error-detail", "child-turn", "unclassified"),
+        ("x" * 5000 + "Failed to shutdown thread persistence", "child-turn", "unclassified"),
+    ],
+)
+async def test_status_audit_correlates_child_errors_without_copying_error_text(
+    caplog: pytest.LogCaptureFixture,
+    message: str,
+    turn_id: str | None,
+    reason: str,
+) -> None:
+    caplog.set_level(logging.INFO, logger=fwd._logger.name)
+    client = _RecordingClient()
+    await fwd._post_turn_status_edge(
+        client,
+        "child-session",
+        fwd._CodexTurnStatusEdge(
+            status="failed",
+            turn_id=turn_id,
+            source="error",
+            error=fwd._CodexTerminalError(message=message, kind=fwd._CODEX_ERROR_KIND_GENERIC),
+        ),
+    )
+    [record] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "codex_turn_status"
+    ]
+    assert record.session_id == "child-session"
+    assert record.attributes["has_turn_id"] is (turn_id is not None)
+    assert record.attributes["has_error"] is True
+    assert record.attributes["native_error_kind"] == "generic"
+    assert record.attributes["native_error_reason"] == reason
+    assert record.attributes["protocol_source"] == "error"
+    assert "private-error-detail" not in json.dumps(record.attributes)
+    assert message not in record.getMessage()
+    assert client.posts[0][1]["data"]["output"] == message
+
+
 def _connection_retry_params(*, http_status: int | None = None) -> dict:
     """The ``error``/``willRetry`` notification codex-cli 0.154 emits per reconnect."""
     return {
@@ -1128,6 +1202,44 @@ async def test_handle_event_fails_retrying_turn_on_launcher_certificate_failure(
         if body["type"] == "external_session_status"
     ]
     assert status_posts == ["failed"]
+
+
+@pytest.mark.asyncio
+async def test_handle_event_retry_after_mcp_certificate_line_is_left_to_codex(
+    tmp_path: Path,
+) -> None:
+    """An MCP server's expired certificate on stderr does not kill a reconnecting turn."""
+    client = _RecordingClient()
+    codex_client = _InterruptRecordingCodexClient()
+    _seed_active_turn(tmp_path, "turn_123")
+    mcp_line = (
+        "2026-10-16T12:00:00.000000Z  WARN codex_mcp::rmcp_client: failed to connect MCP "
+        "server `docs`: error sending request: invalid peer certificate: Expired"
+    )
+    failure = detect_certificate_failure(mcp_line)
+    if failure is not None:
+        record_certificate_failure(tmp_path, failure)
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={"method": "error", "params": _connection_retry_params()},
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_123",
+        codex_client=codex_client,  # type: ignore[arg-type]
+        forwarder_state=fwd._CodexForwarderState(
+            parent_session_id="conv_x",
+            codex_client=codex_client,  # type: ignore[arg-type]
+            model="gpt-5",
+        ),
+    )
+
+    assert codex_client.requests == []
+    assert all(body["data"].get("status") != "failed" for _url, body in client.posts)
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id == "turn_123"
 
 
 @pytest.mark.asyncio
