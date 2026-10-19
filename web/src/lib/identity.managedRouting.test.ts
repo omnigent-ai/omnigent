@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { OmnigentHostConfig } from "./host";
 
 const fetchMock = vi.fn();
+const getHostConfig = vi.fn<() => OmnigentHostConfig>();
 const isWorkspace = vi.fn(() => true);
 const SLICE_KEY = "X-Databricks-Omnigent-Slice-Key";
 const SESSION_ID = "managed-session";
@@ -17,10 +19,11 @@ function requestHeaders(index: number): Headers {
 beforeEach(() => {
   vi.resetModules();
   fetchMock.mockReset();
+  getHostConfig.mockReset().mockReturnValue({ fetcher: fetchMock });
   isWorkspace.mockReturnValue(true);
   vi.doUnmock("./sessionHost");
   vi.doMock("./host", () => ({
-    getOmnigentHostConfig: () => ({ fetcher: fetchMock }),
+    getOmnigentHostConfig: getHostConfig,
     hostFetch: fetchMock,
     isDatabricksWorkspace: isWorkspace,
     isHostRoutingEnabled: isWorkspace,
@@ -92,12 +95,7 @@ describe("managed first-message routing", () => {
   });
 
   it("recovers workspace dev requests without an embedded fetcher", async () => {
-    vi.doMock("./host", () => ({
-      getOmnigentHostConfig: () => ({}),
-      hostFetch: fetchMock,
-      isDatabricksWorkspace: isWorkspace,
-      isHostRoutingEnabled: isWorkspace,
-    }));
+    getHostConfig.mockReturnValue({});
     const { authenticatedFetch, resolve } = await setup();
     fetchMock.mockResolvedValueOnce(wrongReplica()).mockResolvedValueOnce(Response.json({}));
 

@@ -226,6 +226,8 @@ function LocationDisplay() {
 }
 
 interface RenderProps {
+  frameless?: boolean;
+  mobileOverlay?: boolean;
   position?: { line: number; column?: number };
   open?: boolean;
   path?: string;
@@ -251,6 +253,8 @@ interface RenderProps {
  * the current params after state changes.
  */
 function viewerTree({
+  frameless,
+  mobileOverlay,
   position,
   open = false,
   path = "file1.py",
@@ -266,6 +270,8 @@ function viewerTree({
       <MemoryRouter initialEntries={[url]}>
         <LocationDisplay />
         <FileViewer
+          frameless={frameless}
+          mobileOverlay={mobileOverlay}
           position={position}
           open={open}
           conversationId="conv_1"
@@ -408,12 +414,22 @@ describe("FileViewer mobile keyboard inset", () => {
     clearIOSViewport();
   });
 
-  it("pads the overlay bottom by the keyboard inset when the iOS keyboard is open", () => {
-    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
-    setIOSViewport(800, 500); // keyboard covers 300px of the 800px layout
-    renderViewer({ open: true });
+  it.each([false, true])(
+    "pads the mobile overlay with the iOS keyboard open (frameless=%s)",
+    (frameless) => {
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      setIOSViewport(800, 500); // keyboard covers 300px of the 800px layout
+      renderViewer({ open: true, frameless, mobileOverlay: true });
 
-    expect(screen.getByTestId("file-viewer")).toHaveStyle({ paddingBottom: "300px" });
+      expect(screen.getByTestId("file-viewer")).toHaveStyle({ paddingBottom: "300px" });
+    },
+  );
+
+  it("does not pad the desktop rail for the iOS keyboard", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    setIOSViewport(800, 500);
+    renderViewer({ open: true, frameless: true });
+    expect(screen.getByTestId("file-viewer").style.paddingBottom).toBe("");
   });
 
   it("applies no bottom padding when the keyboard is closed", () => {
@@ -1181,12 +1197,10 @@ describe("classifyAndRemapComments", () => {
 // button is hidden there.
 
 describe("FileViewer header close affordance", () => {
-  it("invokes onClose when the back/close button is clicked (mobile)", () => {
+  it.each([false, true])("invokes onClose for a mobile overlay (frameless=%s)", (frameless) => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
     const onClose = vi.fn();
-    // viewerTree renders without `frameless`, i.e. the mobile overlay mode
-    // that keeps the back button.
-    render(viewerTree({ open: true, onClose }));
+    render(viewerTree({ open: true, onClose, frameless, mobileOverlay: true }));
 
     fireEvent.click(screen.getByRole("button", { name: "Close file viewer" }));
 

@@ -98,6 +98,7 @@ from omnigent.runner.identity import (
     token_bound_runner_id,
 )
 from omnigent.runtime.harnesses.paths import HARNESS_TMP_PARENT_ENV_VAR
+from tests._helpers.providers import isolate_provider_resolution
 
 pytestmark = pytest.mark.asyncio
 
@@ -118,6 +119,14 @@ def _isolated_model_catalog_store(
     """
     store_dir = tmp_path_factory.mktemp("model_catalog_store")
     monkeypatch.setattr("omnigent.models.model_catalog_store._data_dir", lambda: store_dir)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_provider_resolution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """Keep model-options frames independent of the developer's provider setup."""
+    isolate_provider_resolution(monkeypatch, tmp_path_factory.mktemp("config_home"))
 
 
 @pytest.fixture(autouse=True)

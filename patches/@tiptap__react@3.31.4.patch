@@ -1,0 +1,44 @@
+diff --git a/dist/index.cjs b/dist/index.cjs
+index 15c9728c6ad3eefa66306cfd3906c7c5311af06c..499a68ef7f49ea2518c45d9f94f4b0f1d243faea 100644
+--- a/dist/index.cjs
++++ b/dist/index.cjs
+@@ -965,7 +965,9 @@ var ReactNodeView = class extends _tiptap_core.NodeView {
+ 		const nodeViewContentRef = (element) => {
+ 			if (element && this.contentDOMElement && element.firstChild !== this.contentDOMElement) {
+ 				if (element.hasAttribute("data-node-view-wrapper")) element.removeAttribute("data-node-view-wrapper");
+-				const restoreSelection = captureDOMSelection(this.contentDOMElement);
++				const pos = this.getPos();
++				const { from, to } = this.editor.state.selection;
++				const restoreSelection = typeof pos === "number" && from > pos && to < pos + this.node.nodeSize ? captureDOMSelection(this.contentDOMElement) : null;
+ 				element.appendChild(this.contentDOMElement);
+ 				restoreSelection === null || restoreSelection === void 0 || restoreSelection();
+ 			}
+diff --git a/dist/index.js b/dist/index.js
+index 54376b761251f4618b2a8c17585824c8d2c1d64c..f5a2eca579453a6ac8b8347dcf1023c48e79a885 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -941,7 +941,9 @@ var ReactNodeView = class extends NodeView {
+ 		const nodeViewContentRef = (element) => {
+ 			if (element && this.contentDOMElement && element.firstChild !== this.contentDOMElement) {
+ 				if (element.hasAttribute("data-node-view-wrapper")) element.removeAttribute("data-node-view-wrapper");
+-				const restoreSelection = captureDOMSelection(this.contentDOMElement);
++				const pos = this.getPos();
++				const { from, to } = this.editor.state.selection;
++				const restoreSelection = typeof pos === "number" && from > pos && to < pos + this.node.nodeSize ? captureDOMSelection(this.contentDOMElement) : null;
+ 				element.appendChild(this.contentDOMElement);
+ 				restoreSelection === null || restoreSelection === void 0 || restoreSelection();
+ 			}
+diff --git a/src/ReactNodeViewRenderer.tsx b/src/ReactNodeViewRenderer.tsx
+index f11ad9384f11b2a53cc071d443239ee1651bc262..f5dd45d5fbd3ffab07267662e33f66b2867c377d 100644
+--- a/src/ReactNodeViewRenderer.tsx
++++ b/src/ReactNodeViewRenderer.tsx
+@@ -202,2 +202,7 @@ export class ReactNodeView<
+-        // The caret can already be inside here. Moving would lose it.
+-        const restoreSelection = captureDOMSelection(this.contentDOMElement)
++        // Reading DOM selection can force layout. Only preserve it for its containing node.
++        const pos = this.getPos()
++        const { from, to } = this.editor.state.selection
++        const restoreSelection =
++          typeof pos === 'number' && from > pos && to < pos + this.node.nodeSize
++            ? captureDOMSelection(this.contentDOMElement)
++            : null
