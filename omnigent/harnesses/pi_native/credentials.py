@@ -18,7 +18,6 @@ The managed config dir is per-session (like codex-native's managed
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import os
@@ -50,13 +49,12 @@ from omnigent.models.databricks_model_discovery import preferred_served_claude_m
 from omnigent.models.model_metadata import ModelWireAPI
 from omnigent.models.model_override import normalize_model_for_provider
 from omnigent.models.pi_model_compatibility import (
-    PI_CLAUDE_THINKING_MODEL_FRAGMENTS,
     SYSTEM_AI_RESPONSES_KEYWORDS,
     DatabricksPiSurface,
     PiModelEntry,
     databricks_pi_surface_for_model,
     enrich_databricks_model_catalog,
-    pi_model_is_reasoning,
+    pi_generic_model_json_entry,
     pi_model_json_entry,
     unsupported_in_pi,
 )
@@ -78,7 +76,6 @@ from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 from omnigent.util.reasoning_effort import (
     EFFORT_CLEAR_VALUES,
     PI_EFFORTS,
-    PI_THINKING_OFF,
     to_pi_thinking_level,
     validate_effort,
 )
@@ -241,6 +238,10 @@ class PiProviderConfig:
         Databricks OAuth token). Pi still launches — its ``!command`` apiKey may
         recover at request time — but the caller surfaces this so a session that
         would otherwise fail silently tells the user how to re-authenticate.
+    :param model_notice: An informational notice about how the requested model
+        was routed (e.g. a pick qualified by another configured provider that is
+        requested from the serving provider instead). The session still works,
+        so the caller surfaces it as a neutral notice, not an error.
     :param databricks_surfaces: Base URLs of the Databricks gateway surfaces
         reachable with this provider's credential, keyed by surface. Set by the
         Databricks builders; lets a model the live catalog didn't list be routed
@@ -259,6 +260,7 @@ class PiProviderConfig:
     api_key: str
     auth_header: bool
     credential_warning: str | None = None
+    model_notice: str | None = None
     # Full model list for providers that expose multiple models (e.g. the
     # Databricks Anthropic gateway). Excluded from __hash__ so the frozen
     # dataclass stays hashable even though list[dict] is not hashable.
@@ -799,7 +801,6 @@ def _databricks_openai_provider(
             "supportsDeveloperRole": False,
             "supportsStore": False,
             "supportsStrictMode": False,
-            "supportsReasoningEffort": False,
             # stream_options is OpenAI-specific; Gemini and other non-OpenAI
             # models reject it with 400.
             "supportsUsageInStreaming": False,
@@ -1223,7 +1224,7 @@ def _databricks_gateway_pi_provider(
         return _with_configured_default_limits(config, **limits)
     # The listing came back but omitted the configured default; keep it on the
     # surface its provider entry declares instead of guessing one from its name.
-    entry = _gateway_pi_model_entry(config.model, **limits)
+    entry = pi_generic_model_json_entry(config.model, **limits)
     if declared_surface is DatabricksPiSurface.ANTHROPIC:
         return replace(config, extra_models=[*config.extra_models, {**entry, "reasoning": True}])
     if declared_surface not in config.databricks_surfaces:
@@ -1405,97 +1406,6 @@ def _cross_family_routing_warning(
     )
 
 
-def _gateway_pi_model_entry(
-    model_id: str,
-    *,
-    configured_context_window: int | None = None,
-    configured_max_output_tokens: int | None = None,
-) -> _PiModelEntry:
-    """Build a Pi models.json entry for a generic gateway model.
-
-    Pi defaults a model entry with no ``contextWindow``/``maxTokens`` to
-    128k/16k, silently truncating large-context gateway models (e.g. a 1M-
-    context GLM).  This helper enriches the entry with real limits.
-
-    Resolution order (first value found wins per field):
-    1. Provider-config-supplied ``context_window``/``max_output_tokens``.
-    2. Best-effort catalog fuzzy match by normalised model id fragment
-       (``glm-5.2`` → ``databricks-glm-5-2`` carries 1M context/65k output).
-    3. No ``contextWindow``/``maxTokens`` key — Pi uses its own defaults;
-       still better than a completely bare entry because ``reasoning`` and
-       ``input`` are set correctly.
-
-    ``reasoning`` is set via :func:`pi_model_is_reasoning` so that DeepSeek
-    and similar chain-of-thought models surface their thinking channel in Pi.
-
-    :param model_id: The gateway model id as configured by the user,
-        e.g. ``"glm-5.2"`` or ``"deepseek-r2"``.
-    :param configured_context_window: User-supplied context limit from the
-        provider config's ``context_window`` field, or ``None``.
-    :param configured_max_output_tokens: User-supplied output limit from the
-        provider config's ``max_output_tokens`` field, or ``None``.
-    :returns: A Pi model entry with as many fields populated as possible.
-    """
-    entry: _PiModelEntry = {"id": model_id, "input": ["text", "image"]}
-    # Set reasoning for DeepSeek (reads reasoning_content channel) and for
-    # Claude (enables Pi's thinking level controls).
-    if pi_model_is_reasoning(model_id) or any(
-        fragment in model_id.lower() for fragment in PI_CLAUDE_THINKING_MODEL_FRAGMENTS
-    ):
-        entry["reasoning"] = True
-
-    # Determine context window and max output tokens.
-    context_window = configured_context_window
-    max_output_tokens = configured_max_output_tokens
-
-    # Fall back to a catalog fuzzy match when the user hasn't configured limits.
-    if context_window is None or max_output_tokens is None:
-        catalog_entry = _catalog_entry_for_model(model_id)
-        if catalog_entry is not None:
-            if context_window is None and catalog_entry.metadata.context_window is not None:
-                context_window = catalog_entry.metadata.context_window
-            if max_output_tokens is None and catalog_entry.metadata.max_output_tokens is not None:
-                max_output_tokens = catalog_entry.metadata.max_output_tokens
-
-    if context_window is not None:
-        entry["contextWindow"] = context_window
-    if max_output_tokens is not None:
-        entry["maxTokens"] = max_output_tokens
-    return entry
-
-
-def _catalog_entry_for_model(model_id: str) -> model_catalog.ModelEntry | None:
-    """Find the best catalog entry for *model_id* by normalised id fragment.
-
-    Tries an exact match first, then a prefix-aware substring match so that
-    user-facing ids like ``glm-5.2`` resolve against catalog entries like
-    ``databricks-glm-5-2``.  Normalises dots to dashes for version numbers.
-
-    :param model_id: A model id, e.g. ``"glm-5.2"`` or ``"gpt-4o-mini"``.
-    :returns: The best matching catalog :class:`ModelEntry`, or ``None``.
-    """
-    lower = model_id.lower()
-    # Normalise dots to dashes so "glm-5.2" matches "databricks-glm-5-2".
-    normalised = lower.replace(".", "-")
-
-    all_entries: list[model_catalog.ModelEntry] = []
-    for provider in ("openai", "anthropic", "databricks", "google"):
-        with contextlib.suppress(Exception):  # catalog failure must not break launch
-            all_entries.extend(model_catalog.catalog_model_entries(provider))
-
-    # 1. Exact match (covers common ids like "gpt-4o-mini").
-    for entry in all_entries:
-        if entry.id.lower() == lower:
-            return entry
-
-    # 2. Normalised substring match (covers "glm-5.2" → "databricks-glm-5-2").
-    for entry in all_entries:
-        if normalised in entry.id.lower().replace(".", "-"):
-            return entry
-
-    return None
-
-
 def _live_family_model_entries(
     provider: PiProviderConfig,
     *,
@@ -1545,7 +1455,7 @@ def _live_family_model_entries(
         if model_entry.id in seen:
             continue
         seen.add(model_entry.id)
-        entries.append(_gateway_pi_model_entry(model_entry.id))
+        entries.append(pi_generic_model_json_entry(model_entry.id))
     return entries
 
 
@@ -1645,7 +1555,7 @@ def _inline_family_pi_provider(
             # Catalog access) keeps the configured model on its own surface.
             if enumerated.extra_models or enumerated.additional_providers:
                 return enumerated
-        model_entry = _gateway_pi_model_entry(
+        model_entry = pi_generic_model_json_entry(
             resolved_model,
             configured_context_window=family.context_window,
             configured_max_output_tokens=family.max_output_tokens,
@@ -1657,7 +1567,7 @@ def _inline_family_pi_provider(
                 if tier_id == resolved_model:
                     continue
                 shortlist.append(
-                    _gateway_pi_model_entry(
+                    pi_generic_model_json_entry(
                         tier_id,
                         configured_context_window=family.context_window,
                         configured_max_output_tokens=family.max_output_tokens,
@@ -1775,7 +1685,7 @@ def resolve_pi_native_provider(
             )
         return replace(resolved, inference_bound=True)
 
-    unmanaged_prefix_warning: str | None = None
+    unmanaged_prefix_notice: str | None = None
     try:
         # Pi is multi-family; ``omnigent setup`` marks defaults per family, not
         # for ``pi``. Use the shared house-pattern selection so pi resolves its
@@ -1813,13 +1723,13 @@ def resolve_pi_native_provider(
             # OpenRouter, "zai-org/GLM-4.7") and must stay verbatim.
             if bare and isinstance(providers, dict) and prefix in providers:
                 if prefix != entry.name:
-                    unmanaged_prefix_warning = (
+                    unmanaged_prefix_notice = (
                         f"The model override '{model}' names provider "
                         f"'{prefix}', but this Pi session is served by "
                         f"provider '{entry.name}'; the model '{bare}' was "
                         f"requested from '{entry.name}' instead."
                     )
-                    _LOGGER.warning("pi-native: %s", unmanaged_prefix_warning)
+                    _LOGGER.info("pi-native: %s", unmanaged_prefix_notice)
                 model = bare
         if entry.kind == DATABRICKS_KIND:
             resolved = _databricks_pi_provider(entry, model=model)
@@ -1870,15 +1780,8 @@ def resolve_pi_native_provider(
                 resolved = _databricks_pi_provider(db_entry, model=model)
             if resolved is None:
                 _LOGGER.warning("pi-native: no usable provider found; Pi will use its own login.")
-        if resolved is not None and unmanaged_prefix_warning is not None:
-            resolved = replace(
-                resolved,
-                credential_warning=(
-                    unmanaged_prefix_warning
-                    if resolved.credential_warning is None
-                    else f"{unmanaged_prefix_warning}\n\n{resolved.credential_warning}"
-                ),
-            )
+        if resolved is not None and unmanaged_prefix_notice is not None:
+            resolved = replace(resolved, model_notice=unmanaged_prefix_notice)
         return resolved
     except Exception:  # noqa: BLE001 — any resolution failure must not break launch
         # Any failure (malformed config, duplicate per-family default, or an
@@ -1970,9 +1873,8 @@ def pi_native_provider_launch(
     :param agent_dir: The managed Pi config dir for this session.
     :param provider: The resolved provider config.
     :param reasoning_effort: Canonical omnigent effort for the session, e.g.
-        ``"high"``. Passed as ``--thinking`` on the primary provider; ignored
-        (with a warning) on a gateway-routed model, whose thinking must stay
-        off for text to surface.
+        ``"high"``. Passed as ``--thinking`` on the selected provider; Pi
+        applies the model's reasoning capabilities.
     :param selection: Optional picker value naming a generated provider and
         model. When that provider no longer serves the model, the provider that
         does is used instead.
@@ -2009,14 +1911,8 @@ def pi_native_provider_launch(
     else:
         model_provider_id = _default_model_provider_id(provider, rendered)
     write_pi_models_config(agent_dir, provider, rendered)
-    # Copy the user's global Pi settings but suppress defaultThinkingLevel.
-    # In TUI mode Pi applies the setting from ~/.pi/agent/settings.json; for
-    # non-Claude models via openai-completions, any thinking level causes the
-    # Databricks gateway to return 400 (reasoning_effort is sent even when
-    # supportsReasoningEffort is false in the compat block, because TUI mode
-    # applies the session-level thinking before the compat check fires).
-    # Passing None in the overlay makes _deep_merge_settings write null for the
-    # key; Pi's getDefaultThinkingLevel() returns null (falsy) → no thinking.
+    # Session effort or Pi's default selects thinking; don't inherit a global
+    # thinking preference that may belong to a different provider.
     from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir
 
     overlay: dict[str, object] = {"defaultThinkingLevel": None}
@@ -2053,20 +1949,6 @@ def pi_native_provider_launch(
             _LOGGER.warning("pi-native: %s", exc)
         if effort is not None:
             thinking = to_pi_thinking_level(effort)
-    # For non-Claude models on openai-completions/responses, disable thinking.
-    # Gemini and other Databricks models return reasoning_tokens in their
-    # responses; Pi's TUI mode applies thinking even with defaultThinkingLevel:null
-    # in settings, causing the agent loop to complete without surfacing the text
-    # content to the extension. Explicitly passing --thinking off ensures the
-    # completions handler doesn't activate the thinking path.
-    if model_provider_id != provider.provider_id:
-        args.extend(["--thinking", PI_THINKING_OFF])
-        if thinking is not None and thinking != PI_THINKING_OFF:
-            effort_warning = (
-                f"effort ignored for gateway-routed model {provider.model}: "
-                "thinking disabled to keep text surfacing"
-            )
-            _LOGGER.warning("pi-native: %s", effort_warning)
-    elif thinking is not None:
+    if thinking is not None:
         args.extend(["--thinking", thinking])
     return PiNativeLaunch(env=env, args=args, effort_warning=effort_warning)

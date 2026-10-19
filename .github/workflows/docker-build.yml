@@ -37,6 +37,7 @@ on:
       - 'uv.lock'
       - 'pnpm-lock.yaml'
       - 'pnpm-workspace.yaml'
+      - 'patches/**'
       - '.github/workflows/docker-build.yml'
 
 permissions:

@@ -16,8 +16,32 @@ import pytest
 from playwright.sync_api import Page, WebSocketRoute, expect
 
 from tests.e2e_ui.conftest import open_right_rail
+from tests.e2e_ui.shells.test_terminal_direct_attach import _BLOCK_LOOPBACK_DIALS
 
 _ATTACH_WS = re.compile(r"/resources/terminals/.*/attach")
+# xterm answers tmux's colour queries (OSC 10/11) on the input stream, so a
+# reply can land between typed characters.
+_OSC_REPLY = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+# Latch status-overlay states on the terminal view's element so short-lived
+# overlays are observed even if they render and unmount between polls.
+_WATCH_OVERLAY_JS = """(view) => {
+  view.__overlayObserver?.disconnect();
+  delete view.dataset.sawReconnecting;
+  delete view.dataset.sawBridgeClosed;
+  const check = () => {
+    if (view.querySelector('[data-testid="terminal-reconnecting"]')) {
+      view.dataset.sawReconnecting = "1";
+    }
+    // The dead-end text can flash for one render before the retry is scheduled;
+    // only a dead end after the retry overlay means the browser gave up.
+    if (view.dataset.sawReconnecting && /Bridge closed/.test(view.textContent || "")) {
+      view.dataset.sawBridgeClosed = "1";
+    }
+  };
+  view.__overlayObserver = new MutationObserver(check);
+  view.__overlayObserver.observe(view, { childList: true, subtree: true, characterData: true });
+}"""
 
 
 def _open_new_shell(page: Page) -> None:
@@ -35,23 +59,31 @@ def test_embedded_terminal_reconnects_after_transport_close(
 ) -> None:
     """Both terminal surfaces reconnect and accept input after two transient closes."""
     base_url, session_id = terminal_session
-    live: dict[str, object] = {"ws": None, "dials": 0, "input": ""}
+    live: dict[str, object] = {"ws": None, "dials": 0}
+    # Browser->server text per dial. Other terminals on the page stay attached
+    # and send their own frames (e.g. xterm's OSC 11 reply to a tmux query).
+    inputs: dict[int, str] = {}
 
     def _handle(ws: WebSocketRoute) -> None:
-        live["dials"] = int(live["dials"]) + 1
+        dial = int(live["dials"]) + 1
+        live["dials"] = dial
         live["ws"] = ws
+        inputs[dial] = ""
         # Transparent proxy to the real terminal bridge (binary frames pass
         # through unchanged); the test drives the drop from outside.
         server = ws.connect_to_server()
 
         def forward_input(message: str | bytes) -> None:
             text = message.decode(errors="replace") if isinstance(message, bytes) else message
-            live["input"] = str(live["input"]) + text
+            inputs[dial] += text
             server.send(message)
 
         ws.on_message(forward_input)
         server.on_message(lambda message: ws.send(message))
 
+    # Stay on the relay: a background relay->loopback upgrade would retire the
+    # socket this test is about to close, and 4400 only comes from the relay.
+    page.add_init_script(_BLOCK_LOOPBACK_DIALS)
     page.route_web_socket(_ATTACH_WS, _handle)
 
     if surface == "agent-terminal":
@@ -74,21 +106,27 @@ def test_embedded_terminal_reconnects_after_transport_close(
     expect(terminal_view).to_have_attribute("data-state", "connected", timeout=30_000)
     for attempt in range(2):
         dials_before = int(live["dials"])
+        # The "Reconnecting…" overlay can live for only the first backoff step
+        # (500ms), so latch it from the DOM instead of polling for visibility.
+        terminal_view.evaluate(_WATCH_OVERLAY_JS)
         # Closing in the route handler would block Playwright's sync API.
         assert isinstance(live["ws"], WebSocketRoute)
         live["ws"].close(code=close_code)
 
-        expect(page.get_by_test_id("terminal-reconnecting")).to_be_visible(timeout=20_000)
-        expect(page.get_by_text(re.compile("Bridge closed"))).to_have_count(0)
+        expect(terminal_view).to_have_attribute("data-saw-reconnecting", "1", timeout=20_000)
         expect(terminal_view).to_have_attribute("data-state", "connected", timeout=60_000)
+        expect(terminal_view).not_to_have_attribute("data-saw-bridge-closed", "1")
         assert int(live["dials"]) > dials_before, "terminal did not reconnect"
 
         probe = f"reconnect-{attempt}"
-        live["input"] = ""
+        dial = int(live["dials"])
+        inputs[dial] = ""
         terminal_view.locator("textarea.xterm-helper-textarea").focus()
         page.keyboard.type(probe)
         deadline = time.monotonic() + 10
-        while probe not in str(live["input"]) and time.monotonic() < deadline:
+        while probe not in _OSC_REPLY.sub("", inputs[dial]) and time.monotonic() < deadline:
             page.wait_for_timeout(50)
-        assert probe in str(live["input"]), "terminal did not forward input after reconnecting"
+        assert probe in _OSC_REPLY.sub("", inputs[dial]), (
+            f"terminal did not forward input after reconnecting: {inputs[dial]!r}"
+        )
         page.keyboard.press("Control+U")
