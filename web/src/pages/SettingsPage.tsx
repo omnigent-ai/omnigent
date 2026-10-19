@@ -60,6 +60,7 @@ import {
   MoonIcon,
   PanelRightCloseIcon,
   PanelRightIcon,
+  PinIcon,
   PlusIcon,
   SunIcon,
   SquareCheckIcon,
@@ -602,6 +603,11 @@ function WorkspaceTabsControl() {
   const [pinned, setPinned] = useState(() => readPinnedWorkspaceTabs());
   const labelId = useId();
   const pinnedLabelId = useId();
+  const pinnedCards = workspaceTabCards.filter((card) => pinned.includes(card.value));
+  const firstTab = pinnedCards.find((card) => card.value === value) ?? pinnedCards[0];
+  const previewTabs = firstTab
+    ? [firstTab, ...pinnedCards.filter((card) => card !== firstTab)]
+    : [];
   const choose = useCallback((next: DefaultWorkspaceTab) => {
     setValue(next);
     writeDefaultWorkspaceTab(next);
@@ -618,56 +624,100 @@ function WorkspaceTabsControl() {
     <div className="flex flex-col gap-4">
       <ThemeSubsection
         labelId={pinnedLabelId}
-        title="Pinned tabs"
-        helper="Keep your go-to pages in the right sidebar. Unpinned pages open from the + menu as closable tabs."
+        title="Sidebar tabs"
+        helper="Pin the pages you use most. Everything else stays in the + menu."
       >
-        <div role="group" aria-labelledby={pinnedLabelId} className="divide-y divide-border">
-          {workspaceTabCards.map(({ value: tab, label, icon: Icon }) => (
-            <label key={tab} className="flex cursor-pointer items-center gap-3 py-3">
-              <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
-              <span className="flex-1 text-ui">{label}</span>
-              <span aria-hidden="true" className="text-sm text-muted-foreground">
-                {pinned.includes(tab) ? "Pinned" : "In + menu"}
+        <div
+          role="img"
+          aria-label={`Sidebar preview: ${previewTabs.length ? `${previewTabs.map((tab) => tab.label).join(", ")} pinned` : "all pages in the + menu"}.`}
+          className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-muted/25 px-3 py-2.5"
+        >
+          <span className="text-sm text-muted-foreground">Sidebar preview</span>
+          <div aria-hidden="true" className="flex shrink-0 items-center gap-1">
+            {previewTabs.map(({ value: tab, icon: Icon }) => (
+              <span
+                key={tab}
+                className={cn(
+                  "flex size-7 items-center justify-center rounded-md text-muted-foreground",
+                  tab === firstTab?.value && "bg-background text-foreground shadow-xs",
+                )}
+              >
+                <Icon className="size-4" />
               </span>
-              <Switch
-                aria-label={`Pin ${label}`}
-                checked={pinned.includes(tab)}
-                onCheckedChange={(checked) => togglePin(tab, checked)}
-                componentId={`settings.appearance.pin_workspace_${tab}`}
-              />
-            </label>
-          ))}
+            ))}
+            {previewTabs.length > 0 && <span className="mx-1 h-4 w-px bg-border" />}
+            <span className="flex size-7 items-center justify-center text-muted-foreground">
+              <PlusIcon className="size-4" />
+            </span>
+          </div>
+        </div>
+        <div role="group" aria-labelledby={pinnedLabelId} className="divide-y divide-border">
+          {workspaceTabCards.map(({ value: tab, label, icon: Icon }) => {
+            const isPinned = pinned.includes(tab);
+            return (
+              <div key={tab} className="flex items-center gap-3 py-2.5">
+                <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+                <span className="flex-1 text-ui">{label}</span>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  aria-label={`Pin ${label}`}
+                  aria-pressed={isPinned}
+                  title={`${isPinned ? "Unpin" : "Pin"} ${label}`}
+                  onClick={() => togglePin(tab, !isPinned)}
+                  className={cn(
+                    "min-w-24",
+                    isPinned
+                      ? "bg-primary/8 text-primary hover:bg-primary/12"
+                      : "text-muted-foreground",
+                  )}
+                  componentId={`settings.appearance.pin_workspace_${tab}`}
+                >
+                  <PinIcon
+                    aria-hidden="true"
+                    className={cn("size-3.5", isPinned && "fill-current")}
+                  />
+                  {isPinned ? "Pinned" : "Pin"}
+                </Button>
+              </div>
+            );
+          })}
         </div>
       </ThemeSubsection>
-      {pinned.length > 0 && (
-        <div className="border-t border-border pt-4">
-          <ThemeSubsection
-            labelId={labelId}
-            title="Default Workspace tab"
-            helper="Shown first in Workspace. Changing this also updates existing chats when reopened or refreshed. Later tab choices are remembered. File links still open the linked file."
+      <div className="flex flex-col items-stretch justify-between gap-4 border-t border-border pt-4 sm:flex-row sm:items-center">
+        <SettingsLabel
+          labelId={labelId}
+          label="Open first"
+          description={
+            firstTab
+              ? "Start with this pinned page. Later tab choices are remembered."
+              : "Pin a page to choose what opens first."
+          }
+        />
+        <Select
+          value={firstTab?.value ?? ""}
+          onValueChange={(next) => choose(next as DefaultWorkspaceTab)}
+          disabled={!firstTab}
+          componentId="settings.appearance.default_workspace_tab"
+          valueHasNoPii
+        >
+          <SelectTrigger
+            aria-labelledby={labelId}
+            data-testid="workspace-tab-default-select"
+            className="w-full shrink-0 sm:w-40"
           >
-            <CardRadioGroup<DefaultWorkspaceTab>
-              labelledBy={labelId}
-              value={pinned.includes(value) ? value : pinned[0]}
-              onSelect={choose}
-              className={cn(
-                "grid gap-3",
-                pinned.length > 1 && "grid-cols-2",
-                pinned.length === 3 && "sm:grid-cols-3",
-                pinned.length === 4 && "sm:grid-cols-4",
-              )}
-              cardClassName="items-center gap-2 p-4"
-              items={workspaceTabCards
-                .filter((card) => pinned.includes(card.value))
-                .map((card) => ({
-                  value: card.value,
-                  testId: `workspace-tab-default-${card.value}`,
-                  body: iconCardBody(card.icon, card.label),
-                }))}
-            />
-          </ThemeSubsection>
-        </div>
-      )}
+            <SelectValue placeholder="No pinned tabs" />
+          </SelectTrigger>
+          <SelectContent>
+            {pinnedCards.map((card) => (
+              <SelectItem key={card.value} value={card.value}>
+                {card.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
     </div>
   );
 }
