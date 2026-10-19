@@ -2606,6 +2606,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         rememberUnsentSend(sessionId, {
           stableId,
           text,
+          authorId: getCurrentAuthorId(),
           ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
         });
       }
@@ -4551,7 +4552,7 @@ async function bindStream(
     // before this chat was opened wouldn't render otherwise.
     const pendingElicitationBlocks = pendingElicitationBlocksFromSnapshot(session);
     const oldestItemId = items[0]?.id ?? null;
-    const unsentDraft = hydratePending ? unsentSendToRestore(id, items, session) : null;
+    const unsentDraft = hydratePending ? unsentSendToRestore(id, items) : null;
     set((state) => {
       const currentBlocks = withoutNativePreviews(state.blocks, snapshotNativeMessageIds);
       const bindingPatch = sessionBindingPatch(session, state, launchBeforeFetch);
@@ -6983,27 +6984,29 @@ async function sendVerdictFromServer(
  * `send` records each message's text before its POST and drops it once the
  * POST settles. A record found on a cold bind therefore comes from a page that
  * reloaded or closed mid-send, e.g. while the server held the POST for a
- * sandbox wake, which persists nothing until the wake ends. The composer gets
- * the text back unless the snapshot shows the server took it: an item under
- * its stable id, or a matching `pending_inputs` entry.
+ * sandbox wake, which persists nothing until the wake ends. Only the sender
+ * gets the text back, and only if the snapshot holds no item under its stable
+ * id. Matching text is no proof: `pending_inputs` entries and native mirrors
+ * carry no stable id, and another message can say the same thing.
  *
  * @param conversationId - The session being bound.
  * @param items - The snapshot's committed items.
- * @param session - The session snapshot.
  * @returns The draft to restore, or `null`.
  */
 function unsentSendToRestore(
   conversationId: string,
   items: readonly { id: string }[],
-  session: Session,
 ): ConversationState["failedSendDraft"] {
   const unsent = peekUnsentSend(conversationId);
   // A send still open in this tab settles on its own.
   if (unsent === null || inFlightSends.has(unsent.stableId)) return null;
+  const authorId = getCurrentAuthorId();
+  // The sender can't be checked before identity resolves; a later bind can.
+  if (authorId === null && unsent.authorId !== null) return null;
   forgetUnsentSend(conversationId, unsent.stableId);
+  // Another account has signed in to this tab since.
+  if (unsent.authorId !== authorId) return null;
   if (items.some((item) => item.id === unsent.stableId)) return null;
-  const pending = session.pendingInputs ?? [];
-  if (pending.some((p) => messageContentText(p.content) === unsent.text)) return null;
   return {
     conversationId,
     text: unsent.text,

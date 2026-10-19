@@ -1,13 +1,14 @@
-// Messages this tab has sent but not yet seen answered, kept per session in
-// sessionStorage so a reload mid-send can hand them back. The server can hold a
-// message POST for minutes (a sandbox launch or wake) and persists nothing until
-// it settles, so a tab that reloads in that window would otherwise lose the text.
+// Sends this tab hasn't seen answered, per session, in sessionStorage. The server can
+// hold a message POST for minutes (a sandbox launch or wake) without persisting it,
+// so a reload in that window would otherwise lose the text.
 import { readComposerDraft, type StoredReplyDraft } from "./replyDraft";
 
 export interface UnsentSend {
   stableId: string;
   text: string;
   replyDraft?: StoredReplyDraft;
+  /** The sender (`getCurrentAuthorId`), so another account in this tab can't recover it. */
+  authorId: string | null;
 }
 
 const UNSENT_SENDS_KEY = "omnigent.unsentSends";
@@ -21,9 +22,14 @@ function read(): Record<string, UnsentSend> {
     const sends: Record<string, UnsentSend> = {};
     for (const [conversationId, entry] of Object.entries(entries)) {
       const draft = readComposerDraft(entry);
-      const stableId = (entry as { stableId?: unknown }).stableId;
-      if (draft?.text && typeof stableId === "string")
-        sends[conversationId] = { ...draft, stableId };
+      if (!draft?.text || typeof entry !== "object" || entry === null) continue;
+      const { stableId, authorId } = entry as { stableId?: unknown; authorId?: unknown };
+      if (typeof stableId !== "string") continue;
+      sends[conversationId] = {
+        ...draft,
+        stableId,
+        authorId: typeof authorId === "string" ? authorId : null,
+      };
     }
     return sends;
   } catch {

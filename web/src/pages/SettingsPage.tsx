@@ -117,6 +117,7 @@ import {
   type DatabricksConnectionStatus,
 } from "@/lib/databricksIntegration";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
+import { clearUnsentSends } from "@/lib/unsentSends";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
@@ -2499,6 +2500,8 @@ function AccountSection() {
   }, []);
 
   const onSignOut = useCallback(async () => {
+    // Sends this tab never saw answered are the signed-in user's text.
+    clearUnsentSends();
     if (accountsEnabled) {
       // Accounts: clear the cookie via the JSON logout endpoint, then land on
       // the SPA login form.
