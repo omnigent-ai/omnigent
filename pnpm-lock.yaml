@@ -76,7 +76,7 @@ overrides:
 packageExtensionsChecksum: sha256-pFEExG4o57joHucsVi/dgGpp9BfdxYD7y4blLQUpCqI=
 
 patchedDependencies:
-  '@tiptap/react@3.31.4': ff84f8fbe1cf718c2633de79bd5a71cab65de13ba98f046f38a5c127a77fd310
+  '@tiptap/react@3.31.4': 4276dd6552be2980d90b31e5346540e66e9b4eb3807014472e56c38116c14473
 
 importers:
 
@@ -256,7 +256,7 @@ importers:
         version: 3.31.4
       '@tiptap/react':
         specifier: 3.31.4
-        version: 3.31.4(patch_hash=ff84f8fbe1cf718c2633de79bd5a71cab65de13ba98f046f38a5c127a77fd310)(@floating-ui/dom@1.8.0)(@tiptap/core@3.31.4(@tiptap/pm@3.31.4))(@tiptap/pm@3.31.4)(@types/react-dom@19.2.7(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
+        version: 3.31.4(patch_hash=4276dd6552be2980d90b31e5346540e66e9b4eb3807014472e56c38116c14473)(@floating-ui/dom@1.8.0)(@tiptap/core@3.31.4(@tiptap/pm@3.31.4))(@tiptap/pm@3.31.4)(@types/react-dom@19.2.7(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
       '@tiptap/starter-kit':
         specifier: 3.31.4
         version: 3.31.4
@@ -14077,7 +14077,7 @@ snapshots:
       prosemirror-transform: 1.12.0
       prosemirror-view: 1.42.6
 
-  '@tiptap/react@3.31.4(patch_hash=ff84f8fbe1cf718c2633de79bd5a71cab65de13ba98f046f38a5c127a77fd310)(@floating-ui/dom@1.8.0)(@tiptap/core@3.31.4(@tiptap/pm@3.31.4))(@tiptap/pm@3.31.4)(@types/react-dom@19.2.7(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)':
+  '@tiptap/react@3.31.4(patch_hash=4276dd6552be2980d90b31e5346540e66e9b4eb3807014472e56c38116c14473)(@floating-ui/dom@1.8.0)(@tiptap/core@3.31.4(@tiptap/pm@3.31.4))(@tiptap/pm@3.31.4)(@types/react-dom@19.2.7(@types/react@19.2.17))(@types/react@19.2.17)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)':
     dependencies:
       '@tiptap/core': 3.31.4(@tiptap/pm@3.31.4)
       '@tiptap/pm': 3.31.4
