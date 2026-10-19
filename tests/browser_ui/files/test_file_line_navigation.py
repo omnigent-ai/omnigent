@@ -771,10 +771,28 @@ def test_comment_navigation_supersedes_citation(
 
 
 @pytest.mark.parametrize("initial_width", [1600, 390])
+@pytest.mark.parametrize("defer_viewport", [False, True], ids=["immediate", "after-css"])
 def test_markdown_comment_draft_survives_responsive_layouts(
-    page: Page, seeded_session: BrowserSession, initial_width: int
+    page: Page, seeded_session: BrowserSession, initial_width: int, defer_viewport: bool
 ) -> None:
     """Moving the viewer preserves an unsubmitted comment and its selection."""
+    if defer_viewport:
+        # Let CSS hide the old layout before React receives the new viewport.
+        page.add_init_script("""
+            const matchMedia = window.matchMedia.bind(window);
+            const query = '(max-width: 767.98px)';
+            const media = matchMedia(query);
+            let matches = media.matches;
+            const deferred = new EventTarget();
+            Object.defineProperty(deferred, 'matches', {get: () => matches});
+            media.addEventListener('change', event => {
+                requestAnimationFrame(() => requestAnimationFrame(() => {
+                    matches = event.matches;
+                    deferred.dispatchEvent(new Event('change'));
+                }));
+            });
+            window.matchMedia = value => value === query ? deferred : matchMedia(value);
+        """)
     path = "src/notes.md"
     _mock_markdown_files(page, seeded_session, {path: "A paragraph to review.\n"})
     page.set_viewport_size({"width": initial_width, "height": 1000})
@@ -790,6 +808,7 @@ def test_markdown_comment_draft_survives_responsive_layouts(
     page.get_by_role("button", name="Add comment", exact=True).click()
     draft = viewer.get_by_placeholder("Add a comment", exact=False)
     draft.fill("Keep this unsubmitted review")
+    draft.evaluate("el => el.setSelectionRange(5, 9, 'backward')")
     editor.evaluate("el => window.originalMarkdownEditor = el")
     for width in (390 if initial_width == 1600 else 1600, initial_width):
         page.set_viewport_size({"width": width, "height": 1000})
@@ -798,6 +817,9 @@ def test_markdown_comment_draft_survives_responsive_layouts(
         expect(draft).to_be_visible()
         expect(draft).to_have_value("Keep this unsubmitted review")
         expect(draft).to_be_focused()
+        assert draft.evaluate(
+            "el => [el.selectionStart, el.selectionEnd, el.selectionDirection]"
+        ) == [5, 9, "backward"]
         assert editor.evaluate("el => el === window.originalMarkdownEditor")
 
 

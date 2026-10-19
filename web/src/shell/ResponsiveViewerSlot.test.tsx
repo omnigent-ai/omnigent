@@ -1,6 +1,6 @@
 import { StrictMode, useState } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { ResponsiveViewerSlot } from "./ResponsiveViewerSlot";
 
 afterEach(cleanup);
@@ -72,3 +72,49 @@ it("attaches an initially mobile viewer when its target becomes available", () =
   expect(mobileTarget).toBeEmptyDOMElement();
   mobileTarget.remove();
 });
+
+it.each(["hidden", "blurred", "elsewhere"] as const)(
+  "restores only implicitly lost focus when the draft was %s before moving",
+  (reason) => {
+    const mobileTarget = document.createElement("div");
+    document.body.appendChild(mobileTarget);
+    const slot = (mobile: boolean) => (
+      <>
+        <button type="button">Outside viewer</button>
+        <ResponsiveViewerSlot mobile={mobile} mobileTarget={mobileTarget}>
+          <textarea aria-label="Comment draft" defaultValue="Unsaved comment" />
+        </ResponsiveViewerSlot>
+      </>
+    );
+    const { rerender, unmount } = render(slot(false));
+    const draft = screen.getByLabelText<HTMLTextAreaElement>("Comment draft");
+    draft.focus();
+    draft.setSelectionRange(2, 7, "backward");
+    // jsdom has no layout; model whether the old slot still has a CSS box.
+    vi.spyOn(draft, "getClientRects").mockReturnValue(
+      (reason === "blurred" ? [new DOMRect()] : []) as unknown as DOMRectList,
+    );
+    draft.blur();
+    if (reason === "elsewhere") {
+      const outside = screen.getByRole("button", { name: "Outside viewer" });
+      outside.focus();
+      outside.blur();
+    }
+    expect(document.body).toHaveFocus();
+    rerender(slot(true));
+    expect(mobileTarget).toContainElement(draft);
+    expect(draft).toHaveValue("Unsaved comment");
+    if (reason === "hidden") {
+      expect(draft).toHaveFocus();
+      expect([draft.selectionStart, draft.selectionEnd, draft.selectionDirection]).toEqual([
+        2,
+        7,
+        "backward",
+      ]);
+    } else {
+      expect(document.body).toHaveFocus();
+    }
+    unmount();
+    mobileTarget.remove();
+  },
+);
