@@ -8,7 +8,7 @@ import itertools
 import secrets
 import time
 import weakref
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -230,6 +230,7 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
+    _cancel_runner_relays,
     _child_session_summaries_from_conversations,
     _codex_side_chat_fork_lost,
     _dispatch_session_event_to_runner,
@@ -549,6 +550,21 @@ def _host_offline_message() -> str:
         "The host for this session is offline. "
         f"Start it with `{cli_invocation()} host` (or reconnect it) and send the message again."
     )
+
+
+# A client that keeps an unsent message and resends it when the host is back
+# sets this header; the server then refuses instead of recording a failed turn.
+HOST_OFFLINE_HOLD_HEADER = "x-omnigent-hold-when-host-offline"
+
+
+def _client_holds_host_offline_sends(headers: Mapping[str, str]) -> bool:
+    """Report whether the posting client resends a message after its host reconnects."""
+    return headers.get(HOST_OFFLINE_HOLD_HEADER, "").lower() == "on"
+
+
+def _host_offline_hold_message() -> str:
+    """Return the refusal text for a send the client holds until the host reconnects."""
+    return "The host for this session is offline. Your message will be sent when it reconnects."
 
 
 async def _recover_retry_session(
@@ -2758,6 +2774,24 @@ def register_events_routes(
                         "Wait for it to reconnect and send the message again.",
                         code=ErrorCode.RUNNER_UNAVAILABLE,
                     )
+                if host_offline and _client_holds_host_offline_sends(request.headers):
+                    # Nothing reaches the harness, so nothing is recorded; the
+                    # client keeps the message and resends it after reconnect.
+                    _logger.info(
+                        "Host %s is offline; the client holds the send for session %s",
+                        conv.host_id,
+                        session_id,
+                        extra=debug_event(
+                            "runner_client_wait",
+                            session_id=session_id,
+                            runner_id=relaunched_runner_id or conv.runner_id,
+                            host_id=conv.host_id,
+                            outcome="host_offline_held",
+                            attempts=0,
+                            waited_s=round(time.monotonic() - host_wait_started, 3),
+                        ),
+                    )
+                    raise OmnigentError(_host_offline_hold_message(), code=ErrorCode.HOST_OFFLINE)
                 if exit_cause:
                     failure_message = exit_cause
                 elif host_offline:
@@ -3326,7 +3360,8 @@ def register_events_routes(
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None:
             raise _session_not_found()
-        await _best_effort_stop(session_id, conversation_store, runner_router)
+        # Capture relay IDs before subtree deletion removes parent links.
+        descendant_ids = await _best_effort_stop(session_id, conversation_store, runner_router)
         # Runner-side resource cleanup is best-effort: if the bound
         # runner is offline or unbound, the session must still be
         # deletable. Server-owned records (files and conversation row
@@ -3419,6 +3454,9 @@ def register_events_routes(
         deleted = await conversation_store.delete_conversation(session_id)
         if not deleted:
             raise _session_not_found()
+        # A relay still inside an offline runner's reconnect grace must not
+        # fail the deleted turns when that grace expires.
+        _cancel_runner_relays([session_id, *descendant_ids])
         # The session is gone, so is its launch-progress state. Failed
         # launches are retained in the cache for reload visibility while
         # the session exists; without this eviction every deleted

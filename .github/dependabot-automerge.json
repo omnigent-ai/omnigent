@@ -199,6 +199,18 @@
       "ryu"
     ]
   },
+  "dependency_workflow_test_jobs": {
+    "npm": {
+      "ci.yml": ["CI scope"]
+    },
+    "pre-commit": {
+      "ci.yml": ["CI scope"]
+    },
+    "cargo": {
+      "ci.yml": ["Pytest (codex-parity)"],
+      "e2e-ui.yml": ["E2E UI Tests (shard *)"]
+    }
+  },
   "workflow_test_jobs": {
     "ci.yml": [
       "Pytest (runtime-core)"
