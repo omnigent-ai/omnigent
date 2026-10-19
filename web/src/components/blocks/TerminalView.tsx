@@ -2,11 +2,9 @@
 //
 // The xterm + WebSocket lifecycle lives in `TerminalSession` (plain
 // JS, outside React). This component is a thin shell: a callback ref
-// constructs the session when its container node attaches and
-// returns a cleanup that disposes the session when the node detaches
-// (or any of the addressing inputs change). React 19 calls the
-// returned cleanup directly — no `useEffect` + `useRef` dance, no
-// guard against a missing `ref.current`.
+// constructs the session when its container node attaches, and a
+// layout effect disposes it on unmount (React 18 never calls a ref's
+// returned cleanup).
 
 import { Loader2Icon } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -307,6 +305,7 @@ export function TerminalView({
   // Abort handle for the outgoing attach's direct-upgrade probe, which
   // otherwise holds a loopback socket open for its full timeout.
   const upgradeCtlRef = useRef<AbortController | null>(null);
+  const mountedRef = useRef(false);
 
   useEffect(() => {
     clipboardMountedRef.current = true;
@@ -496,6 +495,22 @@ export function TerminalView({
     sessionRef.current = null;
   }, []);
 
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    onStateChangeRef.current?.(stateRef.current);
+    return () => {
+      mountedRef.current = false;
+      // Synchronous so a same-id successor's first report lands after it.
+      onStateChangeRef.current?.(null);
+      // Deferred so StrictMode's dev-only remount keeps the live attach.
+      queueMicrotask(() => {
+        if (mountedRef.current) return;
+        upgradeCtlRef.current?.abort();
+        disposeActiveSession();
+      });
+    };
+  }, [disposeActiveSession]);
+
   const handleResume = useCallback(async () => {
     if (!onResume) return;
     setResumeError(null);
@@ -542,9 +557,10 @@ export function TerminalView({
       let cancelled = false;
       const upgradeCtl = new AbortController();
       upgradeCtlRef.current = upgradeCtl;
-      // Superseded by a later attach on this node? React 18 never calls
-      // the ref cleanup, so `cancelled` alone can't catch that case.
-      const superseded = () => cancelled || attachGenerationRef.current !== generation;
+      // Superseded by a later attach on this node, or unmounted (checked
+      // only after the first await)? React 18 never calls the ref cleanup.
+      const superseded = () =>
+        cancelled || attachGenerationRef.current !== generation || !mountedRef.current;
       void (async () => {
         // The awaited microtask preserves the StrictMode-collapse
         // behavior queueMicrotask provided; the URL resolution (when a

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
+import { getCurrentUserId, resolveIdentity, subscribeIdentity } from "@/lib/identity";
 
 /** Whether the initial viewer-identity request has settled, including failure. */
 export function useIdentityReady(): boolean {
@@ -21,17 +21,21 @@ export function useIdentityReady(): boolean {
  * The current viewer's user id, resolved reactively. Uses `getCurrentUserId`
  * (NOT `getCurrentAuthorId`): ownership compares against a session's `owner`
  * grant, which in single-user mode is the reserved ``"local"`` id. ``null``
- * until identity resolves.
+ * until identity resolves. Subscribing keeps a failed first probe retrying,
+ * so the id appears once ``/v1/me`` answers instead of staying null.
  */
 export function useViewerId(): string | null {
   const [viewerId, setViewerId] = useState<string | null>(() => getCurrentUserId());
   useEffect(() => {
     let cancelled = false;
-    void resolveIdentity().then(() => {
+    const read = () => {
       if (!cancelled) setViewerId(getCurrentUserId());
-    });
+    };
+    const unsubscribe = subscribeIdentity(read);
+    void resolveIdentity().then(read);
     return () => {
       cancelled = true;
+      unsubscribe();
     };
   }, []);
   return viewerId;

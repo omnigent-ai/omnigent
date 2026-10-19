@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import shlex
 import shutil
 import subprocess
@@ -14,10 +15,12 @@ from pathlib import Path
 
 import pytest
 
+from omnigent.debug_logging import record_to_row
 from omnigent.harnesses.claude_native import bridge
 
 _TERMINAL = r"""
 import json
+import logging
 import os
 import sys
 import time
@@ -60,10 +63,10 @@ while True:
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
-@pytest.mark.parametrize("startup", ["slow", "dead", "base-budget-only"])
+@pytest.mark.parametrize("startup", ["slow", "dead", "base-budget-only", "exit-after-ready"])
 @pytest.mark.timeout(20)
 def test_first_message_survives_slow_terminal_startup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, startup: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, startup: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Hold startup until the real readiness gate starts, then exceed its base budget."""
     monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
@@ -88,6 +91,13 @@ def test_first_message_survives_slow_terminal_startup(
         started_at.append(time.monotonic())
         gate_started.touch()
         original_wait(socket_path, tmux_target, timeout_s=timeout_s, bridge_dir=bridge_dir)
+        if startup == "exit-after-ready":
+            subprocess.run(
+                ["tmux", "-S", socket_path, "kill-server"],
+                check=True,
+                capture_output=True,
+                timeout=5,
+            )
 
     monkeypatch.setattr(bridge, "_wait_for_claude_prompt_ready", observe_wait)
     with tempfile.TemporaryDirectory(prefix="claude-ready-", dir="/tmp") as socket_dir:
@@ -131,6 +141,23 @@ def test_first_message_survives_slow_terminal_startup(
                 assert time.monotonic() - started_at[0] >= 1.0
                 assert json.loads(delivered.read_text()) == ["FIRST_PROMPT_DELIVERED"]
                 assert bridge._claude_pane_state(str(socket_path), "main").alive
+            elif startup == "exit-after-ready":
+                caplog.set_level(logging.WARNING)
+                with pytest.raises(RuntimeError, match="tmux command failed"):
+                    bridge.inject_user_message(
+                        bridge_dir, content="MUST_NOT_DELIVER", timeout_s=0.3
+                    )
+                record = next(
+                    r
+                    for r in caplog.records
+                    if getattr(r, "event_name", None) == "claude_native_delivery_finished"
+                )
+                row = record_to_row(record, source="runner")
+                assert row["attributes"]["tmux_operation"] == "send-keys"
+                assert row["attributes"]["tmux_returncode"] == "1"
+                assert "MUST_NOT_DELIVER" not in json.dumps(row)
+                assert str(socket_path) not in json.dumps(row)
+                assert not delivered.exists()
             elif startup == "dead":
                 with pytest.raises(
                     bridge.ClaudeTerminalExited,
@@ -152,6 +179,94 @@ def test_first_message_survives_slow_terminal_startup(
                         bridge_dir, content="MUST_NOT_DELIVER", timeout_s=0.3
                     )
                 assert not delivered.exists()
+        finally:
+            with contextlib.suppress(subprocess.SubprocessError):
+                subprocess.run([*tmux, "kill-server"], check=False, capture_output=True, timeout=5)
+
+
+# Boots silently (a blank pane), then drops whatever was typed meanwhile, as the
+# real TUI does when it switches the tty to raw mode, and takes a composer.
+_SILENT_BOOT_TERMINAL = r"""
+import json
+import os
+import sys
+import termios
+import time
+import tty
+from pathlib import Path
+
+delivered, boot_s = Path(sys.argv[1]), float(sys.argv[2])
+fd = sys.stdin.fileno()
+tty.setraw(fd)
+time.sleep(boot_s)
+termios.tcflush(fd, termios.TCIFLUSH)
+
+def render(draft=""):
+    sys.stdout.write("\x1b[H\x1b[2J" + "─" * 80 + "\r\n❯ " + draft + "\r\n" + "─" * 80 + "\r\n")
+    sys.stdout.flush()
+
+render()
+draft, lines = "", []
+while True:
+    for ch in os.read(fd, 65536).decode(errors="ignore"):
+        if ch == "\x15":
+            draft = ""
+        elif ch == "\r":
+            lines.append(draft)
+            draft = ""
+            delivered.write_text(json.dumps(lines))
+        elif ch >= " ":
+            draft += ch
+    render(draft)
+"""
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+@pytest.mark.timeout(20)
+def test_slash_command_waits_for_a_silently_booting_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A command sent during a silent boot is typed after it, not into the void.
+
+    A blank pane gives the occupied-input check nothing to clear, so without the
+    readiness gate the command was typed at once and dropped by the starting
+    TUI, and the submit Enter then sent an empty line.
+    """
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+    delivered = tmp_path / "delivered.json"
+    terminal = tmp_path / "terminal.py"
+    terminal.write_text(_SILENT_BOOT_TERMINAL)
+    with tempfile.TemporaryDirectory(prefix="claude-ready-", dir="/tmp") as socket_dir:
+        socket_path = Path(socket_dir) / "tmux.sock"
+        tmux = ["tmux", "-S", str(socket_path)]
+        command = shlex.join([sys.executable, str(terminal), str(delivered), "1.0"])
+        try:
+            subprocess.run(
+                [
+                    *tmux,
+                    "-f",
+                    "/dev/null",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    "main",
+                    "-x",
+                    "120",
+                    "-y",
+                    "24",
+                    command,
+                ],
+                check=True,
+                capture_output=True,
+                timeout=5,
+            )
+            bridge_dir = tmp_path / "bridge"
+            bridge.write_tmux_target(bridge_dir, socket_path=socket_path, tmux_target="main")
+            bridge.inject_slash_command(
+                bridge_dir, command="/effort high", timeout_s=1.0, ready_timeout_s=9.0
+            )
+            assert json.loads(delivered.read_text()) == ["/effort high"]
         finally:
             with contextlib.suppress(subprocess.SubprocessError):
                 subprocess.run([*tmux, "kill-server"], check=False, capture_output=True, timeout=5)

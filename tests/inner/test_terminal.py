@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import omnigent.inner.terminal as terminal_mod
+from omnigent.errors import ErrorCategory, ErrorImpact, classify_exception
 from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.terminal import (
@@ -2303,11 +2304,15 @@ def test_require_supported_tmux_accepts_minimum_or_newer(
 def test_require_supported_tmux_rejects_missing_binary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Managed terminals retain the existing clear missing-tmux error."""
+    """A missing tmux is a host setup error whose message says how to fix it."""
     monkeypatch.setattr(terminal_mod.shutil, "which", lambda _: None)
 
-    with pytest.raises(RuntimeError, match="tmux is not installed or not on PATH"):
+    with pytest.raises(RuntimeError, match="tmux is not installed or not on PATH") as caught:
         terminal_mod._require_supported_tmux()
+
+    assert isinstance(caught.value, terminal_mod.TmuxUnavailableError)
+    assert classify_exception(caught.value) == (ErrorCategory.CONFIG, ErrorImpact.BLOCKING)
+    assert "brew install tmux" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -2326,7 +2331,7 @@ def test_require_supported_tmux_rejects_old_or_unknown_version(
     monkeypatch.setattr(terminal_mod.shutil, "which", lambda _: "/usr/bin/tmux")
     monkeypatch.setattr(terminal_mod, "tmux_version", lambda _: version)
 
-    with pytest.raises(RuntimeError, match=message):
+    with pytest.raises(terminal_mod.TmuxUnavailableError, match=message):
         terminal_mod._require_supported_tmux()
 
 

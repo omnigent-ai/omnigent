@@ -1,3 +1,4 @@
+import { registryRequest } from "@/lib/mcpRegistry";
 import type * as IdentityModule from "@/lib/identity";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -68,12 +69,18 @@ vi.mock("@/lib/sessionsApi", () => ({ forkSession: vi.fn() }));
 // renders deterministically without those providers; `versionEnv` lets each
 // case dial the values. Defaults (server null / host undefined) keep the
 // footer hidden, so the unrelated cases above are unaffected.
+vi.mock("@/lib/mcpRegistry", () => ({ registryRequest: vi.fn() }));
+
 const versionEnv = vi.hoisted(() => ({
+  enabledConnections: [] as string[],
   serverVersion: null as string | null,
   hostVersion: undefined as string | null | undefined,
 }));
 vi.mock("@/lib/CapabilitiesContext", () => ({
-  useServerInfo: () => ({ server_version: versionEnv.serverVersion }),
+  useServerInfo: () => ({
+    server_version: versionEnv.serverVersion,
+    enabled_connections: versionEnv.enabledConnections,
+  }),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionHostVersion: () => versionEnv.hostVersion,
@@ -89,6 +96,7 @@ import {
 
 afterEach(() => {
   cleanup();
+  versionEnv.enabledConnections = [];
   copyTextMock.mockClear();
   createMcpMutate.mockClear();
   updateMcpMutate.mockClear();
@@ -924,7 +932,16 @@ describe("McpServersSection", () => {
   });
 
   it.each([1, 2, 3])("keeps MCP servers read-only at permission level %s", (permissionLevel) => {
-    renderButtonWithSession(AGENT_WITH_BOTH, "conv_mcp", permissionLevel);
+    versionEnv.enabledConnections = ["mcp"];
+    renderButtonWithSession(
+      {
+        ...AGENT_WITH_BOTH,
+        mcp_registry_editable: true,
+        mcp_servers: [...AGENT_WITH_BOTH.mcp_servers!, { name: "tracker", transport: "registry" }],
+      },
+      "conv_mcp",
+      permissionLevel,
+    );
     fireEvent.click(screen.getByTestId("agent-info-trigger"));
 
     expect(screen.getByText("slack")).toBeInTheDocument();
@@ -932,6 +949,8 @@ describe("McpServersSection", () => {
     expect(screen.queryByRole("button", { name: "Manage MCP servers" })).toBeNull();
     expect(screen.queryByRole("button", { name: "slack" })).toBeNull();
     expect(screen.queryByRole("button", { name: "jira" })).toBeNull();
+    expect(screen.getByText("tracker")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "tracker" })).toBeNull();
   });
 
   it("preserves MCP management when permissions are disabled", () => {
@@ -939,6 +958,111 @@ describe("McpServersSection", () => {
 
     expect(screen.getByRole("button", { name: "Manage MCP servers" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "slack" })).toBeInTheDocument();
+  });
+
+  it.each([
+    ["custom", true, undefined],
+    ["builtin", false, true],
+  ] as const)(
+    "allows managed selection for a %s agent and gates custom configuration",
+    async (_kind, customEditable, registryEditable) => {
+      versionEnv.enabledConnections = ["mcp"];
+      vi.mocked(registryRequest).mockResolvedValue({
+        data: [
+          {
+            id: "tracker",
+            title: "Work tracker",
+            description: "Read tickets",
+            connected: true,
+            auth: "oauth",
+          },
+        ],
+      });
+      renderButtonWithSession(
+        {
+          ...AGENT_WITH_BOTH,
+          mcp_servers_editable: customEditable,
+          mcp_registry_editable: registryEditable,
+        },
+        "conv_mcp",
+      );
+      fireEvent.click(screen.getByTestId("agent-info-trigger"));
+      expect(screen.queryByRole("button", { name: "slack" }) !== null).toBe(customEditable);
+      fireEvent.click(screen.getByRole("button", { name: "Manage MCP servers" }));
+      const checkbox = await screen.findByRole("switch", { name: "Work tracker" });
+      expect(screen.queryByLabelText("URL")).toBeNull();
+      fireEvent.click(checkbox);
+      expect(createMcpMutate).toHaveBeenCalledWith(
+        { name: "tracker", transport: "registry" },
+        expect.anything(),
+      );
+      if (customEditable) {
+        fireEvent.click(screen.getByRole("button", { name: /Advanced: custom MCP servers/ }));
+        expect(screen.getByLabelText("URL")).toBeInTheDocument();
+      } else {
+        expect(screen.queryByRole("button", { name: /Advanced: custom MCP servers/ })).toBeNull();
+      }
+    },
+  );
+
+  it.each([
+    ["custom", true, undefined],
+    ["builtin", false, true],
+  ] as const)(
+    "keeps unavailable registry references removable for a %s agent when MCP capability is disabled",
+    (_kind, customEditable, registryEditable) => {
+      vi.mocked(registryRequest).mockClear();
+      renderButtonWithSession(
+        {
+          ...AGENT_WITH_BOTH,
+          mcp_servers_editable: customEditable,
+          mcp_registry_editable: registryEditable,
+          mcp_servers: [
+            ...AGENT_WITH_BOTH.mcp_servers!,
+            { name: "tracker", transport: "registry" },
+          ],
+        },
+        "conv_mcp",
+      );
+      fireEvent.click(screen.getByTestId("agent-info-trigger"));
+      fireEvent.click(screen.getByRole("button", { name: "Manage MCP servers" }));
+      const dialog = within(screen.getByRole("dialog"));
+      expect(dialog.getByText("No longer available")).toBeVisible();
+      expect(dialog.getByRole("button", { name: /^tracker/ })).toBeDisabled();
+      expect(dialog.getByRole("button", { name: "Edit tracker" })).toBeDisabled();
+      expect(dialog.getByRole("button", { name: "Edit slack" }).hasAttribute("disabled")).toBe(
+        !customEditable,
+      );
+      expect(dialog.getByRole("button", { name: "Delete slack" }).hasAttribute("disabled")).toBe(
+        !customEditable,
+      );
+      expect(registryRequest).not.toHaveBeenCalled();
+
+      fireEvent.click(dialog.getByRole("button", { name: "Delete tracker" }));
+      expect(deleteMcpMutate).toHaveBeenCalledWith("tracker", expect.anything());
+    },
+  );
+
+  it("honors disabled managed editing without restricting custom servers", async () => {
+    versionEnv.enabledConnections = ["mcp"];
+    vi.mocked(registryRequest).mockResolvedValue({
+      data: [{ id: "tracker", title: "Work tracker", connected: true, auth: "none" }],
+    });
+    renderButtonWithSession(
+      {
+        ...AGENT_WITH_BOTH,
+        mcp_registry_editable: false,
+        mcp_servers: [...AGENT_WITH_BOTH.mcp_servers!, { name: "tracker", transport: "registry" }],
+      },
+      "conv_mcp",
+    );
+    fireEvent.click(screen.getByTestId("agent-info-trigger"));
+    expect(screen.queryByRole("button", { name: "tracker" })).toBeNull();
+    expect(screen.getByRole("button", { name: "slack" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Manage MCP servers" }));
+    expect(await screen.findByRole("switch", { name: "Work tracker" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: /Advanced: custom MCP servers/ }));
+    expect(screen.getByRole("button", { name: "Edit slack" })).toBeEnabled();
   });
 
   it("creates an HTTP MCP server from the manager dialog", () => {

@@ -88,7 +88,9 @@ _pr_title_timed_out: ContextVar[bool] = ContextVar("pr_title_timed_out", default
 # both are accepted by ``gh pr list`` too, so the fork-fallback path shares them.
 _PR_VIEW_FIELDS = (
     "number,title,state,url,isDraft,author,baseRefName,headRefName,statusCheckRollup,body,comments"
+    ",reviewRequests,latestReviews"
 )
+_PR_REVIEW_FIELDS = frozenset({"reviewRequests", "latestReviews"})
 # Reading check runs needs the Checks permission, which a fine-grained personal
 # access token cannot hold; GitHub refuses just this field and ``gh`` fails the
 # whole call, so :func:`_gh_pr_view` retries without it.
@@ -405,6 +407,45 @@ def _summarize_checks(rollup: Any) -> dict[str, Any]:
 _MAX_COMMENTS = 100
 
 
+def _shape_reviewers(data: dict[str, Any]) -> list[dict[str, str]]:
+    """Combine completed reviews with outstanding requests, including re-requests."""
+    reviewers: dict[tuple[str, str], dict[str, str]] = {}
+    reviews = data.get("latestReviews")
+    for review in reviews if isinstance(reviews, list) else []:
+        if not isinstance(review, dict):
+            continue
+        author = review.get("author")
+        login = author.get("login") if isinstance(author, dict) else None
+        state = review.get("state")
+        if (
+            not isinstance(login, str)
+            or not login
+            or state
+            not in (
+                "APPROVED",
+                "COMMENTED",
+                "CHANGES_REQUESTED",
+                "DISMISSED",
+            )
+        ):
+            continue
+        reviewers[("user", login.lower())] = {"login": login, "kind": "user", "state": state}
+
+    requests = data.get("reviewRequests")
+    for request in requests if isinstance(requests, list) else []:
+        if not isinstance(request, dict):
+            continue
+        kind = "team" if request.get("__typename") == "Team" else "user"
+        login = (
+            request.get("slug") or request.get("name") if kind == "team" else request.get("login")
+        )
+        if not isinstance(login, str) or not login:
+            continue
+        # A re-request is pending even if the reviewer previously approved.
+        reviewers[(kind, login.lower())] = {"login": login, "kind": kind, "state": "PENDING"}
+    return list(reviewers.values())
+
+
 def _shape_comments(raw: Any) -> list[dict[str, Any]]:
     """Shape ``gh``'s PR ``comments`` into the Summary tab's comment list.
 
@@ -533,14 +574,15 @@ def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int,
     return None
 
 
-def _checks_refused(fields: str, stderr: str) -> bool:
-    """Whether a failed ``gh pr view`` was refused only its ``statusCheckRollup`` field.
-
-    GitHub reports a field it refuses as a GraphQL error at that field's path
-    (``Resource not accessible by personal access token (…statusCheckRollup)``),
-    so the PR itself resolved; a missing PR or a sign-in failure never names it.
-    """
-    return _PR_CHECKS_FIELD in fields.split(",") and _PR_CHECKS_FIELD in stderr
+def _refused_pr_fields(stderr: str) -> set[str]:
+    """Read rejected JSON fields or GraphQL error paths, excluding CLI help catalogs."""
+    if match := re.search(r'^Unknown JSON field: "([^"]+)"', stderr, re.MULTILINE):
+        return {match[1]}
+    return {
+        field
+        for path in re.findall(r"\(([\w.]+(?:,\s*[\w.]+)*)\)", stderr)
+        for field in re.findall(r"\w+", path)
+    }
 
 
 def _gh_pr_view(
@@ -548,15 +590,20 @@ def _gh_pr_view(
 ) -> dict[str, Any] | None:
     """Return ``gh pr view <args> --json <fields>`` as a dict, or ``None``.
 
-    When GitHub refuses ``statusCheckRollup``, retry once without it; the result
-    then lacks that key. Any other failure, or no PR, is ``None``.
+    Retry without optional checks or reviewer fields only when the error names
+    them. Each retry removes fields, so unrelated failures never retry here.
     """
     rc, out, err = _gh(["pr", "view", *args, "--json", fields], cwd=cwd, token=token)
-    if rc != 0 and _checks_refused(fields, err):
-        without_checks = ",".join(f for f in fields.split(",") if f != _PR_CHECKS_FIELD)
-        rc, out, _ = _gh(["pr", "view", *args, "--json", without_checks], cwd=cwd, token=token)
-    if rc != 0:
-        return None
+    while rc != 0:
+        refused = _refused_pr_fields(err) & set(fields.split(","))
+        refused &= _PR_REVIEW_FIELDS | {_PR_CHECKS_FIELD}
+        if refused & _PR_REVIEW_FIELDS:
+            refused.update(_PR_REVIEW_FIELDS)
+        remaining = ",".join(field for field in fields.split(",") if field not in refused)
+        if not remaining or remaining == fields:
+            return None
+        fields = remaining
+        rc, out, err = _gh(["pr", "view", *args, "--json", fields], cwd=cwd, token=token)
     try:
         data = json.loads(out)
     except ValueError:
@@ -681,6 +728,8 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
             "body": body if isinstance(body, str) and body.strip() else None,
             "comments": _shape_comments(data.get("comments")),
         }
+        if _PR_REVIEW_FIELDS.issubset(data):
+            payload["pr"]["reviewers"] = _shape_reviewers(data)
         payload["authenticated"] = True
         payload["base_ref"] = data.get("baseRefName")
         payload["repo"] = {"name_with_owner": _owner_repo_from_pr_url(data.get("url"))}
@@ -782,6 +831,8 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
         "body": data.get("body") or None,
         "comments": _shape_comments(data.get("comments")),
     }
+    if _PR_REVIEW_FIELDS.issubset(data):
+        info["pr"]["reviewers"] = _shape_reviewers(data)
     return info
 
 
@@ -994,13 +1045,15 @@ def _pr_changed_files(root: str, reference: PullRequestRef | None) -> dict[str, 
         token=token,
     )
     if rc != 0:
-        return empty
+        raise ValueError("GitHub could not load the PR's changed files. Refresh to retry.")
     try:
         entries = json.loads(out)
     except ValueError:
-        return empty
+        raise ValueError(
+            "GitHub returned an invalid changed-file list. Refresh to retry."
+        ) from None
     if not isinstance(entries, list):
-        return empty
+        raise ValueError("GitHub returned an invalid changed-file list. Refresh to retry.")
 
     if reference:
         entries = [
@@ -1128,7 +1181,9 @@ def _pr_patch(root: str, reference: PullRequestRef | None) -> dict[str, Any]:
         _host_args(root, reference)
     repo_args = ["-R", _repo_argument(reference)] if reference else []
     rc, out, _ = _gh(["pr", "diff", str(number), *repo_args], cwd=root, token=token)
-    return {"object": "session.github.pr_diff", "patch": out if rc == 0 else ""}
+    if rc != 0:
+        raise ValueError("GitHub could not load the PR diff. Refresh or open the PR on GitHub.")
+    return {"object": "session.github.pr_diff", "patch": out}
 
 
 def _host_args(root: str, reference: PullRequestRef) -> list[str]:

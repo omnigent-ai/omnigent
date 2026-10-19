@@ -18,6 +18,7 @@ _logger = logging.getLogger(__name__)
 _InjectionFunction = TypeVar("_InjectionFunction", bound=Callable[..., Any])
 
 _Parameters = ParamSpec("_Parameters")
+_TMUX_OPERATIONS = frozenset({"send-keys", "load-buffer", "paste-buffer", "kill-session"})
 
 
 def _best_effort(function: Callable[_Parameters, None]) -> Callable[_Parameters, None]:
@@ -39,6 +40,7 @@ class _PromptDeliveryTrace:
     stage_seconds: dict[str, float] = field(default_factory=dict)
     attempts: list[dict[str, object]] = field(default_factory=list)
     input_attributes: dict[str, object] = field(default_factory=dict)
+    tmux_failure: dict[str, object] = field(default_factory=dict)
 
 
 @_best_effort
@@ -64,6 +66,30 @@ def record_details(**attributes: object) -> None:
     trace = _prompt_delivery_trace.get()
     if trace is not None and trace.attempts:
         trace.attempts[-1].update(attributes)
+
+
+@_best_effort
+def record_tmux_failure(
+    operation: str,
+    *,
+    returncode: int | None = None,
+    timeout_s: float | None = None,
+    os_errno: int | None = None,
+) -> None:
+    """Retain the first failing operation without command arguments or terminal output."""
+    trace = _prompt_delivery_trace.get()
+    if trace is None or trace.tmux_failure:
+        return
+    trace.tmux_failure = {
+        "tmux_operation": operation if operation in _TMUX_OPERATIONS else "other",
+    }
+    for name, value in (
+        ("tmux_returncode", returncode),
+        ("tmux_timeout_s", timeout_s),
+        ("tmux_os_errno", os_errno),
+    ):
+        if value is not None:
+            trace.tmux_failure[name] = value
 
 
 def trace_delivery(
@@ -135,6 +161,7 @@ def trace_delivery(
                                 f"stage_{stage}_ms": round(seconds * 1000)
                                 for stage, seconds in trace.stage_seconds.items()
                             },
+                            **trace.tmux_failure,
                         }
                         if error_type is not None:
                             fields["error_type"] = error_type

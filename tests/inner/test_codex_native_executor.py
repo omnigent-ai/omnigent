@@ -2229,6 +2229,7 @@ def test_run_turn_surfaces_recorded_startup_error(
 def test_run_turn_surfaces_coded_startup_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A startup record with a semantic code is surfaced as written, with its
@@ -2249,6 +2250,7 @@ def test_run_turn_surfaces_coded_startup_failure(
     )
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
 
+    caplog.set_level(logging.INFO, logger=codex_native_executor.__name__)
     events = _collect_turn_events(executor, "hello")
 
     assert len(events) == 1
@@ -2261,6 +2263,16 @@ def test_run_turn_surfaces_coded_startup_failure(
     assert "HQ7M-2KPD" in error.remediation
     # The message never reached Codex: the sender's queued copy is the record.
     assert error.undelivered is True
+    [record] = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "codex_bridge_state_unavailable"
+    ]
+    assert record.attributes["startup_error_present"] is True
+    assert record.attributes["startup_failure_coded"] is True
+    assert record.attributes["wait_sleep_ms"] == 0
+    assert "signin.example.com" not in str(record.attributes)
+    assert "HQ7M-2KPD" not in str(record.attributes)
 
 
 class _UnreachableClient(_FakeCodexNativeClient):
@@ -2612,9 +2624,23 @@ async def test_cancelled_bridge_polling_wait_exits_cleanly(tmp_path: Path) -> No
         await task
 
 
+@pytest.mark.parametrize(
+    ("state_bytes", "status"),
+    [
+        pytest.param(None, "missing", id="missing"),
+        pytest.param(b"\xff", "invalid_encoding", id="invalid-utf8"),
+        pytest.param(b"{", "invalid_json", id="invalid-json"),
+        pytest.param(
+            b'{"session_id":"private-state-content"}', "invalid_state", id="missing-fields"
+        ),
+    ],
+)
 def test_run_turn_without_marker_keeps_bounded_legacy_wait(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    state_bytes: bytes | None,
+    status: str,
 ) -> None:
     """The ordinary path retains the existing 60-second nominal bound."""
     sleep_delays: list[float] = []
@@ -2622,13 +2648,32 @@ def test_run_turn_without_marker_keeps_bounded_legacy_wait(
     async def _count_sleep(seconds: float) -> None:
         sleep_delays.append(seconds)
 
+    if state_bytes is not None:
+        (tmp_path / "state.json").write_bytes(state_bytes)
     monkeypatch.setattr(asyncio, "sleep", _count_sleep)
+    caplog.set_level(logging.INFO, logger=codex_native_executor.__name__)
     events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
 
     assert sum(sleep_delays) == pytest.approx(60.0)
     assert set(sleep_delays) == {0.05, 0.25}
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
+    assert events[0].message == "Codex native bridge state is missing"
+    assert events[0].undelivered is True
+    [record] = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "codex_bridge_state_unavailable"
+    ]
+    attrs = record.attributes
+    assert record.levelno == logging.INFO
+    assert attrs["bridge_state_status"] == status
+    assert attrs["wait_sleep_ms"] == 60000
+    assert attrs["wait_budget_ms"] == 60000
+    assert attrs["startup_wait_extended"] is False
+    assert attrs["startup_error_present"] is False
+    assert "private-state-content" not in str(attrs)
+    assert str(tmp_path) not in str(attrs)
 
 
 @pytest.mark.asyncio

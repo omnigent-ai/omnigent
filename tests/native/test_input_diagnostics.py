@@ -80,6 +80,9 @@ def test_diagnostic_emit_filters_extra_content_and_malformed_fields(
         message="private prompt",
         item_id="private prompt",
         native_turn_id="x" * 257,
+        lifecycle_response_id="resp_native",
+        cause_class="accepted_missing_native_record",
+        reason_code="completed_without_native_record",
         exception_type="x" * 65,
         pending_age_ms=True,
         rpc_error_code=-32600,
@@ -88,6 +91,9 @@ def test_diagnostic_emit_filters_extra_content_and_malformed_fields(
     assert record.attributes == {
         "input_stable_id": "a" * 32,
         "response_id": "resp_saved",
+        "lifecycle_response_id": "resp_native",
         "outcome": "rpc_accepted",
+        "cause_class": "accepted_missing_native_record",
+        "reason_code": "completed_without_native_record",
         "rpc_error_code": -32600,
     }

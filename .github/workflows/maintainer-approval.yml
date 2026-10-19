@@ -41,20 +41,36 @@ jobs:
       pull-requests: read
       actions: read
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 10
     steps:
       - name: Check out approval evaluator
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: main
-          sparse-checkout: .github/scripts/maintainer_approval.py
+          sparse-checkout: |
+            .github/scripts/maintainer_approval.py
+            .github/scripts/dependabot_automerge.py
+            .github/scripts/dependabot_policy.py
+            .github/dependabot-automerge.json
           sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Install trusted policy parser
+        if: >-
+          github.event.pull_request.user.login == 'dependabot[bot]' &&
+          vars.DEPENDABOT_AUTOMERGE_MODE == 'merge'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/dependabot-policy-env"
+          "$RUNNER_TEMP/dependabot-policy-env/bin/pip" install --disable-pip-version-check --only-binary=:all: PyYAML==6.0.3
+          echo "$RUNNER_TEMP/dependabot-policy-env/bin" >> "$GITHUB_PATH"
 
       - name: Require maintainer approval
         env:
           GH_TOKEN: ${{ github.token }}
           REPO:     ${{ github.repository }}
           PR:       ${{ github.event.pull_request.number }}
+          DEPENDABOT_AUTOMERGE_MODE: ${{ vars.DEPENDABOT_AUTOMERGE_MODE || 'report' }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           python3 .github/scripts/maintainer_approval.py \
             --repository "$REPO" \

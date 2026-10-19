@@ -1,4 +1,11 @@
-import { forwardRef, useRef, type ComponentPropsWithoutRef, type ReactNode } from "react";
+import {
+  forwardRef,
+  useEffect,
+  useRef,
+  useState,
+  type ComponentPropsWithoutRef,
+  type ReactNode,
+} from "react";
 import {
   ChevronDownIcon,
   FolderIcon,
@@ -16,6 +23,7 @@ import {
   DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { permissionModeConcept } from "@/lib/nativeHarnessModes";
 import {
@@ -33,7 +41,12 @@ import {
  * content inset line via the shared content inset; a chip's box starts there, and its
  * own px-1 keeps the glyph off the edge.
  */
-export function ComposerWorkspaceBar({ className, ...props }: ComponentPropsWithoutRef<"div">) {
+export function ComposerWorkspaceBar({
+  className,
+  children,
+  trailingContent,
+  ...props
+}: ComponentPropsWithoutRef<"div"> & { trailingContent?: ReactNode }) {
   const barRef = useRef<HTMLDivElement>(null);
   useCollapsedWorkspaceLabels(barRef);
   return (
@@ -46,7 +59,10 @@ export function ComposerWorkspaceBar({ className, ...props }: ComponentPropsWith
         className,
       )}
       {...props}
-    />
+    >
+      {children}
+      {trailingContent}
+    </div>
   );
 }
 
@@ -94,7 +110,7 @@ export const ComposerHostTrigger = forwardRef<
   HTMLButtonElement,
   ComponentPropsWithoutRef<"button"> & {
     label: string;
-    status: "online" | "offline" | "unknown";
+    status?: "online" | "offline" | "unknown";
     cloud?: boolean;
     testIdPrefix?: string;
   }
@@ -108,7 +124,6 @@ export const ComposerHostTrigger = forwardRef<
       ref={ref}
       type="button"
       aria-label={label}
-      title={label}
       className={cn(
         "flex h-8 w-11 shrink-0 cursor-pointer items-center justify-center gap-0.5 rounded-lg bg-transparent pl-1 pr-2 text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground data-[state=open]:bg-muted data-[state=open]:text-foreground dark:hover:bg-muted/50 disabled:cursor-default md:h-7",
         className,
@@ -116,16 +131,18 @@ export const ComposerHostTrigger = forwardRef<
       {...props}
     >
       <span className="flex items-center">
-        <span className="flex size-4 shrink-0 items-center justify-center">
-          <span
-            aria-hidden
-            className={cn(
-              "size-2 rounded-full",
-              status === "online" ? "bg-success" : "border-[1.5px] border-muted-foreground",
-            )}
-            data-testid={`${testIdPrefix}-host-status`}
-          />
-        </span>
+        {status && (
+          <span className="flex size-4 shrink-0 items-center justify-center">
+            <span
+              aria-hidden
+              className={cn(
+                "size-2 rounded-full",
+                status === "online" ? "bg-success" : "border-[1.5px] border-muted-foreground",
+              )}
+              data-testid={`${testIdPrefix}-host-status`}
+            />
+          </span>
+        )}
         <Icon className="size-4 shrink-0" data-testid={`${testIdPrefix}-host-icon`} />
       </span>
     </button>
@@ -232,6 +249,83 @@ export function ComposerConfigTooltipRows({
         </span>
       ))}
     </>
+  );
+}
+
+const MENU_CLOSE_TOOLTIP_GUARD_MS = 600;
+
+function useMenuGuardedTooltip(menuOpen: boolean) {
+  const [wantsOpen, setWantsOpen] = useState(false);
+  // Epoch millis until which open requests are ignored; Infinity while the
+  // menu is open. A ref, not state: it is only read when Radix requests an
+  // open, so changing it never needs a re-render.
+  const suppressedUntil = useRef(0);
+  useEffect(() => {
+    if (menuOpen) {
+      setWantsOpen(false);
+      suppressedUntil.current = Number.POSITIVE_INFINITY;
+    } else if (suppressedUntil.current === Number.POSITIVE_INFINITY) {
+      suppressedUntil.current = Date.now() + MENU_CLOSE_TOOLTIP_GUARD_MS;
+    }
+  }, [menuOpen]);
+  return {
+    open: wantsOpen && !menuOpen,
+    onOpenChange: (next: boolean) =>
+      setWantsOpen(next && !menuOpen && Date.now() >= suppressedUntil.current),
+    triggerProps: {
+      onPointerEnter: () => {
+        if (!menuOpen) suppressedUntil.current = 0;
+      },
+    },
+  } as const;
+}
+
+/**
+ * Hover tooltip for a composer control that opens a menu. It stays hidden
+ * while the menu is open and doesn't reopen as focus returns on close.
+ */
+export function ComposerMenuTooltip({
+  menuOpen,
+  content,
+  variant = "default",
+  testId,
+  className,
+  contentClassName,
+  children,
+}: {
+  menuOpen: boolean;
+  content: ReactNode;
+  variant?: "default" | "session-info";
+  testId?: string;
+  /** Classes for the wrapper that receives the hover. */
+  className?: string;
+  /** Classes for the tooltip surface. */
+  contentClassName?: string;
+  children: ReactNode;
+}) {
+  const guardedTooltip = useMenuGuardedTooltip(menuOpen);
+  return (
+    <TooltipProvider>
+      <Tooltip open={guardedTooltip.open} onOpenChange={guardedTooltip.onOpenChange}>
+        <TooltipTrigger asChild>
+          <span className={cn("flex min-w-0", className)} {...guardedTooltip.triggerProps}>
+            {children}
+          </span>
+        </TooltipTrigger>
+        <TooltipContent
+          side="top"
+          className={cn(
+            "max-w-80 flex-col items-start gap-0.5 px-3 py-2",
+            variant === "session-info" &&
+              "w-64 max-w-[calc(100vw-2rem)] items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10",
+            contentClassName,
+          )}
+          data-testid={testId}
+        >
+          {content}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   );
 }
 

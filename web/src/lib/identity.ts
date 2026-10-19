@@ -237,10 +237,23 @@ function beginSessionHostResolve(url: string): Promise<void> | null {
 // {@link hostScopeForUrl} can't see it: the session create (POST /v1/sessions)
 // and the host-mediated local import (POST /v1/imports/local[/stream]).
 const BODY_HOST_KEYED_RE = /\/v1\/(?:sessions(?:\?|$)|imports\/local(?:[/?]|$))/;
+// A managed fork keys like a managed create: its launch must run where its own
+// new host connects, never on the source session's replica.
+const FORK_RE = /\/v1\/sessions\/[^/?#]+\/fork(?:\?|$)/;
+
+function isManagedForkRequest(url: string, body: BodyInit | null | undefined): boolean {
+  if (typeof body !== "string" || !FORK_RE.test(url)) return false;
+  try {
+    return (JSON.parse(body) as { host_type?: unknown }).host_type === "managed";
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Recover the target host_id from a JSON request body for a body-host-keyed
- * request ({@link isBodyHostKeyedRequest}), or null when the body names none.
+ * request ({@link isBodyHostKeyedRequest}) or a managed fork, or null when the
+ * body names none.
  *
  * These requests carry the host in the body, not the URL, so left unkeyed they
  * round-robin and can miss the replica holding that host's runner tunnel. A
@@ -248,13 +261,16 @@ const BODY_HOST_KEYED_RE = /\/v1\/(?:sessions(?:\?|$)|imports\/local(?:[/?]|$))/
  * inline over its pod-local tunnel); an import fails "host is not connected"
  * (the import reads the host's transcripts over that same tunnel). Keying by the
  * body host_id pins both to the right replica like every other host-scoped
- * request. Bundled (multipart) creates are hostless here (non-string body) and a
- * managed-sandbox create carries ``host_type`` but no ``host_id``; both yield
- * null → unkeyed (see {@link isBodyHostKeyedRequest}).
+ * request. A managed-sandbox create's ``host_id`` is the id it chose for its
+ * new sandbox host, so the launch runs where that host's tunnel will land.
+ * A managed fork's ``host_id`` is the same choice. Bundled (multipart) creates
+ * are hostless here (non-string body), as is a managed create or fork without
+ * one; all yield null → unkeyed (see
+ * {@link isBodyHostKeyedRequest}).
  */
 function hostIdFromBody(url: string, body: BodyInit | null | undefined): string | null {
   if (typeof body !== "string") return null;
-  if (!BODY_HOST_KEYED_RE.test(url)) return null;
+  if (!BODY_HOST_KEYED_RE.test(url) && !FORK_RE.test(url)) return null;
   try {
     const hostId = (JSON.parse(body) as { host_id?: unknown }).host_id;
     return typeof hostId === "string" && hostId ? hostId : null;
@@ -269,9 +285,10 @@ function hostIdFromBody(url: string, body: BodyInit | null | undefined): string 
  * The modal host is a cache-affinity hint for reads, but these requests have a
  * side effect pinned to a replica and must key by their OWN target host:
  *
- * - A managed create has no host_id yet and stays unkeyed. If the new host
- *   connects elsewhere, its first message must resolve the assigned host and
- *   re-address after wrong_replica. A create that names a host keeps that key.
+ * - A managed create keys by the host_id it chose for its sandbox host. One
+ *   without a host_id stays unkeyed: if the new host connects elsewhere, its
+ *   first message must resolve the assigned host and re-address after
+ *   wrong_replica. A create that names a host keeps that key.
  * - A local import reads the chosen host's transcripts over its tunnel, which is
  *   registered on the replica keyed by that host_id — never the importing user's
  *   modal host (null / a different host for a fresh user), which is why an
@@ -292,6 +309,15 @@ function isBodyHostKeyedRequest(url: string, body: BodyInit | null | undefined):
 let currentIsAdmin = false;
 let identityResolved = false;
 let identityPromise: Promise<string | null> | null = null;
+// A `/v1/me` that fails in transit says nothing about the viewer, so it is
+// retried rather than cached. Retries run only while `subscribeIdentity` has
+// listeners, so an unwatched probe never leaves a timer behind.
+const IDENTITY_RETRY_INITIAL_MS = 1_000;
+const IDENTITY_RETRY_MAX_MS = 30_000;
+const identityListeners = new Set<() => void>();
+let identityRetryPending = false;
+let identityRetryDelayMs = IDENTITY_RETRY_INITIAL_MS;
+let identityRetryTimer: ReturnType<typeof setTimeout> | null = null;
 // Cache the server-provided login URL on the first /v1/me probe so
 // later session-expiry redirects in authenticatedFetch hit the right
 // path per provider — "/login" for accounts, "/auth/login" for OIDC.
@@ -355,8 +381,84 @@ function isOnLoginPath(): boolean {
 }
 
 /**
+ * Whether a non-2xx `/v1/me` status may change on retry. A 401 or another
+ * 4xx is the server's answer (signed out, route missing); 5xx, 408, and 429
+ * come from an overloaded server or the gateway in front of it.
+ */
+function isTransientIdentityStatus(status: number): boolean {
+  return status >= 500 || status === 408 || status === 429;
+}
+
+/**
+ * Probe ``GET /v1/me`` once and record the identity it reports.
+ *
+ * :returns: True when the outcome is final, False when the request failed
+ *     in a way a retry can fix.
+ */
+async function probeIdentity(): Promise<boolean> {
+  try {
+    const res = await hostFetch("/v1/me");
+    if (res.status === 401) {
+      // OIDC / accounts mode: server requires authentication.
+      // Redirect to the login URL provided in the response body —
+      // unless we're already there (avoid an infinite reload loop
+      // when the LoginPage itself calls resolveIdentity).
+      try {
+        const data = (await res.json()) as {
+          user_id: null;
+          login_url?: string;
+        };
+        if (data.login_url) {
+          serverLoginUrl = data.login_url;
+          if (!isOnLoginPath()) {
+            redirectToLogin(data.login_url);
+          }
+        }
+      } catch {
+        // Response body was not JSON — still a signed-out answer.
+      }
+      return true;
+    }
+    if (res.ok) {
+      const data = (await res.json()) as {
+        user_id: string | null;
+        is_admin?: boolean;
+      };
+      currentUserId = data.user_id;
+      currentIsAdmin = data.is_admin ?? false;
+      return true;
+    }
+    return !isTransientIdentityStatus(res.status);
+  } catch {
+    // Server unreachable, connection dropped, or the body was cut off.
+    return false;
+  }
+}
+
+function cancelIdentityRetry(): void {
+  if (identityRetryTimer === null) return;
+  clearTimeout(identityRetryTimer);
+  identityRetryTimer = null;
+}
+
+function scheduleIdentityRetry(): void {
+  if (!identityRetryPending || identityRetryTimer !== null || identityListeners.size === 0) {
+    return;
+  }
+  identityRetryTimer = setTimeout(() => {
+    identityRetryTimer = null;
+    // Grow the delay only when a retry runs; a cancelled timer made no request.
+    identityRetryDelayMs = Math.min(identityRetryDelayMs * 2, IDENTITY_RETRY_MAX_MS);
+    void resolveIdentity();
+  }, identityRetryDelayMs);
+}
+
+/**
  * Fetch the current user identity from the server.
  * Called once on app load; subsequent calls return the cached value.
+ * A transient failure resolves to null without being cached: the next
+ * call probes again, and while {@link subscribeIdentity} has listeners
+ * the probe is retried with backoff.
  *
  * When the server returns 401 with a ``login_url`` (OIDC mode),
  * redirects the browser to the login page.
@@ -364,45 +466,38 @@ function isOnLoginPath(): boolean {
 export async function resolveIdentity(): Promise<string | null> {
   if (identityResolved) return currentUserId;
   if (identityPromise) return identityPromise;
-  identityPromise = (async () => {
-    try {
-      const res = await hostFetch("/v1/me");
-      if (res.status === 401) {
-        // OIDC / accounts mode: server requires authentication.
-        // Redirect to the login URL provided in the response body —
-        // unless we're already there (avoid an infinite reload loop
-        // when the LoginPage itself calls resolveIdentity).
-        try {
-          const data = (await res.json()) as {
-            user_id: null;
-            login_url?: string;
-          };
-          if (data.login_url) {
-            serverLoginUrl = data.login_url;
-            if (!isOnLoginPath()) {
-              redirectToLogin(data.login_url);
-              return null;
-            }
-          }
-        } catch {
-          // Response body was not JSON — fall through.
-        }
-      }
-      if (res.ok) {
-        const data = (await res.json()) as {
-          user_id: string | null;
-          is_admin?: boolean;
-        };
-        currentUserId = data.user_id;
-        currentIsAdmin = data.is_admin ?? false;
-      }
-    } catch {
-      // Server unreachable — leave as null.
+  const attempt = probeIdentity().then((final) => {
+    identityPromise = null;
+    if (final) {
+      identityResolved = true;
+      identityRetryPending = false;
+      cancelIdentityRetry();
+    } else {
+      identityRetryPending = true;
+      scheduleIdentityRetry();
     }
-    identityResolved = true;
+    for (const listener of identityListeners) listener();
     return currentUserId;
-  })();
-  return identityPromise;
+  });
+  identityPromise = attempt;
+  return attempt;
+}
+
+/**
+ * Watch the viewer identity. The listener runs after each ``/v1/me`` probe
+ * settles; while any listener is attached, a transient failure is retried
+ * with backoff.
+ *
+ * :param listener: Called with no arguments; read {@link getCurrentUserId}.
+ * :returns: A function that detaches the listener.
+ */
+export function subscribeIdentity(listener: () => void): () => void {
+  identityListeners.add(listener);
+  scheduleIdentityRetry();
+  return () => {
+    identityListeners.delete(listener);
+    if (identityListeners.size === 0) cancelIdentityRetry();
+  };
 }
 
 /** Return the cached user ID (null before resolveIdentity completes). */
@@ -496,7 +591,9 @@ export async function authenticatedFetch(
     // it is keyable ONLY by that body host_id (a managed create with none stays
     // unkeyed).
     const scope = hostScopeForUrl(url);
-    if (scope.scoped) {
+    if (isManagedForkRequest(url, init?.body)) {
+      derivedHostId = hostIdFromBody(url, init?.body);
+    } else if (scope.scoped) {
       derivedHostId = scope.hostId;
     } else if (isBodyHostKeyedRequest(url, init?.body)) {
       derivedHostId = hostIdFromBody(url, init?.body);

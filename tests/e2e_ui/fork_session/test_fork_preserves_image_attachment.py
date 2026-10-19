@@ -116,11 +116,9 @@ def test_fork_carries_image_reference_and_its_resource(
     # the fork owns its own copy of the underlying resource.
     forked_user_bubble = page.locator(_USER)
     forked_img = forked_user_bubble.locator("img").first
-    expect(forked_img).to_be_attached(timeout=30_000)
-    src = forked_img.get_attribute("src")
-    assert src is not None and f"/sessions/{fork_id}/resources/files/" in src, (
-        f"expected the fork's copied image block to reference its OWN session id "
-        f"{fork_id!r} (a fresh copy is expected to own its data), got src={src!r}"
+    # Navigation can update the URL before React replaces the source transcript.
+    expect(forked_img).to_have_attribute(
+        "src", re.compile(rf"/sessions/{re.escape(fork_id)}/resources/files/"), timeout=30_000
     )
     # The preview renders with loading="lazy"; scroll it into view so the
     # browser actually issues the fetch instead of deferring it.

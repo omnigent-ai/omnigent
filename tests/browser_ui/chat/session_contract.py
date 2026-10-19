@@ -282,6 +282,10 @@ class ChatSessionContract:
         """Merge wire fields into subsequent mocked session snapshots."""
         self._session_updates.update(fields)
 
+    def session_snapshot(self) -> dict[str, Any]:
+        """Return a fresh wire snapshot for route overrides."""
+        return self._session()
+
     def set_health(self, **fields: Any) -> None:
         """Override per-session fields returned by the health endpoint."""
         self._health_updates.update(fields)

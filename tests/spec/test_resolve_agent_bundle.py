@@ -72,13 +72,27 @@ def test_resolve_startup_prompt_routes_to_procedures_without_inlining_them() -> 
     assert "Before every interim or final handoff" in prompt
 
 
-def test_resolve_markdown_links_resolve_from_their_own_directory() -> None:
+@pytest.mark.parametrize("agent", ["resolve-agent", "feature-agent"])
+def test_otto_agent_markdown_links_resolve_from_their_own_directory(agent: str) -> None:
     # Moving procedures into nested skills must keep relative links pointing at real files.
+    root = _AGENT.parent / agent
     broken = []
-    for document in sorted(_AGENT.rglob("*.md")):
+    # rglob does not descend into the symlinked shared skills, so list them explicitly.
+    shared = [
+        root / "skills" / name
+        for name in (
+            "otto-pr-review-loop",
+            "otto-review-remediation",
+            "otto-impact-assessment",
+            "otto-drive-pr",
+        )
+    ]
+    assert all(skill.is_dir() for skill in shared)
+    documents = {*root.rglob("*.md"), *(doc for skill in shared for doc in skill.rglob("*.md"))}
+    for document in sorted(documents):
         for target in re.findall(r"\]\(([^)\s]+)\)", document.read_text()):
             if re.match(r"[a-z][a-z0-9+.-]*:|#|/", target):
                 continue
             if not (document.parent / target.split("#")[0]).exists():
-                broken.append(f"{document.relative_to(_AGENT)} -> {target}")
+                broken.append(f"{document.relative_to(root)} -> {target}")
     assert not broken

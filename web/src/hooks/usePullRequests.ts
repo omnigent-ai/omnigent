@@ -66,6 +66,15 @@ export interface PullRequestComment {
   url: string | null;
 }
 
+export type PullRequestReviewerState =
+  "PENDING" | "APPROVED" | "COMMENTED" | "CHANGES_REQUESTED" | "DISMISSED";
+
+export interface PullRequestReviewer {
+  login: string;
+  kind: "user" | "team";
+  state: PullRequestReviewerState;
+}
+
 export interface PullRequest {
   number: number;
   title: string;
@@ -91,6 +100,8 @@ export interface PullRequest {
   /** Top-level PR comments GitHub shows by default; absent from an older host. */
   comments?: PullRequestComment[];
   comments_partial?: boolean;
+  /** Assigned reviewers and their current review state; absent from older hosts. */
+  reviewers?: PullRequestReviewer[];
 }
 
 export interface PullRequestRepo {

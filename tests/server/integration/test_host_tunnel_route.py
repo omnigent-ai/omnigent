@@ -6,7 +6,10 @@ import asyncio
 import contextlib
 import logging
 import threading
+import time
+from types import SimpleNamespace
 
+import anyio
 import pytest
 from asgiref.testing import ApplicationCommunicator
 from fastapi import FastAPI
@@ -34,6 +37,7 @@ from omnigent.host.frames import (
     encode_host_frame,
     encode_import_local_session_frames,
 )
+from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
     PingFrame,
     PongFrame,
@@ -101,6 +105,7 @@ async def _connect_route(
 def _make_hello(
     name: str = "test-laptop",
     runners: list[str] | None = None,
+    connection_id: str | None = None,
 ) -> str:
     """Encode a HostHelloFrame for tests.
 
@@ -114,6 +119,7 @@ def _make_hello(
             frame_protocol_version=1,
             name=name,
             runners=runners or [],
+            connection_id=connection_id,
         )
     )
 
@@ -142,6 +148,7 @@ async def _send_hello_and_wait(
     host_id: str = _HOST_ID,
     name: str = "test-laptop",
     runners: list[str] | None = None,
+    connection_id: str | None = None,
 ) -> None:
     """Send hello and wait for registration.
 
@@ -152,7 +159,7 @@ async def _send_hello_and_wait(
     :param runners: Live runner IDs for the hello frame.
     """
     await communicator.send_input(
-        {"type": "websocket.receive", "text": _make_hello(name, runners)},
+        {"type": "websocket.receive", "text": _make_hello(name, runners, connection_id)},
     )
     await asyncio.wait_for(
         _wait_registered(registry, host_id),
@@ -328,7 +335,7 @@ async def test_host_tunnel_heartbeat_failure_does_not_kill_ping_loop(
 
     monkeypatch.setattr(store, "heartbeat", flaky_heartbeat)
     comm = await _connect_route(app, _TUNNEL_PATH)
-    await _send_hello_and_wait(comm, registry)
+    await _send_hello_and_wait(comm, registry, connection_id="heartbeat-persistence")
     try:
         await _receive_ping_and_pong(comm)
         await _receive_ping_and_pong(comm)
@@ -348,6 +355,7 @@ async def test_host_tunnel_heartbeat_failure_does_not_kill_ping_loop(
             if getattr(record, "event_name", None) == "host_heartbeat_failed"
         ]
         assert failed.attributes["host_id"] == _HOST_ID
+        assert failed.attributes["connection_id"] == "heartbeat-persistence"
         assert failed.attributes["error_type"] == "RuntimeError"
         assert failed.attributes["failure_count"] == 1
         assert failed.attributes["duration_s"] >= 0
@@ -357,6 +365,7 @@ async def test_host_tunnel_heartbeat_failure_does_not_kill_ping_loop(
             if getattr(record, "event_name", None) == "host_heartbeat_recovered"
         ]
         assert recovery.attributes["failure_count"] == failures
+        assert recovery.attributes["connection_id"] == "heartbeat-persistence"
         assert "private-store-error-detail" not in caplog.text
     finally:
         await comm.send_input({"type": "websocket.disconnect", "code": 1000})
@@ -416,14 +425,19 @@ async def test_host_tunnel_slow_heartbeat_does_not_delay_ping_or_offline_cleanup
     assert not store.is_online(_HOST_ID)
 
 
+@pytest.mark.parametrize("wall_clock_step", [-3600.0, 0.0, 3600.0])
 async def test_host_tunnel_failed_heartbeat_still_times_out_silent_host(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    wall_clock_step: float,
 ) -> None:
     import omnigent.server.routes.host_tunnel as tunnel_mod
+    from omnigent.server import host_registry
 
     monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
     monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 3)
+    caplog.set_level(logging.INFO, logger=tunnel_mod.__name__)
     app, registry, store = host_app
 
     def fail_heartbeat(_host_id: str) -> None:
@@ -431,37 +445,270 @@ async def test_host_tunnel_failed_heartbeat_still_times_out_silent_host(
 
     monkeypatch.setattr(store, "heartbeat", fail_heartbeat)
     comm = await _connect_route(app, _TUNNEL_PATH)
-    await _send_hello_and_wait(comm, registry)
+    await _send_hello_and_wait(comm, registry, connection_id="host-silent")
+    shifted_clock = SimpleNamespace(
+        time=lambda: time.time() + wall_clock_step, monotonic=time.monotonic
+    )
+    monkeypatch.setattr(tunnel_mod, "time", shifted_clock)
+    monkeypatch.setattr(host_registry, "time", shifted_clock)
     try:
-        while True:
-            message = await comm.receive_output(timeout=budget(2.0))
-            if message["type"] == "websocket.close":
-                assert message["code"] == 4003
-                assert message["reason"] == "ping timeout"
-                break
+        async with asyncio.timeout(budget(2.0)):
+            while True:
+                message = await comm.receive_output(timeout=budget(2.0))
+                if message["type"] == "websocket.close":
+                    assert message["code"] == 4003
+                    assert message["reason"] == "ping timeout"
+                    break
         await comm.wait(timeout=budget(2.0))
         assert registry.get(_HOST_ID) is None
         assert not store.is_online(_HOST_ID)
+        (timeout,) = [
+            r.attributes
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "host_ping_timeout"
+        ]
+        assert timeout["connection_id"] == "host-silent"
+        # A sleeping or offline host is expected; only a local stall warns.
+        assert timeout["silence_source"] == "peer"
+        assert all(
+            r.levelno == logging.INFO
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "host_ping_timeout"
+        )
+        assert timeout["app_silence_timeout_s"] == 0.06
+        assert timeout["last_app_ping_sent_age_s"] is not None
+        assert timeout["last_app_pong_received_age_s"] is None
+        (end,) = [
+            r.attributes
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "host_tunnel"
+            and r.attributes.get("phase") == "disconnected"
+        ]
+        assert end["connection_id"] == "host-silent"
+        assert "host-ping" in end["ended_by"].split(",")
+        assert end["close_requested_code"] == 4003
+        assert end["close_requested_reason"] == "ping timeout"
+        assert end["close_code"] is None  # No peer close event reached ASGI.
     finally:
         await comm.send_input({"type": "websocket.disconnect", "code": 1000})
         await comm.wait(timeout=budget(2.0))
 
 
-async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(db_uri: str) -> None:
+async def test_host_close_retains_blocked_send_before_cleanup(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A stuck ASGI send remains visible after teardown cancels the sender."""
+    from omnigent.runner.transports.ws_tunnel import diagnostics
+    from omnigent.server.routes import host_tunnel
+
+    app, registry, _store = host_app
+    monkeypatch.setattr(host_tunnel, "PING_INTERVAL_S", 0.02)
+    monkeypatch.setattr(host_tunnel, "PING_MISS_THRESHOLD", 100_000)
+    monkeypatch.setattr(diagnostics, "_SAMPLE_INTERVAL_S", 0.01)
+    caplog.set_level(logging.INFO, logger=host_tunnel.__name__)
+    send_started = asyncio.Event()
+
+    async def stalled_transport(scope, receive, send):
+        async def send_with_stall(message):
+            if message["type"] == "websocket.send":
+                send_started.set()
+                await asyncio.Event().wait()
+            await send(message)
+
+        await app(scope, receive, send_with_stall)
+
+    comm = await _connect_route(stalled_transport, _TUNNEL_PATH)
+    try:
+        await _send_hello_and_wait(comm, registry, connection_id="host-blocked-send")
+        conn = registry.get(_HOST_ID)
+        assert conn is not None
+        await asyncio.wait_for(send_started.wait(), timeout=budget(2.0))
+
+        # Real pings queue behind the blocked send until the sampler reports it.
+        async def send_reported() -> None:
+            while not any(
+                getattr(r, "event_name", None) == "host_tunnel_health" for r in caplog.records
+            ):
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(send_reported(), timeout=budget(3.0))
+        await comm.send_input({"type": "websocket.disconnect", "code": 1006})
+        await comm.wait(timeout=budget(2.0))
+        (end,) = [
+            r.attributes
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "host_tunnel"
+            and r.attributes.get("phase") == "disconnected"
+        ]
+        assert end["connection_id"] == "host-blocked-send"
+        assert end["close_code"] == 1006
+        assert end["sends_in_flight"] == 1
+        assert end["oldest_tracked_send_age_s"] > 0
+        assert end["outbound_queue_depth"] >= 1
+        assert end["app_pings_queued"] >= 1
+        assert end["last_app_ping_sent_age_s"] is None
+        assert end["send_cancellations"] == 0
+        assert registry.get(_HOST_ID) is None
+        (health,) = [
+            r.attributes
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "host_tunnel_health"
+        ]
+        assert health["connection_id"] == "host-blocked-send"
+        assert health["tunnel_side"] == "server"
+        assert health["sends_in_flight"] == 1
+    finally:
+        comm.stop(exceptions=False)
+        await asyncio.gather(comm.future, return_exceptions=True)
+
+
+async def test_host_replacement_names_retirement_without_inventing_close_code(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    app, registry, store = host_app
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.host_tunnel")
+    old = await _connect_route(app, _TUNNEL_PATH)
+    new = await _connect_route(app, _TUNNEL_PATH)
+    try:
+        await _send_hello_and_wait(old, registry, connection_id="old-host-socket")
+        await new.send_input(
+            {
+                "type": "websocket.receive",
+                "text": _make_hello(connection_id="new-host-socket"),
+            }
+        )
+        await old.wait(timeout=budget(2.0))
+        conn = registry.get(_HOST_ID)
+        assert conn is not None
+        assert conn.hello.connection_id == "new-host-socket"
+        assert store.is_online(_HOST_ID)
+        (end,) = [
+            r.attributes
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "host_tunnel"
+            and r.attributes.get("phase") == "disconnected"
+        ]
+        assert end["connection_id"] == "old-host-socket"
+        assert end["ended_by"] == "host-sender"
+        assert end["sender_end_reason"] == "queue_retired"
+        assert end["retirement_reason"] == "replaced"
+        assert end["close_code"] is None
+        assert end["close_requested_code"] is None
+        assert conn.diagnostics.snapshot()["outbound_queue_high_water"] is None
+    finally:
+        await new.send_input({"type": "websocket.disconnect", "code": 1000})
+        await new.wait(timeout=budget(2.0))
+        old.stop(exceptions=False)
+        await asyncio.gather(old.future, return_exceptions=True)
+
+
+@pytest.mark.parametrize(
+    ("offline_result", "cancellation"),
+    [
+        ("success", "task"),
+        ("success", "scope"),
+        ("failure", "task"),
+        ("failure", "scope"),
+        ("blocked", "task"),
+        ("blocked", "scope"),
+        ("diagnostics_failure", "task"),
+        ("diagnostics_failure", "scope"),
+        ("diagnostics_blocked", "scope"),
+        ("callback_blocked", "scope"),
+    ],
+)
+async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    cancellation: str,
+    offline_result: str,
+) -> None:
+    from omnigent.server.routes import host_tunnel
+
     registry = HostRegistry()
     store = HostStore(db_uri)
     app = FastAPI()
     entered = asyncio.Event()
+    cleanup_completed = asyncio.Event()
+    real_monitoring = TunnelDiagnostics.monitoring
+
+    @contextlib.asynccontextmanager
+    async def observed_monitoring(*args, **kwargs):
+        try:
+            async with real_monitoring(*args, **kwargs):
+                yield
+        finally:
+            # Observe finalization at a cancellation checkpoint, retaining the real monitor.
+            await anyio.lowlevel.checkpoint()
+            if offline_result == "diagnostics_blocked":
+                await asyncio.Event().wait()
+            cleanup_completed.set()
+            if offline_result == "diagnostics_failure":
+                raise RuntimeError("test diagnostics finalization failure")
+
+    monkeypatch.setattr(TunnelDiagnostics, "monitoring", observed_monitoring)
+    offline_started = threading.Event()
+    offline_release = threading.Event()
+    offline_finished = threading.Event()
+    offline_errors: list[Exception] = []
+    real_set_offline = store.set_offline
+    if offline_result in {"failure", "blocked"}:
+
+        def interrupted_offline(host_id: str, **kwargs) -> None:
+            assert host_id == _HOST_ID
+            if offline_result == "failure":
+                raise RuntimeError("test offline persistence failure")
+            offline_started.set()
+            try:
+                assert offline_release.wait(timeout=budget(5.0))
+                real_set_offline(host_id, **kwargs)
+            except Exception as exc:
+                offline_errors.append(exc)
+                raise
+            finally:
+                offline_finished.set()
+
+        # Hold only the persistence boundary; registration and reads remain real.
+        monkeypatch.setattr(store, "set_offline", interrupted_offline)
+    if offline_result in {"blocked", "diagnostics_blocked", "callback_blocked"}:
+        monkeypatch.setattr(
+            host_tunnel, "_DISCONNECT_CLEANUP_TIMEOUT_S", budget(0.5), raising=False
+        )
+    if offline_result == "blocked":
+        # Reconnects within one timestamp tick still need protection from a stale write.
+        frozen_time = now_epoch()
+        monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: frozen_time)
 
     async def on_connect(_host_id: str, _owner: str | None) -> None:
         entered.set()
         await asyncio.Event().wait()
 
+    disconnected: list[str] = []
+
+    async def on_disconnect(host_id: str, _owner: str | None) -> None:
+        await anyio.lowlevel.checkpoint()
+        disconnected.append(host_id)
+        if offline_result == "callback_blocked":
+            await asyncio.Event().wait()
+
     app.include_router(
-        create_host_tunnel_router(registry, store, on_host_connect=on_connect),
+        create_host_tunnel_router(
+            registry, store, on_host_connect=on_connect, on_host_disconnect=on_disconnect
+        ),
         prefix="/v1",
     )
-    comm = await _connect_route(app, _TUNNEL_PATH)
+    cancel_scopes: list[anyio.CancelScope] = []
+
+    async def cancellable_app(scope, receive, send):
+        with anyio.CancelScope() as cancel_scope:
+            cancel_scopes.append(cancel_scope)
+            await app(scope, receive, send)
+
+    comm = await _connect_route(cancellable_app, _TUNNEL_PATH)
     await _send_hello_and_wait(comm, registry)
     await asyncio.wait_for(entered.wait(), timeout=budget(1.0))
     helpers = [
@@ -473,17 +720,62 @@ async def test_host_tunnel_cancel_during_connect_callback_cleans_up_workers(db_u
             f"host-ping:{_HOST_ID}",
             f"host-receive:{_HOST_ID}",
             f"host-heartbeat:{_HOST_ID}",
+            "tunnel-diagnostics",
         }
     ]
-    assert len(helpers) == 4
+    assert len(helpers) == 5
+    replacement = None
     try:
-        comm.future.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await comm.future
+        if cancellation == "task":
+            comm.future.cancel()
+        else:
+            # ASGI middleware can keep cancelling at every await during teardown.
+            cancel_scopes[0].cancel()
+        done, _ = await asyncio.wait({comm.future}, timeout=budget(2.0))
+        assert done
+        if cancellation == "task":
+            with pytest.raises(asyncio.CancelledError):
+                comm.future.result()
+        else:
+            comm.future.result()
+        assert cleanup_completed.is_set() == (offline_result != "diagnostics_blocked")
+        assert disconnected == [_HOST_ID]
         assert all(task.done() for task in helpers)
         assert registry.get(_HOST_ID) is None
-        assert not store.is_online(_HOST_ID)
+        persisted = HostStore(db_uri).get_host(_HOST_ID)
+        assert persisted is not None
+        assert persisted.status == (
+            "online" if offline_result in {"failure", "blocked"} else "offline"
+        )
+        if offline_result == "failure":
+            assert "test offline persistence failure" in caplog.text
+        if offline_result == "blocked":
+            assert await asyncio.to_thread(offline_started.wait, budget(2.0))
+            assert not offline_release.is_set()
+            assert "Timed out cleaning up host" in caplog.text
+            monkeypatch.setattr(store, "set_offline", real_set_offline)
+            replacement = await _connect_route(cancellable_app, _TUNNEL_PATH)
+            await _send_hello_and_wait(replacement, registry, connection_id="replacement")
+            assert store.is_online(_HOST_ID)
+            offline_release.set()
+            assert await asyncio.to_thread(offline_finished.wait, budget(2.0))
+            assert not offline_errors, f"Offline worker failed: {offline_errors}"
+            assert store.is_online(_HOST_ID), "A timed-out write must not retire the reconnect"
+        if offline_result == "diagnostics_failure":
+            assert "test diagnostics finalization failure" in caplog.text
+        if offline_result == "diagnostics_blocked":
+            assert "Timed out closing host" in caplog.text
+        if offline_result == "callback_blocked":
+            assert "on_host_disconnect callback timed out" in caplog.text
     finally:
+        offline_release.set()
+        if offline_started.is_set():
+            assert await asyncio.to_thread(offline_finished.wait, budget(2.0))
+        comm.stop(exceptions=False)
+        await asyncio.gather(comm.future, return_exceptions=True)
+        if replacement is not None:
+            replacement.stop(exceptions=False)
+            await asyncio.gather(replacement.future, return_exceptions=True)
         for task in helpers:
             task.cancel()
         await asyncio.gather(*helpers, return_exceptions=True)
@@ -510,8 +802,12 @@ async def test_host_tunnel_accepts_and_registers(
     assert conn.hello.name == "test-laptop"
 
 
+@pytest.mark.parametrize("code,reason", [(1000, "done"), (1006, ""), (1012, "restart")])
 async def test_host_tunnel_deregisters_on_disconnect(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
+    caplog: pytest.LogCaptureFixture,
+    code: int,
+    reason: str,
 ) -> None:
     """
     Verify that the host is removed from the registry on disconnect.
@@ -520,17 +816,32 @@ async def test_host_tunnel_deregisters_on_disconnect(
     call in the finally block is missing.
     """
     app, registry, _store = host_app
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.host_tunnel")
     comm = await _connect_route(app, _TUNNEL_PATH)
-    await _send_hello_and_wait(comm, registry)
+    await _send_hello_and_wait(comm, registry, connection_id="host-close")
     assert registry.get(_HOST_ID) is not None
 
-    await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+    await comm.send_input({"type": "websocket.disconnect", "code": code, "reason": reason})
     # Poll until deregistered — a fixed sleep flakes under load (the
     # disconnect handler runs deregister asynchronously and may not
     # complete within a fixed window).
     await asyncio.wait_for(_wait_deregistered(registry, _HOST_ID), timeout=budget(2.0))
 
     assert registry.get(_HOST_ID) is None
+    await comm.wait(timeout=budget(2.0))
+    (end,) = [
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "host_tunnel"
+        and r.attributes.get("phase") == "disconnected"
+    ]
+    assert end["connection_id"] == "host-close"
+    assert end["close_code"] == code
+    assert end["close_reason"] == reason
+    assert end["retirement_reason"] is None
+    assert end["ended_by"] == "host-receive"
+    assert end["tunnel_side"] == "server"
+    assert end["protocol_keepalive_source"] == "unavailable_from_asgi"
 
 
 async def test_host_tunnel_upserts_db_on_connect(
@@ -1410,6 +1721,8 @@ class _FakeSenderWebSocket:
         record the frame instead.
     :param application_state: Post-raise state, mimicking Starlette's
         synchronous state flip when a concurrent close wins the race.
+    :param client_state: Receive-side state; ``DISCONNECTED`` once the
+        peer's close was received.
     """
 
     def __init__(
@@ -1417,6 +1730,7 @@ class _FakeSenderWebSocket:
         *,
         raises: Exception | None = None,
         application_state: object = None,
+        client_state: object = None,
     ) -> None:
         from starlette.websockets import WebSocketState
 
@@ -1424,6 +1738,7 @@ class _FakeSenderWebSocket:
         self.application_state = (
             application_state if application_state is not None else WebSocketState.CONNECTED
         )
+        self.client_state = client_state if client_state is not None else WebSocketState.CONNECTED
         self.sent: list[str] = []
 
     async def send_text(self, data: str) -> None:
@@ -1445,9 +1760,36 @@ async def test_host_sender_loop_swallows_send_after_close_race() -> None:
         raises=RuntimeError('Cannot call "send" once a close message has been sent.'),
         application_state=WebSocketState.DISCONNECTED,
     )
-    conn = SimpleNamespace(host_id=_HOST_ID, outbound_queue=asyncio.Queue())
-    conn.outbound_queue.put_nowait("frame")
+    conn = SimpleNamespace(
+        host_id=_HOST_ID, outbound_queue=asyncio.Queue(), diagnostics=TunnelDiagnostics()
+    )
+    conn.outbound_queue.put_nowait(OutboundFrame("frame", queued_at=time.monotonic()))
     await host_tunnel._sender_loop(ws, conn)  # returns without raising
+
+
+async def test_host_sender_loop_ends_quietly_when_the_peer_close_was_received() -> None:
+    """uvicorn rejects a send once the peer's close was received, even though
+    the server never sent its own close; the receive helper owns that disconnect."""
+    from types import SimpleNamespace
+
+    from starlette.websockets import WebSocketState
+
+    from omnigent.server.routes import host_tunnel
+
+    ws = _FakeSenderWebSocket(
+        raises=RuntimeError(
+            "Unexpected ASGI message 'websocket.send', after sending "
+            "'websocket.close' or response already completed."
+        ),
+        application_state=WebSocketState.CONNECTED,
+        client_state=WebSocketState.DISCONNECTED,
+    )
+    conn = SimpleNamespace(
+        host_id=_HOST_ID, outbound_queue=asyncio.Queue(), diagnostics=TunnelDiagnostics()
+    )
+    conn.outbound_queue.put_nowait(OutboundFrame("frame", queued_at=time.monotonic()))
+    await host_tunnel._sender_loop(ws, conn)  # returns without raising
+    assert conn.sender_end_reason == "send_after_close"
 
 
 async def test_host_sender_loop_reraises_send_failure_while_connected() -> None:
@@ -1463,8 +1805,10 @@ async def test_host_sender_loop_reraises_send_failure_while_connected() -> None:
         raises=RuntimeError('Cannot call "send" once a close message has been sent.'),
         application_state=WebSocketState.CONNECTED,
     )
-    conn = SimpleNamespace(host_id=_HOST_ID, outbound_queue=asyncio.Queue())
-    conn.outbound_queue.put_nowait("frame")
+    conn = SimpleNamespace(
+        host_id=_HOST_ID, outbound_queue=asyncio.Queue(), diagnostics=TunnelDiagnostics()
+    )
+    conn.outbound_queue.put_nowait(OutboundFrame("frame", queued_at=time.monotonic()))
     with pytest.raises(RuntimeError):
         await host_tunnel._sender_loop(ws, conn)
 

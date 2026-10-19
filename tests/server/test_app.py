@@ -967,6 +967,60 @@ async def test_health_unbound_imported_session_reads_offline(
     assert sessions[plain.id]["runner_online"] is True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("host_sharded", "status", "code"),
+    [(True, 400, "wrong_replica"), (None, 409, "conflict")],
+)
+async def test_host_route_for_live_host_on_another_replica(
+    db_uri: str,
+    tmp_path: Path,
+    host_sharded: bool | None,
+    status: int,
+    code: str,
+) -> None:
+    """
+    A live host absent from this replica is re-addressable only when sharded.
+
+    The web client retries a host-keyed request without its routing key only
+    on 400 ``wrong_replica``. A 409 on a sharded deployment leaves the new-chat
+    model picker loading for a host that is online on another replica.
+    ``None`` omits ``host_sharded`` to cover the constructor default.
+    """
+    from omnigent.server.app import create_app
+    from omnigent.server.routes._host_launch import configure_host_sharding
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+
+    host_id = "host_0123456789abcdef0123456789abcdef"
+    host_store = HostStore(db_uri)
+    # Online and freshly seen, but its tunnel never registered on this replica.
+    host_store.upsert_on_connect(host_id, "laptop", "local")
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    sharding = {} if host_sharded is None else {"host_sharded": host_sharded}
+    try:
+        app = create_app(
+            agent_store=SqlAlchemyAgentStore(db_uri),
+            file_store=SqlAlchemyFileStore(db_uri),
+            conversation_store=SqlAlchemyConversationStore(db_uri),
+            artifact_store=artifact_store,
+            host_store=host_store,
+            agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+            **sharding,
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            resp = await c.get(f"/v1/hosts/{host_id}/harnesses/claude-native/model-options")
+    finally:
+        configure_host_sharding(False)
+
+    assert resp.status_code == status, resp.text
+    assert resp.json()["error"]["code"] == code
+
+
 @dataclass(frozen=True)
 class _SeedStores:
     """
@@ -2349,6 +2403,174 @@ async def _reconnect_with_initialize(
     with caplog.at_level(logging.INFO, logger="omnigent.server.app"):
         await captured["callback"](runner_id, connection)  # type: ignore[operator]
     return [r for r in caplog.records if r.name == "omnigent.server.app"]
+
+
+@pytest.mark.asyncio
+async def test_on_runner_connect_defers_idle_tree_initialization_until_demand(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Idle trees attach on reconnect without starting runner runtimes."""
+    from omnigent.entities import Conversation
+    from omnigent.runner.routing import RoutedRunner
+    from omnigent.server.routes import sessions as sessions_routes
+    from omnigent.server.routes._sessions.orchestration import (
+        _ensure_runner_session_initialized,
+    )
+
+    app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
+    runner_id = "runner_idle_reconnect_test"
+    idle_id, archived_id, active_parent_id, orphan_parent_id = _bind_sessions(
+        db_uri, runner_id, count=4
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    idle = store.get_conversation(idle_id)
+    archived = store.get_conversation(archived_id)
+    active_parent = store.get_conversation(active_parent_id)
+    orphan_parent = store.get_conversation(orphan_parent_id)
+    assert idle is not None and archived is not None
+    assert active_parent is not None and orphan_parent is not None
+    store.set_session_live_status(idle.id, "idle")
+    store.set_session_live_status(archived.id, "running")
+    store.update_conversation(archived.id, archived=True)
+    store.set_session_live_status(active_parent.id, "idle")
+    active_child = store.create_conversation(
+        agent_id=active_parent.agent_id,
+        runner_id=runner_id,
+        kind="sub_agent",
+        parent_conversation_id=active_parent.id,
+    )
+    store.set_session_live_status(active_child.id, "running")
+    store.set_session_live_status(orphan_parent.id, "idle")
+    idle_child = store.create_conversation(
+        agent_id=orphan_parent.agent_id,
+        runner_id=runner_id,
+        kind="sub_agent",
+        parent_conversation_id=orphan_parent.id,
+    )
+    store.set_session_live_status(idle_child.id, "idle")
+    orphan = store.create_conversation(
+        agent_id=orphan_parent.agent_id,
+        runner_id="offline_runner",
+        kind="sub_agent",
+        parent_conversation_id=idle_child.id,
+    )
+    store.set_session_live_status(orphan.id, "running")
+    connection = _attach_live_connection(app, monkeypatch, runner_id)
+    monkeypatch.setattr(
+        app.state.tunnel_registry, "get", lambda rid: connection if rid == runner_id else None
+    )
+    routed = RoutedRunner(runner_id=runner_id, client=object())  # type: ignore[arg-type]
+    app.state.runner_router.client_for_session_resources = lambda *_a, **_k: routed  # type: ignore[assignment]
+    initialized: list[tuple[str, bool]] = []
+
+    async def _initialize(conv: Conversation, *_a: object, **kwargs: object) -> httpx.Response:
+        initialized.append((conv.id, bool(kwargs.get("suppress_recovery_turn"))))
+        return httpx.Response(
+            201,
+            json={"session_init_protocol_version": 2, "terminal_ready": True},
+            request=httpx.Request("POST", "http://runner/v1/sessions"),
+        )
+
+    async def _noop_async(*_a: object, **_k: object) -> None:
+        return None
+
+    monkeypatch.setattr(app.state.runner_session_initializer, "initialize", _initialize)
+    monkeypatch.setattr(sessions_routes, "_ensure_runner_relay_ready", _noop_async)
+
+    await captured["callback"](runner_id, connection)  # type: ignore[operator]
+
+    assert set(initialized) == {
+        (active_parent.id, False),
+        (orphan_parent.id, False),
+        (active_child.id, False),
+        (idle_child.id, True),
+        (orphan.id, False),
+    }
+    initialized_ids = [session_id for session_id, _ in initialized]
+    assert initialized_ids.index(active_parent.id) < initialized_ids.index(active_child.id)
+    assert initialized_ids.index(orphan_parent.id) < initialized_ids.index(idle_child.id)
+    assert initialized_ids.index(idle_child.id) < initialized_ids.index(orphan.id)
+    assert store.get_conversation(orphan.id).runner_id == runner_id  # type: ignore[union-attr]
+
+    refreshed_idle = store.get_conversation(idle.id)
+    assert refreshed_idle is not None
+    initialized_on_demand = await _ensure_runner_session_initialized(
+        idle.id,
+        refreshed_idle,
+        routed.client,
+        store,
+        app.state.runner_session_initializer,
+        suppress_recovery_turn=True,
+        require_success=True,
+    )
+
+    assert initialized_on_demand is True
+    assert initialized[-1] == (idle.id, True)
+    assert all(session_id != archived.id for session_id, _ in initialized)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_read", ["list_child_conversation_ids_page", "get_conversations"])
+async def test_on_runner_connect_attaches_sessions_when_child_scan_fails(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_read: str,
+) -> None:
+    from omnigent.entities import Conversation
+    from omnigent.runner.routing import RoutedRunner
+    from omnigent.server.routes import sessions as sessions_routes
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
+    runner_id = "runner_scan_failure_test"
+    root_id, other_id = _bind_sessions(db_uri, runner_id, count=2)
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_session_live_status(root_id, "idle")
+    store.set_session_live_status(other_id, "idle")
+    orphan = store.create_conversation(
+        agent_id=store.get_conversation(root_id).agent_id,  # type: ignore[union-attr]
+        runner_id="offline_runner",
+        kind="sub_agent",
+        parent_conversation_id=root_id,
+    )
+    connection = _attach_live_connection(app, monkeypatch, runner_id)
+    routed = RoutedRunner(runner_id=runner_id, client=object())  # type: ignore[arg-type]
+    app.state.runner_router.client_for_session_resources = lambda *_a, **_k: routed  # type: ignore[assignment]
+    attached: list[str] = []
+    initialized: list[str] = []
+    monkeypatch.setattr(
+        sessions_routes,
+        "_ensure_runner_relay",
+        lambda session_id, *_a, **_k: attached.append(session_id),
+    )
+
+    async def _initialize(conv: Conversation, *_a: object, **_k: object) -> httpx.Response:
+        initialized.append(conv.id)
+        return httpx.Response(201, request=httpx.Request("POST", "http://runner/v1/sessions"))
+
+    monkeypatch.setattr(app.state.runner_session_initializer, "initialize", _initialize)
+    original = getattr(SqlAlchemyConversationStore, failed_read)
+    failed = False
+
+    def _fail_once(self: SqlAlchemyConversationStore, *args: object, **kwargs: object) -> object:
+        nonlocal failed
+        if not failed and (
+            failed_read != "get_conversations"
+            or (isinstance(args[0], list) and orphan.id in args[0])
+        ):
+            failed = True
+            raise RuntimeError("child scan unavailable")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, failed_read, _fail_once)
+    await captured["callback"](runner_id, connection)  # type: ignore[operator]
+
+    assert failed
+    assert set(attached) == {root_id, other_id}
+    assert set(initialized) == {root_id, other_id}
 
 
 @pytest.mark.asyncio

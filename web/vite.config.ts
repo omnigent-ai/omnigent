@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { validateHeaderName, validateHeaderValue } from "node:http";
 import path from "node:path";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
@@ -99,26 +100,45 @@ function configureProxy(target: string, useAuth: boolean): NonNullable<ProxyOpti
 function createProxyConfig(target: string, useAuth: boolean): Record<string, ProxyOptions> {
   const origin = new URL(target).origin;
   const configure = configureProxy(target, useAuth);
+  const byOrigin = JSON.parse(process.env.OMNIGENT_PROXY_HEADERS || "{}");
+  if (!byOrigin || typeof byOrigin !== "object" || Array.isArray(byOrigin)) {
+    throw new Error("OMNIGENT_PROXY_HEADERS must be a JSON object keyed by server origin");
+  }
+  const headers = byOrigin[origin] === undefined ? {} : byOrigin[origin];
+  if (!headers || typeof headers !== "object" || Array.isArray(headers)) {
+    throw new Error("OMNIGENT_PROXY_HEADERS entries must be header objects");
+  }
+  for (const [name, value] of Object.entries(headers)) {
+    validateHeaderName(name);
+    if (typeof value !== "string") {
+      throw new Error("OMNIGENT_PROXY_HEADERS header values must be strings");
+    }
+    validateHeaderValue(name, value);
+  }
 
   return {
     "/v1": {
       target: origin,
+      headers,
       changeOrigin: true,
       ws: true,
       configure,
     },
     "/api": {
       target: origin,
+      headers,
       changeOrigin: true,
       configure,
     },
     "/auth": {
       target: origin,
+      headers,
       changeOrigin: true,
       configure,
     },
     "/health": {
       target: origin,
+      headers,
       changeOrigin: true,
       configure,
     },
@@ -129,6 +149,7 @@ function createProxyConfig(target: string, useAuth: boolean): Record<string, Pro
     // "pre-manifest", making the capability invisible in local development.
     "/.well-known": {
       target: origin,
+      headers,
       changeOrigin: true,
       configure,
     },
@@ -165,8 +186,6 @@ if (useAuth) {
 } else {
   console.log(`[dev-proxy] target=${OMNIGENT_URL}`);
 }
-
-const proxyConfig = createProxyConfig(OMNIGENT_URL, useAuth);
 
 // Safari < 16.4 cannot parse regex lookbehind; these dependency regexes would
 // otherwise throw there, at module scope during boot or on the first rendered
@@ -273,7 +292,7 @@ export default defineConfig(({ command }) => ({
     },
   },
   server: {
-    proxy: proxyConfig,
+    proxy: createProxyConfig(OMNIGENT_URL, useAuth),
   },
   build: {
     // default baseline is Safari 16.4+; iPadOS 15 can't parse dep regex lookbehinds (#1978)

@@ -9,9 +9,12 @@ from typing import Any
 import httpx
 import pytest
 import yaml
+from fastapi import FastAPI
 
+from omnigent.server.bundles import bundle_location
 from omnigent.server.routes import session_mcp_servers as mcp_routes
-from tests.server.helpers import create_test_session
+from omnigent.stores.artifact_store.local import LocalArtifactStore
+from tests.server.helpers import build_agent_bundle, create_test_session
 
 pytestmark = pytest.mark.asyncio
 
@@ -54,6 +57,49 @@ async def test_create_mcp_server_updates_agent_bundle(client: httpx.AsyncClient)
         "description": "GitHub tools",
         "url": "https://example.com/sse",
     }
+
+
+async def test_mcp_server_edit_conflict_preserves_concurrent_update(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A writer committing after the MCP read wins without losing its bundle."""
+    session = await create_test_session(client, name="mcp-conflict-agent")
+    session_id = session["id"]
+    agent_store = app.state.agent_store
+    original = agent_store.get(session["agent_id"])
+    assert original is not None
+    winner_bundle = build_agent_bundle(original.name, description="Concurrent winner")
+    winner_location = bundle_location(original.id, winner_bundle)
+    put = LocalArtifactStore.put
+
+    def put_with_concurrent_update(
+        artifacts: LocalArtifactStore, location: str, content: bytes
+    ) -> None:
+        put(artifacts, location, content)
+        put(artifacts, winner_location, winner_bundle)
+        winner = agent_store.update_configuration(
+            original, winner_location, description="Concurrent winner"
+        )
+        assert winner is not None
+
+    monkeypatch.setattr(LocalArtifactStore, "put", put_with_concurrent_update)
+    response = await client.post(
+        f"/v1/sessions/{session_id}/agent/mcp-servers",
+        json={"name": "loser", "transport": "http", "url": "https://example.com/sse"},
+    )
+
+    assert response.status_code == 409, response.text
+    winner = agent_store.get(original.id)
+    assert winner is not None
+    assert winner.bundle_location == winner_location
+    assert winner.description == "Concurrent winner"
+    assert winner.version == original.version + 1
+    assert await _agent_bundle(client, session_id) == winner_bundle
+    agent_response = await client.get(f"/v1/sessions/{session_id}/agent")
+    assert agent_response.status_code == 200, agent_response.text
+    assert agent_response.json()["mcp_servers"] == []
 
 
 async def test_mcp_server_mutations_reset_bound_runner_agent_cache(

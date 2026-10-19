@@ -1,8 +1,33 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
+
+/** Stub the iOS shell's keyboard API; returns a setter that plays a keyboard-frame change. */
+function stubIOSKeyboard(): (keyboardHeight: number) => void {
+  let keyboardHeight = 0;
+  const listeners = new Set<() => void>();
+  vi.stubGlobal("innerWidth", 390);
+  vi.stubGlobal("innerHeight", 844);
+  vi.stubGlobal("visualViewport", Object.assign(new EventTarget(), { height: 844, offsetTop: 0 }));
+  vi.stubGlobal("omnigentNative", {
+    kind: "ios",
+    getKeyboardViewport: () => ({ width: 390, height: 844 - keyboardHeight }),
+    onKeyboardViewportChanged: (callback: () => void) => {
+      listeners.add(callback);
+      return () => listeners.delete(callback);
+    },
+  });
+  return (height) =>
+    act(() => {
+      keyboardHeight = height;
+      for (const listener of listeners) listener();
+    });
+}
 
 function renderDrawer(props: Partial<Parameters<typeof MobilePanelDrawer>[0]> = {}) {
   return render(
@@ -69,5 +94,43 @@ describe("MobilePanelDrawer", () => {
       </MobilePanelDrawer>,
     );
     expect(screen.getByTestId("drawer-body")).toBeInTheDocument();
+  });
+
+  it("reserves the docked iOS keyboard so bottom content such as a composer stays visible", () => {
+    const setKeyboardHeight = stubIOSKeyboard();
+    renderDrawer();
+    const drawer = screen.getByTestId("shells-panel-drawer");
+    expect(drawer.style.paddingBottom).toBe("");
+
+    setKeyboardHeight(336);
+    expect(drawer.style.paddingBottom).toBe("336px");
+
+    setKeyboardHeight(0);
+    expect(drawer.style.paddingBottom).toBe("");
+  });
+
+  it("does not reserve the keyboard while closed", () => {
+    // A kept-mounted drawer (side chats) sits off-screen while another
+    // surface holds the keyboard.
+    const setKeyboardHeight = stubIOSKeyboard();
+    const { rerender } = renderDrawer({ keepMounted: true });
+    const drawer = screen.getByTestId("shells-panel-drawer");
+    setKeyboardHeight(336);
+    expect(drawer.style.paddingBottom).toBe("336px");
+
+    rerender(
+      <MobilePanelDrawer
+        open={false}
+        title="Shells"
+        onClose={() => {}}
+        testId="shells-panel-drawer"
+        keepMounted
+      >
+        <div data-testid="drawer-body" />
+      </MobilePanelDrawer>,
+    );
+    expect(drawer.style.paddingBottom).toBe("");
+    setKeyboardHeight(300);
+    expect(drawer.style.paddingBottom).toBe("");
   });
 });

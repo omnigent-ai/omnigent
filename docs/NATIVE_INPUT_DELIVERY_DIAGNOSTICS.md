@@ -28,6 +28,7 @@ and codes rather than put content in an allowed field.
 | `native_rpc_attempt_id` | Pairs one Codex RPC attempt with its accepted, failed, or cancelled result, including attempts recovered by retrying. |
 | `requested_native_turn_id` | The target of that specific steer; absent for a new turn start. |
 | `initial_native_turn_id` | Bridge state before a complete injection, which can differ from the target of a recovered RPC attempt. |
+| `lifecycle_response_id` | The Omnigent turn lifecycle that named this stable input before settlement. |
 
 Join within the same workspace and Omnigent session. Missing IDs mean that a
 producer did not supply them; do not infer ownership from timestamps alone.
@@ -77,12 +78,25 @@ emit these input-delivery events.
 - `reported_undelivered`: the runner explicitly reported that this particular
   input had not reached the harness.
 
+Skipped inputs also carry a bounded `cause_class`:
+
+- `rejected_before_handoff`: the runner proved the harness never received the input.
+- `accepted_missing_native_record`: the correlated turn completed but no user record appeared.
+- `interrupted_or_lifecycle`: cancellation or lifecycle teardown invalidated the send.
+- `reconciliation_ambiguity`: FIFO or source-less attribution prevents a delivery claim.
+- `rejected_by_native`: reserved for an identity-linked native refusal.
+- `unknown`: the available identity-linked evidence cannot distinguish the cause.
+
+`reason_code` is a bounded machine code such as an error code or
+`completed_without_native_record`; it never contains prompt or terminal text.
+
 `match_method` is `normalized_text`, `attachment_normalized_text`,
 `fifo_fallback`, or `input_stable_id`. `last_delivery_stage` records the last
-stage the **server** had observed when it drained the entry: `server_queued`,
-`forward_requested`, `forward_accepted`, or `unknown`. It is not a substitute
-for the runner's delivery trace. A transcript can arrive before the forwarding
-HTTP response, so a settled input can still say `forward_requested`.
+identity-linked stage the server observed: enqueue/forward stages, native turn
+start/terminal stages, or `rejected_before_handoff`. A transcript can arrive
+before the forwarding HTTP response, so a settled input can still say
+`forward_requested`. Older runners omit lifecycle identity; those entries stay
+`unknown` instead of being classified from timestamps.
 
 SSE logging retains `item.response_id` and the `item_id` and
 `cleared_pending_id` nested in `session.input.consumed.data`. That consumed
@@ -92,6 +106,12 @@ event clears a pending bubble; it is not proof of delivery. Join it to
 A runner's `response.failed` event can carry top-level `input_stable_id`.
 SSE logging retains this validated ID to connect the failure to its original
 web submission, even before a transcript item exists.
+
+Claude reports an input as undelivered when the tmux target was never
+advertised or submit verification found its draft still in the input box.
+The executor keeps the terminal for recovery and reports this refusal so the
+server can persist the queued web input. A question or permission prompt
+discovered after Enter may belong to a delivered message and remains uncertain.
 
 ## Verification
 

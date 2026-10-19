@@ -64,6 +64,7 @@ import {
   BRAIN_HARNESS_LABELS,
   SMART_ROUTING_LABEL,
   useBrainHarnessLabels,
+  useHarnessEffortFamilies,
 } from "@/lib/agentLabels";
 import { usePermissions, useSessionOwner } from "@/hooks/usePermissions";
 import type { NativeModelOption, Session, SessionStatus, SkillSummary } from "@/lib/types";
@@ -81,13 +82,16 @@ import {
 } from "@/lib/permissionsApi";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { toast } from "sonner";
-import { createSideChat, retrySession } from "@/lib/sessionsApi";
+import { ApiError, createSideChat, retrySession } from "@/lib/sessionsApi";
+import { getProject } from "@/lib/projectsApi";
+import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
   committedItemProvesDelivery,
   composerAttachmentKey,
   consumePendingInitialPrompt,
+  holdsInitialDraft,
   isStaleTempConvId,
   isTempConvId,
   type PendingInitialPrompt,
@@ -181,6 +185,7 @@ import {
 import { useSession } from "@/hooks/useSession";
 import { useOpenGithubTab } from "@/shell/FileViewerContext";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useReleaseHostHeldSends } from "@/hooks/useReleaseHostHeldSends";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
 import {
   type LivenessRow,
@@ -234,6 +239,7 @@ import {
   formatStatusModelLabel,
   formatStatusEffortLabel,
   formatModelEffortStatusLabel,
+  nativeModelTooltip,
 } from "@/lib/composerModelLabel";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
@@ -244,7 +250,7 @@ import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
 import { useSessionReconnect } from "@/hooks/useSessionReconnect";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
-import { supportsEffortControl } from "@/lib/sessionCapabilities";
+import { effortLevelsForFamily, supportsEffortControl } from "@/lib/sessionCapabilities";
 import {
   CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
   claudePermissionModeLabel,
@@ -933,6 +939,7 @@ export function ChatPage() {
           chat.queuedMessages,
           readAlwaysSteer(),
           opensSideChat,
+          holdsInitialDraft(chat),
         )
       ) {
         chat.enqueueMessage(text, files, replyDraft);
@@ -1046,16 +1053,26 @@ export function ChatPage() {
   // returns a fresh array each call; a new identity here would defeat the memo()
   // on MainAgentSurface/Composer on every unrelated store tick (mirrors the
   // codexModelOptions rationale).
+  const harnessEffortFamilies = useHarnessEffortFamilies();
+  // Declared effort family for a non-native harness (claude-sdk, codex, …), whose
+  // effort rides ``reasoning_effort`` into the SDK executor. Native harnesses keep
+  // their label-driven ladders, so a label-less native row never reads this.
+  const sdkEffortFamily =
+    capabilitySource.harness && !nativeCodingAgentForHarness(capabilitySource.harness)
+      ? (harnessEffortFamilies[capabilitySource.harness] ?? null)
+      : null;
   const effortLevels = useMemo(
     () =>
       effortLevelsForConv(
         capabilitySource,
         codexModelOptions,
         llmModel ?? sessionModelOverrideForEffort,
+        sdkEffortFamily,
       ),
-    [capabilitySource, codexModelOptions, llmModel, sessionModelOverrideForEffort],
+    [capabilitySource, codexModelOptions, llmModel, sessionModelOverrideForEffort, sdkEffortFamily],
   );
-  const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
+  const showEffort =
+    shouldShowEffortPicker(capabilitySource, sdkEffortFamily) && effortLevels.length > 0;
 
   // When inside a session, only show the bound agent — the session is
   // tied 1:1 to its runner and can't be reassigned. Show all agents on
@@ -1081,6 +1098,24 @@ export function ChatPage() {
     if (isUnboundFork || canResumeOnLocalHost) setResumeDirDialogOpen(true);
     else void reconnect();
   }, [isUnboundFork, canResumeOnLocalHost, reconnect]);
+
+  const newSessionProjectId =
+    activeConv?.project_id !== undefined ? activeConv.project_id : activeSession?.projectId;
+  const newSessionProjectLabel = (activeConv?.labels ?? activeSession?.labels)?.[PROJECT_LABEL_KEY];
+  const openNewSession = useCallback(async () => {
+    try {
+      const projectName = newSessionProjectId
+        ? (await getProject(newSessionProjectId)).name
+        : newSessionProjectLabel;
+      navigate(projectName ? `/?project=${encodeURIComponent(projectName)}` : "/");
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404) {
+        navigate("/");
+        return;
+      }
+      toast.error("Couldn't open a new session in this project. Please try again.");
+    }
+  }, [newSessionProjectId, newSessionProjectLabel, navigate]);
 
   // Loading + error gates for `/c/:id` hydration. Placed after all hooks so the
   // early return can't change the hook order between renders.
@@ -1108,6 +1143,7 @@ export function ChatPage() {
       agentsError={agentsError}
       disabled={!agentId || agentsError !== null}
       onSend={onSend}
+      onNewSession={openNewSession}
       onSendSlashCommand={onSendSlashCommand}
       onStop={onStop}
       onShowReconnectHelp={onShowReconnectHelp}
@@ -1227,6 +1263,7 @@ function SessionLayout({ mainAgent }: SessionLayoutProps) {
 }
 
 interface MainAgentSurfaceProps {
+  onNewSession: () => void;
   /**
    * Active conversation id, or null when on the landing page. Forwarded
    * to MainTerminalView so the inline terminal can target the right
@@ -1418,6 +1455,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   disabled,
   onSend,
   onSendSlashCommand,
+  onNewSession,
   onStop,
   onShowReconnectHelp,
   agents,
@@ -1728,6 +1766,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             status={status}
             isWorking={isWorking}
             onSend={handleSend}
+            onNewSession={onNewSession}
             onSendSlashCommand={handleSendSlashCommand}
             onStop={onStop}
             agents={agents}
@@ -1827,6 +1866,7 @@ interface ComposerHandle {
 }
 
 interface ComposerProps {
+  onNewSession: () => void;
   status: "idle" | "streaming";
   /** Local stream OR cross-client `session.status: running`. */
   isWorking: boolean;
@@ -2200,6 +2240,7 @@ function ComposerImpl(
     disabled,
     onSend,
     onSendSlashCommand,
+    onNewSession,
     onStop,
     agents,
     selectedAgentId,
@@ -2406,6 +2447,8 @@ function ComposerImpl(
   // No server session behind a temp id — gate goal/workspace fetches on it so
   // the create window issues no `/v1/sessions/temp:*` requests.
   const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
+  // A send held while the host was offline goes out once the host is back.
+  useReleaseHostHeldSends(composerSessionId);
   const { session: composerSession } = useSession(composerSessionId);
   const composerBranch = useChatStore((s) => s.gitBranch);
   const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
@@ -2890,6 +2933,17 @@ function ComposerImpl(
    */
   const executeSlashCommand = (cmd: string, arg: string): boolean => {
     switch (cmd) {
+      case "/new": {
+        if (arg) {
+          setCommandError("/new does not accept arguments");
+          return true;
+        }
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+        onNewSession();
+        return true;
+      }
       case "/compact": {
         if (!showCompact) {
           setCommandError("/compact is not supported for this agent type");
@@ -4291,6 +4345,7 @@ export function effortLevelsForConv(
     | undefined,
   codexModelOptions: readonly NativeModelOption[] = [],
   currentModel: string | null = null,
+  effortFamily: string | null = null,
 ): readonly string[] {
   switch (effectiveWrapperLabel(conv)) {
     case "claude-code-native-ui":
@@ -4306,7 +4361,9 @@ export function effortLevelsForConv(
     case "pi-native-ui":
       return PI_NATIVE_EFFORT_LEVELS;
     default:
-      return EFFORT_LEVELS;
+      // A non-native harness offers its declared family's ladder (claude-sdk →
+      // anthropic, codex → openai); with no family the shared default holds.
+      return effortFamily ? effortLevelsForFamily(effortFamily) : EFFORT_LEVELS;
   }
 }
 
@@ -4388,9 +4445,16 @@ export function shouldShowModelPicker(
  */
 export function shouldShowEffortPicker(
   conv:
-    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
+    | {
+        labels?: Record<string, string | null> | null;
+        harness?: string | null;
+        parentSessionId?: string | null;
+      }
+    | null
+    | undefined,
+  effortFamily: string | null = null,
 ): boolean {
-  return supportsEffortControl(conv);
+  return supportsEffortControl(conv, effortFamily);
 }
 
 export function shouldShowCodexPlanModeControl(
@@ -4703,6 +4767,7 @@ function SessionHarnessPicker({
                         ? selectFusionModel(composerFusion.default)
                         : selectModel(supportsModelReset && model.isDefault ? null : model.id),
                     testId: `composer-agent-model-${model.id}`,
+                    title: nativeModelTooltip(model),
                     className: "whitespace-normal break-words",
                     data: { "data-model-id": model.id },
                   })),

@@ -15,7 +15,7 @@ every file type):
   4. ``test_address_all_moves_comments_to_addressed_tab`` — "Address All"
      POSTs to ``/comments/send`` (which marks every open comment addressed and
      dispatches a formatted message to the agent); the Open tab drains and the
-     comments reappear under the Addressed tab.
+     comments reappear under the Sent tab.
   5. ``test_comment_link_opens_same_comment_in_new_browser`` — the per-card
      "Copy link" button writes a deep link to the clipboard; opening that link
      in a fresh browser context lands on the file with the exact comment
@@ -417,11 +417,11 @@ def test_address_all_moves_comments_to_addressed_tab(
     page: Page,
     commented_session: tuple[str, str, str],
 ) -> None:
-    """ "Address All" sends open comments to the agent and moves them to Addressed.
+    """ "Address All" sends open comments to the agent and moves them to Sent.
 
     ``/comments/send`` marks every requested comment ``addressed`` server-side
     and returns a formatted message the SPA dispatches to the agent. The Open
-    tab drains and the comments reappear under the Addressed tab — this is the
+    tab drains and the comments reappear under the Sent tab — this is the
     deterministic, server-side half of the flow (the agent's reply is not
     asserted, only that the comments transitioned).
     """
@@ -440,8 +440,8 @@ def test_address_all_moves_comments_to_addressed_tab(
     expect(address_all).to_be_enabled()
     address_all.click()
 
-    # The selected comment follows its status transition into Addressed.
-    addressed_tab = file_viewer.get_by_role("button", name=re.compile("Addressed"))
+    # The selected comment follows its status transition into Sent.
+    addressed_tab = file_viewer.get_by_role("button", name=re.compile("Sent"))
     expect(addressed_tab).to_contain_text("2")
     expect(addressed_tab).to_have_class(re.compile("border-primary"))
     selected_card = file_viewer.locator("div.border-primary").filter(has_text=_SHORT_BODY)

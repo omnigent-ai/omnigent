@@ -34,6 +34,7 @@ from omnigent.inner.datamodel import (
     TerminalEnvSpec,
     parse_write_paths,
 )
+from omnigent.inner.git_ssh_policy import parse_git_ssh_bindings as _parse_git_ssh
 from omnigent.inner.sandbox import containment_prefix
 from omnigent.spec.types import (
     DEFAULT_ASK_TIMEOUT,
@@ -997,6 +998,7 @@ def _parse_os_env_sandbox(
     mask_paths = _parse_mask_paths(raw.get("mask_paths"))
     env_passthrough = _parse_env_passthrough(raw.get("env_passthrough"))
     egress_rules = _parse_egress_rules(raw.get("egress_rules"))
+    git_ssh = _parse_git_ssh(raw.get("git_ssh"))
     from omnigent.inner.sandbox import _default_sandbox_for_platform, _resolve_sandbox_type
 
     if "type" not in raw:
@@ -1030,6 +1032,12 @@ def _parse_os_env_sandbox(
             "Fix: set os_env.sandbox.type to linux_bwrap on Linux or "
             "darwin_seatbelt on macOS; do not use sandbox.type=none with "
             "egress_rules.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if git_ssh and sandbox_type not in ("linux_bwrap", "darwin_seatbelt"):
+        raise OmnigentError(
+            "os_env.sandbox.git_ssh requires linux_bwrap or darwin_seatbelt "
+            "for hard network enforcement",
             code=ErrorCode.INVALID_INPUT,
         )
     credential_proxy = _parse_credential_proxy(raw.get("credential_proxy"))
@@ -1073,6 +1081,7 @@ def _parse_os_env_sandbox(
         egress_rules=egress_rules,
         egress_allow_private_destinations=allow_private,
         credential_proxy=credential_proxy,
+        git_ssh=git_ssh,
     )
 
 
@@ -2800,6 +2809,9 @@ def _parse_inline_mcp_servers(
         if str(val.get("type", "")) != "mcp":
             continue
         name = str(key)
+        if val.get("transport") == "registry":
+            servers.append(_parse_registry_mcp_server(name, val, "inline MCP server"))
+            continue
         command = val.get("command")
         url = val.get("url")
         if command is not None:
@@ -2939,6 +2951,12 @@ def _discover_mcp_servers(
                 code=ErrorCode.INVALID_INPUT,
             )
         transport_str = str(transport)
+        if transport_str == "registry":
+            raise OmnigentError(
+                "Managed MCP references must be inline in config.yaml tools, "
+                "where older servers can ignore them; registry sidecars are unsupported",
+                code=ErrorCode.INVALID_INPUT,
+            )
         if transport_str == "http":
             servers.append(_parse_http_mcp_server(name, raw, yaml_file, expand_env=expand_env))
         elif transport_str == "stdio":
@@ -2950,6 +2968,33 @@ def _discover_mcp_servers(
                 code=ErrorCode.INVALID_INPUT,
             )
     return servers
+
+
+def _parse_registry_mcp_server(name: str, raw: dict, source: str) -> MCPServerConfig:
+    """Keep only a catalog reference in agent bundles and runner configuration."""
+    if any(
+        key in raw
+        for key in (
+            "url",
+            "headers",
+            "command",
+            "args",
+            "env",
+            "auth",
+            "profile",
+            "databricks_server",
+        )
+    ):
+        raise OmnigentError(
+            f"Registry MCP {name!r} cannot override its server configuration: {source}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return MCPServerConfig(
+        name=name,
+        transport="registry",
+        description=raw.get("description"),
+        tools=[] if raw.get("tools") == [] else _parse_mcp_tool_allowlist(name, raw, source),
+    )
 
 
 def _parse_http_mcp_server(

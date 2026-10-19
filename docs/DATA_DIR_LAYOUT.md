@@ -128,10 +128,18 @@ for filename-based limits and their scope.
 
 ### Native harness state
 
-Some native (TUI) harnesses keep resumable session state under `~/.omnigent`:
-`claude-native/`, `codex-native/`, `opencode-native/` (all via `data_dir()`),
-and `pi-native/` **†** and `antigravity-native/` **†** (pinned to
-`~/.omnigent`).
+Native TUI harnesses keep resumable session state in these roots:
+`claude-native/` and `opencode-native/` via `data_dir()`, `codex-native/`
+**†** via `bridge_root()` (pinned to `~/.omnigent`), and `pi-native/` **†**
+and `antigravity-native/` **†** (also pinned to `~/.omnigent`).
+The Codex bridge root is producer-owned and is not relocated by
+`OMNIGENT_DATA_DIR` or `OMNIGENT_CONFIG_HOME`.
+
+Each Codex-native session directory also contains a private `codex-home/` with
+its `sessions/` and `archived_sessions/` rollout JSONL. Local session import
+reads those transcript trees plus the matching home's `session_index.jsonl` and
+`state_*.sqlite` for thread metadata; it does not scan the surrounding data
+directory or read Codex credential files.
 
 Within each, session state lives in a subdirectory named by a digest of the
 conversation id (a leading `conv_` is normalized before hashing, and a legacy
@@ -152,7 +160,8 @@ data dir. See e.g. `omnigent/harnesses/qwen_native/bridge.py`.
 ## Notes
 
 - The canonical source of truth is the code, not this document. Start at
-  `data_dir()` in `omnigent/process_logging.py` and follow its callers; each
+  `data_dir()` in `omnigent/process_logging.py` and `bridge_root()` in
+  `omnigent/harnesses/codex_native/bridge.py`, then follow their callers; each
   subsystem documents its own path in a docstring.
 - An existing `~/.omnigent` may also contain files this document doesn't list:
   backups you created by hand (e.g. `chat.db.bak*`, `chat1.db`) and leftovers

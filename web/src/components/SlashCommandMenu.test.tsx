@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   matchSlashCommandInvocation,
+  BUILTIN_SLASH_COMMANDS,
   rankedSlashCommandNames,
   skillDisplayNames,
   skillMenuDescription,
@@ -9,6 +10,13 @@ import {
 } from "./SlashCommandMenu";
 
 afterEach(cleanup);
+
+describe("builtin command matching", () => {
+  it("matches /new by its command name rather than a display alias", () => {
+    expect(rankedSlashCommandNames(BUILTIN_SLASH_COMMANDS, "n")).toContain("/new");
+    expect(rankedSlashCommandNames(BUILTIN_SLASH_COMMANDS, "sess")).not.toContain("/new");
+  });
+});
 
 describe("matchSlashCommandInvocation", () => {
   const commands = [

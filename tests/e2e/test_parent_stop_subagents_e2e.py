@@ -174,8 +174,9 @@ def test_native_parent_teardown_preserves_child_outcome(
     }
     dispatch_prompt = "PARENT_TEARDOWN_PROBE: delegate the research to the worker."
     child_prompt = "CHILD_TEARDOWN_PROBE: research the requested topic."
-    tool_guard = "Bash" if harness == "claude" else "mcp__omnigent"
-    dispatch_guard = "mcp__omnigent__sys_session_send" if harness == "claude" else tool_guard
+    # Child turns can precede MCP discovery; built-in tools still exclude title requests.
+    tool_guard = "Bash" if harness == "claude" else "exec_command"
+    dispatch_guard = "mcp__omnigent__sys_session_send" if harness == "claude" else "mcp__omnigent"
     httpx.post(
         f"{mock_url}/mock/configure",
         trust_env=False,
@@ -200,16 +201,6 @@ def test_native_parent_teardown_preserves_child_outcome(
                 },
                 {"text": "Worker dispatched."},
             ],
-        },
-    ).raise_for_status()
-    httpx.post(
-        f"{mock_url}/mock/configure",
-        trust_env=False,
-        json={
-            "required_tools": [tool_guard],
-            "key": "child",
-            "match": child_prompt,
-            "responses": [{"text": "CHILD_FINISHED", "block": True}] * 5,
         },
     ).raise_for_status()
     set_fallback_mock_llm(mock_url, key="default", text="Acknowledged.")
@@ -281,6 +272,17 @@ def test_native_parent_teardown_preserves_child_outcome(
         response.raise_for_status()
         parent_id = response.json()["session_id"]
         _wait_for_native_tools(client, parent_id, mock_url, dispatch_guard)
+        # Install after readiness; Codex approval reviews quote the child prompt.
+        httpx.post(
+            f"{mock_url}/mock/configure",
+            trust_env=False,
+            json={
+                "required_tools": [tool_guard],
+                "key": "child" if harness == "claude" else _MODELS[harness],
+                **({"match": child_prompt} if harness == "claude" else {}),
+                "responses": [{"text": "CHILD_FINISHED", "block": True}] * 5,
+            },
+        ).raise_for_status()
         _send_message(client, parent_id, dispatch_prompt)
 
         def dispatched_child():

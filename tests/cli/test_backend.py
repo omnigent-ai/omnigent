@@ -3082,6 +3082,8 @@ def _patch_auth_preflight(
         lambda server_url=None, *, host_id=None: {},
     )
     monkeypatch.setattr(httpx, "get", lambda url, **kw: _databricks_probe_response(probe_status))
+    # Scripted unauthenticated probes must not discover real SDK/CLI credentials.
+    monkeypatch.setattr(cli, "_databricks_workspace_auth_info", lambda workspace: None)
     monkeypatch.setattr(cli, "_workspace_api_server_url", lambda server: server.rstrip("/"))
     monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: tty)
     login_calls: list[str] = []

@@ -451,15 +451,52 @@ describe("CodeViewer markdown preview links", () => {
     expect(openFile).toHaveBeenCalledWith("notes/plan.md");
   });
 
-  it("keeps URLs and in-page anchors as links", () => {
+  it("opens URLs outside the app window and keeps in-page anchors in place", () => {
+    // A same-window URL navigates the app off its server; the desktop app's
+    // Databricks browser sign-in treats that as a lost session.
     const openFile = renderPreview(
-      "[docs](https://example.com/docs) and [below](#usage)\n\n## Usage",
+      "[docs](https://example.com/docs), [cdn](//cdn.example.com/docs), " +
+        "[mail](mailto:docs@example.com) and [below](#usage)\n\n## Usage",
       "docs/guide.md",
     );
 
-    expect(screen.getByText("docs").getAttribute("href")).toBe("https://example.com/docs");
-    expect(screen.getByText("below").getAttribute("href")).toBe("#usage");
+    for (const [text, href] of [
+      ["docs", "https://example.com/docs"],
+      ["cdn", "//cdn.example.com/docs"],
+      ["mail", "mailto:docs@example.com"],
+    ]) {
+      const link = screen.getByText(text);
+      expect(link.getAttribute("href")).toBe(href);
+      expect(link.getAttribute("target")).toBe("_blank");
+      expect(link.getAttribute("rel")).toBe("noopener noreferrer");
+    }
+    const anchor = screen.getByText("below");
+    expect(anchor.getAttribute("href")).toBe("#usage");
+    expect(anchor.getAttribute("target")).toBeNull();
     expect(openFile).not.toHaveBeenCalled();
+  });
+
+  it("follows a URL click the way chat links do", () => {
+    const followed: HTMLAnchorElement[] = [];
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      followed.push(this);
+    });
+    const popupDocument = document.implementation.createHTMLDocument();
+    const openSpy = vi
+      .spyOn(window, "open")
+      .mockReturnValue({ opener: window, document: popupDocument } as Window);
+
+    renderPreview("[docs](https://example.com/docs)", "docs/guide.md");
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 });
+    screen.getByText("docs").dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(openSpy).toHaveBeenCalledWith("about:blank", "_blank");
+    expect(followed.map((link) => [link.ownerDocument, link.href])).toEqual([
+      [popupDocument, "https://example.com/docs"],
+    ]);
   });
 });
 

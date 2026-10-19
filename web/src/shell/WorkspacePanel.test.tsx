@@ -1150,6 +1150,78 @@ describe("WorkspacePanel panel picker", () => {
     expect(onRightRailTabChange).toHaveBeenCalledWith("github");
   });
 
+  // A real mouse press also releases; Radix's tooltip ignores focus while it
+  // still believes the pointer is down on its trigger.
+  function openPickerWithMouse() {
+    const trigger = screen.getByRole("button", { name: "Select panel" });
+    fireEvent.pointerDown(trigger, { button: 0 });
+    fireEvent.pointerUp(trigger, { button: 0 });
+    return trigger;
+  }
+
+  // Radix hands focus back from a timer queued when the menu unmounts; give it
+  // a short, bounded window before asserting that nothing refocused.
+  async function settleMenuClose() {
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 50);
+    });
+  }
+
+  it("keeps the Select panel tooltip closed after a mouse pick", async () => {
+    renderWorkspace({ openFiles: ["src/App.tsx", "docs/README.md"] });
+    const trigger = openPickerWithMouse();
+    const item = await screen.findByRole("menuitem", { name: "docs/README.md" });
+    fireEvent.pointerDown(item, { button: 0 });
+    fireEvent.click(item);
+    await settleMenuClose();
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    expect(trigger).not.toHaveFocus();
+    // Hovering the button afterwards still shows its tooltip.
+    fireEvent.pointerMove(trigger.parentElement!, { pointerType: "mouse" });
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Select panel");
+  });
+
+  it("keeps the tooltip closed when the pick releases a press that began on the trigger", async () => {
+    renderWorkspace({ openFiles: ["src/App.tsx"] });
+    const trigger = screen.getByRole("button", { name: "Select panel" });
+    fireEvent.pointerDown(trigger, { button: 0 });
+    const item = await screen.findByRole("menuitem", { name: "src/App.tsx" });
+    // Releasing on an item that was never pressed is how Radix selects on drag.
+    fireEvent.pointerUp(item, { button: 0 });
+    await settleMenuClose();
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    expect(trigger).not.toHaveFocus();
+  });
+
+  it("keeps the tooltip closed after a mouse click outside the open picker", async () => {
+    renderWorkspace({ openFiles: ["src/App.tsx"] });
+    const trigger = openPickerWithMouse();
+    await screen.findByRole("menu");
+    // The outside-press listener attaches a tick after the menu opens.
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    fireEvent.pointerDown(document.body, { button: 0 });
+    await settleMenuClose();
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    expect(trigger).not.toHaveFocus();
+  });
+
+  it("returns focus to the trigger after a keyboard pick, even after a press in the menu", async () => {
+    renderWorkspace({ openFiles: ["src/App.tsx"] });
+    const trigger = screen.getByRole("button", { name: "Select panel" });
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    const item = await screen.findByRole("menuitem", { name: "src/App.tsx" });
+    // A press inside the open menu switches the picker to pointer input; the
+    // Enter that follows must switch it back so focus still returns.
+    fireEvent.pointerDown(item, { button: 0 });
+    fireEvent.keyDown(item, { key: "Enter" });
+    await waitFor(() => expect(screen.queryByRole("menu")).toBeNull());
+    await waitFor(() => expect(trigger).toHaveFocus());
+  });
+
   it("selects an open terminal", () => {
     const { openTerminalTab } = renderWorkspace({ openTerminals: ["terminal:zsh"] });
     fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });

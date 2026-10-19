@@ -3,6 +3,12 @@
 Guidance for AI agents (Claude Code, Copilot, Cursor, etc.) working in this
 repository. See `CONTRIBUTING.md` for the full contributor workflow.
 
+## Reuse and design
+
+- Search for and reuse existing helpers before adding code. Refactor an existing
+  implementation if that avoids duplication.
+- Use descriptive names; avoid unexplained abbreviations and single-letter names.
+
 ## Test changes
 
 Before adding test setup, read [the test guide](tests/README.md) and
@@ -13,6 +19,11 @@ or browser boundaries. Reuse primitives with explicit caller inputs and keep
 faults and assertions in the test. Explain new setup or a separate E2E in the
 PR's Test Plan (Repro uses `evidence`; Resolve uses `test_audit`). Count helper changes in
 test LOC; fewer lines alone do not establish adequate coverage.
+
+- Add a unit test for non-trivial functions, methods, and exported APIs. Add
+  coverage when changed behavior needs it.
+- Run the relevant tests before submitting. Document unrelated pre-existing
+  failures in the PR description.
 
 ## Committing
 

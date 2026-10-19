@@ -176,3 +176,36 @@ def test_touch_connect_marker_survives_unwritable_path(tmp_path) -> None:
     touch_connect_marker({RUNNER_CONNECT_MARKER_ENV_VAR: str(marker)})
 
     assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "state", ["valid", "other_runner", "expired", "future", "malformed", "boolean", "connected"]
+)
+def test_pending_sign_in_marker_is_launch_scoped_and_bounded(tmp_path, monkeypatch, state) -> None:
+    import json
+    import time
+
+    from omnigent.runner.identity import (
+        mark_sign_in_pending,
+        runner_sign_in_is_pending,
+        sign_in_pending_marker_path,
+    )
+
+    connected = tmp_path / "runner.connected"
+    monkeypatch.setenv(RUNNER_CONNECT_MARKER_ENV_VAR, str(connected))
+    mark_sign_in_pending("runner-owned", time.monotonic() + 20)
+    marker = sign_in_pending_marker_path(connected)
+    if state == "other_runner":
+        mark_sign_in_pending("runner-other", time.monotonic() + 20)
+    elif state in {"expired", "future", "boolean"}:
+        deadline = (
+            True if state == "boolean" else time.monotonic() + (-1 if state == "expired" else 1000)
+        )
+        marker.write_text(json.dumps({"runner_id": "runner-owned", "deadline": deadline}))
+    elif state == "malformed":
+        marker.write_text("{invalid")
+    elif state == "connected":
+        connected.touch()
+    assert runner_sign_in_is_pending(connected, "runner-owned") is (state == "valid")
+    mark_sign_in_pending("runner-owned", None)
+    assert not marker.exists()

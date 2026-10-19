@@ -1,10 +1,12 @@
-// Route an opted-in chat link click into the conversation's embedded browser
-// (desktop only). AppShell listens via `onInAppLinkOpen` to surface a Browser
-// soft tab; if the view refuses the link, it reopens externally with a toast.
+// Click handling for external links in chat and file previews. On the desktop,
+// an opted-in click routes into the conversation's embedded browser: AppShell
+// listens via `onInAppLinkOpen` to surface a Browser soft tab, and if the view
+// refuses the link, it reopens externally with a toast.
 
+import type { MouseEvent } from "react";
 import { showToast } from "@/components/ui/toast";
 import { readOpenLinksInApp } from "./linkOpenPreferences";
-import { supportsBrowser } from "./nativeBridge";
+import { isNativeShell, supportsBrowser } from "./nativeBridge";
 
 type OpenOrNavigate = (
   conversationId: string,
@@ -27,8 +29,9 @@ async function openInApp(conversationId: string, url: string): Promise<void> {
   ).omnigentDesktop;
   let error: string | undefined;
   try {
-    // Chat links are model-authored and the agent can read the view, so they get
-    // the agent's navigation policy (no loopback/private hosts, even via redirect).
+    // Chat and workspace-file links are agent- or repo-authored and the agent can
+    // read the view, so they get the agent's navigation policy (no loopback/private
+    // hosts, even via redirect).
     const result = await bridge.browserOpenOrNavigate(conversationId, url, undefined, {
       agent: true,
     });
@@ -65,4 +68,42 @@ export function maybeOpenLinkInApp(conversationId: string | undefined, href: str
   if (url.protocol !== "http:" && url.protocol !== "https:") return false;
   void openInApp(conversationId, url.toString());
   return true;
+}
+
+/**
+ * Follows an external link (`target="_blank"`) on a plain click, with a
+ * same-tab fallback where popup creation is withheld. In a normal browser tab
+ * the link still opens a new tab, but in an embedding host pane (or under a
+ * popup blocker) a bare `_blank` click is silently swallowed — nothing opens
+ * and nothing navigates — so a click must fall back to navigating in place.
+ * Modified clicks (cmd/ctrl/shift/alt, non-primary buttons) keep their native
+ * open-in-new-tab / menu semantics. In a native shell the default path is the
+ * shell's window-open policy (external browser / system handlers) — except
+ * when the user opted in to the in-app browser, where a plain click on a web
+ * link routes to the conversation's embedded browser pane instead. The web
+ * popup fallback never runs natively: the shell's policy reports `null` from
+ * window.open regardless, so it would navigate twice.
+ */
+export function followLinkWithPopupFallback(
+  event: MouseEvent<HTMLAnchorElement>,
+  href: string,
+  conversationId: string | undefined,
+): void {
+  if (event.defaultPrevented || event.button !== 0) return;
+  if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  if (isNativeShell()) {
+    if (maybeOpenLinkInApp(conversationId, href)) event.preventDefault();
+    return;
+  }
+  if (!/^(?:https?:)?\/\//i.test(href)) return;
+  event.preventDefault();
+  const popup = window.open("about:blank", "_blank");
+  if (popup) {
+    popup.opener = null;
+  }
+  const link = (popup?.document ?? document).createElement("a");
+  link.href = href;
+  link.target = "_self";
+  link.rel = "noopener noreferrer";
+  link.click();
 }

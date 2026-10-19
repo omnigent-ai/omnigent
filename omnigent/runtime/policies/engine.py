@@ -64,6 +64,8 @@ class PolicyEngine:
         :meth:`spec_for`.
     :param conversation_id: The conversation this engine owns
         label state for.
+    :param conversation_title: The conversation's human-readable
+        title. ``None`` when untitled.
     :param initial_labels: Labels already persisted for the
         conversation at workflow-start (the hot cache seed).
     :param initial_session_state: Seed state for the hot cache.
@@ -108,6 +110,7 @@ class PolicyEngine:
         label_defs: dict[str, LabelDef],
         ask_timeout: int,
         conversation_id: str,
+        conversation_title: str | None = None,
         initial_labels: dict[str, str],
         initial_session_state: dict[str, Any] | None = None,
         initial_usage: dict[str, float] | None = None,
@@ -125,6 +128,7 @@ class PolicyEngine:
         self.label_defs = label_defs
         self.ask_timeout = ask_timeout
         self._conversation_id = conversation_id
+        self._conversation_title = conversation_title
         # Root of this conversation's spawn tree. The per-session cost-budget
         # approval is routed here (not the per-conversation session_state) so
         # approving once covers the whole tree — a sub-agent runs as its own
@@ -228,6 +232,11 @@ class PolicyEngine:
     def conversation_id(self) -> str:
         """:returns: The conversation this engine owns."""
         return self._conversation_id
+
+    @property
+    def conversation_title(self) -> str | None:
+        """:returns: The conversation's readable title, ``None`` when untitled."""
+        return self._conversation_title
 
     async def evaluate(
         self,
@@ -359,6 +368,7 @@ class PolicyEngine:
         ctx = self._inject_labels(ctx)
         ctx = self._inject_llm_client(ctx)
         ctx = self._inject_conversation_id(ctx)
+        ctx = self._inject_conversation_title(ctx)
 
         for policy in self.policies:
             if not self._should_fire(policy.spec, ctx):
@@ -906,6 +916,24 @@ class PolicyEngine:
             ``conversation_id`` set to this engine's conversation_id.
         """
         return replace(ctx, conversation_id=self._conversation_id)
+
+    def _inject_conversation_title(self, ctx: EvaluationContext) -> EvaluationContext:
+        """
+        Return a copy of *ctx* with ``conversation_title`` populated.
+
+        Injects the engine's own conversation title so function policy
+        callables can build human-readable, session-scoped identifiers
+        via ``event["context"]["conversation_title"]`` without the caller
+        having to thread it through every :class:``EvaluationContext`
+        it builds.
+
+        :param ctx: Original :class:``EvaluationContext`` from the
+            caller.
+        :returns: A new :class:``EvaluationContext`` with
+            ``conversation_title`` set to this engine's conversation
+            title.
+        """
+        return replace(ctx, conversation_title=self._conversation_title)
 
     def _filter_schema_valid(
         self,

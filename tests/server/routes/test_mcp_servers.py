@@ -85,7 +85,7 @@ async def test_owner_gets_host_inventory(
         task = asyncio.create_task(
             client.get(f"/v1/hosts/{_HOST_ID}/mcp-servers", headers={"x-test-user": "owner"})
         )
-        frame = decode_host_frame(await asyncio.wait_for(conn.outbound_queue.get(), 2))
+        frame = decode_host_frame((await asyncio.wait_for(conn.outbound_queue.get(), 2)).data)
         assert isinstance(frame, HostMcpServersFrame)
         result.request_id = frame.request_id
         conn.pending_mcp_servers[frame.request_id].set_result(result)

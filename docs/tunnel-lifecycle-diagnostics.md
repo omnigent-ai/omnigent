@@ -1,11 +1,72 @@
 # Tunnel lifecycle diagnostics
 
-Structured fields that explain a runner tunnel drop end to end: what closed
+Structured fields that explain a host or runner tunnel drop end to end: what closed
 the socket, how long the runner was gone, whether the server failed the turn,
 and whether the reconnect restarted a turn. They ride the existing debug-log
 sink as `event_name` plus string `attributes`; booleans appear as `True` or
 `False`. Deploy both the server and the runner before expecting the fields on
-both ends.
+both ends. Host diagnostics likewise require the updated host and server.
+
+## Host connections
+
+`host_tunnel` rows with `phase = connected` or `disconnected` carry `host_id`
+and a fresh `connection_id` for each accepted socket. The host sends this ID in
+an optional hello field; older peers remain compatible, but older hosts leave
+the server's ID absent. Join on `host_id + connection_id` and compare
+`tunnel_side = host` with `server`. Runner connections use different IDs;
+do not join host and runner sockets on connection ID.
+
+The host's disconnect row includes `pid`, `connection_age_s`, `error_type`,
+`disconnect_reason`, and both directions' close codes and reasons:
+`close_rcvd_code`, `close_rcvd_reason`, `close_sent_code`, `close_sent_reason`.
+`close_code` / `close_reason` prefer received metadata, then sent metadata.
+`transport_close_code` is the library's resulting connection code. For example,
+a locally sent `1011 / keepalive ping timeout` with no received close can end
+with transport code `1006`. A missing close frame stays absent; a sender
+returning normally does not establish a `1006`.
+
+The server's disconnect row preserves the ASGI-observed `close_code` and
+`close_reason`, separately from `close_requested_code` and
+`close_requested_reason`. A close request is not proof of delivery. `ended_by`
+names the completed helpers (`host-receive`, `host-ping`, `host-sender`) or
+`handler_cancelled`. `sender_end_reason = queue_retired` together with
+`retirement_reason = replaced` or `deregistered` explains a sender that ended
+without a close event. `send_after_close` identifies a send racing socket
+closure. Retirement is captured before disconnect cleanup, so cleanup itself
+does not become the explanation.
+
+`host_ping_timeout` is emitted by the server's `_ping_loop` in
+`omnigent/server/routes/host_tunnel.py` when no host frame has arrived for more
+than `PING_INTERVAL_S * PING_MISS_THRESHOLD` (currently 90 seconds). Any host
+frame counts as liveness, not just pongs. It records the silence, actual
+application keepalive budget, pending sends/queue, last ping/pong observations,
+and requested `4003 / ping timeout`. The host handles application pings in
+`HostProcess._handle_raw_message`; protocol keepalives run separately inside
+the WebSocket library.
+
+Both ends use the heartbeat/send timing fields below. Server pings retain
+local enqueue timing without changing their wire payload. All host application
+sends, including pongs and request replies, pass through the same timing
+observer. Detached handlers from an old socket cannot update the new socket's
+observations. Snapshots freeze before teardown cancels sends.
+
+Logging volume: the host adds one INFO connected row and one INFO disconnected
+row per accepted socket. Server lifecycle rows are enriched, and normal helper
+termination now also gets a disconnect row. `host_tunnel_health` warns only
+for a scheduling/send/queue delay of at least one second, at most once per
+minute per side and connection. The five-second sampler emits no regular
+health rows. Normal application pings/pongs add no INFO/WARNING rows. A timeout
+adds one `host_ping_timeout` warning; an unexpected ping enqueue failure adds
+one `host_ping_failed` warning before the ping loop exits.
+
+These fields distinguish local scheduling gaps, queued pings and blocked sends;
+they cannot alone identify a network device, OOM killer or signal sender.
+Correlate host exits by host identity and PID with `host_exiting`, and correlate
+machine lifecycle/resource evidence separately. A killed process may be unable
+to emit its final snapshot. Database `host_heartbeat_failed` events describe
+persistence, not unanswered network pings; that worker is separate from the
+application keepalive loop. Diagnostic attribution never establishes harmless
+session impact or changes KPI eligibility.
 
 ## Runner events (`source = 'runner'`)
 
@@ -68,9 +129,19 @@ both ends.
   grace window without readiness starts a new outage ID and does not recover
   the previous one.
 - `runner_stream_disconnected`: the relay's give-up row, with `decision`
-  (`intentional_stop`, `server_shutdown`, `live_elsewhere`, `idle_no_failure` or
-  `failed_mid_turn`), the matching `outage_id`, loss-time `runner_id`/`turn_id`,
-  `grace_s`, `outage_s`, `retries`, and the schema marker. `outage_s` is the
+  (`intentional_stop`, `server_shutdown`, `handed_off`, `live_elsewhere`,
+  `rebound`, `idle_no_failure` or `failed_mid_turn`), the matching `outage_id`,
+  loss-time `runner_id`/`turn_id`, `grace_s`, `outage_s`, `retries`, and the
+  schema marker. `server_shutting_down` and `runner_handoff_reason` say whether
+  this replica's own shutdown mark or a per-runner handoff mark was fresh at the
+  decision; `handed_off` means this replica retired the runner's tunnel itself
+  (`runner_handoff_reason = tunnel_retired`, or the reason a caller recorded
+  with `mark_runner_handed_off`), so another replica owns the turn. `rebound`
+  means the stored binding named another runner both when the transport was
+  lost and at the decision: the session had moved on a replica that could not
+  cancel this relay, so the lost runner no longer owns its turn. A move during
+  the outage still fails the turn. The
+  `runner_disconnected` row carries the same two attributes. `outage_s` is the
   time since the current grace window opened; a reconnect that dropped again
   within the window does not reset it, so it includes that brief connected
   stretch and is not cumulative disconnected time.
@@ -78,7 +149,10 @@ both ends.
   relay (`origin = runner_disconnected_mid_turn`) or offline sweep
   (`origin = runner_offline_sweep`). `decision` is `idle_no_failure`,
   `failed_mid_turn`, `failed_before_start`, `already_failed`, `intentional_stop`,
-  or `subagent_unobserved`.
+  `handed_off`, or `subagent_unobserved`, alongside `server_shutting_down` and
+  `runner_handoff_reason` as above. A `runner_tunnel_handed_off` info row marks
+  the start of each per-runner handoff window, and the first
+  `server_shutdown_marked` row the start of each shutdown window.
   Idle subsessions keep their status and emit no `session_turn_failed` event
   or error labels. Running and waiting sessions still fail on disconnect, but
   a subsession mirrored from a native parent (such as a Claude subsession)
@@ -176,17 +250,17 @@ Unexpected sampler failures are logged with their traceback. Loop-lag sampling
 then stops and subsequent snapshots set `sampler_failed = true`; send and queue
 timing observations continue. A new connection starts with `sampler_failed = false`.
 
-Join on `connection_id` and compare `tunnel_side = server` with `runner`:
+Join on `connection_id` and compare `tunnel_side = server` with `runner` or `host`:
 
 | Fields | Meaning |
 | --- | --- |
 | `loop_lag_s`, `loop_lag_max_s` | Delay past the sampler's scheduled wakeup. A local scheduling gap, including process suspension on platforms whose monotonic clock advances during suspension; it does not identify the blocking code. |
 | `sends_in_flight`, `oldest_tracked_send_age_s` | Sends awaiting the local WebSocket API at the observation time. A blocked send can coexist with a responsive loop. |
 | `send_duration_s`, `send_duration_max_s`, `last_send_outcome` | Completed, failed, or cancelled send duration. Includes loop scheduling delays; send completion proves local acceptance, not peer receipt. |
-| `outbound_queue_depth`, `outbound_queue_high_water` | Server frames waiting behind its sole sender. Absent on the runner, which sends directly. |
+| `outbound_queue_depth`, `outbound_queue_high_water` | Server frames waiting behind its sole sender. Absent on the runner/host client, which send directly. |
 | `enqueue_delay_s`, `queue_wait_s` (and `_max_s`) | Server time from requesting an enqueue to execution on the socket loop, and from enqueue to dequeue, respectively. Queue timing metadata never travels over the wire. |
 | `app_pings_queued`, `last_app_ping_queued_age_s`, `last_app_ping_sent_age_s`, `last_app_pong_received_age_s` | Server application-heartbeat progress through enqueue, successful send, and pong receipt. |
-| `last_app_ping_received_age_s`, `last_app_pong_sent_age_s` | Runner application-heartbeat receive and successful response-send times. |
+| `last_app_ping_received_age_s`, `last_app_pong_sent_age_s` | Runner/host application-heartbeat handling and successful response-send times. |
 | `app_ping_rtt_s` | Server-local elapsed time from starting the matching ping send to consuming its pong; excludes queue wait, may include send delay. Uses the echoed token only for matching, not as a clock. |
 | `last_received_frame_age_s` | Time since a WebSocket message was received, including messages later dropped as non-text or malformed. |
 | `last_sent_frame_age_s` | Time since an application-frame send completed successfully. |
@@ -204,7 +278,7 @@ sampling limit; `sends_in_flight` still counts all sends. Frames already waiting
 in the server queue retain only their own timestamp and optional ping token.
 
 Application heartbeats and WebSocket protocol keepalives are separate. These
-fields do not observe protocol control-frame ping/pong traffic. Runner
+fields do not observe protocol control-frame ping/pong traffic. Runner and host
 `protocol_ping_interval_s` and `protocol_ping_timeout_s` come from the live
 WebSocket connection (`protocol_keepalive_source = websockets_connection`).
 With that source, an absent interval or timeout means the corresponding library
@@ -232,6 +306,23 @@ the build. The generated version is itself valid for
 `--skip-build --version <version>`.
 
 ## Verification
+
+Host diagnostics, including real WebSocket abrupt/clean close and reconnect,
+server ping timeout, blocked sends, and connection replacement:
+
+```sh
+uv run --no-sync pytest -q tests/host/test_connect.py tests/host/test_frames.py \
+  tests/server/test_host_registry.py tests/server/integration/test_host_tunnel_route.py \
+  tests/runner/transports/ws_tunnel/test_diagnostics.py --reruns 0
+```
+
+For a local host check, run `omnigent host` against a disposable local server,
+record its PID, pause it with `kill -STOP "$host_pid"` for eight seconds, then
+resume it with `kill -CONT "$host_pid"`. Match `host_tunnel_health` to the
+server's `host_tunnel` by connection ID. The local loop delay should appear
+without a disconnect. Stop/restart the local server to inspect both close
+snapshots and verify that the reconnect uses a different ID. Healthy idle
+connections should add no `host_tunnel_health` rows.
 
 ```sh
 uv run --no-sync pytest -q tests/runner/transports/ws_tunnel/test_serve.py \

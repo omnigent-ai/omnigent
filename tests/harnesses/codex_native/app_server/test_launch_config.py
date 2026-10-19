@@ -16,10 +16,13 @@ try:
     import tomllib
 except ImportError:  # pragma: no cover - Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
+from omnigent.errors import ErrorCategory, ErrorImpact, classify_exception
 from omnigent.harnesses.codex_native.app_server import (
+    CodexDatabricksProfileMissingError,
     build_codex_native_server,
     codex_terminal_env,
 )
+from omnigent.runner.native.orchestration import _native_terminal_start_error_payload
 from tests.harnesses.codex_native.app_server._support import (
     _disable_codex_startup_rpc,
     _test_app_server,
@@ -48,7 +51,7 @@ def test_build_codex_native_server_profile_error_names_profile(
     )
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "missing-databrickscfg"))
 
-    with pytest.raises(OSError, match="profile 'oss'"):
+    with pytest.raises(OSError, match="profile 'oss'") as caught:
         build_codex_native_server(
             socket_path=tmp_path / "codex.sock",
             codex_home=tmp_path / "codex-home",
@@ -59,6 +62,15 @@ def test_build_codex_native_server_profile_error_names_profile(
             ap_server_url=None,
             ap_auth_headers={},
         )
+
+    # The person must fix the profile, so the failure is attributed to config
+    # and its message names the fix.
+    assert isinstance(caught.value, CodexDatabricksProfileMissingError)
+    assert classify_exception(caught.value) == (ErrorCategory.CONFIG, ErrorImpact.BLOCKING)
+    assert "databricks auth login --profile oss" in str(caught.value)
+    payload = _native_terminal_start_error_payload(caught.value, "Codex", session_id="conv_1")
+    assert str(caught.value) in payload["message"]
+    assert "see the runner log" not in payload["message"]
 
 
 def test_build_codex_native_server_uses_profile_host_without_static_token(
@@ -274,6 +286,8 @@ def test_build_codex_native_server_pins_profile_resolved_model(
         # Subscription: an explicit pick and a catalog-resolved Default.
         ("gpt-5.5", None, ['model_provider="openai"']),
         ("gpt-5.6-terra", None, ['model_provider="openai"']),
+        ("system.ai.gpt-6-1-sol", None, ['model_provider="openai"']),
+        ("databricks-gpt-5-6-sol", None, None),
         # cli-config: the user's own provider table rides the config copy.
         ("gpt-5.5", None, ['model_provider="Databricks"']),
         # Databricks profile: Default and an explicit pick.
@@ -342,6 +356,7 @@ def test_launch_argv_and_config_pin_name_the_same_model(
     assert comparable_model_id(argv_model) == comparable_model_id(pinned)
     if profile is None:
         assert argv_model == pinned
+        assert pinned == model
 
 
 async def test_start_pins_reasoning_effort_in_config(
@@ -373,6 +388,54 @@ async def test_start_pins_reasoning_effort_in_config(
     rendered = (codex_home / "config.toml").read_text(encoding="utf-8")
     assert tomllib.loads(rendered)["model_reasoning_effort"] == "ultra"
     assert rendered.count("model_reasoning_effort") == 1
+    assert (real_codex_home / "config.toml").read_text(encoding="utf-8") == original
+
+
+def test_build_codex_native_server_owns_add_dir_roots(tmp_path: Path) -> None:
+    """``--add-dir`` roots resolve against the workspace, as Codex resolves them."""
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path / "workspace",
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        codex_path="/opt/codex/bin/codex",
+        terminal_launch_args=("--add-dir", "attachments", "--add-dir=/shared"),
+    )
+
+    assert app_server.writable_roots == (str(tmp_path / "workspace" / "attachments"), "/shared")
+
+
+async def test_start_writes_add_dir_roots_for_remote_threads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Startup appends ``--add-dir`` roots to the private workspace-write roots.
+
+    The ``--remote`` TUI cannot pass them, and the thread it starts takes its
+    writable roots from this config. The user's own roots stay first.
+    """
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    original = '[sandbox_workspace_write]\nwritable_roots = ["/configured"]\n'
+    (real_codex_home / "config.toml").write_text(original, encoding="utf-8")
+    codex_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    _disable_codex_startup_rpc(monkeypatch)
+
+    server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace)
+    server.writable_roots = (str(tmp_path / "attachments"), "/configured")
+    await server.start()
+    await server.close()
+
+    rendered = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
+    assert rendered["sandbox_workspace_write"]["writable_roots"] == [
+        "/configured",
+        str(tmp_path / "attachments"),
+    ]
     assert (real_codex_home / "config.toml").read_text(encoding="utf-8") == original
 
 
