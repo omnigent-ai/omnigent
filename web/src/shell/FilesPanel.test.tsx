@@ -8,6 +8,7 @@ import {
   type WorkspaceFile,
   PathUnreachableError,
   useWorkspaceAllFiles,
+  useWorkspaceAsleep,
   useWorkspaceChangedFiles,
   useWorkspaceDirectories,
   useWorkspaceDirectory,
@@ -32,6 +33,7 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
   // panel makes, so stubbing it would test a fiction.
   ...(await importOriginal<typeof WorkspaceChangedFilesModule>()),
   useWorkspaceAllFiles: vi.fn(),
+  useWorkspaceAsleep: vi.fn(),
   useWorkspaceChangedFiles: vi.fn(),
   useWorkspaceDirectory: vi.fn(),
   // The tree fetches expanded lazy dirs centrally via the plural hook; default
@@ -71,6 +73,7 @@ vi.mock("@/hooks/useSession", () => ({
 }));
 
 const useAllFilesMock = vi.mocked(useWorkspaceAllFiles);
+const useAsleepMock = vi.mocked(useWorkspaceAsleep);
 const useChangedFilesMock = vi.mocked(useWorkspaceChangedFiles);
 const useDirectoryMock = vi.mocked(useWorkspaceDirectory);
 const useDirectoriesMock = vi.mocked(useWorkspaceDirectories);
@@ -242,6 +245,7 @@ function renderPanel({
 
 beforeEach(() => {
   useAllFilesMock.mockReset();
+  useAsleepMock.mockReturnValue(false);
   useChangedFilesMock.mockReset();
   useDirectoryMock.mockReset();
   useDirectoriesMock.mockClear();
@@ -383,6 +387,20 @@ describe("FilesPanel hidden-files toggle icon", () => {
     expect(toggle.querySelector(".lucide-eye")).not.toBeNull();
     expect(toggle.querySelector(".lucide-eye-off")).toBeNull();
   });
+});
+
+describe("FilesPanel on an asleep sandbox", () => {
+  it.each([true, false])(
+    "says the agent is asleep instead of an empty workspace (flatView=%s)",
+    (flatView) => {
+      useAsleepMock.mockReturnValue(true);
+      renderPanel({ conversationId: "conv_asleep", flatView, files: [] });
+
+      expect(screen.getByText("Agent is asleep")).toBeInTheDocument();
+      expect(screen.queryByText("No files in workspace")).not.toBeInTheDocument();
+      expect(screen.queryByText("No workspace changes yet")).not.toBeInTheDocument();
+    },
+  );
 });
 
 describe("FilesPanel scope (fixed by the caller's Files/Changes tab)", () => {

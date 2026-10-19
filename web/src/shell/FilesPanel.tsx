@@ -24,6 +24,7 @@ import {
   relativizeToWorkspace,
   useWorkspaceChangedFiles,
   useWorkspaceAllFiles,
+  useWorkspaceAsleep,
   useWorkspaceEnvironment,
   useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
@@ -41,6 +42,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { type ChangedSort, FlatFileList } from "./FlatFileList";
 import { FolderTree } from "./FolderTree";
+import { RunnerAsleepHint } from "./RunnerAsleepHint";
 import { useScrollRestore } from "./useScrollRestore";
 
 interface FilesPanelProps {
@@ -258,6 +260,10 @@ export function FilesPanel({
   const runnerWentOffline = useChatStore(
     (s) => s.conversationId === conversationId && s.sessionStatus === "failed",
   );
+  // An idle-stopped managed sandbox is asleep, not failed: its status stays
+  // idle, and with neither a runner nor a host to read the workspace from, the
+  // lists can't load. Say so rather than "No files in workspace".
+  const sandboxAsleep = useWorkspaceAsleep(conversationId);
   // The runner is offline but the host still holds the workspace on disk,
   // so the server serves the panel by reading the workspace over the host
   // tunnel. Show a passive "served from host" badge — the panel keeps
@@ -647,7 +653,9 @@ export function FilesPanel({
         )}
         onScroll={handleScroll}
       >
-        {flatView ? (
+        {sandboxAsleep ? (
+          <RunnerAsleepHint />
+        ) : flatView ? (
           <FlatFileList
             files={changedQuery.data?.data}
             isLoading={changedQuery.isLoading}

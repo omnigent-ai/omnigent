@@ -76,7 +76,7 @@ import {
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
-import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
+import { RunnerOfflineError, useWorkspaceAsleep } from "@/hooks/useWorkspaceChangedFiles";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { gitProviderCopy, type GitProviderCopy } from "@/lib/gitProviders";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
@@ -244,7 +244,13 @@ export function derivePullRequestPanelState(info: {
   isLoading: boolean;
   error: unknown;
   data: PullRequestInfo | undefined;
+  /** The session's managed sandbox is asleep (see `useWorkspaceAsleep`). */
+  sandboxAsleep?: boolean;
 }): PullRequestPanelState {
+  // Nothing can answer until the sandbox wakes, so the query is skipped or 503s.
+  // Say so instead of spinning or "not available"; info cached before it slept
+  // still renders.
+  if (info.sandboxAsleep && info.data === undefined) return { kind: "runner-offline" };
   if (info.isLoading) return { kind: "loading" };
   if (info.error) {
     if (info.error instanceof RunnerOfflineError) return { kind: "runner-offline" };
@@ -1331,6 +1337,7 @@ function PullRequestPanelDetails({
   const hasPr = !!info.data?.pr;
   const changes = usePullRequestChangedFiles(conversationId, hasPr, prUrl, revision);
   const prDiff = usePullRequestDiff(conversationId, hasPr, prUrl, revision);
+  const sandboxAsleep = useWorkspaceAsleep(conversationId);
 
   // Summary (checks + PR body), Comments, and Changes (the stacked diff).
   // Summary is the landing tab — like GitHub's PR page opening on the
@@ -1506,6 +1513,7 @@ function PullRequestPanelDetails({
     isLoading: info.isLoading,
     error: info.error,
     data: info.data,
+    sandboxAsleep,
   });
   switch (panelState.kind) {
     case "loading":
