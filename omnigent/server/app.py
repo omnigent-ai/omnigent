@@ -3790,6 +3790,7 @@ def create_app(
             _ensure_runner_relay,
             _publish_runner_recovered_status,
             _publish_sandbox_status,
+            _resend_lost_subagent_notices,
             prefetch_session_routing_catalogs,
         )
 
@@ -4077,6 +4078,9 @@ def create_app(
         async with asyncio.TaskGroup() as recoveries:
             for conv, client in roots:
                 recoveries.create_task(recover_root(conv, client), name=f"recover-root-{conv.id}")
+        # Children elsewhere whose runner went away while this one was absent
+        # may have missed telling their parent here.
+        await _resend_lost_subagent_notices(sorted(bound_ids), conversation_store)
 
     def _mint_managed_runner_token(runner_id: str, ttl_seconds: int) -> str | None:
         assert runner_account_store is not None and auth_provider is not None

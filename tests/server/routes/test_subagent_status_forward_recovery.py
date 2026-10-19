@@ -9,6 +9,7 @@ the parent never receives the child result.
 
 from __future__ import annotations
 
+import json
 import types
 from typing import Any
 
@@ -351,3 +352,65 @@ async def test_recover_real_body_retry_resolves_healed_runner() -> None:
     # ...and the retry forwarded via the CHILD id, which the resolver — reading
     # the freshly healed runner_id — routed to the live runner.
     assert posted == ["/v1/sessions/conv_child/events"]
+
+
+@pytest.mark.parametrize(
+    "parent_runner", ["runner_parent", "runner_child"], ids=["apart", "shared"]
+)
+async def test_boot_failure_wakes_parent_through_its_own_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    parent_runner: str,
+) -> None:
+    """
+    A sub-agent that cannot start reaches its parent even with no runner of its own.
+
+    The boot/launch failure forward goes to the child's runner first; when
+    that runner is gone, the failure is delivered on the parent's runner
+    instead of failing the request while the parent waits forever. A parent
+    on that same, unreachable runner still fails loudly.
+    """
+    from omnigent.entities import ErrorData
+    from omnigent.errors import OmnigentError
+
+    child = _conv("conv_child", runner_id="runner_child", parent_id="conv_parent")
+    child.kind = "sub_agent"
+    store = _FakeStore(_conv("conv_parent", runner_id=parent_runner))
+    posted: list[tuple[str, dict[str, Any]]] = []
+
+    def _parent_runner(request: httpx.Request) -> httpx.Response:
+        posted.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(204)
+
+    parent_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_parent_runner), base_url="http://runner"
+    )
+
+    async def _no_child_runner(*_a: Any, **_k: Any) -> None:
+        return None
+
+    async def _runner_client(session_id: str, *_a: Any, **_k: Any) -> Any:
+        return parent_client if session_id == "conv_parent" else None
+
+    monkeypatch.setattr(sessions_mod, "_forward_session_change_to_runner", _no_child_runner)
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", _runner_client)
+    error = ErrorData(source="execution", code="workspace_missing", message="Workspace is gone.")
+
+    if parent_runner == "runner_child":
+        with pytest.raises(OmnigentError):
+            await sessions_mod._forward_native_subagent_terminal_failure(
+                "conv_child", child, error, None, store
+            )
+        assert posted == []
+        return
+    await sessions_mod._forward_native_subagent_terminal_failure(
+        "conv_child", child, error, None, store
+    )
+    assert posted == [
+        (
+            "/v1/sessions/conv_child/events",
+            {
+                "type": "external_session_status",
+                "data": {"status": "failed", "output": "Workspace is gone."},
+            },
+        )
+    ]

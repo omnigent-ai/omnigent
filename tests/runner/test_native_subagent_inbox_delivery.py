@@ -412,7 +412,8 @@ async def test_nested_subagent_parent_without_inbox_is_acked(
         parent_body=_parent_snapshot(parent_session_id="conv_top_level"),
     )
 
-    assert http == 204
+    # 2xx, so the forwarder stops; the reason lets the server try the parent's runner.
+    assert http == 202
     assert items == []
     entry = subagent_work.get_subagent_work(CHILD_SESSION_ID)
     assert entry is not None
@@ -421,17 +422,24 @@ async def test_nested_subagent_parent_without_inbox_is_acked(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "receipt", ["undelivered", "drained-elsewhere", "superseded"], ids=lambda r: r
+)
 async def test_retained_result_is_delivered_when_parent_inbox_is_created(
     _clean_subagent_registry: None,
+    receipt: str,
 ) -> None:
     """A result acknowledged without a parent inbox is delivered once the inbox exists.
 
-    After the nested-parent 204 the forwarder never resends, so the runner must
+    After the nested-parent 202 the forwarder never resends, so the runner must
     hand the retained result over itself when it creates the parent's inbox
     (session init or a drain), the way the pending retry used to the moment
-    the inbox appeared. Delivered exactly once.
+    the inbox appeared. Delivered exactly once, and not at all when the
+    parent already drained this dispatch on another runner or has since sent
+    the child a newer one.
     """
     child_body = _child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID)
+    child_body["labels"] = {subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: DISPATCH_ID}
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
@@ -454,14 +462,27 @@ async def test_retained_result_is_delivered_when_parent_inbox_is_created(
             f"/v1/sessions/{CHILD_SESSION_ID}/events",
             json={"type": "external_session_status", "data": {"status": "idle", "output": "x"}},
         )
-        assert acked.status_code == 204
+        assert acked.status_code == 202
+        assert acked.json() == {"delivered": False, "reason": "missing_parent_inbox"}
         assert PARENT_SESSION_ID not in subagent_work._session_inboxes_ref
+        retained = subagent_work.get_subagent_work(CHILD_SESSION_ID)
+        assert retained is not None and retained.work_id == DISPATCH_ID
+        if receipt == "drained-elsewhere":
+            child_body["labels"][subagent_work.SUBAGENT_DELIVERED_ID_LABEL_KEY] = DISPATCH_ID
+        elif receipt == "superseded":
+            child_body["labels"] = {
+                subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: "subagent_newer",
+                subagent_work.SUBAGENT_DELIVERED_ID_LABEL_KEY: DISPATCH_ID,
+            }
 
         # The parent's inbox appears on this process; a second creation is a no-op.
         await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
         await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
 
     inbox = subagent_work._session_inboxes_ref[PARENT_SESSION_ID]
+    if receipt != "undelivered":
+        assert inbox.empty(), "re-delivered a result the parent drained on another runner"
+        return
     assert inbox.qsize() == 1
     delivered = inbox.get_nowait()
     assert delivered["task_id"] == CHILD_SESSION_ID
@@ -522,6 +543,157 @@ async def test_replayed_idle_after_drain_does_not_redeliver(
 
     assert replay.status_code == 204
     assert inbox.qsize() == 0, "replayed idle re-delivered a duplicate to the parent inbox"
+
+
+@pytest.mark.asyncio
+async def test_lost_notice_wakes_parent_and_yields_to_the_real_result(
+    _clean_subagent_registry: None,
+) -> None:
+    """A server-inferred failure reaches the parent but never closes the dispatch.
+
+    When the child's runner goes away mid-turn, the server tells the parent's
+    runner with a ``lost`` status naming the dispatch. The parent must get it
+    as a failure, a repeat must not deliver it twice, a notice for another
+    dispatch must not touch this one, and the relaunched child's real result
+    must still replace it and be delivered.
+    """
+    child_body = _child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID)
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = inbox
+    dispatch = subagent_work.register_subagent_work(
+        parent_session_id=PARENT_SESSION_ID,
+        child_session_id=CHILD_SESSION_ID,
+        agent="reviewer",
+        title="review",
+    )
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="reviewer",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        )
+
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_SnapshotServerClient(child_body),  # type: ignore[arg-type]
+    )
+    lost = {
+        "type": "external_session_status",
+        "data": {"status": "lost", "work_id": dispatch.work_id, "output": "Error: runner gone"},
+    }
+    async with _runner_client(app) as client:
+        # A delayed notice for an earlier dispatch, or one naming none, leaves this one running.
+        for stale_data in ({"work_id": "subagent_older"}, {}):
+            stale = await client.post(
+                f"/v1/sessions/{CHILD_SESSION_ID}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "lost", "output": "Error: old runner gone", **stale_data},
+                },
+            )
+            assert stale.status_code == 204
+        assert inbox.empty()
+        assert dispatch.status not in subagent_work._SUBAGENT_TERMINAL_STATUSES
+
+        first = await client.post(f"/v1/sessions/{CHILD_SESSION_ID}/events", json=lost)
+        repeat = await client.post(f"/v1/sessions/{CHILD_SESSION_ID}/events", json=lost)
+        assert first.status_code == repeat.status_code == 204
+        assert inbox.qsize() == 1
+        notice = inbox.get_nowait()
+        assert (notice["status"], notice["output"]) == ("failed", "Error: runner gone")
+        entry = subagent_work.get_subagent_work(CHILD_SESSION_ID)
+        assert entry is not None and entry.launch_timed_out
+
+        real = await client.post(
+            f"/v1/sessions/{CHILD_SESSION_ID}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "idle", "output": "review complete: LGTM"},
+            },
+        )
+
+    assert real.status_code == 204
+    assert inbox.qsize() == 1
+    result = inbox.get_nowait()
+    assert (result["status"], result["output"]) == ("completed", "review complete: LGTM")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["cold-durable-A", "cold-durable-B", "B-during-snapshot"])
+async def test_lost_notice_rebuilds_only_the_dispatch_it_names(
+    _clean_subagent_registry: None,
+    case: str,
+) -> None:
+    """A delayed loss notice for dispatch A never rebuilds A over a newer dispatch B.
+
+    With no local entry (the parent's runner restarted or moved), the notice
+    may rebuild A only while A is still the child's undrained durable dispatch
+    (``cold-durable-A``). Once the child names B, it settles nothing
+    (``cold-durable-B``), and a B registered while the rebuild reads the
+    server keeps running (``B-during-snapshot``).
+    """
+    durable = "dispatch-A" if case == "cold-durable-A" else "dispatch-B"
+    child_body = _child_snapshot(sub_agent_name="reviewer", parent_session_id=PARENT_SESSION_ID)
+    child_body["labels"] = {subagent_work.SUBAGENT_DISPATCH_ID_LABEL_KEY: durable}
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class _GatedServerClient(_SnapshotServerClient):
+        async def get(self, url: str, **kwargs: Any) -> Any:
+            if case == "B-during-snapshot" and url.rstrip("/").endswith(CHILD_SESSION_ID):
+                entered.set()
+                await release.wait()
+            return await super().get(url, **kwargs)
+
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    subagent_work._session_inboxes_ref[PARENT_SESSION_ID] = inbox
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return AgentSpec(
+            spec_version=1,
+            name="reviewer",
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        )
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_GatedServerClient(child_body),  # type: ignore[arg-type]
+    )
+    lost = {
+        "type": "external_session_status",
+        "data": {"status": "lost", "work_id": "dispatch-A", "output": "Error: A's runner gone"},
+    }
+    async with _runner_client(app) as client:
+        request = asyncio.create_task(
+            client.post(f"/v1/sessions/{CHILD_SESSION_ID}/events", json=lost)
+        )
+        if case == "B-during-snapshot":
+            await asyncio.wait_for(entered.wait(), timeout=10)
+            subagent_work.register_subagent_work(
+                parent_session_id=PARENT_SESSION_ID,
+                child_session_id=CHILD_SESSION_ID,
+                agent="reviewer",
+                title="new dispatch",
+                work_id="dispatch-B",
+            )
+            release.set()
+        response = await request
+
+    assert response.status_code == 204
+    entry = subagent_work.get_subagent_work(CHILD_SESSION_ID)
+    if case == "cold-durable-A":
+        assert inbox.qsize() == 1
+        assert entry is not None and (entry.work_id, entry.status) == ("dispatch-A", "failed")
+        return
+    assert inbox.empty(), "a stale loss notice reached the parent"
+    if case == "B-during-snapshot":
+        assert entry is not None and entry.work_id == "dispatch-B"
+        assert entry.status not in subagent_work._SUBAGENT_TERMINAL_STATUSES
 
 
 @pytest.mark.asyncio
