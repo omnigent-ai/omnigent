@@ -48,6 +48,11 @@ const cases: [string, string, number, string?][] = [
   ["URL", `[Details](https://example.com/word/${"x".repeat(2000)})\n\nword ⟦word⟧ word`, 1],
   ["title", `[Details](https://example.com "word")\n\nword ⟦word⟧ word\n\n${link}`, 1],
   ["image", `![word](word.png)\n\nword ⟦word⟧ word\n\n${link}`, 1],
+  [
+    "image and link blocks before selection",
+    `# Guide\n\n![Logo](https://example.com/${"x".repeat(200)}.png)\n\n${link}\n\nword ⟦word⟧ word`,
+    1,
+  ],
   ["HTML comment", `<!-- word -->\n\nword ⟦word⟧ word\n\n${link}`, 1],
   ["reference definition before text", "[ref]: word\n\n⟦word⟧ word [Details][ref]", 0],
   [
