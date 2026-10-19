@@ -58,3 +58,33 @@ def git_status(worktree: Path) -> str:
         capture_output=True,
         text=True,
     ).stdout
+
+
+LINEAR_URL = "https://linear.app/omnigent/issue/OMNI-7"
+
+
+@pytest.mark.parametrize(
+    ("url", "proxy_token", "forwarded"),
+    [
+        (LINEAR_URL, "", True),
+        # CI's credential proxy already owns the real token for the sandbox.
+        (LINEAR_URL, "proxy-token", False),
+        ("https://github.com/omnigent-ai/omnigent/issues/7", "", False),
+    ],
+)
+def test_launch_env_forwards_the_linear_key_only_without_the_credential_proxy(
+    monkeypatch: pytest.MonkeyPatch, url: str, proxy_token: str, forwarded: bool
+) -> None:
+    monkeypatch.setenv("LINEAR_API_KEY", "lin-key")
+    monkeypatch.delenv("DATABRICKS_LINEAR_API_KEY", raising=False)
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "OTHER")
+    if proxy_token:
+        monkeypatch.setenv("DATABRICKS_REPRO_LINEAR_TOKEN", proxy_token)
+    else:
+        monkeypatch.delenv("DATABRICKS_REPRO_LINEAR_TOKEN", raising=False)
+
+    env = repro._launch_env(url)
+
+    assert ("DATABRICKS_LINEAR_API_KEY" in env) is forwarded
+    expected = "OTHER,DATABRICKS_LINEAR_API_KEY" if forwarded else "OTHER"
+    assert env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] == expected

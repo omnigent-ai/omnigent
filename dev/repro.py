@@ -58,11 +58,12 @@ def _launch_env(bug_url: str) -> dict[str, str]:
     (itself allowlisted), which tells the runner env-build to forward it the rest
     of the way. Maintainers usually export the plain ``LINEAR_API_KEY`` locally,
     so mirror that into the ``DATABRICKS_`` name when only the plain one is set.
-    Only kicks in for Linear URLs; if neither is set we warn rather than fail (the
+    Only kicks in for Linear URLs, and not under CI's credential proxy
+    (``DATABRICKS_REPRO_LINEAR_TOKEN`` set). If neither key is set we warn rather than fail (the
     agent stops with ``needs_more_info`` and names the missing key).
     """
     env = os.environ.copy()
-    if "linear.app" not in bug_url:
+    if "linear.app" not in bug_url or env.get("DATABRICKS_REPRO_LINEAR_TOKEN"):
         return env
     if not env.get("DATABRICKS_LINEAR_API_KEY") and env.get("LINEAR_API_KEY"):
         env["DATABRICKS_LINEAR_API_KEY"] = env["LINEAR_API_KEY"]
