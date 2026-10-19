@@ -35,7 +35,10 @@ function unmapped(): never {
   throw new UnmappedBlock();
 }
 
-const tokenCache = new WeakMap<MarkdownManager, { source: string; tokens: MarkdownToken[] }>();
+const tokenCache = new WeakMap<
+  MarkdownManager,
+  { source: string; tokens: MarkdownToken[] | null }
+>();
 const cache = new WeakMap<
   ProseMirrorNode,
   {
@@ -46,13 +49,17 @@ const cache = new WeakMap<
 >();
 
 // Lex with the editor's configured marked instance, once per source string.
-// Tokenizer errors propagate so markdownSourceMap can cache a failed mapping.
-function markdownTokens(manager: MarkdownManager, source: string): MarkdownToken[] {
+// A tokenizer error is reported once and cached as null for later documents.
+function markdownTokens(manager: MarkdownManager, source: string): MarkdownToken[] | null {
   const previous = tokenCache.get(manager);
   if (previous?.source === source) return previous.tokens;
   const marked = manager.instance;
-  const tokens = new marked.Lexer(marked.defaults).lex(source);
-  tokenCache.set(manager, { source, tokens });
+  let tokens: MarkdownToken[] | null = null;
+  try {
+    tokens = new marked.Lexer(marked.defaults).lex(source);
+  } finally {
+    tokenCache.set(manager, { source, tokens });
+  }
   return tokens;
 }
 
@@ -333,7 +340,8 @@ function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): 
       if (raw[i] === "\r" && raw[i + 1] === "\n") i++;
     }
   }
-  const tokenBlocks = mapTokenBlocks(markdownTokens(manager, normalized), source);
+  const tokens = markdownTokens(manager, normalized);
+  const tokenBlocks = tokens && mapTokenBlocks(tokens, source);
   const docBlocks = documentBlocks(doc);
   // A partial map cannot tell exact offsets from legacy ones, so any unverified
   // or edited block keeps the whole document on legacy anchors.

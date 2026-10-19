@@ -238,11 +238,11 @@ describe("validated Markdown source positions", () => {
   it("lexes once per editor and source without sharing tokens between editors", () => {
     const raw = "word **word**";
     const doc = parse(raw);
-    const other = createEditor("Other word");
+    const other = createEditor(raw);
     const lexer = vi.spyOn(editor.markdown!.instance.Lexer.prototype, "lex");
     try {
       expect(markdownSourceMap(doc, raw, editor.markdown)).not.toBeNull();
-      expect(markdownSourceMap(other.state.doc, "Other word", other.markdown)).not.toBeNull();
+      expect(markdownSourceMap(other.state.doc, raw, other.markdown)).not.toBeNull();
       expect(lexer).toHaveBeenCalledTimes(2);
       const rebuilt = editor.schema.nodeFromJSON(doc.toJSON());
       expect(markdownSourceMap(rebuilt, raw, editor.markdown)).not.toBeNull();
@@ -264,9 +264,10 @@ describe("validated Markdown source positions", () => {
         throw new Error("Custom tokenizer failure");
       });
     try {
-      for (let i = 0; i < 2; i++) {
-        expect(findPmRangeForComment(doc, comment, changedSource, editor.markdown)).toEqual(
-          findPmRangeForComment(doc, comment, changedSource),
+      const rebuilt = editor.schema.nodeFromJSON(doc.toJSON());
+      for (const current of [doc, doc, rebuilt]) {
+        expect(findPmRangeForComment(current, comment, changedSource, editor.markdown)).toEqual(
+          findPmRangeForComment(current, comment, changedSource),
         );
       }
       expect(lexer).toHaveBeenCalledTimes(1);
