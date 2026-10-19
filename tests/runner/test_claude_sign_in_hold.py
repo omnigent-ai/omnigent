@@ -9,7 +9,7 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +20,7 @@ from fastapi import FastAPI
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.diagnostics import sign_in_next_step
 from omnigent.runner import app as runner_app
-from omnigent.runner import create_runner_app, sign_in_watch
+from omnigent.runner import create_runner_app, sign_in_watch, subagent_work
 from omnigent.runtime import pending_inputs
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
@@ -103,6 +103,45 @@ class _TakeoverScript(list[str]):
             self.take_over()
 
 
+class _PausedStreamHarness(_TurnScriptHarness):
+    """Keep turn ``pause_turn``'s stream open after its last frame until ``resume`` is set."""
+
+    def __init__(self, scripts: list[list[str]], *, pause_turn: int = 1) -> None:
+        super().__init__(scripts)
+        self._pause_turn = pause_turn
+        self.frames_sent = asyncio.Event()
+        self.resume = asyncio.Event()
+
+    def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
+        inner = super().stream(method, url, json=json, timeout=timeout)
+        if len(self.posted_bodies) != self._pause_turn:
+            return inner
+        harness = self
+
+        class _Paused:
+            status_code = 200
+
+            async def __aenter__(self) -> Any:
+                handle = await inner.__aenter__()
+
+                class _Handle:
+                    status_code = 200
+
+                    async def aiter_text(self) -> AsyncIterator[str]:
+                        async for frame in handle.aiter_text():
+                            yield frame
+                        # Every frame was read and handled; the stream just hasn't ended.
+                        harness.frames_sent.set()
+                        await harness.resume.wait()
+
+                return _Handle()
+
+            async def __aexit__(self, *exc: Any) -> None:
+                await inner.__aexit__(*exc)
+
+        return _Paused()
+
+
 class _RecordingServerClient(NullServerClient):
     def __init__(self) -> None:
         self.posts: list[tuple[str, Any]] = []
@@ -131,6 +170,7 @@ def _build_app(
     scripts: list[list[str]],
     *,
     terminal_registry: TerminalRegistry | None = None,
+    harness: _TurnScriptHarness | None = None,
 ) -> tuple[FastAPI, _TurnScriptHarness, _RecordingServerClient]:
     spec = AgentSpec(
         spec_version=1,
@@ -141,7 +181,7 @@ def _build_app(
     async def resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         return spec
 
-    harness = _TurnScriptHarness(scripts)
+    harness = harness or _TurnScriptHarness(scripts)
     server = _RecordingServerClient()
     app = create_runner_app(
         process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
@@ -670,3 +710,95 @@ async def test_resend_that_is_not_refused_ends_the_wait_even_with_messages_still
     assert [_sent_text(body) for body in harness.posted_bodies] == ["first", "first", "second"]
     assert app.state.sign_in_holds[sid].holds == 1
     assert len(server.notices("databricks_sign_in_pending")) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "control"),
+    [("interrupt", "inject_interrupt"), ("stop_session", "kill_session")],
+)
+async def test_interrupt_or_stop_before_the_refused_stream_ends_is_never_undone(
+    action: str, control: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A control that lands after the refusal but before the stream ends drops the message."""
+    monkeypatch.setattr(claude_native_bridge, control, lambda *_a, **_k: None)
+    harness = _PausedStreamHarness([_REFUSED, _DELIVERED])
+    app, _harness, server = _build_app([], harness=harness)
+    sid = uuid.uuid4().hex
+    async with _runner_client(app) as client:
+        await _create_session(client, sid)
+        await client.post(f"/v1/sessions/{sid}/events", json=_message("first"))
+        async with asyncio.timeout(5):
+            await harness.frames_sent.wait()
+        response = await client.post(f"/v1/sessions/{sid}/events", json={"type": action})
+        assert response.status_code == 204
+        harness.resume.set()
+        await _until(lambda: sid not in app.state.active_turns)
+        # A sign-in that completes afterwards finds nothing to send.
+        if (hold := app.state.sign_in_holds.get(sid)) is not None:
+            hold.waiting = False
+        await asyncio.sleep(0.1)
+
+    assert len(harness.posted_bodies) == 1
+    assert sid not in app.state.sign_in_holds
+    assert not app.state.session_message_buffers.get(sid)
+    assert not server.notices("databricks_sign_in_pending")
+    # The refusal is reported as it was before messages were held.
+    (failed,) = [e for e in _published(app, sid) if e.get("type") == "response.failed"]
+    assert failed["error"]["code"] == "databricks_sign_in_pending"
+
+
+@pytest.mark.asyncio
+async def test_child_agent_dispatch_refused_by_a_sign_in_fails_at_once() -> None:
+    """A sub-agent dispatch is never held: its launch bookkeeping fails it as before."""
+    app, harness, server = _build_app([_REFUSED, _DELIVERED])
+    parent, sid = uuid.uuid4().hex, uuid.uuid4().hex
+    entry = subagent_work.register_subagent_work(
+        parent_session_id=parent, child_session_id=sid, agent="worker", title="child"
+    )
+    try:
+        async with _runner_client(app) as client:
+            await _create_session(client, sid)
+            await client.post(f"/v1/sessions/{sid}/events", json=_message("child task"))
+            await _until(lambda: sid not in app.state.active_turns and entry.status == "failed")
+            await asyncio.sleep(0.05)
+    finally:
+        subagent_work.unregister_subagent_work(sid)
+
+    assert len(harness.posted_bodies) == 1
+    assert sid not in app.state.sign_in_holds
+    assert not app.state.session_message_buffers.get(sid)
+    assert not server.notices("databricks_sign_in_pending")
+    (failed,) = [e for e in _published(app, sid) if e.get("type") == "response.failed"]
+    assert failed["error"]["code"] == "databricks_sign_in_pending"
+
+
+@pytest.mark.asyncio
+async def test_ready_notice_during_the_resend_an_expired_wait_released_asks_for_no_resend(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The pane looks ready while the expired wait's resend is still running: no manual resend."""
+    monkeypatch.setattr(runner_app, "_SIGN_IN_HOLD_MAX_S", 0.05)
+    monkeypatch.setattr(sign_in_watch, "_SIGN_IN_WATCH_INTERVAL_S", 0.02)
+    sid = uuid.uuid4().hex
+    harness = _PausedStreamHarness([_REFUSED, _DELIVERED], pause_turn=2)
+
+    async def read(scrollback: int = 0, *, join_wrapped: bool = False) -> dict[str, object]:
+        # Still signing in until the expired wait has resent the message.
+        return {"screen": _READY_SCREEN if harness.frames_sent.is_set() else _SIGN_IN_SCREEN}
+
+    app, _harness, server = _build_app(
+        [], terminal_registry=_claude_pane(sid, tmp_path, read), harness=harness
+    )
+    async with _runner_client(app) as client:
+        await _create_session(client, sid)
+        await client.post(f"/v1/sessions/{sid}/events", json=_message("first"))
+        # The resend is under way and the watcher sees the agent ready before it ends.
+        await _until(lambda: bool(server.notices("databricks_sign_in_completed")))
+        harness.resume.set()
+        await _until(lambda: len(harness.posted_bodies) == 2 and sid not in app.state.active_turns)
+
+    (ready,) = server.notices("databricks_sign_in_completed")
+    assert ready["message"] == "Claude Code is ready. Sending your message now."
+    assert [_sent_text(body) for body in harness.posted_bodies] == ["first", "first"]
+    assert sid not in app.state.sign_in_holds

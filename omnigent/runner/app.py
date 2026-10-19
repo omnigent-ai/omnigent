@@ -237,12 +237,15 @@ class _SignInHold:
     :param waiting: Whether the queue is paused until the sign-in completes.
     :param releasing: Whether the sign-in watcher saw the agent ready and is
         announcing the resend; until it resumes the queue, the deadline can't.
+    :param resent: Whether the wait ran out and its message is being resent, so
+        a watcher that sees the agent ready meanwhile asks for no resend.
     """
 
     deadline: float
     holds: int = 0
     waiting: bool = False
     releasing: bool = False
+    resent: bool = False
 
 
 def _sign_in_hold_deadline(body: Mapping[str, Any]) -> float:
@@ -3938,6 +3941,9 @@ def create_runner_app(
                 # Only a refusal that ended the wait fails the queue behind it too; after
                 # any other end, a later refusal waits afresh.
                 _sign_in_holds.pop(conv_id, None)
+            elif (hold := _sign_in_holds.get(conv_id)) is not None:
+                # The resend failed, so no resend is in flight any more.
+                hold.resent = False
             normalized_error = _normalize_turn_error(error)
             if not _suppress_status:
                 _publish_turn_status(
@@ -3981,8 +3987,6 @@ def create_runner_app(
                     status="cancelled",
                     output=None,
                 )
-        elif sign_in_hold:
-            pass
         elif error is not None:
             _mark_subagent_terminal_and_wake(
                 conv_id,
@@ -4309,6 +4313,8 @@ def create_runner_app(
     def _cancel_claude_prompt_waiter(session_id: str) -> None:
         """Discard waiting input before explicit terminal interruption or teardown."""
         _sign_in_holds.pop(session_id, None)
+        # A refusal still streaming can no longer hold the cancelled turn's message.
+        _turn_message_bodies.pop(session_id, None)
         waiter = _claude_prompt_waiters.pop(session_id, None)
         if waiter is not None or _session_harness_name(session_id) == "claude-native":
             # Cancel queued work even if the terminal control fails; restoring it
@@ -4382,9 +4388,11 @@ def create_runner_app(
         """
         Return whether a turn's refusal should wait for a launcher sign-in instead of failing.
 
-        Only a Claude message that never reached the pane qualifies: the
-        launcher in front of ``claude`` is showing a sign-in address, so the
-        message can be sent unchanged once the person signs in.
+        Only a main-session Claude message that never reached the pane
+        qualifies: the launcher in front of ``claude`` is showing a sign-in
+        address, so the message can be sent unchanged once the person signs in.
+        A sub-agent dispatch fails as before, since its launch bookkeeping
+        times out on its own.
 
         :param conv_id: Session whose background turn was refused.
         :param error: The harness ``response.failed`` error.
@@ -4397,6 +4405,7 @@ def create_runner_app(
             or _session_harness_name(conv_id) != "claude-native"
             or conv_id not in _turn_message_bodies
             or conv_id in _interrupted_sessions
+            or _is_sub_agent_session(conv_id)
         ):
             return False
         hold = _sign_in_holds.get(conv_id)
@@ -4408,6 +4417,15 @@ def create_runner_app(
             # refusal stands, and so do those of the messages queued during the wait.
             return False
         return True
+
+    def _is_sub_agent_session(conv_id: str) -> bool:
+        """Return whether *conv_id* runs a sub-agent dispatch rather than a main session."""
+        snapshot = _session_snapshot_cache.get(conv_id)
+        return (
+            get_subagent_work(conv_id) is not None
+            or conv_id in _child_session_parents
+            or (snapshot is not None and snapshot.parent_session_id is not None)
+        )
 
     def _hold_message_for_sign_in(conv_id: str, error: Mapping[str, Any]) -> None:
         """
@@ -4450,12 +4468,19 @@ def create_runner_app(
         return hold is not None and hold.waiting
 
     def _claim_sign_in_release(conv_id: str) -> bool:
-        """Return whether a message waits on the sign-in; if so, only the watcher resumes it."""
+        """
+        Return whether a held message is being sent without the person resending it.
+
+        A message still waiting on the sign-in is claimed: only the watcher resumes it.
+        One the expired wait already resent needs no claim.
+        """
         hold = _sign_in_holds.get(conv_id)
-        if hold is None or not hold.waiting:
+        if hold is None:
             return False
-        hold.releasing = True
-        return True
+        if hold.waiting:
+            hold.releasing = True
+            return True
+        return hold.resent
 
     def _release_sign_in_hold(conv_id: str) -> None:
         """Resume a queue paused for a sign-in."""
@@ -4472,6 +4497,7 @@ def create_runner_app(
         if hold.releasing or time.monotonic() < hold.deadline:
             return True
         hold.waiting = False
+        hold.resent = True
         _logger.warning(
             "Databricks sign-in for %s did not complete before its wait ran out; "
             "resending its message",
@@ -6029,6 +6055,7 @@ def create_runner_app(
                     _stream_failed_error: _JsonObject | None = None
                     # A sign-in refusal kept from the chat while its message waits to be resent.
                     _held_refusal: _JsonObject | None = None
+                    _held_body: _JsonObject | None = None
 
                     def _owns_live_turn() -> bool:
                         live = _live_response_id.get(conv_id)
@@ -6143,6 +6170,7 @@ def create_runner_app(
                                         # Neither fail the turn nor mark the message
                                         # undelivered: it is sent after the sign-in.
                                         _held_refusal = event
+                                        _held_body = _turn_message_bodies.get(conv_id)
                                         continue
                                 elif _evt_type == "response.output_item.done":
                                     _item = event.get("item")
@@ -6420,8 +6448,12 @@ def create_runner_app(
                     if _dispatch_tasks:
                         await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
 
-                    if _held_refusal is not None and not _owns_live_turn():
-                        # A newer turn took the session meanwhile: report the refusal as usual.
+                    if _held_refusal is not None and (
+                        not _owns_live_turn()
+                        or _turn_message_bodies.get(conv_id) is not _held_body
+                    ):
+                        # A newer turn took the session, or an interrupt or Stop cancelled
+                        # this one meanwhile: report the refusal as usual.
                         if turn_input_stable_id is not None:
                             _held_refusal["input_stable_id"] = turn_input_stable_id
                         _publish_event(conv_id, _held_refusal)
