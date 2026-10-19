@@ -23,6 +23,9 @@ _sleep = asyncio.sleep
 
 async def request_with_429_retry(
     send: Callable[[], Awaitable[httpx.Response]],
+    *,
+    delays_s: tuple[float, ...] = _HTTP_429_RETRY_DELAYS_S,
+    max_retry_after_s: float = _HTTP_429_MAX_RETRY_AFTER_S,
 ) -> httpx.Response:
     """Send an HTTP request, retrying only explicit 429 responses.
 
@@ -32,12 +35,15 @@ async def request_with_429_retry(
 
     Retries are bounded by attempt count, not a wall-clock deadline: with
     every hint capped, the sleeps total at most
-    ``len(_HTTP_429_RETRY_DELAYS_S) * _HTTP_429_MAX_RETRY_AFTER_S`` (40s).
+    ``len(delays_s) * max_retry_after_s`` (40s with the defaults).
 
     :param send: Callable that creates and sends one request attempt.
+    :param delays_s: Fallback pause before each retry when the response has
+        no usable ``Retry-After`` hint, e.g. ``(0.5, 1.0, 2.0)``.
+    :param max_retry_after_s: Cap on any single pause, e.g. ``10.0``.
     :returns: The first non-429 response, or the final 429 response.
     """
-    for fallback_delay_s in _HTTP_429_RETRY_DELAYS_S:
+    for fallback_delay_s in delays_s:
         response = await send()
         if response.status_code != 429:
             return response
@@ -45,7 +51,7 @@ async def request_with_429_retry(
             bounded_retry_after_seconds(
                 response,
                 fallback=fallback_delay_s,
-                max_delay=_HTTP_429_MAX_RETRY_AFTER_S,
+                max_delay=max_retry_after_s,
             )
         )
     return await send()

@@ -334,6 +334,8 @@ class HostConnection:
     :param connected_at: Unix epoch float of connect time.
     :param last_frame_at: Unix epoch float of the most recent
         frame from this host.
+    :param last_frame_monotonic: Monotonic timestamp of the last frame,
+        used for watchdog inactivity checks across wall-clock corrections.
     :param pending_launches: Per-``request_id`` futures for
         in-flight ``host.launch_runner`` requests. Resolved when
         the host sends ``host.launch_runner_result``.
@@ -417,6 +419,7 @@ class HostConnection:
     outbound_queue: asyncio.Queue[OutboundFrame | None]
     connected_at: float
     last_frame_at: float
+    last_frame_monotonic: float = field(default_factory=time.monotonic, kw_only=True)
     diagnostics: TunnelDiagnostics = field(default_factory=TunnelDiagnostics)
     retirement_reason: str | None = None
     sender_end_reason: str | None = None
@@ -586,6 +589,7 @@ class HostRegistry:
             outbound_queue=asyncio.Queue(),
             connected_at=now,
             last_frame_at=now,
+            last_frame_monotonic=time.monotonic(),
             registered_with_managed_token=registered_with_managed_token,
         )
         with self._lock:
@@ -668,6 +672,7 @@ class HostRegistry:
             if self._hosts.get((conn.workspace_id, conn.host_id)) is not conn:
                 return False
             conn.last_frame_at = time.time()
+            conn.last_frame_monotonic = time.monotonic()
             return True
 
     def get(self, host_id: str, workspace_id: int | None = None) -> HostConnection | None:

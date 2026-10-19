@@ -6,11 +6,18 @@ import { useSession } from "@/hooks/useSession";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import { useSessionHostOnline } from "@/hooks/RunnerHealthProvider";
 import { sandboxOptionLabel } from "@/lib/capabilities";
+import { SANDBOX_STAGE_LABELS } from "@/lib/sandboxStatus";
+import type { SandboxStatus } from "@/lib/types";
+import { useChatStore } from "@/store/chatStore";
 import { DisabledActionTooltip } from "./DisabledActionTooltip";
 import { SessionActionMenuItem } from "./SessionActionMenuItem";
 import { SwitchHostDialog } from "@/shell/SwitchHostDialog";
 import { cn } from "@/lib/utils";
-import { ComposerHostTrigger } from "@/components/composer/ComposerControls";
+import {
+  ComposerConfigTooltipRows,
+  ComposerHostTrigger,
+  ComposerMenuTooltip,
+} from "@/components/composer/ComposerControls";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -70,6 +77,18 @@ const STATUS_WORD: Record<HostBadgeStatus, string> = {
 
 const RECONNECT_WORD = "offline — click to reconnect";
 
+const CONNECTION_WORD: Record<HostBadgeStatus, string> = {
+  online: "Connected",
+  offline: "Disconnected",
+  unknown: "Unknown",
+};
+
+/** Composer status for a sandbox that is still launching, or failed to launch. */
+function launchStatusWord(launch: SandboxStatus): string {
+  if (launch.stage === "failed") return "Sandbox launch failed";
+  return SANDBOX_STAGE_LABELS[launch.stage] ?? "Launching sandbox";
+}
+
 /**
  * Session-bound host status with shared liveness, reconnect and switch behavior.
  * The composer variant uses the compact host menu; the default retains the
@@ -87,6 +106,7 @@ export function HostBadge({
   readOnly?: boolean;
 }) {
   const [switchOpen, setSwitchOpen] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
   const { session } = useSession(sessionId);
   const hostId = session?.hostId ?? null;
   // Keep sandbox hosts so managed sessions resolve to a provider label.
@@ -96,6 +116,8 @@ export function HostBadge({
   const liveOnline = useSessionHostOnline(sessionId);
 
   const host = hostId ? hosts?.find((h) => h.host_id === hostId) : undefined;
+  // The open session's sandbox launch, which its chat progress banners also show.
+  const launch = useChatStore((s) => (s.conversationId === sessionId ? s.sandboxStatus : null));
 
   // Host liveness is keyed by SESSION, not by host, and comes from a ~10s
   // poll. A host switch repoints `hostId` as soon as the session snapshot
@@ -137,19 +159,48 @@ export function HostBadge({
     if (!canSwitch) setSwitchOpen(false);
   }, [canSwitch]);
   if (appearance === "composer") {
-    const reconnectable = badge?.status === "offline" && !session?.hostResumable && !!onReconnect;
-    const label = badge ? `Host ${badge.label}, ${STATUS_WORD[badge.status]}` : "No host bound";
+    // A launching sandbox has no host record yet: show the launch, not a missing host.
+    const launchStatus = launch && !host ? launchStatusWord(launch) : null;
+    const reconnectable =
+      !launchStatus && badge?.status === "offline" && !session?.hostResumable && !!onReconnect;
+    let label = badge ? `Host ${badge.label}, ${STATUS_WORD[badge.status]}` : "No host bound";
+    // A dormant resumable host wakes on the next message; it isn't disconnected.
+    const asleep = badge?.status === "offline" && !!session?.hostResumable;
+    let tooltipRows = badge
+      ? [
+          { label: "Host", value: badge.label },
+          {
+            label: "Status",
+            value: asleep ? "Asleep — wakes on next message" : CONNECTION_WORD[badge.status],
+          },
+        ]
+      : [{ label: "Host", value: "None" }];
+    const launchHost = launch?.provider ? sandboxOptionLabel(launch.provider) : "Sandbox";
+    if (launchStatus) {
+      label = `Host ${launchHost}, ${launchStatus}`;
+      tooltipRows = [
+        { label: "Host", value: launchHost },
+        { label: "Status", value: launchStatus },
+      ];
+    }
     return (
       <>
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <ComposerHostTrigger
-              label={label}
-              status={badge?.status ?? "unknown"}
-              cloud={!!host?.sandbox_provider}
-              data-testid="composer-host-select"
-            />
-          </DropdownMenuTrigger>
+        <DropdownMenu onOpenChange={setMenuOpen}>
+          <ComposerMenuTooltip
+            menuOpen={menuOpen}
+            content={<ComposerConfigTooltipRows rows={tooltipRows} />}
+            testId="composer-host-tooltip"
+            className="shrink-0"
+          >
+            <DropdownMenuTrigger asChild>
+              <ComposerHostTrigger
+                label={label}
+                status={launchStatus ? undefined : (badge?.status ?? "unknown")}
+                cloud={!!launchStatus || !!host?.sandbox_provider}
+                data-testid="composer-host-select"
+              />
+            </DropdownMenuTrigger>
+          </ComposerMenuTooltip>
           <DropdownMenuContent
             align="start"
             side="top"
@@ -158,16 +209,18 @@ export function HostBadge({
             data-testid="composer-host-menu"
           >
             <div className="px-2 py-1 text-xs text-muted-foreground">
-              {host?.sandbox_provider ? "Cloud" : "My machines"}
+              {launchStatus || host?.sandbox_provider ? "Cloud" : "My machines"}
             </div>
             <DropdownMenuItem disabled className="gap-2" data-selected="true">
-              <span
-                className={cn(
-                  "size-2 shrink-0 rounded-full",
-                  STATUS_DOT_CLASS[badge?.status ?? "unknown"],
-                )}
-              />
-              <span>{badge?.label ?? "No host bound"}</span>
+              {!launchStatus && (
+                <span
+                  className={cn(
+                    "size-2 shrink-0 rounded-full",
+                    STATUS_DOT_CLASS[badge?.status ?? "unknown"],
+                  )}
+                />
+              )}
+              <span>{launchStatus ? launchHost : (badge?.label ?? "No host bound")}</span>
             </DropdownMenuItem>
             {reconnectable && (
               <DropdownMenuItem disabled={readOnly} onSelect={onReconnect}>
@@ -182,9 +235,9 @@ export function HostBadge({
                 Switch host…
               </SessionActionMenuItem>
             )}
-            {!badge && (
+            {(launchStatus || !badge) && (
               <p className="max-w-60 px-2 py-1 text-xs text-muted-foreground">
-                This session has no host binding.
+                {launchStatus ?? "This session has no host binding."}
               </p>
             )}
           </DropdownMenuContent>

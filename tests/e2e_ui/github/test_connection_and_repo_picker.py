@@ -68,11 +68,15 @@ def test_github_connection_controls(
     )
     page.goto(f"{base_url}/settings/integrations")
     if width < 768:
-        page.get_by_test_id("settings-nav-integrations").click()
+        expect(page.locator("aside[aria-label='Conversations']")).to_have_attribute(
+            "aria-hidden", "true"
+        )
     page.get_by_role("button", name="Connect GitHub", exact=True).click()
     expect(page.get_by_role("status")).to_contain_text("GitHub account connected.")
     if width < 768:
-        page.get_by_test_id("settings-nav-integrations").click()
+        expect(page.locator("aside[aria-label='Conversations']")).to_have_attribute(
+            "aria-hidden", "true"
+        )
         page.get_by_role("button", name="About GitHub", exact=True).focus()
         expect(page.get_by_role("tooltip")).to_contain_text("Connected as octocat.")
     else:
@@ -85,7 +89,9 @@ def test_github_connection_controls(
     page.screenshot(path=tmp_path / "github-disconnected.png", animations="disabled")
     page.goto(f"{base_url}/settings/integrations?github=error")
     if width < 768:
-        page.get_by_test_id("settings-nav-integrations").click()
+        expect(page.locator("aside[aria-label='Conversations']")).to_have_attribute(
+            "aria-hidden", "true"
+        )
     expect(page.get_by_role("alert")).to_contain_text("Couldn't connect your GitHub account.")
 
 

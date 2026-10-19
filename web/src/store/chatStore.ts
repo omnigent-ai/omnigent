@@ -68,6 +68,7 @@ import {
   getSessionSlim,
   getSessionUsage,
   fetchSessionItemsPage,
+  HOST_OFFLINE_CODE,
   INITIAL_WINDOW_ITEMS,
   interrupt as interruptSession,
   openSessionStream,
@@ -109,6 +110,7 @@ import {
 } from "@/lib/sessionListCache";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import { forgetUnsentSend, peekUnsentSend, rememberUnsentSend } from "@/lib/unsentSends";
 import { isSideChatCommand, usesNativeSideChatFork } from "@/lib/sideChat";
 // Re-exported below so existing `@/store/chatStore` importers keep working; the
 // pure helpers live in a leaf module so low-level session hooks can gate on temp
@@ -130,10 +132,16 @@ import { uploadFile } from "@/lib/filesApi";
 import { attachmentKey } from "@/lib/attachments";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
+import { fetchHarnessCatalog, type HarnessCatalog } from "@/lib/agentLabels";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
 import { codexPlanModeFromSession, isCodexNativeSession } from "@/lib/codexPlanMode";
-import { getCurrentAuthorId, resolveSessionHost } from "@/lib/identity";
+import {
+  getCurrentAuthorId,
+  getCurrentUserId,
+  resolveSessionHost,
+  subscribeIdentity,
+} from "@/lib/identity";
 import { getOmnigentHostConfig, isDatabricksWorkspace } from "@/lib/host";
 // Routing-free emit primitive (not "@/lib/analytics", which pulls in useLocation
 // and would form a routing↔store import cycle).
@@ -150,7 +158,10 @@ import {
   isSystemUserContent,
   taskNotificationMarkerContent,
 } from "@/lib/systemMessage";
-import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
+import {
+  isNativeTerminalSession as isNativeTerminalSessionFn,
+  nativeCodingAgentForHarness,
+} from "@/lib/nativeCodingAgents";
 import type { StoredReplyDraft } from "@/lib/replyDraft";
 import { toast } from "sonner";
 
@@ -395,12 +406,22 @@ export function beginLocalConversation(
 
 /** Whether a temporary conversation still owns its unsent first message. */
 export function hasPendingLocalMessage(tempConvId: string): boolean {
-  return (
-    conversationRegistry
-      .peek(tempConvId)
-      ?.getState()
-      .pendingUserMessages.some((message) => message.initialDraft !== undefined) ?? false
-  );
+  const state = conversationRegistry.peek(tempConvId)?.getState();
+  return state !== undefined && holdsInitialDraft(state);
+}
+
+/** Whether a first message is still held for startup; nothing queued may overtake it. */
+export function holdsInitialDraft(state: Pick<ConversationState, "pendingUserMessages">): boolean {
+  return state.pendingUserMessages.some((message) => message.initialDraft !== undefined);
+}
+
+/** Keep a conversation's queued messages from sending until the user retries each one. */
+function suspendQueuedMessages(conversationId: string): void {
+  setActive((s) => ({
+    queuedMessages: s.queuedMessages.map((m) =>
+      m.conversationId === conversationId ? { ...m, requiresRetry: true } : m,
+    ),
+  }));
 }
 
 /**
@@ -542,6 +563,13 @@ export interface PendingUserMessage {
    * receipt names. Snapshot-replayed entries carry that id as `tempId`.
    */
   pendingId?: string;
+  /**
+   * Sent to a native-terminal session while its turn was running. The vendor
+   * agent reads such a message only after its current step (e.g. a running
+   * tool call), so the bubble says so until `session.input.consumed` promotes
+   * it. Unset on snapshot-replayed entries.
+   */
+  sentMidTurn?: boolean;
 }
 
 /**
@@ -582,6 +610,8 @@ export interface QueuedMessage {
   stableId?: string;
   /** A failed send stays queued until the user explicitly retries or edits it. */
   requiresRetry?: boolean;
+  /** The session's host was offline; held until it reconnects, then sent. */
+  waitingForHost?: boolean;
 }
 
 /**
@@ -974,7 +1004,8 @@ export interface ConversationState {
    * is in flight, so it would otherwise read as idle `runner_asleep` and
    * show nothing at all. Feeds `useSessionLiveness` as a `starting` nudge
    * and self-expires after `STARTING_GRACE_S`. `null` when no such launch
-   * is outstanding.
+   * is outstanding. Also stamped when the session's managed sandbox reports
+   * `ready`: its runner is up, but its terminal is not created yet.
    */
   runnerLaunchedAt: number | null;
   /**
@@ -1150,6 +1181,8 @@ export interface ChatActions {
    * turn) when the session next goes idle — see the `session_status` handler.
    */
   enqueueMessage: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
+  /** Let a conversation's messages held for an offline host flush again. */
+  releaseHostHeldMessages: (conversationId: string) => void;
   /** Remove a queued message by id (the strip's per-row delete). */
   dequeueMessage: (queueId: string) => void;
   /**
@@ -1393,15 +1426,50 @@ function modelSelectionPending(state: ConversationState): boolean {
   );
 }
 
-/** Keep the draft local while native model startup or a model switch is pending. */
-function waitForModelSelection(conversationId: string, tempId: string): Promise<boolean> {
+// A native CLI can't take input until its sandbox is up, and a launch can take
+// minutes; the server holds a message for less than that.
+function nativeSandboxLaunching(state: ConversationState): boolean {
+  return (
+    state.isNativeTerminalSession &&
+    state.sandboxStatus !== null &&
+    state.sandboxStatus.stage !== "failed"
+  );
+}
+
+// Restores a draft held through a launch whose end never reaches this tab; well
+// past the time any launch is allowed to take.
+const SANDBOX_LAUNCH_MAX_WAIT_MS = 20 * 60_000;
+
+/** Whether a message sent now is held locally for startup rather than posted. */
+function wouldHoldSend(state: ConversationState): boolean {
+  return (
+    modelSelectionPending(state) ||
+    nativeSandboxLaunching(state) ||
+    (state.sessionModelSeeded && state.sessionHarness === null)
+  );
+}
+
+/**
+ * Keep the draft local while native model startup or a model switch is pending,
+ * or while a native session's sandbox launches.
+ */
+function waitForInitialDispatch(conversationId: string, tempId: string): Promise<boolean> {
   return new Promise((resolve, reject) => {
+    // One deadline at a time: the launch's while the sandbox starts, then the model's.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let deadline: "launch" | "model" | undefined;
     const finish = (ready: boolean, error?: Error) => {
       clearTimeout(timer);
       unsubscribe();
       unsubscribeDisposed();
       if (error) reject(error);
       else resolve(ready);
+    };
+    const expireAfter = (phase: "launch" | "model", ms: number, message: string) => {
+      if (deadline === phase) return;
+      clearTimeout(timer);
+      deadline = phase;
+      timer = setTimeout(() => finish(false, new Error(message)), ms);
     };
     const check = () => {
       const entry = conversationRegistry.peek(conversationId);
@@ -1417,8 +1485,29 @@ function waitForModelSelection(conversationId: string, tempId: string): Promise<
           false,
           state.conversationLoadError ?? new Error("Session failed before the message was sent."),
         );
-      } else if (!modelSelectionPending(state)) {
+      } else if (state.isNativeTerminalSession && state.sandboxStatus?.stage === "failed") {
+        const reason = state.sandboxStatus.error;
+        finish(
+          false,
+          new Error(
+            `The session's managed sandbox failed to launch${reason ? `: ${reason}` : "."}`,
+          ),
+        );
+      } else if (!modelSelectionPending(state) && !nativeSandboxLaunching(state)) {
         finish(true);
+      } else if (nativeSandboxLaunching(state)) {
+        // The model can only start once the sandbox is up.
+        expireAfter(
+          "launch",
+          SANDBOX_LAUNCH_MAX_WAIT_MS,
+          "The sandbox did not finish launching. Please retry the message.",
+        );
+      } else {
+        expireAfter(
+          "model",
+          SEND_CHAIN_MAX_WAIT_MS,
+          "The model did not finish starting. Please retry the message.",
+        );
       }
     };
     const unsubscribe = conversationRegistry.subscribe((id) => {
@@ -1427,11 +1516,6 @@ function waitForModelSelection(conversationId: string, tempId: string): Promise<
     const unsubscribeDisposed = conversationRegistry.subscribeDisposed((id) => {
       if (id === conversationId) finish(false);
     });
-    const timer = setTimeout(
-      () =>
-        finish(false, new Error("The model did not finish starting. Please retry the message.")),
-      SEND_CHAIN_MAX_WAIT_MS,
-    );
     check();
   });
 }
@@ -1859,6 +1943,53 @@ export function consumePendingInitialPrompt(conversationId: string): PendingInit
   return prompt;
 }
 
+const HARNESS_CATALOG_QUERY = {
+  queryKey: ["harness-labels"] as const,
+  queryFn: fetchHarnessCatalog,
+  staleTime: 30_000,
+};
+
+/**
+ * Resolve the SDK harness's declared family from the same catalog as the picker.
+ * Use cached data immediately and refresh stale entries in the background.
+ * Native harnesses keep their wrapper-label gate; no cache still awaits discovery.
+ */
+async function effortFamilyForSession(
+  session: { harness?: string | null } | null | undefined,
+): Promise<string | null> {
+  if (queryClient === null || !session?.harness) return null;
+  if (nativeCodingAgentForHarness(session.harness)) return null;
+  let catalog: HarnessCatalog | undefined;
+  try {
+    catalog = await queryClient.ensureQueryData({
+      ...HARNESS_CATALOG_QUERY,
+      revalidateIfStale: true,
+    });
+  } catch {
+    catalog = queryClient.getQueryData<HarnessCatalog>(HARNESS_CATALOG_QUERY.queryKey);
+  }
+  return catalog?.effortFamilies[session.harness] ?? null;
+}
+
+/**
+ * Synchronous variant for the hydration path: the declared family from the
+ * catalog already in cache, or ``undefined`` when no catalog has loaded yet.
+ * Never awaits — the transcript must not wait on ``/v1/harnesses``. When the
+ * catalog is absent it is prefetched in the background for the next lookup.
+ */
+function cachedEffortFamilyForSession(
+  session: { harness?: string | null } | null | undefined,
+): string | null | undefined {
+  if (queryClient === null || !session?.harness) return null;
+  if (nativeCodingAgentForHarness(session.harness)) return null;
+  const catalog = queryClient.getQueryData<HarnessCatalog>(HARNESS_CATALOG_QUERY.queryKey);
+  if (catalog === undefined) {
+    void queryClient.prefetchQuery(HARNESS_CATALOG_QUERY);
+    return undefined;
+  }
+  return catalog.effortFamilies[session.harness] ?? null;
+}
+
 export const useChatStore = create<ChatState>((_rootSet, get) => ({
   conversationId: null,
   redirectToConversationId: null,
@@ -1964,6 +2095,21 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }));
   },
 
+  releaseHostHeldMessages: (conversationId) => {
+    setActive((s) => {
+      if (!s.queuedMessages.some((m) => m.conversationId === conversationId && m.waitingForHost)) {
+        return {};
+      }
+      return {
+        queuedMessages: s.queuedMessages.map((m) =>
+          m.conversationId === conversationId && m.waitingForHost
+            ? { ...m, waitingForHost: false }
+            : m,
+        ),
+      };
+    });
+  },
+
   reorderQueuedMessage: (queueId, beforeQueueId) => {
     setActive((s) => {
       const moved = s.queuedMessages.find((m) => m.queueId === queueId);
@@ -1999,6 +2145,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const agentId = target?.agentId ?? s.boundAgentId;
     if (target === undefined || agentId === null) return;
     if (target.command === "compact" && rejectBusyCompact(target.conversationId)) return;
+    // Nothing can be steered past a first message still held for startup; it stays queued.
+    const targetState = setterForState(target.conversationId);
+    if (targetState !== null && holdsInitialDraft(targetState)) return;
     // Remove BEFORE the POST so a concurrent flush can't also send it.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId) });
     void s.send(target.text, agentId, target.files, queuedSendOptions(target));
@@ -2008,6 +2157,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const s = get();
     const own = s.queuedMessages.filter((m) => m.conversationId === conversationId);
     if (own.length === 0) return;
+    const state = setterForState(conversationId);
+    if (state !== null && holdsInitialDraft(state)) return;
+    // When the first one will be held for startup, the rest stay queued behind it.
+    if (state !== null && wouldHoldSend(state)) {
+      s.steerMessage(own[0]!.queueId);
+      return;
+    }
     // SDK buffers compact; Pi interrupts and Codex requires idle.
     // Drain their prefix first so compaction cannot interrupt those messages.
     const compactIndex =
@@ -2048,7 +2204,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // sub-agents) outlives it, so the server accepts a new turn immediately —
     // mirror `shouldQueueSend`. Only the local send lifecycle (`streaming`) and
     // an actively `running` turn gate the flush. No agent → nothing to send to.
-    if (s.conversationId === null || s.boundAgentId === null || s.sessionStatus === "running") {
+    if (
+      s.conversationId === null ||
+      s.boundAgentId === null ||
+      s.sessionStatus === "running" ||
+      holdsInitialDraft(s)
+    ) {
       return;
     }
     if (s.status === "streaming") {
@@ -2073,7 +2234,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // so an undrained message from another conversation can sit at index 0; a
     // head-only guard would let it block this conversation's messages forever.
     const head = s.queuedMessages.find((m) => m.conversationId === s.conversationId);
-    if (head === undefined || head.requiresRetry) return;
+    if (head === undefined || head.requiresRetry || head.waitingForHost) return;
     // Remove it BEFORE the POST so a re-entrant flush can't double-send.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
     void s.send(head.text, head.agentId ?? s.boundAgentId, head.files, queuedSendOptions(head));
@@ -2115,6 +2276,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (statusById.get(conversationId) !== "idle") continue;
       // The sidebar can still say idle while a compact control starts.
       const local = setterForState(conversationId);
+      if (local !== null && holdsInitialDraft(local)) continue;
       if (
         local?.sessionHarness === "codex-native" ||
         local?.sessionHarness === "claude-sdk" ||
@@ -2135,7 +2297,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const cooldownUntil = backgroundFlushCooldownUntil.get(conversationId);
       if (cooldownUntil !== undefined && cooldownUntil > now) continue;
       const head = get().queuedMessages.find((m) => m.conversationId === conversationId);
-      if (head === undefined || head.requiresRetry) continue;
+      if (head === undefined || head.requiresRetry || head.waitingForHost) continue;
       const compactAgentId = head.agentId ?? local?.boundAgentId;
       if (head.command === "compact" && !compactAgentId) continue;
 
@@ -2304,9 +2466,6 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // their `/side` text never reaches `send`.
     const opensSideChat =
       usesNativeSideChatFork(get().sessionHarness) && isSideChatCommand(text.trim());
-    if (opensSideChat) {
-      useChatStore.setState({ awaitingSideChatFor: pinnedId ?? get().conversationId });
-    }
     const targetState = pinnedId === null ? get() : setterForState(pinnedId);
     const compacts =
       opts?.command === "compact" || isCompactControl(targetState?.sessionHarness, text, files);
@@ -2314,17 +2473,54 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       opts?.onError?.("Compact is disabled while a chat is in progress");
       return;
     }
+    // Nothing may overtake a first message still held for startup: queue behind it.
+    if (
+      !compacts &&
+      !opts?.reusePendingTempId &&
+      targetState !== null &&
+      holdsInitialDraft(targetState)
+    ) {
+      const target = pinnedId ?? get().conversationId;
+      if (opts?.onError !== undefined) {
+        // Callers with their own failure handling take the message back, e.g. the queue.
+        opts.onError("This session is still starting. Try again once it has started.");
+      } else if (target !== null) {
+        // Queue it behind the held message, in the session it was meant for.
+        queueSeq += 1;
+        const queuedFor = target === get().conversationId ? get() : setterForState(target);
+        const queuedAgentId = queuedFor?.boundAgentId ?? agentId;
+        setActive((s) => ({
+          queuedMessages: [
+            ...s.queuedMessages,
+            {
+              queueId: `q_${queueSeq}`,
+              text,
+              stableId,
+              conversationId: target,
+              agentId: queuedAgentId,
+              ...(files && files.length > 0 ? { files } : {}),
+              ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+            },
+          ],
+        }));
+      }
+      return;
+    }
+    if (opensSideChat) {
+      useChatStore.setState({ awaitingSideChatFor: pinnedId ?? get().conversationId });
+    }
     const skipPendingBubble = opensSideChat || compacts;
     const initialDraft =
       opts?.reusePendingTempId != null
         ? targetState?.pendingUserMessages.find((p) => p.tempId === opts.reusePendingTempId)
             ?.initialDraft
-        : !skipPendingBubble &&
-            targetState &&
-            (modelSelectionPending(targetState) ||
-              (targetState.sessionModelSeeded && targetState.sessionHarness === null))
+        : !skipPendingBubble && targetState && wouldHoldSend(targetState)
           ? { text, files: files ?? [] }
           : undefined;
+    // Non-native sends persist at POST time, so only a native session leaves
+    // the bubble pending until the agent actually reads it.
+    const sentMidTurn =
+      targetState?.isNativeTerminalSession === true && targetState.sessionStatus === "running";
     const alreadyStreaming =
       opts?.reusePendingTempId != null
         ? false
@@ -2383,6 +2579,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                 ...(initialDraft ? { initialDraft } : {}),
                 createdAtS: Math.floor(Date.now() / 1000),
                 ...(selfAuthor !== null ? { author: selfAuthor } : {}),
+                ...(sentMidTurn ? { sentMidTurn } : {}),
               },
             ],
         // A new turn does NOT supersede the background-shell tally: shells
@@ -2401,6 +2598,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // target afterward would leak the message into the now-active session.
     // An explicit pin (navigate-first background POST) wins over the visible id.
     const submitConversationId = pinnedId ?? get().conversationId;
+    // Only the composer on screen takes back a send cut off by a reload (see
+    // `unsentSendToRestore`); a side chat posts to its child beside the parent.
+    const sentOnScreen = pinnedId === null || pinnedId === get().conversationId;
 
     // Take our place in THIS conversation's send chain: wait for its prior
     // send's network work, then hand off to the next via `releaseSend` in the
@@ -2428,7 +2628,20 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // otherwise resolve that id, find an empty chain, and overtake this POST.
       const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
       postedSessionId = sessionId;
-      if (initialDraft && !(await waitForModelSelection(sessionId, tempId))) return;
+      // Until this send settles, the server may hold the message without persisting
+      // it, so keep its text where a reload can find it (see `unsentSendToRestore`).
+      // Only once identity names the sender: unlike `getCurrentAuthorId`, this id
+      // tells the single-user `local` viewer apart from one not yet resolved.
+      const senderId = getCurrentUserId();
+      if (!compacts && sentOnScreen && senderId !== null && text.trim()) {
+        rememberUnsentSend(sessionId, {
+          stableId,
+          text,
+          authorId: senderId,
+          ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+        });
+      }
+      if (initialDraft && !(await waitForInitialDispatch(sessionId, tempId))) return;
 
       if (compacts) {
         // Compact controls emit turn status edges, but no user
@@ -2478,14 +2691,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }));
         initialDispatched = true;
       }
-      const postResult = await postEvent(sessionId, {
-        type: "message",
-        data: {
-          role: "user",
-          content: serverContent,
-          stable_id: stableId,
+      const postResult = await postEvent(
+        sessionId,
+        {
+          type: "message",
+          data: {
+            role: "user",
+            content: serverContent,
+            stable_id: stableId,
+          },
         },
-      });
+        { holdWhenHostOffline: true },
+      );
       // Policy denied the input — the server returned immediately
       // without starting a turn or persisting the user message, so
       // no session.input.consumed will reconcile this exact optimistic
@@ -2556,8 +2773,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // suppresses the default surfacing below — no restored draft, no error
       // block in the parent transcript. The bubble rollback + status settle still
       // run so the parent isn't left mid-send.
-      const callerHandlesError = opts?.onError !== undefined;
-      opts?.onError?.(message);
+      // The host is offline and the server recorded nothing: queue the message
+      // ahead of this conversation's others and send it once the host is back.
+      const holdTarget = postedSessionId ?? submitConversationId;
+      const heldForHost =
+        err instanceof ApiError && err.code === HOST_OFFLINE_CODE && holdTarget !== null;
+      if (heldForHost) {
+        holdSendForHost(holdTarget, message, {
+          text,
+          stableId,
+          ...(agentId ? { agentId } : {}),
+          ...(files && files.length > 0 ? { files } : {}),
+          ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+        });
+      }
+      const callerHandlesError = heldForHost || opts?.onError !== undefined;
+      if (!heldForHost) opts?.onError?.(message);
       // Hand the failed message back to the composer so the user can retry it —
       // a failed send has no server-side record, so nothing else would restore
       // it. Keyed by the session it was meant for, so it lands in the right
@@ -2565,6 +2796,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // (`failedSendDraft` is conversation-scoped); the composer reads whichever
       // conversation is active and guards on the id before restoring.
       const draftSessionId = postedSessionId ?? submitConversationId;
+      // A first message that never left the browser goes back to the composer;
+      // what was queued behind it waits for an explicit retry rather than going first.
+      if (initialDraft && !initialDispatched && draftSessionId !== null) {
+        suspendQueuedMessages(draftSessionId);
+      }
       // A coded error confirms refusal; a transport failure leaves delivery
       // unknown unless this retries a previously refused send.
       const answeredWithRefusal = err instanceof ApiError && err.code !== null;
@@ -2660,6 +2896,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
     } finally {
       inFlightSends.delete(stableId);
+      if (postedSessionId !== null) forgetUnsentSend(postedSessionId, stableId);
       // Release the next queued send regardless of success/failure so one
       // failed POST can't stall the chain forever.
       releaseSend();
@@ -2803,6 +3040,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         sendLatchedAt: null,
         failedSendDraft: { ...draft, conversationId: sessionId },
       });
+      // What was queued behind it must not go first; it waits for an explicit retry.
+      suspendQueuedMessages(sessionId);
       // A local follow-up must not prevent Interrupt from stopping earlier work.
       if (
         state.activeResponse?.state !== "streaming" &&
@@ -3111,7 +3350,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         });
         // Harness has no effort control: undo the optimistic session-scoped write
         // so this conversation doesn't claim an effort the server will never hold.
-        if (!supportsEffortControl(session)) {
+        // SDK harnesses carry no wrapper label, so resolve their declared effort
+        // family to recognize that they do take a ``reasoning_effort`` override.
+        if (!supportsEffortControl(session, await effortFamilyForSession(session))) {
           setterFor(conversationId)({ sessionReasoningEffort: null });
           return;
         }
@@ -3424,6 +3665,39 @@ function rejectBusyCompact(conversationId: string | null): boolean {
   if (state?.status !== "streaming" && state?.sessionStatus !== "running") return false;
   toast.error("Compact is disabled while a chat is in progress", { richColors: true });
   return true;
+}
+
+/**
+ * Queue a send the server refused because the session's host is offline. It
+ * waits ahead of the conversation's other queued messages until
+ * `releaseHostHeldMessages` runs, then flushes like any queued message.
+ */
+function holdSendForHost(
+  conversationId: string,
+  notice: string,
+  message: Omit<QueuedMessage, "queueId" | "conversationId">,
+): void {
+  queueSeq += 1;
+  const held: QueuedMessage = {
+    ...message,
+    queueId: `q_${queueSeq}`,
+    conversationId,
+    waitingForHost: true,
+  };
+  setActive((s) => {
+    const at = s.queuedMessages.findIndex(
+      (m) => m.conversationId === conversationId && !m.waitingForHost,
+    );
+    const index = at === -1 ? s.queuedMessages.length : at;
+    return {
+      queuedMessages: [...s.queuedMessages.slice(0, index), held, ...s.queuedMessages.slice(index)],
+    };
+  });
+  setterFor(conversationId)((s) => {
+    const last = s.blocks[s.blocks.length - 1];
+    if (last?.type === "error" && last.code === HOST_OFFLINE_CODE) return {};
+    return { blocks: [...s.blocks, makeClientErrorBlock(notice, HOST_OFFLINE_CODE)] };
+  });
 }
 
 function queuedSendOptions(
@@ -4345,7 +4619,13 @@ async function bindStream(
     const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
     snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
 
-    const canApplyEffort = supportsEffortControl(session);
+    // The session row's reasoning_effort is the server's truth; the harness
+    // catalog only gates whether a control is shown. Read the family from cache
+    // so hydration never waits on /v1/harnesses, and keep the server's value
+    // when no catalog has loaded yet rather than blanking a real setting.
+    const cachedFamily = cachedEffortFamilyForSession(session);
+    const canApplyEffort =
+      cachedFamily === undefined ? true : supportsEffortControl(session, cachedFamily);
     const effectiveEffort = canApplyEffort ? (session.reasoningEffort ?? null) : null;
 
     const snapshotBlocks = itemsToBlocks(items);
@@ -4354,6 +4634,7 @@ async function bindStream(
     // before this chat was opened wouldn't render otherwise.
     const pendingElicitationBlocks = pendingElicitationBlocksFromSnapshot(session);
     const oldestItemId = items[0]?.id ?? null;
+    const unsentDraft = hydratePending ? unsentSendToRestore(id, items) : null;
     set((state) => {
       const currentBlocks = withoutNativePreviews(state.blocks, snapshotNativeMessageIds);
       const bindingPatch = sessionBindingPatch(session, state, launchBeforeFetch);
@@ -4484,6 +4765,9 @@ async function bindStream(
         ...effectiveBindingPatch,
         blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
         pendingUserMessages: snapshotPending,
+        ...(unsentDraft !== null && state.failedSendDraft === null
+          ? { failedSendDraft: unsentDraft }
+          : {}),
         loadingConversation: false,
         hasMoreHistory: page.hasMore,
         oldestItemId,
@@ -4725,6 +5009,21 @@ function dropEphemeralInFlightBlocks(
 const RECONNECT_BACKFILL_MAX_PAGES = 4;
 
 /**
+ * Launch stages are not replayed, so a launch last seen in flight takes a snapshot's
+ * stage; one that settled unseen starts the runner grace a live `ready` would.
+ */
+function launchSnapshotPatch(
+  session: Session,
+  state: Pick<ConversationState, "sandboxStatus">,
+): Partial<Pick<ConversationState, "sandboxStatus" | "runnerLaunchedAt">> {
+  if (state.sandboxStatus === null || state.sandboxStatus.stage === "failed") return {};
+  const sandboxStatus = session.sandboxStatus ?? null;
+  return sandboxStatus === null
+    ? { sandboxStatus, runnerLaunchedAt: Date.now() }
+    : { sandboxStatus };
+}
+
+/**
  * Session-snapshot state every reconnect path recovers: `sessionStatus`,
  * token/context/cost counters, the MCP startup band, and — when the turn
  * ended during the gap —
@@ -4747,6 +5046,7 @@ function reconnectStatusPatch(
   const patch: Partial<ChatState> = {
     sessionStatus: session.status,
     ...mcpStartupSnapshotPatch(session, s, launchBeforeFetch),
+    ...launchSnapshotPatch(session, s),
   };
   // Recover the background-shell tally across the gap too, so the spinner
   // returns to "N background tasks still running" rather than vanishing on reconnect.
@@ -4803,6 +5103,22 @@ function reconnectStatusPatch(
     patch.status = "streaming";
   }
   return patch;
+}
+
+/**
+ * Re-read only a launch's stage, on screen or not. Live events that leave the launch
+ * alone can't void the read; a launch update that lands during it wins instead.
+ */
+async function reconcileLaunchStatus(id: string, set: Setter, get: Getter): Promise<void> {
+  const before = get().sandboxStatus;
+  let session: Session;
+  try {
+    session = await getSessionSlim(id);
+  } catch {
+    return;
+  }
+  if (isConversationDisposed(id)) return;
+  set((s) => (s.sandboxStatus === before ? launchSnapshotPatch(session, s) : {}));
 }
 
 /**
@@ -5435,6 +5751,20 @@ export async function startStreamPump(
     for (const timer of catchupTimers) window.clearTimeout(timer);
     catchupTimers = [];
   };
+  // Re-read at each catch-up delay, replacing any prior burst: the full status if asked
+  // (on screen only) and, while a launch shows, its stage on screen or not.
+  const scheduleStatusCatchup = (withStatus: boolean): void => {
+    if (typeof window === "undefined") return;
+    clearCatchupTimers();
+    catchupTimers = RECONNECT_STATUS_CATCHUP_DELAYS_MS.map((delayMs) =>
+      window.setTimeout(() => {
+        if (controller.signal.aborted || isConversationDisposed(id)) return;
+        if (withStatus) runGuardedStatusReconcile();
+        const launch = get().sandboxStatus;
+        if (launch !== null && launch.stage !== "failed") void reconcileLaunchStatus(id, set, get);
+      }, delayMs),
+    );
+  };
   // Consecutive 404s only — reset on any non-404 outcome (success or a
   // different-status failure), so a 404 has to persist across attempts to
   // count toward the cap below.
@@ -5637,17 +5967,11 @@ export async function startStreamPump(
           // settles shortly after reconnect clears in seconds. Guarded +
           // idempotent, and scoped to the active conversation by
           // reconcileActiveSessionStatus itself.
-          if (typeof window !== "undefined") {
-            // Cancel any prior burst so recurring reconnects don't accumulate
-            // timers on the long-lived controller.
-            clearCatchupTimers();
-            catchupTimers = RECONNECT_STATUS_CATCHUP_DELAYS_MS.map((delayMs) =>
-              window.setTimeout(() => {
-                if (controller.signal.aborted || isConversationDisposed(id)) return;
-                runGuardedStatusReconcile();
-              }, delayMs),
-            );
-          }
+          scheduleStatusCatchup(true);
+        } else {
+          // A launch's `ready` sent before this first open subscribed is in no snapshot
+          // read yet, so re-read its stage over the next ~20 s while it still shows.
+          scheduleStatusCatchup(false);
         }
         let reason = await pumpPromise;
 
@@ -6737,6 +7061,73 @@ async function sendVerdictFromServer(
 }
 
 /**
+ * The send a previous page of this tab left unanswered, as a failed-send draft.
+ *
+ * `send` records each message's text before its POST and drops it once the
+ * POST settles. A record found on a cold bind therefore comes from a page that
+ * reloaded or closed mid-send, e.g. while the server held the POST for a
+ * sandbox wake, which persists nothing until the wake ends. Only the sender
+ * gets the text back, and only if the snapshot holds no item under its stable
+ * id. Matching text is no proof: `pending_inputs` entries and native mirrors
+ * carry no stable id, and another message can say the same thing.
+ *
+ * @param conversationId - The session being bound.
+ * @param items - The snapshot's committed items.
+ * @returns The draft to restore, or `null`.
+ */
+function unsentSendToRestore(
+  conversationId: string,
+  items: readonly { id: string }[],
+): ConversationState["failedSendDraft"] {
+  const unsent = peekUnsentSend(conversationId);
+  // A send still open in this tab settles on its own.
+  if (unsent === null || inFlightSends.has(unsent.stableId)) return null;
+  const viewerId = getCurrentUserId();
+  // The viewer can't be checked before identity resolves; try again once it does.
+  if (viewerId === null) {
+    restoreUnsentSendOnceIdentified(conversationId, items);
+    return null;
+  }
+  forgetUnsentSend(conversationId, unsent.stableId);
+  // Another account has signed in to this tab since.
+  if (unsent.authorId !== viewerId) return null;
+  if (items.some((item) => item.id === unsent.stableId)) return null;
+  return {
+    conversationId,
+    text: unsent.text,
+    files: [],
+    stableId: unsent.stableId,
+    ...(unsent.replyDraft ? { replyDraft: unsent.replyDraft } : {}),
+    serverRefused: false,
+  };
+}
+
+/**
+ * Finish a restore `unsentSendToRestore` put off until `/v1/me` names the viewer.
+ * The bind has already painted, so the draft goes straight onto the session's
+ * entry. Subscribing keeps a failed probe retrying.
+ *
+ * @param conversationId - The session whose bind put the restore off.
+ * @param items - That bind's snapshot items.
+ */
+function restoreUnsentSendOnceIdentified(
+  conversationId: string,
+  items: readonly { id: string }[],
+): void {
+  const unsubscribe = subscribeIdentity(() => {
+    if (getCurrentUserId() === null) return;
+    unsubscribe();
+    // An evicted session keeps the record for its next bind.
+    if (isConversationDisposed(conversationId)) return;
+    const draft = unsentSendToRestore(conversationId, items);
+    if (draft === null) return;
+    setterFor(conversationId)((state) =>
+      state.failedSendDraft === null ? { failedSendDraft: draft } : {},
+    );
+  });
+}
+
+/**
  * Reconcile a failed-send draft against a reconnect snapshot.
  *
  * A snapshot item under the draft's stable id proves delivery (see
@@ -7120,13 +7511,32 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       }));
       return;
     case "session_sandbox_status":
-      // Advance the managed-sandbox provisioning indicator. `ready`
-      // clears it — from then on the session looks like any
-      // host-bound session; `failed` retains the reason so the page
-      // explains why the sandbox never came up.
-      applyToConversation({
-        sandboxStatus: event.stage === "ready" ? null : { stage: event.stage, error: event.error },
-      });
+      // `ready` clears the launch indicator and starts the launch grace (the runner is
+      // up, its terminal not yet); `failed` keeps the reason so the page can explain
+      // why the sandbox never came up.
+      applyToConversation(
+        event.stage === "ready"
+          ? { sandboxStatus: null, runnerLaunchedAt: Date.now() }
+          : { sandboxStatus: { stage: event.stage, error: event.error, provider: event.provider } },
+      );
+      // The sandbox host is bound before its runner starts; refetch the binding and a
+      // host list cached before that host registered, so the composer can name it.
+      if (event.stage === "connecting" || event.stage === "ready") {
+        void queryClient?.invalidateQueries({
+          queryKey: ["session", event.conversationId],
+          exact: true,
+        });
+        void queryClient?.invalidateQueries({ queryKey: ["hosts"] });
+        // Cancel pre-binding requests too: invalidation alone reuses an initial fetch.
+        void queryClient?.cancelQueries({
+          queryKey: ["session-agent", event.conversationId],
+          exact: true,
+        });
+        void queryClient?.invalidateQueries({
+          queryKey: ["session-agent", event.conversationId],
+          exact: true,
+        });
+      }
       return;
     case "session_mcp_startup": {
       // Mirror the harness's per-MCP-server startup map while the round

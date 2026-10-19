@@ -39,13 +39,25 @@ jobs:
     outputs:
       ui: ${{ steps.changes.outputs.ui }}
     steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - id: scope
+        uses: ./.github/actions/dependency-ci-scope
       - id: changes
         env:
+          DEPENDENCY: ${{ steps.scope.outputs.dependency }}
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
           PR_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
           REPO: ${{ github.repository }}
         run: |
+          if [ "$DEPENDENCY" = true ]; then
+            echo "ui=false" >> "$GITHUB_OUTPUT"
+            echo "Dependency-only PR: performance benchmarking remains on scheduled runs."
+            exit 0
+          fi
           # The files API truncates successful responses at 3,000 entries.
           if [ -z "${PR:-}" ] || [ "${PR_CHANGED_FILES:-0}" -ge 3000 ]; then
             echo "ui=true" >> "$GITHUB_OUTPUT"
@@ -97,7 +109,7 @@ jobs:
         uses: ./.github/actions/setup-pnpm
 
       - name: Cache Playwright browsers
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ms-playwright
           key: ${{ runner.os }}-playwright-${{ hashFiles('uv.lock') }}

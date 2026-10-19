@@ -630,7 +630,7 @@ purge_desktop_data() {
 }
 
 report_shared_deps() {
-  for dep in uv node npm tmux bwrap; do
+  for dep in uv node npm tmux bwrap databricks; do
     dep_path="$(command -v "$dep" 2>/dev/null || true)"
     if [ -n "$dep_path" ]; then
       record_action shared_dep "$dep" report reported "" "present at $dep_path; not removed"

@@ -2188,6 +2188,12 @@ html[data-electron-mac] .breadcrumb-folder {
   border-top: 1px solid var(--border);
   margin: 1.5em 0;
 }
+/* Soft line breaks (TipTapSoftBreak.ts) hold a hard-wrapped paragraph's source
+   newlines; their collapsible space reads as a word gap instead of the line
+   break ProseMirror's break-spaces would draw. */
+.tiptap-md-content .ProseMirror .md-soft-break {
+  white-space: normal;
+}
 /* Raw-HTML passthrough blocks (TipTapHtmlPassthrough.ts). Hidden blocks
    (comments, bare wrapper tags) keep the bytes without visual presence;
    summary blocks render as a dim disclosure line. */

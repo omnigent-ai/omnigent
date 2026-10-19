@@ -125,6 +125,7 @@ async def test_spec_resolution_error_has_a_valid_queued_failure(eager: bool) -> 
         "code": "RuntimeError",
         "message": "Failed to resolve the agent spec for this turn.",
         "type": "RuntimeError",
+        **({"undelivered": True} if eager else {}),
     }
 
 

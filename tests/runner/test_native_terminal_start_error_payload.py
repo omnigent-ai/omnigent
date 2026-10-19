@@ -4,7 +4,7 @@ The runner builds every native-terminal-start failure payload through
 ``_native_terminal_start_error_payload``. A deleted/rebound session agent is a
 session-lifecycle condition, not a terminal-startup defect: it must surface a
 distinct ``session_agent_missing`` code with a client-safe remedy message,
-while any other cause keeps the generic ``native_terminal_start_failed``
+while unclassified causes keep the generic ``native_terminal_start_failed``
 startup-defect code. These are fast, layer-local guards for that split.
 """
 
@@ -21,7 +21,8 @@ import pytest
 
 from omnigent.debug_logging import record_to_row
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.inner.terminal import TerminalInstance
+from omnigent.harnesses.codex_native.launch_args import CodexTransportArgsError
+from omnigent.inner.terminal import TerminalInstance, TmuxUnavailableError
 from omnigent.runner.native import orchestration
 from omnigent.runner.native.orchestration import (
     _NATIVE_TERMINAL_START_FAILED_CODE,
@@ -102,6 +103,8 @@ def test_other_causes_keep_generic_startup_failure_code(cause: Exception) -> Non
             OmnigentError("workspace gone", code=ErrorCode.WORKSPACE_MISSING),
             "user",
         ),
+        (TmuxUnavailableError("tmux is not installed or not on PATH."), "config"),
+        (CodexTransportArgsError("app-server"), "config"),
     ],
 )
 def test_start_failure_log_row_is_blocking_with_derived_category(
@@ -269,6 +272,35 @@ def test_outdated_pi_cli_surfaces_its_actionable_message() -> None:
     assert _ERROR_ID_RE.search(payload["message"]) is not None
 
 
+@pytest.mark.parametrize(
+    ("exc", "runtime_name"),
+    [
+        (
+            TmuxUnavailableError(
+                "tmux 3.2 is too old; managed terminals require tmux 3.3 or newer"
+            ),
+            "Claude",
+        ),
+        (CodexTransportArgsError("app-server"), "Codex"),
+    ],
+)
+def test_host_setup_error_surfaces_its_remedy(
+    exc: Exception, runtime_name: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A known setup error shows how to fix it in the session."""
+    payload = _native_terminal_start_error_payload(exc, runtime_name, session_id="conv_1")
+
+    assert payload["code"] == ErrorCode.HARNESS_NOT_CONFIGURED
+    assert str(exc) in payload["message"]
+    assert "see the runner log" not in payload["message"]
+    assert _ERROR_ID_RE.search(payload["message"]) is not None
+
+    response = _native_terminal_start_error_response(exc, runtime_name, session_id="conv_1")
+    assert response.status_code == 412
+    assert json.loads(response.body)["error"]["code"] == ErrorCode.HARNESS_NOT_CONFIGURED
+    assert not any(record.exc_info for record in caplog.records)
+
+
 def test_claude_early_exit_surfaces_classified_diagnosis(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -389,11 +421,19 @@ def test_startup_failure_diagnostics_belong_to_failing_child(
         exc = RuntimeError(private_detail)
         exc.__cause__ = httpx.ReadTimeout("private upstream URL")
 
+    events: list[dict[str, object]] = []
     with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
         payload = _publish_native_terminal_start_error(
-            lambda _session_id, _event: None, "child-session", "Codex", exc
+            lambda _session_id, event: events.append(event), "child-session", "Codex", exc
         )
 
+    assert len(events) == 1
+    context = events[0]["failure_context"]
+    assert isinstance(context, dict)
+    assert context["failure_id"] == payload["error_id"]
+    assert context["failure_source"] == "native_terminal_start"
+    assert context["exception_type"] == type(exc).__name__
+    assert private_detail not in str(context)
     record = next(r for r in caplog.records if payload["error_id"] in r.getMessage())
     row = record_to_row(record, source="runner")
     assert row["session_id"] == "child-session"

@@ -18,11 +18,15 @@ session (multipart ``POST /v1/sessions``) also creates one.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+from collections.abc import Callable, Coroutine
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import UploadFile
 from starlette.types import Message
@@ -31,17 +35,23 @@ from omnigent.db.utils import builtin_agent_id, installed_agent_id
 from omnigent.entities import Agent
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime.agent_cache import AgentCache
+from omnigent.server.agent_config import agent_config_object, edit_agent_bundle
 from omnigent.server.auth import AuthProvider, local_single_user_enabled
 from omnigent.server.bundles import content_bundle_location, validate_agent_bundle
 from omnigent.server.routes._auth_helpers import require_user as _require_user
+from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.schemas import (
+    AgentConfigObject,
+    AgentConfigPatch,
     AgentDetailObject,
     AgentObject,
+    ErrorResponse,
     MCPServerSummary,
     PaginatedList,
     SkillSummary,
 )
+from omnigent.spec import AgentSpec
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 
@@ -147,13 +157,14 @@ def _too_large() -> HTTPException:
     )
 
 
-def _body_capped(request: Request) -> Request:
+def _body_capped(request: Request, limit: int | None = None) -> Request:
     """Wrap *request* so reading more than the install cap raises 413 mid-stream.
 
     Multipart parsing spools file parts to disk, so a size check after
     ``form()`` would come too late for a huge (or chunked) upload.
     """
-    limit = MAX_INSTALL_BUNDLE_BYTES + _MULTIPART_OVERHEAD_BYTES
+    if limit is None:
+        limit = MAX_INSTALL_BUNDLE_BYTES + _MULTIPART_OVERHEAD_BYTES
     received = 0
 
     async def receive() -> Message:
@@ -166,6 +177,61 @@ def _body_capped(request: Request) -> Request:
         return message
 
     return Request(request.scope, receive)
+
+
+class _AgentRoute(APIRoute):
+    """Bound PATCH bodies before parsing and omit credentials from validation errors."""
+
+    def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+        handler = super().get_route_handler()
+        patch = "PATCH" in self.methods
+        if not patch and not self.path.endswith("/{agent_id}/config"):
+            return handler
+
+        async def patch_handler(request: Request) -> Response:
+            try:
+                if patch:
+                    require_json_content_type(request)
+                    request = _body_capped(request, MAX_INSTALL_BUNDLE_BYTES)
+                return await handler(request)
+            except RequestValidationError:
+                return _config_error(422, "invalid_input", "Invalid agent configuration patch")
+            except HTTPException as exc:
+                if exc.status_code == 413:
+                    return _config_error(
+                        413,
+                        "payload_too_large",
+                        "Agent configuration or request exceeds the size limit",
+                    )
+                if exc.status_code == 415:
+                    return _config_error(415, "invalid_input", "A JSON request body is required")
+                if isinstance(exc.detail, dict) and {"code", "message"} <= exc.detail.keys():
+                    return _config_error(
+                        exc.status_code, exc.detail["code"], exc.detail["message"]
+                    )
+                raise
+
+        return patch_handler
+
+
+def _config_error(status: int, code: str, message: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status,
+        content={"error": {"code": code, "message": message}},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+def _config_etag(agent: Agent) -> str:
+    # ponytail: identical same-second reinstalls share a tag; add a generation column if needed.
+    revision = f"{agent.id}:{agent.created_at}:{agent.version}:{agent.bundle_location}"
+    return '"' + hashlib.sha256(revision.encode()).hexdigest() + '"'
+
+
+def _config_headers(response: Response, agent: Agent) -> None:
+    response.headers["ETag"] = _config_etag(agent)
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Access-Control-Expose-Headers"] = "ETag"
 
 
 def install_user_agent(
@@ -220,7 +286,10 @@ def install_user_agent(
             artifact_store.put(location, bundle_bytes)
         return existing
     artifact_store.put(location, bundle_bytes)
-    updated = agent_store.update(agent_id, location)
+    if agent_store.supports_config_edit:
+        updated = agent_store.update(agent_id, location, description=None)
+    else:
+        updated = agent_store.update(agent_id, location)
     agent_cache.evict(agent_id)
     if updated is None:  # removed concurrently
         raise OmnigentError(f"Agent not found: {agent_id!r}", code=ErrorCode.NOT_FOUND)
@@ -251,11 +320,122 @@ def create_builtin_agents_router(
         must be authenticated.
     :returns: A FastAPI router exposing the list, detail, install, and remove routes.
     """
-    router = APIRouter()
+    router = APIRouter(route_class=_AgentRoute)
 
     def require_user_agents() -> None:
         if not agent_store.supports_user_agents:
             raise HTTPException(status_code=404, detail="user agents are not supported")
+
+    async def editable_agent(request: Request, agent_id: str) -> Agent:
+        user_id = _require_user(request, auth_provider)
+        require_user_agents()
+        agent = await asyncio.to_thread(agent_store.get, agent_id)
+        if agent is None or agent.kind != "user" or agent.created_by != user_id:
+            raise OmnigentError(f"Agent not found: {agent_id!r}", code=ErrorCode.NOT_FOUND)
+        if artifact_store is None or not agent_store.supports_config_edit:
+            raise HTTPException(status_code=501, detail="Agent configuration editing unavailable")
+        return agent
+
+    def configuration(
+        agent: Agent, patch: AgentConfigPatch | None = None
+    ) -> tuple[bytes, AgentSpec, str]:
+        assert artifact_store is not None
+        try:
+            bundle = artifact_store.get(agent.bundle_location)
+        except KeyError:
+            raise OmnigentError("Agent bundle not found", code=ErrorCode.INTERNAL_ERROR) from None
+        if len(bundle) > MAX_INSTALL_BUNDLE_BYTES:
+            raise _too_large()
+        if (
+            patch is not None
+            and "description" in patch.model_fields_set
+            and (agent.description is not None and patch.description == agent.description)
+        ):
+            # The stored description can override YAML on copied/uploaded agents.
+            patch = AgentConfigPatch.model_validate(
+                patch.model_dump(exclude_unset=True, exclude={"description"})
+            )
+        edited, spec = edit_agent_bundle(bundle, patch)
+        location = (
+            agent.bundle_location
+            if edited == bundle
+            else content_bundle_location(agent.id, edited)
+        )
+        return edited, spec, location
+
+    @router.get(
+        "/agents/{agent_id}/config",
+        responses={
+            200: {"headers": {"ETag": {"schema": {"type": "string"}}}},
+            409: {"model": ErrorResponse, "description": "Bundle format cannot be edited"},
+            413: {"model": ErrorResponse, "description": "Agent bundle exceeds the size limit"},
+        },
+    )
+    async def get_agent_config(
+        request: Request, agent_id: str, response: Response
+    ) -> AgentConfigObject:
+        """Read owned configuration and its ETag; credential values are never returned."""
+        agent = await editable_agent(request, agent_id)
+        _, spec, _ = await asyncio.to_thread(configuration, agent)
+        _config_headers(response, agent)
+        return agent_config_object(agent, spec)
+
+    @router.patch(
+        "/agents/{agent_id}",
+        response_model=AgentConfigObject,
+        responses={
+            200: {"headers": {"ETag": {"schema": {"type": "string"}}}},
+            400: {"model": ErrorResponse, "description": "Invalid If-Match header"},
+            409: {"model": ErrorResponse, "description": "Configuration cannot be edited"},
+            412: {"model": ErrorResponse, "description": "Agent changed; reload before saving"},
+            413: {
+                "model": ErrorResponse,
+                "description": "Request or bundle exceeds the size limit",
+            },
+            415: {"model": ErrorResponse, "description": "A JSON request body is required"},
+            422: {"model": ErrorResponse, "description": "Invalid partial configuration"},
+            428: {"model": ErrorResponse, "description": "If-Match is required"},
+        },
+    )
+    async def patch_agent_config(
+        request: Request,
+        agent_id: str,
+        body: AgentConfigPatch,
+        response: Response,
+        if_match: str | None = Header(default=None),
+    ) -> AgentConfigObject | JSONResponse:
+        """Patch only supplied fields; require the ETag from GET /agents/{id}/config."""
+        agent = await editable_agent(request, agent_id)
+        if if_match is None:
+            return _config_error(428, "precondition_required", "If-Match is required")
+        if len(request.headers.getlist("if-match")) != 1 or not (
+            len(if_match) == 66 and if_match.startswith('"') and if_match.endswith('"')
+        ):
+            return _config_error(400, "invalid_input", "Supply one strong configuration ETag")
+        if if_match != _config_etag(agent):
+            return _config_error(412, "precondition_failed", "Agent changed; reload before saving")
+        bundle, spec, location = await asyncio.to_thread(configuration, agent, body)
+        if len(bundle) > MAX_INSTALL_BUNDLE_BYTES:
+            raise _too_large()
+        assert artifact_store is not None
+        if location != agent.bundle_location:
+            await asyncio.to_thread(artifact_store.put, location, bundle)
+        description = agent.description
+        if (
+            "description" in body.model_fields_set
+            and body.description != agent.description
+            and not (location == agent.bundle_location and agent.description is None)
+        ):
+            description = spec.description
+        updated = await asyncio.to_thread(
+            agent_store.update_configuration, agent, location, description=description
+        )
+        if updated is None:
+            # A concurrent identical edit may reference this same content-addressed artifact.
+            return _config_error(412, "precondition_failed", "Agent changed; reload before saving")
+        agent_cache.evict(agent.id)
+        _config_headers(response, updated)
+        return agent_config_object(updated, spec)
 
     @router.get("/agents")
     async def list_builtin_agents(

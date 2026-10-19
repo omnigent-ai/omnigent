@@ -210,11 +210,14 @@ essential constraints, and completion contract. Detailed procedures live in
 | --- | --- |
 | Input, preflight, and existing-fix discovery | `resolve-inputs` (mode-specific resources) |
 | Inherited repro and behavioral baseline | `resolve-repro-audit` |
-| Final diff, consumers, focused checks, and evidence | `resolve-impact-assessment` |
+| Final diff, consumers, focused checks, and evidence | `otto-impact-assessment` |
 | Author or review | `resolve-author-fix` / `resolve-review-pr` |
 | Commit and selected publication mode | `resolve-publish` |
-| Open PR: CI, Polly/OCR, preview, and human validation | `resolve-drive-pr` (substep resources) |
+| Open PR: CI, Polly/OCR, preview, and human validation | `resolve-drive-pr` (substep resources; CI and preview from `otto-drive-pr`) |
 | Complete output contract | `resolve-handoff` |
+
+Skills named `otto-*` are shared with other Otto agents. They live in
+[`dev/agent-skills/`](../agent-skills/) and are linked into `skills/`.
 
 The CLI transports these files with the agent bundle. They need not exist in
 the target checkout. Claude loads them through its native Skill tool; other
@@ -267,7 +270,7 @@ Run the bundled helper against a ready PR in a repository with both review
 workflows installed (read-only):
 
 ```bash
-python3 dev/resolve-agent/skills/resolve-drive-pr/review_cycle.py snapshot --repository omnigent-ai/omnigent --pr-number <pr>
+python3 dev/agent-skills/otto-pr-review-loop/review_cycle.py snapshot --repository omnigent-ai/omnigent --pr-number <pr>
 ```
 
 A new head must show both reviews incomplete until that head has Polly's reviewed

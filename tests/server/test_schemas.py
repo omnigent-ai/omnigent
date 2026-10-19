@@ -825,16 +825,55 @@ def test_session_create_host_type_defaults_external() -> None:
     assert req.host_type == "external"
 
 
-def test_session_create_managed_rejects_host_id() -> None:
+def test_session_create_managed_host_id_names_the_new_host() -> None:
     """
-    ``host_type="managed"`` + caller-supplied ``host_id`` is a
-    contradiction (the server provisions the host) — must 422 at
-    validation instead of silently ignoring the caller's host.
+    A managed create's ``host_id`` names the sandbox host it provisions, in
+    the shape the server mints (``uuid.uuid4().hex``). It moves to
+    ``requested_host_id`` so ``host_id`` keeps meaning an existing host, and
+    survives the dump-and-revalidate a project create does.
     """
     from omnigent.server.schemas import SessionCreateRequest
 
-    with pytest.raises(ValidationError, match="host_id must not be set"):
-        SessionCreateRequest(agent_id="ag_x", host_type="managed", host_id="host_abc")
+    req = SessionCreateRequest(
+        agent_id="ag_x", host_type="managed", host_id="0123456789abcdef0123456789abcdef"
+    )
+    assert req.host_id is None
+    assert req.requested_host_id == "0123456789abcdef0123456789abcdef"
+    again = SessionCreateRequest.model_validate(req.model_dump())
+    assert again.host_id is None
+    assert again.requested_host_id == "0123456789abcdef0123456789abcdef"
+
+
+@pytest.mark.parametrize(
+    "host_id",
+    [
+        "host_abc",
+        "0123456789ABCDEF0123456789ABCDEF",
+        "0123456789abcdef0123456789abcde",
+        "01234567-89ab-cdef-0123-456789abcdef",
+        "0123456789abcdef0123456789abcdef\n",
+        "",
+    ],
+)
+def test_session_create_managed_rejects_malformed_host_id(host_id: str) -> None:
+    """A managed ``host_id`` the server would never mint is a 422."""
+    from omnigent.server.schemas import SessionCreateRequest
+
+    with pytest.raises(ValidationError, match="32 lowercase hex"):
+        SessionCreateRequest(agent_id="ag_x", host_type="managed", host_id=host_id)
+
+
+def test_session_create_child_rejects_managed_host_id() -> None:
+    """A child session runs on its parent's host, so it cannot name one."""
+    from omnigent.server.schemas import SessionCreateRequest
+
+    with pytest.raises(ValidationError, match="does not apply to a managed child session"):
+        SessionCreateRequest(
+            agent_id="ag_x",
+            host_type="managed",
+            parent_session_id="conv_parent",
+            host_id="0123456789abcdef0123456789abcdef",
+        )
 
 
 def test_session_create_managed_rejects_path_workspace() -> None:
@@ -1098,6 +1137,27 @@ def test_session_fork_managed_accepts_provider_and_repo_workspace() -> None:
     )
     assert req.sandbox_provider == "modal"
     assert req.workspace == "https://github.com/org/repo#release-1.2"
+
+
+@pytest.mark.parametrize(
+    ("host_type", "host_id", "error"),
+    [
+        ("managed", "0123456789abcdef0123456789abcdef", None),
+        ("managed", "host_abc", "32 lowercase hex characters"),
+        ("external", "0123456789abcdef0123456789abcdef", "host_id only applies"),
+    ],
+)
+def test_session_fork_host_id_names_only_a_managed_forks_host(
+    host_type: str, host_id: str, error: str | None
+) -> None:
+    """A fork's ``host_id`` takes a managed create's shape and only on a managed fork."""
+    from omnigent.server.schemas import SessionForkRequest
+
+    if error is None:
+        assert SessionForkRequest(host_type=host_type, host_id=host_id).host_id == host_id
+        return
+    with pytest.raises(ValidationError, match=error):
+        SessionForkRequest(host_type=host_type, host_id=host_id)
 
 
 def test_session_fork_managed_rejects_path_workspace() -> None:

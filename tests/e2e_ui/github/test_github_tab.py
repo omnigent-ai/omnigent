@@ -54,6 +54,10 @@ _INFO = {
         "url": "https://example.com/pr/4242",
         "is_draft": False,
         "author": "octocat",
+        "reviewers": [
+            {"login": "alice", "kind": "user", "state": "APPROVED"},
+            {"login": "platform", "kind": "team", "state": "PENDING"},
+        ],
         "base_ref": "main",
         "head_ref": "feature/github-tab",
         "checks": {
@@ -68,7 +72,7 @@ _INFO = {
                 {"name": "e2e", "bucket": "failing", "url": None},
             ],
         },
-        # The Summary tab renders the description (markdown) and comments.
+        # The Summary tab renders the description (markdown); comments get their own tab.
         "body": "## Summary\n\nAdds the GitHub tab to the workspace rail.",
         "comments": [
             {
@@ -167,7 +171,7 @@ def test_github_tab_shows_summary_checks_and_file_tree(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """The Pull Requests tab lands on Summary; Changes shows the compacted file tree."""
+    """The Pull Requests tab lands on Summary; Comments and Changes are one click away."""
     base_url, session_id = seeded_session
     _stub_github(page)
     page.goto(f"{base_url}/c/{session_id}")
@@ -180,6 +184,8 @@ def test_github_tab_shows_summary_checks_and_file_tree(
     expect(rail.get_by_text("Add the GitHub tab")).to_be_visible(timeout=30_000)
     expect(rail.get_by_text(f"#{_PR_NUMBER}")).to_be_visible()
     expect(rail.get_by_label("Pull request status: Open")).to_be_visible()
+    expect(rail.get_by_role("listitem", name="alice: Approved")).to_be_visible()
+    expect(rail.get_by_role("listitem", name="Team platform: Pending")).to_be_visible()
 
     # A host without tracking controls puts the provider beside the repo.
     icon = rail.get_by_role("heading", name="GitHub", exact=True).bounding_box()
@@ -192,17 +198,25 @@ def test_github_tab_shows_summary_checks_and_file_tree(
     expect(rail.get_by_text(re.compile(r"3\s*passed"))).to_be_visible()
     expect(rail.get_by_text(re.compile(r"1\s*failed"))).to_be_visible()
 
-    # Summary is the default tab: the PR description + a comment render there.
+    # Summary is the default tab: the PR description renders there.
     expect(rail.get_by_text(re.compile(r"Adds the GitHub tab"))).to_be_visible()
+    expect(rail.get_by_text("Nice work!")).to_have_count(0)
+
+    # Comments have their own tab, labeled with the count. Scope to the inner
+    # "Pull request" tablist — the rail's own tab bar also has a "Changes" tab.
+    pr_tabs = rail.get_by_role("tablist", name="Pull request")
+    pr_tabs.get_by_role("tab", name="Comments 1", exact=True).click()
     expect(rail.get_by_text("Nice work!")).to_be_visible()
 
-    # Switching to Changes reveals the sidebar file tree. Scope to the inner
-    # "Pull request" tablist — the rail's own tab bar also has a "Changes" tab.
-    # The src → app single-child chain compacts into one "src/app" folder row
-    # (exact — the diff section header carries the full path and would substring).
-    rail.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Changes").click()
+    # Switching to Changes reveals the sidebar file tree. The src → app
+    # single-child chain compacts into one "src/app" folder row (exact — the
+    # diff section header carries the full path and would substring).
+    pr_tabs.get_by_role("tab", name="Changes").click()
     expect(rail.get_by_role("button", name="src/app", exact=True)).to_be_visible()
     expect(rail.get_by_role("button", name=re.compile(r"main\.py")).first).to_be_visible()
+
+    rail.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Summary").click()
+    expect(rail.get_by_role("listitem", name="alice: Approved")).to_be_visible()
 
 
 @pytest.mark.parametrize(
@@ -343,7 +357,11 @@ def test_composer_pr_link_opens_github_tab(
             )
         expect(panel.get_by_text("Add the GitHub tab", exact=True)).to_be_visible(timeout=30_000)
         expect(panel.get_by_label("Pull request status: Open")).to_be_visible()
-        expect(panel.get_by_text("Nice work!", exact=True)).to_be_visible()
+        expect(
+            panel.get_by_role("tablist", name="Pull request").get_by_role(
+                "tab", name="Comments 1", exact=True
+            )
+        ).to_be_visible()
         if pr_count > 1:
             expect(panel.get_by_role("combobox", name="Session pull request")).to_have_text(
                 f"example.com/acme/app #{_PR_NUMBER}"

@@ -928,6 +928,54 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByText("Relayed.")).toBeDefined();
     });
 
+    const slashReceipt = (name = "dev-productivity:simplify"): RenderItem => ({
+      kind: "slash_command",
+      itemId: "sc_turn",
+      slashKind: "skill",
+      name,
+      arguments: "",
+      output: null,
+    });
+
+    it("keeps a slash-command receipt visible after the turn settles", () => {
+      // A skill invocation's receipt is a durable record of what the
+      // user ran. When the agent's reply lands in the same bubble it
+      // must stay visible, not fold behind the Worked row with it.
+      const items: RenderItem[] = [
+        slashReceipt(),
+        { kind: "text", itemId: "m1", text: "Acknowledged.", final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+      expect(screen.getByText("Skill")).toBeDefined();
+      expect(screen.getByText("dev-productivity:simplify")).toBeDefined();
+      expect(screen.getByText("Acknowledged.")).toBeDefined();
+    });
+
+    it("keeps a slash-command receipt visible outside a folded work run", () => {
+      const items: RenderItem[] = [
+        slashReceipt(),
+        tool(1),
+        tool(2),
+        { kind: "text", itemId: "m1", text: "Acknowledged.", final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" />
+        </FileViewerContext.Provider>,
+      );
+      // The tool run folds, but the receipt and the answer stay visible.
+      expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+      expect(screen.getByText("Skill")).toBeDefined();
+      expect(screen.getByText("dev-productivity:simplify")).toBeDefined();
+      expect(screen.queryByText(/tool_1/)).toBeNull();
+      expect(screen.getByText("Acknowledged.")).toBeDefined();
+    });
+
     const elicitation = (
       status: "pending" | "responded",
       response: { action: "accept" } | null,

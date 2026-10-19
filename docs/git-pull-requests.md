@@ -92,7 +92,7 @@ change a tool's result or prevent another provider from recording requests.
 Run the existing GitHub resource and tracking suites together with provider
 dispatcher tests, then the shared panel, composer, and canvas frontend tests.
 For a manual check, open a GitHub session's Pull Requests tab, select a linked
-request, inspect Summary and Changes, and confirm the same link appears in the
-composer and canvas. Repeat with the installed provider, including signed-out
-and partial-data responses. Existing GitHub account and base-remote selectors
-must continue to work.
+request, inspect Summary, Comments, and Changes, and confirm the same link
+appears in the composer and canvas. Repeat with the installed provider,
+including signed-out and partial-data responses. Existing GitHub account and
+base-remote selectors must continue to work.

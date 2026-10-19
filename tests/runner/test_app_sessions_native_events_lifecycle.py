@@ -30,6 +30,7 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
+from tests.budgets import budget
 from tests.runner.conftest import (
     _build_app_for_spec,
     _drain_session_event_queue,
@@ -326,15 +327,15 @@ async def test_codex_native_reset_without_a_current_model_is_rejected_before_con
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stalled", ["connect", "update"])
+@pytest.mark.parametrize("stalled", ["connect", "update", "resume", "retry", "close"])
 async def test_codex_native_settings_update_times_out_and_releases_the_lock(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     stalled: str,
 ) -> None:
-    """A hung connect is refused (503) and a hung update is unconfirmed (504); neither blocks."""
+    """Only a pending write is unconfirmed; all timeout paths release the settings lock."""
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
-    from omnigent.runner import turn_routing
+    from omnigent.runner import native_controls, turn_routing
 
     conv_id = "1f2e3d4c5b6a49788796a5b4c3d2e1f0"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
@@ -349,18 +350,35 @@ async def test_codex_native_settings_update_times_out_and_releases_the_lock(
         ),
     )
     monkeypatch.setattr(turn_routing, "SETTINGS_UPDATE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(native_controls, "_CODEX_SETTINGS_CLOSE_TIMEOUT_S", 0.05)
     stall = {"active": True}
 
     class _StallingClient(_RecordingCodexAppServerClient):
+        rejected_unloaded_thread = False
+
         async def connect(self) -> None:
             if stalled == "connect" and stall["active"]:
                 await asyncio.Event().wait()
             await super().connect()
 
         async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-            if stalled == "update" and method == "thread/settings/update" and stall["active"]:
-                await asyncio.Event().wait()
+            if stall["active"]:
+                if method == "thread/settings/update":
+                    if stalled in {"resume", "retry"} and not self.rejected_unloaded_thread:
+                        self.rejected_unloaded_thread = True
+                        raise codex_native_app_server.CodexAppServerResponseError(
+                            {"code": -32600, "message": "thread not found: thread_codex"}
+                        )
+                    if stalled in {"update", "retry"}:
+                        await asyncio.Event().wait()
+                elif method == "thread/resume" and stalled == "resume":
+                    await asyncio.Event().wait()
             return await super().request(method, params)
+
+        async def close(self) -> None:
+            await super().close()
+            if stalled == "close" and stall["active"]:
+                await asyncio.Event().wait()
 
     clients: list[_StallingClient] = []
 
@@ -390,8 +408,8 @@ async def test_codex_native_settings_update_times_out_and_releases_the_lock(
             f"/v1/sessions/{conv_id}/events", json={"type": "effort_change", "effort": "low"}
         )
 
-    # A stalled update may still apply, so it is unconfirmed rather than refused.
-    assert stalled_resp.status_code == (504 if stalled == "update" else 503), stalled_resp.text
+    expected_status = {"connect": 503, "update": 504, "resume": 503, "retry": 504, "close": 204}
+    assert stalled_resp.status_code == expected_status[stalled], stalled_resp.text
     assert next_resp.status_code == 204, next_resp.text
     assert all(stalled_client.closed for stalled_client in clients)
     assert clients[-1].requests == [
@@ -4383,8 +4401,11 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(
         )
         on_exit = callbacks.get("on_exit")
         assert callable(on_exit)
+        # The watcher marks a dead pane not running before reporting exit, so
+        # cleanup skips tmux kill-server for the stub's never-started server.
+        instance.running = False
         on_exit()
-        queued_events = await asyncio.wait_for(_collect_exit_events(), timeout=1.0)
+        queued_events = await asyncio.wait_for(_collect_exit_events(), timeout=budget(1.0))
         for _ in range(100):
             if pm.released:
                 break
@@ -4515,8 +4536,11 @@ async def test_required_terminal_exit_classifies_root_failure(tmp_path: Path) ->
         await resource_registry.observe_required_terminal(conv_id, "claude", "main", instance)
         on_exit = callbacks.get("on_exit")
         assert callable(on_exit)
+        # The watcher marks a dead pane not running before reporting exit, so
+        # cleanup skips tmux kill-server for the stub's never-started server.
+        instance.running = False
         on_exit()
-        failed = await asyncio.wait_for(_collect_failed(), timeout=1.0)
+        failed = await asyncio.wait_for(_collect_failed(), timeout=budget(1.0))
     finally:
         _session_event_queues_ref.pop(conv_id, None)
 
@@ -5124,6 +5148,7 @@ async def test_events_effort_change_on_native_session_types_slash_command(
         timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        ready_timeout_s: float | None = None,
     ) -> None:
         """Record the call and return without touching tmux."""
         captured.append((bridge_dir, command, timeout_s, confirm_hint))
@@ -5494,6 +5519,88 @@ async def test_events_codex_side_chat_preserves_indentation(
             )
         ]
         assert fake_client.closed
+
+
+@pytest.mark.parametrize(
+    "lookup", ["unavailable", "missing-label", "explicit-label", "wrong-label", "no-map"]
+)
+async def test_events_rotated_codex_side_chat_uses_the_launch_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, lookup: str
+) -> None:
+    """Queue side questions in the forwarder's directory without starting a turn."""
+    import httpx
+
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+    from omnigent.harnesses.codex_native import side_chat
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+    from omnigent.runner.native import orchestration as native_runtime
+
+    conv_id = "acbeddbbce38421b921a7abbe82f7176"
+    rotated_id = "rotated-" + conv_id
+    wrong_id = "wrong-" + conv_id
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    default_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    rotated_dir = codex_native_bridge.bridge_dir_for_bridge_id(rotated_id)
+    wrong_dir = codex_native_bridge.bridge_dir_for_bridge_id(wrong_id)
+    mapped_dirs = {conv_id: rotated_dir}
+    expected_dir = rotated_dir
+    live_labels = {}
+    if lookup == "explicit-label":
+        live_labels[codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY] = rotated_id
+        mapped_dirs[conv_id] = default_dir
+    elif lookup == "wrong-label":
+        live_labels[codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY] = wrong_id
+        expected_dir = wrong_dir
+    elif lookup == "no-map":
+        mapped_dirs.clear()
+        expected_dir = default_dir
+    monkeypatch.setattr(native_runtime, "_AUTO_CODEX_BRIDGE_DIRS", mapped_dirs)
+    monkeypatch.setattr(
+        native_runtime, "_auto_create_codex_terminal", AsyncMock(return_value=None)
+    )
+    fake_client = _RecordingCodexAppServerClient(
+        transport="ws://127.0.0.1:43210", client_name="omnigent-codex-native-runner"
+    )
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+    get = NullServerClient.get
+    label_calls = []
+
+    async def labels(self: Any, url: str, **kwargs: Any) -> Any:
+        if not url.endswith("/labels"):
+            return await get(self, url, **kwargs)
+        label_calls.append(url)
+        if lookup == "unavailable":
+            raise DatabricksAuthError("Credential service could not supply callback credentials")
+        return httpx.Response(200, json={"labels": live_labels}, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(NullServerClient, "get", labels)
+    app, pm = await _build_app_for_spec(_harness_spec("codex-native"))
+    question = "  - First\n  - Second"
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_side"}
+        )
+        assert created.status_code == 201, created.text
+        lookups_before = len(label_calls)
+        spawns_before = list(pm.get_client_calls)
+        response = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "message",
+                "content": [{"type": "input_text", "text": "/side " + question}],
+            },
+        )
+    assert response.status_code == 202, response.text
+    assert len(label_calls) == lookups_before + 1
+    assert pm.get_client_calls == spawns_before
+    assert fake_client.requests == []
+    assert [request.question for request in side_chat.peek_side_chat_requests(expected_dir)] == [
+        question
+    ]
+    for unused_dir in {default_dir, rotated_dir, wrong_dir} - {expected_dir}:
+        assert side_chat.peek_side_chat_requests(unused_dir) == []
 
 
 @pytest.mark.asyncio

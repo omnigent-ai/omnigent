@@ -96,16 +96,16 @@ describe("CommentsPanel copy-comment-link", () => {
     expect(onCopyCommentLink).toHaveBeenCalledWith("c1");
   });
 
-  it("shows a link button for addressed comments after switching to the Addressed tab", () => {
+  it("shows a link button for addressed comments after switching to the Sent tab", () => {
     const addressedComment = makeComment("c2", "addressed");
     const onCopyCommentLink = vi.fn();
     renderPanel([], [addressedComment], onCopyCommentLink);
 
     // The default view is "Open". Addressed comments are hidden until the user
-    // clicks the Addressed tab.
+    // clicks the Sent tab.
     expect(screen.queryByRole("button", { name: "Copy link to comment" })).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: /addressed/i }));
+    fireEvent.click(screen.getByRole("button", { name: /sent/i }));
 
     // After switching tabs, the addressed comment is visible and has a link button.
     // Failure: onCopyLink was not passed to CommentCard for addressed comments.
@@ -520,7 +520,7 @@ describe("CommentsPanel active-comment reveal", () => {
     expect(screen.queryByText("Comment c2")).not.toBeInTheDocument();
   });
 
-  it("follows a selected comment into Addressed once without locking the tabs", async () => {
+  it("follows a selected comment into Sent once without locking the tabs", async () => {
     Element.prototype.scrollIntoView = vi.fn();
 
     // Matching ids model one comment changing status; only one tab renders at a time.
@@ -552,7 +552,7 @@ describe("CommentsPanel active-comment reveal", () => {
     const onClickComment = vi.fn();
     render(panelWithSelection([], [addressed], null, onClickComment));
 
-    fireEvent.click(screen.getByRole("button", { name: /^Addressed/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Sent/ }));
     fireEvent.click(screen.getByText("Comment c2"));
 
     expect(onClickComment).toHaveBeenCalledWith(addressed);

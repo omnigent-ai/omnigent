@@ -89,6 +89,7 @@ from omnigent.util.tunnel_limits import (
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
+from tests._helpers.providers import isolate_provider_resolution
 
 
 @pytest.fixture(autouse=True)
@@ -1052,6 +1053,46 @@ def test_codex_args_no_config_is_cli_args_only(
     assert captured["extra_args"] == ("--flag",)
 
 
+@pytest.mark.parametrize(
+    ("codex_args", "reserved"),
+    [
+        # A tool spawning its own app-server sidecar through the Omnigent launcher.
+        (
+            [
+                "app-server",
+                "--listen",
+                "ws://127.0.0.1:7101",
+                "-c",
+                "mcp_servers.demo.command=node",
+            ],
+            "app-server",
+        ),
+        (["--remote", "ws://127.0.0.1:7101"], "--remote"),
+        (["--remote=ws://127.0.0.1:7101"], "--remote"),
+    ],
+)
+def test_codex_cli_rejects_runner_owned_transport_args(
+    monkeypatch: pytest.MonkeyPatch,
+    codex_args: list[str],
+    reserved: str,
+) -> None:
+    """Runner-owned Codex transport args fail before a session or backend exists."""
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    monkeypatch.setattr(
+        "omnigent.cli._ensure_backend",
+        lambda *_: pytest.fail("invalid args must not start the backend"),
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.main.run_codex_native",
+        lambda **_: pytest.fail("invalid args must not create a session"),
+    )
+
+    result = CliRunner().invoke(cli, ["codex", *codex_args])
+
+    assert result.exit_code == 2, result.output
+    assert f"'{reserved}' is reserved for Omnigent" in result.output
+
+
 def test_pi_config_args_form_base_cli_args_append(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1514,9 +1555,8 @@ def test_bundled_agent_launches_with_first_available_credential(
     the ``_run_bundled_agent`` path and the ``claude-sdk`` brain, so the
     fallback fires identically for each.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
     # No ambient credentials — the explicit provider below is the only one.
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     _write_isolated_provider_config(
         tmp_path,
@@ -1563,8 +1603,7 @@ def test_bundled_agent_multiple_credentials_notice_preserves_first_pick(
     shorthand remains headless-safe: it promotes the first configured
     credential, reports the ambiguity, and tells the user where to change it.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
 
     def _fail_prompt(*_args: object, **_kwargs: object) -> None:
@@ -1620,8 +1659,7 @@ def test_bundled_agent_leaves_existing_default_credential_alone(
     brain's family, the shorthand must NOT touch the config — the fallback
     only fires when no default exists.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     config_path = _write_isolated_provider_config(
         tmp_path,
@@ -1658,8 +1696,7 @@ def test_bundled_agent_no_credential_does_not_write_config(
     config is left untouched and ``run`` is still forwarded so that error
     surfaces in the normal launch path rather than as a silent no-op.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     # An OpenAI-only credential — the claude-sdk brain needs anthropic.
     config_path = _write_isolated_provider_config(
@@ -1698,8 +1735,7 @@ def test_bundled_agent_unreadable_global_config_degrades_to_launch(
     before the harness ever runs — the exact failure mode this path exists to
     avoid. An explicit anthropic key keeps the fallback loop reaching that read.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     _write_isolated_provider_config(
         tmp_path,
@@ -1746,8 +1782,7 @@ def test_bundled_agent_ambiguous_default_config_degrades_to_launch(
     with a traceback. Regression for the narrow guard that caught only the
     ``_load_global_config`` read.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     _write_isolated_provider_config(
         tmp_path,
@@ -1793,8 +1828,7 @@ def test_bundled_agent_codex_only_credential_reroutes_brain_harness(
     harness (mirroring bare ``omnigent``'s first-run pick) and announce the
     reroute.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     _write_isolated_provider_config(
         tmp_path,
@@ -1825,8 +1859,7 @@ def test_bundled_agent_brain_family_credential_keeps_declared_harness(
     serves the brain's own family — even alongside a Codex one — the brain
     stays on its declared harness and no ``--harness`` is injected.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     _write_isolated_provider_config(
         tmp_path,
@@ -1861,8 +1894,7 @@ def test_bundled_agent_no_credential_anywhere_skips_brain_reroute(
     There is nothing to fall back to, so the shorthand must not inject a
     harness — the downstream launch surfaces its own credential error.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     _write_isolated_provider_config(tmp_path, {})
     dispatch = Mock()
@@ -1884,8 +1916,7 @@ def test_bundled_agent_explicit_harness_wins_over_brain_reroute(
     Even on a Codex-only config, a forwarded ``--harness`` must reach ``run``
     unchanged (never doubled or overridden by the fallback's injection).
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     _write_isolated_provider_config(
         tmp_path,
@@ -1912,8 +1943,7 @@ def test_bundled_agent_flag_lookalike_prompt_value_keeps_brain_reroute(
     pin — the applicability check must parse flag shapes exactly like the
     forwarded ``run`` does, so the fallback still fires.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     _write_isolated_provider_config(
         tmp_path,
@@ -1962,8 +1992,7 @@ def test_bundled_agent_resume_flags_skip_brain_reroute(
     A resume/continue/fork picks up a conversation whose brain harness is
     already decided; injecting ``--harness`` there would silently change it.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     _write_isolated_provider_config(
         tmp_path,
@@ -1989,8 +2018,7 @@ def test_bundled_agent_remote_server_flag_skips_brain_reroute(
     managed gateway), so a missing local credential is not evidence the
     brain can't run there.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     _write_isolated_provider_config(
         tmp_path,
@@ -2016,8 +2044,7 @@ def test_bundled_agent_configured_remote_server_skips_brain_reroute(
     config pointing at a remote app, the launch targets that server and its
     routing — the local-credential fallback must stay out.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr(
         "omnigent.cli._load_effective_config",
         lambda: {"server": "https://example.databricksapps.com"},
@@ -2046,8 +2073,7 @@ def test_bundled_agent_local_server_alias_keeps_brain_reroute(
     launch — exactly the topology whose brain credential must resolve from
     the local config, so the fallback fires the same as with no flag.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     _write_isolated_provider_config(
         tmp_path,
@@ -2073,8 +2099,7 @@ def test_bundled_agent_brain_reroute_config_error_degrades_to_launch(
     malformed config must not crash the launch — the harness surfaces its
     own error downstream.
     """
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
     # Two defaults for the openai family — load_providers/get_default_provider
     # raise OmnigentError when the fallback resolves the codex candidate.
@@ -3161,6 +3186,115 @@ def test_bundle_resolves_config_env_vars(
     # Non-secret fields survive bundling.
     assert parsed["name"] == "env-test-agent"
     assert parsed["llm"]["model"] == "openai/gpt-4o"
+
+
+def _agent_with_shared_skill(checkout: Path, *, git: bool = True) -> Path:
+    """Create a checkout with one agent and a skill stored outside its ``skills/``."""
+    checkout.mkdir(parents=True, exist_ok=True)
+    if git:
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    else:
+        # A stray directory named .git is not a checkout and must not widen the boundary.
+        (checkout / ".git").mkdir()
+    shared = checkout / "shared-skills" / "review-loop"
+    shared.mkdir(parents=True)
+    (shared / "SKILL.md").write_text(
+        "---\nname: review-loop\ndescription: Shared loop.\n---\nBody.\n"
+    )
+    (shared / "helper.py").write_text("print('helper')\n")
+    agent = checkout / "agents" / "fixer"
+    (agent / "skills").mkdir(parents=True)
+    _write_config(
+        agent,
+        {
+            "spec_version": 1,
+            "name": "fixer",
+            "executor": {"type": "omnigent", "config": {"harness": "claude-sdk"}},
+        },
+    )
+    return agent
+
+
+@pytest.mark.parametrize("link", ["directory", "files", "hardlinks"])
+def test_bundle_includes_symlinked_skill_as_regular_files(tmp_path: Path, link: str) -> None:
+    """A skill linked from elsewhere in the checkout survives server-side extraction."""
+    from omnigent.spec import load
+    from omnigent.spec.tar_utils import extract_safe
+
+    agent = _agent_with_shared_skill(tmp_path)
+    linked = agent / "skills" / "review-loop"
+    if link == "directory":
+        linked.symlink_to(Path("../../../shared-skills/review-loop"))
+    elif link == "files":
+        linked.mkdir()
+        for name in ("SKILL.md", "helper.py"):
+            (linked / name).symlink_to(Path("../../../../shared-skills/review-loop") / name)
+    else:
+        # Two bundled paths sharing an inode must not become a hardlink member.
+        linked.mkdir()
+        shared = agent.parents[1] / "shared-skills" / "review-loop"
+        (linked / "SKILL.md").symlink_to(shared / "SKILL.md")
+        os.link(shared / "helper.py", linked / "helper.py")
+        (linked / "helper-alias.py").symlink_to(shared / "helper.py")
+
+    bundle_bytes = _bundle(agent)
+
+    with tarfile.open(fileobj=io.BytesIO(bundle_bytes), mode="r:gz") as tf:
+        assert tf.getmember("skills/review-loop/helper.py").isfile()
+    extracted = tmp_path / "extracted"
+    extract_safe(bundle_bytes, extracted)
+    assert [skill.name for skill in load(extracted).skills] == ["review-loop"]
+    assert (extracted / "skills/review-loop/helper.py").read_text() == "print('helper')\n"
+
+
+@pytest.mark.parametrize(
+    ("target", "message", "git"),
+    [
+        ("../../../shared-skills/missing", "dangling symlink", True),
+        ("../../../../outside", "outside", True),
+        ("../../../shared-skills/review-loop", "outside", False),
+        ("..", "symlink loop", True),
+        ("review-loop", "symlink loop", True),
+        ("../../../.git/config", "repository's .git directory", True),
+    ],
+)
+def test_bundle_rejects_unbundleable_symlinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str, message: str, git: bool
+) -> None:
+    """Links that cannot be bundled fail instead of silently dropping the skill."""
+    from omnigent.runtime import filesystem_registry
+
+    # Ignore any repository enclosing pytest's temp dir; only the fixture's own .git counts.
+    detect = filesystem_registry.detect_git_root
+    monkeypatch.setattr(
+        filesystem_registry,
+        "detect_git_root",
+        lambda path: root if (root := detect(path)) and root.is_relative_to(tmp_path) else None,
+    )
+    agent = _agent_with_shared_skill(tmp_path / "checkout", git=git)
+    (tmp_path / "outside").mkdir()
+    (agent / "skills" / "review-loop").symlink_to(Path(target))
+
+    with pytest.raises(OmnigentError, match=message):
+        _bundle(agent)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    [(0o600, r"cannot be resolved \(Permission denied\)"), (0o300, r"cannot be read")],
+)
+def test_bundle_reports_inaccessible_skill_paths(tmp_path: Path, mode: int, message: str) -> None:
+    """Permission failures are reported as such, not as dangling links or skipped content."""
+    agent = _agent_with_shared_skill(tmp_path)
+    shared = tmp_path / "shared-skills" / "review-loop"
+    (agent / "skills" / "review-loop").symlink_to(Path("../../../shared-skills/review-loop"))
+    shared.chmod(mode)
+    try:
+        with pytest.raises(OmnigentError, match=message):
+            _bundle(agent)
+    finally:
+        shared.chmod(0o755)
 
 
 def test_bundle_resolves_mcp_header_env_vars(

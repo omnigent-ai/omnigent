@@ -249,11 +249,16 @@ class ScheduledTaskScheduler:
         """Compute the next fire and arm a (possibly capped) timer for it."""
         now_epoch = self._now()
         after = datetime.fromtimestamp(now_epoch, tz=_UTC)
-        next_run = job.trigger.next_fire_after(after, job.tz)
+        try:
+            next_run = job.trigger.next_fire_after(after, job.tz)
+        except RRuleValidationError as exc:
+            _logger.warning("scheduler: task %s stopped: %s", job.task_id, exc)
+            next_run = None
         if next_run is None:
             job.next_run = None
             job.next_run_epoch = None
             job.timer = None
+            job.armed_capped = False
             return
         job.next_run = next_run
         job.next_run_epoch = next_run.timestamp()

@@ -145,6 +145,127 @@ def test_deletion_retains_sandbox_cleanup_and_invalidates_magic_links(db_uri: st
     assert accounts.redeem_token("magic", kind="magic", now_epoch_seconds=1) is None
 
 
+def test_session_revocation_moves_only_current_registration_work(db_uri: str) -> None:
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlHost
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    hosts = HostStore(db_uri)
+    tasks = SqlAlchemyScheduledTaskStore(db_uri)
+    grants = DeviceGrantStore(db_uri)
+
+    def create_task():
+        return tasks.create(
+            uuid.uuid4().hex, "job", "hello", "FREQ=DAILY", "alice", uuid.uuid4().hex, "UTC"
+        )
+
+    def register_managed_host(name: str) -> str:
+        host_id = uuid.uuid4().hex
+        hosts.register_managed_host(
+            host_id=host_id,
+            name=name,
+            user_id="alice",
+            token=f"{name}-token",
+            provider="modal",
+            sandbox_id=f"{name}-sandbox",
+            token_expires_at=int(time.time()) + 3600,
+        )
+        return host_id
+
+    def stored_host_generation(host_id: str) -> str | None:
+        # Hosts retained for sandbox cleanup are hidden from get_host.
+        with accounts._engine.connect() as connection:
+            return connection.execute(
+                select(SqlHost.account_generation).where(SqlHost.host_id == host_id)
+            ).scalar_one()
+
+    first = accounts.create_user_with_password("alice", "first-hash").account_generation
+    predecessor_task = create_task()
+    predecessor_host_id = register_managed_host("predecessor")
+    assert accounts.delete_user("alice") is True
+    assert hosts.get_host(predecessor_host_id) is None
+    assert stored_host_generation(predecessor_host_id) == first
+    old = accounts.create_user_with_password("alice", "second-hash").account_generation
+    task = create_task()
+    host_id = register_managed_host("managed")
+    grants.create_redeemed_grant(
+        "cli-grant",
+        user_id="alice",
+        client_id="omnigent-cli",
+        refresh_token_hash="hash",
+        created_at=int(time.time()),
+    )
+    accounts.create_token(
+        "magic",
+        kind="magic",
+        user_id="alice",
+        created_by=None,
+        created_at=0,
+        expires_at=2000000000,
+    )
+
+    # The login-time rehash keeps the generation.
+    assert accounts.update_password("alice", "rehashed") == old
+    new = accounts.update_password("alice", "third-hash", revoke_sessions=True)
+    assert new not in (None, old)
+    assert not accounts.accepts_generation("alice", old)
+    assert accounts.accepts_generation("alice", new)
+    assert tasks.get(task.id).account_generation == new
+    assert tasks.get(predecessor_task.id).account_generation == first
+    assert stored_host_generation(predecessor_host_id) == first
+    assert hosts.get_host(host_id).account_generation == new
+    assert hosts.replace_managed_host_sandbox(
+        host_id=host_id,
+        user_id="alice",
+        token="replacement",
+        provider="modal",
+        sandbox_id="new-sandbox",
+        token_expires_at=int(time.time()) + 3600,
+    )
+    with pytest.raises(OmnigentError, match="revoked"):
+        grants.authorize_access("cli-grant")
+    magic = accounts.redeem_token("magic", kind="magic", now_epoch_seconds=1)
+    assert magic is not None and magic.account_generation == old
+
+
+def test_failed_session_revocation_rolls_back_password_and_work(db_uri: str) -> None:
+    import re
+
+    import sqlalchemy as sa
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    hosts = HostStore(db_uri)
+    tasks = SqlAlchemyScheduledTaskStore(db_uri)
+    generation = accounts.create_user_with_password("alice", "old-hash").account_generation
+    task = tasks.create(
+        uuid.uuid4().hex, "job", "hello", "FREQ=DAILY", "alice", uuid.uuid4().hex, "UTC"
+    )
+    host = hosts.upsert_on_connect(uuid.uuid4().hex, "laptop", "alice")
+
+    updated: list[str] = []
+
+    def fail_host_update(_conn, _cursor, statement, *_args) -> None:
+        match = re.search(r"\bUPDATE\s+(\w+)", statement)
+        if match:
+            updated.append(match.group(1))
+            if match.group(1) == "hosts":
+                raise RuntimeError("injected failure after the task update")
+
+    sa.event.listen(accounts._engine, "before_cursor_execute", fail_host_update)
+    try:
+        with pytest.raises(RuntimeError, match="injected failure"):
+            accounts.update_password("alice", "new-hash", revoke_sessions=True)
+    finally:
+        sa.event.remove(accounts._engine, "before_cursor_execute", fail_host_update)
+    assert updated == ["scheduled_tasks", "hosts"]
+    assert accounts.get_password_hash("alice") == "old-hash"
+    assert accounts.get_user("alice").account_generation == generation
+    assert accounts.accepts_generation("alice", generation)
+    assert tasks.get(task.id).account_generation == generation
+    assert hosts.get_host(host.host_id).account_generation == generation
+
+
 def test_username_reuse_does_not_inherit_connections_projects_or_spending(db_uri: str) -> None:
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore

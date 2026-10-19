@@ -64,6 +64,7 @@ import {
   BRAIN_HARNESS_LABELS,
   SMART_ROUTING_LABEL,
   useBrainHarnessLabels,
+  useHarnessEffortFamilies,
 } from "@/lib/agentLabels";
 import { usePermissions, useSessionOwner } from "@/hooks/usePermissions";
 import type { NativeModelOption, Session, SessionStatus, SkillSummary } from "@/lib/types";
@@ -90,6 +91,7 @@ import {
   committedItemProvesDelivery,
   composerAttachmentKey,
   consumePendingInitialPrompt,
+  holdsInitialDraft,
   isStaleTempConvId,
   isTempConvId,
   type PendingInitialPrompt,
@@ -183,6 +185,7 @@ import {
 import { useSession } from "@/hooks/useSession";
 import { useOpenGithubTab } from "@/shell/FileViewerContext";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useReleaseHostHeldSends } from "@/hooks/useReleaseHostHeldSends";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
 import {
   type LivenessRow,
@@ -236,6 +239,7 @@ import {
   formatStatusModelLabel,
   formatStatusEffortLabel,
   formatModelEffortStatusLabel,
+  nativeModelTooltip,
 } from "@/lib/composerModelLabel";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
@@ -246,7 +250,7 @@ import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
 import { useSessionReconnect } from "@/hooks/useSessionReconnect";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
-import { supportsEffortControl } from "@/lib/sessionCapabilities";
+import { effortLevelsForFamily, supportsEffortControl } from "@/lib/sessionCapabilities";
 import {
   CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
   claudePermissionModeLabel,
@@ -935,6 +939,7 @@ export function ChatPage() {
           chat.queuedMessages,
           readAlwaysSteer(),
           opensSideChat,
+          holdsInitialDraft(chat),
         )
       ) {
         chat.enqueueMessage(text, files, replyDraft);
@@ -1048,16 +1053,26 @@ export function ChatPage() {
   // returns a fresh array each call; a new identity here would defeat the memo()
   // on MainAgentSurface/Composer on every unrelated store tick (mirrors the
   // codexModelOptions rationale).
+  const harnessEffortFamilies = useHarnessEffortFamilies();
+  // Declared effort family for a non-native harness (claude-sdk, codex, …), whose
+  // effort rides ``reasoning_effort`` into the SDK executor. Native harnesses keep
+  // their label-driven ladders, so a label-less native row never reads this.
+  const sdkEffortFamily =
+    capabilitySource.harness && !nativeCodingAgentForHarness(capabilitySource.harness)
+      ? (harnessEffortFamilies[capabilitySource.harness] ?? null)
+      : null;
   const effortLevels = useMemo(
     () =>
       effortLevelsForConv(
         capabilitySource,
         codexModelOptions,
         llmModel ?? sessionModelOverrideForEffort,
+        sdkEffortFamily,
       ),
-    [capabilitySource, codexModelOptions, llmModel, sessionModelOverrideForEffort],
+    [capabilitySource, codexModelOptions, llmModel, sessionModelOverrideForEffort, sdkEffortFamily],
   );
-  const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
+  const showEffort =
+    shouldShowEffortPicker(capabilitySource, sdkEffortFamily) && effortLevels.length > 0;
 
   // When inside a session, only show the bound agent — the session is
   // tied 1:1 to its runner and can't be reassigned. Show all agents on
@@ -2432,6 +2447,8 @@ function ComposerImpl(
   // No server session behind a temp id — gate goal/workspace fetches on it so
   // the create window issues no `/v1/sessions/temp:*` requests.
   const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
+  // A send held while the host was offline goes out once the host is back.
+  useReleaseHostHeldSends(composerSessionId);
   const { session: composerSession } = useSession(composerSessionId);
   const composerBranch = useChatStore((s) => s.gitBranch);
   const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
@@ -4328,6 +4345,7 @@ export function effortLevelsForConv(
     | undefined,
   codexModelOptions: readonly NativeModelOption[] = [],
   currentModel: string | null = null,
+  effortFamily: string | null = null,
 ): readonly string[] {
   switch (effectiveWrapperLabel(conv)) {
     case "claude-code-native-ui":
@@ -4343,7 +4361,9 @@ export function effortLevelsForConv(
     case "pi-native-ui":
       return PI_NATIVE_EFFORT_LEVELS;
     default:
-      return EFFORT_LEVELS;
+      // A non-native harness offers its declared family's ladder (claude-sdk →
+      // anthropic, codex → openai); with no family the shared default holds.
+      return effortFamily ? effortLevelsForFamily(effortFamily) : EFFORT_LEVELS;
   }
 }
 
@@ -4425,9 +4445,16 @@ export function shouldShowModelPicker(
  */
 export function shouldShowEffortPicker(
   conv:
-    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
+    | {
+        labels?: Record<string, string | null> | null;
+        harness?: string | null;
+        parentSessionId?: string | null;
+      }
+    | null
+    | undefined,
+  effortFamily: string | null = null,
 ): boolean {
-  return supportsEffortControl(conv);
+  return supportsEffortControl(conv, effortFamily);
 }
 
 export function shouldShowCodexPlanModeControl(
@@ -4740,6 +4767,7 @@ function SessionHarnessPicker({
                         ? selectFusionModel(composerFusion.default)
                         : selectModel(supportsModelReset && model.isDefault ? null : model.id),
                     testId: `composer-agent-model-${model.id}`,
+                    title: nativeModelTooltip(model),
                     className: "whitespace-normal break-words",
                     data: { "data-model-id": model.id },
                   })),

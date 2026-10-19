@@ -116,6 +116,140 @@ describe("resolveIdentity", () => {
   });
 });
 
+describe("resolveIdentity transient failures", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const failWithStatus = (status: number) => () =>
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status }));
+
+  it.each<[string, () => void]>([
+    ["a network error", () => fetchMock.mockRejectedValueOnce(new Error("network"))],
+    ["a gateway 503", failWithStatus(503)],
+    ["a 408", failWithStatus(408)],
+    ["a 429", failWithStatus(429)],
+    [
+      "a 200 whose body cannot be parsed",
+      () =>
+        fetchMock.mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          json: async () => {
+            throw new SyntaxError("Unexpected end of JSON input");
+          },
+        } as unknown as Response),
+    ],
+  ])("probes again after %s instead of caching null", async (_label, failOnce) => {
+    failOnce();
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ user_id: "alice@example.com" }));
+    const { resolveIdentity, getCurrentUserId } = await import("./identity");
+
+    expect(await resolveIdentity()).toBeNull();
+    expect(await resolveIdentity()).toBe("alice@example.com");
+    expect(await resolveIdentity()).toBe("alice@example.com");
+
+    expect(getCurrentUserId()).toBe("alice@example.com");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("caches a 4xx answer without probing again", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 403 }));
+    const { resolveIdentity } = await import("./identity");
+
+    expect(await resolveIdentity()).toBeNull();
+    expect(await resolveIdentity()).toBeNull();
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("caches a 401 answer even when its body is unreadable", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 401,
+      json: async () => {
+        throw new SyntaxError("Unexpected token <");
+      },
+    } as unknown as Response);
+    const { resolveIdentity } = await import("./identity");
+
+    expect(await resolveIdentity()).toBeNull();
+    expect(await resolveIdentity()).toBeNull();
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("retries in the background while a listener is subscribed", async () => {
+    vi.useFakeTimers();
+    fetchMock.mockRejectedValueOnce(new Error("network"));
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ user_id: "alice@example.com" }));
+    const { resolveIdentity, getCurrentUserId, subscribeIdentity } = await import("./identity");
+    const listener = vi.fn();
+    subscribeIdentity(listener);
+
+    expect(await resolveIdentity()).toBeNull();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(getCurrentUserId()).toBe("alice@example.com");
+    expect(listener).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("backs off up to the cap and stops when the last listener leaves", async () => {
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValue(mockJsonResponse({}, { ok: false, status: 502 }));
+    const { resolveIdentity, subscribeIdentity } = await import("./identity");
+    const unsubscribe = subscribeIdentity(() => {});
+
+    await resolveIdentity();
+    let calls = 1;
+    // Each retry's timer exists only after the previous probe settles, so the
+    // clock must advance one delay at a time.
+    /* oxlint-disable no-await-in-loop */
+    for (const delayMs of [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000]) {
+      await vi.advanceTimersByTimeAsync(delayMs - 1);
+      expect(fetchMock).toHaveBeenCalledTimes(calls);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(fetchMock).toHaveBeenCalledTimes(++calls);
+    }
+    /* oxlint-enable no-await-in-loop */
+
+    unsubscribe();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetchMock).toHaveBeenCalledTimes(calls);
+  });
+
+  it("keeps the retry delay when the listener leaves before the retry runs", async () => {
+    vi.useFakeTimers();
+    fetchMock.mockResolvedValue(mockJsonResponse({}, { ok: false, status: 502 }));
+    const { resolveIdentity, subscribeIdentity } = await import("./identity");
+    const unsubscribe = subscribeIdentity(() => {});
+    await resolveIdentity();
+
+    await vi.advanceTimersByTimeAsync(500);
+    unsubscribe();
+    const resubscribe = subscribeIdentity(() => {});
+    await vi.advanceTimersByTimeAsync(999);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    resubscribe();
+  });
+
+  it("does not retry without a listener", async () => {
+    vi.useFakeTimers();
+    fetchMock.mockRejectedValue(new Error("network"));
+    const { resolveIdentity } = await import("./identity");
+
+    await resolveIdentity();
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+});
+
 describe("getCurrentUserId", () => {
   it("returns null before resolveIdentity has been called", async () => {
     const { getCurrentUserId } = await import("./identity");
@@ -501,6 +635,44 @@ describe("authenticatedFetch", () => {
 
       const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
       expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_target");
+    });
+
+    it.each([
+      [{ host_type: "managed", host_id: "host_fork" }, "host_fork"],
+      [{ host_type: "managed" }, null],
+      [{}, "host_source"],
+    ])("keys a managed fork only by the host it names (%j)", async (body, key) => {
+      // A managed fork's launch runs on the replica it lands on, so it must
+      // land where its own new host will connect (unkeyed without an id),
+      // never on the source's; any other fork keeps the source's key.
+      vi.doMock("./sessionHost", () => ({
+        getSessionHost: vi.fn(() => "host_source"),
+        setSessionHost: vi.fn(),
+        isHostKeyless: vi.fn(() => false),
+        markHostKeyless: vi.fn(),
+        clearHostKeyless: vi.fn(),
+        modalHostId: vi.fn(() => "host_modal"),
+        resolveModalHost: vi.fn(),
+        isModalHostResolved: vi.fn(() => true),
+      }));
+      vi.doMock("./host", () => ({
+        getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        hostFetch: fetchMock,
+        isDatabricksWorkspace: vi.fn(() => true),
+        isHostRoutingEnabled: vi.fn(() => true),
+      }));
+
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+      const { authenticatedFetch } = await import("./identity");
+
+      await authenticatedFetch("/v1/sessions/conv_src/fork", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+      const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+      expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe(key);
     });
   });
 });

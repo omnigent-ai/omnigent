@@ -9,6 +9,7 @@ import {
   fetchConversationsPage,
   timeInitialConversationLoad,
   useConversations,
+  type SessionSortBy,
 } from "./useConversations";
 
 export function useScopeCache(
@@ -18,11 +19,19 @@ export function useScopeCache(
   maxRefreshSessions = sidebarConfig.maxRefreshSessions,
   entryKey: string | null = null,
   pageSize = sidebarConfig.sessionPageSize,
+  sortBy: SessionSortBy = "updated_at",
 ) {
   const client = useQueryClient();
   const queryKey = useMemo(
-    () => ["conversations", "", false, null, visibility] as const,
-    [visibility],
+    () => [
+      "conversations",
+      "",
+      false,
+      null,
+      visibility,
+      ...(sortBy === "created_at" ? [sortBy] : []),
+    ],
+    [visibility, sortBy],
   );
   const pendingPage = useRef<AbortController | null>(null);
   const pendingResult = useRef<Promise<void> | null>(null);
@@ -55,9 +64,10 @@ export function useScopeCache(
           queryClient: client,
           signal,
           limit,
+          sortBy,
         }),
       );
-      return refreshScopeWindow(client.getQueryData<ScopeCacheData>(queryKey), page, limit);
+      return refreshScopeWindow(client.getQueryData<ScopeCacheData>(queryKey), page, limit, sortBy);
     },
     select: filterData,
     staleTime: enabled ? 30_000 : "static",
@@ -101,10 +111,11 @@ export function useScopeCache(
           queryClient: client,
           signal: controller.signal,
           limit: pageSize,
+          sortBy,
         });
         if (controller.signal.aborted) return;
         client.setQueryData<ScopeCacheData>(queryKey, (current) =>
-          current ? appendScopePage(current, page, pageSize) : current,
+          current ? appendScopePage(current, page, pageSize, sortBy) : current,
         );
       })();
       // Refresh waits only for a page request, never for a click queued behind it.
@@ -127,7 +138,7 @@ export function useScopeCache(
       pendingPage.current = null;
       pendingResult.current = null;
     };
-  }, [enabled, visibility]);
+  }, [enabled, visibility, sortBy]);
 
   const { mutateAsync } = pagination;
   const fetchNextPage = useCallback(async () => {
@@ -169,15 +180,22 @@ export function useScopeCache(
   };
 }
 
-export function useArchivedSessions(enabled: boolean) {
-  const query = useConversations("", false, { enabled, snapshot: true }, undefined, "archived");
-  const wasEnabled = useRef(false);
+export function useArchivedSessions(enabled: boolean, sortBy: SessionSortBy = "updated_at") {
+  const query = useConversations(
+    "",
+    false,
+    { enabled, snapshot: true, sortBy },
+    undefined,
+    "archived",
+  );
+  const previousEntry = useRef({ enabled: false, sortBy });
   const { data, refetch } = query;
   useEffect(() => {
-    const opening = enabled && !wasEnabled.current;
-    wasEnabled.current = enabled;
-    // The initial load is automatic; later entries refresh the retained snapshot.
+    const opening =
+      enabled && (!previousEntry.current.enabled || sortBy !== previousEntry.current.sortBy);
+    previousEntry.current = { enabled, sortBy };
+    // The initial load is automatic; entries and sort changes refresh retained snapshots.
     if (opening && data) void refetch({ cancelRefetch: false });
-  }, [enabled, data, refetch]);
+  }, [enabled, sortBy, data, refetch]);
   return query;
 }

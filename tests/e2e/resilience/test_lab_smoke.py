@@ -7,16 +7,87 @@ lab itself; scenario scripts assert the product's behavior under faults.
 
 from __future__ import annotations
 
+import errno
+import socket
 import time
 import uuid
 from collections.abc import Callable
+from pathlib import Path
 
 import psutil
 import pytest
 
-from tests.e2e.resilience.lab.lab import Lab, LabMode
+from tests.e2e.resilience.lab.lab import Lab, LabConfig, LabMode
+from tests.e2e.resilience.lab.proxy import FaultProxy
 
 _TURN_TIMEOUT_S = 120.0
+
+
+@pytest.mark.timeout(60)
+def test_upstream_ports_remain_available_after_proxy_startup_and_server_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lab = Lab(LabConfig(root=tmp_path / "lab"))
+    original_start = FaultProxy.start
+    proxy_choices: list[int] = []
+
+    def start(proxy: FaultProxy) -> None:
+        if proxy.name == "client":
+            # Choose an upstream port whenever it is free, as an ephemeral
+            # allocation can do before the upstream process binds it.
+            for port in (lab._model_port, lab._server_port):
+                with socket.socket() as probe:
+                    try:
+                        probe.bind(("127.0.0.1", port))
+                    except OSError as error:
+                        assert error.errno == errno.EADDRINUSE
+                        continue
+                proxy._listen_port = port
+                proxy_choices.append(port)
+                break
+        original_start(proxy)
+
+    monkeypatch.setattr(FaultProxy, "start", start)
+    # No host or native harness is needed to exercise listener ownership.
+    monkeypatch.setattr(lab, "_start_host", lambda: None)
+    with lab:
+        assert proxy_choices == []
+        proxy_ports = {lab.proxies.client.port, lab.proxies.host.port, lab.proxies.model.port}
+        assert not proxy_ports.intersection({lab._server_port, lab._model_port})
+        assert lab.model is not None
+        assert lab.model.requests() == []
+        assert lab._client(lab.proxies.model.url).get("/stats").status_code == 200
+        server_url = lab.server_url
+        lab.restart_server()
+        assert lab.server_url == server_url
+        assert lab.observer is not None
+        assert lab.observer.get("/health").status_code == 200
+        assert lab._client(lab.proxies.model.url).get("/stats").status_code == 200
+    assert all(not process.running for process in lab._processes)
+    for port in (lab._server_port, lab._model_port):
+        with socket.socket() as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(("127.0.0.1", port))
+
+
+@pytest.mark.parametrize("start_fails", [False, True])
+def test_stopping_a_lab_releases_upstream_ports_before_processes_start(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, start_fails: bool
+) -> None:
+    lab = Lab(LabConfig(root=tmp_path / "lab"))
+    if start_fails:
+
+        def fail(_proxy: FaultProxy) -> None:
+            raise RuntimeError("owned proxy startup failed")
+
+        monkeypatch.setattr(FaultProxy, "start", fail)
+        with pytest.raises(RuntimeError, match="owned proxy startup failed"):
+            lab.start()
+    else:
+        lab.stop()
+    for port in (lab._server_port, lab._model_port):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", port))
 
 
 def _round_trip(lab: Lab, session_id: str) -> str:

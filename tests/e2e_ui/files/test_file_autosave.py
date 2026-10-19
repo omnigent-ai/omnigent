@@ -143,6 +143,24 @@ def test_markdown_edit_autosaves(page: Page, seeded_markdown: tuple[str, str]) -
     persisted = _wait_for_persisted(base_url, session_id, _MARKDOWN_PATH, sentinel)
     assert sentinel in persisted
 
+    # Undo after saving must persist the older document, then redo must save
+    # the edit again against that new baseline.
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PUT"
+            and response.url.endswith(f"/filesystem/{_MARKDOWN_PATH}")
+        )
+    ) as undo_save:
+        page.keyboard.press("ControlOrMeta+z")
+        expect(editor).not_to_contain_text(sentinel)
+    assert undo_save.value.ok
+    assert _read_file(base_url, session_id, _MARKDOWN_PATH).strip() == _MARKDOWN_CONTENT.strip()
+    page.keyboard.press("ControlOrMeta+Shift+z")
+    expect(editor).to_contain_text(sentinel)
+    assert _wait_for_persisted(base_url, session_id, _MARKDOWN_PATH, sentinel) == persisted
+    page.reload()
+    expect(editor).to_contain_text(sentinel)
+
 
 def test_non_markdown_edit_autosaves(page: Page, seeded_python: tuple[str, str, str]) -> None:
     """The full file can be viewed and edited without losing its tail on save."""

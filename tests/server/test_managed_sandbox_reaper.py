@@ -8,15 +8,24 @@ from collections.abc import Callable, Iterator
 from dataclasses import replace
 
 import pytest
+from sqlalchemy import update
+from sqlalchemy.orm import Session
 
-from omnigent.db.db_models import current_workspace_id
+from omnigent.db.db_models import SqlHost, current_workspace_id
+from omnigent.db.enum_codecs import encode_host_status
+from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.server.managed_hosts import (
     ManagedSandboxConfig,
     ManagedSandboxDeployment,
     ManagedSandboxReaperConfig,
 )
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
-from omnigent.stores.host_store import Host, ManagedSandboxScanCursor, ManagedSandboxScanRow
+from omnigent.stores.host_store import (
+    Host,
+    HostStore,
+    ManagedSandboxScanCursor,
+    ManagedSandboxScanRow,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -531,6 +540,54 @@ async def test_successful_termination_preserves_new_active_generation() -> None:
     assert modal.terminated == ["sb-modal"]
     assert hosts.hosts[7]["host_modal"].sandbox_id == "sb-modal-new"
     assert hosts.hosts[7]["host_modal"].terminating_sandbox_id is None
+
+
+@pytest.mark.parametrize("stale_status", ["offline", "online"])
+async def test_new_binding_gets_reaping_grace_without_reviving_host(
+    db_uri: str, stale_status: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hosts = HostStore(db_uri)
+    host_id = "ab" * 16
+    modal = _RecordingLauncher("modal")
+    reaper = ManagedSandboxReaper(host_store=hosts, sandbox_config=_deployment([modal]))
+    now = now_epoch()
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: now)
+    hosts.reserve_sandbox_host(
+        host_id=host_id, name="managed-host", user_id="alice@example.com", provider="modal"
+    )
+    hosts.bind_sandbox(host_id, provider="modal", sandbox_id="old")
+    with Session(get_or_create_engine(db_uri)) as session:
+        session.execute(
+            update(SqlHost)
+            .where(SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id)
+            .values(updated_at=now - 2 * _DAY_S)
+        )
+        session.commit()
+    assert await reaper.sweep_once(now=now) == 1
+    assert modal.terminated == ["old"]
+
+    # A durable row may retain online status after an unclean host disconnect.
+    with Session(get_or_create_engine(db_uri)) as session:
+        session.execute(
+            update(SqlHost)
+            .where(SqlHost.workspace_id == current_workspace_id(), SqlHost.host_id == host_id)
+            .values(status=encode_host_status(stale_status))
+        )
+        session.commit()
+    hosts.reserve_sandbox_host(
+        host_id=host_id, name="managed-host", user_id="alice@example.com", provider="modal"
+    )
+    bound = hosts.bind_sandbox(host_id, provider="modal", sandbox_id="replacement")
+    assert bound is not None
+    assert not hosts.is_online(host_id)
+    assert await reaper.sweep_once(now=now) == 0
+    assert modal.terminated == ["old"]
+    assert hosts.get_host(host_id) == bound
+    # Rebinding the same generation must not extend its lifetime indefinitely.
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: now + 3600)
+    assert hosts.bind_sandbox(host_id, provider="modal", sandbox_id="replacement") == bound
+    assert await reaper.sweep_once(now=now + _DAY_S) == 1
+    assert modal.terminated == ["old", "replacement"]
 
 
 async def test_pending_termination_retries_without_detaching_active_generation() -> None:

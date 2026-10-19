@@ -19,6 +19,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.routes._host_launch import (
     LAUNCH_TIMEOUT_ENV_VAR,
+    configure_host_sharding,
     host_absent_error,
     resolve_host_launch,
     resolve_host_owner,
@@ -295,6 +296,16 @@ class TestHostAbsentError:
         host = _FakeHost(host_id="host_1", status="offline", updated_at=0)
         assert host_absent_error(host, sharded=True).code == ErrorCode.CONFLICT
         assert host_absent_error(host, sharded=False).code == ErrorCode.CONFLICT
+
+    def test_default_follows_configured_sharding(self) -> None:
+        """Without an explicit ``sharded``, the deployment's setting decides."""
+        host = _FakeHost(host_id="host_1", status="online", updated_at=now_epoch())
+        try:
+            assert host_absent_error(host).code == ErrorCode.CONFLICT
+            configure_host_sharding(True)
+            assert host_absent_error(host).code == ErrorCode.WRONG_REPLICA
+        finally:
+            configure_host_sharding(False)
 
 
 # ── resolve_launch_timeout_s (operator-tunable launch budget) ─────────
