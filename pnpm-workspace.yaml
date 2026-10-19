@@ -53,6 +53,8 @@ overrides:
   react: "catalog:"
   react-dom: "catalog:"
   dompurify: 3.4.14
+  # KaTeX 0.18.11 was accidentally published with breaking changes.
+  'katex@0.18.11': 0.18.10
   mermaid: 11.16.1
   tar: 7.5.21
   'node-gyp>undici': 6.28.0
