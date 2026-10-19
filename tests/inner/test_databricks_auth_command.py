@@ -397,6 +397,7 @@ def test_no_sidecar_falls_back_to_the_sdk_mint_not_the_broker(
             "myprofile",
         ]
     )
+    sdk_mint = f"cd / && exec {sdk_mint}"
     # The eval-fallback clause now carries the sdk mint.
     assert f"eval {shlex.quote(sdk_mint)}" in cmd
 
@@ -421,6 +422,7 @@ def test_the_sdk_fallback_selects_by_host_when_no_profile(
             "https://example.databricks.com",
         ]
     )
+    sdk_mint = f"cd / && exec {sdk_mint}"
     assert f"eval {shlex.quote(sdk_mint)}" in cmd
 
 
@@ -460,12 +462,15 @@ def test_the_sdk_fallback_runs_under_omnigents_interpreter_not_path_python3(
 
 
 @pytest.mark.posix_only
+@pytest.mark.parametrize("pythonpath_prefix", ["", ":"])
 def test_an_omnigent_package_in_the_workspace_cannot_stand_in_for_the_sdk_mint(
-    tmp_path: Path,
+    tmp_path: Path, pythonpath_prefix: str
 ) -> None:
     """The helper runs in the agent's workspace, and ``-m`` would put that cwd
     first on ``sys.path``: an ``omnigent`` package there (a checkout, or one an
-    agent wrote) would mint in place of the installed one. ``-P`` keeps it off."""
+    agent wrote) would mint in place of the installed one. ``-P`` keeps it off,
+    and running from ``/`` covers an empty ``PYTHONPATH`` component (``:``),
+    which ``-P`` does not."""
     from omnigent.inner.databricks_executor import databricks_bearer_token_command
 
     shadow = tmp_path / "workspace" / "omnigent" / "inner"
@@ -484,7 +489,10 @@ def test_an_omnigent_package_in_the_workspace_cannot_stand_in_for_the_sdk_mint(
         force_refresh_works=False,
         cached_token_works=False,
         cwd=tmp_path / "workspace",
-        extra_env=_offline_databricks_sdk(tmp_path / "sdk"),
+        extra_env={
+            "PYTHONPATH": pythonpath_prefix
+            + _offline_databricks_sdk(tmp_path / "sdk")["PYTHONPATH"]
+        },
     )
     assert token == "sdk-minted"
 
@@ -498,7 +506,16 @@ def test_the_sdk_fallback_names_python3_when_the_interpreter_is_unknown(
 
     monkeypatch.setattr(sys, "executable", "")
     command = _databricks_sdk_token_command("https://example.databricks.com", None)
-    assert shlex.split(command)[:4] == ["python3", "-P", "-m", "omnigent.inner.databricks_token"]
+    assert shlex.split(command)[:8] == [
+        "cd",
+        "/",
+        "&&",
+        "exec",
+        "python3",
+        "-P",
+        "-m",
+        "omnigent.inner.databricks_token",
+    ]
 
 
 def test_the_connect_profile_tries_the_broker_then_the_sdk_fallback(
