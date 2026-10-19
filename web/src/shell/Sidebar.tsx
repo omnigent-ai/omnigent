@@ -2,6 +2,7 @@ import { filterSessionScope } from "@/lib/sessionVisibility";
 import { getCurrentUserId } from "@/lib/identity";
 import { PinCapacityContext, SidebarConfigContext } from "@/lib/sidebarConfig";
 import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
+import { useSidebarWorkingIds } from "@/hooks/useSidebarWorkingIds";
 import { useSidebarData, useSidebarView, type SidebarListQuery } from "@/hooks/useSidebarData";
 import { useArchivedSessions } from "@/hooks/useScopeCache";
 import { InfiniteScrollSentinel, type AutoLoadBudget } from "@/components/InfiniteScrollSentinel";
@@ -274,6 +275,8 @@ import AntigravityColor from "@lobehub/icons/es/Antigravity/components/Color";
 import DevinColor from "@lobehub/icons/es/Devin/components/Color";
 import KiroColor from "@lobehub/icons/es/Kiro/components/Color";
 import { type PullRequest, usePullRequestInfo } from "@/hooks/usePullRequests";
+import { matchWorktree } from "@/hooks/useHostWorktrees";
+import { useSessionWorktrees } from "@/hooks/useSessionWorktrees";
 import {
   deriveRepoName,
   localMachineLabel,
@@ -1773,6 +1776,7 @@ function ConversationList({
     () => conversationsQuery.data?.pages.flatMap((page) => page.data) ?? [],
     [conversationsQuery.data],
   );
+  const workingIds = useSidebarWorkingIds(allConversations, startingId, statusView);
 
   // Project folders ({ id, name }) for grouping sessions — first-class id
   // and/or the legacy omni_project label, unioned server-side.
@@ -1964,8 +1968,10 @@ function ConversationList({
       if (frozen) return frozen;
       const unseen = isConversationUnseen(c.id, c.updated_at, c.status);
       const bucket = statusBucket(c, unseen, hasSessionDraft(c.id));
-      // Like the row's spinner, the open session is Working while it starts up.
-      const live = bucket !== "Needs attention" && c.id === startingId ? "Working" : bucket;
+      const live =
+        bucket !== "Needs attention" && (c.id === startingId || workingIds.has(c.id))
+          ? "Working"
+          : bucket;
       frozenStatus?.set(c.id, live);
       return live;
     };
@@ -2017,6 +2023,7 @@ function ConversationList({
     unseenTick,
     draftIds,
     startingId,
+    workingIds,
   ]);
 
   const config = useContext(SidebarConfigContext);
@@ -2043,12 +2050,17 @@ function ConversationList({
     };
   }, [loadedSections, displayPagination.rows]);
   // The paginated Sessions rows split into titled groups; null keeps the single
-  // "Sessions" section (default grouping, or nothing to group).
+  // "Sessions" section (default/date grouping with nothing to group).
   const sessionGroups = useMemo(() => {
     const titles = loadedSections.groupTitles;
-    if (!titles || sections.sessions.length === 0) return null;
-    return groupConversations(sections.sessions, (c) => titles.get(c.id), groupOrder);
-  }, [loadedSections.groupTitles, sections.sessions, groupOrder]);
+    if (!titles || (sections.sessions.length === 0 && !statusView)) return null;
+    return groupConversations(
+      sections.sessions,
+      (c) => titles.get(c.id),
+      groupOrder,
+      statusView ? "Working" : undefined,
+    );
+  }, [loadedSections.groupTitles, sections.sessions, groupOrder, statusView]);
 
   // Scope-active flags: which section owns the current selection UI (checkboxes
   // + bulk-action bar). Only one is true at a time unless the selection is unified.
@@ -2858,8 +2870,20 @@ function ConversationList({
                           {sessionGroups.map((group, index) => (
                             <ConversationSection
                               key={group.title}
-                              title={group.title}
+                              title={
+                                index === 0
+                                  ? group.title
+                                  : group.title.replace(
+                                      /^(?:Created|Updated) (.)/,
+                                      (_, initial: string) => initial.toUpperCase(),
+                                    )
+                              }
                               conversations={group.conversations}
+                              emptyMessage={
+                                group.title === "Working" && !sessionStatus
+                                  ? emptyMessage
+                                  : undefined
+                              }
                               footer={
                                 index === sessionGroups.length - 1 ? sessionStatus : undefined
                               }
@@ -4285,7 +4309,7 @@ function SessionMetaLine({
           {i > 0 && <span aria-hidden>·</span>}
           <span className="flex min-w-0 items-center gap-1">
             <Icon aria-hidden className="size-3.5 shrink-0" />
-            <span className="truncate">{value}</span>
+            <span className={key === "environment" ? "sr-only" : "truncate"}>{value}</span>
           </span>
         </Fragment>
       ))}
@@ -4721,7 +4745,19 @@ function ConversationRowImpl({
     <SessionEnvironmentLabel conversation={conversation} hostsById={hostsById} />
   ) : null;
   const metaRepo = show.includes("repo") ? sessionRepoName(conversation) : null;
-  const metaBranch = show.includes("branch") ? gitBranch : null;
+  const loadBranch = show.includes("branch") && gitBranch === null;
+  const { data: worktrees } = useSessionWorktrees(
+    loadBranch ? conversation.id : null,
+    loadBranch ? conversation.host_id : null,
+    loadBranch ? conversation.workspace : null,
+  );
+  const workspaceWorktree =
+    loadBranch && worktrees?.status === "ok" && conversation.workspace
+      ? matchWorktree(worktrees.worktrees, conversation.workspace)
+      : null;
+  const metaBranch = show.includes("branch")
+    ? (gitBranch ?? (workspaceWorktree?.detached ? null : (workspaceWorktree?.branch ?? null)))
+    : null;
   // Overlays (checkbox, badges, controls; each also `-translate-y-1/2`) center on
   // the row, or on the title line — padding + half its 20px box — above a meta line.
   const overlayTop =

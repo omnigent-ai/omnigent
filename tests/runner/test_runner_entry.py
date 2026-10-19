@@ -410,6 +410,29 @@ def test_initial_host_token_defers_local_auth_until_rejected(
     assert mint_calls == []
 
 
+def test_initial_token_factory_reports_a_fallback_sign_in_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The host bearer never waits on a sign-in; the fallback source behind it can."""
+
+    class _PendingFallback:
+        sign_in_pending = True
+
+        def __call__(self) -> str | None:
+            return None
+
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory", lambda *_a, **_k: _PendingFallback()
+    )
+    factory = _InitialAuthTokenFactory("host-bootstrap-token", "https://app.databricksapps.com")
+
+    assert factory() == "host-bootstrap-token"
+    assert factory.sign_in_pending is False
+    assert factory.invalidate() is True
+    assert factory() is None
+    assert factory.sign_in_pending is True
+
+
 def test_initial_host_token_falls_back_to_managed_mint_when_no_sdk_auth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -151,7 +151,7 @@ def python_changes(read, files: set[str], policy: dict) -> dict:
         changes,
         "uv.lock",
         "uv",
-        ["ci.yml", "lint.yml", "integration.yml", "e2e.yml"],
+        ["ci.yml", "lint.yml", "integration.yml", "e2e.yml", "e2e-ui.yml"],
         ["Pre-commit checks", "Pytest (runtime-core)", "Integration (openai-agents)"],
     )
 
@@ -355,7 +355,7 @@ def github_release(repository: str, sha: str, days: int) -> tuple[str, str]:
 def action_changes(read, files: set[str], policy: dict, *, for_scan: bool = False) -> dict:
     changes = set()
     exercised = set()
-    workflows = {"ci.yml", "lint.yml"}
+    workflows = {"ci.yml", "lint.yml", "integration.yml", "e2e.yml", "e2e-ui.yml"}
     pattern = re.compile(r"^(\s*-?\s*uses:\s*)([\w-]+/[\w./-]+)@([a-f0-9]{40})(\s*(?:#.*)?)$")
     for path in sorted(files):
         require(
@@ -482,7 +482,7 @@ def cargo_changes(read, files: set[str], policy: dict) -> dict:
         target,
         "cargo",
         ["ci.yml", "e2e-ui.yml"],
-        ["Pytest (codex-parity)", "Browser Contract UI"],
+        ["Pytest (codex-parity)"],
     )
 
 

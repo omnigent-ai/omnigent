@@ -1497,6 +1497,34 @@ describe("ForkSessionDialog", () => {
       await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
     });
 
+    it.each([true, false])(
+      "chooses the sandbox host's id only on a server that accepts it (%s)",
+      async (accepts) => {
+        forkSessionMock.mockResolvedValue({
+          id: "conv_fork",
+        } as unknown as Awaited<ReturnType<typeof forkSession>>);
+        renderDialog({
+          ...CODING,
+          info: {
+            managed_sandboxes_enabled: true,
+            sandbox_provider: "modal",
+            request_managed_sandbox_host_id: accepts,
+          },
+        });
+
+        selectSandbox();
+        fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+        await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+        const sandbox = forkSessionMock.mock.calls[0][1]?.sandbox;
+        if (accepts) {
+          expect(sandbox?.hostId).toMatch(/^[0-9a-f]{32}$/);
+        } else {
+          expect(sandbox !== undefined && "hostId" in sandbox).toBe(false);
+        }
+      },
+    );
+
     it("inherits ALL repositories from a multi-repo sandbox source", async () => {
       // A source with several repos records them space-joined; the single
       // URL/branch fields can't represent that, so the fork shows a read-only

@@ -129,9 +129,19 @@ session impact or changes KPI eligibility.
   grace window without readiness starts a new outage ID and does not recover
   the previous one.
 - `runner_stream_disconnected`: the relay's give-up row, with `decision`
-  (`intentional_stop`, `server_shutdown`, `live_elsewhere`, `idle_no_failure` or
-  `failed_mid_turn`), the matching `outage_id`, loss-time `runner_id`/`turn_id`,
-  `grace_s`, `outage_s`, `retries`, and the schema marker. `outage_s` is the
+  (`intentional_stop`, `server_shutdown`, `handed_off`, `live_elsewhere`,
+  `rebound`, `idle_no_failure` or `failed_mid_turn`), the matching `outage_id`,
+  loss-time `runner_id`/`turn_id`, `grace_s`, `outage_s`, `retries`, and the
+  schema marker. `server_shutting_down` and `runner_handoff_reason` say whether
+  this replica's own shutdown mark or a per-runner handoff mark was fresh at the
+  decision; `handed_off` means this replica retired the runner's tunnel itself
+  (`runner_handoff_reason = tunnel_retired`, or the reason a caller recorded
+  with `mark_runner_handed_off`), so another replica owns the turn. `rebound`
+  means the stored binding named another runner both when the transport was
+  lost and at the decision: the session had moved on a replica that could not
+  cancel this relay, so the lost runner no longer owns its turn. A move during
+  the outage still fails the turn. The
+  `runner_disconnected` row carries the same two attributes. `outage_s` is the
   time since the current grace window opened; a reconnect that dropped again
   within the window does not reset it, so it includes that brief connected
   stretch and is not cumulative disconnected time.
@@ -139,7 +149,10 @@ session impact or changes KPI eligibility.
   relay (`origin = runner_disconnected_mid_turn`) or offline sweep
   (`origin = runner_offline_sweep`). `decision` is `idle_no_failure`,
   `failed_mid_turn`, `failed_before_start`, `already_failed`, `intentional_stop`,
-  or `subagent_unobserved`.
+  `handed_off`, or `subagent_unobserved`, alongside `server_shutting_down` and
+  `runner_handoff_reason` as above. A `runner_tunnel_handed_off` info row marks
+  the start of each per-runner handoff window, and the first
+  `server_shutdown_marked` row the start of each shutdown window.
   Idle subsessions keep their status and emit no `session_turn_failed` event
   or error labels. Running and waiting sessions still fail on disconnect, but
   a subsession mirrored from a native parent (such as a Claude subsession)

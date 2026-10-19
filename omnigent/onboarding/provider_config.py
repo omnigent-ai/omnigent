@@ -63,8 +63,15 @@ from omnigent.util.env_credentials import (
 
 _logger = logging.getLogger(__name__)
 
-# Protocol families: Anthropic Messages, OpenAI Responses/Chat, and native
-# Gemini generateContent (agy). Pi consumes the Anthropic/OpenAI surfaces.
+# Family keys. ``anthropic`` is the Messages-API surface (Claude SDK,
+# native Claude); ``openai`` is the Responses/Chat surface (Codex,
+# native Codex, OpenAI-Agents SDK). ``pi`` consumes both. ``gemini`` is the
+# Google Gemini surface — the credential the native Antigravity (``agy``)
+# onboarding adopts as a ``key``-kind provider with a ``gemini:`` block from a
+# detected ``GEMINI_API_KEY``. It is key-only: a gateway/local proxy cannot
+# drive it, and the ``antigravity-native`` (``agy``) OAuth flavor consumes no
+# provider credential at all (its readiness is the file-based OAuth check in
+# :mod:`omnigent.onboarding.gemini_auth`, not a ``gemini:`` family here).
 ANTHROPIC_FAMILY = "anthropic"
 OPENAI_FAMILY = "openai"
 GEMINI_FAMILY = "gemini"
@@ -433,8 +440,6 @@ class ProviderEntry:
     model_provider: str | None = None
     display_name: str | None = None
     default_families: frozenset[str] = frozenset()
-    # Databricks Gemini routing is opt-in and has a separate default scope.
-    native_gemini: bool = False
 
     @property
     def default(self) -> bool:
@@ -709,11 +714,19 @@ def _parse_family(provider_name: str, family_name: str, raw: dict[str, object]) 
             code=ErrorCode.INVALID_INPUT,
         )
 
-    # agy sends static keys in x-goog-api-key; token refresh is not supported.
+    # The ``gemini`` family is consumed by the antigravity harness, which drives
+    # the google SDK with a STATIC GEMINI_API_KEY. ``auth_command`` mints a
+    # bearer token — useless as a GEMINI_API_KEY — so an ``auth_command`` gemini
+    # block is nonsensical. Reject it HERE (parse) so it never reaches
+    # provider_families / default-resolution / the display+readiness layer /
+    # spawn / ``/models``: every layer then agrees by construction. ``auth_command``
+    # stays valid for anthropic/openai families (gateways / dynamic tokens).
     if family_name == GEMINI_FAMILY and isinstance(auth_command_raw, str) and auth_command_raw:
         raise OmnigentError(
-            f"{prefix}.auth_command is not allowed on a 'gemini' family: "
-            "native agy requires a static 'api_key' or 'api_key_ref'.",
+            f"{prefix}.auth_command is not allowed on a 'gemini' family: the "
+            "antigravity harness drives Gemini with a static GEMINI_API_KEY, and "
+            "an auth_command mints a bearer token the google SDK cannot use as one. "
+            "Use a static key source ('api_key' or 'api_key_ref') instead.",
             code=ErrorCode.INVALID_INPUT,
         )
 
@@ -1026,24 +1039,17 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
                 f"provider {name!r}: a profile or connection: databricks is required.",
                 code=ErrorCode.INVALID_INPUT,
             )
-        native_gemini = raw.get("native_gemini", False)
-        if not isinstance(native_gemini, bool):
-            raise OmnigentError("native_gemini must be a boolean", code=ErrorCode.INVALID_INPUT)
-        if native_gemini and connection_raw is not None:
-            raise OmnigentError(
-                f"provider {name!r}: native Gemini requires a local Databricks profile; "
-                "connection: databricks is not supported. Use omni setup on the host.",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        served = {GEMINI_FAMILY} if native_gemini else set(_PI_FALLBACK_FAMILIES)
+        # Databricks (ucode) routes the anthropic/openai surfaces + pi, but NOT
+        # gemini: the antigravity harness drives Gemini via the dedicated google
+        # SDK + GEMINI_API_KEY, not an OpenAI-compatible gateway, so a databricks
+        # profile cannot serve (or default) the Gemini surface.
         return ProviderEntry(
             name=name,
             kind=kind,
             profile=profile_raw if isinstance(profile_raw, str) else None,
             connection=connection_raw,
-            native_gemini=native_gemini,
             default_families=_parse_default_families(
-                name, default_raw, served, pi_capable=not native_gemini
+                name, default_raw, set(_VALID_FAMILIES) - {GEMINI_FAMILY}, pi_capable=True
             ),
         )
 
@@ -1059,7 +1065,26 @@ def _parse_provider(name: str, raw: dict[str, object]) -> ProviderEntry:
             "'anthropic', 'openai', or 'gemini' family.",
             code=ErrorCode.INVALID_INPUT,
         )
+    # The Gemini surface is key-ONLY (the antigravity flavors need either a raw
+    # GEMINI_API_KEY or OAuth — never a proxy). A ``gateway`` / ``local`` may
+    # *carry* a gemini block alongside a real family (we ignore it for the Gemini
+    # surface — see :func:`provider_families`), but one whose ONLY family is
+    # gemini configures nothing it can actually serve: reject it loudly here.
+    if kind != KEY_KIND and set(families) == {GEMINI_FAMILY}:
+        raise OmnigentError(
+            f"provider {name!r} (kind {kind!r}) declares only a 'gemini' family, "
+            "but the Gemini surface is served only by a 'key' provider with a real "
+            "GEMINI_API_KEY (a gateway/local proxy cannot drive the antigravity "
+            "harness). Use kind: 'key', or add an 'anthropic'/'openai' family.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    # Scope the parseable default to the families this kind can actually serve:
+    # a gateway/local's gemini block never grants the Gemini surface, so a
+    # hand-edited ``default: gemini`` on a gateway must fail at parse (parity
+    # with how a databricks profile cannot name the gemini scope).
     served_for_default = set(families)
+    if kind != KEY_KIND:
+        served_for_default -= {GEMINI_FAMILY}
     return ProviderEntry(
         name=name,
         kind=kind,
@@ -1246,8 +1271,7 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
       serves the ``anthropic`` surface, ``codex`` serves the ``openai``
       surface, ``pi`` serves only the :data:`PI_SURFACE` scope (signals
       "use Pi's own native auth"). Other CLIs serve nothing.
-    - ``databricks``: Gemini only when ``native_gemini`` is enabled;
-      otherwise both families plus pi — ucode routes the Claude,
+    - ``databricks``: both families plus pi — ucode routes the Claude,
       Codex, and pi surfaces.
 
     :param entry: The provider entry to classify.
@@ -1264,6 +1288,16 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
         return frozenset(entry.families)
     if entry.kind in (KEY_KIND, GATEWAY_KIND, LOCAL_KIND):
         served = frozenset(entry.families)
+        # The Gemini surface is key-ONLY: it is consumed by the antigravity
+        # flavors (the SDK harness via a raw GEMINI_API_KEY, antigravity-native
+        # via OAuth), neither driveable by a gateway / local proxy. So a
+        # ``gateway`` / ``local`` declaring a ``gemini:`` block must NOT claim
+        # the Gemini surface — only a ``key`` may. Stripping it here (rather than
+        # at parse) keeps a multi-family gateway usable for its anthropic /
+        # openai surfaces; a gateway whose ONLY family is gemini is rejected at
+        # parse (see :func:`_parse_provider`).
+        if entry.kind != KEY_KIND:
+            served = served - {GEMINI_FAMILY}
         # pi consumes the anthropic / openai families only — a gemini-only key
         # serves just the Gemini surface, never pi (see ``_PI_FALLBACK_FAMILIES``).
         # Granting pi here would let the add flow auto-default pi to a gemini key
@@ -1299,8 +1333,9 @@ def provider_families(entry: ProviderEntry) -> frozenset[str]:
             return frozenset({OPENAI_FAMILY})
         return frozenset()
     if entry.kind == DATABRICKS_KIND:
-        served = frozenset(_PI_FALLBACK_FAMILIES) | {PI_SURFACE}
-        return frozenset({GEMINI_FAMILY}) if entry.native_gemini else served
+        # ucode routes anthropic/openai + pi, never the Gemini surface (which
+        # needs the antigravity SDK + GEMINI_API_KEY, not a gateway).
+        return (frozenset(_VALID_FAMILIES) - {GEMINI_FAMILY}) | {PI_SURFACE}
     return frozenset()
 
 
