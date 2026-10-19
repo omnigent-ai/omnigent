@@ -1322,10 +1322,11 @@ export function AppShell() {
       // gated nav tab — always valid, and never a fallback target.
       if (tab === null) return fallbackTab;
       if (tab === "sidechat") return tab;
+      if (tab === "content-search" && serverInfo === "loading") return tab;
       if (railTabsAvailable[tab]) return tab;
       return fallbackTab;
     });
-  }, [railTabsAvailable, rightRailTab, openPanels, fallbackWorkspaceTab]);
+  }, [railTabsAvailable, rightRailTab, openPanels, fallbackWorkspaceTab, serverInfo]);
 
   // Closing a file must not reveal an unpinned scope that was never opened.
   useEffect(() => {

@@ -95,9 +95,11 @@ describe("KeyboardShortcutsDialog", () => {
   it("shows the workspace search shortcut only when the feature is enabled", () => {
     const { rerender } = render(<KeyboardShortcutsList />);
     expect(screen.queryByText("Search workspace contents")).toBeNull();
+    expect(keysFor("Select a workspace tab")).toContain("1…4");
     contentSearchEnabled.mockReturnValue(true);
     rerender(<KeyboardShortcutsList />);
     expect(keysFor("Search workspace contents")).toEqual(["Ctrl", "⇧", "F"]);
+    expect(keysFor("Select a workspace tab")).toContain("1…5");
   });
 
   it("advertises the session-search chord without taking the Print shortcut", () => {

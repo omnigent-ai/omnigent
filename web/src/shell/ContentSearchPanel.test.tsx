@@ -94,7 +94,7 @@ it("submits content and options explicitly, highlights results and opens the exa
   );
   const result = await screen.findByRole("button", { name: "Open src/main.py at line 351" });
   expect(screen.getByText("Needle").tagName).toBe("MARK");
-  expect(screen.getByText(/first 500 matching lines/)).toBeInTheDocument();
+  expect(screen.getByText(/first 1 matching lines/)).toBeInTheDocument();
   fireEvent.click(result);
   expect(onFileSelect).toHaveBeenCalledWith("src/main.py", { line: 351, column: 4 });
 
@@ -108,7 +108,7 @@ it("submits content and options explicitly, highlights results and opens the exa
   expect(screen.getByLabelText("Match case")).toBeChecked();
   expect(screen.getByLabelText("Regular expression")).toBeChecked();
   expect(screen.getByText(/matching lines.*Needle/)).toBeInTheDocument();
-  expect(screen.getByText(/first 500 matching lines/)).toBeInTheDocument();
+  expect(screen.getByText(/first 1 matching lines/)).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Open src/main.py at line 351" }));
   expect(onFileSelect).toHaveBeenLastCalledWith("src/main.py", { line: 351, column: 4 });
   expect(authenticatedFetch).toHaveBeenCalledTimes(1);
@@ -174,4 +174,21 @@ it("shows runner errors and allows a fresh search with no matches", async () => 
   fireEvent.submit(screen.getByRole("searchbox").closest("form")!);
   expect(await screen.findByText("No matches for “needle”.")).toBeInTheDocument();
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
+it.each([
+  [502, "<html>Bad gateway</html>"],
+  [200, ""],
+  [200, "{}"],
+  [200, "null"],
+])("handles an invalid search response (%s, %s)", async (status, body) => {
+  vi.mocked(authenticatedFetch).mockResolvedValue(new Response(body, { status }));
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <ContentSearchPanel conversationId="session-one" onFileSelect={vi.fn()} />
+    </QueryClientProvider>,
+  );
+  fireEvent.change(screen.getByRole("searchbox"), { target: { value: "needle" } });
+  fireEvent.submit(screen.getByRole("searchbox").closest("form")!);
+  expect(await screen.findByRole("alert")).toHaveTextContent("Content search is unavailable.");
 });

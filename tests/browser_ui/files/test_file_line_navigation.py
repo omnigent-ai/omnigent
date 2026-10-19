@@ -42,6 +42,7 @@ class BrowserSession:
     comments: list[dict[str, object]] = field(default_factory=list)
     runner_online: bool = True
     host_online: bool = True
+    features: dict[str, bool] = field(default_factory=dict)
 
     def __iter__(self) -> Iterator[str]:
         yield self.contract.base_url
@@ -84,7 +85,7 @@ def seeded_session(browser_contract: BrowserContract) -> BrowserSession:
             "server_version": "browser-contract",
             "smart_routing_enabled": False,
             "smart_routing_sources": {"external": False, "oss": False},
-            "features": {"workspace_content_search": True},
+            "features": session.features,
             "harness_install_enabled": False,
             "installable_harnesses": [],
             "dictation_available": False,
@@ -496,6 +497,7 @@ def test_content_search_opens_line_and_preserves_results(
     page: Page, seeded_session: BrowserSession
 ) -> None:
     """The tab, picker and hotkey preserve search and line navigation."""
+    seeded_session.features["workspace_content_search"] = True
     _seed_citation_file(page, seeded_session)
     seeded_session.contract.json(
         f"/v1/sessions/{seeded_session.session_id}/resources/environments/default/content-search",
@@ -550,6 +552,12 @@ def test_content_search_opens_line_and_preserves_results(
     result.click()
     page.wait_for_function(_CENTERED_LINE, arg={"text": _AFTER_LINES[350], "diff": False})
     expect(page).to_have_url(re.compile(r"[?&]line=351(?:&|$)"))
+    rail.get_by_role("tab", name="Content search", exact=True).click()
+    page.reload()
+    expect(rail.get_by_role("tab", name="Content search", exact=True)).to_have_attribute(
+        "aria-selected", "true"
+    )
+    expect(search).to_have_value("")
 
 
 def test_source_citation_centers_last_loaded_line(

@@ -19,7 +19,7 @@ import subprocess
 import tempfile
 import threading
 
-args = ["rg", "--json", "--no-config", "--no-messages", "--hidden",
+args = ["rg", "--json", "--no-config", "--hidden",
         "--glob=!.git", "--color=never", "--", query, "."]
 args[1:1] = ["--case-sensitive" if case_sensitive else "--ignore-case"]
 if not regex:
@@ -51,6 +51,7 @@ with tempfile.TemporaryFile() as errors:
     timer = threading.Timer(15, expire)
     timer.start()
     reached_end = False
+    searched = False
     try:
         while True:
             # Bound even a single JSON record from a generated/minified file.
@@ -64,6 +65,8 @@ with tempfile.TemporaryFile() as errors:
                     record = process.stdout.readline(1024 * 1024)
                 continue
             event = json.loads(record)
+            if event["type"] == "summary":
+                searched = True
             if event["type"] != "match":
                 continue
             if len(matches) == limit:
@@ -102,7 +105,14 @@ with tempfile.TemporaryFile() as errors:
     if expired.is_set():
         warning = "Search stopped after 15 seconds. Narrow your query and try again."
         truncated = True
-    elif process.returncode not in (0, 1) and not truncated:
+    # A summary distinguishes a search with read errors from an invalid pattern.
+    if (process.returncode == 2 and searched) or (error and truncated):
+        truncated = True
+        warning = ((warning + " ") if warning else "") + (
+            "Some files or ignore rules could not be read. "
+            "Results may be incomplete or include normally ignored files."
+        )
+    if process.returncode not in (0, 1) and not truncated:
         print(json.dumps({
             "error": error or "ripgrep could not complete the search. Check workspace access."
         }))

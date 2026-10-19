@@ -192,11 +192,17 @@ function shortcutGroupsFor(
     if (group.title === "View") {
       return {
         ...group,
-        items: group.items.filter(
-          (item) =>
-            (browser || item.label !== "Open a new browser tab") &&
-            (contentSearch || item.label !== "Search workspace contents"),
-        ),
+        items: group.items
+          .filter(
+            (item) =>
+              (browser || item.label !== "Open a new browser tab") &&
+              (contentSearch || item.label !== "Search workspace contents"),
+          )
+          .map((item) =>
+            contentSearch && item.label === "Select a workspace tab"
+              ? { ...item, keys: [MOD_KEY, ALT_KEY, "]", "1…5"] }
+              : item,
+          ),
       };
     }
     return group;

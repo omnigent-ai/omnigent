@@ -271,6 +271,23 @@ describe("AgentInfoButton hover behavior", () => {
     expect(search).toHaveFocus();
   });
 
+  it("keeps an interacted hover preview open and restores focus on dismissal", () => {
+    renderButton(AGENT_WITH_BOTH);
+    const trigger = screen.getByTestId("agent-info-trigger");
+    mousePointerEnter(trigger);
+    const panel = screen.getByTestId("agent-info-panel");
+    mousePointerLeave(trigger);
+    act(() => panel.focus());
+    mousePointerLeave(panel);
+    act(() => vi.advanceTimersByTime(HOVER_CLOSE_DELAY_MS + 50));
+    expect(panel).toHaveFocus();
+    expect(panel).toBeInTheDocument();
+    fireEvent.keyDown(panel, { key: "Escape" });
+    act(() => vi.runOnlyPendingTimers());
+    expect(screen.queryByTestId("agent-info-panel")).toBeNull();
+    expect(trigger).toHaveFocus();
+  });
+
   it("re-entering the icon during the close delay keeps the panel open", () => {
     renderButton(AGENT_WITH_BOTH);
     const trigger = screen.getByTestId("agent-info-trigger");

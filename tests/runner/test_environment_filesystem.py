@@ -1967,6 +1967,59 @@ def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("unreadable", [".env", ".ignore"])
+async def test_content_search_read_errors_keep_partial_results(
+    client: httpx.AsyncClient, workspace: Path, unreadable: str
+) -> None:
+    (workspace / "readable.txt").write_text("needle\n")
+    denied = workspace / unreadable
+    denied.write_text("readable.txt\n")
+    denied.chmod(0)
+    try:
+        response = await client.get(
+            "/v1/sessions/conv_test/resources/environments/default/content-search",
+            params={"q": "needle"},
+        )
+        result = response.json()
+        assert [match["path"] for match in result["matches"]] == ["readable.txt"], result
+        assert result["truncated"] is True
+        assert "ignore rules could not be read" in result["warning"]
+        assert "include normally ignored files" in result["warning"]
+    finally:
+        denied.chmod(0o600)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sandbox_type", _SANDBOX_BACKENDS)
+async def test_content_search_under_real_sandbox_keeps_readable_matches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sandbox_type: str
+) -> None:
+    from omnigent.runner.content_search import search_content
+
+    (tmp_path / ".env").write_text("needle secret\n")
+    (tmp_path / ".ignore").write_text("readable.txt\n")
+    (tmp_path / "readable.txt").write_text("needle\n")
+    monkeypatch.setenv("PYTHONPATH", f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(type=sandbox_type, read_paths=[str(_REPO_ROOT)]),
+        )
+    )
+    assert os_env is not None
+    try:
+        result = await search_content(os_env, "needle")
+        assert [match["path"] for match in result["matches"]] == ["readable.txt"], result
+        assert "secret" not in json.dumps(result)
+        if sandbox_type == "darwin_seatbelt":
+            assert result["truncated"] is True
+            assert "could not be read" in result["warning"]
+    finally:
+        os_env.close()
+
+
+@pytest.mark.asyncio
 async def test_search_no_matches_returns_empty_list(
     client: httpx.AsyncClient,
 ) -> None:

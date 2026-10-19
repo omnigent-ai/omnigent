@@ -63,6 +63,8 @@ shortcut should be unavailable.
   files allowed by ignore rules. Unsaved editor changes are not searched.
 - Binary files, `.git`, ignored files and symlinks are excluded. `.gitignore`
   follows ripgrep's normal repository detection; `.ignore` works outside Git.
+- Read errors retain partial results with a warning. Only sandbox-readable ignore
+  rules apply; inaccessible ignore files can leave normally ignored paths in results.
 - Searches return at most 500 matching lines and stop after 15 seconds. Partial
   results are labeled; exceptionally long matching lines may be omitted with a warning.
 - The server and runner both need this implementation. An offline or older runner,

@@ -1650,6 +1650,10 @@ export function AgentInfoButton({ agent, sessionId, permissionLevel }: AgentInfo
         data-testid="agent-info-panel"
         onPointerEnter={cancelCloseOnEnter}
         onPointerLeave={scheduleCloseOnLeave}
+        onFocusCapture={() => {
+          cancelClose();
+          openedByHoverRef.current = false;
+        }}
         onOpenAutoFocus={(e) => {
           if (openedByHoverRef.current) e.preventDefault();
         }}

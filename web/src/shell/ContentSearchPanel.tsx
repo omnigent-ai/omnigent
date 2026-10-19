@@ -64,11 +64,11 @@ export function ContentSearchPanel({
       const response = await authenticatedFetch(
         `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/default/content-search?${params}`,
       );
-      const body = await response.json();
-      if (!response.ok || body.error) {
+      const body = await response.json().catch(() => null);
+      if (!response.ok || body?.error || !Array.isArray(body?.matches)) {
         throw new Error(
-          (typeof body.error === "string" ? body.error : body.error?.message) ||
-            (typeof body.detail === "string" ? body.detail : null) ||
+          (typeof body?.error === "string" ? body.error : body?.error?.message) ||
+            (typeof body?.detail === "string" ? body.detail : null) ||
             "Content search is unavailable. Check that the runner is online and up to date.",
         );
       }
@@ -125,7 +125,8 @@ export function ContentSearchPanel({
           </label>
         </div>
         <p className="text-xs text-muted-foreground">
-          Searches workspace contents on disk. Respects ignore files; skips binary files and .git.
+          Searches workspace contents on disk. Respects readable ignore files; skips binary files
+          and .git.
         </p>
       </form>
       <div className="min-h-0 flex-1 overflow-auto p-2" aria-busy={search.isFetching}>
@@ -152,7 +153,7 @@ export function ContentSearchPanel({
             {(search.data.truncated || search.data.warning) && (
               <p role="status" className="p-2 text-xs text-muted-foreground">
                 {search.data.warning ||
-                  "Showing the first 500 matching lines. Narrow your query for more results."}
+                  `Showing the first ${search.data.matches.length} matching lines. Narrow your query for more results.`}
               </p>
             )}
             {[...files].map(([path, matches]) => (

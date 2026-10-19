@@ -173,6 +173,7 @@ class _RecordingRunnerClient:
     def __init__(self) -> None:
         self.posts: list[tuple[str, Any]] = []
         self.gets: list[str] = []
+        self.get_params: list[Any] = []
         self.puts: list[tuple[str, Any]] = []
         self.deletes: list[str] = []
 
@@ -206,6 +207,7 @@ class _RecordingRunnerClient:
         timeout: float | None = None,
     ) -> httpx.Response:
         del timeout
+        self.get_params.append(params)
         query = "&".join(f"{k}={v}" for k, v in (params or {}).items())
         self.gets.append(f"{url}&{query}" if query and "?" in url else url)
         return httpx.Response(
@@ -838,3 +840,17 @@ async def test_content_search_disabled_never_reaches_runner(
     )
     assert response.status_code == 404
     assert runner_client.gets == []
+
+
+@pytest.mark.asyncio
+async def test_content_search_forwards_options(
+    client: httpx.AsyncClient, runner_client: _RecordingRunnerClient
+) -> None:
+    path = "/v1/sessions/conv_share/resources/environments/default/content-search"
+    params = {"q": "  Needle.* & more  ", "case_sensitive": "true", "regex": "true", "limit": "7"}
+    response = await client.get(
+        path, params=params, headers={"X-Forwarded-Email": "owner@example.com"}
+    )
+    assert response.status_code == 200, response.text
+    assert runner_client.gets == [path]
+    assert runner_client.get_params == [params]

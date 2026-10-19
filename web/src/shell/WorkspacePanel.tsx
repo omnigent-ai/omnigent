@@ -849,7 +849,7 @@ function WorkspacePanelImpl({
   onMobileSideChatsOpenChange,
 }: WorkspacePanelProps) {
   const contentSearchInputRef = useRef<HTMLInputElement>(null);
-  const [focusContentSearch, setFocusContentSearch] = useState(false);
+  const [contentSearchFocusSession, setContentSearchFocusSession] = useState<string | null>(null);
   const browsers = useBrowserTabs(conversationId);
   const closeBrowserTab = async (tabId: string) => {
     const closed = await browsers.close(tabId);
@@ -1005,25 +1005,43 @@ function WorkspacePanelImpl({
       event.stopPropagation();
       onRightRailTabChange("content-search");
       onReveal?.();
-      setFocusContentSearch(true);
+      setContentSearchFocusSession(conversationId);
     };
     // Capture so workspace search also works from Monaco and terminal inputs.
     window.addEventListener("keydown", handleKeyDown, true);
     return () => window.removeEventListener("keydown", handleKeyDown, true);
-  }, [showContentSearch, showFilesPanel, pending, isMobile, onRightRailTabChange, onReveal]);
+  }, [
+    showContentSearch,
+    showFilesPanel,
+    pending,
+    isMobile,
+    onRightRailTabChange,
+    onReveal,
+    conversationId,
+  ]);
   useEffect(() => {
+    if (contentSearchFocusSession === null) return;
     if (
-      !focusContentSearch ||
-      !open ||
-      inert ||
+      contentSearchFocusSession !== conversationId ||
       rightRailTab !== "content-search" ||
       selectedFilePath !== null ||
       selectedTerminalKey !== null
-    )
+    ) {
+      setContentSearchFocusSession(null);
       return;
+    }
+    if (!open || inert) return;
     contentSearchInputRef.current?.focus();
-    setFocusContentSearch(false);
-  }, [focusContentSearch, open, inert, rightRailTab, selectedFilePath, selectedTerminalKey]);
+    setContentSearchFocusSession(null);
+  }, [
+    contentSearchFocusSession,
+    conversationId,
+    open,
+    inert,
+    rightRailTab,
+    selectedFilePath,
+    selectedTerminalKey,
+  ]);
   const selectedSideChat = sideChats.selected;
   const selectedSideChatPane =
     selectedSideChat === null ? null : (
