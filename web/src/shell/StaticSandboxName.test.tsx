@@ -29,7 +29,7 @@ it("renames, reports failures without closing, and clears the optional label", a
       />
     </QueryClientProvider>,
   );
-  fireEvent.click(screen.getByRole("button", { name: "Rename static sandbox" }));
+  fireEvent.click(screen.getByRole("button", { name: "Edit static sandbox name" }));
   const input = screen.getByRole("textbox", { name: "Sandbox name" });
   expect(input).toHaveValue("Old label");
   fireEvent.change(input, { target: { value: " My project " } });
@@ -46,7 +46,7 @@ it("renames, reports failures without closing, and clears the optional label", a
     }),
   );
   expect(invalidate).toHaveBeenCalledWith({ queryKey: ["hosts"] });
-  fireEvent.click(screen.getByRole("button", { name: "Rename static sandbox" }));
+  fireEvent.click(screen.getByRole("button", { name: "Edit static sandbox name" }));
   fireEvent.change(screen.getByRole("textbox", { name: "Sandbox name" }), {
     target: { value: "" },
   });

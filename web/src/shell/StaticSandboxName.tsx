@@ -1,6 +1,5 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { PencilIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -37,18 +36,18 @@ export function StaticSandboxName({ host }: { host: Host }) {
     <>
       <Button
         type="button"
-        variant="ghost"
-        size="icon"
-        className="size-7 shrink-0 text-muted-foreground"
-        title="Rename static sandbox"
-        aria-label="Rename static sandbox"
+        variant="link"
+        size="sm"
+        className="h-8 shrink-0 px-0 text-xs font-normal text-muted-foreground underline-offset-2 hover:text-foreground"
+        title="Edit static sandbox name"
+        aria-label="Edit static sandbox name"
         onClick={() => {
           setName(host.display_name ?? "");
           rename.reset();
           setOpen(true);
         }}
       >
-        <PencilIcon className="size-3.5" aria-hidden="true" />
+        Edit
       </Button>
       <Dialog open={open} onOpenChange={(next) => !rename.isPending && setOpen(next)}>
         <DialogContent>

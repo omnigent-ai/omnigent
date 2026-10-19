@@ -169,7 +169,7 @@ host identity and token; returning an HTTP endpoint alone is insufficient.
 
 `hosts.display_name` is an optional user-owned label, independent of the existing
 registration `name` and the provider's sandbox ID. After selecting a static
-sandbox in New session or Clone session, use the pencil button to rename it.
+sandbox in New session or Clone session, use **Edit** to rename it.
 The label appears in host pickers, the session badge, and host setup screens.
 Clearing it restores the existing host name. Duplicate display names are allowed.
 

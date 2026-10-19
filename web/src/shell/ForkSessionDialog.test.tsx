@@ -1483,7 +1483,7 @@ describe("ForkSessionDialog", () => {
             screen.queryByRole("dialog", { name: "Choose existing static sandbox" }),
           ).not.toBeInTheDocument();
           expect(forkSessionMock).not.toHaveBeenCalled();
-          fireEvent.click(screen.getByRole("button", { name: "Rename static sandbox" }));
+          fireEvent.click(screen.getByRole("button", { name: "Edit static sandbox name" }));
           expect(screen.getByRole("dialog", { name: "Rename static sandbox" })).toBeInTheDocument();
           fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
         } finally {

@@ -3636,7 +3636,9 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
                 await row.click()
                 await expect(chip).to_have_attribute("aria-label", "Host: My devbox, Online")
                 assert wake_calls == ["POST"]
-                await page.get_by_role("button", name="Rename static sandbox", exact=True).click()
+                await page.get_by_role(
+                    "button", name="Edit static sandbox name", exact=True
+                ).click()
                 naming = page.get_by_role("dialog", name="Rename static sandbox")
                 await naming.get_by_role("textbox", name="Sandbox name").fill("My project")
                 await naming.get_by_role("button", name="Save", exact=True).click()
@@ -3677,7 +3679,7 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
                 await expect(clone.get_by_test_id("fork-session-host-select")).to_contain_text(
                     "My project"
                 )
-                await clone.get_by_role("button", name="Rename static sandbox").click()
+                await clone.get_by_role("button", name="Edit static sandbox name").click()
                 await naming.get_by_role("textbox", name="Sandbox name").fill("")
                 await naming.get_by_role("button", name="Save", exact=True).click()
                 await expect(naming).to_be_hidden()
