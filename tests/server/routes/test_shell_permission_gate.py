@@ -854,3 +854,35 @@ async def test_content_search_forwards_options(
     assert response.status_code == 200, response.text
     assert runner_client.gets == [path]
     assert runner_client.get_params == [params]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_endpoint", [True, False])
+async def test_content_search_distinguishes_older_runner_from_missing_resource(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_endpoint: bool,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    payload = (
+        {"detail": "Not Found"}
+        if missing_endpoint
+        else {"error": {"code": "not_found", "message": "Environment not found"}}
+    )
+    monkeypatch.setattr(
+        runner_client, "get", AsyncMock(return_value=httpx.Response(404, json=payload))
+    )
+    response = await client.get(
+        "/v1/sessions/conv_share/resources/environments/default/content-search?q=needle",
+        headers={"X-Forwarded-Email": "owner@example.com"},
+    )
+    assert response.status_code == (503 if missing_endpoint else 404)
+    error = response.json()["error"]
+    assert error["code"] == ("runner_unavailable" if missing_endpoint else "not_found")
+    assert error["message"] == (
+        "Session runner does not support content search; update the host and restart the session"
+        if missing_endpoint
+        else "Environment not found"
+    )

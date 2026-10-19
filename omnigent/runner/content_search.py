@@ -156,4 +156,7 @@ async def search_content(
     )
     if result.get("error") or result.get("exit_code"):
         return {"error": "Content search could not run in this workspace. Try again."}
-    return json.loads(result.get("stdout", ""))
+    try:
+        return json.loads(result.get("stdout", ""))
+    except json.JSONDecodeError:
+        return {"error": "Content search could not run in this workspace. Try again."}

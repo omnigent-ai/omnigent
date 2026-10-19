@@ -95,6 +95,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         frontend_visible=False,
         default_enabled=True,
     ),
+    FeatureDefinition(
+        feature=Feature.WORKSPACE_CONTENT_SEARCH,
+        description="Search workspace file contents through the session runner",
+        owner="web",
+        review_by_release="0.20.0",
+    ),
 )
 
 

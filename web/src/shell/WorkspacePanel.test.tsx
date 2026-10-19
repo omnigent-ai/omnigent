@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { RefObject } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import * as sessionsApi from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
@@ -94,10 +94,15 @@ const useTerminalsMock = vi.mocked(useTerminals);
 const useCreateTerminalMock = vi.mocked(useCreateTerminal);
 const useSessionAgentMock = vi.mocked(useSessionAgent);
 
+beforeEach(() => {
+  vi.spyOn(navigator, "platform", "get").mockReturnValue("Win32");
+});
+
 afterEach(() => {
   cleanup();
   localStorage.clear();
   vi.clearAllMocks();
+  vi.restoreAllMocks();
   isMobileMock.mockReturnValue(false);
   Reflect.deleteProperty(window, "omnigentDesktop");
   useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
@@ -121,7 +126,6 @@ function renderWorkspace(
     conversationId?: string;
     rightRailTab?: RightRailTab | null;
     openPanels?: DefaultWorkspaceTab[];
-    showFilesPanel?: boolean;
     selectedFilePath?: string | null;
     openFiles?: string[];
     changedCount?: number;
@@ -270,7 +274,6 @@ describe("WorkspacePanel surface presentation", () => {
   it.each(["tab", "conversation"])(
     "cancels a deferred search focus after changing %s",
     (changed) => {
-      vi.spyOn(navigator, "platform", "get").mockReturnValue("Win32");
       const { rerender } = renderWorkspace({
         showContentSearch: true,
         rightRailTab: "content-search",
@@ -353,6 +356,12 @@ describe("WorkspacePanel surface presentation", () => {
     enabled.onRightRailTabChange.mockClear();
     fireEvent.keyDown(searchTab, { key: "5" });
     expect(enabled.onRightRailTabChange).toHaveBeenLastCalledWith("content-search");
+
+    writePinnedWorkspaceTabs([]);
+    enabled.rerender({ rightRailTab: "content-search" });
+    expect(screen.getAllByRole("tab")).toHaveLength(1);
+    expect(searchTab).toHaveAttribute("aria-keyshortcuts", expect.stringContaining(" 1"));
+    expect(screen.getByTestId("content-search-stub").parentElement).toHaveClass("flex");
   });
 
   it("sits flush to the window edge with a left divider, no floating card frame", () => {
@@ -682,7 +691,9 @@ describe("WorkspacePanel shell tabs", () => {
 
   it("surfaces the active shell's xterm in the content slot", async () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
-    renderWorkspace({
+    const { rerender } = renderWorkspace({
+      showContentSearch: true,
+      rightRailTab: "content-search",
       openTerminals: [termKey],
       selectedTerminalKey: termKey,
     });
@@ -694,6 +705,14 @@ describe("WorkspacePanel shell tabs", () => {
     expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("terminal_zsh_s1");
     expect(screen.queryByTestId("files-panel-stub")).toBeNull();
     expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+    expect(screen.getByTestId("content-search-stub").parentElement).toHaveClass("hidden");
+    rerender({ openTerminals: [] });
+    expect(screen.getByTestId("content-search-stub").parentElement).toHaveClass("flex");
+    fireEvent.keyDown(window, { code: "KeyF", ctrlKey: true, shiftKey: true });
+    expect(screen.getByTestId("content-search-stub")).toHaveFocus();
+    rerender({ openTerminals: [termKey] });
+    expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("terminal_zsh_s1");
+    expect(screen.getByTestId("content-search-stub").parentElement).toHaveClass("hidden");
   });
 
   it("activates a shell via openTerminalTab when its tab body is clicked", () => {

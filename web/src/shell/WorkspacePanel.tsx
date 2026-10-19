@@ -848,6 +848,7 @@ function WorkspacePanelImpl({
   mobileSideChatsOpen = false,
   onMobileSideChatsOpenChange,
 }: WorkspacePanelProps) {
+  const terminalShown = selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey);
   const contentSearchInputRef = useRef<HTMLInputElement>(null);
   const [contentSearchFocusSession, setContentSearchFocusSession] = useState<string | null>(null);
   const browsers = useBrowserTabs(conversationId);
@@ -1025,7 +1026,7 @@ function WorkspacePanelImpl({
       contentSearchFocusSession !== conversationId ||
       rightRailTab !== "content-search" ||
       selectedFilePath !== null ||
-      selectedTerminalKey !== null
+      terminalShown
     ) {
       setContentSearchFocusSession(null);
       return;
@@ -1040,7 +1041,7 @@ function WorkspacePanelImpl({
     inert,
     rightRailTab,
     selectedFilePath,
-    selectedTerminalKey,
+    terminalShown,
   ]);
   const selectedSideChat = sideChats.selected;
   const selectedSideChatPane =
@@ -1412,7 +1413,7 @@ function WorkspacePanelImpl({
                   : selectedFilePath !== null ||
                       browserSelected ||
                       sideChatSelected ||
-                      (selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey))
+                      terminalShown
                     ? "__tab__"
                     : (rightRailTab ?? "__empty__")
               }
@@ -1700,9 +1701,7 @@ function WorkspacePanelImpl({
             <div
               className={cn(
                 "min-h-0 flex-1 flex-col",
-                rightRailTab === "content-search" &&
-                  selectedFilePath === null &&
-                  selectedTerminalKey === null
+                rightRailTab === "content-search" && selectedFilePath === null && !terminalShown
                   ? "flex"
                   : "hidden",
               )}
@@ -1720,7 +1719,7 @@ function WorkspacePanelImpl({
               <Spinner />
               <span className="text-ui">Starting workspace…</span>
             </div>
-          ) : selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey) ? (
+          ) : terminalShown ? (
             // Show the selected shell's xterm only while its terminal is actually
             // present. The selection is sticky (AppShell never prunes it off the
             // list), so during a transient terminals-list churn this falls back to

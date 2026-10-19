@@ -135,7 +135,7 @@ export function ContentSearchPanel({
             <Spinner /> Searching…
           </div>
         )}
-        {search.isError && (
+        {search.isError && !search.isFetching && (
           <p role="alert" className="p-2 text-sm text-destructive">
             {search.error.message}
           </p>

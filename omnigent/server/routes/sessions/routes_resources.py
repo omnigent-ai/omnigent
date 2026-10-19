@@ -455,6 +455,7 @@ def register_resources_routes(
         conversation: Conversation,
         params: dict[str, str] | None = None,
         timeout: float = 10.0,
+        unsupported_endpoint_message: str | None = None,
     ) -> dict[str, Any]:
         """Proxy a GET request to the runner and return parsed JSON.
 
@@ -464,8 +465,10 @@ def register_resources_routes(
         :param params: Optional query params forwarded to the runner,
             e.g. ``{"order": "asc"}``. ``None`` sends no query string.
         :param timeout: Seconds to wait for the runner response.
+        :param unsupported_endpoint_message: Upgrade guidance for an unregistered runner route.
         :returns: Parsed JSON response body.
-        :raises OmnigentError: Typed ``not_found`` (404) or
+        :raises OmnigentError: ``runner_unavailable`` (503) for an unsupported endpoint;
+            typed ``not_found`` (404) or
             ``session_agent_missing`` (410) re-derived from the runner body.
         :raises HTTPException: 502 on any other runner failure.
         """
@@ -492,6 +495,11 @@ def register_resources_routes(
                 status_code=502, detail="runner resource endpoint returned invalid JSON"
             ) from exc
         if resp.status_code == 404:
+            if unsupported_endpoint_message and response_payload == {"detail": "Not Found"}:
+                raise OmnigentError(
+                    unsupported_endpoint_message,
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
             message = "Resource not found"
             if isinstance(response_payload, dict):
                 error = response_payload.get("error")
@@ -2472,6 +2480,9 @@ def register_resources_routes(
                 "limit": str(limit),
             },
             timeout=25.0,
+            unsupported_endpoint_message=(
+                "Session runner does not support content search; update the host and restart the session"
+            ),
         )
 
     @router.get(

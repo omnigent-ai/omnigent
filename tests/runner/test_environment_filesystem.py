@@ -1967,6 +1967,23 @@ def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stdout", ["", '{"matches": []}\n[stdout truncated]'])
+async def test_content_search_rejects_invalid_helper_output(
+    registry: SessionResourceRegistry, monkeypatch: pytest.MonkeyPatch, stdout: str
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.runner.content_search import search_content
+
+    environment = registry._primary_envs["conv_test"]
+    monkeypatch.setattr(environment, "shell", AsyncMock(return_value={"stdout": stdout}))
+    assert await search_content(environment, "needle") == {
+        "error": "Content search could not run in this workspace. Try again."
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(_IS_ROOT, reason="root bypasses permission checks")
 @pytest.mark.parametrize("unreadable", [".env", ".ignore"])
 async def test_content_search_read_errors_keep_partial_results(
     client: httpx.AsyncClient, workspace: Path, unreadable: str

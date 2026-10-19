@@ -67,8 +67,8 @@ shortcut should be unavailable.
   rules apply; inaccessible ignore files can leave normally ignored paths in results.
 - Searches return at most 500 matching lines and stop after 15 seconds. Partial
   results are labeled; exceptionally long matching lines may be omitted with a warning.
-- The server and runner both need this implementation. An offline or older runner,
-  or missing ripgrep, shows an error. Search has no host-daemon fallback.
+- Older runners show guidance to update the host and restart the session. Offline
+  runners or missing ripgrep show an error. Search has no host-daemon fallback.
 - Workspace file-sharing permissions apply. A shared conversation alone does not
   grant access to its file contents.
 - This entry is in the desktop Workspace panel. Mobile file drawers do not

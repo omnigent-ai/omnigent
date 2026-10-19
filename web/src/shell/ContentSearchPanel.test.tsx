@@ -156,11 +156,18 @@ it("keeps an in-flight search across switches without mixing conversations", asy
   expect(authenticatedFetch).toHaveBeenCalledTimes(2);
 });
 
-it("shows runner errors and allows a fresh search with no matches", async () => {
+it("hides a previous error while retrying and displays runner warnings", async () => {
+  let resolveRetry!: (response: Response) => void;
   vi.mocked(authenticatedFetch)
-    .mockResolvedValueOnce(new Response(JSON.stringify({ error: "regex parse error" })))
     .mockResolvedValueOnce(
       new Response(JSON.stringify({ matches: [], truncated: false, warning: null })),
+    )
+    .mockResolvedValueOnce(new Response(JSON.stringify({ error: "regex parse error" })))
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveRetry = resolve;
+        }),
     );
   render(
     <QueryClientProvider client={new QueryClient()}>
@@ -170,9 +177,16 @@ it("shows runner errors and allows a fresh search with no matches", async () => 
   expect(screen.getByRole("button", { name: "Search" })).toBeDisabled();
   fireEvent.change(screen.getByRole("searchbox"), { target: { value: "needle" } });
   fireEvent.submit(screen.getByRole("searchbox").closest("form")!);
+  expect(await screen.findByText("No matches for “needle”.")).toBeInTheDocument();
+  fireEvent.submit(screen.getByRole("searchbox").closest("form")!);
   expect(await screen.findByRole("alert")).toHaveTextContent("regex parse error");
   fireEvent.submit(screen.getByRole("searchbox").closest("form")!);
+  expect(await screen.findByText("Searching…")).toBeInTheDocument();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  const warning = "Some files or ignore rules could not be read.";
+  resolveRetry(new Response(JSON.stringify({ matches: [], truncated: true, warning })));
   expect(await screen.findByText("No matches for “needle”.")).toBeInTheDocument();
+  expect(screen.getByText(warning)).toBeInTheDocument();
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 });
 
