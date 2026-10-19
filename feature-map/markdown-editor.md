@@ -94,7 +94,11 @@ entry point, fixture, and whether APIs were mocked. Keep artifacts out of Git.
 256 KiB. Each test writes `markdown-load.json` beside its recording: fixture hash,
 actual bytes, browser version, viewport, editor count, selection-read count,
 longest main-thread task, and navigation-to-ready time through two animation
-frames. The load runs use real time and no slow-motion or simulated clock.
+frames. Readiness waits directly for the visible editor's terminal marker;
+locator assertions can build a full accessibility snapshot and inflate timings.
+Results carry `readiness_probe: terminal-marker`; older results without this
+field include assertion overhead and must be remeasured for comparisons.
+The load runs use real time and no slow-motion or simulated clock.
 Report repeated samples for performance decisions; a single video is illustrative.
 This does not cover every Markdown shape or establish a safe 1 MiB limit.
 
