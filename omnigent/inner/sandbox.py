@@ -1173,7 +1173,9 @@ def run_launcher(
                 f"raise SystemExit(run_launcher({encoded_sandbox!r}, "
                 f"{target_path!r}, sys.argv[1:]))"
             )
-            launcher_argv = [sys.executable, "-c", inline, *argv]
+            # -P keeps the wrap's cwd (the workspace) off sys.path, as in
+            # the host-side launcher script.
+            launcher_argv = [sys.executable, "-P", "-c", inline, *argv]
             wrapped = list(
                 backend.wrap_launcher_argv(
                     launcher_argv,
@@ -1320,8 +1322,10 @@ def create_exec_launcher(
         # breaks whenever it is a wrapper script, sits behind a path
         # too long for the kernel's shebang buffer, or contains spaces —
         # each of which surfaces as an opaque ENOEXEC from the spawner.
+        # Spawners usually run it from the agent workspace. -P keeps that cwd
+        # off sys.path but, unlike -I, still honours the runtime's PYTHONPATH.
         fd, path = tempfile.mkstemp(prefix="omnigent-sandbox-", suffix=".sh", dir=launcher_dir)
-        script = f'#!/bin/sh\nexec {shlex.quote(interpreter)} -c {shlex.quote(inline)} "$@"\n'
+        script = f'#!/bin/sh\nexec {shlex.quote(interpreter)} -P -c {shlex.quote(inline)} "$@"\n'
 
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(script)

@@ -110,6 +110,11 @@ mock model there. For any other harness, install its CLI, sign in with a test
 account, and run its tests with plain `uv run pytest` instead, or follow its dev
 skill when one is linked above.
 
+Apply the shared [harness acceptance checklist](./harness-acceptance.md) to
+affected harnesses and entry points. The matrix above locates existing tests;
+it is not a coverage verdict. Use the existing harness bench where applicable
+and record each harness's missing or blocked checks, not just its passing ones.
+
 ```sh
 verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   --output="$VERIFY_EVIDENCE/native-harnesses"

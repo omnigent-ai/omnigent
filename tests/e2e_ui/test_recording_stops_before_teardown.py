@@ -83,8 +83,20 @@ def search_sessions(page):
 
 
 def test_journey(page, search_sessions):
-    page.set_content("<body style='background:#1d4ed8'><ul>" +
+    # The video films only paints after its screencast attaches: a static page painted
+    # first records as blank, so a spinner repaints until frames reach the screencast.
+    page.set_content("<style>@keyframes spin{to{transform:rotate(1turn)}}</style>"
+                     "<body style='background:#1d4ed8'>"
+                     "<i style='display:block;width:8px;height:8px;background:#fff;"
+                     "animation:spin 1s linear infinite'></i><ul>" +
                      "".join(f"<li>{row}</li>" for row in search_sessions) + "</ul></body>")
+    frames = []
+    page.screencast.start(on_frame=lambda frame: frames.append(frame))
+    for _ in range(200):
+        if len(frames) >= 2:
+            break
+        page.wait_for_timeout(50)
+    page.screencast.stop()
     page.wait_for_timeout(1_000)"""
 
 

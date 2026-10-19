@@ -106,6 +106,34 @@ print(json.dumps({
     assert not (desktop / "probe.sock").exists()
 
 
+def test_sandbox_launcher_ignores_workspace_modules(
+    tmp_path: Path,
+    active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
+    sandbox_pythonpath_env: None,
+) -> None:
+    """Neither launcher pass, on the host or inside the wrap, imports workspace modules."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    for name in ("logging", "json", "base64"):
+        (workspace / f"{name}.py").write_text(f"raise ImportError('{name} loaded from the cwd')\n")
+    spec = OSEnvSpec(
+        type="caller_process", cwd=str(workspace), sandbox=active_sandbox_spec_factory()
+    )
+    launcher = create_exec_launcher(sys.executable, resolve_sandbox(spec, workspace))
+    try:
+        completed = subprocess.run(
+            [launcher, "-c", "print('target ran')"],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    finally:
+        Path(launcher).unlink(missing_ok=True)
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "target ran"
+
+
 def test_sandbox_blocks_shell_write_outside_cwd(
     tmp_path: Path,
     active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
