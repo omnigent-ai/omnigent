@@ -39,6 +39,9 @@ implements them separately, so a fix for one harness does not reach the others.
   Other harnesses keep their credential card only.
 - `skill-contents`: open plain or plugin skills to read their SKILL.md markdown,
   with loading, truncation, unavailable-host, and older-server states.
+- `codex-plugin-skills`: enabled Codex plugin skills remain selectable in both
+  web composers when marketplace inventory fails; disabled or uninstalled
+  cached plugins do not become invocable.
 
 - `mcp-tools`: expand a configured or plugin MCP server to probe its tools,
   with connected/auth/timeout/unreachable/unsupported and mixed-version states.
@@ -64,6 +67,11 @@ the advertised session and saved-rule choices.
 **Skill contents:** Settings → Harnesses → configured harness card (or gear),
 then Skills → a skill, or Plugins → a plugin → a skill. Back returns to the
 list or plugin.
+
+**Codex plugin completion:** in an existing Codex Chat session, or on the
+landing page with a Codex host/workspace selected, type `$<skill-name>` and
+select its namespaced suggestion. See the
+[Composer recipe](./composer.md#driving-it-with-the-repro-environment).
 
 **MCP tools:** Settings → Harnesses → configured harness card (or gear),
 then MCP servers → expand a server, or Plugins → plugin → MCPs → expand.
@@ -342,6 +350,11 @@ Cross-harness journeys:
   After a greeting, run `!echo "hi"`, `!ls`, and `!echo "hi"` again. Each shell
   prompt must remain a separate user turn outside the assistant's folded work,
   including after reload. This browser contract does not launch the Claude CLI.
+- **`codex-plugin-skills`:** use the
+  [Composer recipe](./composer.md#driving-it-with-the-repro-environment) for the
+  real CLI catalog regression and recorded browser journey across both
+  composers. No model call is needed for discovery; this is separate from
+  Settings plugin inventory and vendor-terminal completion.
 - **`skill-contents`:** run `tests/host/test_skill_content.py`,
   `tests/server/routes/test_skill_content.py`, and the real-host test
   `tests/e2e/test_host_skill_content_e2e.py::test_host_skill_content` with plain

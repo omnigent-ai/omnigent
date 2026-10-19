@@ -47,6 +47,9 @@ and steers messages while the agent is busy.
   such as `/help` is handled locally; a recognised skill routes through
   `slash_command` so it runs on an in-process harness. A native terminal side
   chat shows no menu and sends slash text to the vendor TUI.
+- `codex-plugin-skills`: typing `$` lists enabled Codex plugin skills in both
+  composers, including cached plugins whose marketplace inventory is unavailable.
+  Selecting a row inserts its namespaced identifier.
 - `new-command`: `/new` opens a blank new-session composer in the same project;
   working-directory selection follows the project's defaults, not the old session.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
@@ -99,6 +102,8 @@ and steers messages while the agent is busy.
   return to Chat.
 - Type `/` in the message box; attach files with the button, by paste, or by
   dropping them on the transcript.
+- For Codex plugin skills, type `$<skill-name>` in Chat and select the
+  namespaced suggestion. The vendor terminal owns its own completion menu.
 - Send while the agent is working to queue a message, then steer it.
 - Type `/n`, press Tab to complete `/new`, then Enter to open the new-session
   page in the same project. Selecting **/new** in Commands also opens it.
@@ -134,6 +139,8 @@ and steers messages while the agent is busy.
   `tests/e2e_ui/start_session/test_sandbox_gateway_models_without_binding.py`
   and `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_optional_gateway_preview_without_a_host`.
 - Attach files or type `/` before the first send.
+- Select a Codex host and workspace, then type `$<skill-name>` and select the
+  namespaced plugin suggestion before starting the session.
 - Open **MCPs** in the workspace bar above the composer (the plug icon when space is tight), then turn
   services on or off in **Tools for this session** before launching on a host or
   sandbox. Turning a service off keeps its account connected. Explicit selections
@@ -282,6 +289,25 @@ Other connection providers alone do not enable the managed MCP picker.
 - **`slash-menu`:**
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`,
   `tests/e2e_ui/chat/test_side_chat_slash_command.py::test_side_chat_slash_menu_and_skill_invocation`
+- **`codex-plugin-skills`, both composers:**
+  `tests/e2e_ui/chat/test_codex_plugin_skills.py::test_plugin_skill_in_both_composers_after_inventory_failure`
+  installs an enabled local plugin using the real Codex CLI, moves away its
+  marketplace, asserts inventory failure, then opens and selects the cached
+  skill in an existing session and on the landing page. It restores remembered
+  host/harness/workspace choices; it does not test picker interaction or send
+  a model turn. Run through the instance with recording enabled as above.
+  Requires Codex; a missing CLI is a skip, not a verified journey.
+  Run the model-free process contract separately:
+
+  ```sh
+  uv run --no-sync pytest tests/harnesses/codex_native/test_skill_discovery.py --reruns 0
+  ```
+
+  Repeat with `OMNIGENT_CODEX_PATH` pointing to the CI-pinned CLI and the
+  installed CLI. This covers the loaded catalog, numeric prereleases, preferred
+  `local`, disable/re-enable, and uninstall with stale cache. Manually refresh
+  both composers after disabling the plugin and confirm its skill disappears.
+  Catalog/process checks do not prove browser rendering or live-model invocation.
 - **`attachments`:**
   `tests/browser_ui/chat/test_composer_attachments.py::test_attach_supported_files_and_remove`,
   `tests/browser_ui/chat/test_composer_attachments.py::test_file_dropped_on_the_transcript_attaches`,

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
@@ -13,6 +12,7 @@ import pytest
 
 from omnigent.harnesses.codex_native import skill_discovery
 from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
+from tests._helpers.codex_plugins import install_codex_plugin
 
 
 @pytest.mark.parametrize(
@@ -57,40 +57,16 @@ def test_installed_plugin_survives_marketplace_failure(
     home, workspace, marketplace = (tmp_path / name for name in ("codex", "workspace", "market"))
     home.mkdir()
     workspace.mkdir()
-    plugin = marketplace / "plugins" / "discovery-check"
-    (plugin / ".codex-plugin").mkdir(parents=True)
-    (plugin / ".codex-plugin/plugin.json").write_text(
-        json.dumps({"name": "discovery-check", "version": "1.0.0"})
-    )
-    skill = plugin / "skills" / "check"
-    skill.mkdir(parents=True)
-    (skill / "SKILL.md").write_text(
-        "---\nname: check\ndescription: Plugin discovery check\n---\nCheck.\n"
-    )
-    (marketplace / ".agents/plugins").mkdir(parents=True)
-    (marketplace / ".agents/plugins/marketplace.json").write_text(
-        json.dumps(
-            {
-                "name": "discovery-lab",
-                "owner": {"name": "test"},
-                "plugins": [{"name": "discovery-check", "source": "./plugins/discovery-check"}],
-            }
-        )
+    install_codex_plugin(
+        codex,
+        home,
+        workspace,
+        marketplace,
+        marketplace_name="discovery-lab",
+        plugin_name="discovery-check",
+        skill_name="check",
     )
     env = {**os.environ, "CODEX_HOME": str(home)}
-    for args in [
-        ("plugin", "marketplace", "add", str(marketplace)),
-        ("plugin", "add", "discovery-check@discovery-lab"),
-    ]:
-        subprocess.run(
-            [codex, *args],
-            cwd=workspace,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=True,
-        )
     ctx = SkillSourceContext((workspace,), tmp_path, "all", None, codex_home=home)
 
     def selected_version() -> str | None:
