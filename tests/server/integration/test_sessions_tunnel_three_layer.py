@@ -38,6 +38,7 @@ import io
 import json
 import tarfile
 import threading
+import time
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -2452,6 +2453,9 @@ async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
         "nested",
         "reconnect_at_expiry",
         "list_during_hold",
+        "remote_live_at_expiry",
+        "label_write_retry",
+        "shutdown_keeps_label",
     ],
 )
 async def test_runner_disconnect_holds_turn_while_host_offline(
@@ -2477,9 +2481,13 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
     ap_app = tunnel_three_layer_stack.ap_app
     grace = 0.2
     # Long holds for outcomes that must not race the deadline.
-    hold = {"reconnect": 1.0, "host_back_without_runner": 30.0, "list_during_hold": 30.0}.get(
-        scenario, 0.6
-    )
+    hold = {
+        "reconnect": 1.0,
+        "host_back_without_runner": 30.0,
+        "list_during_hold": 30.0,
+        "label_write_retry": 30.0,
+        "shutdown_keeps_label": 30.0,
+    }.get(scenario, 0.6)
     monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
     monkeypatch.setattr("omnigent.server.routes.sessions.HOST_OFFLINE_HOLD_S", hold)
     monkeypatch.setattr("omnigent.server.routes.sessions._HOST_OFFLINE_RECHECK_S", 0.05)
@@ -2563,6 +2571,34 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             return get_liveness(conversation_id)
 
         monkeypatch.setattr(store, "get_runner_liveness", reconnect_during_final_read)
+    remote_stamped: list[bool] = []
+    if scenario == "remote_live_at_expiry":
+        get_liveness = store.get_runner_liveness
+
+        def remote_live_during_final_read(conversation_id: str):  # type: ignore[no-untyped-def]
+            # The first final read fails while another replica takes the runner over.
+            hold_over = any(r["event_name"] == "runner_disconnect_hold_ended" for r in rows)
+            if hold_over and not remote_stamped:
+                remote_stamped.append(True)
+                store.touch_runner_liveness([runner_id], int(time.time()) + 5)
+                raise RuntimeError("store unavailable")
+            return get_liveness(conversation_id)
+
+        monkeypatch.setattr(store, "get_runner_liveness", remote_live_during_final_read)
+    label_writes_failed: list[bool] = []
+    if scenario == "label_write_retry":
+        set_labels = store.set_labels
+
+        def flaky_set_labels(conversation_id: str, updates: dict[str, str], *args, **kwargs):  # type: ignore[no-untyped-def]
+            if (
+                sessions_module.HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY in updates
+                and not label_writes_failed
+            ):
+                label_writes_failed.append(True)
+                raise RuntimeError("store unavailable")
+            return set_labels(conversation_id, updates, *args, **kwargs)
+
+        monkeypatch.setattr(store, "set_labels", flaky_set_labels)
 
     communicator = await _connect_runner_tunnel(ap_app, runner_id)
     await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
@@ -2612,6 +2648,67 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
                         await asyncio.sleep(0.02)
 
                 await asyncio.wait_for(_label_cleared(), timeout=budget(5.0))
+            elif scenario in ("label_write_retry", "shutdown_keeps_label"):
+
+                async def _labeled() -> None:
+                    while True:
+                        row = store.get_conversation(held_id)
+                        if row is not None and (
+                            sessions_module.HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY in row.labels
+                        ):
+                            return
+                        await asyncio.sleep(0.02)
+
+                # A failed first write is retried on the next re-check.
+                await asyncio.wait_for(_labeled(), timeout=budget(5.0))
+                if scenario == "label_write_retry":
+                    assert label_writes_failed
+                    reconnect = await _connect_runner_tunnel(ap_app, runner_id)
+                    await _send_hello_and_wait(
+                        reconnect, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
+                    )
+                else:
+                    from omnigent.server import shutdown_state
+
+                    shutdown_state.mark_server_shutting_down()
+                    try:
+
+                        async def _hold_ended() -> None:
+                            while not any(
+                                r["event_name"] == "runner_disconnect_hold_ended" for r in rows
+                            ):
+                                await asyncio.sleep(0.02)
+
+                        await asyncio.wait_for(_hold_ended(), timeout=budget(5.0))
+                    finally:
+                        shutdown_state.reset_for_tests()
+                    # The deadline outlives this replica, so another replica's
+                    # orphan cleanup leaves the turn running.
+                    store.set_session_live_status(held_id, "running")
+                    sessions_module._session_status_cache.pop(held_id, None)
+                    listed = await ap_client.get("/v1/sessions")
+                    assert listed.status_code == 200, listed.text
+                    refreshed = store.get_conversation(held_id)
+                    assert refreshed is not None
+                    assert refreshed.live_status == "running"
+                    assert sessions_module.HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY in refreshed.labels
+            elif scenario == "remote_live_at_expiry":
+
+                async def _settled_or_skipped() -> None:
+                    while not (
+                        remote_stamped
+                        and any(r["event_name"] == "runner_disconnect_hold_ended" for r in rows)
+                    ):
+                        await asyncio.sleep(0.02)
+
+                await asyncio.wait_for(_settled_or_skipped(), timeout=budget(5.0))
+                # Give a wrongly-proceeding settlement time to land.
+                await asyncio.sleep(0.5)
+                refreshed = store.get_conversation(held_id)
+                assert refreshed is not None
+                assert sessions_module._last_task_error_from_labels(refreshed.labels) is None
+                assert sessions_module._session_status_cache.get(held_id) != "failed"
+                assert not any(r["event_name"] == "session_turn_failed" for r in rows)
             elif scenario == "reconnect_at_expiry":
 
                 async def _reconnected() -> None:
@@ -2671,6 +2768,9 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             "nested": "expired",
             "reconnect_at_expiry": "expired",
             "list_during_hold": "runner_reconnected",
+            "remote_live_at_expiry": "expired",
+            "label_write_retry": "runner_reconnected",
+            "shutdown_keeps_label": "server_shutdown",
         }[scenario]
         assert [r["attributes"]["outcome"] for r in ended] == [expected_outcome]
     finally:

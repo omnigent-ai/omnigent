@@ -170,6 +170,11 @@ def pinned_label_key(user_id: str | None) -> str:
 # match that fallback's unit.
 ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
 
+# Epoch-seconds deadline of a server's hold on a turn whose host went offline.
+# Written and cleared only by the server; other replicas read it so their
+# orphan cleanup leaves a held turn running.
+HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY = "omnigent.host_offline_hold_until"
+
 
 # Labels that must NOT cross into a new session context — deliberately
 # dropped both when forking (not copied to the clone) and on an in-place

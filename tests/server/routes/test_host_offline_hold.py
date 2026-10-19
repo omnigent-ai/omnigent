@@ -184,8 +184,11 @@ async def test_relay_finds_an_offline_host_through_a_side_chats_source(
     monkeypatch.setitem(orchestration._runner_relay_tasks, "side", handle)
     monkeypatch.setattr(orchestration, "get_server_host_store", lambda: _FakeHostStore(_host))
     monkeypatch.setattr(orchestration, "get_server_host_registry", lambda: _FakeRegistry(False))
+    # The runner's tunnel dropped here, so its disconnect task owns the turn.
+    monkeypatch.setattr(orchestration, "_runner_disconnect_owned", lambda runner_id: True)
 
-    assert await orchestration._relay_host_offline("side", store) is expected  # type: ignore[arg-type]
+    result = await orchestration._relay_host_offline("side", store, "runner_shared")  # type: ignore[arg-type]
+    assert result is expected
 
 
 @pytest.mark.parametrize(

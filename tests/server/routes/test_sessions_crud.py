@@ -797,6 +797,44 @@ async def test_patch_rejects_client_supplied_archived_at_label(
     assert ARCHIVED_AT_LABEL_KEY not in conv.labels
 
 
+async def test_patch_rejects_client_supplied_host_offline_hold_label(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """A host-offline hold's deadline label is server-owned.
+
+    Other replicas read it to leave a held turn running, so a client must not
+    seed it (forging a long hold) or overwrite the server's value (cancelling
+    one), including on shared sessions it can edit.
+    """
+    from omnigent.stores.conversation_store import HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    for value in ("9999999999", ""):
+        resp = await client.patch(
+            f"/v1/sessions/{session_id}",
+            json={"labels": {HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY: value}},
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 400
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY not in conv.labels
+
+    # A hold the server started keeps its deadline through a client write.
+    conv_store.set_labels(session_id, {HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY: "2000000000"})
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY: "1"}},
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 400
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.labels[HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY] == "2000000000"
+
+
 async def test_list_sessions_pinned_filter(
     client: httpx.AsyncClient,
     db_uri: str,

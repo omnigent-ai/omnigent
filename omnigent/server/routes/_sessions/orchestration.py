@@ -398,6 +398,7 @@ from omnigent.spec.types import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
+    HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY,
     PINNED_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
     SIDE_CHAT_LABEL_KEY,
@@ -8052,25 +8053,47 @@ _MID_TURN_STATUSES = ("running", "waiting")
 HOST_OFFLINE_HOLD_S: float = 24 * 3600.0
 # How often a held runner re-checks its host and cross-replica liveness.
 _HOST_OFFLINE_RECHECK_S: float = 60.0
-# Label holding a held session's deadline (epoch seconds). Other replicas
-# have neither the hold nor the runner's tunnel, so the label is how their
-# orphan cleanup tells a held turn from an abandoned one.
-HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY = "omnigent.host_offline_hold_until"
+# Slack on a hold label's deadline for clock skew between replicas.
+_HOST_OFFLINE_HOLD_SKEW_S: float = 60.0
 
 
 def host_offline_hold_active(labels: Mapping[str, str], now: float) -> bool:
     """
     Report whether a session's labels carry an unexpired host-offline hold.
 
+    Other replicas have neither the hold nor the runner's tunnel, so the label
+    is how their orphan cleanup tells a held turn from an abandoned one. A
+    deadline further out than one hold can reach is not trusted.
+
     :param labels: The session's labels.
     :param now: Epoch seconds to compare the deadline against.
-    :returns: ``True`` while the hold's deadline is in the future.
+    :returns: ``True`` while the hold's deadline is ahead and within bounds.
     """
     raw = labels.get(HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY)
+    if raw is None:
+        return False
     try:
-        return raw is not None and float(raw) > now
+        deadline = float(raw)
     except ValueError:
         return False
+    return now < deadline <= now + HOST_OFFLINE_HOLD_S + _HOST_OFFLINE_HOLD_SKEW_S
+
+
+# Reports whether this replica's disconnect task for a runner is still running;
+# set once at app startup. Only that task may take over a lost relay's turn.
+_runner_disconnect_owned: Callable[[str], bool] | None = None
+
+
+def set_runner_disconnect_owner_probe(probe: Callable[[str], bool] | None) -> None:
+    """
+    Register how a relay learns that a disconnect task owns its runner's turns.
+
+    :param probe: Returns ``True`` while a runner's disconnect task (its grace
+        or host-offline hold) is still running here; ``None`` clears it.
+    :returns: None.
+    """
+    global _runner_disconnect_owned
+    _runner_disconnect_owned = probe
 
 
 async def _host_offline_state(host_id: str | None) -> bool | None:
@@ -8186,18 +8209,26 @@ def _log_host_offline_hold(
 async def _relay_host_offline(
     session_id: str,
     conversation_store: ConversationStore,
+    runner_id: str | None,
 ) -> bool:
     """
     Report whether a lost relay's session sits on a host that went offline.
 
-    The same drop schedules this replica's disconnect sweep, which holds the
-    interrupted turn while the host is away, so the relay leaves the outcome
-    to it. Any unreadable row reads as not offline and fails as before.
+    When the runner's tunnel dropped here, this replica's disconnect task
+    holds the interrupted turn while the host is away, so the relay leaves the
+    outcome to it. Without that task (the tunnel is still registered and only
+    the stream failed) the relay keeps its own handling. Any unreadable row
+    reads as not offline and fails as before.
 
     :param session_id: Session whose relay gave up.
     :param conversation_store: Store used to find the session's host.
-    :returns: ``True`` only when the session's user-run host is confirmed offline.
+    :param runner_id: Runner the relay streamed from, or ``None`` when unknown.
+    :returns: ``True`` only when a disconnect task owns the turn and the
+        session's user-run host is confirmed offline.
     """
+    owned = _runner_disconnect_owned
+    if runner_id is None or owned is None or not owned(runner_id):
+        return False
     if get_server_host_store() is None:
         return False
     # The stored row carries the labels a side chat routes through; the relay's
@@ -8709,7 +8740,7 @@ async def _relay_runner_stream(
                 session_id, conversation_store, outage_runner_id
             ):
                 decision = "rebound"
-            elif await _relay_host_offline(session_id, conversation_store):
+            elif await _relay_host_offline(session_id, conversation_store, outage_runner_id):
                 decision = "held_host_offline"
             elif await _runner_disconnect_requires_failure(
                 session_id, conversation_store, origin="runner_disconnected_mid_turn"

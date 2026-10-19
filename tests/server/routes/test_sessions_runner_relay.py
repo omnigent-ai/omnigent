@@ -3915,33 +3915,47 @@ def test_runner_disconnect_grace_exceeds_runner_worst_case_reconnect() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("host_offline", [True, False])
+@pytest.mark.parametrize(
+    ("host_offline", "disconnect_task_owns", "held"),
+    [
+        pytest.param(True, True, True, id="host-offline-runner-dropped"),
+        pytest.param(False, True, False, id="host-online"),
+        # The runner's tunnel is still registered (only the stream failed), so no
+        # disconnect task exists to hold the turn; the relay keeps its own handling.
+        pytest.param(True, False, False, id="host-offline-runner-still-registered"),
+    ],
+)
 async def test_relay_leaves_a_turn_on_an_offline_host_to_the_disconnect_hold(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     host_offline: bool,
+    disconnect_task_owns: bool,
+    held: bool,
 ) -> None:
     """
     A relay that loses a mid-turn runner whose host went offline does not fail it.
 
-    The disconnect sweep holds that turn until the host returns, so the relay
+    The disconnect task holds that turn until the host returns, so the relay
     records ``held_host_offline`` and publishes no failure. A host that is
-    still online means the runner itself died, and the turn fails as before.
+    still online means the runner itself died, and the turn fails as before;
+    so does a turn with no disconnect task to take it over.
     """
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
 
     monkeypatch.setattr(
         "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
         0.0,
     )
 
-    async def scripted_host_offline(_session_id: str, _store: object) -> bool:
+    async def scripted_host_offline(_host_id: str | None) -> bool:
         return host_offline
 
+    monkeypatch.setattr(orchestration, "_host_offline_state", scripted_host_offline)
+    monkeypatch.setattr(orchestration, "get_server_host_store", lambda: object())
     monkeypatch.setattr(
-        "omnigent.server.routes._sessions.orchestration._relay_host_offline",
-        scripted_host_offline,
+        orchestration, "_runner_disconnect_owned", lambda runner_id: disconnect_task_owns
     )
     caplog.set_level(logging.INFO)
     sessions_module._runner_relay_tasks.clear()
@@ -3967,7 +3981,7 @@ async def test_relay_leaves_a_turn_on_an_offline_host_to_the_disconnect_hold(
             if getattr(r, "event_name", None) == "runner_stream_disconnected"
         )
         error = sessions_module._last_task_error_from_labels(store.labels.get(session_id, {}))
-        if host_offline:
+        if held:
             assert record.attributes["decision"] == "held_host_offline"
             assert sessions_module._session_status_cache.get(session_id) == "running"
             assert error is None
