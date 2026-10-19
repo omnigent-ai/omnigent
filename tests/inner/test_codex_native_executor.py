@@ -1316,10 +1316,9 @@ def test_oversized_text_block_spills_to_an_attachment_file(tmp_path: Path) -> No
     """
     A text block past Codex's input limit is sent as a file reference.
 
-    Codex rejects a turn whose text exceeds 1,048,576 characters, so a huge
-    paste used to fail the turn with ``input_too_large``. The full text now
-    lands in the session's attachment cache and the turn carries only the
-    reference line, like a binary attachment.
+    Codex rejects a turn whose text exceeds 1,048,576 characters, so oversized
+    text reaches Codex through a complete attachment reference: the full text
+    in the session's attachment cache, like a binary attachment.
     """
     from omnigent.inner.codex_native_executor import _content_to_input_items
 
@@ -1437,8 +1436,7 @@ def test_text_shorter_than_its_file_reference_stays_inline(
     items = _content_to_input_items([_input_text(block) for block in blocks], tmp_path)
 
     assert items == [{"type": "text", "text": block} for block in blocks]
-    cache = attachment_cache_dir(tmp_path)
-    assert not cache.exists() or len(list(cache.iterdir())) <= 1
+    assert not attachment_cache_dir(tmp_path).exists()
 
 
 def test_text_file_and_message_text_share_the_turn_limit(tmp_path: Path) -> None:

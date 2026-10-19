@@ -25,6 +25,7 @@ from omnigent.inner.native_attachments import (
     requires_filesystem,
     resize_notice,
     resolve_file_id_block,
+    restore_spilled_text,
     unresolved_attachment_marker,
 )
 
@@ -440,6 +441,48 @@ def test_materialize_text_refuses_a_symlinked_destination(tmp_path: Path) -> Non
 
     assert materialize_text("text", tmp_path) is None
     assert outside.read_bytes() == b"precious"
+
+
+def test_restore_spilled_text_puts_each_paste_back_in_place(tmp_path: Path) -> None:
+    """Every whole-line reference to a spilled paste becomes the paste again."""
+    first = "caf\u00e9 \u2014 first paste\nwith two lines\n"
+    second = "second paste"
+    echoed = "\n\n".join(
+        [
+            "Compare these:",
+            f"[Attached file: {materialize_text(first, tmp_path)}]",
+            f"[Attached file: {materialize_text(second, tmp_path)}]",
+        ]
+    )
+
+    assert restore_spilled_text(echoed, tmp_path) == "\n\n".join(["Compare these:", first, second])
+
+
+@pytest.mark.parametrize("case", ["other-session", "edited", "missing", "symlink", "inline"])
+def test_restore_spilled_text_leaves_unverified_references_alone(
+    tmp_path: Path, case: str
+) -> None:
+    """Only this session's cache file, still holding the digested text, is read back."""
+    bridge = tmp_path / "bridge"
+    path = materialize_text("original paste", bridge)
+    assert path is not None
+    if case == "other-session":
+        other = materialize_text("original paste", tmp_path / "other-bridge")
+        assert other is not None
+        path = other
+    elif case == "edited":
+        path.write_text("edited after the spill", encoding="utf-8")
+    elif case == "missing":
+        path.unlink()
+    elif case == "symlink":
+        outside = tmp_path / "outside.txt"
+        outside.write_text("original paste", encoding="utf-8")
+        path.unlink()
+        path.symlink_to(outside)
+    reference = f"[Attached file: {path}]"
+    echoed = f"see {reference} here" if case == "inline" else reference
+
+    assert restore_spilled_text(echoed, bridge) == echoed
 
 
 def test_materialize_cache_does_not_overwrite_when_both_names_taken(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import logging
@@ -5057,13 +5058,16 @@ async def test_kiro_native_dispatch_clears_pending_when_injection_fails(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("earlier_pending", ["none", "source_id", "source_less"])
-async def test_codex_spilled_paste_settles_its_own_input_and_survives_cache_removal(
+async def test_codex_spilled_paste_is_mirrored_as_sent_and_settles_its_own_input(
     earlier_pending: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A paste Codex got as a file is recorded as sent, on any server, and survives the cache."""
+    from omnigent.harnesses.codex_native import forwarder
     from omnigent.inner import codex_native_executor
     from omnigent.inner.native_attachments import attachment_cache_dir
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes.sessions import _persist_external_conversation_item
+    from tests.harnesses.codex_native.forwarder._support import _RecordingClient
 
     pending_inputs.reset_for_tests()
     store = _ConversationStore()
@@ -5073,8 +5077,9 @@ async def test_codex_spilled_paste_settles_its_own_input_and_survives_cache_remo
     conv.labels["omnigent.wrapper"] = "codex-native-ui"
     bridge = tmp_path / "bridge"
     monkeypatch.setattr(codex_native_executor, "_MAX_INLINE_TEXT_CHARS", 350)
+    paste = "r\u00e9sum\u00e9 line\n" * 120
     original = [
-        {"type": "input_text", "text": "résumé line\n" * 120},
+        {"type": "input_text", "text": paste},
         {"type": "input_text", "text": "keep this tail inline"},
     ]
     first = None
@@ -5090,47 +5095,55 @@ async def test_codex_spilled_paste_settles_its_own_input_and_survives_cache_remo
         sid, original, created_by="paste@example.test", stable_id="b" * 32
     )
     items = codex_native_executor._content_to_input_items(original, bridge)
-    mirror = "\n".join(str(item["text"]) for item in items)
-    assert "pasted_text_" in mirror and "keep this tail inline" in mirror
-    body = SessionEventInput(
-        type="external_conversation_item",
-        data={
-            "item_type": "message",
-            "item_data": {"role": "user", "content": [{"type": "input_text", "text": mirror}]},
-            "response_id": "codex:spilled-paste",
-            **({"source_id": "codex:spilled-paste:0"} if earlier_pending != "source_less" else {}),
-        },
+    assert "pasted_text_" in str(items[0]["text"])
+    echoed = {"type": "userMessage", "content": [dict(item) for item in items]}
+    client = _RecordingClient()
+    source_id = "codex:spilled-paste:0" if earlier_pending != "source_less" else None
+    await forwarder._post_user_message(
+        client, sid, {"turnId": "t1"}, echoed, source_id=source_id, bridge_dir=bridge
     )
+    [(_url, posted)] = client.posts
+    if source_id is None:
+        posted["data"].pop("source_id", None)
 
     try:
-        item_id = await _persist_external_conversation_item(sid, conv, body, store)  # type: ignore[arg-type]
+        item_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            SessionEventInput.model_validate(posted),
+            store,  # type: ignore[arg-type]
+        )
         committed = store.get_item(sid, item_id)
         assert committed.created_by == "paste@example.test"
-        assert committed.data.content == original
+        assert committed.data.content == [
+            {"type": "input_text", "text": f"{paste}\n\nkeep this tail inline"}
+        ]
         assert second not in pending_inputs.pending_ids(sid)
         if earlier_pending == "source_less":
             assert pending_inputs.pending_ids(sid) == [first]
-            assert store.persisted_by_stable_id["b" * 32] is committed
         elif earlier_pending == "source_id":
             assert store.appended_items[0].data.content[0]["text"] == "summarize the readme"
             assert store.appended_items[0].created_by == "earlier@example.test"
             assert store.appended_items[1].type == "error"
 
-        # Rebuild from the serialized durable message after the runner's cache is gone.
-        durable = ConversationItem.model_validate_json(committed.model_dump_json())
+        # The committed message, not the runner's cache, is the durable copy.
         shutil.rmtree(attachment_cache_dir(bridge))
-        replay = codex_native_executor._content_to_input_items(durable.data.content, bridge)
-        restored_path = Path(str(replay[0]["text"])[len("[Attached file: ") : -1])
-        assert restored_path.read_text() == original[0]["text"]
-        assert replay[1] == {"type": "text", "text": original[1]["text"]}
+        durable = ConversationItem.model_validate_json(committed.model_dump_json())
+        assert paste in durable.data.content[0]["text"]
     finally:
         pending_inputs.reset_for_tests()
 
 
 @pytest.mark.asyncio
-async def test_unmatched_spilled_paste_does_not_consume_an_unrelated_upload() -> None:
+async def test_codex_text_upload_beside_a_spilled_paste_settles_with_the_whole_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An upload Codex got inline and a paste it got as a file both reach history."""
+    from omnigent.harnesses.codex_native import forwarder
+    from omnigent.inner import codex_native_executor
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes.sessions import _persist_external_conversation_item
+    from tests.harnesses.codex_native.forwarder._support import _RecordingClient
 
     pending_inputs.reset_for_tests()
     store = _ConversationStore()
@@ -5138,36 +5151,47 @@ async def test_unmatched_spilled_paste_does_not_consume_an_unrelated_upload() ->
     conv = store.get_conversation(sid)
     assert conv is not None
     conv.labels["omnigent.wrapper"] = "codex-native-ui"
-    earlier = pending_inputs.record(
+    bridge = tmp_path / "bridge"
+    monkeypatch.setattr(codex_native_executor, "_MAX_INLINE_TEXT_CHARS", 1_000)
+    csv = "id,value\n" + "1,2\n" * 100
+    paste = "pasted log line\n" * 60
+    upload = {"type": "input_file", "file_id": "file_csv", "filename": "data.csv"}
+    queued = pending_inputs.record(
+        sid, [upload, {"type": "input_text", "text": paste}], created_by="paste@example.test"
+    )
+    resolved_upload = {
+        **upload,
+        "file_data": "data:text/csv;base64," + base64.b64encode(csv.encode()).decode(),
+    }
+    items = codex_native_executor._content_to_input_items(
+        [resolved_upload, {"type": "input_text", "text": paste}], bridge
+    )
+    assert items[0] == {"type": "text", "text": csv}
+    assert "pasted_text_" in str(items[1]["text"])
+    client = _RecordingClient()
+    await forwarder._post_user_message(
+        client,
         sid,
-        [
-            {"type": "input_file", "file_id": "earlier-upload"},
-            {"type": "input_text", "text": "tail"},
-        ],
-        created_by="earlier@example.test",
+        {"turnId": "t1"},
+        {"type": "userMessage", "content": [dict(item) for item in items]},
+        bridge_dir=bridge,
     )
-    mirror = f"[Attached file: /runner/attachments/{'a' * 32}/pasted_text_{'0' * 12}.txt]\ntail"
-    body = SessionEventInput(
-        type="external_conversation_item",
-        data={
-            "item_type": "message",
-            "item_data": {"role": "user", "content": [{"type": "input_text", "text": mirror}]},
-            "source_id": "codex:unknown-paste:0",
-        },
-    )
+    [(_url, posted)] = client.posts
 
     try:
         item_id = await _persist_external_conversation_item(
             sid,
             conv,
-            body,
-            store,
-            created_by="terminal@example.test",  # type: ignore[arg-type]
+            SessionEventInput.model_validate(posted),
+            store,  # type: ignore[arg-type]
         )
         committed = store.get_item(sid, item_id)
-        assert committed.created_by == "terminal@example.test"
-        assert committed.data.content == [{"type": "input_text", "text": mirror}]
-        assert pending_inputs.pending_ids(sid) == [earlier]
+        assert committed.created_by == "paste@example.test"
+        assert committed.data.content == [
+            upload,
+            {"type": "input_text", "text": f"{csv}\n\n{paste}"},
+        ]
+        assert queued not in pending_inputs.pending_ids(sid)
     finally:
         pending_inputs.reset_for_tests()
 

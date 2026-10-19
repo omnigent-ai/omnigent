@@ -206,6 +206,64 @@ def materialize_text(text: str, bridge_dir: Path) -> Path | None:
     return _materialize_bytes(raw_bytes, f"pasted_text_{digest}.txt", bridge_dir)
 
 
+def restore_spilled_text(text: str, bridge_dir: Path) -> str:
+    """
+    Put back the text each :func:`materialize_text` reference in *text* stands for.
+
+    A harness echoes a spilled paste as its ``[Attached file: ...]`` line. Only a
+    whole-line reference into this session's cache is replaced, and only when the
+    file still holds text with the digest in its name; anything else stays as is.
+
+    :param text: Message text as the harness echoed it.
+    :param bridge_dir: Session bridge path, used to identify its attachment cache.
+    :returns: *text* with each such reference replaced by the text it stands for.
+    """
+    if "pasted_text_" not in text:
+        return text
+    cache = attachment_cache_dir(bridge_dir)
+    reference = re.compile(
+        rf"(?m)^[ \t]*\[Attached file: {re.escape(str(cache))}/"
+        r"(?P<name>pasted_text_(?P<digest>[0-9a-f]{12})(?:_(?P=digest))?\.txt)\][ \t]*(?=\r?$)"
+    )
+
+    def original(match: re.Match[str]) -> str:
+        raw_bytes = _read_cached_file(cache, match.group("name"))
+        if raw_bytes is None or attachment_content_digest(raw_bytes) != match.group("digest"):
+            return match.group(0)
+        return raw_bytes.decode("utf-8", errors="replace")
+
+    return reference.sub(original, text)
+
+
+def _read_cached_file(cache: Path, name: str) -> bytes | None:
+    """
+    Read the regular file *name* from *cache* without following symlinks.
+
+    :param cache: A session's attachment cache directory.
+    :param name: Base filename, no directory components.
+    :returns: The file's bytes, or ``None`` if it can't be read safely.
+    """
+    try:
+        root_fd = os.open(cache.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            dir_fd = os.open(
+                cache.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd
+            )
+        finally:
+            os.close(root_fd)
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+        try:
+            info = os.fstat(fd)
+            return _read_fd(fd, info.st_size) if stat.S_ISREG(info.st_mode) else None
+        finally:
+            os.close(fd)
+    except OSError:
+        return None
+
+
 def _materialize_bytes(raw_bytes: bytes, filename: str, bridge_dir: Path) -> Path | None:
     """
     Place *raw_bytes* as *filename* in the session's attachment cache.
@@ -394,12 +452,6 @@ UNRESOLVED_ATTACHMENT_MARKER_PATTERN = r"\[Attachment [^\]]+ could not be loaded
 # Codex's binary file inputs also use the "[Attached file: ...]" shape.
 ATTACHMENT_MARKER_STRIP_PATTERN = (
     rf"\[Attached(?: file)?:[^\]]*\]|{UNRESOLVED_ATTACHMENT_MARKER_PATTERN}"
-)
-
-# A spilled paste replaces one whole text block with this cache reference.
-SPILLED_TEXT_MARKER_PATTERN = (
-    r"(?m)^[ \t]*\[Attached file: /(?:[^\]\r\n]*/)?attachments/[0-9a-f]{32}/"
-    r"pasted_text_(?P<digest>[0-9a-f]{12})(?:_(?P=digest))?\.txt\][ \t]*(?=\r?$)"
 )
 
 

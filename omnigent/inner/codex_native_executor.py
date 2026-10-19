@@ -67,6 +67,7 @@ from omnigent.inner.executor import (
 )
 from omnigent.inner.native_attachments import (
     FRAMEWORK_NOTICE_BLOCK_TYPE,
+    attachment_cache_dir,
     attachment_reference_line,
     codex_resize_metadata_path,
     materialize_attachment,
@@ -1201,10 +1202,16 @@ def _spill_oversized_text(
     :param session_id: Omnigent session id that the log event is attributed to.
     """
     total = sum(len(text) for item in items if isinstance(text := item.get("text"), str))
+    if total <= _MAX_INLINE_TEXT_CHARS:
+        return
+    # Even a one-character file name makes a reference this long.
+    cache_reference = _attached_file_item(attachment_cache_dir(bridge_dir) / "x")
+    shortest_reference = len(str(cache_reference["text"]))
+    # Largest first: once a text is no longer than its reference, no smaller one helps.
     for index in sorted(inline, key=lambda i: len(inline[i].text), reverse=True):
-        if total <= _MAX_INLINE_TEXT_CHARS:
-            return
         entry = inline[index]
+        if total <= _MAX_INLINE_TEXT_CHARS or len(entry.text) <= shortest_reference:
+            return
         path = (
             materialize_attachment(entry.block, bridge_dir)
             if entry.block is not None
@@ -1215,7 +1222,6 @@ def _spill_oversized_text(
         reference = _attached_file_item(path)
         saved = len(entry.text) - len(str(reference["text"]))
         if saved <= 0:
-            # Largest first, so no smaller text could shrink the turn either.
             return
         total -= saved
         items[index] = reference

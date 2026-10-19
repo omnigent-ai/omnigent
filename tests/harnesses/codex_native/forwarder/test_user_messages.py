@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from omnigent.harnesses.codex_native import forwarder as fwd
+from omnigent.inner.native_attachments import materialize_text
 from tests.harnesses.codex_native.forwarder._support import (
     _RecordingClient,
 )
@@ -90,3 +93,44 @@ async def test_post_user_message_truly_empty_is_skipped() -> None:
     await fwd._post_user_message(client, "conv_x", {"turnId": "t1"}, item)
 
     assert client.posts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bridge_known", [True, False], ids=["bridge", "no-bridge"])
+async def test_post_user_message_mirrors_a_spilled_paste_as_sent(
+    tmp_path: Path, bridge_known: bool
+) -> None:
+    """The server receives the paste itself, not the cache reference Codex was given."""
+    paste = "line of a long log\n" * 50
+    reference = f"[Attached file: {materialize_text(paste, tmp_path)}]"
+    item = {
+        "type": "userMessage",
+        "content": [{"type": "text", "text": "what failed?"}, {"type": "text", "text": reference}],
+    }
+    client = _RecordingClient()
+
+    await fwd._post_user_message(
+        client, "conv_x", {"turnId": "t1"}, item, bridge_dir=tmp_path if bridge_known else None
+    )
+
+    [(_url, body)] = client.posts
+    sent = paste if bridge_known else reference
+    assert body["data"]["item_data"]["content"] == [
+        {"type": "input_text", "text": f"what failed?\n\n{sent}"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_post_user_message_keeps_the_reference_when_the_paste_would_not_fit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restored message too large for one event is mirrored with its reference instead."""
+    monkeypatch.setattr(fwd, "MAX_SESSION_EVENT_REQUEST_BYTES", fwd._EVENT_ENVELOPE_HEADROOM_BYTES)
+    reference = f"[Attached file: {materialize_text('x' * 1_000, tmp_path)}]"
+    item = {"type": "userMessage", "content": [{"type": "text", "text": reference}]}
+    client = _RecordingClient()
+
+    await fwd._post_user_message(client, "conv_x", {"turnId": "t1"}, item, bridge_dir=tmp_path)
+
+    [(_url, body)] = client.posts
+    assert body["data"]["item_data"]["content"] == [{"type": "input_text", "text": reference}]
