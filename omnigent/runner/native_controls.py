@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import dataclasses
 import logging
+import threading
 import time
 import urllib.parse
 import weakref
@@ -19,11 +20,13 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
+    from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
     from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
 
 import httpx
 from fastapi.responses import JSONResponse, Response
 
+from omnigent.debug_logging import debug_event
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import native_terminal_name
 from omnigent.inner.databricks_executor import DatabricksAuthError
@@ -40,7 +43,7 @@ from omnigent.runner.native import (
     _CodexNativeModelOptionsNotReady,
     _resolve_opencode_compact_model,
 )
-from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.runner.resource_registry import CODEX_NATIVE_TERMINAL_ROLE, SessionResourceRegistry
 from omnigent.spec.types import AgentSpec
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -68,6 +71,48 @@ _CLAUDE_MODEL_CONFIRM_TIMEOUT_S = 10.0
 
 
 _CLAUDE_MODEL_CONFIRM_POLL_S = 0.25
+
+
+# A session woken for a control may still be booting its TUI, so typing waits for
+# the prompt, capped so the rest fits the server's ~20s wait for the control.
+_CLAUDE_CONTROL_PROMPT_WAIT_S = 9.0
+
+
+# Whole-request budget for a control, under the server's ~20s forward timeout.
+_CLAUDE_CONTROL_BUDGET_S = 18.0
+
+
+class _ClaudeControlDeadline(threading.Event):
+    """A ``cancellable_injection`` flag that sets itself once the control's budget is spent.
+
+    The bridge checks the flag before every tmux key, pane capture and lock
+    wait, so no key reaches the terminal after the server has rolled the
+    control back.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.at = time.monotonic() + _CLAUDE_CONTROL_BUDGET_S
+
+    def remaining_s(self) -> float:
+        return max(0.0, self.at - time.monotonic())
+
+    def is_set(self) -> bool:
+        return super().is_set() or time.monotonic() >= self.at
+
+    def wait(self, timeout: float | None = None) -> bool:
+        budget = self.remaining_s()
+        return super().wait(budget if timeout is None else min(timeout, budget)) or self.is_set()
+
+
+async def _drive_claude_pane(
+    deadline: _ClaudeControlDeadline, function: Callable[..., Any], /, *args: Any, **kwargs: Any
+) -> Any:
+    """Run a pane-driving bridge call that stops sending keys at *deadline*."""
+    from omnigent.harnesses.claude_native.bridge import cancellable_injection
+
+    with cancellable_injection(deadline):
+        return await asyncio.to_thread(function, *args, **kwargs)
 
 
 # How long the detached watcher keeps answering a /model confirm dialog that
@@ -240,6 +285,7 @@ def build_native_controls(
     _claude_model_options_rows: dict[str, tuple[float, list[dict[str, object]]]],
     _codex_native_bridge_state_for_session: _CodexNativeBridgeStateForSessionFn,
     _codex_native_bridge_state_and_dir_for_session: _CodexNativeBridgeStateAndDirForSessionFn,
+    _codex_terminal_ensure_locks: dict[str, asyncio.Lock],
     _ensure_comment_relay_started: _EnsureCommentRelayStartedFn,
     _ensure_native_terminal_for_turn: Callable[[str, str | None], Coroutine[Any, Any, None]],
     _fetch_session_model_override: Callable[[str], Coroutine[Any, Any, str | None]],
@@ -341,11 +387,56 @@ def build_native_controls(
             await asyncio.sleep(_CODEX_SETTINGS_READY_POLL_S)
         return None
 
+    async def _close_unreachable_owned_codex(
+        conv_id: str,
+        state: CodexNativeBridgeState,
+        bridge_dir: Path,
+        failed_backend: CodexNativeAppServer | None,
+    ) -> bool:
+        """Retire the same stopped, owned launch whose listener refused this connection."""
+        from omnigent.entities.session_resources import terminal_resource_id
+        from omnigent.harnesses.codex_native.bridge import read_bridge_state
+        from omnigent.runner.native.orchestration import (
+            _AUTO_CODEX_APP_SERVERS,
+            teardown_codex_native_app_server,
+        )
+
+        registry = resource_registry.terminal_registry
+        if registry is None:
+            return False
+        lock = _codex_terminal_ensure_locks.setdefault(conv_id, asyncio.Lock())
+        async with lock:
+            if (
+                resource_registry.terminal_resource_role(
+                    conv_id, terminal_resource_id("codex", "main")
+                )
+                != CODEX_NATIVE_TERMINAL_ROLE
+                or read_bridge_state(bridge_dir) != state
+            ):
+                return False
+            backend = _AUTO_CODEX_APP_SERVERS.get(conv_id)
+            if backend is None or backend is not failed_backend:
+                return False
+            if backend.bridge_dir != bridge_dir or (
+                backend.proc is not None and backend.proc.returncode is None
+            ):
+                return False
+            _logger.info(
+                "Recreating unreachable owned Codex backend before settings update for session=%s",
+                conv_id,
+                extra={"session_id": conv_id},
+            )
+            await teardown_codex_native_app_server(conv_id)
+            await registry.close(conv_id, "codex", "main")
+            return True
+
     async def _apply_codex_native_settings_update(
         conv_id: str,
         settings: _JsonObject,
         *,
         legacy_server: bool,
+        ready_deadline: float | None = None,
+        retry_unreachable: bool = True,
     ) -> tuple[Response, _JsonObject]:
         """Apply *settings* and return the response with the settings as resolved."""
         from omnigent.harnesses.codex_native.app_server import (
@@ -359,13 +450,16 @@ def build_native_controls(
             read_codex_config_effort,
             read_codex_config_model,
         )
+        from omnigent.runner.native.orchestration import _AUTO_CODEX_APP_SERVERS
         from omnigent.runner.turn_routing import SETTINGS_UPDATE_TIMEOUT_S
         from omnigent.util.reasoning_effort import effort_for_model_switch
 
+        if ready_deadline is None:
+            ready_deadline = asyncio.get_running_loop().time() + _CODEX_SETTINGS_READY_TIMEOUT_S
         try:
             state = await asyncio.wait_for(
                 _ready_codex_bridge_for_settings(conv_id),
-                timeout=_CODEX_SETTINGS_READY_TIMEOUT_S,
+                timeout=ready_deadline - asyncio.get_running_loop().time(),
             )
         except TimeoutError:
             _logger.warning(
@@ -417,9 +511,31 @@ def build_native_controls(
             state.socket_path,
             client_name="omnigent-codex-native-runner",
         )
+        failed_backend = _AUTO_CODEX_APP_SERVERS.get(conv_id)
         try:
-            # Bounded so a hung app-server cannot hold the settings lock indefinitely.
-            await asyncio.wait_for(codex_client.connect(), timeout=SETTINGS_UPDATE_TIMEOUT_S)
+            try:
+                await asyncio.wait_for(
+                    codex_client.connect(),
+                    timeout=SETTINGS_UPDATE_TIMEOUT_S,
+                )
+            except (ConnectionRefusedError, FileNotFoundError):
+                if not retry_unreachable:
+                    raise
+                # No settings request was sent. Recreate this owned launch once,
+                # sharing the original readiness budget with cleanup and startup.
+                retired = await asyncio.wait_for(
+                    _close_unreachable_owned_codex(conv_id, state, bridge_dir, failed_backend),
+                    timeout=ready_deadline - asyncio.get_running_loop().time(),
+                )
+                if not retired:
+                    raise
+                return await _apply_codex_native_settings_update(
+                    conv_id,
+                    settings,
+                    legacy_server=legacy_server,
+                    ready_deadline=ready_deadline,
+                    retry_unreachable=False,
+                )
             if "model" in settings or "effort" in settings:
                 # Only an absent key inherits config; null selects the model's default.
                 effort = (
@@ -1006,6 +1122,8 @@ def build_native_controls(
         has no way to clear: ``inject_slash_command`` reclaims the composer
         itself in ``_restore_occupied_input``. Waiting here would stall the
         case inject already handles for the whole budget, then inject anyway.
+        A live pane that is still booting (a session woken just before the
+        change) is likewise left to the prompt wait inside the injection.
 
         No terminal registry means there is nothing to heal, and a recreate that
         produced no pane is not waited on either (inject keeps its own short
@@ -1060,6 +1178,7 @@ def build_native_controls(
 
         if effort is None or effort not in CLAUDE_EFFORTS:
             return Response(status_code=204)
+        deadline = _ClaudeControlDeadline()
         bridge_id = await _claude_native_bridge_id_for_session(
             server_client=server_client,
             session_id=conv_id,
@@ -1071,15 +1190,17 @@ def build_native_controls(
             # An effort switch invalidates the prompt cache on a session with
             # history, so Claude Code asks to confirm; the chat UI cannot render
             # that TUI dialog, so answer it by its own title.
-            await asyncio.to_thread(
+            await _drive_claude_pane(
+                deadline,
                 inject_slash_command,
                 bridge_dir,
                 command=command,
                 timeout_s=1.0,
+                ready_timeout_s=min(_CLAUDE_CONTROL_PROMPT_WAIT_S, deadline.remaining_s()),
                 auto_confirm=True,
                 confirm_hint=EFFORT_DIALOG_HINT,
             )
-        except (RuntimeError, ValueError) as exc:
+        except (RuntimeError, ValueError, OSError) as exc:
             return JSONResponse(
                 status_code=503,
                 content={
@@ -1143,12 +1264,14 @@ def build_native_controls(
     ) -> Response:
         from omnigent.harnesses.claude_native.bridge import (
             SWITCH_MODEL_DIALOG_HINT,
+            ClaudePromptTimeout,
             bridge_dir_for_bridge_id,
             confirm_dialog_if_open,
             inject_slash_command,
             read_claude_status_model,
             read_model_env,
             read_model_picker_values,
+            wait_for_input_ready,
         )
         from omnigent.harnesses.claude_native.main import (
             resolve_claude_native_model_selection,
@@ -1167,6 +1290,9 @@ def build_native_controls(
 
         if model is None or not model.strip():
             return Response(status_code=204)
+        # The server rolls the pick back after its forward timeout, so no key may
+        # reach the terminal past this deadline.
+        deadline = _ClaudeControlDeadline()
         bridge_id = await _claude_native_bridge_id_for_session(
             server_client=server_client,
             session_id=conv_id,
@@ -1221,21 +1347,8 @@ def build_native_controls(
                 },
             )
         command = f"/model {model_arg}"
-        baseline = await asyncio.to_thread(read_claude_status_model, bridge_dir)
-        try:
-            # Accepted trade-off: ``/model <id>`` also saves the pick as the
-            # person's global default in ``~/.claude/settings.json``. Driving
-            # the interactive picker instead avoided that write but needed
-            # ~35s of fragile tmux automation, so the write stands.
-            await asyncio.to_thread(
-                inject_slash_command,
-                bridge_dir,
-                command=command,
-                timeout_s=1.0,
-                auto_confirm=True,
-                confirm_hint=SWITCH_MODEL_DIALOG_HINT,
-            )
-        except (RuntimeError, ValueError) as exc:
+
+        def _model_failed(exc: BaseException) -> JSONResponse:
             return JSONResponse(
                 status_code=503,
                 content={
@@ -1243,6 +1356,60 @@ def build_native_controls(
                     "detail": _client_safe_error_detail(exc, context="claude-native model change"),
                 },
             )
+
+        # A session woken for this change may still be booting its TUI, which drops
+        # typed keys. Wait for the prompt first, so the baseline below is the booted
+        # pane's model rather than an empty or leftover snapshot.
+        prompt_budget_s = min(_CLAUDE_CONTROL_PROMPT_WAIT_S, deadline.remaining_s())
+        wait_started = time.monotonic()
+        wait_error: Exception | None = None
+        try:
+            await _drive_claude_pane(
+                deadline,
+                wait_for_input_ready,
+                bridge_dir,
+                ready_timeout_s=prompt_budget_s,
+                timeout_s=1.0,
+            )
+        except (RuntimeError, OSError) as exc:
+            wait_error = exc
+        waited_s = time.monotonic() - wait_started
+        _logger.info(
+            "claude-native model change for session=%s waited %.1fs for the Claude prompt: %s",
+            conv_id,
+            waited_s,
+            "ready" if wait_error is None else type(wait_error).__name__,
+            extra=debug_event(
+                "claude_native_model_change_prompt_wait",
+                session_id=conv_id,
+                waited_ms=round(waited_s * 1000),
+                budget_ms=round(prompt_budget_s * 1000),
+                timed_out=isinstance(wait_error, ClaudePromptTimeout),
+                error_type=None if wait_error is None else type(wait_error).__name__,
+            ),
+        )
+        if wait_error is not None:
+            return _model_failed(wait_error)
+        baseline = await asyncio.to_thread(read_claude_status_model, bridge_dir)
+        try:
+            # Accepted trade-off: ``/model <id>`` also saves the pick as the
+            # person's global default in ``~/.claude/settings.json``. Driving
+            # the interactive picker instead avoided that write but needed
+            # ~35s of fragile tmux automation, so the write stands.
+            await _drive_claude_pane(
+                deadline,
+                inject_slash_command,
+                bridge_dir,
+                command=command,
+                timeout_s=1.0,
+                # A boot that used the prompt budget still leaves the injection a
+                # short wait for a torn capture right after the prompt rendered.
+                ready_timeout_s=min(deadline.remaining_s(), max(1.0, prompt_budget_s - waited_s)),
+                auto_confirm=True,
+                confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+            )
+        except (RuntimeError, ValueError, OSError) as exc:
+            return _model_failed(exc)
         # Verify against the statusLine snapshot the forwarder already polls:
         # Claude rewrites it on every render, including right after ``/model``.
         # Expected spellings come from this session's own catalog rows (every
@@ -1260,7 +1427,12 @@ def build_native_controls(
                 row_model = row.get("model")
                 if isinstance(row_model, str) and row_model:
                     expected.add(row_model)
-        deadline = time.monotonic() + _CLAUDE_MODEL_CONFIRM_TIMEOUT_S
+        # The prompt wait comes out of this window, keeping the whole request
+        # inside the server's forward timeout.
+        confirm_window_s = min(_CLAUDE_MODEL_CONFIRM_TIMEOUT_S, deadline.remaining_s())
+        confirm_deadline = time.monotonic() + confirm_window_s
+        # A switch typed into a busy pane is queued; its turn may settle before the deadline.
+        was_busy = _native_pane_status.get(conv_id) in ("running", "waiting")
         while True:
             current = await asyncio.to_thread(read_claude_status_model, bridge_dir)
             if current and (current in expected or (baseline and current != baseline)):
@@ -1281,16 +1453,19 @@ def build_native_controls(
                     extra={"session_id": conv_id},
                 )
                 return Response(status_code=204)
-            # The confirm dialog can render well after the injection's own
-            # short watch (a warm repaint, or a queued command surfacing) —
-            # answer it whenever it shows inside the window.
-            await asyncio.to_thread(
-                confirm_dialog_if_open, bridge_dir, hint=SWITCH_MODEL_DIALOG_HINT
+            # The dialog can render after the injection's short watch; answer it
+            # inside the window. A lapsed budget ends the window like a timeout.
+            if deadline.is_set():
+                break
+            await _drive_claude_pane(
+                deadline, confirm_dialog_if_open, bridge_dir, hint=SWITCH_MODEL_DIALOG_HINT
             )
-            if time.monotonic() >= deadline:
+            if _native_pane_status.get(conv_id) in ("running", "waiting"):
+                was_busy = True
+            if time.monotonic() >= confirm_deadline:
                 break
             await asyncio.sleep(_CLAUDE_MODEL_CONFIRM_POLL_S)
-        if _native_pane_status.get(conv_id) in ("running", "waiting"):
+        if was_busy:
             # Mid-turn switch: Claude queues the typed command and applies it
             # when the turn settles — its confirm dialog can pop minutes from
             # now. Not a failure: answer success, keep a detached watcher on
@@ -1315,7 +1490,7 @@ def build_native_controls(
                 "error": "claude_native_model_unconfirmed",
                 "detail": (
                     f"the terminal did not confirm the switch to {model_arg} within "
-                    f"{_CLAUDE_MODEL_CONFIRM_TIMEOUT_S:.0f}s — a dialog may be open in the pane"
+                    f"{confirm_window_s:.0f}s — a dialog may be open in the pane"
                 ),
             },
         )
@@ -1521,6 +1696,7 @@ def build_native_controls(
             inject_slash_command,
         )
 
+        deadline = _ClaudeControlDeadline()
         bridge_id = await _claude_native_bridge_id_for_session(
             server_client=server_client,
             session_id=conv_id,
@@ -1528,13 +1704,15 @@ def build_native_controls(
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
         await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
         try:
-            await asyncio.to_thread(
+            await _drive_claude_pane(
+                deadline,
                 inject_slash_command,
                 bridge_dir,
                 command="/compact",
                 timeout_s=1.0,
+                ready_timeout_s=min(_CLAUDE_CONTROL_PROMPT_WAIT_S, deadline.remaining_s()),
             )
-        except (RuntimeError, ValueError) as exc:
+        except (RuntimeError, ValueError, OSError) as exc:
             return JSONResponse(
                 status_code=503,
                 content={

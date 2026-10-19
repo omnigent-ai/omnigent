@@ -193,7 +193,12 @@ def test_login_with_reauth_stamps_reauth_at_in_state(login_client: TestClient) -
     assert "reauth_at" not in plain_payload
 
 
-def test_github_provider_reauth_sends_no_prompt(github_client: TestClient) -> None:
+@pytest.mark.parametrize(
+    "params", [{"reauth": "1"}, {"ticket": "cli-ticket"}, {"ticket": "cli-ticket", "reauth": "0"}]
+)
+def test_github_provider_reauth_sends_no_prompt(
+    github_client: TestClient, params: dict[str, str]
+) -> None:
     """GitHub OAuth does not support prompt=login; reauth=1 must be silently ignored.
 
     The device-grant router refuses to mount for GitHub (enforced in
@@ -201,7 +206,7 @@ def test_github_provider_reauth_sends_no_prompt(github_client: TestClient) -> No
     deployment from the device-grant consent path. But if it does, the handler
     must not add prompt=login (GitHub ignores it; some implementations error).
     """
-    r = github_client.get("/auth/login", params={"reauth": "1"})
+    r = github_client.get("/auth/login", params=params)
     assert r.status_code == 302, f"expected 302, got {r.status_code}"
     location = r.headers["location"]
     params = _parse_auth_url(location)

@@ -14,7 +14,7 @@ import yaml
 
 from tests._helpers.server_runner import server_runner
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
-from tests.e2e.conftest import configure_mock_llm, get_mock_requests
+from tests.e2e.conftest import get_mock_requests, set_fallback_mock_llm
 
 _SERVER_BOOTSTRAP = """
 import json, os
@@ -43,7 +43,8 @@ def test_native_turn_survives_an_unsupported_automatic_model_verdict(
     isolated_mock_llm_server_url: str,
 ) -> None:
     model, answer = "gpt-5.4", "COMPATIBLE_ROUTED_TURN"
-    configure_mock_llm(isolated_mock_llm_server_url, [{"text": answer}])
+    # The native turn and background title calls share this isolated gateway.
+    set_fallback_mock_llm(isolated_mock_llm_server_url, "default", answer)
     offered = tmp_path / "offered.json"
     source = tmp_path / "source-home"
     source.mkdir()
@@ -132,7 +133,13 @@ def test_native_turn_survives_an_unsupported_automatic_model_verdict(
                     snapshot["last_task_error"],
                     stack.log_tail(),
                 )
-                if snapshot["status"] == "idle" and answer in json.dumps(snapshot["items"]):
+                answered = any(
+                    item["type"] == "message"
+                    and item["data"].get("role") == "assistant"
+                    and answer in json.dumps(item["data"].get("content", []))
+                    for item in snapshot["items"]
+                )
+                if snapshot["status"] == "idle" and answered:
                     break
                 assert time.monotonic() < deadline, stack.log_tail()
                 time.sleep(0.1)

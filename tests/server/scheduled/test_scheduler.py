@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field, replace
 
+import pytest
+
 from omnigent.server.scheduled.scheduler import (
     MISFIRE_GRACE_TIME_S,
     ScheduledTaskScheduler,
@@ -156,11 +158,16 @@ def _make(
 # ── boot load ────────────────────────────────────────────────────────────────
 
 
-async def test_start_arms_one_timer_per_active_task() -> None:
-    scheduler, _clock, seam, _fired = _make([_task("a"), _task("b")])
+@pytest.mark.parametrize(
+    "rule", ["FREQ=HOURLY", "FREQ=MINUTELY;INTERVAL=60", "FREQ=SECONDLY;INTERVAL=3600"]
+)
+async def test_start_arms_one_timer_per_active_task(rule: str) -> None:
+    scheduler, _clock, seam, _fired = _make([_task("a", rule), _task("b", rule)])
     await scheduler.start()
     assert scheduler.job_count == 2
     assert len(seam.live()) == 2
+    assert scheduler.next_run_at("a") is not None
+    assert all(0 < timer.delay <= 3600 for timer in seam.live())
 
 
 async def test_start_is_idempotent() -> None:
@@ -335,6 +342,21 @@ async def test_on_fire_exception_does_not_break_rearm() -> None:
     await scheduler.start()
     await seam.fire_latest()  # must not raise
     assert len(seam.live()) == 1  # re-armed despite the error
+
+
+async def test_rearm_work_limit_clears_next_run(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    scheduler, clock, seam, fired = _make([_task("a")])
+    await scheduler.start()
+    clock.advance(seam.live()[0].delay)
+    monkeypatch.setattr("omnigent.server.scheduled.rrule._MAX_SEARCH_STEPS", 0)
+    await seam.fire_latest()
+    assert fired.calls == [(0, "a")]
+    assert scheduler.next_run_at("a") is None
+    assert seam.live() == []
+    assert "task a stopped" in caplog.text
+    assert "work limit" in caplog.text
 
 
 async def test_inactive_fire_does_not_remove_a_replacement_timer() -> None:

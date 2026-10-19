@@ -58,6 +58,7 @@ def mint_session_token(
     provider: str,
     *,
     account_generation: str | None = None,
+    cli_login_ticket: str | None = None,
 ) -> str:
     """
     Mint a signed session JWT with a second-granularity lifetime.
@@ -74,6 +75,8 @@ def mint_session_token(
     :param ttl_seconds: Token lifetime in seconds.
     :param provider: Identity provider name, e.g. ``"google"`` or
         ``"accounts"``. Stored as an informational claim.
+    :param cli_login_ticket: Ticket authenticated by the browser callback,
+        never included in runner, refresh, or CLI-issued credentials.
     :returns: An HS256-signed JWT string.
     """
     now = int(time.time())
@@ -85,6 +88,8 @@ def mint_session_token(
     }
     if account_generation is not None:
         payload["account_generation"] = account_generation
+    if cli_login_ticket is not None:
+        payload["cli_login_ticket"] = cli_login_ticket
     return jwt.encode(payload, cookie_secret, algorithm="HS256")
 
 
@@ -95,6 +100,7 @@ def mint_session_cookie(
     provider: str,
     *,
     account_generation: str | None = None,
+    cli_login_ticket: str | None = None,
 ) -> str:
     """Mint a signed session cookie JWT.
 
@@ -104,10 +110,16 @@ def mint_session_cookie(
     :param ttl_hours: Session lifetime in hours.
     :param provider: Identity provider name, e.g. ``"google"``
         or ``"github"``. Stored as an informational claim.
+    :param cli_login_ticket: Ticket authenticated by the browser callback.
     :returns: An HS256-signed JWT string.
     """
     return mint_session_token(
-        user_id, cookie_secret, ttl_hours * 3600, provider, account_generation=account_generation
+        user_id,
+        cookie_secret,
+        ttl_hours * 3600,
+        provider,
+        account_generation=account_generation,
+        cli_login_ticket=cli_login_ticket,
     )
 
 

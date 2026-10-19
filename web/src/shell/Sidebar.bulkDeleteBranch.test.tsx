@@ -38,7 +38,8 @@ import { type Conversation, useConversations } from "@/hooks/useConversations";
 const useConvMock = vi.mocked(useConversations);
 
 // Two worktree sessions (git_branch set) and one plain session. Owner
-// (owner unset → owned by viewer), idle → selectable + deletable.
+// (owner unset → owned by viewer), idle → selectable + deletable. Distinct
+// updated_at values pin the rendered order the payload assertions rely on.
 const WORKTREE_A: Conversation = {
   id: "conv_a",
   object: "conversation",
@@ -54,12 +55,14 @@ const WORKTREE_B: Conversation = {
   ...WORKTREE_A,
   id: "conv_b",
   title: "Beta",
+  updated_at: 1_699_999_999,
   git_branch: "feat/beta",
 };
 const PLAIN: Conversation = {
   ...WORKTREE_A,
   id: "conv_c",
   title: "Gamma",
+  updated_at: 1_699_999_998,
   git_branch: null,
 };
 

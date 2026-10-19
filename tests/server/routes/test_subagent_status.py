@@ -366,17 +366,29 @@ async def test_subagent_idle_validates_optional_response_id(
     ("status", "turn_outcome"),
     [("idle", None), ("running", None), ("failed", None), ("idle", "cancelled")],
 )
+@pytest.mark.parametrize("structured", [False, True])
 async def test_external_session_status_still_forwards_to_runner(
-    status_route: _StatusRoute, status: str, turn_outcome: str | None
+    status_route: _StatusRoute, status: str, turn_outcome: str | None, structured: bool
 ) -> None:
     route = status_route
     sid = route.child_id
     data = {"status": status, "output": "authoritative result"}
+    if structured:
+        data["output"] = json.dumps(
+            {
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "array_above_max_length",
+                    "param": "input[3].content",
+                }
+            }
+        )
     if turn_outcome is not None:
         data["turn_outcome"] = turn_outcome
-    response = await route.client.post(
-        f"/v1/sessions/{sid}/events", json={"type": "external_session_status", "data": data}
-    )
+    with capture_debug_rows("server") as rows:
+        response = await route.client.post(
+            f"/v1/sessions/{sid}/events", json={"type": "external_session_status", "data": data}
+        )
     assert response.status_code == 202, response.text
     assert response.json() == {"queued": False}
     assert len(route.forwarded) == 1
@@ -388,7 +400,22 @@ async def test_external_session_status_still_forwards_to_runner(
         expected_data["failure_context"] = {
             "failure_source": "external_status",
             "detail_source": "external_status_output",
+            **(
+                {
+                    "inference_detail_source": "provider_error_json",
+                    "provider_error_type": "invalid_request_error",
+                    "provider_error_code": "array_above_max_length",
+                    "provider_error_param": "input[3].content",
+                }
+                if structured
+                else {}
+            ),
         }
+        [failure] = [r for r in rows if r["event_name"] == "session_turn_failed"]
+        assert failure["session_id"] == sid
+        assert failure["attributes"]["origin"] == "external_session_status"
+        if structured:
+            assert failure["attributes"]["provider_error_param"] == "input[3].content"
     assert body["data"] == expected_data
     assert route.telemetry.call_count == (0 if status == "running" else 1)
 

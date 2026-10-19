@@ -52,6 +52,11 @@ class ServerStore(
             ?.filter { it.isNotBlank() }
             .orEmpty()
 
+    /** Forget the automatic default while retaining recents for an explicit reconnect. */
+    fun clearCurrent() {
+        prefs.edit().remove(KEY_CURRENT).apply()
+    }
+
     /** Set the current server and push it to the front of the recents list. */
     fun connect(url: String) {
         val recents = (listOf(url) + recentServers()).distinct().take(MAX_RECENTS)

@@ -414,6 +414,7 @@ def test_runner_resource_attach_recreates_dead_qwen_terminal(
         *,
         server_client: object,
         ensure_comment_relay: object = None,
+        agent_spec: object = None,
     ) -> SessionResourceView:
         """
         Stand-in for ``_auto_create_qwen_terminal`` that registers a
@@ -425,6 +426,8 @@ def test_runner_resource_attach_recreates_dead_qwen_terminal(
         :param server_client: Omnigent server client (unused).
         :param ensure_comment_relay: Comment relay hook threaded by the
             recreate path (unused by the stub).
+        :param agent_spec: Session agent spec threaded by the recreate path so
+            the pane inherits its ``os_env`` (unused by the stub).
         :returns: Terminal resource view for the fresh pane.
         """
         auto_create_sessions.append(session_id)

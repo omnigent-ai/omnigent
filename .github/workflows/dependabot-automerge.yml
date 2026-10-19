@@ -1,0 +1,65 @@
+name: Dependabot Auto-merge
+
+on:
+  schedule:
+    - cron: '17,47 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependabot-automerge
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    if: github.repository == 'omnigent-ai/omnigent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      DEPENDABOT_AUTOMERGE_MODE: ${{ vars.DEPENDABOT_AUTOMERGE_MODE || 'report' }}
+    steps:
+      - name: Check out trusted policy
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
+          sparse-checkout: |
+            .github/scripts/dependabot_automerge.py
+            .github/scripts/dependabot_policy.py
+            .github/scripts/maintainer_approval.py
+            .github/dependabot-automerge.json
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Install trusted policy parser
+        run: |
+          python3 -m venv "$RUNNER_TEMP/dependabot-policy-env"
+          "$RUNNER_TEMP/dependabot-policy-env/bin/pip" install --disable-pip-version-check --only-binary=:all: PyYAML==6.0.3
+          echo "$RUNNER_TEMP/dependabot-policy-env/bin" >> "$GITHUB_PATH"
+
+      - name: Mint merge token
+        id: merge-token
+        if: vars.DEPENDABOT_AUTOMERGE_MODE == 'merge'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: omnigent
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+          permission-actions: write
+
+      - name: Evaluate and optionally merge Dependabot upgrades
+        env:
+          DEPENDABOT_MERGE_TOKEN: ${{ steps.merge-token.outputs.token }}
+        run: python3 .github/scripts/dependabot_automerge.py --repository "$REPO"

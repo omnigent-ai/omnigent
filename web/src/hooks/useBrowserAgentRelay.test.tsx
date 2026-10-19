@@ -25,6 +25,7 @@ import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import { useBrowserAgentRelay } from "./useBrowserAgentRelay";
+import legacyActions from "../../electron/test/fixtures/browserActions-v0.18.json";
 
 const CONV = "conv_relay";
 const renderRelay = (visibleId: string | null | undefined = CONV, client = new QueryClient()) => {
@@ -61,7 +62,7 @@ function installBridge(overrides: Record<string, unknown> = {}) {
     browserScreenshot: vi
       .fn()
       .mockResolvedValue({ ok: true, dataUrl: "data:image/png;base64,AAA" }),
-    browserExecute: vi.fn().mockResolvedValue({ ok: true, result: "ok" }),
+    browserPerformAction: vi.fn().mockResolvedValue({ ok: true, result: "ok" }),
     ...overrides,
   };
   (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = bridge;
@@ -95,11 +96,6 @@ async function runAction(
 
 /** The claim_token the winning-claim response carries in most tests. */
 const WON = jsonResponse({ claimed: true, claim_token: "tok_1" });
-
-/** Parse the JS string passed to browserExecute for the Nth call. */
-function executedJs(bridge: { browserExecute: ReturnType<typeof vi.fn> }, n = 0): string {
-  return bridge.browserExecute.mock.calls[n][1] as string;
-}
 
 /** Read the result body POSTed back for the last action_result call. */
 function postedResult(): Record<string, unknown> {
@@ -653,54 +649,60 @@ describe("useBrowserAgentRelay — action dispatch", () => {
 
   it("snapshot: parses the executed JSON tree", async () => {
     const bridge = installBridge({
-      browserExecute: vi
+      browserPerformAction: vi
         .fn()
         .mockResolvedValue({ ok: true, result: JSON.stringify({ snapshot_id: "s1", tree: "x" }) }),
     });
     await runAction(actionEvent("snapshot"));
-    // The snapshot JS is the fixed SNAPSHOT_JS constant (walks the DOM).
-    expect(executedJs(bridge)).toContain("__omni_refs__");
+    expect(bridge.browserPerformAction).toHaveBeenCalledWith("conv_relay", "snapshot", undefined);
     expect((postedResult().result as { data: { snapshot_id: string } }).data.snapshot_id).toBe(
       "s1",
     );
   });
 
   it("snapshot: reports a parse error on non-JSON output", async () => {
-    installBridge({ browserExecute: vi.fn().mockResolvedValue({ ok: true, result: "not json" }) });
+    installBridge({
+      browserPerformAction: vi.fn().mockResolvedValue({ ok: true, result: "not json" }),
+    });
     await runAction(actionEvent("snapshot"));
     expect((postedResult().result as { error: string }).error).toMatch(/snapshot parse failed/);
   });
 
-  it("click by ref: validates snapshot_id and clicks the resolved element", async () => {
-    const bridge = installBridge();
-    await runAction(actionEvent("click", { ref: 7, snapshot_id: "snap-9" }));
-    const js = executedJs(bridge);
-    expect(js).toContain('__omni_snapshot_id__ !== "snap-9"');
-    expect(js).toContain("__omni_refs__");
-    expect(js).toContain("el.click()");
-    expect((postedResult().result as { ok: boolean }).ok).toBe(true);
+  it.each(legacyActions.requests)(
+    "supports an older desktop's $action transport with its frozen template",
+    async ({ action, args, script }) => {
+      const browserExecute = vi.fn().mockResolvedValue({ ok: true, result: "{}" });
+      installBridge({ browserPerformAction: undefined, browserExecute });
+      await runAction(actionEvent(action, args));
+      expect(browserExecute).toHaveBeenCalledWith(CONV, script);
+      expect(postedResult().result).toMatchObject({ ok: true });
+    },
+  );
+
+  it("prefers typed actions when a desktop also offers legacy compatibility", async () => {
+    const browserExecute = vi.fn();
+    const bridge = installBridge({ browserExecute });
+    await runAction(actionEvent("click", { ref: 1 }));
+    expect(bridge.browserPerformAction).toHaveBeenCalledWith(CONV, "click", { ref: 1 });
+    expect(browserExecute).not.toHaveBeenCalled();
   });
 
-  it("click by selector: resolves via querySelector (neutral selector, JSON-escaped)", async () => {
+  it.each([
+    { action: "click", args: { ref: 7, snapshot_id: "snap-9" } },
+    { action: "click", args: { selector: "button.submit" } },
+    { action: "type", args: { ref: 3, text: "hello" } },
+  ])("forwards $action with $args and returns its result", async ({ action, args }) => {
     const bridge = installBridge();
-    await runAction(actionEvent("click", { selector: "button.submit" }));
-    const js = executedJs(bridge);
-    expect(js).toContain('document.querySelector("button.submit")');
-  });
-
-  it("type: sets the value via the native setter and dispatches input/change", async () => {
-    const bridge = installBridge();
-    await runAction(actionEvent("type", { ref: 3, text: "hello" }));
-    const js = executedJs(bridge);
-    expect(js).toContain('"hello"'); // text JSON-escaped into the payload
-    expect(js).toContain("input");
-    expect(js).toContain("change");
+    await runAction(actionEvent(action, args));
+    expect(bridge.browserPerformAction).toHaveBeenCalledWith("conv_relay", action, args);
     expect((postedResult().result as { ok: boolean }).ok).toBe(true);
   });
 
   it("click: surfaces the in-page execute error", async () => {
     installBridge({
-      browserExecute: vi.fn().mockResolvedValue({ ok: false, error: "selector not found: x" }),
+      browserPerformAction: vi
+        .fn()
+        .mockResolvedValue({ ok: false, error: "selector not found: x" }),
     });
     await runAction(actionEvent("click", { selector: "x" }));
     expect((postedResult().result as { error: string }).error).toBe("selector not found: x");
@@ -714,17 +716,9 @@ describe("useBrowserAgentRelay — action dispatch", () => {
     );
   });
 
-  it("missing bridge method → 'does not support the browser pane'", async () => {
-    installBridge({ browserExecute: undefined });
-    await runAction(actionEvent("snapshot"));
-    expect((postedResult().result as { error: string }).error).toMatch(
-      /does not support the browser pane/,
-    );
-  });
-
-  it("type: missing execute bridge → 'does not support the browser pane'", async () => {
-    installBridge({ browserExecute: undefined });
-    await runAction(actionEvent("type", { ref: 1, text: "x" }));
+  it.each(["snapshot", "click", "type"])("%s: missing browser action bridge", async (action) => {
+    installBridge({ browserPerformAction: undefined });
+    await runAction(actionEvent(action, { ref: 1, text: "x" }));
     expect((postedResult().result as { error: string }).error).toMatch(
       /does not support the browser pane/,
     );
@@ -740,7 +734,7 @@ describe("useBrowserAgentRelay — action dispatch", () => {
 
   it("dispatch surfaces a thrown in-page/IPC error as {ok:false} (outer catch)", async () => {
     installBridge({
-      browserExecute: vi.fn().mockRejectedValue(new Error("execute blew up")),
+      browserPerformAction: vi.fn().mockRejectedValue(new Error("execute blew up")),
     });
     await runAction(actionEvent("click", { selector: "x" }));
     expect((postedResult().result as { ok: boolean; error: string }).error).toBe("execute blew up");

@@ -1,16 +1,6 @@
-# Dependabot configuration: security updates plus grouped version updates.
-#
-# Security fix PRs come from the repo-level "Dependabot security updates"
-# toggle (enabled out of band); the `*-security` groups below batch a burst of
-# advisories into one PR per ecosystem. Version updates are ON again, but
-# shaped to avoid the churn that had them switched off before:
-#   - minor + patch bumps land as ONE grouped PR per ecosystem per week;
-#   - majors never arrive for the web workspace (react, react-router, vite
-#     migrations are planned work, not a bot PR) and fall through to their own
-#     PR elsewhere so each gets explicit review;
-#   - a 7-day cooldown matches the repo's existing release-age policy
-#     (pnpm `minimumReleaseAge`, uv `exclude-newer = "P7D"`), so a compromised
-#     or yanked release has a window to surface before it is pinned.
+# Dependabot opens individual version and security update PRs by default.
+# Keep only cross-pinned MLflow packages together so they can resolve in lockstep.
+# Weekly version updates retain the seven-day cooldown and existing PR limits.
 #
 # Layout invariants (tests/scripts/test_dependabot_config.py checks them):
 #   - Declare each lockfile once, at its workspace root, so manifests and locks
@@ -39,15 +29,12 @@ updates:
     commit-message:
       prefix: "chore(deps)"
     groups:
-      python-security:
-        applies-to: security-updates
-        patterns: ["*"]
-      # One group, so the cross-pinned mlflow / mlflow-skinny / mlflow-tracing
-      # train (see uv.toml) moves inside the same PR as everything else.
-      python-minor-patch:
+      mlflow:
         applies-to: version-updates
-        patterns: ["*"]
-        update-types: ["minor", "patch"]
+        patterns: ["mlflow", "mlflow-skinny", "mlflow-tracing"]
+      mlflow-security:
+        applies-to: security-updates
+        patterns: ["mlflow", "mlflow-skinny", "mlflow-tracing"]
 
   # ── JavaScript: the pnpm workspace (web, electron, vscode, cloudflare,
   #    web-extension SDK, CI deps, example extension) ────────────────────
@@ -69,14 +56,6 @@ updates:
       # migrations the team schedules; a bot PR for them is only churn.
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
-    groups:
-      web-security:
-        applies-to: security-updates
-        patterns: ["*"]
-      npm-minor-patch:
-        applies-to: version-updates
-        patterns: ["*"]
-        update-types: ["minor", "patch"]
 
   # ── Pinned harness CLIs installed by CI: intentional exact pins, never bump.
   #    Declared so the security toggle does not file ungrouped PRs for them.
@@ -106,16 +85,6 @@ updates:
       - github_actions
     commit-message:
       prefix: "chore(deps)"
-    groups:
-      actions-security:
-        applies-to: security-updates
-        patterns: ["*"]
-      # One PR moves every action's SHA pin (and its `# vX.Y.Z` comment);
-      # majors fall through to individual PRs for explicit review.
-      actions-minor-patch:
-        applies-to: version-updates
-        patterns: ["*"]
-        update-types: ["minor", "patch"]
 
   # ── Rust: the omnidev tool and the codex-parity test sidecar ─────────────
   - package-ecosystem: cargo
@@ -133,14 +102,6 @@ updates:
       - rust
     commit-message:
       prefix: "chore(deps)"
-    groups:
-      cargo-security:
-        applies-to: security-updates
-        patterns: ["*"]
-      cargo-minor-patch:
-        applies-to: version-updates
-        patterns: ["*"]
-        update-types: ["minor", "patch"]
 
   # ── Android app (Gradle, version catalog) ────────────────────────────────
   - package-ecosystem: gradle
@@ -155,14 +116,6 @@ updates:
       - dependencies
     commit-message:
       prefix: "chore(deps)"
-    groups:
-      android-security:
-        applies-to: security-updates
-        patterns: ["*"]
-      android-minor-patch:
-        applies-to: version-updates
-        patterns: ["*"]
-        update-types: ["minor", "patch"]
 
   # ── iOS app tooling (Bundler) ────────────────────────────────────────────
   - package-ecosystem: bundler
@@ -177,14 +130,6 @@ updates:
       - dependencies
     commit-message:
       prefix: "chore(deps)"
-    groups:
-      ios-security:
-        applies-to: security-updates
-        patterns: ["*"]
-      ios-minor-patch:
-        applies-to: version-updates
-        patterns: ["*"]
-        update-types: ["minor", "patch"]
 
   # ── Container base images (deploy/*/Dockerfile*) ─────────────────────────
   - package-ecosystem: docker
@@ -202,11 +147,6 @@ updates:
       - dependencies
     commit-message:
       prefix: "chore(deps)"
-    groups:
-      docker-minor-patch:
-        applies-to: version-updates
-        patterns: ["*"]
-        update-types: ["minor", "patch"]
 
   # ── pre-commit hook revisions ────────────────────────────────────────────
   - package-ecosystem: pre-commit
@@ -221,7 +161,3 @@ updates:
       - dependencies
     commit-message:
       prefix: "chore(deps)"
-    groups:
-      pre-commit-hooks:
-        patterns: ["*"]
-        update-types: ["minor", "patch"]

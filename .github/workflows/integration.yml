@@ -72,13 +72,19 @@ jobs:
           # running ref, and it is not a security gate -- it only selects which
           # harness legs run and can't expose secrets, so the PR's own copy is
           # fine.
-          sparse-checkout: .github/scripts/ci
+          fetch-depth: 2
+          sparse-checkout: |
+            .github/scripts/ci
+            .github/actions/dependency-ci-scope
           persist-credentials: false
+      - id: scope
+        uses: ./.github/actions/dependency-ci-scope
       - name: Compute integration matrix
         id: matrix
         env:
           EVENT_NAME: ${{ github.event_name }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
+          RUN_TESTS: ${{ steps.scope.outputs.integration }}
         run: bash .github/scripts/ci/integration-matrix.sh
 
   integration:

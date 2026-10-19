@@ -85,6 +85,58 @@ function readConfig() {
   }
 }
 
+function nativeAuthFailure(message, ctx) {
+  const authDir = process.env.OMNIGENT_PI_NATIVE_AUTH_DIR;
+  const error = message && message.errorMessage;
+  const provider =
+    (message && message.provider) || (ctx && ctx.model && ctx.model.provider);
+  if (!authDir || typeof provider !== "string" || typeof error !== "string")
+    return null;
+  // Match wrap_auth_command's provider key and Pi's resolver error wording.
+  const id = crypto
+    .createHash("sha256")
+    .update(provider)
+    .digest("hex")
+    .slice(0, 16);
+  const file = `auth-${id}.json`;
+  if (
+    !error.includes("Failed to resolve API key for provider") ||
+    !error.includes(file)
+  )
+    return null;
+  try {
+    const resultPath = path.join(authDir, `${file}.result.json`);
+    const result = JSON.parse(fs.readFileSync(resultPath, "utf8"));
+    const age = Date.now() - result.at;
+    if (
+      result.piPid !== process.pid ||
+      !Number.isFinite(age) ||
+      age < 0 ||
+      age > 30_000
+    )
+      return null;
+    const reasons = {
+      timeout: "timed out before Pi's ten-second deadline",
+      failed_exit: "exited unsuccessfully",
+      empty: "returned an empty token",
+      invalid_output: "returned invalid UTF-8",
+      output_limit: "exceeded the output limit",
+      start_failed: "could not start",
+      invalid_command: "has no command configured",
+      cancelled: "was cancelled",
+    };
+    const reason = reasons[result.kind];
+    if (!reason) return null;
+    fs.unlinkSync(resultPath);
+    return {
+      code: `pi_auth_${result.kind}`,
+      message: `Pi authentication helper ${reason}. Check the configured token command, then send another message to retry. Your session is preserved.`,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
 // Re-read authHeaders from config.json on each outbound request. The bearer
 // baked at launch dies with the ~1h Databricks OAuth lifetime; the runner
 // re-mints it into config.json each turn (PiNativeExecutor), so re-reading
@@ -852,9 +904,8 @@ function assistantItemPostTimeoutMs(config) {
     : _ASSISTANT_ITEM_POST_TIMEOUT_MS;
 }
 
-// Only the authoritative assistant message_end uses this checked, bounded
-// path; every other bridge event retains postEvent's best-effort behavior.
-async function postAssistantMessage(config, data, sourceId) {
+// Final assistant messages and errors survive transient transport failures.
+async function postConversationItem(config, data, sourceId) {
   const body = {
     type: "external_conversation_item",
     data: { ...data, source_id: boundedSourceId(sourceId) },
@@ -1377,6 +1428,7 @@ function startInboxPoller(
 }
 
 module.exports = function (pi) {
+  process.env.OMNIGENT_PI_NATIVE_PID = String(process.pid);
   const config = readConfig();
   let sequence = 0;
   let turnOrdinal = 0;
@@ -2218,9 +2270,15 @@ module.exports = function (pi) {
     rememberContext(ctx);
     replayPendingInterrupt(ctx);
     setOmnigentStatus(config, ctx, undefined);
-    const message = event ? event.message : undefined;
+    let message = event ? event.message : undefined;
     const role = messageRole(message);
     if (role !== "assistant") return;
+    const authFailure = nativeAuthFailure(message, ctx);
+    if (authFailure) {
+      message = { ...message, errorMessage: authFailure.message };
+      if (ctx && ctx.ui && ctx.ui.notify)
+        ctx.ui.notify(authFailure.message, "error");
+    }
     const responseId = currentResponseId();
     // Close the live preview for this message (no-op if nothing streamed),
     // then bump the ordinal so the NEXT assistant message of this turn
@@ -2247,18 +2305,19 @@ module.exports = function (pi) {
         ? message.errorMessage
         : "";
     if (stopReason === "error" && errorMessage) {
-      await postEvent(config, {
-        type: "external_conversation_item",
-        data: {
+      await postConversationItem(
+        config,
+        {
           response_id: responseId,
           item_type: "error",
           item_data: {
             source: "execution",
-            code: "RuntimeError",
+            code: authFailure ? authFailure.code : "RuntimeError",
             message: `Pi model error: ${errorMessage}`,
           },
         },
-      });
+        assistantMessageSourceId(message, responseId, errorMessage),
+      );
       return;
     }
     const text = textFromMessage(message);
@@ -2268,7 +2327,7 @@ module.exports = function (pi) {
     // The authoritative assistant item. The web UI retires + replaces the
     // oldest in-flight live preview in place with this (FIFO; one preview
     // per message), so the streamed partials never duplicate the final.
-    await postAssistantMessage(
+    await postConversationItem(
       config,
       {
         response_id: responseId,

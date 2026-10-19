@@ -43,7 +43,7 @@ from omnigent.debug_logging import (
 )
 from omnigent.errors import ErrorImpact, ErrorPhase
 from omnigent.native.input_diagnostics import input_attributes
-from omnigent.runtime import inflight_text, pending_elicitations
+from omnigent.runtime import disconnect_outcome, inflight_text, pending_elicitations
 
 _logger = logging.getLogger(__name__)
 
@@ -331,6 +331,7 @@ def publish(conversation_id: str, event: dict[str, Any]) -> int:
     # no-op unless a sink is enabled). Done first so it captures every event the
     # server produces — including ones with no live subscriber.
     _log_sse_event(conversation_id, event)
+    disconnect_outcome.observe_event(conversation_id, event)
     # Track reconnect state and centrally suppress or rewrite native deltas
     # before they reach subscribers.
     live_event = inflight_text.record_publish(conversation_id, event)
@@ -393,7 +394,8 @@ def shutdown_all() -> None:
     Broadcasts the end-of-stream sentinel to every queued subscriber so
     SSE generators return at their next iteration without waiting for a
     heartbeat timeout or forced task cancellation. Called from the asyncio
-    event loop (``_ShutdownSignalingServer.shutdown`` in ``cli.py``) before
+    event loop (``ShutdownSignalingServer.shutdown`` in
+    ``omnigent.server.graceful_shutdown``) before
     uvicorn's graceful-shutdown wait starts, so streams drain within the
     window rather than being force-cancelled. Sync callers should use
     :func:`close` per-conversation instead.
