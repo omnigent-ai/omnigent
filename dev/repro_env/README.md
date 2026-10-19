@@ -70,8 +70,9 @@ python -m dev.repro_env exec -- python -m pytest \
   --ui-skip-build --video=on --output=recordings/native-claude
 ```
 
-Use `native_codex_mock_session` or `native_claude_mock_session` in authored UI
-tests. Existing fixtures attach to the prepared server and runner, and
+Use `native_codex_mock_session`, `native_claude_mock_session`, or
+`native_pi_mock_session` in authored UI tests. Existing fixtures attach to the
+prepared server and runner, and
 `mock_llm_server_url` addresses its model server. They do not provision another
 runner or decide the model backend from ambient credentials.
 
