@@ -54,6 +54,19 @@ export interface HarnessReadinessExplanation {
   description: string;
 }
 
+export type HarnessCredentialKind = "isaac" | "personal";
+
+export const HARNESS_CREDENTIAL_COPY: Record<HarnessCredentialKind, HarnessReadinessExplanation> = {
+  isaac: {
+    label: "Isaac",
+    description: "Databricks-managed credential via the Unity Gateway",
+  },
+  personal: {
+    label: "Personal subscription",
+    description: "Your own plan (e.g. Claude Pro/Max, ChatGPT Plus)",
+  },
+};
+
 export interface HarnessReadiness {
   state: HarnessReadinessState;
   reason: HarnessReadinessReason;
