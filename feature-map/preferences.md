@@ -2,9 +2,9 @@
 
 Users can save local model and harness defaults, override them for a project,
 and choose how an individual session runs. Native startup arguments also come
-from local configuration. Shared workspace preferences currently have only a
-resolver foundation: automatic sync and shared/machine scope controls are not
-available through the CLI or UI yet.
+from local configuration. Shared workspace preferences have a resolver
+and an opt-in server API for durable edits and conflicts. Automatic client sync
+and shared/machine scope controls are not available through the CLI or UI yet.
 
 ## Sub-features
 
@@ -20,8 +20,10 @@ available through the CLI or UI yet.
   installed plugins, including unavailable or older hosts.
 - `session-choice`: choose a harness/model for a new session or change a
   supported setting in an existing session; keep the two composers distinct.
-- `shared-scopes`: foundation only; requested values and their sources remain
+- `shared-scopes`: resolver only; requested values and their sources remain
   distinct across shared, machine, project, and session scopes.
+- `shared-operations`: opt-in server API; read/save all four groups, retry an
+  edit, remove a preference, inspect competing edits, and resolve them explicitly.
 
 ## How to get to it (user POV)
 
@@ -42,6 +44,13 @@ native terminal controls, and fork dialog have separate selection paths; see
 [Composer](./composer.md). Settings → Harnesses → select a host → a Claude or
 Codex card/gear → Settings shows read-only startup configuration. The Plugins
 tab shows inventory; both are covered in [Native harnesses](./native-harnesses.md).
+
+**Shared operations API:** on an isolated server configured with
+`shared_preferences_authority_id`, use `GET /v1/preferences/shared` and
+`POST /v1/preferences/shared/operations` with the server's normal authentication.
+The [API guide](../docs/shared-preferences-api.md) covers requests, conflict
+resolution, identity, and limits. These endpoints do not adopt preferences into
+launchers or turn on sync.
 
 **Shared scopes:** there is no user entry point yet for importing/reimporting
 preferences, saving shared or machine defaults, removing a machine override,
@@ -101,12 +110,28 @@ adopts these layers. Before activation, add cross-machine, restart, conflict,
 offline, native-plugin, and managed-startup journeys with explicit coverage for
 each user entry point.
 
-**Next implementation slice:** include live verification of the newly connected
-preference path on an isolated deployment. Record the exact candidate and runtime
-versions, enabled configuration, user action, and observed result, including
-persistence/reload and affected consumers where implemented. Identify the mapped
-entry points exercised, any mocked services, and remaining gaps. Supplying layers
-directly to the resolver does not verify the live path.
+**Shared operations (own environment, real server processes):**
+
+```sh
+uv run --no-sync pytest tests/e2e/omnigent/test_shared_preferences_e2e.py --reruns 0 -q -rs
+```
+
+This drives two isolated CLI servers sharing a SQLite database through actual
+HTTP requests (or another isolated backend via `OMNIGENT_TEST_DB_URI`). It checks
+all preference groups, conflicting edits, explicit
+resolution, retries, user isolation, deletion, and persistence after restart.
+No services or providers are mocked; no model is called. This verifies the local
+OSS API, not managed deployment or actual native application of preferences.
+The store matrix also runs on PostgreSQL, MySQL, and CockroachDB:
+
+```sh
+uv run --no-sync pytest tests/stores/test_preference_store.py \
+  tests/server/routes/test_preferences.py tests/test_preference_sync.py --reruns 0 -q
+```
+
+For later slices, continue live verification of each newly connected path on an
+isolated deployment. Record the candidate/runtime versions, configuration,
+observed results, any mocked services, and remaining entry-point gaps.
 
 ## Gotchas
 
