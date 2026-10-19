@@ -18,7 +18,7 @@ from fastapi import FastAPI
 
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
-from omnigent.server.auth import LEVEL_EDIT
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_READ
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -65,12 +65,16 @@ def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
 
 
 async def _share_editor(
-    client: httpx.AsyncClient, session_id: str, owner: str, grantee: str
+    client: httpx.AsyncClient,
+    session_id: str,
+    owner: str,
+    grantee: str,
+    level: int = LEVEL_EDIT,
 ) -> None:
-    """Owner shares a session with ``grantee`` at editor level."""
+    """Owner shares a session with ``grantee`` at the requested level."""
     resp = await client.put(
         f"/v1/sessions/{session_id}/permissions",
-        json={"user_id": grantee, "level": LEVEL_EDIT},
+        json={"user_id": grantee, "level": level},
         headers={"X-Forwarded-Email": owner},
     )
     assert resp.status_code in (200, 204), resp.text
@@ -116,6 +120,128 @@ async def test_owner_can_update_bundle_and_mcp(auth_client: httpx.AsyncClient) -
         headers=headers,
     )
     assert mcp.status_code == 200, mcp.text
+
+
+@pytest.mark.parametrize("level", [LEVEL_READ, LEVEL_EDIT, LEVEL_MANAGE])
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"terminal_launch_args": []},
+        {"permission_mode": "default"},
+        {"labels": {"omnigent.codex_native.bypass_sandbox": "1"}},
+        {"labels": {"omnigent.codex_native.bypass_sandbox": "0"}},
+    ],
+    ids=["launch-args", "permission-mode", "sandbox-bypass", "sandbox-enforced"],
+)
+async def test_only_owner_can_update_terminal_launch_args(
+    auth_client: httpx.AsyncClient, level: int, change: dict[str, object]
+) -> None:
+    agent = await create_test_agent(auth_client, name="owned-terminal", user=ALICE)
+    session_id = agent["_session_id"]
+    path = f"/v1/sessions/{session_id}"
+    owner = {"X-Forwarded-Email": ALICE}
+    shared = {"X-Forwarded-Email": BOB}
+    response = await auth_client.put(
+        f"{path}/permissions", json={"user_id": BOB, "level": level}, headers=owner
+    )
+    assert response.status_code in (200, 204), response.text
+    response = await auth_client.patch(
+        path, json={"terminal_launch_args": ["--verbose"], "title": "Owner title"}, headers=owner
+    )
+    assert response.status_code == 200, response.text
+    response = await auth_client.patch(
+        path, json={**change, "title": "Changed title"}, headers=shared
+    )
+    assert response.status_code == 403, response.text
+    response = await auth_client.get(path, headers=owner)
+    assert response.status_code == 200, response.text
+    assert response.json()["terminal_launch_args"] == ["--verbose"]
+    assert response.json()["title"] == "Owner title"
+    assert "omnigent.codex_native.bypass_sandbox" not in response.json()["labels"]
+    response = await auth_client.patch(path, json={"title": "Changed title"}, headers=shared)
+    assert response.status_code == (403 if level == LEVEL_READ else 200), response.text
+    response = await auth_client.patch(
+        path, json={"title": "Null preserves args", "terminal_launch_args": None}, headers=shared
+    )
+    assert response.status_code == (403 if level == LEVEL_READ else 200), response.text
+    response = await auth_client.get(path, headers=owner)
+    assert response.json()["terminal_launch_args"] == ["--verbose"]
+    response = await auth_client.patch(path, json={"terminal_launch_args": []}, headers=owner)
+    assert response.status_code == 200, response.text
+    response = await auth_client.get(path, headers=owner)
+    assert response.json()["terminal_launch_args"] == []
+    for value in ("1", "0"):
+        response = await auth_client.patch(
+            path,
+            json={"labels": {"omnigent.codex_native.bypass_sandbox": value}},
+            headers=owner,
+        )
+        assert response.status_code == 200, response.text
+        response = await auth_client.get(path, headers=owner)
+        assert response.json()["labels"]["omnigent.codex_native.bypass_sandbox"] == value
+
+
+@pytest.mark.parametrize(
+    "level", [LEVEL_READ, LEVEL_EDIT, LEVEL_MANAGE], ids=["read", "edit", "manage"]
+)
+async def test_only_owner_can_change_codex_approval_mode(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    level: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Approval mode needs ownership even in a mixed PATCH on a Codex session."""
+    from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
+
+    forwarded: list[dict[str, object]] = []
+
+    async def forward(session_id: str, router: object, event: dict[str, object], **kwargs: object):
+        forwarded.append(event)
+        return _RunnerForwardResult(200, '{"approval_mode": "full-access"}')
+
+    # Isolate the external runner; keep authorization, persistence, and mode confirmation real.
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner", forward
+    )
+    agent = await create_test_agent(auth_client, name="shared-approval", user=ALICE)
+    session_id = agent["_session_id"]
+    path = f"/v1/sessions/{session_id}"
+    # Stamp the persisted labels used by the native Codex wrapper, as the
+    # create route does for its built-in agent.
+    SqlAlchemyConversationStore(db_uri).set_labels(
+        session_id,
+        {"omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui"},
+    )
+    await _share_editor(auth_client, session_id, ALICE, BOB, level)
+    owner = {"X-Forwarded-Email": ALICE}
+    shared = {"X-Forwarded-Email": BOB}
+    before = await auth_client.get(path, headers=owner)
+    assert before.status_code == 200, before.text
+    assert before.json()["labels"]["omnigent.wrapper"] == "codex-native-ui"
+    original_title = before.json()["title"]
+
+    response = await auth_client.patch(
+        path,
+        json={"approval_mode": "full-access", "title": "Unauthorized title"},
+        headers=shared,
+    )
+    assert response.status_code == 403, response.text
+
+    after_denial = await auth_client.get(path, headers=owner)
+    assert after_denial.status_code == 200, after_denial.text
+    assert after_denial.json()["title"] == original_title
+    assert "omnigent.codex_native.approval_mode" not in after_denial.json()["labels"]
+    assert forwarded == []
+
+    owner_update = await auth_client.patch(
+        path,
+        json={"approval_mode": "full-access", "title": "Owner title"},
+        headers=owner,
+    )
+    assert owner_update.status_code == 200, owner_update.text
+    assert owner_update.json()["title"] == "Owner title"
+    assert owner_update.json()["labels"]["omnigent.codex_native.approval_mode"] == "full-access"
+    assert forwarded == [{"type": "codex_approval_mode_change", "approval_mode": "full-access"}]
 
 
 async def test_shared_editor_cannot_update_bundle(auth_client: httpx.AsyncClient) -> None:
