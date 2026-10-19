@@ -515,3 +515,118 @@ def test_shell_command_does_not_see_omnigent_project_root(
     out = result.get("stdout", "")
     assert project_entry in out
     assert str(_project_root()) not in out
+
+
+# ---------------------------------------------------------------------------
+# create_os_environment — shell selection on Windows
+# ---------------------------------------------------------------------------
+
+
+def _windows_like_tree(root: Path) -> tuple[Path, Path]:
+    """Lay out the two ``bash`` binaries a Windows+WSL+Git machine carries.
+
+    ``Windows/System32/bash`` is the WSL launcher and sits first on PATH;
+    Git for Windows' ``usr/bin/bash`` is installed but only ``Git/cmd`` is
+    on PATH. Each shell exists both as ``bash`` and ``bash.exe`` so the
+    lookup works on this POSIX filesystem as well as with ``PATHEXT``.
+
+    :returns: ``(system32_dir, git_usr_bin_dir)``.
+    """
+    system32 = root / "Windows" / "System32"
+    git_root = root / "Program Files" / "Git"
+    git_usr_bin = git_root / "usr" / "bin"
+    for directory in (system32, git_usr_bin, git_root / "bin", git_root / "cmd"):
+        directory.mkdir(parents=True)
+    for exe in (
+        system32 / "bash",
+        system32 / "bash.exe",
+        system32 / "cmd.exe",
+        git_usr_bin / "bash",
+        git_usr_bin / "bash.exe",
+        git_root / "bin" / "bash",
+        git_root / "bin" / "bash.exe",
+        git_root / "cmd" / "git.exe",
+    ):
+        exe.write_text("#!/bin/sh\n")
+        exe.chmod(0o755)
+    return system32, git_usr_bin
+
+
+def test_create_os_environment_skips_wsl_launcher_bash_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On Windows the System32 ``bash`` (the WSL launcher) is not the agent shell.
+
+    With WSL installed and the host started from PowerShell, the first
+    ``bash`` on PATH is ``%SystemRoot%\\System32\\bash.exe``, which boots the
+    Linux distro instead of running against the Windows checkout. The
+    environment must pick Git for Windows' bash (or a Windows shell), never
+    the launcher.
+
+    :returns: None.
+    """
+    from omnigent import _platform
+    from omnigent.inner import os_env as os_env_module
+
+    system32, git_usr_bin = _windows_like_tree(tmp_path)
+    git_cmd = tmp_path / "Program Files" / "Git" / "cmd"
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    monkeypatch.setattr(os_env_module, "IS_WINDOWS", True)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(system32), str(git_cmd)]))
+    # Spelled as Windows stores them: ``os.environ`` keys are uppercased there.
+    monkeypatch.setenv("SYSTEMROOT", str(tmp_path / "Windows"))
+    monkeypatch.setenv("PROGRAMFILES", str(tmp_path / "Program Files"))
+    monkeypatch.setenv("COMSPEC", str(system32 / "cmd.exe"))
+
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        )
+    )
+    assert os_env is not None
+    try:
+        shell = Path(os_env.shell_path)
+    finally:
+        os_env.close()
+
+    is_wsl_launcher = shell.name.lower() in ("bash", "bash.exe") and shell.parent == system32
+    assert not is_wsl_launcher, f"agent shell resolved to the WSL launcher {shell}"
+    assert shell == git_usr_bin.parent.parent / "bin" / "bash.exe"
+
+
+def test_create_os_environment_falls_back_to_comspec_without_posix_shell_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With only the WSL launcher installed, the agent shell is ``%COMSPEC%``, not WSL.
+
+    :returns: None.
+    """
+    from omnigent import _platform
+    from omnigent.inner import os_env as os_env_module
+
+    system32 = tmp_path / "Windows" / "System32"
+    system32.mkdir(parents=True)
+    for exe in (system32 / "bash", system32 / "bash.exe", system32 / "cmd.exe"):
+        exe.write_text("#!/bin/sh\n")
+        exe.chmod(0o755)
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    monkeypatch.setattr(os_env_module, "IS_WINDOWS", True)
+    monkeypatch.setenv("PATH", str(system32))
+    monkeypatch.setenv("COMSPEC", str(system32 / "cmd.exe"))
+    for var in ("PROGRAMFILES", "PROGRAMW6432", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+        monkeypatch.delenv(var, raising=False)
+
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(type="none"),
+        )
+    )
+    assert os_env is not None
+    try:
+        assert os_env.shell_path == str(system32 / "cmd.exe")
+    finally:
+        os_env.close()
