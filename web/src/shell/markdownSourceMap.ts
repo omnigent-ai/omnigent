@@ -1,8 +1,8 @@
-import { markdownTokens } from "./SourceMappedMarkdown";
 import { decodeHtmlEntities, type MarkdownToken } from "@tiptap/core";
 import type { MarkdownManager } from "@tiptap/markdown";
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
 import { ALERT_MARKER } from "./TipTapGitHubAlert";
+import { SOFT_BREAK_NODE } from "./TipTapSoftBreak";
 
 interface Source {
   text: string;
@@ -15,6 +15,27 @@ interface SourceMap {
   ends: number[];
   positions: number[];
 }
+// Rendered characters of one top-level node; `textblocks` numbers each character's
+// paragraph, heading, code block or cell so moved text cannot keep a stale range.
+interface TokenBlock {
+  text: string;
+  starts: number[];
+  ends: number[];
+  textblocks: number[];
+}
+interface DocumentBlock {
+  text: string;
+  positions: number[];
+  textblocks: number[];
+}
+
+// Thrown when a token's rendering cannot be verified; only its top-level block is skipped.
+class UnmappedBlock extends Error {}
+function unmapped(): never {
+  throw new UnmappedBlock();
+}
+
+const tokenCache = new WeakMap<MarkdownManager, { source: string; tokens: MarkdownToken[] }>();
 const cache = new WeakMap<
   ProseMirrorNode,
   {
@@ -23,6 +44,17 @@ const cache = new WeakMap<
     map: SourceMap | null;
   }
 >();
+
+// Lex with the editor's configured marked instance, once per source string.
+// Tokenizer errors propagate so markdownSourceMap can cache a failed mapping.
+function markdownTokens(manager: MarkdownManager, source: string): MarkdownToken[] {
+  const previous = tokenCache.get(manager);
+  if (previous?.source === source) return previous.tokens;
+  const marked = manager.instance;
+  const tokens = new marked.Lexer(marked.defaults).lex(source);
+  tokenCache.set(manager, { source, tokens });
+  return tokens;
+}
 
 function offset(source: Source, index: number): number {
   return source.offsets?.[(source.offsetStart ?? 0) + index] ?? source.start + index;
@@ -34,6 +66,9 @@ function slice(source: Source, start: number, end = source.text.length): Source 
     offsets: source.offsets,
     offsetStart: source.offsets ? (source.offsetStart ?? 0) + start : undefined,
   };
+}
+function rawText(token: MarkdownToken): string {
+  return token.type === "taskList" ? (token.raw ?? "").replace(/\n$/, "") : (token.raw ?? "");
 }
 
 // Container tokens remove list/quote prefixes. Locate each retained line inside
@@ -52,32 +87,21 @@ function locate(source: Source, text: string, from = 0): Source | null {
   return offsets.length === text.length ? { text, start: offsets[0], offsets } : null;
 }
 
-function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): SourceMap | null {
-  const normalized = raw.replace(/\r\n?/g, "\n");
-  const source: Source = { text: normalized, start: 0 };
-  if (normalized !== raw) {
-    source.offsets = [];
-    for (let i = 0; i < raw.length; i++) {
-      source.offsets.push(i);
-      if (raw[i] === "\r" && raw[i + 1] === "\n") i++;
-    }
-  }
-  const starts: number[] = [];
-  const ends: number[] = [];
-  const pieces: string[] = [];
-  let valid = true;
+// Returns one entry per top-level token (null when unverifiable), or null when
+// the tokens do not consume the source in order.
+function mapTokenBlocks(topLevel: MarkdownToken[], source: Source): (TokenBlock | null)[] | null {
+  let block: TokenBlock = { text: "", starts: [], ends: [], textblocks: [] };
+  let textblock = 0;
 
   function emit(value: string, view: Source, decode = false) {
     const located = locate(view, value);
-    if (!located) {
-      valid = false;
-      return;
-    }
+    if (!located) unmapped();
     const append = (text: string, from: number, to?: number) => {
-      pieces.push(text);
+      block.text += text;
       for (let i = 0; i < text.length; i++) {
-        starts.push(offset(located, from + (to === undefined ? i : 0)));
-        ends.push(offset(located, to === undefined ? from + i : to - 1) + 1);
+        block.starts.push(offset(located, from + (to === undefined ? i : 0)));
+        block.ends.push(offset(located, to === undefined ? from + i : to - 1) + 1);
+        block.textblocks.push(textblock);
       }
     };
     if (!decode) {
@@ -96,26 +120,12 @@ function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): 
     append(value.slice(cursor), cursor);
   }
 
-  function children(tokens: MarkdownToken[], view: Source, top = false) {
+  function children(tokens: MarkdownToken[], view: Source) {
     let cursor = 0;
     for (const token of tokens) {
-      const value =
-        token.type === "taskList" ? (token.raw ?? "").replace(/\n$/, "") : (token.raw ?? "");
-      if (!valid) return;
-      let found: Source | null;
-      // Top-level tokens consume the source in order; only whitespace may be
-      // omitted. Never locate a block inside a skipped construct's contents.
-      if (top) {
-        const at = view.text.indexOf(value, cursor);
-        found =
-          at < 0 || view.text.slice(cursor, at).trim() ? null : slice(view, at, at + value.length);
-      } else {
-        found = locate(view, value, cursor);
-      }
-      if (!found || !value) {
-        valid = false;
-        return;
-      }
+      const value = rawText(token);
+      const found = value ? locate(view, value, cursor) : null;
+      if (!found) unmapped();
       const last = offset(found, value.length - 1);
       while (cursor < view.text.length && offset(view, cursor) <= last) cursor++;
       visit(token, found);
@@ -123,7 +133,6 @@ function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): 
   }
 
   function visit(token: MarkdownToken, view: Source) {
-    if (!valid) return;
     switch (token.type) {
       case "def":
       case "space":
@@ -133,13 +142,14 @@ function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): 
         return;
       case "html":
         // HTML blocks are opaque in our editor. Inline tags have no text of
-        // their own; the final comparison rejects any different DOM rendering.
-        if (!token.block && !/^<[^>]*>$/.test(view.text)) valid = false;
+        // their own; the document comparison rejects any different rendering.
+        if (!token.block && !/^<[^>]*>$/.test(view.text)) unmapped();
         return;
       case "code": {
         const body = /^[ \t]*(`{3,}|~{3,})/.test(view.text)
           ? slice(view, view.text.indexOf("\n") + 1)
           : view;
+        textblock++;
         emit(token.text ?? "", body);
         return;
       }
@@ -154,31 +164,24 @@ function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): 
         emit(token.text ?? "", slice(view, 1));
         return;
       case "table": {
-        if (/\\\|/.test(view.text)) {
-          valid = false;
-          return;
-        }
+        if (/\\\|/.test(view.text)) unmapped();
         const rows = [token.header, ...(token.rows ?? [])] as {
           text: string;
           tokens: MarkdownToken[];
         }[][];
         const lines = view.text.match(/[^\n]*\n|[^\n]+$/g) ?? [];
         let lineStart = 0;
-        for (let r = 0; r < rows.length; r++) {
-          if (r === 1) lineStart += lines[1]?.length ?? 0;
-          const line = slice(
-            view,
-            lineStart,
-            lineStart + (lines[r === 0 ? 0 : r + 1]?.length ?? 0),
-          );
+        for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+          // Line 1 is the delimiter row, which has no cells.
+          if (rowIndex === 1) lineStart += lines[1]?.length ?? 0;
+          const lineIndex = rowIndex === 0 ? 0 : rowIndex + 1;
+          const line = slice(view, lineStart, lineStart + (lines[lineIndex]?.length ?? 0));
           let cursor = 0;
-          for (const cell of rows[r]) {
+          for (const cell of rows[rowIndex]) {
+            textblock++;
             if (!cell.text) continue;
             const at = line.text.indexOf(cell.text, cursor);
-            if (at === -1) {
-              valid = false;
-              return;
-            }
+            if (at === -1) unmapped();
             children(cell.tokens, slice(line, at, at + cell.text.length));
             cursor = at + cell.text.length;
           }
@@ -191,18 +194,13 @@ function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): 
         const indent = lines[0]?.[1].length;
         const siblings = lines.filter((line) => line[1].length === indent);
         const items = token.items ?? [];
-        if (siblings.length !== items.length) {
-          valid = false;
-          return;
-        }
-        for (let i = 0; i < items.length && valid; i++) {
+        if (siblings.length !== items.length) unmapped();
+        for (let i = 0; i < items.length; i++) {
           const item = items[i];
           const line = siblings[i];
-          if (line[3] !== item.text) {
-            valid = false;
-            return;
-          }
+          if (line[3] !== item.text) unmapped();
           const from = line.index + line[0].length - line[3].length;
+          textblock++;
           children(item.tokens ?? [], slice(view, from, from + line[3].length));
           const nested = slice(view, line.index + line[0].length + 1, siblings[i + 1]?.index);
           children(item.nestedTokens ?? [], nested);
@@ -213,21 +211,17 @@ function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): 
         children(token.items ?? [], view);
         return;
       case "blockquote": {
-        const begin = pieces.length;
-        const charBegin = starts.length;
+        const begin = block.text.length;
         const inner = locate(view, token.text ?? "");
-        if (!inner) {
-          valid = false;
-          return;
-        }
+        if (!inner) unmapped();
         const tokens = token.tokens ?? [];
         children(tokens, inner);
         const marker = ALERT_MARKER.exec(tokens[0]?.text ?? "");
         if (marker) {
-          const text = pieces.slice(begin).join("");
-          pieces.splice(begin, pieces.length - begin, text.slice(marker[0].length));
-          starts.splice(charBegin, marker[0].length);
-          ends.splice(charBegin, marker[0].length);
+          if (!block.text.startsWith(marker[0], begin)) unmapped();
+          block.text = block.text.slice(0, begin) + block.text.slice(begin + marker[0].length);
+          for (const values of [block.starts, block.ends, block.textblocks])
+            values.splice(begin, marker[0].length);
         }
         return;
       }
@@ -236,15 +230,14 @@ function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): 
         const marker = /^ {0,3}(?:[-+*]|\d+[.)])[ \t]+/.exec(view.text);
         const body = slice(view, marker?.[0].length ?? 0);
         const inner = token.text === undefined ? body : locate(body, token.text);
-        if (!inner) {
-          valid = false;
-          return;
-        }
+        if (!inner) unmapped();
+        textblock++;
         children(token.tokens ?? [], inner);
         return;
       }
       case "heading": {
         const marker = /^ {0,3}#{1,6}(?:[ \t]+|$)/.exec(view.text);
+        textblock++;
         children(token.tokens ?? [], slice(view, marker?.[0].length ?? 0));
         return;
       }
@@ -263,6 +256,7 @@ function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): 
         );
         return;
       case "paragraph":
+        textblock++;
         children(token.tokens ?? [], view);
         return;
       case "text":
@@ -270,30 +264,112 @@ function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): 
         else emit(token.text ?? "", view, true);
         return;
       default:
-        valid = false;
+        unmapped();
     }
   }
 
-  const tokens = markdownTokens(manager, normalized);
-  children(tokens, source, true);
-  if (!valid) return null;
-  const text = pieces.join("");
-  const positions: number[] = [];
+  const blocks: (TokenBlock | null)[] = [];
   let cursor = 0;
-  doc.descendants((node, pos) => {
-    if (!valid) return false;
-    if (!node.isText || !node.text) return true;
-    if (!text.startsWith(node.text, cursor)) {
-      valid = false;
-      return false;
+  for (const token of topLevel) {
+    const value = rawText(token);
+    const at = value ? source.text.indexOf(value, cursor) : -1;
+    // Top-level tokens consume the source in order; only whitespace may be omitted.
+    if (at < 0 || source.text.slice(cursor, at).trim()) return null;
+    cursor = at + value.length;
+    block = { text: "", starts: [], ends: [], textblocks: [] };
+    try {
+      visit(token, slice(source, at, cursor));
+      blocks.push(block);
+    } catch (error) {
+      if (!(error instanceof UnmappedBlock)) throw error;
+      blocks.push(null);
     }
-    for (let i = 0; i < node.text.length; i++) positions.push(pos + i);
-    cursor += node.text.length;
-    return true;
+  }
+  return blocks;
+}
+
+// Text-bearing top-level nodes; soft breaks render the source "\n" they replace.
+function documentBlocks(doc: ProseMirrorNode): DocumentBlock[] {
+  const blocks: DocumentBlock[] = [];
+  doc.forEach((child, childOffset) => {
+    const block: DocumentBlock = { text: "", positions: [], textblocks: [] };
+    let textblock = child.isTextblock ? 1 : 0;
+    const append = (text: string, pos: number) => {
+      block.text += text;
+      for (let i = 0; i < text.length; i++) {
+        block.positions.push(pos + i);
+        block.textblocks.push(textblock);
+      }
+    };
+    child.descendants((node, relative) => {
+      const pos = childOffset + 1 + relative;
+      if (node.isText) append(node.text ?? "", pos);
+      else if (node.type.name === SOFT_BREAK_NODE) append("\n", pos);
+      else if (node.isTextblock) textblock++;
+      return true;
+    });
+    if (block.text) blocks.push(block);
   });
+  return blocks;
+}
+
+function sameTextblocks(tokenBlock: TokenBlock, documentBlock: DocumentBlock): boolean {
+  const { textblocks } = tokenBlock;
+  return textblocks.every(
+    (value, i) =>
+      i === 0 ||
+      (value === textblocks[i - 1]) ===
+        (documentBlock.textblocks[i] === documentBlock.textblocks[i - 1]),
+  );
+}
+
+function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): SourceMap | null {
+  const normalized = raw.replace(/\r\n?/g, "\n");
+  const source: Source = { text: normalized, start: 0 };
+  if (normalized !== raw) {
+    source.offsets = [];
+    for (let i = 0; i < raw.length; i++) {
+      source.offsets.push(i);
+      if (raw[i] === "\r" && raw[i + 1] === "\n") i++;
+    }
+  }
+  const tokenBlocks = mapTokenBlocks(markdownTokens(manager, normalized), source);
+  if (!tokenBlocks) return null;
+  const docBlocks = documentBlocks(doc);
+  const starts: number[] = [];
+  const ends: number[] = [];
+  const positions: number[] = [];
+  let next = 0;
+  // Unmatched tokens since the last match. Each renders at most one top-level
+  // node, so the next match may sit that many nodes ahead; ambiguity skips it.
+  let skipped = 0;
+  for (const tokenBlock of tokenBlocks) {
+    if (!tokenBlock) {
+      skipped++;
+      continue;
+    }
+    if (!tokenBlock.text) continue;
+    const candidates: number[] = [];
+    for (let i = next; i <= next + skipped && i < docBlocks.length; i++) {
+      if (docBlocks[i].text === tokenBlock.text) candidates.push(i);
+    }
+    if (candidates.length !== 1) {
+      skipped++;
+      continue;
+    }
+    const documentBlock = docBlocks[candidates[0]];
+    next = candidates[0] + 1;
+    skipped = 0;
+    if (!sameTextblocks(tokenBlock, documentBlock)) continue;
+    for (let i = 0; i < tokenBlock.text.length; i++) {
+      starts.push(tokenBlock.starts[i]);
+      ends.push(tokenBlock.ends[i]);
+      positions.push(documentBlock.positions[i]);
+    }
+  }
   const monotonic = (values: number[]) =>
     values.every((value, i) => i === 0 || value >= values[i - 1]);
-  return valid && cursor === text.length && monotonic(starts) && monotonic(ends)
+  return positions.length && monotonic(starts) && monotonic(ends)
     ? { starts, ends, positions }
     : null;
 }

@@ -1,13 +1,9 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { Editor } from "@tiptap/core";
-import { SourceMappedMarkdown } from "./SourceMappedMarkdown";
+import { createMarkdownDocumentExtensions } from "./markdownDocumentExtensions";
 import { installMarkdownParserPatch } from "./tiptapMarkdownPatches";
-import { StarterKit } from "@tiptap/starter-kit";
-import { TableKit } from "@tiptap/extension-table";
-import { TaskItem, TaskList } from "@tiptap/extension-list";
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
 import { findPmRangeForComment, computeSelectionData } from "./TipTapEditorHelpers";
-import { GitHubAlertBlockquote } from "./TipTapGitHubAlert";
 import type { Comment } from "@/hooks/useComments";
 
 installMarkdownParserPatch();
@@ -35,16 +31,10 @@ describe("repeated words in Markdown", () => {
     ["link labels", `word [word](https://example.com) word\n\n${link}`],
     ["strikethrough", `word ~~word~~ word\n\n${link}`],
     ["substring matches", `sword word password word\n\n${link}`],
+    ["hard-wrapped prose", `word word\nword\n\n> word\n> word\n\n${link}`],
   ])("preserves every occurrence's raw offset and highlight: %s", (_name, raw) => {
     editor = new Editor({
-      extensions: [
-        StarterKit.configure({ blockquote: false }),
-        GitHubAlertBlockquote,
-        TableKit,
-        TaskList,
-        TaskItem,
-        SourceMappedMarkdown,
-      ],
+      extensions: createMarkdownDocumentExtensions("conversation", "doc.md"),
       content: raw,
       contentType: "markdown",
     });

@@ -71,8 +71,8 @@ function textOffsetToPmPos(doc: ProseMirrorNode, offset: number): number {
 /**
  * Finds the PM [from, to) range for a saved comment.
  *
- * Single words use validated source positions from the editor’s Markdown tokens.
- * Otherwise, scale the raw-file character offset to a rendered-text hint.
+ * Uses validated source positions from the editor’s Markdown tokens when they
+ * cover the comment. Otherwise, scale the raw-file offset to a rendered-text hint.
  *
  * Returns null when anchor_content is absent or not found in the document.
  */
@@ -85,7 +85,7 @@ export function findPmRangeForComment(
   const { anchor_content, start_index, end_index } = comment;
   if (!anchor_content?.trim()) return null;
 
-  if (!/\s/u.test(anchor_content) && rawContent.slice(start_index, end_index) === anchor_content) {
+  if (rawContent.slice(start_index, end_index) === anchor_content) {
     const map = markdownSourceMap(doc, rawContent, manager);
     if (map) {
       const indexes = exactRange(map.starts, start_index, map.ends, end_index);
@@ -116,8 +116,8 @@ export function findPmRangeForComment(
 /**
  * Computes raw-file comment anchor data for a PM selection range.
  *
- * Single words use validated source positions from the editor’s Markdown tokens.
- * Otherwise, search rawContent using the scaled text-content offset as a hint.
+ * Uses validated source positions from the editor’s Markdown tokens when they
+ * cover the selection. Otherwise, search rawContent near the scaled offset.
  *
  * When the text cannot be found verbatim in the raw file (e.g. multi-line
  * selections, table cells, or code blocks whose markdown syntax the parser
@@ -137,18 +137,14 @@ export function computeSelectionData(
   const anchor_content = doc.textBetween(from, to, SEP);
   if (!anchor_content.trim()) return null;
 
-  if (!/\s/u.test(anchor_content)) {
-    const map = markdownSourceMap(doc, rawContent, manager);
-    if (map) {
-      const indexes = exactRange(map.positions, from, map.positions, to - 1);
-      if (indexes) {
-        const [first, last] = indexes;
-        const start_index = map.starts[first];
-        const end_index = map.ends[last];
-        if (rawContent.slice(start_index, end_index) === anchor_content) {
-          return { start_index, end_index, anchor_content };
-        }
-      }
+  const map = markdownSourceMap(doc, rawContent, manager);
+  const indexes = map && exactRange(map.positions, from, map.positions, to - 1);
+  if (map && indexes) {
+    const [first, last] = indexes;
+    const start_index = map.starts[first];
+    const end_index = map.ends[last];
+    if (rawContent.slice(start_index, end_index) === anchor_content) {
+      return { start_index, end_index, anchor_content };
     }
   }
   const textContent = doc.textBetween(0, doc.content.size, SEP);

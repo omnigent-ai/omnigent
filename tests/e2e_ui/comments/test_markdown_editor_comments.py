@@ -332,8 +332,9 @@ def test_heading_text_anchor_content_excludes_prefix(
         ("repeated-word.md", "Repeated", 1, 30),
         ("hidden-word.md", "word", 0, 16),
         ("hidden-url.md", "word", 1, 242),
+        ("wrapped-word.md", "word", 2, 247),
     ],
-    ids=["repeated-word", "hidden-url-and-split-word", "hidden-url"],
+    ids=["repeated-word", "hidden-url-and-split-word", "hidden-url", "hard-wrapped"],
 )
 def test_repeated_word_keeps_selected_occurrence_after_reopen(
     page: Page,

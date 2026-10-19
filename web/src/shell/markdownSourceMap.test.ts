@@ -1,14 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Editor } from "@tiptap/core";
-import { Markdown } from "@tiptap/markdown";
-import { SourceMappedMarkdown } from "./SourceMappedMarkdown";
-import { StarterKit } from "@tiptap/starter-kit";
-import { Image } from "@tiptap/extension-image";
-import { TableKit } from "@tiptap/extension-table";
-import { TaskList, TaskItem } from "@tiptap/extension-list";
 import type { Comment } from "@/hooks/useComments";
-import { GitHubAlertBlockquote } from "./TipTapGitHubAlert";
-import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
+import { createMarkdownDocumentExtensions } from "./markdownDocumentExtensions";
 import { installMarkdownParserPatch } from "./tiptapMarkdownPatches";
 import { computeSelectionData, findPmRangeForComment } from "./TipTapEditorHelpers";
 import { markdownSourceMap } from "./markdownSourceMap";
@@ -16,24 +9,27 @@ import { markdownSourceMap } from "./markdownSourceMap";
 installMarkdownParserPatch();
 let editor: Editor;
 afterEach(() => editor?.destroy());
-function parse(raw: string) {
-  editor?.destroy();
-  editor = new Editor({
+function createEditor(raw: string) {
+  return new Editor({
     element: null,
-    extensions: [
-      StarterKit.configure({ blockquote: false }),
-      GitHubAlertBlockquote,
-      Image.configure({ inline: true }),
-      TableKit,
-      TaskList,
-      TaskItem,
-      HtmlPassthrough,
-      SourceMappedMarkdown,
-    ],
+    extensions: createMarkdownDocumentExtensions("conversation", "doc.md"),
     content: raw,
     contentType: "markdown",
   });
+}
+function parse(raw: string) {
+  editor?.destroy();
+  editor = createEditor(raw);
   return editor.state.doc;
+}
+function paragraphs(...texts: string[]) {
+  return editor.schema.nodeFromJSON({
+    type: "doc",
+    content: texts.map((text) => ({ type: "paragraph", content: [{ type: "text", text }] })),
+  });
+}
+function legacySelection(from: number, to: number, doc: ReturnType<typeof parse>, raw: string) {
+  return computeSelectionData(from, to, doc, raw);
 }
 const link = `[Details](https://example.com/${"x".repeat(2000)})`;
 // Brackets identify the expected raw range independently of the implementation.
@@ -75,6 +71,10 @@ const cases: [string, string, number, string?][] = [
   ["Chinese", `词语 **⟦词语⟧** 词语\n\n${link}`, 1, "词语"],
   ["accented word", `café **⟦café⟧** café\n\n${link}`, 1, "café"],
   ["overlapping matches", `aaaa ⟦aa⟧\n\n${link}`, 3, "aa"],
+  ["hard-wrapped paragraph", `word word\nsecond line\n\n**word** ⟦word⟧\n\n${link}`, 3],
+  ["hard-wrapped quote", "> word\n> word\n\n> ⟦word⟧", 2],
+  ["multiword phrase", "[Details](https://x/the-word) the word ⟦the word⟧", 1, "the word"],
+  ["phrase after a soft break", `the word\nmore\n\n**⟦the word⟧**\n\n${link}`, 1, "the word"],
 ];
 
 describe("validated Markdown source positions", () => {
@@ -123,15 +123,11 @@ describe("validated Markdown source positions", () => {
       const first = markdownSourceMap(doc, raw, editor.markdown);
       for (let i = 0; i < 100; i++)
         expect(markdownSourceMap(doc, raw, editor.markdown)).toBe(first);
-      expect(lexer).toHaveBeenCalledTimes(0);
+      expect(lexer).toHaveBeenCalledTimes(1);
       const shifted = markdownSourceMap(doc, "\n" + raw, editor.markdown);
       expect(shifted?.starts[0]).toBe(first!.starts[0] + 1);
-      expect(lexer).toHaveBeenCalledTimes(1);
-      const edited = editor.schema.nodeFromJSON({
-        type: "doc",
-        content: [{ type: "paragraph", content: [{ type: "text", text: "word word" }] }],
-      });
-      expect(markdownSourceMap(edited, raw, editor.markdown)).toBeNull();
+      expect(lexer).toHaveBeenCalledTimes(2);
+      expect(markdownSourceMap(paragraphs("word word"), raw, editor.markdown)).toBeNull();
     } finally {
       lexer.mockRestore();
     }
@@ -164,57 +160,78 @@ describe("validated Markdown source positions", () => {
           computeSelectionData(expected[i], expected[i] + 4, doc, raw, editor.markdown),
         ).toEqual({ start_index, end_index, anchor_content: "word" });
       }
-      expect(lexer).toHaveBeenCalledTimes(0);
+      expect(lexer).toHaveBeenCalledTimes(1);
     } finally {
       lexer.mockRestore();
     }
   });
 
-  it("retains the fallback for token/source transforms it cannot verify", () => {
-    const raw = "| A | B |\n| --- | --- |\n| a\\|b | word |\n\nword";
+  it("falls back only for the block whose tokens it cannot verify", () => {
+    const raw = "| A | B |\n| --- | --- |\n| a\\|b | word |\n\nword word";
     const doc = parse(raw);
-    expect(markdownSourceMap(doc, raw, editor.markdown)).toBeNull();
-    const comment = {
-      start_index: raw.lastIndexOf("word"),
-      end_index: raw.length,
-      anchor_content: "word",
-    } as Comment;
-    expect(findPmRangeForComment(doc, comment, raw, editor.markdown)).toEqual(
-      findPmRangeForComment(doc, comment, raw),
+    const positions: number[] = [];
+    doc.descendants((node, pos) => {
+      if (node.isText && node.text?.includes("word"))
+        positions.push(pos + node.text.indexOf("word"));
+    });
+    const [inTable, afterTable] = positions;
+    expect(computeSelectionData(inTable, inTable + 4, doc, raw, editor.markdown)).toEqual(
+      legacySelection(inTable, inTable + 4, doc, raw),
     );
+    expect(computeSelectionData(afterTable, afterTable + 4, doc, raw, editor.markdown)).toEqual({
+      start_index: raw.lastIndexOf("word word"),
+      end_index: raw.lastIndexOf("word word") + 4,
+      anchor_content: "word",
+    });
   });
 
-  it("preserves parsing and serialization while keeping editor token caches separate", () => {
-    const raw = "# Title\n\n[Details](word) word wo**rd**\n\n- item\n";
+  it("keeps unedited blocks mapped and rejects text moved between blocks", () => {
+    const raw = "word\n\nab\n\ncd\n\nword word";
+    parse(raw);
+    const edited = paragraphs("word", "abc", "d", "word word");
+    const target = edited.content.size - 5;
+    expect(edited.textBetween(target, target + 4)).toBe("word");
+    expect(computeSelectionData(target, target + 4, edited, raw, editor.markdown)).toEqual({
+      start_index: raw.length - 4,
+      end_index: raw.length,
+      anchor_content: "word",
+    });
+    const moved = 1 + "word".length + 2 + 2;
+    expect(edited.textBetween(moved, moved + 1)).toBe("c");
+    expect(computeSelectionData(moved, moved + 1, edited, raw, editor.markdown)).toEqual(
+      legacySelection(moved, moved + 1, edited, raw),
+    );
+    const list = "- ab\n- cd";
+    parse(list);
+    const movedInList = editor.schema.nodeFromJSON({
+      type: "doc",
+      content: [
+        {
+          type: "bulletList",
+          content: ["abc", "d"].map((text) => ({
+            type: "listItem",
+            content: [{ type: "paragraph", content: [{ type: "text", text }] }],
+          })),
+        },
+      ],
+    });
+    expect(markdownSourceMap(movedInList, list, editor.markdown)).toBeNull();
+  });
+
+  it("lexes once per editor and source without sharing tokens between editors", () => {
+    const raw = "word **word**";
     const doc = parse(raw);
-    const plain = new Editor({
-      element: null,
-      extensions: [StarterKit, Markdown],
-      content: raw,
-      contentType: "markdown",
-    });
-    const other = new Editor({
-      element: null,
-      extensions: [StarterKit, SourceMappedMarkdown],
-      content: "Other word",
-      contentType: "markdown",
-    });
+    const other = createEditor("Other word");
     const lexer = vi.spyOn(editor.markdown!.instance.Lexer.prototype, "lex");
     try {
-      expect(editor.getJSON()).toEqual(plain.getJSON());
-      expect(editor.getMarkdown()).toBe(plain.getMarkdown());
-      expect(editor.markdown!.instance).not.toBe(other.markdown!.instance);
-      expect(markdownSourceMap(other.state.doc, "Other word", other.markdown)).not.toBeNull();
       expect(markdownSourceMap(doc, raw, editor.markdown)).not.toBeNull();
-      expect(lexer).toHaveBeenCalledTimes(0);
-      const replacement = "word **word**";
-      editor.commands.setContent(replacement, { contentType: "markdown" });
-      expect(lexer).toHaveBeenCalledTimes(1);
-      expect(markdownSourceMap(editor.state.doc, replacement, editor.markdown)).not.toBeNull();
-      expect(lexer).toHaveBeenCalledTimes(1);
+      expect(markdownSourceMap(other.state.doc, "Other word", other.markdown)).not.toBeNull();
+      expect(lexer).toHaveBeenCalledTimes(2);
+      const rebuilt = editor.schema.nodeFromJSON(doc.toJSON());
+      expect(markdownSourceMap(rebuilt, raw, editor.markdown)).not.toBeNull();
+      expect(lexer).toHaveBeenCalledTimes(2);
     } finally {
       lexer.mockRestore();
-      plain.destroy();
       other.destroy();
     }
   });
@@ -239,13 +256,5 @@ describe("validated Markdown source positions", () => {
     } finally {
       lexer.mockRestore();
     }
-  });
-
-  it("leaves multiword selections on the existing path", () => {
-    const raw = `word phrase **word phrase**\n\n${link}`;
-    const doc = parse(raw);
-    expect(computeSelectionData(13, 24, doc, raw, editor.markdown)).toEqual(
-      computeSelectionData(13, 24, doc, raw),
-    );
   });
 });
