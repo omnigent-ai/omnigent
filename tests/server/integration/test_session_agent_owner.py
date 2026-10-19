@@ -520,3 +520,49 @@ async def test_admin_can_update_any_agent(auth_client: httpx.AsyncClient, db_uri
         headers={"X-Forwarded-Email": ADMIN},
     )
     assert put.status_code == 200, put.text
+
+
+@pytest.mark.parametrize("level", [LEVEL_EDIT, LEVEL_MANAGE])
+@pytest.mark.parametrize(
+    "event,args",
+    [
+        (
+            {
+                "type": "external_codex_approval_mode_change",
+                "data": {"terminal_launch_args": ["--sandbox", "read-only"]},
+            },
+            ["--sandbox", "read-only"],
+        ),
+        (
+            {
+                "type": "external_permission_mode_change",
+                "data": {"permission_mode": "default", "initial_observation": False},
+            },
+            ["--permission-mode", "default"],
+        ),
+    ],
+    ids=["codex", "claude"],
+)
+async def test_native_approval_changes_require_owner_authority(
+    auth_client: httpx.AsyncClient,
+    level: int,
+    event: dict[str, object],
+    args: list[str],
+) -> None:
+    agent = await create_test_agent(auth_client, name="native-settings", user=ALICE)
+    session_id = agent["_session_id"]
+    path = f"/v1/sessions/{session_id}"
+    owner = {"X-Forwarded-Email": ALICE}
+    response = await auth_client.put(
+        f"{path}/permissions", json={"user_id": BOB, "level": level}, headers=owner
+    )
+    assert response.status_code in (200, 204), response.text
+    initial = (await auth_client.get(path, headers=owner)).json()["terminal_launch_args"]
+    response = await auth_client.post(
+        f"{path}/events", json=event, headers={"X-Forwarded-Email": BOB}
+    )
+    assert response.status_code == 403, response.text
+    assert (await auth_client.get(path, headers=owner)).json()["terminal_launch_args"] == initial
+    response = await auth_client.post(f"{path}/events", json=event, headers=owner)
+    assert response.status_code == 202, response.text
+    assert (await auth_client.get(path, headers=owner)).json()["terminal_launch_args"] == args

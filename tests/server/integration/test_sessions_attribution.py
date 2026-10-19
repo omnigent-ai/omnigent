@@ -148,7 +148,9 @@ def _seed_items(db_uri: str, session_id: str) -> None:
 
 
 @pytest.fixture()
-def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+def auth_app(
+    runtime_init: None, db_uri: str, tmp_path: Path, request: pytest.FixtureRequest
+) -> FastAPI:
     """App with ``permission_store`` enabled so auth is active.
 
     Uses header-mode auth so tests can authenticate via
@@ -173,6 +175,7 @@ def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         comment_store=SqlAlchemyCommentStore(db_uri),
         permission_store=SqlAlchemyPermissionStore(db_uri),
         auth_provider=UnifiedAuthProvider(source="header", local_single_user=True),
+        runner_tunnel_tokens=getattr(request, "param", None),
     )
 
 
@@ -316,6 +319,73 @@ async def test_post_event_uses_runner_supplied_created_by(
     items = await asyncio.to_thread(SqlAlchemyConversationStore(db_uri).list_items, session_id)
     [persisted] = items.data
     assert persisted.created_by == "bob@example.com"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "auth_app",
+    [None, frozenset({_RUNNER_BINDING_TOKEN, "different-runner-token"})],
+    indirect=True,
+    ids=["no-global-token", "global-token"],
+)
+@pytest.mark.parametrize("binding", ["token-bound", "different-token", "stable-id"])
+@pytest.mark.parametrize(
+    "event,args",
+    [
+        (
+            {
+                "type": "external_codex_approval_mode_change",
+                "data": {"terminal_launch_args": ["--sandbox", "read-only"]},
+            },
+            ["--sandbox", "read-only"],
+        ),
+        (
+            {
+                "type": "external_permission_mode_change",
+                "data": {"permission_mode": "default", "initial_observation": False},
+            },
+            ["--permission-mode", "default"],
+        ),
+    ],
+    ids=["codex", "claude"],
+)
+async def test_bound_runner_can_update_native_approval_mode(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    binding: str,
+    event: dict[str, object],
+    args: list[str],
+) -> None:
+    session_id = _seed_shared_session(
+        db_uri, {"alice@example.com": LEVEL_EDIT, "bob@example.com": LEVEL_OWNER}
+    )
+    if binding == "stable-id":
+        assert SqlAlchemyConversationStore(db_uri).set_runner_id(session_id, "legacy-runner")
+        runner_headers = {RUNNER_TUNNEL_TOKEN_HEADER: _RUNNER_BINDING_TOKEN}
+    else:
+        runner_headers = _bind_runner(db_uri, session_id)
+        if binding == "different-token":
+            runner_headers[RUNNER_TUNNEL_TOKEN_HEADER] = "different-runner-token"
+    response = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json=event,
+        headers={"X-Forwarded-Email": "alice@example.com", **runner_headers},
+    )
+    authorized = binding == "token-bound"
+    assert response.status_code == (202 if authorized else 403), response.text
+    stored = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert stored is not None
+    assert stored.terminal_launch_args == (args if authorized else None)
+    if binding == "stable-id":
+        response = await auth_client.post(
+            f"/v1/sessions/{session_id}/events",
+            json=event,
+            headers={"X-Forwarded-Email": "bob@example.com"},
+        )
+        assert response.status_code == 202, response.text
+        stored = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+        assert stored is not None
+        assert stored.terminal_launch_args == args
 
 
 @pytest.mark.asyncio

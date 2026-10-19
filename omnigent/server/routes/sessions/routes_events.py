@@ -1060,6 +1060,15 @@ def register_events_routes(
                 _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             ),
         )
+        if (
+            body.type
+            in {_EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE, _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE}
+            and not _has_bound_runner_authority(request, conv)
+        ):
+            # Owner-authenticated local forwarders also report native settings.
+            await _require_access_and_level(
+                user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+            )
         if in_flight is not None:
             # Marked only after authorization, so an unauthorized caller
             # cannot flip a session to "running" even transiently.
