@@ -882,11 +882,47 @@ async function postEventChecked(config, body, signal) {
 }
 
 async function postEvent(config, body) {
-  try {
-    await postEventChecked(config, body);
-  } catch (_err) {
-    // Keep Pi responsive even if Omnigent is temporarily unavailable.
+  // Retry failed event posts with exponential backoff, bounded by a transient-error budget.
+  // This prevents orphaned tool results when a function_call POST fails but a later
+  // function_call_output POST succeeds.
+  const maxRetries = 5;
+  const baseBackoffMs = 1000;
+  const maxBackoffMs = 10000;
+  const totalBudgetMs = 30000; // 30 seconds transient-error budget
+  const startTime = Date.now();
+  let attempt = 0;
+  let backoff = baseBackoffMs;
+
+  while (attempt < maxRetries) {
+    try {
+      await postEventChecked(config, body);
+      // Success: exit retry loop
+      return;
+    } catch (err) {
+      attempt++;
+      const elapsed = Date.now() - startTime;
+      if (elapsed + backoff >= totalBudgetMs) {
+        // Budget exhausted: log failure and give up.
+        console.error(
+          `[pi-native] postEvent failed after ${attempt} attempts and exhausted transient budget:`,
+          err
+        );
+        // Keep Pi responsive: silently drop the event as before, but now logged.
+        return;
+      }
+      // Log retry attempt.
+      console.error(
+        `[pi-native] postEvent attempt ${attempt} failed, retrying in ${backoff}ms:`,
+        err
+      );
+      await new Promise((resolve) => setTimeout(resolve, backoff));
+      backoff = Math.min(backoff * 2, maxBackoffMs);
+    }
   }
+  // All retries exhausted without success.
+  console.error(
+    `[pi-native] postEvent failed after ${maxRetries} attempts, giving up.`
+  );
 }
 
 function isRetryableAssistantError(error) {
