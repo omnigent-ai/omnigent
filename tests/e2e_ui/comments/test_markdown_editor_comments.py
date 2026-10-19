@@ -373,8 +373,10 @@ def test_repeated_word_keeps_selected_occurrence_after_reopen(
                 text += node.textContent;
             }
             let start = -1;
-            for (let i = 0; i <= occurrence; i++) start = text.indexOf(phrase, start + 1);
-            if (start < 0) throw new Error('Selected occurrence not found');
+            for (let i = 0; i <= occurrence; i++) {
+                start = text.indexOf(phrase, start + 1);
+                if (start < 0) throw new Error('Selected occurrence not found');
+            }
             const range = document.createRange();
             range.setStart(...positions[start]);
             const [endNode, endOffset] = positions[start + phrase.length - 1];

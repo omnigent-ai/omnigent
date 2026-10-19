@@ -2,7 +2,7 @@
 
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
 import type { MarkdownManager } from "@tiptap/markdown";
-import { exactIndex, markdownSourceMap } from "./markdownSourceMap";
+import { exactIndex, markdownSourceMap, type SourceMap } from "./markdownSourceMap";
 import type { Comment } from "@/hooks/useComments";
 
 const SEP = "\n";
@@ -26,7 +26,12 @@ function exactRange(
  * copy of the same text can sit well within that window, and `indexOf`
  * returns the first one rather than the one the user selected.
  */
-function nearestOccurrence(haystack: string, needle: string, hint: number): number {
+function nearestOccurrence(
+  haystack: string,
+  needle: string,
+  hint: number,
+  accept: (index: number) => boolean = () => true,
+): number {
   if (!needle) return -1;
   let best = -1;
   let bestDistance = Number.POSITIVE_INFINITY;
@@ -35,15 +40,27 @@ function nearestOccurrence(haystack: string, needle: string, hint: number): numb
     const found = haystack.indexOf(needle, from);
     if (found === -1) break;
     const distance = Math.abs(found - hint);
-    if (distance < bestDistance) {
+    if (found > hint && distance >= bestDistance) break;
+    if (distance < bestDistance && accept(found)) {
       best = found;
       bestDistance = distance;
-    } else if (found > hint) {
-      break;
     }
     from = found + 1;
   }
   return best;
+}
+
+function mappedRange(
+  doc: ProseMirrorNode,
+  map: SourceMap,
+  start: number,
+  end: number,
+  anchor: string,
+): { from: number; to: number } | null {
+  const indexes = exactRange(map.starts, start, map.ends, end);
+  if (!indexes) return null;
+  const range = { from: map.positions[indexes[0]], to: map.positions[indexes[1]] + 1 };
+  return doc.textBetween(range.from, range.to, SEP) === anchor ? range : null;
 }
 
 /**
@@ -87,14 +104,8 @@ export function findPmRangeForComment(
 
   if (rawContent.slice(start_index, end_index) === anchor_content) {
     const map = markdownSourceMap(doc, rawContent, manager);
-    if (map) {
-      const indexes = exactRange(map.starts, start_index, map.ends, end_index);
-      if (indexes) {
-        const [first, last] = indexes;
-        const range = { from: map.positions[first], to: map.positions[last] + 1 };
-        if (doc.textBetween(range.from, range.to, SEP) === anchor_content) return range;
-      }
-    }
+    const range = map && mappedRange(doc, map, start_index, end_index, anchor_content);
+    if (range) return range;
   }
   const textContent = doc.textBetween(0, doc.content.size, SEP);
   if (!textContent) return null;
@@ -153,7 +164,12 @@ export function computeSelectionData(
   const hint =
     textContent.length > 0 ? Math.round((textFrom * rawContent.length) / textContent.length) : 0;
 
-  const idx = nearestOccurrence(rawContent, anchor_content, hint);
+  // Restoration trusts mapped copies, so never store one that maps elsewhere.
+  const idx = nearestOccurrence(rawContent, anchor_content, hint, (index) => {
+    const range =
+      map && mappedRange(doc, map, index, index + anchor_content.length, anchor_content);
+    return !range || (range.from === from && range.to === to);
+  });
 
   // Fall back to proportional indices when the anchor text isn't found
   // verbatim (multi-line, table, code block selections).

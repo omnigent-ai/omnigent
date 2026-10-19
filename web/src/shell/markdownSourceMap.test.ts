@@ -171,41 +171,39 @@ describe("validated Markdown source positions", () => {
     }
   });
 
-  it("falls back only for the block whose tokens it cannot verify", () => {
-    const raw = "| A | B |\n| --- | --- |\n| a\\|b | word |\n\nword word";
+  it("keeps the whole document on legacy anchors when a block cannot be verified", () => {
+    const raw = `| A | B |\n| --- | --- |\n| a\\|b | word |\n\nword\n\n${link}`;
     const doc = parse(raw);
+    expect(markdownSourceMap(doc, raw, editor.markdown)).toBeNull();
     const positions: number[] = [];
     doc.descendants((node, pos) => {
       if (node.isText && node.text?.includes("word"))
         positions.push(pos + node.text.indexOf("word"));
     });
     const [inTable, afterTable] = positions;
-    expect(computeSelectionData(inTable, inTable + 4, doc, raw, editor.markdown)).toEqual(
-      legacySelection(inTable, inTable + 4, doc, raw),
+    expect(computeSelectionData(afterTable, afterTable + 4, doc, raw, editor.markdown)).toEqual(
+      legacySelection(afterTable, afterTable + 4, doc, raw),
     );
-    expect(computeSelectionData(afterTable, afterTable + 4, doc, raw, editor.markdown)).toEqual({
-      start_index: raw.lastIndexOf("word word"),
-      end_index: raw.lastIndexOf("word word") + 4,
-      anchor_content: "word",
+    const captured = computeSelectionData(inTable, inTable + 4, doc, raw, editor.markdown);
+    expect(captured).toEqual(legacySelection(inTable, inTable + 4, doc, raw));
+    expect(findPmRangeForComment(doc, captured as Comment, raw, editor.markdown)).toEqual({
+      from: inTable,
+      to: inTable + 4,
     });
   });
 
-  it("keeps unedited blocks mapped and rejects text moved between blocks", () => {
-    const raw = "word\n\nab\n\ncd\n\nword word";
+  it("keeps edited documents on legacy anchors", () => {
+    const raw = "word\n\nword";
     parse(raw);
-    const edited = paragraphs("word", "abc", "d", "word word");
-    const target = edited.content.size - 5;
-    expect(edited.textBetween(target, target + 4)).toBe("word");
-    expect(computeSelectionData(target, target + 4, edited, raw, editor.markdown)).toEqual({
-      start_index: raw.length - 4,
-      end_index: raw.length,
-      anchor_content: "word",
-    });
-    const moved = 1 + "word".length + 2 + 2;
-    expect(edited.textBetween(moved, moved + 1)).toBe("c");
-    expect(computeSelectionData(moved, moved + 1, edited, raw, editor.markdown)).toEqual(
-      legacySelection(moved, moved + 1, edited, raw),
-    );
+    const inserted = paragraphs("new", "word", "word");
+    expect(markdownSourceMap(inserted, raw, editor.markdown)).toBeNull();
+    const second = inserted.content.size - 5;
+    const comment = { start_index: 6, end_index: 10, anchor_content: "word" } as Comment;
+    const range = findPmRangeForComment(inserted, comment, raw, editor.markdown);
+    expect(range?.from).toBe(second);
+    expect(inserted.textBetween(range!.from, range!.to)).toBe("word");
+    const moved = paragraphs("word", "abc", "d", "word word");
+    expect(markdownSourceMap(moved, "word\n\nab\n\ncd\n\nword word", editor.markdown)).toBeNull();
     const list = "- ab\n- cd";
     parse(list);
     const movedInList = editor.schema.nodeFromJSON({
@@ -221,6 +219,20 @@ describe("validated Markdown source positions", () => {
       ],
     });
     expect(markdownSourceMap(movedInList, list, editor.markdown)).toBeNull();
+  });
+
+  it("does not store a fallback anchor on another mapped copy", () => {
+    const raw = "word wo**rd** word";
+    const doc = parse(raw);
+    expect(markdownSourceMap(doc, raw, editor.markdown)).not.toBeNull();
+    const from = 1 + "word ".length;
+    const to = from + 4;
+    expect(doc.textBetween(from, to)).toBe("word");
+    const captured = computeSelectionData(from, to, doc, raw, editor.markdown);
+    expect(findPmRangeForComment(doc, captured as Comment, raw, editor.markdown)).toEqual({
+      from,
+      to,
+    });
   });
 
   it("lexes once per editor and source without sharing tokens between editors", () => {

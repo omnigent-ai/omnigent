@@ -10,7 +10,7 @@ interface Source {
   offsets?: number[];
   offsetStart?: number;
 }
-interface SourceMap {
+export interface SourceMap {
   starts: number[];
   ends: number[];
   positions: number[];
@@ -29,7 +29,7 @@ interface DocumentBlock {
   textblocks: number[];
 }
 
-// Thrown when a token's rendering cannot be verified; only its top-level block is skipped.
+// Thrown when a token's rendering cannot be verified.
 class UnmappedBlock extends Error {}
 function unmapped(): never {
   throw new UnmappedBlock();
@@ -87,9 +87,9 @@ function locate(source: Source, text: string, from = 0): Source | null {
   return offsets.length === text.length ? { text, start: offsets[0], offsets } : null;
 }
 
-// Returns one entry per top-level token (null when unverifiable), or null when
-// the tokens do not consume the source in order.
-function mapTokenBlocks(topLevel: MarkdownToken[], source: Source): (TokenBlock | null)[] | null {
+// Returns the text-bearing top-level blocks, or null when a token cannot be
+// verified or the tokens do not consume the source in order.
+function mapTokenBlocks(topLevel: MarkdownToken[], source: Source): TokenBlock[] | null {
   let block: TokenBlock = { text: "", starts: [], ends: [], textblocks: [] };
   let textblock = 0;
 
@@ -268,7 +268,7 @@ function mapTokenBlocks(topLevel: MarkdownToken[], source: Source): (TokenBlock 
     }
   }
 
-  const blocks: (TokenBlock | null)[] = [];
+  const blocks: TokenBlock[] = [];
   let cursor = 0;
   for (const token of topLevel) {
     const value = rawText(token);
@@ -279,11 +279,11 @@ function mapTokenBlocks(topLevel: MarkdownToken[], source: Source): (TokenBlock 
     block = { text: "", starts: [], ends: [], textblocks: [] };
     try {
       visit(token, slice(source, at, cursor));
-      blocks.push(block);
     } catch (error) {
       if (!(error instanceof UnmappedBlock)) throw error;
-      blocks.push(null);
+      return null;
     }
+    if (block.text) blocks.push(block);
   }
   return blocks;
 }
@@ -334,33 +334,17 @@ function buildMap(doc: ProseMirrorNode, raw: string, manager: MarkdownManager): 
     }
   }
   const tokenBlocks = mapTokenBlocks(markdownTokens(manager, normalized), source);
-  if (!tokenBlocks) return null;
   const docBlocks = documentBlocks(doc);
+  // A partial map cannot tell exact offsets from legacy ones, so any unverified
+  // or edited block keeps the whole document on legacy anchors.
+  if (!tokenBlocks || tokenBlocks.length !== docBlocks.length) return null;
   const starts: number[] = [];
   const ends: number[] = [];
   const positions: number[] = [];
-  let next = 0;
-  // Unmatched tokens since the last match. Each renders at most one top-level
-  // node, so the next match may sit that many nodes ahead; ambiguity skips it.
-  let skipped = 0;
-  for (const tokenBlock of tokenBlocks) {
-    if (!tokenBlock) {
-      skipped++;
-      continue;
-    }
-    if (!tokenBlock.text) continue;
-    const candidates: number[] = [];
-    for (let i = next; i <= next + skipped && i < docBlocks.length; i++) {
-      if (docBlocks[i].text === tokenBlock.text) candidates.push(i);
-    }
-    if (candidates.length !== 1) {
-      skipped++;
-      continue;
-    }
-    const documentBlock = docBlocks[candidates[0]];
-    next = candidates[0] + 1;
-    skipped = 0;
-    if (!sameTextblocks(tokenBlock, documentBlock)) continue;
+  for (const [index, tokenBlock] of tokenBlocks.entries()) {
+    const documentBlock = docBlocks[index];
+    if (tokenBlock.text !== documentBlock.text || !sameTextblocks(tokenBlock, documentBlock))
+      return null;
     for (let i = 0; i < tokenBlock.text.length; i++) {
       starts.push(tokenBlock.starts[i]);
       ends.push(tokenBlock.ends[i]);
