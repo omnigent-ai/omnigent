@@ -29,6 +29,7 @@ from pydantic.json_schema import SkipJsonSchema
 from omnigent.entities import (
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
     USER_SESSION_TITLE_MAX_CHARS,
+    CodeRunOutputSegment,
     ConversationItem,
 )
 from omnigent.inner.native_attachments import reject_authored_framework_notices
@@ -4814,6 +4815,66 @@ class SessionTerminalActivityEvent(_SSEEventBase):
     terminal_id: str
 
 
+class SessionCodeRunStartedEvent(_SSEEventBase):
+    """
+    A chat code run was accepted and its ``started`` item saved.
+
+    :param type: Always ``"session.code_run.started"``.
+    :param item: The saved ``code_run`` item (``phase: "started"``).
+    """
+
+    type: Literal["session.code_run.started"]
+    item: dict[str, Any]
+
+
+class SessionCodeRunOutputEvent(_SSEEventBase):
+    """
+    Live output from a running chat code run. Transient; not persisted.
+
+    :param type: Always ``"session.code_run.output"``.
+    :param run_id: The run, e.g. ``"run_abc"``.
+    :param offset: Characters of the run's output before ``text``; clients
+        drop output whose offset they already have.
+    :param stream: ``"stdout"`` or ``"stderr"``.
+    :param text: The chunk's text.
+    """
+
+    type: Literal["session.code_run.output"]
+    run_id: str
+    offset: int
+    stream: Literal["stdout", "stderr"]
+    text: str
+
+
+class SessionCodeRunFinishedEvent(_SSEEventBase):
+    """
+    A chat code run ended and its ``finished`` item was saved.
+
+    :param type: Always ``"session.code_run.finished"``.
+    :param item: The saved ``code_run`` item (``phase: "finished"``).
+    """
+
+    type: Literal["session.code_run.finished"]
+    item: dict[str, Any]
+
+
+class SessionCodeRunSnapshotEvent(_SSEEventBase):
+    """
+    Output so far of a run in progress, sent when a client subscribes.
+
+    :param type: Always ``"session.code_run.snapshot"``.
+    :param run_id: The run, e.g. ``"run_abc"``.
+    :param offset: Total characters the run has produced; later output
+        events start at or after it.
+    :param output: The runner's bounded copy (start and end kept).
+    """
+
+    type: Literal["session.code_run.snapshot"]
+    run_id: str
+    offset: int
+    output: list[CodeRunOutputSegment]
+
+
 class TurnStartedEvent(_SSEEventBase):
     """
     Emitted when the runner starts a new turn for a session.
@@ -4916,6 +4977,11 @@ ServerStreamEvent = Annotated[
     | SessionChildSessionUpdatedEvent
     | SessionChangedFilesInvalidatedEvent
     | SessionTerminalActivityEvent
+    # Chat code runs: started / finished wrap saved items; output and snapshot are live.
+    | SessionCodeRunStartedEvent
+    | SessionCodeRunOutputEvent
+    | SessionCodeRunFinishedEvent
+    | SessionCodeRunSnapshotEvent
     # ── Transient (SSE-only) — incremental token deltas ────────
     | OutputTextDeltaEvent
     | ToolOutputDeltaEvent

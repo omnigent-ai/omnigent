@@ -5,9 +5,12 @@ from omnigent.entities.agent import Agent, LoadedAgent
 from omnigent.entities.comment import Comment, CommentsFingerprint
 from omnigent.entities.connection import ProviderConnection
 from omnigent.entities.conversation import (
+    CODE_RUN_OUTPUT_MAX_CHARS,
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
     NON_CONTENT_ITEM_TYPES,
     USER_SESSION_TITLE_MAX_CHARS,
+    CodeRunData,
+    CodeRunOutputSegment,
     CompactionData,
     Conversation,
     ConversationItem,
@@ -44,6 +47,7 @@ from omnigent.entities.session_resources import (
 )
 
 __all__ = [
+    "CODE_RUN_OUTPUT_MAX_CHARS",
     "DEFAULT_ENVIRONMENT_ID",
     "DEFAULT_GENERATED_TITLE_MAX_CHARS",
     "NON_CONTENT_ITEM_TYPES",
@@ -51,6 +55,8 @@ __all__ = [
     "Account",
     "AccountToken",
     "Agent",
+    "CodeRunData",
+    "CodeRunOutputSegment",
     "Comment",
     "CommentsFingerprint",
     "CompactionData",

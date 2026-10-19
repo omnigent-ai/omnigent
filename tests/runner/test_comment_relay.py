@@ -19,7 +19,7 @@ import contextlib
 import json
 import shutil
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -82,6 +82,15 @@ class _StubResourceRegistry:
         :returns: None.
         """
         self._terminal_activity_publisher = publisher
+
+    def set_code_run_stopper(self, stopper: Callable[[str], Awaitable[None]]) -> None:
+        """
+        Accept the code-run stopper installed by the runner app.
+
+        :param stopper: Coroutine function ``(session_id) -> None``.
+        :returns: None.
+        """
+        self._code_run_stopper = stopper
 
     def set_session_status_publisher(
         self,

@@ -538,3 +538,54 @@ describe("parseEvent — response.elicitation_resolved", () => {
     } satisfies ElicitationResolved);
   });
 });
+
+describe("parseEvent: session.code_run.*", () => {
+  it("passes the saved started and finished items through", () => {
+    const item = { id: "item_1", type: "code_run", run_id: "run_1", phase: "started" };
+    expect(parseEvent("session.code_run.started", { item })).toEqual({
+      type: "session_code_run_started",
+      item,
+    });
+    expect(parseEvent("session.code_run.finished", { item })).toEqual({
+      type: "session_code_run_finished",
+      item,
+    });
+    expect(parseEvent("session.code_run.started", { item: "nope" })).toBeNull();
+  });
+
+  it("parses live output", () => {
+    expect(
+      parseEvent("session.code_run.output", {
+        run_id: "run_1",
+        offset: 5,
+        stream: "stderr",
+        text: "oops",
+      }),
+    ).toEqual({
+      type: "session_code_run_output",
+      runId: "run_1",
+      offset: 5,
+      stream: "stderr",
+      text: "oops",
+    });
+    expect(
+      parseEvent("session.code_run.output", { run_id: "run_1", offset: 5, stream: "x", text: "" }),
+    ).toBeNull();
+  });
+
+  it("parses a reconnect snapshot, dropping malformed segments", () => {
+    expect(
+      parseEvent("session.code_run.snapshot", {
+        run_id: "run_1",
+        offset: 3,
+        output: [{ stream: "stdout", text: "abc" }, { stream: "bad" }],
+      }),
+    ).toEqual({
+      type: "session_code_run_snapshot",
+      runId: "run_1",
+      offset: 3,
+      output: [{ stream: "stdout", text: "abc" }],
+    });
+    expect(parseEvent("session.code_run.snapshot", { offset: 3, output: [] })).toBeNull();
+  });
+});

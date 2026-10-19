@@ -116,6 +116,7 @@ import { isSideChatCommand, usesNativeSideChatFork } from "@/lib/sideChat";
 // pure helpers live in a leaf module so low-level session hooks can gate on temp
 // ids without an import cycle back to the store.
 import { isTempConvId, newTempConversation } from "@/lib/tempConversationId";
+import { useCodeRunStore } from "./codeRunStore";
 import { useTerminalActivityStore } from "./terminalActivity";
 import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import type {
@@ -1142,6 +1143,8 @@ export interface AppChatState {
    * The composer drains this on change and clears it.
    */
   pendingComposerAttachments: ComposerAttachment[];
+  /** Text queued for the active composer from outside it, e.g. a code run's output. */
+  pendingComposerText: string[];
   /**
    * True when this tab could not take an origin-wide stream slot for a
    * conversation it needed to open: every slot is held by other tabs and this
@@ -1334,6 +1337,10 @@ export interface ChatActions {
   addComposerAttachment: (attachment: ComposerAttachment) => void;
   /** Drain the queued composer attachments (called by the composer). */
   clearPendingComposerAttachments: () => void;
+  /** Queue text to append to the active composer from outside it. */
+  addComposerText: (text: string) => void;
+  /** Drain the queued composer text (called by the composer). */
+  clearPendingComposerText: () => void;
   /** Stamp {@link ChatState.runnerLaunchedAt} now — call right after a
    *  successful `launchRunner` for the open session. */
   markRunnerLaunched: () => void;
@@ -2025,6 +2032,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   oldestItemId: null,
   flashItemId: null,
   pendingComposerAttachments: [],
+  pendingComposerText: [],
   streamBudgetExceeded: false,
   streamBudgetBannerDismissed: false,
   failedSendDraft: null,
@@ -3121,6 +3129,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // drained yet, so it can't bleed into the incoming composer (which drains
       // the store on mount).
       pendingComposerAttachments: [],
+      pendingComposerText: [],
     });
     conversationRegistry.setActive(conversationId);
 
@@ -3301,6 +3310,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   clearPendingComposerAttachments: () => setActive({ pendingComposerAttachments: [] }),
+
+  addComposerText: (text) =>
+    setActive((s) => ({ pendingComposerText: [...s.pendingComposerText, text] })),
+
+  clearPendingComposerText: () => setActive({ pendingComposerText: [] }),
 
   dismissStreamBudgetBanner: () => rootSetState({ streamBudgetBannerDismissed: true }),
 
@@ -3588,6 +3602,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         olderThan: oldestItemId,
       });
       if (stale()) return;
+      useCodeRunStore.getState().ingestItems(conversationId, items);
       const newBlocks = itemsToBlocks(items);
       pageSet((state) => {
         // Rebind hydration resets the cursor to the fresh window's top while
@@ -4628,6 +4643,7 @@ async function bindStream(
       cachedFamily === undefined ? true : supportsEffortControl(session, cachedFamily);
     const effectiveEffort = canApplyEffort ? (session.reasoningEffort ?? null) : null;
 
+    useCodeRunStore.getState().ingestItems(id, items);
     const snapshotBlocks = itemsToBlocks(items);
     // Replay outstanding elicitation prompts from the snapshot.
     // The live SSE stream has no buffer, so a prompt that fired
@@ -5406,6 +5422,7 @@ async function rehydrateWindowOnReconnect(
   if (isConversationDisposed(id) || get().historyGeneration !== generation) return;
   const snapshotNativeMessageIds = nativeCompletedMessageIds(fresh.items);
   snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
+  useCodeRunStore.getState().ingestItems(id, fresh.items);
   const freshBlocks = itemsToBlocks(fresh.items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   const freshItemIds = new Set(fresh.items.map((it) => it.id));
@@ -5564,6 +5581,7 @@ async function reconcileOnReconnect(
     return;
   }
 
+  useCodeRunStore.getState().ingestItems(id, items);
   const snapshotBlocks = itemsToBlocks(items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   const snapshotItemIds = new Set(items.map((it) => it.id));
@@ -6504,6 +6522,8 @@ export async function pumpStreamEvents(
 ): Promise<StreamEndReason> {
   const stream = new BlockStream();
   const sseResult: SseStreamResult = { sawDone: false };
+  // Runs are live again only once this connection reports them.
+  useCodeRunStore.getState().streamOpened(id);
   const rawEvents = parseSseStream(body, sseResult);
   // Blocks awaiting their coalesced flush; `seenItemIds` dedupes against
   // both committed and still-buffered blocks. Lives for the whole stream
@@ -8335,6 +8355,31 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // changed-files/root refresh, and mark expanded directory caches
       // stale without immediately refetching every visible folder.
       scheduleWorkspaceFilesystemInvalidation(event.sessionId);
+      // The connect snapshot sends this right after its active code runs, so
+      // a run it didn't list is no longer running.
+      if (sourceConversationId) useCodeRunStore.getState().listingSettled(sourceConversationId);
+      return;
+    case "session_code_run_started":
+      if (sourceConversationId)
+        useCodeRunStore.getState().started(sourceConversationId, event.item);
+      return;
+    case "session_code_run_finished":
+      if (sourceConversationId) {
+        useCodeRunStore.getState().finished(sourceConversationId, event.item);
+      }
+      return;
+    case "session_code_run_output":
+      if (sourceConversationId) {
+        const { runId, offset, stream, text } = event;
+        // At most one store update per frame, however fast batches arrive.
+        useCodeRunStore.getState().queueOutput(sourceConversationId, runId, offset, stream, text);
+      }
+      return;
+    case "session_code_run_snapshot":
+      if (sourceConversationId) {
+        const { runId, offset, output } = event;
+        useCodeRunStore.getState().snapshot(sourceConversationId, runId, offset, output);
+      }
       return;
     case "session_terminal_activity":
       // Runner-determined PTY-output pulse — drives the "active" badge

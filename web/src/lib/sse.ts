@@ -8,6 +8,7 @@
 // reducer never seeing certain events, which the reducer's tests can't
 // catch — please add an SSE-parser test when you touch this.
 
+import { readCodeRunSegments } from "./codeRuns";
 import { readSubagentActivity } from "./subagentActivity";
 import type {
   BrowserActionRequestEvent,
@@ -48,6 +49,9 @@ import type {
   SessionSupersededEvent,
   SessionViewer,
   SessionTerminalActivityEvent,
+  SessionCodeRunItemEvent,
+  SessionCodeRunOutputEvent,
+  SessionCodeRunSnapshotEvent,
   SessionStatusEvent,
   SessionModelEvent,
   SessionTitleEvent,
@@ -950,6 +954,39 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       sessionId,
       terminalId,
     } satisfies SessionTerminalActivityEvent;
+  }
+  if (eventType === "session.code_run.started" || eventType === "session.code_run.finished") {
+    const item = data.item;
+    if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+    return {
+      type:
+        eventType === "session.code_run.started"
+          ? "session_code_run_started"
+          : "session_code_run_finished",
+      item: item as Record<string, unknown>,
+    } satisfies SessionCodeRunItemEvent;
+  }
+  if (eventType === "session.code_run.output") {
+    const { run_id: runId, offset, stream, text } = data;
+    if (typeof runId !== "string" || !runId || typeof offset !== "number") return null;
+    if ((stream !== "stdout" && stream !== "stderr") || typeof text !== "string") return null;
+    return {
+      type: "session_code_run_output",
+      runId,
+      offset,
+      stream,
+      text,
+    } satisfies SessionCodeRunOutputEvent;
+  }
+  if (eventType === "session.code_run.snapshot") {
+    const { run_id: runId, offset } = data;
+    if (typeof runId !== "string" || !runId || typeof offset !== "number") return null;
+    return {
+      type: "session_code_run_snapshot",
+      runId,
+      offset,
+      output: readCodeRunSegments(data.output),
+    } satisfies SessionCodeRunSnapshotEvent;
   }
   if (eventType === "session.model_options") {
     const conversationId = data.conversation_id;

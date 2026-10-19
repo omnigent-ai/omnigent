@@ -4,6 +4,9 @@ import { Button } from "@/components/ui/button";
 import { ButtonGroup, ButtonGroupText } from "@/components/ui/button-group";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { copyText } from "@/lib/clipboard";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { codeRunLanguage, normalizeBlockText } from "@/lib/codeRuns";
 import { getEmbedRoot } from "@/lib/host";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { cn } from "@/lib/utils";
@@ -32,6 +35,7 @@ import {
   type StreamdownProps,
 } from "streamdown";
 
+import { CodeBlockRunner, CodeRunMessageContext } from "@/components/chat/CodeRunPanel";
 import { MarkdownErrorBoundary } from "./MarkdownErrorBoundary";
 import { mermaidOptionsForTheme } from "./MermaidError";
 import { FullscreenIcon, isMermaidPre, MermaidBlock, MERMAID_NO_FULLSCREEN } from "./MermaidBlock";
@@ -586,6 +590,15 @@ function ChatCodeBlockWrapToggle({ wrap, onToggle }: { wrap: boolean; onToggle: 
   );
 }
 
+/** The fence tag Streamdown put on a code block, e.g. `"bash"`; `""` when untagged. */
+function codeFenceTag(children: ReactNode): string {
+  if (!isValidElement<{ className?: string }>(children)) return "";
+  const languageClass = children.props.className
+    ?.split(/\s+/)
+    .find((name) => name.startsWith("language-"));
+  return languageClass ? languageClass.slice("language-".length) : "";
+}
+
 function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
   const code = extractCodeText(children);
   const getCode = useCallback(() => code, [code]);
@@ -594,6 +607,18 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
   // horizontal-scroll view for when column alignment matters.
   const [wrap, setWrap] = useState(true);
   const toggleWrap = useCallback(() => setWrap((w) => !w), []);
+  // Blocks of a saved assistant message can run when the deployment allows it.
+  const runMessage = useContext(CodeRunMessageContext);
+  const codeRunsEnabled = isFeatureEnabled(useServerInfo(), "code_block_run");
+  const tag = codeFenceTag(children);
+  // Checked once per block text, and never while the message streams (no context yet).
+  const checkRuns = runMessage !== null && codeRunsEnabled;
+  const runnable = useMemo(() => {
+    if (!checkRuns) return null;
+    const runCode = normalizeBlockText(code);
+    const language = codeRunLanguage(tag, runCode);
+    return language ? { code: runCode, language } : null;
+  }, [checkRuns, code, tag]);
   const block = isValidElement(children)
     ? cloneElement(children, { "data-block": "true" } as Record<string, unknown>)
     : children;
@@ -605,17 +630,32 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
     return <MermaidBlock block={block} />;
   }
 
-  return (
+  const renderBlock = (runButton?: ReactNode) => (
     <div className={cn("chat-code-block relative", wrap && "chat-code-wrap")}>
       {block}
       {/* Match Streamdown's action-pill height and reserve its rightmost slot
           for download. All controls stay anchored to the header. */}
       <div className="absolute top-2 right-12 z-10 -mr-1.5 flex items-center gap-0.5 border-y border-transparent py-1">
+        {runButton}
         <ChatCodeBlockWrapToggle onToggle={toggleWrap} wrap={wrap} />
         <ChatCodeBlockCopyButton getCode={getCode} />
       </div>
     </div>
   );
+
+  if (runMessage && runnable) {
+    return (
+      <CodeBlockRunner
+        message={runMessage}
+        code={runnable.code}
+        language={runnable.language}
+        console={tag.toLowerCase() === "console"}
+        render={renderBlock}
+        runButtonClassName={CODE_BLOCK_OVERLAY_BUTTON_CLASS}
+      />
+    );
+  }
+  return renderBlock();
 }
 
 export const MessageResponse = memo(

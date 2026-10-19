@@ -8,6 +8,7 @@
 // uses camelCase fields + a `type` discriminator string equal to the
 // Python class name lowercased (e.g. ResponseCreated → "response_created").
 
+import type { CodeRunSegment, CodeRunStream } from "./codeRuns";
 import type { RoutingDecisionExtras } from "./routingDecision";
 import type {
   AgyPermission,
@@ -893,6 +894,32 @@ export interface SessionTerminalActivityEvent {
 }
 
 /**
+ * `session.code_run.started` / `session.code_run.finished`: a chat code run's
+ * saved `code_run` item, in the flat wire shape of `GET /items`.
+ */
+export interface SessionCodeRunItemEvent {
+  type: "session_code_run_started" | "session_code_run_finished";
+  item: Record<string, unknown>;
+}
+
+/** `session.code_run.output`: live output; `offset` is the characters before `text`. */
+export interface SessionCodeRunOutputEvent {
+  type: "session_code_run_output";
+  runId: string;
+  offset: number;
+  stream: CodeRunStream;
+  text: string;
+}
+
+/** `session.code_run.snapshot`: a running run's output so far, sent on subscribe. */
+export interface SessionCodeRunSnapshotEvent {
+  type: "session_code_run_snapshot";
+  runId: string;
+  offset: number;
+  output: CodeRunSegment[];
+}
+
+/**
  * `session.model_options` — a runner-owned native model catalog just resolved.
  * Consumers refetch the session snapshot and apply its now-populated options.
  */
@@ -1034,6 +1061,9 @@ export type StreamEvent =
   | SessionChildSessionUpdatedEvent
   | SessionChangedFilesInvalidatedEvent
   | SessionTerminalActivityEvent
+  | SessionCodeRunItemEvent
+  | SessionCodeRunOutputEvent
+  | SessionCodeRunSnapshotEvent
   | SessionModelOptionsEvent
   | SessionPresenceEvent
   | SessionBtwSidechatEvent

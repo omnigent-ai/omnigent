@@ -17,7 +17,7 @@
 //    pending elicitations and routing cards stay visible too.
 
 import type { ReactNode } from "react";
-import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ChevronRightIcon } from "lucide-react";
 import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
@@ -26,6 +26,7 @@ import type { RenderItem } from "@/lib/renderItems";
 import type { SessionStatus } from "@/lib/types";
 import type { ActiveResponse } from "@/store/types";
 import { cn } from "@/lib/utils";
+import { CodeRunMessageContext, type CodeRunMessage } from "@/components/chat/CodeRunPanel";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 import { ElicitationCard } from "./ApprovalCard";
 import { ReasoningView } from "./ReasoningView";
@@ -729,6 +730,25 @@ function isInProgressTool(item: RenderItem): boolean {
   return item.kind === "tool" && item.state === "input-available";
 }
 
+/** Ties code blocks of saved assistant text to its message; live previews have no stored id. */
+function CodeRunMessageScope({
+  item,
+  streaming,
+  children,
+}: {
+  item: Extract<RenderItem, { kind: "text" }>;
+  streaming: boolean;
+  children: ReactNode;
+}) {
+  const messageId =
+    item.final && item.itemId && !item.itemId.startsWith("live:") ? item.itemId : null;
+  const value = useMemo<CodeRunMessage | null>(
+    () => (messageId ? { messageId, streaming } : null),
+    [messageId, streaming],
+  );
+  return <CodeRunMessageContext.Provider value={value}>{children}</CodeRunMessageContext.Provider>;
+}
+
 function renderItem(
   item: RenderItem,
   index: number,
@@ -747,12 +767,14 @@ function renderItem(
           data-testid="assistant-text-section"
           className={cn("min-w-0", followsText && "mt-2")}
         >
-          <FilePathAwareMessageResponse
-            className="chat-markdown"
-            mode={isTextStreaming ? "streaming" : "static"}
-          >
-            {item.text}
-          </FilePathAwareMessageResponse>
+          <CodeRunMessageScope item={item} streaming={isTextStreaming}>
+            <FilePathAwareMessageResponse
+              className="chat-markdown"
+              mode={isTextStreaming ? "streaming" : "static"}
+            >
+              {item.text}
+            </FilePathAwareMessageResponse>
+          </CodeRunMessageScope>
           {item.previewInterrupted && item.itemId?.startsWith("live:") && (
             <div
               role="status"

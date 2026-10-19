@@ -2903,3 +2903,28 @@ async def test_subprocess_tracking_uses_validated_session_without_telemetry(
     assert [pr.url for pr in SessionPrRegistry(conv_id).list()] == [
         "https://github.com/example/sdk/pull/42"
     ]
+
+
+def test_image_message_folds_a_text_notice_for_executors_that_do_not_read_notices() -> None:
+    """Pi and other plain readers never receive a raw framework notice block."""
+    from omnigent.inner.native_attachments import (
+        FRAMEWORK_NOTICE_BLOCK_TYPE,
+        framework_notice_block,
+        framework_text_notice_block,
+    )
+    from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
+
+    image = {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+    typed = {"type": "input_text", "text": "what is this?"}
+    content = [image, typed, framework_text_notice_block("run summary")]
+
+    [message] = _translate_input_to_messages(content)
+
+    assert message["content"] == [image, typed, {"type": "input_text", "text": "run summary"}]
+    kept = _translate_input_to_messages(content, keep_notices=True)
+    assert kept[0]["content"] == content
+    # Without a code-run notice the content is unchanged, resize notices included.
+    resized = [image, framework_notice_block({"width": 6000, "height": 4000}), typed]
+    assert _translate_input_to_messages(resized)[0]["content"] == resized
+    assert _translate_input_to_messages([image, typed])[0]["content"] == [image, typed]
+    assert FRAMEWORK_NOTICE_BLOCK_TYPE not in json.dumps(message["content"])

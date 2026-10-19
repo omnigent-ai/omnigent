@@ -43,6 +43,7 @@ from omnigent.inner.executor import (
     TurnCancelled,
     TurnComplete,
 )
+from omnigent.inner.native_attachments import FRAMEWORK_NOTICE_BLOCK_TYPE
 from omnigent.inner.tracing import TracingContext, is_tracing_enabled
 from omnigent.native.input_diagnostics import (
     INPUT_FIELDS,
@@ -239,7 +240,9 @@ class ExecutorAdapter(HarnessApp):
         instance. Installs stable tool/elicitation/policy bridges once on first use.
         """
         executor = self._ensure_executor()
-        messages = _translate_input_to_messages(request.input)
+        messages = _translate_input_to_messages(
+            request.input, keep_notices=getattr(executor, "reads_framework_notices", False)
+        )
         # Stamp session_key on every message so the inner executor keys its client consistently,
         # matching the key used by enqueue_session_message (steering delivery depends on this).
         for message in messages:
@@ -706,7 +709,9 @@ class ExecutorAdapter(HarnessApp):
             if injection is None:
                 # None signals a sentinel or protocol change; bail to avoid spinning.
                 return
-            text = _extract_user_text(injection.input)
+            text = _extract_user_text(
+                injection.input, keep_notices=getattr(executor, "reads_framework_notices", False)
+            )
             if not text:
                 _logger.warning(
                     "skipping in-band injection with no text payload: %r",
@@ -1444,9 +1449,16 @@ def _extract_last_user_message(
 
 def _extract_user_text(
     input_value: str | list[dict[str, Any]],
-) -> str:
-    """Extract concatenated text from an injection input for ``enqueue_session_message``."""
+    *,
+    keep_notices: bool = False,
+) -> str | list[dict[str, Any]]:
+    """Extract concatenated text from an injection input for ``enqueue_session_message``.
+
+    With *keep_notices*, a block list carrying a framework notice is returned whole.
+    """
     if isinstance(input_value, str):
+        return input_value
+    if keep_notices and _has_framework_notice(input_value):
         return input_value
     parts: list[str] = []
     for block in input_value:
@@ -1458,6 +1470,8 @@ def _extract_user_text(
 
 def _translate_input_to_messages(
     input_value: str | list[dict[str, Any]],
+    *,
+    keep_notices: bool = False,
 ) -> list[Message]:
     """Convert a CreateResponseRequest input to inner Message list.
 
@@ -1467,16 +1481,18 @@ def _translate_input_to_messages(
     if isinstance(input_value, str):
         return [{"role": "user", "content": input_value}]
 
-    history_messages = _extract_role_keyed_messages(input_value)
+    history_messages = _extract_role_keyed_messages(input_value, keep_notices=keep_notices)
     if history_messages:
         return history_messages
 
-    content = _normalize_message_content(input_value)
+    content = _normalize_message_content(input_value, keep_notices=keep_notices)
     return [{"role": "user", "content": content}]
 
 
 def _extract_role_keyed_messages(
     input_value: list[dict[str, Any]],
+    *,
+    keep_notices: bool = False,
 ) -> list[Message]:
     """Extract role-keyed message items from an Omnigent input list.
 
@@ -1490,7 +1506,7 @@ def _extract_role_keyed_messages(
         if item.get("type") != "message" or "role" not in item:
             continue
         role = item["role"]
-        content = _normalize_message_content(item.get("content"))
+        content = _normalize_message_content(item.get("content"), keep_notices=keep_notices)
         if not content:
             continue
         messages.append({"role": role, "content": content})
@@ -1500,10 +1516,23 @@ def _extract_role_keyed_messages(
 _MULTIMODAL_BLOCK_TYPES: frozenset[str] = frozenset({"input_image", "input_file", "input_audio"})
 
 
+def _has_framework_notice(blocks: list[Any]) -> bool:
+    return any(
+        isinstance(block, dict) and block.get("type") == FRAMEWORK_NOTICE_BLOCK_TYPE
+        for block in blocks
+    )
+
+
 def _normalize_message_content(
     content: Any,
+    *,
+    keep_notices: bool = False,
 ) -> str | list[dict[str, Any]]:
-    """Normalize message content: plain string for text-only; full block list for multimodal."""
+    """Normalize message content: plain string for text-only; full block list for multimodal.
+
+    With *keep_notices*, a framework notice also keeps the block list, so the
+    executor can keep the notice out of the user's text.
+    """
     if content is None:
         return ""
     if isinstance(content, str):
@@ -1515,8 +1544,18 @@ def _normalize_message_content(
         isinstance(block, dict) and block.get("type") in _MULTIMODAL_BLOCK_TYPES
         for block in content
     )
-    if has_multimodal:
+    if keep_notices and _has_framework_notice(content):
         return content
+    if has_multimodal:
+        # Plain readers reject unknown blocks, so a text notice becomes text.
+        return [
+            {"type": "input_text", "text": block["text"]}
+            if isinstance(block, dict)
+            and block.get("type") == FRAMEWORK_NOTICE_BLOCK_TYPE
+            and isinstance(block.get("text"), str)
+            else block
+            for block in content
+        ]
 
     parts: list[str] = []
     for block in content:

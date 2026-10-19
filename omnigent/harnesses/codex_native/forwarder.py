@@ -63,6 +63,7 @@ from omnigent.harnesses.codex_native.elicitation import (
 from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
+from omnigent.inner.native_attachments import is_sent_codex_framework_notice
 from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
@@ -8545,6 +8546,13 @@ def _delta_recovery_status_edge(
     )
 
 
+def _is_sent_notice(text: str) -> bool:
+    """Whether *text* is a framework notice the executor sent, not user text."""
+    # The dead-letter context var holds this forwarder's bridge directory.
+    bridge_dir = _dead_letter_dir.get()
+    return bridge_dir is not None and is_sent_codex_framework_notice(text, bridge_dir)
+
+
 def _user_message_text(item: _JsonObject) -> str:
     """
     Convert a Codex ``userMessage`` item into plain text.
@@ -8560,7 +8568,7 @@ def _user_message_text(item: _JsonObject) -> str:
         if not isinstance(block, dict):
             continue
         text = block.get("text")
-        if isinstance(text, str) and text:
+        if isinstance(text, str) and text and not _is_sent_notice(text):
             parts.append(text)
     return "\n\n".join(parts)
 

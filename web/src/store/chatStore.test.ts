@@ -97,6 +97,7 @@ import {
   type StreamSlot,
   type StreamSlotManager,
 } from "./streamSlots";
+import { useCodeRunStore } from "./codeRunStore";
 import { useTerminalActivityStore } from "./terminalActivity";
 
 // The real `send` action, captured before any test stubs it via
@@ -1739,6 +1740,31 @@ describe("chatStore — switchTo", () => {
     ]);
     expect(blocks[3]).toMatchObject({ type: "text_done", fullText: "second assistant" });
     expect(useChatStore.getState().hasMoreHistory).toBe(false);
+  });
+
+  it("hydrates saved code runs into the run store without timeline blocks", async () => {
+    useCodeRunStore.setState({ sessions: {} });
+    const run = {
+      id: "item_run_1",
+      type: "code_run",
+      run_id: "run_1",
+      phase: "started",
+      message_id: "msg_1",
+      block_hash: "h",
+      language: "shell",
+      command: "ls",
+      started_at: 100,
+    } as unknown as ConversationItem;
+    seedSessionSnapshot("conv_runs", []);
+    seedSessionItems("conv_runs", [assistantMessage("resp_1", "```bash\nls\n```"), run]);
+
+    await useChatStore.getState().switchTo("conv_runs");
+
+    expect(useChatStore.getState().blocks).toHaveLength(1);
+    expect(useCodeRunStore.getState().sessions["conv_runs"]!.runs["run_1"]).toMatchObject({
+      command: "ls",
+      startedAt: 100,
+    });
   });
 
   it("hydrates pending elicitations from the session snapshot after refresh", async () => {
@@ -10099,6 +10125,78 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       // the debounce broke and each event flushed separately.
       expect(spy).toHaveBeenCalledTimes(5);
       spy.mockRestore();
+    });
+  });
+
+  describe("composer text queue", () => {
+    it("queues text for the composer until a session switch drops it", async () => {
+      useChatStore.getState().addComposerText("one");
+      useChatStore.getState().addComposerText("two");
+      expect(useChatStore.getState().pendingComposerText).toEqual(["one", "two"]);
+      useChatStore.getState().clearPendingComposerText();
+      expect(useChatStore.getState().pendingComposerText).toEqual([]);
+      useChatStore.getState().addComposerText("stale");
+      seedSessionSnapshot("conv_other", []);
+      seedSessionItems("conv_other", []);
+      await useChatStore.getState().switchTo("conv_other");
+      expect(useChatStore.getState().pendingComposerText).toEqual([]);
+    });
+  });
+
+  describe("session.code_run.*", () => {
+    it("routes run events to the delivering stream's session", () => {
+      vi.useFakeTimers({ toFake: ["requestAnimationFrame"] });
+      onTestFinished(() => {
+        vi.useRealTimers();
+      });
+      useCodeRunStore.setState({ sessions: {} });
+      const item = {
+        type: "code_run",
+        run_id: "run_1",
+        phase: "started",
+        message_id: "msg_1",
+        block_hash: "h",
+      };
+      handleSessionEvent({ type: "session_code_run_started", item }, "conv_runs");
+      handleSessionEvent(
+        {
+          type: "session_code_run_output",
+          runId: "run_1",
+          offset: 0,
+          stream: "stdout",
+          text: "hi",
+        },
+        "conv_runs",
+      );
+      vi.advanceTimersToNextFrame();
+      handleSessionEvent(
+        { type: "session_code_run_snapshot", runId: "run_1", offset: 1, output: [] },
+        "conv_runs",
+      );
+      handleSessionEvent(
+        {
+          type: "session_changed_files_invalidated",
+          sessionId: "conv_runs",
+          environmentId: "default",
+        },
+        "conv_runs",
+      );
+      const session = useCodeRunStore.getState().sessions["conv_runs"]!;
+      expect(session.runs["run_1"]).toMatchObject({
+        messageId: "msg_1",
+        output: [{ stream: "stdout", text: "hi" }],
+      });
+      expect(session.listingSettled).toBe(true);
+      handleSessionEvent(
+        {
+          type: "session_code_run_finished",
+          item: { type: "code_run", run_id: "run_1", phase: "finished", status: "stopped" },
+        },
+        "conv_runs",
+      );
+      expect(
+        useCodeRunStore.getState().sessions["conv_runs"]!.runs["run_1"]!.finished?.status,
+      ).toBe("stopped");
     });
   });
 

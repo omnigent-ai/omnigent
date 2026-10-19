@@ -7165,6 +7165,42 @@ async def _seed_os_env_snapshot(
         pass  # file does not exist yet or unreadable — no baseline to capture
 
 
+def _needs_shared_environment(effective_spec: OSEnvSpec) -> bool:
+    """
+    Whether *effective_spec* has copy-on-write paths, which only the shared
+    primary environment can own.
+
+    :param effective_spec: Spec from :func:`_effective_runner_os_env_spec`.
+    :returns: ``True`` when sys_os_* must use the session's primary environment.
+    """
+    return effective_spec.sandbox is not None and any(
+        path.copy_on_write for path in effective_spec.sandbox.write_path_specs
+    )
+
+
+def _dedicated_os_environment(
+    effective_spec: OSEnvSpec,
+    conversation_id: str | None,
+    resource_registry: SessionResourceRegistry | None,
+) -> OSEnvironment | None:
+    """
+    Build a caller-owned OSEnvironment for one sys_os_* call or code run.
+
+    :param effective_spec: Spec from :func:`_effective_runner_os_env_spec`.
+    :param conversation_id: Session id whose Codex skills stay readable.
+    :param resource_registry: Registry owning the session's skills directory.
+    :returns: A fresh environment the caller must close, or ``None``.
+    """
+    from omnigent.inner.os_env import create_os_environment
+
+    additional_read_roots = (
+        [resource_registry.codex_skills_dir(conversation_id)]
+        if resource_registry is not None and conversation_id is not None
+        else []
+    )
+    return create_os_environment(effective_spec, additional_read_roots=additional_read_roots)
+
+
 async def _execute_os_env_tool(
     tool_name: str,
     args: _JsonObject,
@@ -7194,7 +7230,7 @@ async def _execute_os_env_tool(
         session.
     :returns: Serialized tool result string.
     """
-    from omnigent.inner.os_env import _DEFAULT_READ_LIMIT, create_os_environment
+    from omnigent.inner.os_env import _DEFAULT_READ_LIMIT
 
     os_env = None
     owns_environment = True
@@ -7202,10 +7238,7 @@ async def _execute_os_env_tool(
         effective_spec = _effective_runner_os_env_spec(
             agent_spec, conversation_id, runner_workspace
         )
-        needs_shared_environment = effective_spec.sandbox is not None and any(
-            p.copy_on_write for p in effective_spec.sandbox.write_path_specs
-        )
-        if needs_shared_environment:
+        if _needs_shared_environment(effective_spec):
             if resource_registry is None or conversation_id is None:
                 raise ValueError("copy_on_write tools require a session resource registry")
             from omnigent.entities import DEFAULT_ENVIRONMENT_ID
@@ -7215,14 +7248,7 @@ async def _execute_os_env_tool(
             )
             owns_environment = False
         else:
-            additional_read_roots = (
-                [resource_registry.codex_skills_dir(conversation_id)]
-                if resource_registry is not None and conversation_id is not None
-                else []
-            )
-            os_env = create_os_environment(
-                effective_spec, additional_read_roots=additional_read_roots
-            )
+            os_env = _dedicated_os_environment(effective_spec, conversation_id, resource_registry)
         if os_env is None:
             return "Error: unable to create OSEnvironment"
 

@@ -1,0 +1,80 @@
+{
+  "description": "Untagged code blocks and whether the server runs them as shell (find_code_fence). Shared by the web and server tests.",
+  "cases": [
+    {
+      "name": "every line is a prompt",
+      "code": "$ ls\n$ pwd",
+      "runnable": true
+    },
+    {
+      "name": "a non-prompt line",
+      "code": "$ ls\nfile.txt",
+      "runnable": false
+    },
+    {
+      "name": "blank lines between prompts",
+      "code": "$ ls\n\n$ pwd\n",
+      "runnable": true
+    },
+    {
+      "name": "whitespace-only line",
+      "code": "$ ls\n \t \n$ pwd",
+      "runnable": true
+    },
+    {
+      "name": "CRLF line endings",
+      "code": "$ ls\r\n$ pwd\r\n",
+      "runnable": true
+    },
+    {
+      "name": "CRLF with a non-prompt line",
+      "code": "$ ls\r\nfile.txt",
+      "runnable": false
+    },
+    {
+      "name": "prompt needs the space",
+      "code": "$ls",
+      "runnable": false
+    },
+    {
+      "name": "indented prompt",
+      "code": "  $ ls",
+      "runnable": false
+    },
+    {
+      "name": "percent prompt alone is not enough",
+      "code": "% ls",
+      "runnable": false
+    },
+    {
+      "name": "empty block",
+      "code": "",
+      "runnable": false
+    },
+    {
+      "name": "form feed then a non-prompt line stays one line",
+      "code": "$ echo ok\fnot-a-prompt",
+      "runnable": true
+    },
+    {
+      "name": "U+2028 then a non-prompt line stays one line",
+      "code": "$ echo ok\u2028not-a-prompt",
+      "runnable": true
+    },
+    {
+      "name": "a line of U+001C is blank to the server",
+      "code": "$ ls\n\u001c",
+      "runnable": true
+    },
+    {
+      "name": "a line of U+0085 is blank to the server",
+      "code": "$ ls\n\u0085",
+      "runnable": true
+    },
+    {
+      "name": "a line of U+FEFF is not blank to the server",
+      "code": "$ ls\n\ufeff",
+      "runnable": false
+    }
+  ]
+}

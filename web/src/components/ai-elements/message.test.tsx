@@ -1,9 +1,30 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { setEmbedRoot } from "@/lib/host";
 import { MermaidPreview } from "@/shell/MermaidPreview";
 import { Reasoning, ReasoningContent } from "./reasoning";
 import { Message, MessageAction, MessageActions, MessageContent, MessageResponse } from "./message";
+import { CodeBlockRunner, CodeRunMessageContext } from "@/components/chat/CodeRunPanel";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { codeRunLanguage, normalizeBlockText } from "@/lib/codeRuns";
+import type { ServerInfo } from "@/lib/capabilities";
+
+vi.mock("@/lib/codeRuns", async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  return {
+    ...actual,
+    codeRunLanguage: vi.fn(actual.codeRunLanguage as (tag: string, code: string) => unknown),
+    normalizeBlockText: vi.fn(actual.normalizeBlockText as (text: string) => string),
+  };
+});
+
+vi.mock("@/components/chat/CodeRunPanel", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  CodeBlockRunner: vi.fn(({ render: renderBlock }: { render: (button?: ReactNode) => ReactNode }) =>
+    renderBlock(<button type="button">Run</button>),
+  ),
+}));
 
 const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
 const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
@@ -308,5 +329,100 @@ describe("MessageResponse code-block copy", () => {
       expect(copiedText).toEqual(["const value = 1;\nconsole.log(value);\n"]);
     });
     expect(screen.getByRole("button", { name: "Download file" })).toBeInTheDocument();
+  });
+});
+
+describe("MessageResponse code-block run", () => {
+  const runnerCalls = () =>
+    vi.mocked(CodeBlockRunner).mock.calls.map(([props]) => ({
+      code: props.code,
+      language: props.language,
+      console: props.console,
+    }));
+
+  function renderRunnable(markdown: string, { enabled = true, inMessage = true } = {}) {
+    const info = { features: { code_block_run: enabled } } as unknown as ServerInfo;
+    const response = <MessageResponse>{markdown}</MessageResponse>;
+    return render(
+      <CapabilitiesProvider info={info}>
+        {inMessage ? (
+          <CodeRunMessageContext.Provider value={{ messageId: "msg_1", streaming: false }}>
+            {response}
+          </CodeRunMessageContext.Provider>
+        ) : (
+          response
+        )}
+      </CapabilitiesProvider>,
+    );
+  }
+
+  afterEach(() => vi.mocked(CodeBlockRunner).mockClear());
+
+  it.each([
+    ["```bash\nls -la\n```", { code: "ls -la", language: "shell", console: false }],
+    ["```console\n$ ls\nfile\n```", { code: "$ ls\nfile", language: "shell", console: true }],
+    ["```\n$ ls\n$ pwd\n```", { code: "$ ls\n$ pwd", language: "shell", console: false }],
+    ["```python\nprint(1)\n```", { code: "print(1)", language: "python", console: false }],
+    [
+      "```javascript\nconsole.log(1)\n```",
+      { code: "console.log(1)", language: "node", console: false },
+    ],
+  ])("offers a run for %j", async (markdown, expected) => {
+    renderRunnable(markdown);
+    const copy = await screen.findByRole("button", { name: "Copy Code" });
+    expect(copy.parentElement).toContainElement(screen.getByRole("button", { name: "Run" }));
+    expect(runnerCalls().at(-1)).toEqual(expected);
+  });
+
+  it("checks a block once while its message re-renders", async () => {
+    const info = { features: { code_block_run: true } } as unknown as ServerInfo;
+    const tree = (markdown: string, streaming: boolean) => (
+      <CapabilitiesProvider info={info}>
+        <CodeRunMessageContext.Provider value={{ messageId: "msg_1", streaming }}>
+          <MessageResponse>{markdown}</MessageResponse>
+        </CodeRunMessageContext.Provider>
+      </CapabilitiesProvider>
+    );
+    const markdown = "```bash\nls\n```";
+    const { rerender } = render(tree(markdown, false));
+    await screen.findByRole("button", { name: "Copy Code" });
+    vi.mocked(codeRunLanguage).mockClear();
+    for (let index = 0; index < 20; index++) rerender(tree(markdown, index % 2 === 0));
+    expect(codeRunLanguage).toHaveBeenCalledTimes(0);
+  });
+
+  it("skips run checks while the message is still streaming", async () => {
+    const info = { features: { code_block_run: true } } as unknown as ServerInfo;
+    const { rerender } = render(
+      <CapabilitiesProvider info={info}>
+        <MessageResponse>{"```bash\nl"}</MessageResponse>
+      </CapabilitiesProvider>,
+    );
+    await screen.findByRole("button", { name: "Copy Code" });
+    vi.mocked(codeRunLanguage).mockClear();
+    vi.mocked(normalizeBlockText).mockClear();
+    let markdown = "```bash\nl";
+    for (const token of ["s", " -", "la", "\n```"]) {
+      markdown += token;
+      rerender(
+        <CapabilitiesProvider info={info}>
+          <MessageResponse>{markdown}</MessageResponse>
+        </CapabilitiesProvider>,
+      );
+    }
+    expect(codeRunLanguage).not.toHaveBeenCalled();
+    expect(normalizeBlockText).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a non-runnable tag", "```ts\nconst x = 1;\n```", {}],
+    ["an untagged block without prompts", "```\nls\n```", {}],
+    ["the flag off", "```bash\nls\n```", { enabled: false }],
+    ["text outside an assistant message", "```bash\nls\n```", { inMessage: false }],
+  ])("offers no run for %s", async (_label, markdown, options) => {
+    renderRunnable(markdown, options);
+    await screen.findByRole("button", { name: "Copy Code" });
+    expect(screen.queryByRole("button", { name: "Run" })).toBeNull();
+    expect(CodeBlockRunner).not.toHaveBeenCalled();
   });
 });

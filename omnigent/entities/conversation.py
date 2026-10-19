@@ -632,6 +632,117 @@ class TerminalCommandData(BaseModel):
     stderr: str | None = None
 
 
+# Cap on the total characters across a saved code run's output segments.
+CODE_RUN_OUTPUT_MAX_CHARS = 100_000
+
+
+class CodeRunOutputSegment(BaseModel):
+    """
+    One contiguous chunk of a code run's output from a single stream.
+
+    :param stream: ``"stdout"`` or ``"stderr"``.
+    :param text: The chunk's text, e.g. ``"hello\\n"``.
+    """
+
+    stream: Literal["stdout", "stderr"]
+    text: str
+
+
+class CodeRunData(BaseModel):
+    """
+    Data payload for a chat code block the session owner ran.
+
+    Each run appends two ``code_run`` items sharing ``run_id``: a
+    ``started`` item and, once the process ends, a ``finished`` item.
+    Fields of the other phase stay unset. Listed in
+    :data:`NON_CONTENT_ITEM_TYPES` so the agent loop never replays a run
+    as model history; the agent gets a summary through a framework notice.
+
+    :param run_id: Id shared by the run's two items, e.g. ``"run_abc"``.
+    :param phase: ``"started"`` or ``"finished"``.
+    :param message_id: Started: id of the assistant message holding the
+        block.
+    :param block_hash: Started: hash identifying the block within that
+        message.
+    :param language: Started: block language, e.g. ``"bash"``.
+    :param command: Started: the exact code that ran.
+    :param timeout: Started: timeout in seconds, e.g. ``60``.
+    :param approved_by: Started: who approved a policy ASK for this run,
+        or ``None`` when no approval was needed.
+    :param started_at: Started: Unix epoch seconds when the run began.
+    :param status: Finished: ``"exited"``, ``"stopped"``,
+        ``"timed_out"``, or ``"failed"``.
+    :param exit_code: Finished: process exit code, or ``None`` when the
+        process did not exit on its own.
+    :param duration_ms: Finished: run duration in milliseconds.
+    :param output: Finished: output segments in arrival order, at most
+        :data:`CODE_RUN_OUTPUT_MAX_CHARS` characters in total.
+    :param truncated: Finished: ``True`` when output was cut to the cap.
+    """
+
+    run_id: str
+    phase: Literal["started", "finished"]
+    message_id: str | None = None
+    block_hash: str | None = None
+    language: str | None = None
+    command: str | None = None
+    timeout: int | None = None
+    approved_by: str | None = None
+    started_at: int | None = None
+    status: Literal["exited", "stopped", "timed_out", "failed"] | None = None
+    exit_code: int | None = None
+    duration_ms: int | None = None
+    output: list[CodeRunOutputSegment] | None = None
+    truncated: bool | None = None
+
+    @model_validator(mode="after")
+    def check_phase_fields_and_output_cap(self) -> CodeRunData:
+        """
+        Require the declared phase's fields and enforce the output cap.
+
+        :returns: The validated model.
+        :raises ValueError: If a field the phase needs is unset, or the
+            output exceeds :data:`CODE_RUN_OUTPUT_MAX_CHARS` characters.
+        """
+        missing = [
+            name for name in _CODE_RUN_PHASE_FIELDS[self.phase] if getattr(self, name) is None
+        ]
+        if missing:
+            raise ValueError(f"code_run {self.phase} item requires {', '.join(missing)}")
+        if sum(len(segment.text) for segment in self.output or ()) > CODE_RUN_OUTPUT_MAX_CHARS:
+            raise ValueError(f"code_run output exceeds {CODE_RUN_OUTPUT_MAX_CHARS} characters")
+        return self
+
+
+def code_run_source_id(run_id: str, phase: Literal["started", "finished"]) -> str:
+    """
+    Return the ``external_conversation_item`` source id for a run's item.
+
+    The server and the runner both derive a run's item ids from it, so a
+    retried or late post of the same phase dedupes instead of duplicating.
+
+    :param run_id: The run, e.g. ``"run_abc"``.
+    :param phase: ``"started"`` or ``"finished"``.
+    :returns: E.g. ``"code_run:run_abc:finished"``.
+    """
+    return f"code_run:{run_id}:{phase}"
+
+
+# The runner's code-run route answers these (status: body ``code``) only when it
+# refuses a run before starting it; any other reply may follow a started run.
+CODE_RUN_START_REFUSALS: dict[int, str] = {
+    400: "invalid_input",
+    409: "copy_on_write",
+    429: "too_many_runs",
+}
+
+
+_CODE_RUN_PHASE_FIELDS: dict[str, tuple[str, ...]] = {
+    "started": ("message_id", "block_hash", "language", "command", "timeout", "started_at"),
+    "finished": ("status", "duration_ms", "output", "truncated"),
+}
+
+
 class RoutingDecisionData(BaseModel):
     """
     Data payload for an intelligent model-router decision item.
@@ -767,6 +878,7 @@ ItemData = (
     | RoutingDecisionData
     | SlashCommandData
     | TerminalCommandData
+    | CodeRunData
 )
 
 ITEM_TYPE_TO_DATA_CLS: dict[str, type[BaseModel]] = {
@@ -781,7 +893,25 @@ ITEM_TYPE_TO_DATA_CLS: dict[str, type[BaseModel]] = {
     "routing_decision": RoutingDecisionData,
     "slash_command": SlashCommandData,
     "terminal_command": TerminalCommandData,
+    "code_run": CodeRunData,
 }
+
+# User-role message the runner stores when the user cancels a turn.
+CANCELLATION_MARKER_TEXT = (
+    "[System: interrupted]\n"
+    "The user interrupted and abandoned their previous request (the user "
+    "message immediately before this one). Do not resume or act on that "
+    "interrupted request unless the user asks for it again; treat the next "
+    "user message as the current instruction. The preceding assistant "
+    "message may be incomplete."
+)
+
+# Error codes stored right after a user message a native harness never received.
+NATIVE_PROMPT_NOT_RECORDED = "native_prompt_not_recorded"
+KIRO_NATIVE_PROMPT_NOT_RECORDED = "kiro_native_prompt_not_recorded"
+UNDELIVERED_PROMPT_ERROR_CODES: frozenset[str] = frozenset(
+    {NATIVE_PROMPT_NOT_RECORDED, KIRO_NATIVE_PROMPT_NOT_RECORDED}
+)
 
 # Item types that are metadata / lifecycle events — not content
 # the agent loop should include in the LLM's message context.
@@ -794,6 +924,7 @@ NON_CONTENT_ITEM_TYPES: frozenset[str] = frozenset(
         "routing_decision",
         "slash_command",
         "terminal_command",
+        "code_run",
     }
 )
 

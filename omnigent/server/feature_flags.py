@@ -27,6 +27,7 @@ class Feature(StrEnum):
     IMPORT_REVIEW = "import_review"
     CUSTOM_AGENTS_SETTINGS_UI = "custom_agents_settings_ui"
     SIDEBAR_GROUPING_UI = "sidebar_grouping_ui"
+    CODE_BLOCK_RUN = "code_block_run"
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Sidebar grouping, ordering and row metadata options, Shared section",
         owner="web",
         review_by_release="0.19.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.CODE_BLOCK_RUN,
+        description="Run shell, Python, and Node code blocks from agent messages",
+        owner="web",
+        review_by_release="0.22.0",
     ),
 )
 

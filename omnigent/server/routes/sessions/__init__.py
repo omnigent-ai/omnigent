@@ -340,6 +340,7 @@ from omnigent.server.routes._sessions.common import (
     _session_terminal_pending_cache as _session_terminal_pending_cache,
     get_server_host_registry as get_server_host_registry,
     get_server_runner_router as get_server_runner_router,
+    set_server_feature_flags as set_server_feature_flags,
     set_server_host_registry as set_server_host_registry,
     set_server_runner_router as set_server_runner_router,
 )
@@ -883,6 +884,7 @@ def create_sessions_router(
 
     from omnigent.server.routes.sessions.routes_agent import register_agent_routes
     from omnigent.server.routes.sessions.routes_browser import register_browser_routes
+    from omnigent.server.routes.sessions.routes_code_runs import register_code_runs_routes
     from omnigent.server.routes.sessions.routes_core import register_core_routes
     from omnigent.server.routes.sessions.routes_elicitations import register_elicitations_routes
     from omnigent.server.routes.sessions.routes_events import register_events_routes
@@ -921,6 +923,14 @@ def create_sessions_router(
     )
 
     register_items_routes(
+        router,
+        conversation_store=conversation_store,
+        agent_store=agent_store,
+        auth_provider=auth_provider,
+        permission_store=permission_store,
+    )
+
+    register_code_runs_routes(
         router,
         conversation_store=conversation_store,
         agent_store=agent_store,

@@ -9,6 +9,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   type Permission,
   derivePermissionLevel,
+  isOwnerLevel,
   getSessionOwner,
   grantPermission,
   listPermissions,
@@ -76,25 +77,35 @@ export function useRevokePermission(sessionId: string) {
   });
 }
 
-/**
- * Returns whether the current user has edit access (level >= 2) to a session.
- * `null` permission level (single-user mode) is treated as unrestricted.
- */
-export function useCanEdit(conversationId: string): boolean {
+/** The current user's effective permission level, `null` when unrestricted or unknown. */
+function usePermissionLevel(conversationId: string): number | null {
   const { data: conversationsData } = useLoadedConversations();
   const { session: activeSession, isLoading: sessionLoading } = useSession(conversationId);
   return useMemo(() => {
     const conversations = conversationsData?.pages.flatMap((p) => p.data);
     const activeConv = conversations?.find((c) => c.id === conversationId) ?? null;
-    const permissionLevel = derivePermissionLevel(
+    return derivePermissionLevel(
       activeSession,
       sessionLoading,
       activeConv,
       conversationId,
       conversationsData !== undefined,
     );
-    return permissionLevel == null || permissionLevel >= 2;
   }, [conversationsData, conversationId, activeSession, sessionLoading]);
+}
+
+/**
+ * Returns whether the current user has edit access (level >= 2) to a session.
+ * `null` permission level (single-user mode) is treated as unrestricted.
+ */
+export function useCanEdit(conversationId: string): boolean {
+  const permissionLevel = usePermissionLevel(conversationId);
+  return permissionLevel == null || permissionLevel >= 2;
+}
+
+/** Whether the current user owns the session, e.g. to run its code blocks. */
+export function useIsOwner(conversationId: string): boolean {
+  return isOwnerLevel(usePermissionLevel(conversationId));
 }
 
 export type { Permission };

@@ -1,0 +1,82 @@
+{
+  "description": "Code run blocks and the command the server derives (normalize, then derive_code_run_command). Shared by the web and server tests.",
+  "cases": [
+    {
+      "name": "shell with $ and % prompts",
+      "language": "shell",
+      "console": false,
+      "code": "$ ls -la\n% pwd\necho plain",
+      "command": "ls -la\npwd\necho plain"
+    },
+    {
+      "name": "console drops output lines",
+      "language": "shell",
+      "console": true,
+      "code": "$ ls\nfile.txt\ndir/\n$ pwd\n/tmp",
+      "command": "ls\npwd"
+    },
+    {
+      "name": "shell keeps blank lines between commands",
+      "language": "shell",
+      "console": false,
+      "code": "$ echo a\n\n$ echo b",
+      "command": "echo a\n\necho b"
+    },
+    {
+      "name": "console drops blank lines",
+      "language": "shell",
+      "console": true,
+      "code": "$ echo a\n\n$ echo b\n",
+      "command": "echo a\necho b"
+    },
+    {
+      "name": "CRLF and trailing newlines",
+      "language": "shell",
+      "console": false,
+      "code": "$ echo a\r\n$ echo b\r\n\r\n",
+      "command": "echo a\necho b"
+    },
+    {
+      "name": "untagged $ block",
+      "language": "shell",
+      "console": false,
+      "code": "$ make\n$ make test",
+      "command": "make\nmake test"
+    },
+    {
+      "name": "prompt needs the trailing space",
+      "language": "shell",
+      "console": false,
+      "code": "$HOME/bin/tool\n%PATH%",
+      "command": "$HOME/bin/tool\n%PATH%"
+    },
+    {
+      "name": "Python line separators split lines",
+      "language": "shell",
+      "console": false,
+      "code": "$ echo a\f$ echo b\u2028$ echo c",
+      "command": "echo a\necho b\necho c"
+    },
+    {
+      "name": "a trailing line separator ends the last line",
+      "language": "shell",
+      "console": false,
+      "code": "$ echo a\u000b\u0085",
+      "command": "echo a\n"
+    },
+    {
+      "name": "python unchanged",
+      "language": "python",
+      "console": false,
+      "code": "$ not a prompt\nprint(1)\n",
+      "command": "$ not a prompt\nprint(1)"
+    },
+    {
+      "name": "node unchanged",
+      "language": "node",
+      "console": false,
+      "code": "% x\r\nconsole.log(1)",
+      "command": "% x\nconsole.log(1)"
+    }
+  ]
+}

@@ -13,7 +13,15 @@ import type { RenderItem } from "@/lib/renderItems";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
+import { CodeBlockRunner } from "@/components/chat/CodeRunPanel";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import type { ServerInfo } from "@/lib/capabilities";
 import { BlockRenderer } from "./BlockRenderer";
+
+vi.mock("@/components/chat/CodeRunPanel", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  CodeBlockRunner: vi.fn(({ render: renderBlock }: { render: () => ReactNode }) => renderBlock()),
+}));
 
 afterEach(cleanup);
 
@@ -2095,5 +2103,47 @@ describe("BlockRenderer inline file-path linkification", () => {
     const url = fetchMock.mock.calls[0][0] as string;
     expect(url).toContain("/filesystem/etc?");
     expect(url).toContain("base=host");
+  });
+});
+
+describe("BlockRenderer code block runs", () => {
+  const CODE_RUN_INFO = { features: { code_block_run: true } } as unknown as ServerInfo;
+
+  function renderText(item: Extract<RenderItem, { kind: "text" }>, sessionStatus = "idle") {
+    vi.mocked(CodeBlockRunner).mockClear();
+    render(
+      <CapabilitiesProvider info={CODE_RUN_INFO}>
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer
+            items={[item]}
+            sessionStatus={sessionStatus as "idle"}
+            turnLifecycle={sessionStatus === "running" ? "streaming" : undefined}
+          />
+        </FileViewerContext.Provider>
+      </CapabilitiesProvider>,
+    );
+  }
+
+  it("ties a saved message's blocks to its item id", async () => {
+    renderText({
+      kind: "text",
+      itemId: "msg_1",
+      text: "```bash\nls\n```",
+      final: true,
+    });
+    await screen.findByRole("button", { name: "Copy Code" });
+    expect(vi.mocked(CodeBlockRunner).mock.calls.at(-1)?.[0].message).toEqual({
+      messageId: "msg_1",
+      streaming: false,
+    });
+  });
+
+  it.each([
+    ["a live preview", { itemId: "live:resp_1", final: true }],
+    ["unfinished text", { itemId: null, final: false }],
+  ])("leaves %s without runs", async (_label, fields) => {
+    renderText({ kind: "text", text: "```bash\nls\n```", ...fields });
+    await screen.findByRole("button", { name: "Copy Code" });
+    expect(CodeBlockRunner).not.toHaveBeenCalled();
   });
 });

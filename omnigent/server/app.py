@@ -120,6 +120,7 @@ from omnigent.server.routes.sessions import (
     SessionLiveness,
     announce_hosts_changed,
     create_sessions_router,
+    set_server_feature_flags,
     set_server_host_registry,
     set_server_runner_router,
 )
@@ -2099,6 +2100,7 @@ def create_app(
     # refill their model catalog from the session's host, from background
     # tasks with no request in scope.
     set_server_host_registry(host_registry)
+    set_server_feature_flags(resolved_feature_flags)
     # Mirror per-session live state (turn status, pending-approval count,
     # runner liveness) onto the conversations row so replicas that don't
     # hold a session's runner tunnel serve the same sidebar fields. The

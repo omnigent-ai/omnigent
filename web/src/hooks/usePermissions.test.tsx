@@ -24,7 +24,7 @@ vi.mock("./useSession", () => ({ useSession: vi.fn() }));
 
 import { useConversations } from "./useConversations";
 import { useSession } from "./useSession";
-import { useCanEdit } from "./usePermissions";
+import { useCanEdit, useIsOwner } from "./usePermissions";
 
 const useConversationsMock = vi.mocked(useConversations);
 const useSessionMock = vi.mocked(useSession);
@@ -131,5 +131,17 @@ describe("useCanEdit — safe defaults", () => {
     // sidebar settles. derivePermissionLevel returns null → permissive.
     setHooks({ session: null, sessionLoading: false, conversations: undefined });
     expect(renderHook(() => useCanEdit("conv_1")).result.current).toBe(true);
+  });
+});
+
+describe("useIsOwner: owner-only affordances", () => {
+  it.each([
+    [2, false],
+    [3, false],
+    [4, true],
+    [null, true],
+  ])("level %s → owner %s", (level, expected) => {
+    setHooks({ session: makeSession(level), conversations: [] });
+    expect(renderHook(() => useIsOwner("conv_1")).result.current).toBe(expected);
   });
 });

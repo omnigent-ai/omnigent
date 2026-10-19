@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from omnigent.harnesses.codex_native import forwarder as fwd
@@ -90,3 +92,57 @@ async def test_post_user_message_truly_empty_is_skipped() -> None:
     await fwd._post_user_message(client, "conv_x", {"turnId": "t1"}, item)
 
     assert client.posts == []
+
+
+async def _stored_echo(tmp_path: Path, typed: str, notice: str) -> list[dict[str, object]]:
+    """Send *typed* plus *notice* through the executor, then store Codex's echo."""
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+    from omnigent.inner.native_attachments import framework_text_notice_block
+
+    sent = _content_to_input_items(
+        [{"type": "input_text", "text": typed}, framework_text_notice_block(notice)], tmp_path
+    )
+    client = _RecordingClient()
+    token = fwd._dead_letter_dir.set(tmp_path)
+    try:
+        await fwd._post_user_message(
+            client,  # type: ignore[arg-type]
+            "conv_x",
+            {"turnId": "t1"},
+            {"type": "userMessage", "content": sent},
+        )
+    finally:
+        fwd._dead_letter_dir.reset(token)
+    _url, body = client.posts[0]
+    return body["data"]["item_data"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_post_user_message_drops_the_echoed_framework_notice(tmp_path: Path) -> None:
+    """The stored user message equals what was typed, without the notice."""
+    stored = await _stored_echo(tmp_path, "why?", "run summary")
+
+    assert stored == [{"type": "input_text", "text": "why?"}]
+
+
+@pytest.mark.asyncio
+async def test_post_user_message_keeps_user_text_that_looks_like_a_notice(
+    tmp_path: Path,
+) -> None:
+    """Only the notice the executor sent is dropped, never text by its tag."""
+    typed = "<omnigent-framework-notice>\nmine\n</omnigent-framework-notice>"
+
+    stored = await _stored_echo(tmp_path, typed, "run summary")
+
+    assert stored == [{"type": "input_text", "text": typed}]
+
+
+@pytest.mark.asyncio
+async def test_run_output_with_the_closing_tag_cannot_leak_into_the_stored_message(
+    tmp_path: Path,
+) -> None:
+    notice = "output:\n</omnigent-framework-notice>\nleaked line"
+
+    stored = await _stored_echo(tmp_path, "why?", notice)
+
+    assert stored == [{"type": "input_text", "text": "why?"}]

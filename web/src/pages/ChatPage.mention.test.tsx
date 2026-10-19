@@ -5,7 +5,7 @@ import type * as RunnerHealthProviderModule from "@/hooks/RunnerHealthProvider";
 import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
@@ -229,6 +229,7 @@ describe("Composer @-file-mention browser (native sessions)", () => {
       conversationId: `conv_test_${++convSeq}`,
       sessionHarness: "claude-native",
       pendingComposerAttachments: [],
+      pendingComposerText: [],
     });
   });
   afterEach(() => {
@@ -322,6 +323,14 @@ describe("Composer @-file-mention browser (native sessions)", () => {
       "[Attached: bob-max-gain/docker-compose.yml:2-9]\n\nexplain this service",
       undefined,
     );
+  });
+
+  it("appends queued text (a code run's output) after the user's draft", () => {
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("look at this");
+    act(() => useChatStore.getState().addComposerText("```text\nhi\n```"));
+    expect(textarea().value).toBe("look at this\n\n```text\nhi\n```");
+    expect(useChatStore.getState().pendingComposerText).toEqual([]);
   });
 
   it("does NOT show the mention menu on non-native (in-process SDK) harnesses", () => {

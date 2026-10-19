@@ -1,12 +1,28 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { NotebookPreview } from "./NotebookPreview";
+import AnsiDefault from "ansi-to-react";
+import { NotebookPreview, OutputView } from "./NotebookPreview";
 
 // Stub Shiki (same rationale as CodeViewer.test.tsx) — render code verbatim so
 // assertions can target cell source without async highlighting.
 vi.mock("@/components/ai-elements/code-block", () => ({
   CodeBlockContent: ({ code }: { code: string }) => <pre data-testid="code-cell">{code}</pre>,
 }));
+
+// Count the characters each ANSI render parses, delegating to the real component.
+const ansiParsed = vi.hoisted(() => ({ chars: 0 }));
+vi.mock("ansi-to-react", async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  const module = actual.default as Record<string, unknown> | ((props: unknown) => unknown);
+  const Real = (typeof module === "function" ? module : module.default) as (props: {
+    children?: string;
+  }) => unknown;
+  const Counting = (props: { children?: string }) => {
+    ansiParsed.chars += props.children?.length ?? 0;
+    return Real(props);
+  };
+  return { default: Counting };
+});
 
 import typicalRaw from "./__fixtures__/01_typical.ipynb?raw";
 import edgecasesRaw from "./__fixtures__/02_edgecases.ipynb?raw";
@@ -196,5 +212,121 @@ describe("NotebookPreview — invalid input", () => {
     // Parse recovered (no error state) and the output text is rendered.
     expect(screen.queryByText(/Cannot render notebook/)).toBeNull();
     expect(screen.getByText(/line one/)).toBeInTheDocument();
+  });
+});
+
+describe("OutputView: reused for chat code run output", () => {
+  it("keeps ANSI colors and styles stderr apart", () => {
+    const { container } = render(
+      <OutputView
+        output={{ output_type: "stream", name: "stderr", text: "\u001b[31mred\u001b[0m" }}
+      />,
+    );
+    const pre = container.querySelector("pre")!;
+    expect(pre.className).toContain("bg-destructive/10");
+    expect(pre.querySelector("span[style*='color']")?.textContent).toBe("red");
+  });
+
+  it("scrolls long lines instead of wrapping when asked", () => {
+    const { container } = render(
+      <OutputView nowrap output={{ output_type: "stream", name: "stdout", text: "x" }} />,
+    );
+    const pre = container.querySelector("pre")!;
+    expect(pre.classList.contains("whitespace-pre")).toBe(true);
+    expect(pre.classList.contains("whitespace-pre-wrap")).toBe(false);
+  });
+});
+
+describe("OutputView: long streamed output", () => {
+  const RED_LINE = "x".repeat(99) + "\n";
+
+  it("keeps a color set early on for text far past the first piece", () => {
+    const text = "\u001b[31m" + RED_LINE.repeat(100) + "\u001b[0mplain\n";
+    const { container } = render(
+      <OutputView output={{ output_type: "stream", name: "stdout", text }} />,
+    );
+    const spans = [...container.querySelectorAll("span")].filter((span) => span.textContent);
+    const red = spans.filter((span) => span.getAttribute("style")?.includes("color"));
+    expect(red.map((span) => span.textContent).join("")).toBe(RED_LINE.repeat(100));
+    expect(container.textContent).toBe(RED_LINE.repeat(100) + "plain\n");
+  });
+
+  it("parses only the end again when output grows", () => {
+    const base = RED_LINE.repeat(200);
+    const { rerender } = render(
+      <OutputView output={{ output_type: "stream", name: "stdout", text: base }} />,
+    );
+    ansiParsed.chars = 0;
+    rerender(
+      <OutputView output={{ output_type: "stream", name: "stdout", text: base + RED_LINE }} />,
+    );
+    expect(ansiParsed.chars).toBeLessThan(10_000);
+  });
+});
+
+describe("OutputView: pieced ANSI renders like one pass", () => {
+  // Same interop as NotebookPreview.tsx for the CJS default export.
+  const Ansi = ("default" in AnsiDefault ? AnsiDefault.default : AnsiDefault) as typeof AnsiDefault;
+  const ESC = "\u001b[";
+  const FILLER = ("f".repeat(99) + "\n").repeat(45);
+
+  /** Each character's style, merged into runs, ignoring how spans are split. */
+  function styledRuns(root: Element): [string, string][] {
+    const runs: [string, string][] = [];
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const style = node.parentElement?.closest("span")?.getAttribute("style") ?? "";
+      const last = runs.at(-1);
+      if (last && last[0] === style) last[1] += node.textContent;
+      else runs.push([style, node.textContent ?? ""]);
+    }
+    return runs;
+  }
+
+  function expectSameAsOnePass(text: string) {
+    const single = render(<Ansi>{text}</Ansi>).container;
+    const pieced = render(
+      <OutputView output={{ output_type: "stream", name: "stdout", text }} />,
+    ).container;
+    expect(pieced.querySelectorAll("code").length).toBeGreaterThan(1);
+    expect(styledRuns(pieced)).toEqual(styledRuns(single));
+  }
+
+  it("carries more than 16 active style and color codes across a piece", () => {
+    const codes = ["1", "3", "4", "9"].map((code) => `${ESC}${code}m`).join("");
+    const recolors = Array.from({ length: 20 }, (_, index) => `${ESC}${31 + (index % 7)}m`);
+    expectSameAsOnePass(codes + recolors.join("") + FILLER + "after the boundary\n");
+  });
+
+  it("starts over after a reset and carries the new color", () => {
+    expectSameAsOnePass(
+      `${ESC}1;31mbold red\n` + FILLER + `${ESC}0m${ESC}34mblue\n` + FILLER + "still blue\n",
+    );
+  });
+
+  it("carries 256-color and truecolor codes, ignoring invalid ones", () => {
+    expectSameAsOnePass(
+      `${ESC}38;5;196m${ESC}48;2;10;20;30m${ESC}38;5;300m${ESC}48;2;1;2;999m` +
+        FILLER +
+        "palette fg, truecolor bg\n",
+    );
+  });
+
+  it("follows partial resets and repeated codes like the one-pass parser", () => {
+    expectSameAsOnePass(
+      `${ESC}1m${ESC}1m${ESC}2m${ESC}22m${ESC}7;4m${ESC}24m${ESC}39;49m${ESC}93;104m` +
+        FILLER +
+        "one bold left, reversed, bright colors\n",
+    );
+  });
+
+  it("applies backspaces before reading the codes a line leaves on", () => {
+    expectSameAsOnePass(
+      `${ESC}31mx\b${ESC}32m\b\b${ESC}33my\b\b\bz\n` + FILLER + "after the boundary\n",
+    );
+  });
+
+  it("applies carriage returns before reading the codes a line leaves on", () => {
+    expectSameAsOnePass(`${ESC}31mred\r${ESC}32mgreen\n` + FILLER + "green\n");
   });
 });
