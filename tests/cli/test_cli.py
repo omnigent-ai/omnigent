@@ -5903,6 +5903,146 @@ def test_config_list_shows_scalar_harness_without_note(
     assert "per-harness overrides" not in result.output
 
 
+def test_config_list_hides_project_harness_launch_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``config list`` shows a project ``harness.default`` but not project command/args."""
+    monkeypatch.chdir(tmp_path)
+    local_path = tmp_path / ".omnigent" / "config.yaml"
+    local_path.parent.mkdir()
+    local_path.write_text(
+        "harness:\n  default: codex\n  codex-native:\n    command: /project/project-codex\n"
+        "    args: [--from-project]\n"
+    )
+    monkeypatch.setattr("omnigent.cli._load_global_config", dict)
+    monkeypatch.setattr("omnigent.cli._print_credentials_by_harness", lambda: None)
+
+    result = CliRunner().invoke(cli, ["config", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "harness=codex" in result.output
+    # Project launch overrides are user-owned; they must not surface here.
+    assert "per-harness overrides" not in result.output
+    assert "/project/project-codex" not in result.output
+    assert "--from-project" not in result.output
+    # ...but the user is told which project launch overrides were ignored.
+    assert "ignored project harness launch override(s): codex-native" in result.output
+
+
+def test_config_list_notes_project_harness_overrides_without_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A project that sets only harness launch overrides is not reported as empty."""
+    monkeypatch.chdir(tmp_path)
+    local_path = tmp_path / ".omnigent" / "config.yaml"
+    local_path.parent.mkdir()
+    local_path.write_text(
+        "harness:\n  codex-native:\n    command: /project/project-codex\n"
+        "    args: [--from-project]\n"
+    )
+    monkeypatch.setattr("omnigent.cli._load_global_config", dict)
+    monkeypatch.setattr("omnigent.cli._print_credentials_by_harness", lambda: None)
+
+    result = CliRunner().invoke(cli, ["config", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "(none set" not in result.output
+    assert "ignored project harness launch override(s): codex-native" in result.output
+    # The ignored executable and arguments themselves stay hidden.
+    assert "/project/project-codex" not in result.output
+    assert "--from-project" not in result.output
+
+
+@pytest.mark.parametrize(
+    ("harness_yaml", "expect_notice"),
+    [
+        ("harness:\n  default: codex\n  1:\n    command: /np/numeric-override\n", False),
+        (
+            "harness:\n  default: codex\n  1:\n    command: /np/numeric-override\n"
+            "  codex-native:\n    command: /project/project-codex\n",
+            True,
+        ),
+    ],
+)
+def test_config_list_tolerates_non_string_harness_override_keys(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    harness_yaml: str,
+    expect_notice: bool,
+) -> None:
+    """A non-string nested harness key must not crash ``config list``."""
+    monkeypatch.chdir(tmp_path)
+    local_path = tmp_path / ".omnigent" / "config.yaml"
+    local_path.parent.mkdir()
+    local_path.write_text(harness_yaml)
+    monkeypatch.setattr("omnigent.cli._load_global_config", dict)
+    monkeypatch.setattr("omnigent.cli._print_credentials_by_harness", lambda: None)
+
+    result = CliRunner().invoke(cli, ["config", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "harness=codex" in result.output
+    # The non-string key is skipped silently, matching the harness resolver.
+    assert "/np/numeric-override" not in result.output
+    if expect_notice:
+        assert "ignored project harness launch override(s): codex-native" in result.output
+        assert "/project/project-codex" not in result.output
+    else:
+        assert "ignored project harness launch override" not in result.output
+
+
+@pytest.mark.parametrize(
+    "harness_yaml",
+    [
+        "harness:\n  default: [bad]\n",
+        'harness:\n  default: ""\n',
+        "harness:\n  default: 123\n",
+        'harness: ""\n',
+        "harness: 123\n",
+    ],
+)
+def test_config_list_notes_ignored_invalid_project_harness_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    harness_yaml: str,
+) -> None:
+    """An invalid project harness default (mapping or scalar) is reported, not dropped silently."""
+    monkeypatch.chdir(tmp_path)
+    local_path = tmp_path / ".omnigent" / "config.yaml"
+    local_path.parent.mkdir()
+    local_path.write_text(harness_yaml)
+    monkeypatch.setattr("omnigent.cli._load_global_config", dict)
+    monkeypatch.setattr("omnigent.cli._print_credentials_by_harness", lambda: None)
+
+    result = CliRunner().invoke(cli, ["config", "list"])
+
+    assert result.exit_code == 0, result.output
+    # The malformed value fails safe but is not silently swallowed.
+    assert "(none set" not in result.output
+    assert "ignored invalid project harness default" in result.output
+
+
+def test_config_list_shows_scalar_project_harness_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A valid scalar project ``harness`` selects the default with no ignored notice."""
+    monkeypatch.chdir(tmp_path)
+    local_path = tmp_path / ".omnigent" / "config.yaml"
+    local_path.parent.mkdir()
+    local_path.write_text("harness: codex\n")
+    monkeypatch.setattr("omnigent.cli._load_global_config", dict)
+    monkeypatch.setattr("omnigent.cli._print_credentials_by_harness", lambda: None)
+
+    result = CliRunner().invoke(cli, ["config", "list"])
+
+    assert result.exit_code == 0, result.output
+    assert "harness=codex" in result.output
+    assert "ignored invalid project harness default" not in result.output
+
+
 def test_config_unset_removes_key(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -1,10 +1,12 @@
 """Per-harness startup command/args resolution from config.
 
 Lets users override the executable (``command``) and base launch args
-(``args``) for each harness in ``config.yaml`` via a polymorphic
+(``args``) for each harness in user-level ``config.yaml`` via a polymorphic
 ``harness:`` key — a scalar (legacy default) or a mapping with
 ``default`` plus per-harness overrides. See
 ``~/.pi/plans/omnigent/harness-startup-command-overrides.md``.
+Project configuration may select ``harness.default``; command and argument
+overrides are read only from user configuration.
 
 This is a leaf resolver module: it lazy-imports
 :func:`omnigent.harness_aliases.canonicalize_harness` so it can be used
