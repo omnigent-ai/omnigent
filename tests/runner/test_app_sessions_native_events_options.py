@@ -2163,7 +2163,9 @@ async def test_events_model_change_unconfirmed_switch_answers_503(
     assert context["control_failure_reason"] == "model_unconfirmed"
     assert context["control_model_before"] == "claude-opus-4-6"
     assert context["control_model_observed"] == "claude-opus-4-6"
-    assert context["control_model_requested"] == "claude-opus-4-7"
+    # The submitted model is a request argument: never retained.
+    assert "control_model_requested" not in context
+    assert "claude-opus-4-7" not in str(context)
     assert context["control_pane_status_snapshot"] == "idle"
     assert context["control_confirmation_budget_ms"] == 300
     assert "control_model_command_arg" not in context

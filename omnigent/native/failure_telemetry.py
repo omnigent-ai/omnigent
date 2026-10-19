@@ -32,7 +32,6 @@ _TEXT_FIELDS = frozenset(
         "runner_version",
         "control_failure_reason",
         "control_pane_status_snapshot",
-        "control_model_requested",
         "control_model_before",
         "control_model_observed",
         "control_backend_returncode",

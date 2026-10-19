@@ -81,8 +81,9 @@ Failures without an exception use `failure_source=native_control` and a
 `control_failure_reason`. A missing Codex bridge records whether readiness
 actually timed out, whether a terminal/backend is registered, and an observed
 backend return code when available. An unconfirmed Claude switch records the
-requested/command, before/observed models, confirmation budget in milliseconds,
-and cached pane-status snapshot. Capturing these fields adds no terminal I/O;
+before/observed models, the confirmation window in milliseconds and the cached
+pane-status snapshot. Request arguments, such as the requested model, are never
+recorded. Capturing these fields adds no terminal I/O;
 registration and cached status describe the snapshot rather than establish
 liveness.
 

@@ -505,7 +505,6 @@ def build_native_controls(
                         "codex-native",
                         "bridge_not_ready",
                         control_wait_timed_out=ready_timed_out,
-                        control_model_requested=settings.get("model"),
                         control_terminal_registered=registry.get(conv_id, "codex", "main")
                         is not None
                         if registry is not None
@@ -1528,7 +1527,6 @@ def build_native_controls(
                     conv_id,
                     "claude-native",
                     "model_unconfirmed",
-                    control_model_requested=selected_model,
                     control_model_before=baseline,
                     control_model_observed=current,
                     control_confirmation_budget_ms=round(confirm_window_s * 1000),

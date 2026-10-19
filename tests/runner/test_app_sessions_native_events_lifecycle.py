@@ -1109,7 +1109,9 @@ async def test_events_codex_native_model_change_without_bridge_fails_loud(
     assert context["control_failure_reason"] == "bridge_not_ready"
     assert context["control_wait_timed_out"] is False
     assert context["control_backend_registered"] is False
-    assert context["control_model_requested"] == "gpt-5.6-terra"
+    # The submitted model is a request argument: never retained.
+    assert "control_model_requested" not in context
+    assert "gpt-5.6-terra" not in str(context)
 
 
 @pytest.mark.asyncio

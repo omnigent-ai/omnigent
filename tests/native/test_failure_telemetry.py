@@ -97,6 +97,14 @@ def test_malformed_metadata_is_ignored(value: object) -> None:
     assert normalize_failure_context(value) == {}
 
 
+@pytest.mark.parametrize("field", ["control_model_requested", "control_model_command_arg"])
+def test_request_argument_fields_are_not_retained(field: str) -> None:
+    context = normalize_failure_context(
+        {field: "submitted-model-sentinel", "control_failure_reason": "model_unconfirmed"}
+    )
+    assert context == {"control_failure_reason": "model_unconfirmed"}
+
+
 def test_context_is_bounded_redacted_and_cannot_override_canonical_fields() -> None:
     context = failure_log_attributes(
         {
