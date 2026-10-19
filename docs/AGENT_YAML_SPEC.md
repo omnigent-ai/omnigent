@@ -47,7 +47,7 @@ of the agent YAML.
 | `params` | Optional | Typed user parameters available to tools/skills. |
 | `os_env` | Optional | Enables local OS tools such as file reads, writes, edits, and shell commands. |
 | `terminals` | Optional | Named interactive terminal environments the agent can launch. |
-| `async` | Optional | Whether async work tools are exposed. Defaults to `true`. |
+| `async` | Optional | Whether async dispatch and cancellation tools are exposed. Defaults to `true`. With `false`, `sys_read_inbox` remains available to drain delegated work when the spec can dispatch it. |
 | `cancellable` | Optional | Whether the session can be cancelled. Defaults to `true`. |
 | `timers` | Optional | Whether timer tools are exposed. Defaults to `false`. |
 
