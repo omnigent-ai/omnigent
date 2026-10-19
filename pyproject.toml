@@ -213,6 +213,12 @@ kubernetes = ["kubernetes>=36,<37"]
 # OMNIGENT_CREDENTIAL_VAULT_KEY). hvac is imported lazily, like boto3, so
 # only deployments that pick the Vault backend need this extra.
 vault = ["hvac>=2,<3"]
+# Azure Key Vault / Managed HSM backend for the credential store's SecretCipher
+# — the managed Azure alternative to the built-in KMS cipher (selected by
+# OMNIGENT_CREDENTIAL_AZURE_KEY_ID). Both SDKs are imported lazily, like boto3
+# and hvac, so only deployments that pick this backend need the extra. Requires
+# an AES key: oct on Managed HSM, or oct-HSM on Key Vault Premium.
+azure = ["azure-keyvault-keys>=4.9,<5", "azure-identity>=1.17,<2"]
 # OpenTelemetry tracing is opt-in so the exporters and automatic
 # instrumentors do not inflate the default install.
 tracing = [
@@ -396,6 +402,10 @@ test = [
     # The Cloudflare D1 SQLAlchemy dialect, exercised by the D1 FTS integration
     # test (tests/db/test_d1_fts_dialect.py) via respx + sqlite3.
     "sqlalchemy-cloudflare-d1==0.3.10",
+    # The Azure credential backend's tests import azure.core's exception types
+    # and run the cipher against an in-memory fake client.
+    "azure-keyvault-keys>=4.9,<5",
+    "azure-identity>=1.17,<2",
 ]
 dev = [
     { include-group = "lint" },

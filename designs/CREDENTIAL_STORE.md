@@ -73,8 +73,8 @@ class SecretCipher(Protocol):
 
 `context` is the row's identity (`workspace`/`user`/`provider`/`account`) and is
 **required** — every secret is bound to a user; there is no unbound/global-key
-path. The store depends on this port, not on a concrete backend, so the KMS
-implementation can be swapped for GCP/Azure KMS or Vault Transit without a
+path. The store depends on this port, not on a concrete backend, so the cipher
+can be swapped between AWS KMS, Vault Transit and Azure Key Vault without a
 schema change.
 
 `KmsSecretCipher` is the implementation: `encrypt` is one `kms:Encrypt` call
@@ -83,12 +83,34 @@ returned ciphertext blob is stored base64. Blobs are small (a token JSON
 object), well under the 4 KB `Encrypt` limit, so no envelope/data-key layer is
 needed. `decrypt` is `kms:Decrypt` with the same context.
 
+`AzureKeyVaultSecretCipher` is the Azure implementation: `encrypt` is one
+Key Vault `encrypt` call (AES-256-GCM) under the configured key, with the row
+identity as the GCM additional authenticated data. A Key Vault ciphertext embeds
+neither the key identifier nor the GCM `iv` and tag, so the stored envelope
+carries all three; `decrypt` presents the same identity as AAD. A non-AES key
+raises store-wide rather than silently dropping the binding.
+
+AES keys exist only on **Managed HSM** (`oct`, generally available) and Key
+Vault **Premium** (`oct-HSM`, public preview: no SLA, and Microsoft does not
+recommend it for production). Key Vault **Standard** holds RSA/EC keys only, has
+no AAD parameter, and is unsupported. Check the resource before deploying.
+
+The key identifier (`OMNIGENT_CREDENTIAL_AZURE_KEY_ID`) must include its
+version, `https://<vault>.vault.azure.net/keys/<name>/<version>`; an unversioned
+identifier is rejected at startup. To rotate, create a new key version and set
+the identifier to it. Rows written under earlier versions keep decrypting,
+because each envelope records the version that encrypted it. The version is
+required because the envelope records the configured identifier: an unversioned
+identifier would record no encrypting version, so rows written before a rotation
+could not be decrypted after it.
+
 `build_secret_cipher()` is the single seam where a deployment selects the
-backend; it reads the **store-level** key `OMNIGENT_CREDENTIAL_KMS_KEY_ID` (id,
-ARN, or `alias/…`) and returns the cipher, or `None` when unset — the store, and
-every integration on it, is then disabled. **There is no non-KMS fallback:** no
-key configured means the feature is off, not that it silently encrypts with a
-local key.
+backend. Each backend has a **store-level** key env var:
+`OMNIGENT_CREDENTIAL_KMS_KEY_ID` (id, ARN, or `alias/…`),
+`OMNIGENT_CREDENTIAL_VAULT_KEY` or `OMNIGENT_CREDENTIAL_AZURE_KEY_ID`. It returns
+the configured cipher, or `None` when none is set. **No backend configured means
+the feature is off,** not that it silently encrypts with a local key; the store,
+and every integration on it, is then disabled.
 
 The key belongs to the **credential store**, not to any one provider: every
 provider façade shares the one cipher, so connecting an MCP server or Datadog
@@ -137,6 +159,21 @@ credential key. No AWS credentials sit in the pod; the KMS key ARN is passed as
 plain config (`OMNIGENT_CREDENTIAL_KMS_KEY_ID`), not a secret. The key + role +
 policy are provisioned in the infra repo (Pulumi, `cloud-infra/core`).
 
+### Pod → Key Vault auth (Workload Identity)
+
+On AKS the server's ServiceAccount is federated to a user-assigned managed
+identity that holds Key Vault Crypto User (or the Managed HSM equivalent) on the
+one credential key. No Azure credentials sit in the pod; the key identifier is
+passed as plain config (`OMNIGENT_CREDENTIAL_AZURE_KEY_ID`), not a secret.
+
+Only `keys/encrypt` and `keys/decrypt` are required; `keys/get` is not. Key
+Vault Crypto User does grant it, in which case the SDK makes one extra `get_key`
+round trip per client on first use; that is harmless, and the stored envelope
+does not depend on it. Set
+`AZURE_CLIENT_ID` explicitly: `DefaultAzureCredential` walks several credential
+sources in order and, on a cluster with more than one usable identity, can
+otherwise bind to an unintended one.
+
 ## Layers
 
 The stack has four layers, each with one job:
@@ -151,7 +188,7 @@ ConnectionStore(ABC)   per-provider façade: maps the provider surface ⇄ a row
 CredentialStore        the one concrete DB backend (SQLAlchemy) — uniform writes
    │
    ▼
-SecretCipher(Protocol) encrypt/decrypt the secret blob (KmsSecretCipher impl)
+SecretCipher(Protocol) encrypt/decrypt the secret blob (KMS, Vault or Azure impl)
 ```
 
 - **`CredentialStore`** is the generic, provider-agnostic persistence: rows keyed
@@ -212,19 +249,30 @@ depth on the storage, not the session boundary.
 ## Dependencies
 
 The credential store is backend-agnostic; each `SecretCipher` backend declares its
-own extra, both imported lazily:
+own extra, all imported lazily:
 
 - **AWS KMS** (`KmsSecretCipher`) needs boto3 — `omnigent[kms]`.
 - **HashiCorp Vault** (`VaultSecretCipher`, Transit) needs hvac — `omnigent[vault]`.
+- **Azure Key Vault / Managed HSM** (`AzureKeyVaultSecretCipher`) needs
+  `azure-keyvault-keys` + `azure-identity` — `omnigent[azure]`.
 
-boto3 / hvac load only when the matching backend is selected
-(`OMNIGENT_CREDENTIAL_KMS_KEY_ID` / `OMNIGENT_CREDENTIAL_VAULT_KEY`), so a deployment
-that doesn't enable the credential store — or uses the other backend — needs neither.
+boto3 / hvac / the Azure SDKs load only when the matching backend is selected
+(`OMNIGENT_CREDENTIAL_KMS_KEY_ID` / `OMNIGENT_CREDENTIAL_VAULT_KEY` /
+`OMNIGENT_CREDENTIAL_AZURE_KEY_ID`), so a deployment that doesn't enable the
+credential store — or uses another backend — needs none of them.
 
-`OMNIGENT_CREDENTIAL_CIPHER` (`kms` | `vault`) selects the backend explicitly per
+`OMNIGENT_CREDENTIAL_CIPHER` (`kms` | `vault` | `azure`) selects the backend explicitly per
 server; the chosen backend's key env var is then required. Leave it unset to
 auto-detect the single configured backend — configuring more than one without the
 selector is an error (no silent precedence), and configuring none disables the store.
+
+**Switching backends.** Changing `OMNIGENT_CREDENTIAL_CIPHER` (say from `vault` to
+`azure`) has no migration: the new backend cannot read rows the previous one
+wrote, so every integration reads as disconnected until its user reconnects, and
+each reconnect overwrites that user's old ciphertext. Switching back restores
+only the rows nobody has reconnected yet. Plan a switch as a forced reconnect of
+every integration, announce it to users, and keep the old key available until
+you are sure you will not roll back.
 
 ## MCP auth & roadmap
 
