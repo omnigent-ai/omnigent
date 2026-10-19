@@ -19556,6 +19556,34 @@ describe("a send cut off by a reload", () => {
     });
   });
 
+  it("keeps the record when the page unloads mid-send", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    let abort: (() => void) | undefined;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
+        return new Promise<Response>((_, reject) => {
+          abort = () => reject(new TypeError("Failed to fetch"));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const sending = useChatStore.getState().send("rerun the failing test", "agent_xyz");
+    await vi.waitFor(() => expect(abort).toBeDefined());
+    // Unloading aborts the open POST, and the send still settles before the page goes.
+    window.dispatchEvent(new Event("pagehide"));
+    try {
+      abort!();
+      await sending;
+      expect(peekUnsentSend("conv_existing")?.text).toBe("rerun the failing test");
+    } finally {
+      window.dispatchEvent(new Event("pageshow"));
+    }
+  });
+
   it("hands an unanswered send back to the composer on the next load", async () => {
     // The server held the POST for a sandbox wake and the tab reloaded meanwhile.
     seedSession("conv_reload", []);

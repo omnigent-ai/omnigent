@@ -13,6 +13,18 @@ export interface UnsentSend {
 
 const UNSENT_SENDS_KEY = "omnigent.unsentSends";
 
+// A page that is going away aborts its open sends, and their cleanup still runs
+// as it unloads; keep their records for the next page instead.
+let pageHiding = false;
+if (typeof window !== "undefined") {
+  window.addEventListener("pagehide", () => {
+    pageHiding = true;
+  });
+  window.addEventListener("pageshow", () => {
+    pageHiding = false;
+  });
+}
+
 function read(): Record<string, UnsentSend> {
   if (typeof window === "undefined") return {};
   try {
@@ -54,6 +66,7 @@ export function rememberUnsentSend(conversationId: string, send: UnsentSend): vo
 
 /** Drop a session's record once this tab has seen that send settle. */
 export function forgetUnsentSend(conversationId: string, stableId: string): void {
+  if (pageHiding) return;
   const sends = read();
   if (sends[conversationId]?.stableId !== stableId) return;
   write(Object.fromEntries(Object.entries(sends).filter(([id]) => id !== conversationId)));
