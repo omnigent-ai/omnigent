@@ -98,6 +98,13 @@ adopts these layers. Before activation, add cross-machine, restart, conflict,
 offline, native-plugin, and managed-startup journeys with explicit coverage for
 each user entry point.
 
+**Next implementation slice:** include live verification of the newly connected
+preference path on an isolated deployment. Record the exact candidate and runtime
+versions, enabled configuration, user action, and observed result, including
+persistence/reload and affected consumers where implemented. Identify the mapped
+entry points exercised, any mocked services, and remaining gaps. Supplying layers
+directly to the resolver does not verify the live path.
+
 ## Gotchas
 
 - `--global` means this machine's user YAML, not a shared workspace write.
