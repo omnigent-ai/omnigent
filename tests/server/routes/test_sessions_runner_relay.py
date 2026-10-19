@@ -3636,6 +3636,91 @@ async def test_relay_stays_quiet_when_runner_is_live_on_another_replica(
         session_stream.close(session_id)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("binding", ["moved_before_loss", "moved_during_outage", "unchanged"])
+async def test_relay_does_not_fail_a_session_that_moved_to_another_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    binding: str,
+) -> None:
+    """
+    A relay left over from the session's previous runner does not fail it.
+
+    The session moved to a new runner served by another replica, so nothing
+    here cancelled this relay. When the previous runner later exits, the
+    stored binding already names the new runner: this replica must publish no
+    ``failed`` status, even with a stale cached ``running``. A move during the
+    outage can be the lost runner's own crash recovery, and a binding that
+    never moved has no newer owner, so both still fail the interrupted turn.
+    """
+    import time
+
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    previous_runner_id = "runner_previous"
+    session_id = "4c3b2a1f0e9d48c7b6a5f4e3d2c1b0a9"
+    # An hour-old stamp is not fresh evidence for either runner.
+    stale_stamp = int(time.time()) - 3600
+    store = _RecordingLabelStore(live_status="running")
+    reads: list[str] = []
+
+    def stored_binding(conversation_id: str) -> tuple[str, int]:
+        reads.append(conversation_id)
+        if binding == "moved_before_loss" or (binding == "moved_during_outage" and len(reads) > 1):
+            return ("runner_current", stale_stamp)
+        return (previous_runner_id, stale_stamp)
+
+    monkeypatch.setattr(store, "get_runner_liveness", stored_binding)
+    sessions_module._session_status_cache[session_id] = "running"
+    sessions_module._session_active_response_cache[session_id] = "response-current"
+    handle = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            previous_runner_id,
+            _TunnelCloseRunnerClient(gate),  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        with capture_debug_rows("server") as rows:
+            gate.set()
+            await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        assert handle.task.exception() is None
+        outcome = next(row for row in rows if row["event_name"] == "runner_stream_disconnected")
+        attributes = cast("dict[str, object]", outcome["attributes"])
+        failures = [row for row in rows if row["event_name"] == "session_turn_failed"]
+        if binding == "moved_before_loss":
+            assert attributes["decision"] == "rebound"
+            assert not failures
+            assert session_id not in store.labels, "a previous runner's exit persisted failure"
+            assert sessions_module._session_status_cache.get(session_id) is None
+            assert sessions_module._session_active_response_cache.get(session_id) is None
+        else:
+            assert attributes["decision"] == "failed_mid_turn"
+            assert len(failures) == 1
+            persisted = sessions_module._last_task_error_from_labels(store.labels[session_id])
+            assert persisted is not None
+            assert persisted["code"] == "runner_disconnected"
+            assert sessions_module._session_status_cache.get(session_id) == "failed"
+    finally:
+        gate.set()
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        sessions_module._session_active_response_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
 def test_runner_live_elsewhere_uses_preloaded_conversation_stamps() -> None:
     """The grace path can detect a newer replica from already-loaded rows."""
     import time
@@ -3667,7 +3752,6 @@ def test_runner_live_elsewhere_uses_preloaded_conversation_stamps() -> None:
         "expired",
         "same-stamp",
         "older-stamp",
-        "different-runner",
         "missing",
         "unavailable",
     ],
@@ -3713,14 +3797,7 @@ async def test_relay_still_fails_mid_turn_session_without_handoff_evidence(
         "older-stamp": reference_stamp - 1,
     }.get(liveness_state, now)
     store = _RecordingLabelStore(
-        runner_liveness={}
-        if liveness_state == "missing"
-        else {
-            session_id: (
-                "other-runner" if liveness_state == "different-runner" else runner_id,
-                stamp,
-            )
-        }
+        runner_liveness={} if liveness_state == "missing" else {session_id: (runner_id, stamp)}
     )
     if liveness_state == "unavailable":
 

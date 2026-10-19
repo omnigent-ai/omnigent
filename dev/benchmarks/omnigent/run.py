@@ -54,6 +54,8 @@ from dev.benchmarks.omnigent.schema import build_report
 # runner journeys drive turns through the in-process openai-agents SDK harness.
 _HTTP_HARNESS = "http-only"
 _RUNNER_HARNESS = "openai-agents"
+# How often a SIGTERM cancellation is re-sent while the run has not yet unwound.
+_RECANCEL_INTERVAL_S = 0.5
 
 
 def _backend_of(database_uri: str | None) -> str:
@@ -137,9 +139,12 @@ def _skipped_block(journey: Journey, backend: str, exc: Exception) -> dict[str, 
     }
 
 
-async def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, object], bool]:
+async def run_benchmark(
+    args: argparse.Namespace, *, teardown_started: asyncio.Event | None = None
+) -> tuple[dict[str, object], bool]:
     """Run all selected journeys and build the report.
 
+    :param teardown_started: Set once the benchmark environment begins teardown.
     :returns: ``(report, passed)`` where *passed* is ``False`` if any journey
         breached a supplied threshold.
     """
@@ -163,6 +168,7 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[dict[str, object], bo
         with_host=with_host,
         database_uri=args.database_uri,
         network_delay_ms=args.network_delay_ms,
+        teardown_started=teardown_started,
     ) as env:
         for journey in journeys:
             console.print(f"\n[bold]Benchmarking[/bold] {journey.name} [dim]({backend})[/dim]")
@@ -331,18 +337,27 @@ async def _run_until_terminated(args: argparse.Namespace) -> tuple[dict[str, obj
     """
     task = asyncio.current_task()
     assert task is not None
+    loop = asyncio.get_running_loop()
+    teardown_started = asyncio.Event()
     cancelled = False
+
+    def _cancel_until_teardown() -> None:
+        # httpx's anyio internals can consume a native cancel as their own and
+        # keep going, so repeat it until teardown starts (then never interrupt it).
+        if not task.done() and not teardown_started.is_set():
+            task.cancel()
+            loop.call_later(_RECANCEL_INTERVAL_S, _cancel_until_teardown)
 
     def _on_sigterm() -> None:
         # Ignore repeats: a second SIGTERM must not cancel the teardown in flight.
         nonlocal cancelled
         if not cancelled:
             cancelled = True
-            task.cancel()
+            _cancel_until_teardown()
 
     with contextlib.suppress(NotImplementedError):  # no loop signal handlers on Windows
-        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, _on_sigterm)
-    return await run_benchmark(args)
+        loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
+    return await run_benchmark(args, teardown_started=teardown_started)
 
 
 def main(argv: list[str] | None = None) -> int:

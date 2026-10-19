@@ -302,9 +302,11 @@ def test_build_engine_no_store_returns_noop(db_uri: str) -> None:
         policy_store=None,
     )
 
-    # No user-declared policies, but ask_on_add_policy is always present.
-    assert len(engine.policies) == 2
-    assert engine.policies[0].spec.name == "__ask_on_add_policy"
+    # No user-declared policies, but the mandatory approval guards are always present.
+    assert [p.spec.name for p in engine.policies] == [
+        "__ask_on_add_policy",
+        "__ask_on_scheduled_task_change",
+    ]
 
 
 def test_build_engine_ordering_session_agent_admin(db_uri: str) -> None:
