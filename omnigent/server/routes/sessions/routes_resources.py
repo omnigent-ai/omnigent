@@ -65,6 +65,7 @@ from omnigent.server.routes._content_type import (
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
 from omnigent.server.routes._gzip_route import GZipFileContentRoute, skip_gzip
+from omnigent.server.routes._host_launch import resolve_host_owner
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import (
     _logger,
@@ -1504,7 +1505,8 @@ def register_resources_routes(
         from the previous conversation to the fresh one while the tmux
         pane keeps running. A successful transfer also carries the
         source host, workspace, and git branch to the target because the
-        live terminal remains on that same placement.
+        live terminal remains on that same placement. The caller must own
+        both sessions and the source host.
 
         :param request: The incoming FastAPI request (for auth) with
             JSON body ``{"target_session_id": "conv_new"}``.
@@ -1514,7 +1516,7 @@ def register_resources_routes(
             e.g. ``"terminal_claude_main"``.
         :returns: The terminal resource object under the target session.
         """
-        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        conv = await _validate_session(session_id, request, LEVEL_OWNER)
         body = await request.json()
         target_session_id = body.get("target_session_id") if isinstance(body, dict) else None
         if not isinstance(target_session_id, str) or not target_session_id:
@@ -1522,7 +1524,22 @@ def register_resources_routes(
                 "'target_session_id' is required",
                 code=ErrorCode.INVALID_INPUT,
             )
-        await _validate_session(target_session_id, request, LEVEL_EDIT)
+        await _validate_session(target_session_id, request, LEVEL_OWNER)
+
+        user_id = _get_user_id(request, auth_provider)
+        if conv.host_id is not None and user_id is not None:
+            host_store = getattr(request.app.state, "host_store", None)
+            if host_store is None:
+                raise OmnigentError(
+                    "Host ownership cannot be verified",
+                    code=ErrorCode.FORBIDDEN,
+                )
+            await asyncio.to_thread(
+                resolve_host_owner,
+                user_id=user_id,
+                host_id=conv.host_id,
+                host_store=host_store,
+            )
 
         path = f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/transfer"
         status, payload = await _proxy_post_to_runner(

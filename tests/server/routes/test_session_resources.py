@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import threading
+import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -30,9 +31,18 @@ from omnigent.runtime import (
     set_runner_router,
 )
 from omnigent.server._runner_ws_tunnel import DirectAttachEndpoint
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_MANAGE,
+    LEVEL_OWNER,
+    LEVEL_READ,
+    UnifiedAuthProvider,
+)
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
+from omnigent.stores.host_store import HostStore
+from tests.server.routes.test_shell_permission_gate import _StubPermissionStore
 
 
 class _ConversationStore:
@@ -1797,6 +1807,108 @@ async def test_delete_terminal_proxies_to_runner(
             "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals/terminal_bash_s1",
         ),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_level,target_level,host_owner,expected_status,admin,inherited",
+    [
+        (LEVEL_READ, LEVEL_OWNER, "alice@example.com", 403, False, False),
+        (LEVEL_EDIT, LEVEL_OWNER, "alice@example.com", 403, False, False),
+        (LEVEL_MANAGE, LEVEL_OWNER, "alice@example.com", 403, False, False),
+        (LEVEL_OWNER, LEVEL_READ, "alice@example.com", 403, False, False),
+        (LEVEL_OWNER, LEVEL_EDIT, "alice@example.com", 403, False, False),
+        (LEVEL_OWNER, LEVEL_MANAGE, "alice@example.com", 403, False, False),
+        (LEVEL_OWNER, LEVEL_OWNER, "bob@example.com", 403, False, False),
+        (LEVEL_OWNER, LEVEL_OWNER, None, 403, False, False),
+        (LEVEL_OWNER, LEVEL_OWNER, "alice@example.com", 200, False, False),
+        (LEVEL_READ, LEVEL_READ, "bob@example.com", 403, True, False),
+        (LEVEL_READ, LEVEL_READ, "bob@example.com", 200, True, True),
+    ],
+)
+async def test_terminal_transfer_requires_session_and_host_ownership(
+    db_uri: str,
+    runner_globals_reset: None,
+    source_level: int,
+    target_level: int,
+    host_owner: str | None,
+    expected_status: int,
+    admin: bool,
+    inherited: bool,
+) -> None:
+    """Placement changes require authority over both sessions and their host."""
+    del runner_globals_reset
+    source_id = "79b22ebd2309e48fdeb450c65611d51b"
+    target_id = "5d29bee4350489d66feafecfebd94a97"
+    host_id = uuid.uuid4().hex
+    conversations = _ConversationStore()
+    source = conversations.get_conversation(source_id)
+    target = conversations.get_conversation(target_id)
+    assert source is not None and target is not None
+    source.host_id = host_id
+    source.workspace = "/workspace/project"
+    source.git_branch = "feature/rotation"
+    if inherited:
+        parent = conversations.get_conversation("64a784c3aa907d1774f44313546947c6")
+        assert parent is not None
+        parent.host_id = host_id
+        source.host_id = None
+        source.kind = "sub_agent"
+        source.parent_conversation_id = parent.id
+        source.runner_id = "runner_one"
+    permissions = _StubPermissionStore()
+    if admin:
+        permissions.add_admin("alice@example.com")
+    permissions.add_grant("alice@example.com", source_id, source_level)
+    permissions.add_grant("alice@example.com", target_id, target_level)
+    application = FastAPI()
+    if host_owner is not None:
+        hosts = HostStore(db_uri)
+        hosts.upsert_on_connect(host_id, "test-host", host_owner)
+        application.state.host_store = hosts
+
+    @application.exception_handler(OmnigentError)
+    async def handle_error(request: Request, exc: OmnigentError) -> JSONResponse:
+        del request
+        return JSONResponse(status_code=exc.http_status, content={"error": exc.code})
+
+    application.include_router(
+        create_sessions_router(
+            conversations,  # type: ignore[arg-type]
+            Mock(),  # Agent loading is outside the transfer boundary.
+            auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+            permission_store=permissions,  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+    # No terminal process is needed to exercise authorization and stored placement.
+    runner = _FakeRunnerClient(payload={"id": "terminal_main", "session_id": target_id})
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application), base_url="http://server"
+    ) as client:
+        response = await client.post(
+            f"/v1/sessions/{source_id}/resources/terminals/terminal_main/transfer",
+            json={"target_session_id": target_id},
+            headers={"X-Forwarded-Email": "alice@example.com"},
+        )
+    assert response.status_code == expected_status, response.text
+    assert source.host_id == (None if inherited else host_id)
+    assert source.workspace == "/workspace/project"
+    if expected_status == 200 and not inherited:
+        assert response.json()["session_id"] == target_id
+        assert target.host_id == source.host_id
+        assert target.workspace == source.workspace
+        assert target.git_branch == source.git_branch
+    else:
+        if expected_status == 403:
+            assert runner.calls == []
+        else:
+            assert runner.calls
+            assert response.json()["session_id"] == target_id
+        assert target.host_id is None
+        assert target.workspace is None
+        assert target.git_branch is None
 
 
 @pytest.mark.asyncio
