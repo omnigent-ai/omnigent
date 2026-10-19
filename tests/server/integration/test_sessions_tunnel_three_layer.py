@@ -2455,6 +2455,7 @@ async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
         "list_during_hold",
         "remote_live_at_expiry",
         "label_write_retry",
+        "label_clear_retry",
         "shutdown_keeps_label",
         "final_read_recovers",
     ],
@@ -2487,6 +2488,7 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
         "host_back_without_runner": 30.0,
         "list_during_hold": 30.0,
         "label_write_retry": 30.0,
+        "label_clear_retry": 30.0,
         "shutdown_keeps_label": 30.0,
     }.get(scenario, 0.6)
     monkeypatch.setattr("omnigent.server.routes.sessions.RUNNER_DISCONNECT_GRACE_S", grace)
@@ -2613,6 +2615,20 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             return set_labels(conversation_id, updates, *args, **kwargs)
 
         monkeypatch.setattr(store, "set_labels", flaky_set_labels)
+    label_clears_failed: list[bool] = []
+    if scenario == "label_clear_retry":
+        delete_label = store.delete_label
+
+        def flaky_delete_label(conversation_id: str, key: str, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if (
+                key == sessions_module.HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY
+                and not label_clears_failed
+            ):
+                label_clears_failed.append(True)
+                raise RuntimeError("store unavailable")
+            return delete_label(conversation_id, key, *args, **kwargs)
+
+        monkeypatch.setattr(store, "delete_label", flaky_delete_label)
 
     communicator = await _connect_runner_tunnel(ap_app, runner_id)
     await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
@@ -2662,7 +2678,7 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
                         await asyncio.sleep(0.02)
 
                 await asyncio.wait_for(_label_cleared(), timeout=budget(5.0))
-            elif scenario in ("label_write_retry", "shutdown_keeps_label"):
+            elif scenario in ("label_write_retry", "label_clear_retry", "shutdown_keeps_label"):
 
                 async def _labeled() -> None:
                     while True:
@@ -2677,10 +2693,26 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
                 await asyncio.wait_for(_labeled(), timeout=budget(5.0))
                 if scenario == "label_write_retry":
                     assert label_writes_failed
+                if scenario in ("label_write_retry", "label_clear_retry"):
                     reconnect = await _connect_runner_tunnel(ap_app, runner_id)
                     await _send_hello_and_wait(
                         reconnect, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
                     )
+                    if scenario == "label_clear_retry":
+
+                        async def _unlabeled() -> None:
+                            while True:
+                                row = store.get_conversation(held_id)
+                                if row is not None and (
+                                    sessions_module.HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY
+                                    not in row.labels
+                                ):
+                                    return
+                                await asyncio.sleep(0.02)
+
+                        # A failed clear is retried, so no deadline outlives the hold.
+                        await asyncio.wait_for(_unlabeled(), timeout=budget(5.0))
+                        assert label_clears_failed
                 else:
                     from omnigent.server import shutdown_state
 
@@ -2787,6 +2819,7 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             "list_during_hold": "runner_reconnected",
             "remote_live_at_expiry": "expired",
             "label_write_retry": "runner_reconnected",
+            "label_clear_retry": "runner_reconnected",
             "shutdown_keeps_label": "server_shutdown",
             "final_read_recovers": "expired",
         }[scenario]
@@ -2809,10 +2842,10 @@ async def test_an_ended_hold_leaves_a_later_holds_deadline_in_place(
 ) -> None:
     """A hold whose clear failed never removes a later hold's deadline.
 
-    The first hold ends on reconnect but its clear fails, leaving its deadline.
-    The runner drops again and a second hold writes a newer one. Nothing from
-    the first hold deletes it, so a replica without the hold leaves the turn
-    running.
+    The first hold ends on reconnect but its clears keep failing until the
+    runner drops again and a second hold writes a newer deadline. The first
+    hold's retried clear matches only its own value, so a replica without the
+    hold still leaves the turn running.
     """
     from omnigent.runtime import get_conversation_store
     from omnigent.server.routes import sessions as sessions_module

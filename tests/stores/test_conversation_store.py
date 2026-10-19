@@ -6856,6 +6856,24 @@ def test_delete_label_is_noop_when_absent(
     assert got.labels == {}
 
 
+def test_delete_label_if_value_removes_only_a_matching_value(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A conditional delete leaves a label that another writer changed in place."""
+    conv = conversation_store.create_conversation()
+    conversation_store.set_labels(conv.id, {"omnigent.host_offline_hold_until": "2000"})
+
+    conversation_store.delete_label(conv.id, "omnigent.host_offline_hold_until", if_value="1000")
+    got = conversation_store.get_conversation(conv.id)
+    assert got is not None
+    assert got.labels == {"omnigent.host_offline_hold_until": "2000"}
+
+    conversation_store.delete_label(conv.id, "omnigent.host_offline_hold_until", if_value="2000")
+    got = conversation_store.get_conversation(conv.id)
+    assert got is not None
+    assert got.labels == {}
+
+
 def test_list_conversations_filters_by_project(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

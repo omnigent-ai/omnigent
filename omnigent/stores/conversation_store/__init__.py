@@ -1174,6 +1174,8 @@ class ConversationStore(ABC):
         self,
         conversation_id: str,
         key: str,
+        *,
+        if_value: str | None = None,
     ) -> None:
         """
         Delete a single label key from a conversation.
@@ -1186,6 +1188,8 @@ class ConversationStore(ABC):
         :param conversation_id: The conversation to update,
             e.g. ``"conv_abc123"``.
         :param key: The label key to remove, e.g. ``"omni_project"``.
+        :param if_value: Delete only while the label still holds this
+            value, atomically, so a writer can't remove a newer value.
         """
         ...
 

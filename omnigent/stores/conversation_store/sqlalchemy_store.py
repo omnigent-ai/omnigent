@@ -2727,6 +2727,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         self,
         conversation_id: str,
         key: str,
+        *,
+        if_value: str | None = None,
     ) -> None:
         """
         Delete a single label key from a conversation.
@@ -2735,16 +2737,18 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         :param conversation_id: The conversation to update.
         :param key: The label key to remove, e.g. ``"omni_project"``.
+        :param if_value: Delete only while the label still holds this value.
         """
 
         def write(session: Session) -> None:
-            session.execute(
-                delete(SqlConversationLabel).where(
-                    SqlConversationLabel.workspace_id == current_workspace_id(),
-                    SqlConversationLabel.conversation_id == conversation_id,
-                    SqlConversationLabel.key == key,
-                )
+            statement = delete(SqlConversationLabel).where(
+                SqlConversationLabel.workspace_id == current_workspace_id(),
+                SqlConversationLabel.conversation_id == conversation_id,
+                SqlConversationLabel.key == key,
             )
+            if if_value is not None:
+                statement = statement.where(SqlConversationLabel.value == if_value)
+            session.execute(statement)
 
         run_write_transaction(self._conv_session_immediate, "delete_label", write)
 
