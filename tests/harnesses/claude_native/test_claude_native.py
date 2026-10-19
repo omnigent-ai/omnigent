@@ -11,9 +11,11 @@ import io
 import json
 import logging
 import os
+import queue
 import re
 import shlex
 import ssl
+import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from itertools import pairwise
@@ -55,6 +57,7 @@ from tests._image_fixtures import (
 from tests._image_fixtures import (
     mcp_call_output as _mcp_call_output,
 )
+from tests.budgets import budget
 
 
 @pytest.fixture(autouse=True)
@@ -6725,9 +6728,6 @@ def _pick_workspace_action_with_tty_input(
     :param current: Current cwd rendered in the selector.
     :returns: Selected action plus captured output.
     """
-    import queue
-    import threading
-
     result_queue: queue.Queue[str | BaseException] = queue.Queue()
     master_fd, slave_fd = os.openpty()
     slave_check_fd = os.dup(slave_fd)
@@ -6757,12 +6757,13 @@ def _pick_workspace_action_with_tty_input(
     thread.start()
     try:
         for index, chunk in enumerate(input_chunks):
-            _wait_for_workspace_action_terminal_mode(slave_check_fd)
-            render_count = out.getvalue().count("Keys:")
+            _wait_for_workspace_action_terminal_mode(slave_check_fd, thread, result_queue)
+            rendered_len = len(out.getvalue())
             os.write(master_fd, chunk)
             if index < len(input_chunks) - 1:
-                _wait_for_workspace_action_redraw(out, render_count)
-        thread.join(timeout=2)
+                _wait_for_workspace_action_redraw(out, rendered_len)
+        # Esc alone waits out prompt-toolkit's 0.5s escape-sequence timeout.
+        thread.join(timeout=budget(5))
         if thread.is_alive():
             pytest.fail(f"workspace action picker hung; output={out.getvalue()!r}")
         payload = result_queue.get_nowait()
@@ -6775,39 +6776,55 @@ def _pick_workspace_action_with_tty_input(
                 os.close(fd)
 
 
-def _wait_for_workspace_action_terminal_mode(slave_check_fd: int) -> None:
+def _wait_for_workspace_action_terminal_mode(
+    slave_check_fd: int,
+    thread: threading.Thread,
+    result_queue: queue.Queue[str | BaseException],
+) -> None:
     """
     Wait until prompt-toolkit has put the TTY in raw-ish mode.
 
     :param slave_check_fd: Duplicate slave pty file descriptor.
+    :param thread: Thread running the picker.
+    :param result_queue: Queue the picker thread reports its outcome to.
     :returns: None.
     """
     import termios
     import time
 
-    deadline = time.monotonic() + 2
-    while time.monotonic() < deadline:
-        local_flags = termios.tcgetattr(slave_check_fd)[3]
-        if not local_flags & termios.ICANON:
+    deadline = time.monotonic() + budget(5)
+    while True:
+        # Look once more after a runner stall before honoring the deadline.
+        if not termios.tcgetattr(slave_check_fd)[3] & termios.ICANON:
             return
+        if not thread.is_alive():
+            with contextlib.suppress(queue.Empty):
+                payload = result_queue.get_nowait()
+                if isinstance(payload, BaseException):
+                    raise payload
+                pytest.fail(f"workspace action picker returned {payload!r} before reading input")
+        if time.monotonic() >= deadline:
+            pytest.fail("workspace action picker did not enter terminal input mode")
         time.sleep(0.001)
-    pytest.fail("workspace action picker did not enter terminal input mode")
 
 
-def _wait_for_workspace_action_redraw(out: io.StringIO, previous_render_count: int) -> None:
+def _wait_for_workspace_action_redraw(out: io.StringIO, previous_len: int) -> None:
     """
     Wait until the prompt-toolkit selector redraws after a keypress.
 
+    prompt-toolkit repaints only changed lines, so any new output marks the
+    redraw; the footer is not necessarily rewritten.
+
     :param out: Captured prompt-toolkit output stream.
-    :param previous_render_count: Previous count of footer render markers.
+    :param previous_len: Length of the captured output before the keypress.
     :returns: None.
     """
     import time
 
-    deadline = time.monotonic() + 2
-    while time.monotonic() < deadline:
-        if out.getvalue().count("Keys:") > previous_render_count:
-            return
+    deadline = time.monotonic() + budget(5)
+    while len(out.getvalue()) <= previous_len:
+        if time.monotonic() >= deadline:
+            pytest.fail(f"workspace action picker did not redraw; output={out.getvalue()!r}")
         time.sleep(0.005)
 
 

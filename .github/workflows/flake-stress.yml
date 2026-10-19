@@ -169,6 +169,8 @@ jobs:
           WORKERS: ${{ github.event.inputs.workers }}
           DIST: ${{ github.event.inputs.dist }}
           EXTRA_ARGS: ${{ github.event.inputs.extra_pytest_args }}
+          # Match ci.yml so hang guards (tests.budgets.budget) get CI's slack.
+          OMNIGENT_TEST_TIMEOUT_SCALE: "4"
         run: |
           mkdir -p artifacts
           # shellcheck disable=SC2086

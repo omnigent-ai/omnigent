@@ -1106,6 +1106,7 @@ _state = MockState()
 
 
 @app.post("/v1/responses", response_model=None)
+@app.post("/ai-gateway/codex/v1/responses", response_model=None)
 async def create_response(
     request: Request,
 ) -> StreamingResponse | JSONResponse:
@@ -1289,6 +1290,7 @@ async def create_message(
 
 
 @app.post("/v1/chat/completions", response_model=None)
+@app.post("/ai-gateway/mlflow/v1/chat/completions", response_model=None)
 async def create_chat_completion(
     request: Request,
 ) -> StreamingResponse | JSONResponse:
