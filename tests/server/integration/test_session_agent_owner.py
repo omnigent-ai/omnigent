@@ -302,9 +302,7 @@ async def test_read_only_collaborator_cannot_publish_native_hooks(
         )
         assert response.status_code in (200, 204), response.text
         # An empty body reaches validation only after mutation authority is checked.
-        response = await auth_client.post(
-            f"{path}/hooks/{hook}", json={}, headers=collaborator
-        )
+        response = await auth_client.post(f"{path}/hooks/{hook}", json={}, headers=collaborator)
         assert response.status_code == expected, response.text
 
 

@@ -749,9 +749,7 @@ def register_events_routes(
 
     event_router = APIRouter(route_class=_SessionEventBodyLimitRoute)
 
-    def _has_bound_runner_authority(
-        request: Request | _RunnerEventContext, conv: Any
-    ) -> bool:
+    def _has_bound_runner_authority(request: Request | _RunnerEventContext, conv: Any) -> bool:
         if isinstance(request, _RunnerEventContext):
             return conv.runner_id == request.runner_id
         token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
@@ -1055,16 +1053,16 @@ def register_events_routes(
         user_id, conv = await _authorized_conversation(
             request,
             session_id,
-            external_transcript=body.type in (
+            external_transcript=body.type
+            in (
                 _EXTERNAL_CONVERSATION_ITEM_TYPE,
                 _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             ),
         )
-        if (
-            body.type
-            in {_EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE, _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE}
-            and not _has_bound_runner_authority(request, conv)
-        ):
+        if body.type in {
+            _EXTERNAL_CODEX_APPROVAL_MODE_CHANGE_TYPE,
+            _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
+        } and not _has_bound_runner_authority(request, conv):
             # Owner-authenticated local forwarders also report native settings.
             await _require_access_and_level(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
