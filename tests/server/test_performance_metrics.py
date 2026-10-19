@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import httpx
@@ -17,6 +18,8 @@ from starlette.types import Scope
 
 from omnigent.process_logging import DEFAULT_LOG_DATEFMT, DEFAULT_LOG_PREFIX_FORMAT
 from omnigent.server.performance_metrics import (
+    HealthCheckAccessFilter,
+    JsonAccessFormatter,
     RequestDurationAccessFormatter,
     ServerMetricsOtelPublisher,
     ServerMetricsSnapshot,
@@ -229,6 +232,8 @@ class _FakeMeter:
         name: str,
         unit: str = "",
         description: str = "",
+        *,
+        explicit_bucket_boundaries_advisory: Sequence[float] | None = None,
     ) -> _FakeHistogram:
         """
         Create and record a fake histogram.
@@ -236,6 +241,7 @@ class _FakeMeter:
         :param name: Metric name.
         :param unit: Metric unit.
         :param description: Metric description.
+        :param explicit_bucket_boundaries_advisory: Ignored bucket bounds.
         :returns: Fake histogram instrument.
         """
         histogram = _FakeHistogram(name)
@@ -966,3 +972,91 @@ async def test_create_app_websocket_metrics_count_accepted_connections(
 
     after = app.state.server_metrics.snapshot()
     assert after.active_websockets == before.active_websockets
+
+
+def test_json_access_formatter_emits_request_fields() -> None:
+    """The JSON access line carries the request context, then clears it."""
+    import json
+
+    record = _make_access_record()
+    record.args = ("10.0.0.1:0", "GET", "/v1/sessions/conv_abc/events?token=s3cret", "1.1", 200)
+    set_request_duration_for_access_log(0.0125)
+    set_request_id_for_access_log("aabbccdd11223344")
+    set_request_user_agent_for_access_log("httpx/0.27")
+    set_request_session_id_for_access_log("conv_abc")
+
+    entry = json.loads(JsonAccessFormatter().format(record))
+
+    assert entry["msg"] == "request completed"
+    assert entry["method"] == "GET"
+    assert entry["path"] == "/v1/sessions/conv_abc/events"
+    assert entry["status"] == 200
+    assert entry["duration_ms"] == 12.5
+    assert entry["request_id"] == "aabbccdd11223344"
+    assert entry["user_agent"] == "httpx/0.27"
+    assert entry["session_id"] == "conv_abc"
+    assert "s3cret" not in json.dumps(entry)
+    assert "duration_ms" not in json.loads(JsonAccessFormatter().format(_make_access_record()))
+
+
+@pytest.mark.parametrize(
+    ("base_path", "path", "visible"),
+    [
+        ("", "/health?session_ids=conv_a", False),
+        ("/", "/health", False),
+        ("/proxy/6767", "/health", False),
+        ("/proxy/6767", "/proxy/6767/health?session_ids=conv_a", False),
+        (" proxy/6767/ ", "/proxy/6767/health", False),
+        ("", "/unconfigured/health", True),
+        ("/proxy/6767", "/proxy/67670/health", True),
+        ("/proxy/6767", "/v1/services/health", True),
+        ("/proxy/6767", "/proxy/6767/v1/services/health", True),
+    ],
+)
+def test_health_check_access_filter_drops_only_health(
+    monkeypatch: pytest.MonkeyPatch, base_path: str, path: str, visible: bool
+) -> None:
+    """Root and configured-prefix probes are dropped; other health routes pass."""
+    monkeypatch.setenv("OMNIGENT_WEB_BASE_PATH", base_path)
+    health = _make_access_record()
+    health.args = ("10.0.0.1:0", "GET", path, "1.1", 200)
+
+    access_filter = HealthCheckAccessFilter()
+    assert access_filter.filter(health) is visible
+    assert access_filter.filter(_make_access_record()) is True
+
+
+async def test_middleware_adopts_traceparent_and_labels_outcome(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proxied ``traceparent`` becomes the ambient trace; durations carry the outcome."""
+    from opentelemetry import trace as otel_trace
+
+    from omnigent.server import app as server_app
+
+    seen_trace_ids: list[str] = []
+    original_set_request_id = server_app.set_current_request_id
+
+    def spy_set_current_request_id(request_id: str | None) -> None:
+        span_context = otel_trace.get_current_span().get_span_context()
+        seen_trace_ids.append(otel_trace.format_trace_id(span_context.trace_id))
+        original_set_request_id(request_id)
+
+    monkeypatch.setattr(server_app, "set_current_request_id", spy_set_current_request_id)
+    recorded: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        app.state.server_metrics_otel,
+        "record_request_duration",
+        lambda **kwargs: recorded.append(kwargs),
+    )
+
+    resp = await client.get(
+        "/health",
+        headers={"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"},
+    )
+
+    assert resp.status_code == 200
+    assert seen_trace_ids == ["4bf92f3577b34da6a3ce929d0e0e4736"]
+    assert recorded[-1]["outcome"] == "ok"

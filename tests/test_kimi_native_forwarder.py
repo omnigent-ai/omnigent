@@ -1948,6 +1948,10 @@ class TestForwardLoopEdges:
 
     @pytest.fixture(autouse=True)
     def _stub_posts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Real wire fixtures also emit usage/model posts and pricing lookups.
+        _no_window(monkeypatch)
+        client = _FakeAsyncClient()
+        monkeypatch.setattr(fwd.httpx, "AsyncClient", lambda **_kw: client)
         self.items: list[str] = []
         self.statuses: list[tuple[str, str]] = []
         forwarder_health.clear()

@@ -74,6 +74,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
+from omnigent.server import operation_metrics
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import (
     HostConnection,
@@ -200,6 +201,7 @@ def create_host_tunnel_router(
     router = APIRouter()
 
     @router.websocket("/hosts/{host_id}/tunnel")
+    @operation_metrics.tracked_tunnel("host")
     async def tunnel(ws: WebSocket, host_id: str) -> None:
         """Accept a host's outbound WebSocket tunnel.
 

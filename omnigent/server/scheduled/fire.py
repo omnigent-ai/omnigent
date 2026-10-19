@@ -59,6 +59,7 @@ from omnigent.db.db_models import workspace_scope
 from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.mcp_selection import mcp_selection_revision
+from omnigent.server import operation_metrics
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.host_registry import host_owner_scope
@@ -991,20 +992,27 @@ def _record_run_sync(
 ) -> None:
     """Synchronous run recording body for ``asyncio.to_thread`` callers."""
     now = int(time.time())
-    update_fields: dict[str, Any] = {"last_run_at": now}
-    if conversation_id is not None:
-        update_fields["last_run_conversation_id"] = conversation_id
-    deps.scheduled_task_store.update(task.id, **update_fields)
-    deps.scheduled_task_store.create_run(
-        _new_id(),
-        task.id,
-        status,
-        scheduled_at,
-        conversation_id=conversation_id,
-        fired_at=now,
-        error=error,
-        error_code=error_code,
-    )
+    outcome: operation_metrics.Outcome = "server_error"
+    try:
+        update_fields: dict[str, Any] = {"last_run_at": now}
+        if conversation_id is not None:
+            update_fields["last_run_conversation_id"] = conversation_id
+        deps.scheduled_task_store.update(task.id, **update_fields)
+        deps.scheduled_task_store.create_run(
+            _new_id(),
+            task.id,
+            status,
+            scheduled_at,
+            conversation_id=conversation_id,
+            fired_at=now,
+            error=error,
+            error_code=error_code,
+        )
+        outcome = operation_metrics.scheduled_run_outcome(status, error_code)
+    finally:
+        operation_metrics.record_operation(
+            "scheduled_task_run", max(0, int(time.time()) - scheduled_at), outcome
+        )
 
 
 async def _validate_fire_session_inputs(

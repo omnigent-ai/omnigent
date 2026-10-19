@@ -309,6 +309,16 @@ def set_current_request_id(request_id: str | None) -> None:
     _request_id_var.set(request_id or None)
 
 
+def current_request_id() -> str | None:
+    """Return the server HTTP request id bound to the current request, if any."""
+    return _request_id_var.get() or None
+
+
+def current_runner_id() -> str | None:
+    """Return the runner bound to the current request or lifecycle scope, if any."""
+    return _runner_id_var.get() or None
+
+
 def set_current_runner_id(runner_id: str | None) -> None:
     """Bind a known runner without looking up a session on every log record."""
     _runner_id_var.set(runner_id or None)

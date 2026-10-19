@@ -190,6 +190,7 @@ from omnigent.onboarding.sandboxes.base import SandboxGoneError
 # without importing omnigent.server; re-exported here (its parser is here) so
 # existing `from omnigent.server.managed_hosts import RepoWorkspace` keeps working.
 from omnigent.onboarding.sandboxes.types import GitCloneOptions, RepoWorkspace
+from omnigent.server import operation_metrics
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
@@ -3519,6 +3520,7 @@ def _select_provider_config(
     return selected
 
 
+@operation_metrics.timed_operation("sandbox_launch")
 async def launch_managed_host(
     *,
     config: ManagedSandboxDeployment,
@@ -4079,6 +4081,7 @@ def host_sandbox_is_running(
 _resume_locks: dict[str, asyncio.Lock] = {}
 
 
+@operation_metrics.timed_operation("sandbox_resume")
 async def resume_managed_host(
     host_id: str,
     host_store: HostStore,
