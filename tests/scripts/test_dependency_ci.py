@@ -647,6 +647,7 @@ def test_merge_gate_waits_for_selected_rust_checks(tmp_path, fault):
             REPO="example/project",
             SHA="a" * 40,
             GITHUB_OUTPUT=str(tmp_path / "gate-output"),
+            MERGE_READY_LAG_DELAY_S="0",
         ),
         text=True,
         capture_output=True,

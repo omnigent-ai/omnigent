@@ -25,6 +25,12 @@
 # PR) from blocking the gate; trusting a *skipped* run keeps fork/draft
 # PRs — whose entire e2e workflow is gated off — from wedging it.
 #
+# Under load GitHub can mark a workflow run completed while its check runs
+# still read as running. When every non-green check is such a pending check
+# whose workflow already succeeded, the checks are read again (up to
+# MERGE_READY_LAG_ATTEMPTS reads, MERGE_READY_LAG_DELAY_S apart): the gate
+# posts only green, and nothing else would re-run it for this SHA.
+#
 # Env in: GH_TOKEN, REPO, SHA
 # Out:    failed=<markdown bullet list of failed names> on $GITHUB_OUTPUT
 # Exit:   0 if all green, 1 if any red.
@@ -35,14 +41,21 @@ HERE=$(dirname "$0")
 # shellcheck disable=SC1091
 source "$HERE/required.sh"
 
-CHECKS=$(gh api "repos/$REPO/commits/$SHA/check-runs" --paginate \
-  --jq '.check_runs[] | "\(.name)\t\(.status)\t\(.conclusion // "null")\t\(.id)"')
+LAG_ATTEMPTS="${MERGE_READY_LAG_ATTEMPTS:-6}"
+LAG_DELAY_S="${MERGE_READY_LAG_DELAY_S:-20}"
+[[ "$LAG_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || LAG_ATTEMPTS=6
+[[ "$LAG_DELAY_S" =~ ^[0-9]+$ ]] || LAG_DELAY_S=20
 
-# Per-workflow run state for this SHA (one row per run:
-# name<TAB>status<TAB>conclusion<TAB>created_at). Used to classify a
-# *missing* required check via workflow_run_outcome below.
-WORKFLOW_RUNS=$(gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" --paginate \
-  --jq '.workflow_runs[] | [.name, .status, (.conclusion // "null"), (.created_at // "")] | @tsv')
+read_state() {
+  CHECKS=$(gh api "repos/$REPO/commits/$SHA/check-runs" --paginate \
+    --jq '.check_runs[] | "\(.name)\t\(.status)\t\(.conclusion // "null")\t\(.id)"')
+
+  # Per-workflow run state for this SHA (one row per run:
+  # name<TAB>status<TAB>conclusion<TAB>created_at). Used to classify a
+  # *missing* required check via workflow_run_outcome below.
+  WORKFLOW_RUNS=$(gh api "repos/$REPO/actions/runs?head_sha=$SHA&per_page=100" --paginate \
+    --jq '.workflow_runs[] | [.name, .status, (.conclusion // "null"), (.created_at // "")] | @tsv')
+}
 
 # Classify the newest run of a workflow for this SHA:
 #   "none"    — no run at all. The workflow was gated out by
@@ -80,55 +93,85 @@ workflow_run_outcome() {
   fi
 }
 
-FAIL=0
-FAILED_LINES=""
-for n in "${REQUIRED[@]}"; do
-  ROW=$(echo "$CHECKS" | awk -F'\t' -v n="$n" '$1 == n {print}' | sort -t $'\t' -k4,4n | tail -n 1)
-  scope=$(scope_for_result "$n")
-  if [[ -z "$ROW" ]]; then
-    if [[ -n "$scope" ]] && echo "$CHECKS" | awk -F'\t' -v n="$scope" '$1 == n {found=1} END {exit !found}'; then
-      echo "MISSING : $n  (selection job '$scope' requires an executed result check)"
-      FAILED_LINES+="- \`$n\` (selection ran; waiting for its result check)"$'\n'
-      FAIL=1
-      continue
-    fi
-    if is_allow_skip "$n"; then
-      wf=$(workflow_for "$n")
-      outcome="none"
-      [[ -n "$wf" ]] && outcome=$(workflow_run_outcome "$wf")
-      if [[ "$outcome" == "other" ]]; then
-        echo "NOT GREEN: $n  (workflow '$wf' has not succeeded and the check is missing -- pending/cancelled, not a skip)"
-        FAILED_LINES+="- \`$n\` (workflow ran but has not succeeded and the check is missing -- still pending or cancelled)"$'\n'
+# One pass over REQUIRED. FAILS counts non-green checks; LAGGING counts those
+# still read as running although their workflow has already succeeded.
+evaluate() {
+  FAIL=0
+  FAILS=0
+  LAGGING=0
+  FAILED_LINES=""
+  REPORT=""
+  local n ROW scope wf outcome STATUS CONCL
+  for n in "${REQUIRED[@]}"; do
+    ROW=$(echo "$CHECKS" | awk -F'\t' -v n="$n" '$1 == n {print}' | sort -t $'\t' -k4,4n | tail -n 1)
+    scope=$(scope_for_result "$n")
+    if [[ -z "$ROW" ]]; then
+      if [[ -n "$scope" ]] && echo "$CHECKS" | awk -F'\t' -v n="$scope" '$1 == n {found=1} END {exit !found}'; then
+        REPORT+="MISSING : $n  (selection job '$scope' requires an executed result check)"$'\n'
+        FAILED_LINES+="- \`$n\` (selection ran; waiting for its result check)"$'\n'
         FAIL=1
+        FAILS=$((FAILS + 1))
         continue
       fi
-      # outcome is "none" (workflow path-skipped), "success" (job
-      # conditionally excluded from a green run), or "skipped" (whole
-      # workflow gated off, e.g. fork/draft PR) — all legitimate.
-      echo "OK      : $n  (skipped: path-ignored, conditionally-excluded, or fork/draft-gated)"
+      if is_allow_skip "$n"; then
+        wf=$(workflow_for "$n")
+        outcome="none"
+        [[ -n "$wf" ]] && outcome=$(workflow_run_outcome "$wf")
+        if [[ "$outcome" == "other" ]]; then
+          REPORT+="NOT GREEN: $n  (workflow '$wf' has not succeeded and the check is missing -- pending/cancelled, not a skip)"$'\n'
+          FAILED_LINES+="- \`$n\` (workflow ran but has not succeeded and the check is missing -- still pending or cancelled)"$'\n'
+          FAIL=1
+          FAILS=$((FAILS + 1))
+          continue
+        fi
+        # outcome is "none" (workflow path-skipped), "success" (job
+        # conditionally excluded from a green run), or "skipped" (whole
+        # workflow gated off, e.g. fork/draft PR) — all legitimate.
+        REPORT+="OK      : $n  (skipped: path-ignored, conditionally-excluded, or fork/draft-gated)"$'\n'
+        continue
+      fi
+      REPORT+="MISSING : $n"$'\n'
+      FAILED_LINES+="- \`$n\` (not yet started or not configured on this commit)"$'\n'
+      FAIL=1
+      FAILS=$((FAILS + 1))
       continue
     fi
-    echo "MISSING : $n"
-    FAILED_LINES+="- \`$n\` (not yet started or not configured on this commit)"$'\n'
-    FAIL=1
-    continue
+    STATUS=$(echo "$ROW" | cut -f2)
+    CONCL=$(echo "$ROW" | cut -f3)
+    if [[ "$STATUS" != "completed" ]]; then
+      REPORT+="NOT GREEN: $n  (status=$STATUS, conclusion=$CONCL)"$'\n'
+      FAILED_LINES+="- \`$n\` (still running, status=$STATUS)"$'\n'
+      FAIL=1
+      FAILS=$((FAILS + 1))
+      wf=$(workflow_for "$n")
+      if [[ -n "$wf" && "$(workflow_run_outcome "$wf")" == "success" ]]; then
+        LAGGING=$((LAGGING + 1))
+      fi
+    elif [[ "$CONCL" == "skipped" && -z "$scope" ]] && is_allow_skip "$n"; then
+      REPORT+="OK      : $n  (skipped via path filter)"$'\n'
+    elif [[ "$CONCL" != "success" ]]; then
+      REPORT+="NOT GREEN: $n  (status=$STATUS, conclusion=$CONCL)"$'\n'
+      FAILED_LINES+="- \`$n\` (conclusion=$CONCL)"$'\n'
+      FAIL=1
+      FAILS=$((FAILS + 1))
+    else
+      REPORT+="OK      : $n"$'\n'
+    fi
+  done
+}
+
+attempt=1
+while true; do
+  read_state
+  evaluate
+  if (( FAILS == 0 || LAGGING < FAILS || attempt >= LAG_ATTEMPTS )); then
+    break
   fi
-  STATUS=$(echo "$ROW" | cut -f2)
-  CONCL=$(echo "$ROW" | cut -f3)
-  if [[ "$STATUS" != "completed" ]]; then
-    echo "NOT GREEN: $n  (status=$STATUS, conclusion=$CONCL)"
-    FAILED_LINES+="- \`$n\` (still running, status=$STATUS)"$'\n'
-    FAIL=1
-  elif [[ "$CONCL" == "skipped" && -z "$scope" ]] && is_allow_skip "$n"; then
-    echo "OK      : $n  (skipped via path filter)"
-  elif [[ "$CONCL" != "success" ]]; then
-    echo "NOT GREEN: $n  (status=$STATUS, conclusion=$CONCL)"
-    FAILED_LINES+="- \`$n\` (conclusion=$CONCL)"$'\n'
-    FAIL=1
-  else
-    echo "OK      : $n"
-  fi
+  echo "Re-reading in ${LAG_DELAY_S}s (read $attempt of $LAG_ATTEMPTS): $LAGGING check(s) still read as running, but their workflow has finished."
+  sleep "$LAG_DELAY_S"
+  attempt=$((attempt + 1))
 done
+printf '%s' "$REPORT"
 
 {
   echo "failed<<_FAILED_EOF_"
