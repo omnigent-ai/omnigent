@@ -43,6 +43,9 @@ async def test_catalog_query_closes_client_and_process(
             skill_discovery.loaded_codex_skills("/test/codex", tmp_path, tmp_path)
     assert start.call_args.kwargs["env"]["CODEX_HOME"] == str(tmp_path)
     assert start.call_args.kwargs["cwd"] == tmp_path
+    client.request.assert_awaited_once_with(
+        "skills/list", {"cwds": [str(tmp_path)], "forceReload": True}
+    )
     client.close.assert_awaited_once()
     stop.assert_awaited_once_with(start.return_value)
 

@@ -224,10 +224,19 @@ def test_unavailable_plugin_inventory_keeps_standalone_and_enabled_plugin_skills
     enabled = _skill(_plugin(codex_home) / "skills")
     disabled = _skill(_plugin(codex_home, "disabled") / "skills")
     _skill(_plugin(codex_home, "uninstalled") / "skills")
+    outside = _skill(tmp_path / "outside-cache", "outside-only")
+    escaped = _plugin(codex_home, "escape") / "skills"
+    escaped.symlink_to(outside.parent, target_is_directory=True)
     loaded_skills.return_value = [
         {"name": "toolkit:review", "path": str(enabled / "SKILL.md"), "enabled": True},
         {"name": "disabled:review", "path": str(disabled / "SKILL.md"), "enabled": False},
         {"name": "review", "path": str(standalone / "SKILL.md"), "enabled": True},
+        {"name": "outside-only", "path": str(outside / "SKILL.md"), "enabled": True},
+        {
+            "name": "escape:outside-only",
+            "path": str(escaped / outside.name / "SKILL.md"),
+            "enabled": True,
+        },
     ]
     if failure is None:
         monkeypatch.setattr("omnigent.inner.codex_executor._find_codex_cli", lambda: None)
