@@ -438,6 +438,9 @@ Cross-harness journeys:
 
 ## Gotchas
 
+- For user/project defaults and startup-argument precedence, use
+  [Preferences and config defaults](./preferences.md). The read-only Startup
+  configuration and plugin inventory do not expose shared-preference controls.
 - A change to shared native-harness behavior (cleanup, idle handling,
   approvals, sign-in state, resume) must be checked on every harness it claims
   to cover. List the harnesses you actually drove; "all harnesses" means all

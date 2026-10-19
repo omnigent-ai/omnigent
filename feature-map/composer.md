@@ -339,6 +339,9 @@ Other connection providers alone do not enable the managed MCP picker.
 
 ## Gotchas
 
+- Session choices and server-stored project defaults are separate from local
+  YAML and the shared-preference foundation; see
+  [Preferences and config defaults](./preferences.md) for those boundaries.
 - Chat `/new` is local navigation, not a message to the agent. Native TUI
   `/new` is unchanged.
 

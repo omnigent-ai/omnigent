@@ -130,6 +130,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 - [Native harnesses](./native-harnesses.md) is the matrix of every native
   harness against launch, authentication, model and effort selection,
   approvals, resume, and terminal behavior, with native disconnect test boundaries.
+- [Preferences and config defaults](./preferences.md) covers local user/project
+  defaults, invocation overrides, related settings surfaces, and the boundary
+  between the shared-preference foundation and user journeys not yet available.
 - [Login and host authentication](./login-and-host-auth.md) covers
   `omnigent login`, host daemon credentials, Databricks auth modes, and embedded
   authentication for project writes.
@@ -188,7 +191,8 @@ map an area, remove it here in the same change.
 **CLI commands:**
 
 - Setup and diagnostics: `omnigent setup`, `omnigent config`, `omnigent doctor`,
-  `omnigent diagnose`, `omnigent debug`, `omnigent usage`
+  `omnigent diagnose`, `omnigent debug`, `omnigent usage` (config defaults are
+  mapped; credential configuration and the other commands remain unmapped)
 - Install lifecycle: `omnigent upgrade`, `omnigent update`, `omnigent uninstall`
 - Running agents and servers: `omnigent run`, `omnigent start`, `omnigent stop`,
   `omnigent server`, `omnigent attach`, `omnigent resume`, `omnigent session`,
