@@ -863,18 +863,27 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(mutate).toHaveBeenCalledWith("zsh", expect.any(Object));
   });
 
-  it("shows 'Reconnecting…' while a create is in flight on a wakeable session", async () => {
+  it("keeps unpinned pages accessible while a shell reconnects", async () => {
     declaresShell();
+    writePinnedWorkspaceTabs([]);
+    const mutate = vi.fn();
     useCreateTerminalMock.mockReturnValue({
-      mutate: vi.fn(),
+      mutate,
       isPending: true,
       isError: false,
     } as unknown as ReturnType<typeof useCreateTerminal>);
 
-    renderWorkspace({ liveness: { kind: "host_asleep" } });
+    const { onRightRailTabChange } = renderWorkspace({ liveness: { kind: "host_asleep" } });
 
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
-    expect(await screen.findByRole("menuitem", { name: /reconnecting/i })).toBeInTheDocument();
+    const plus = screen.getByRole("button", { name: "Open new" });
+    expect(plus).toBeEnabled();
+    fireEvent.pointerDown(plus, { button: 0 });
+    const shell = await screen.findByRole("menuitem", { name: /reconnecting/i });
+    expect(shell).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(shell);
+    expect(mutate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Changes" }));
+    expect(onRightRailTabChange).toHaveBeenCalledWith("changes");
   });
 
   it("disables Shell and labels it Offline when the session can't be reconnected from the web", async () => {

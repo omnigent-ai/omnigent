@@ -289,8 +289,7 @@ function NewTabMenu({
           <button
             type="button"
             aria-label="Open new"
-            disabled={create.isPending}
-            className="cursor-pointer flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:cursor-default disabled:opacity-50"
+            className="cursor-pointer flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
           >
             <PlusIcon className="size-5" />
           </button>
@@ -1316,12 +1315,8 @@ function WorkspacePanelImpl({
           {visiblePermanentTabs.length > 0 && (
             <Tabs
               className={cn("shrink-0", showOpenTabs && "@max-[400px]/rail:hidden")}
-              // When a file or shell tab is active no fixed trigger should
-              // highlight, so feed the radix group a sentinel that matches none of
-              // them. The active file/shell tab carries its own highlight. Gate the
-              // shell case on the terminal actually being present (same gate as the
-              // content slot below): a sticky selection whose terminal is gone shows
-              // the fallback nav view, so its nav tab must highlight, not "__tab__".
+              // Soft tabs own their highlight. A vanished shell falls back to a
+              // fixed page, so only live shell selections suppress its highlight.
               value={
                 pending
                   ? "__pending__"

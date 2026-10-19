@@ -618,7 +618,11 @@ function WorkspaceTabsControl() {
     );
     setPinned(next);
     writePinnedWorkspaceTabs(next);
-    if (!next.includes(value)) choose(next[0] ?? DEFAULT_WORKSPACE_TAB);
+    if (!next.includes(value)) {
+      const fallback = next[0] ?? DEFAULT_WORKSPACE_TAB;
+      setValue(fallback);
+      writeDefaultWorkspaceTab(fallback, false);
+    }
   };
   return (
     <div className="flex flex-col gap-4">

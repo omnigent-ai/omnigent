@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import * as host from "@/lib/host";
 import {
   readTerminalClipboardPreference,
@@ -653,6 +654,16 @@ describe("SettingsPage", () => {
   });
 
   it("lets every workspace page be unpinned, remembers the choice, and selects a pinned default", () => {
+    writeSessionWorkspaceState("file", {
+      rightRailTab: "files",
+      openFiles: ["README.md"],
+      selectedFilePath: "README.md",
+    });
+    writeSessionWorkspaceState("browser", {
+      rightRailTab: "browser",
+      openBrowsers: ["one"],
+      selectedBrowserId: "one",
+    });
     const page = renderPage("/settings/appearance");
     for (const label of ["Files", "Changes", "Pull Requests", "Agents"]) {
       const toggle = screen.getByRole("button", { name: `Pin ${label}` });
@@ -682,6 +693,15 @@ describe("SettingsPage", () => {
       screen.getByRole("img", { name: "Sidebar preview: Changes pinned." }),
     ).toBeInTheDocument();
     expect(localStorage.getItem("omnigent:default-workspace-tab")).toBe("changes");
+    expect(readSessionWorkspaceState("file")).toEqual({
+      openFiles: ["README.md"],
+      selectedFilePath: "README.md",
+    });
+    expect(readSessionWorkspaceState("browser")).toEqual({
+      rightRailTab: "browser",
+      openBrowsers: ["one"],
+      selectedBrowserId: "one",
+    });
   });
 
   it("renders the color theme dropdown, defaults to Omnigent, and applies a palette on change", () => {

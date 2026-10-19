@@ -8,7 +8,10 @@
 
 import { DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY } from "./archiveWorktreePreferences";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
-import { resetSessionWorkspaceTabSelections } from "./sessionWorkspaceState";
+import {
+  resetSessionWorkspaceTabSelections,
+  unpinSessionWorkspaceTabs,
+} from "./sessionWorkspaceState";
 import {
   PINNED_WORKSPACE_TABS_STORAGE_KEY,
   readDefaultWorkspaceTab,
@@ -127,7 +130,7 @@ export function readSettingsFile(file: File): Promise<ExportedSettings> {
 export function applyImportedSettings(imported: ExportedSettings): number {
   if (typeof window === "undefined") return 0;
   const allowedKeys = new Set<string>(EXPORTABLE_KEYS);
-  const previousPins = readPinnedWorkspaceTabs().join();
+  const previousPins = readPinnedWorkspaceTabs();
   const previousDefault = readDefaultWorkspaceTab();
 
   // Clear all exportable keys first to honor the "overwrite" contract.
@@ -150,9 +153,15 @@ export function applyImportedSettings(imported: ExportedSettings): number {
       // Swallow individual write failures.
     }
   }
-  const pinsChanged = previousPins !== readPinnedWorkspaceTabs().join();
-  if (pinsChanged || previousDefault !== readDefaultWorkspaceTab()) {
-    resetSessionWorkspaceTabSelections(pinsChanged);
+  const nextPins = readPinnedWorkspaceTabs();
+  const removedPins = previousPins.filter((tab) => !nextPins.includes(tab));
+  unpinSessionWorkspaceTabs(removedPins);
+  const pinsChanged = previousPins.join() !== nextPins.join();
+  if (
+    previousDefault !== readDefaultWorkspaceTab() &&
+    (!pinsChanged || nextPins.includes(previousDefault))
+  ) {
+    resetSessionWorkspaceTabSelections();
   }
   return count;
 }

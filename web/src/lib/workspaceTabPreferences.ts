@@ -1,7 +1,10 @@
 // Browser-local fallback for the selected tab in a session's Workspace rail.
 // A session's remembered tab and file-opening signals take precedence.
 
-import { resetSessionWorkspaceTabSelections } from "./sessionWorkspaceState";
+import {
+  resetSessionWorkspaceTabSelections,
+  unpinSessionWorkspaceTabs,
+} from "./sessionWorkspaceState";
 
 const STORAGE_KEY = "omnigent:default-workspace-tab";
 export const PINNED_WORKSPACE_TABS_STORAGE_KEY = "omnigent:pinned-workspace-tabs";
@@ -36,8 +39,8 @@ export function readDefaultWorkspaceTab(): DefaultWorkspaceTab {
   }
 }
 
-/** Apply a changed default to existing chats; subsequent manual tab choices are remembered. */
-export function writeDefaultWorkspaceTab(value: DefaultWorkspaceTab): void {
+/** Explicit default choices update existing chats; automatic pin fallbacks preserve selections. */
+export function writeDefaultWorkspaceTab(value: DefaultWorkspaceTab, resetSelections = true): void {
   if (typeof window === "undefined") return;
   try {
     const normalized = normalizeDefaultWorkspaceTab(value);
@@ -47,7 +50,7 @@ export function writeDefaultWorkspaceTab(value: DefaultWorkspaceTab): void {
     } else {
       window.localStorage.setItem(STORAGE_KEY, normalized);
     }
-    if (normalized !== previous) resetSessionWorkspaceTabSelections();
+    if (resetSelections && normalized !== previous) resetSessionWorkspaceTabSelections();
   } catch {
     // localStorage quota or access errors shouldn't break settings.
   }
@@ -81,7 +84,7 @@ export function writePinnedWorkspaceTabs(tabs: readonly DefaultWorkspaceTab[]): 
     } else {
       window.localStorage.setItem(PINNED_WORKSPACE_TABS_STORAGE_KEY, JSON.stringify(next));
     }
-    if (next.join() !== previous.join()) resetSessionWorkspaceTabSelections(true);
+    unpinSessionWorkspaceTabs(previous.filter((tab) => !next.includes(tab)));
   } catch {
     // Storage failures must not break settings.
   }

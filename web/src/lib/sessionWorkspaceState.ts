@@ -9,21 +9,20 @@
 import type { RightRailTab } from "@/shell/railTabs";
 import type { DefaultWorkspaceTab } from "./workspaceTabPreferences";
 
-const RAIL_TABS: readonly RightRailTab[] = [
+const WORKSPACE_PANEL_TABS: readonly DefaultWorkspaceTab[] = [
   "files",
   "changes",
   "github",
   "subagents",
-  "browser",
-  "sidechat",
 ];
+const RAIL_TABS: readonly RightRailTab[] = [...WORKSPACE_PANEL_TABS, "browser", "sidechat"];
 
 export interface SessionWorkspaceState {
   /** Whether the rail was left open in this session. */
   open?: boolean;
   /** User-chosen rail width (px) for this session. */
   widthPx?: number;
-  /** The selected Workspace navigation tab. */
+  /** Selected Workspace page, or null when no pinned or opened page is available. */
   rightRailTab?: RightRailTab | null;
   /** Unpinned built-in pages explicitly opened from the Workspace menu. */
   openPanels?: DefaultWorkspaceTab[];
@@ -88,9 +87,8 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   if (Array.isArray(record.openPanels)) {
     state.openPanels = [
       ...new Set(
-        record.openPanels.filter(
-          (value): value is DefaultWorkspaceTab =>
-            isRailTab(value) && value !== "browser" && value !== "sidechat",
+        record.openPanels.filter((value): value is DefaultWorkspaceTab =>
+          WORKSPACE_PANEL_TABS.some((tab) => tab === value),
         ),
       ),
     ];
@@ -209,15 +207,25 @@ export function writeSessionWorkspaceState(
 }
 
 /** Let existing chats follow a changed default while keeping their open tabs and layout. */
-export function resetSessionWorkspaceTabSelections(clearOpenPanels = false): void {
+export function resetSessionWorkspaceTabSelections(): void {
   const store = readStore();
   for (const { state } of store) {
     delete state.rightRailTab;
-    if (clearOpenPanels) delete state.openPanels;
     delete state.selectedFilePath;
     delete state.selectedTerminalKey;
     delete state.selectedBrowserId;
     delete state.selectedSideChatId;
+  }
+  writeStore(store);
+}
+
+/** Forget newly unpinned pages without disturbing other tabs or their selection. */
+export function unpinSessionWorkspaceTabs(tabs: readonly DefaultWorkspaceTab[]): void {
+  if (tabs.length === 0) return;
+  const store = readStore();
+  for (const { state } of store) {
+    if (tabs.some((tab) => tab === state.rightRailTab)) delete state.rightRailTab;
+    if (state.openPanels) state.openPanels = state.openPanels.filter((tab) => !tabs.includes(tab));
   }
   writeStore(store);
 }

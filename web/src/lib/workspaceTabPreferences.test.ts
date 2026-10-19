@@ -11,7 +11,11 @@ import {
   writePinnedWorkspaceTabs,
 } from "./workspaceTabPreferences";
 
-import { readSessionWorkspaceState, writeSessionWorkspaceState } from "./sessionWorkspaceState";
+import {
+  type SessionWorkspaceState,
+  readSessionWorkspaceState,
+  writeSessionWorkspaceState,
+} from "./sessionWorkspaceState";
 
 const STORAGE_KEY = "omnigent:default-workspace-tab";
 
@@ -46,6 +50,39 @@ describe("workspaceTabPreferences — read/write", () => {
       expect(readPinnedWorkspaceTabs()).toEqual(defaultWorkspaceTabs);
     },
   );
+
+  it("preserves an opened page when pinning it and other opened pages when unpinning it again", () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const state: SessionWorkspaceState = {
+      rightRailTab: "changes",
+      openPanels: ["changes", "github"],
+      open: false,
+    };
+    writeSessionWorkspaceState("conv", state);
+
+    writePinnedWorkspaceTabs(["files", "changes", "subagents"]);
+    expect(readSessionWorkspaceState("conv")).toEqual(state);
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    expect(readSessionWorkspaceState("conv")).toEqual({ openPanels: ["github"], open: false });
+  });
+
+  it("preserves unrelated selections when a pin change needs a new default", () => {
+    const state: SessionWorkspaceState = {
+      rightRailTab: "files",
+      selectedFilePath: "README.md",
+      openFiles: ["README.md"],
+    };
+    writeSessionWorkspaceState("conv", state);
+
+    writePinnedWorkspaceTabs(["changes", "github", "subagents"]);
+    writeDefaultWorkspaceTab("changes", false);
+
+    expect(readDefaultWorkspaceTab()).toBe("changes");
+    expect(readSessionWorkspaceState("conv")).toEqual({
+      selectedFilePath: "README.md",
+      openFiles: ["README.md"],
+    });
+  });
 
   it("returns files when nothing is stored", () => {
     expect(readDefaultWorkspaceTab()).toBe(DEFAULT_WORKSPACE_TAB);
