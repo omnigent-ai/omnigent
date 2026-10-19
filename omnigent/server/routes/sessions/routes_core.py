@@ -156,6 +156,8 @@ from omnigent.server.routes._sessions.helpers import (
     _require_collaboration_mode_forward,
     _require_cost_control_label_authority,
     _require_permission_mode_forward,
+    _resolve_message_source,
+    _runner_token_binds,
     _RunnerForwardResult,
     _same_provider_family,
     _session_status_cache,
@@ -834,6 +836,27 @@ def register_core_routes(
         # behind.
         if body.requested_host_id is not None:
             await _check_requested_host_id(request, body.requested_host_id, user_id)
+        if body.initial_items:
+            tunnel_token = request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER)
+            body = body.model_copy(
+                update={
+                    "initial_items": [
+                        await _resolve_message_source(
+                            item,
+                            parent_session_id=body.parent_session_id,
+                            speaks_for=lambda source: (
+                                permission_store is None
+                                or _runner_token_binds(
+                                    tunnel_token, source.runner_id, runner_tunnel_tokens
+                                )
+                            ),
+                            conversation_store=conversation_store,
+                            agent_store=agent_store,
+                        )
+                        for item in body.initial_items
+                    ]
+                }
+            )
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
         resp, conv = await _create_session_from_existing_agent(
             conversation_store,

@@ -25,6 +25,7 @@ import type {
   AnyBlock,
   ElicitationBlock,
   ErrorBlock,
+  MessageContentBlock,
   NativeToolBlock,
   TextDone,
   ToolGroup,
@@ -8555,6 +8556,63 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(promoted.ctx.createdBy).toBe("bob@example.com");
     });
 
+    const sentContent: MessageContentBlock[] = [{ type: "input_text", text: "run the tests" }];
+    it.each([
+      ["with no pending bubble", []],
+      ["promoting its pending bubble", [{ tempId: "pend_sent", content: sentContent }]],
+    ])("carries an agent sender from the live consumed event %s", (_name, pendingUserMessages) => {
+      useChatStore.setState({ blocks: [], pendingUserMessages });
+
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_from_parent",
+        itemType: "message",
+        clearedPendingId: "pend_sent",
+        data: {
+          role: "user",
+          content: sentContent,
+          source_session_id: "conv_parent",
+          source_agent_name: "Claude",
+        },
+      });
+
+      const [promoted] = useChatStore.getState().blocks as UserMessageBlock[];
+      expect(promoted.source).toEqual({ sessionId: "conv_parent", agentName: "Claude" });
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    });
+
+    it.each<[string, MessageContentBlock[]]>([
+      ["different", [{ type: "input_text", text: "my own note" }]],
+      ["identical", sentContent],
+    ])(
+      "leaves a person's queued bubble with %s text alone when an agent-sent message is consumed",
+      (_name, typedContent) => {
+        const typed: PendingUserMessage = { tempId: "pend_typed", content: typedContent };
+        useChatStore.setState({ blocks: [], pendingUserMessages: [typed] });
+        const event = {
+          type: "session_input_consumed",
+          itemId: "msg_from_parent",
+          itemType: "message",
+          data: {
+            role: "user",
+            content: sentContent,
+            source_session_id: "conv_parent",
+            source_agent_name: "Claude",
+          },
+        } as const;
+
+        handleSessionEvent(event);
+        handleSessionEvent(event);
+
+        const [fresh, ...rest] = useChatStore.getState().blocks as UserMessageBlock[];
+        expect(rest).toEqual([]);
+        expect(fresh.content).toEqual(sentContent);
+        expect(fresh.stableKey).toBeUndefined();
+        expect(fresh.source).toEqual({ sessionId: "conv_parent", agentName: "Claude" });
+        expect(useChatStore.getState().pendingUserMessages).toEqual([typed]);
+      },
+    );
+
     it("leaves ctx.createdBy unset when the event omits an author", () => {
       // No created_by (agent/system items, single-user "local") must not
       // produce a label; ctx.createdBy stays undefined rather than null.
@@ -8569,6 +8627,7 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
 
       const promoted = useChatStore.getState().blocks[0] as UserMessageBlock;
       expect(promoted.ctx.createdBy).toBeUndefined();
+      expect(promoted.source).toBeUndefined();
     });
 
     it("dedupes repeated consumed events for the same item id", () => {

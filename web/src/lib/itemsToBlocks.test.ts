@@ -209,6 +209,19 @@ describe("itemsToBlocks — flat shape", () => {
     }
   });
 
+  it("names the sending session on an agent-sent user message", () => {
+    const sent = {
+      ...userMessage("resp_sent", "Run the tests"),
+      source_session_id: "conv_parent",
+      source_agent_name: "Claude",
+    };
+    expect(itemsToBlocks([sent])).toMatchObject([
+      { type: "user_message", source: { sessionId: "conv_parent", agentName: "Claude" } },
+    ]);
+    const [typed] = itemsToBlocks([userMessage("resp_typed", "Run the tests")]);
+    expect(typed).not.toHaveProperty("source");
+  });
+
   it("keeps legacy teammate handbacks out of the transcript while preserving user discussion", () => {
     const envelope =
       '<teammate-message teammate_id="reviewer" summary="Review complete">Ready</teammate-message>';

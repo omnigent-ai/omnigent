@@ -4085,6 +4085,30 @@
             "title": "Role",
             "type": "string"
           },
+          "source_agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Display name of the agent in `source_session_id`, stamped by the server, e.g. `\"Claude\"`.",
+            "title": "Source Agent Name"
+          },
+          "source_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Session whose agent sent this user message into a child session, e.g. `\"conv_parent123\"`. The server keeps it only for a message the parent's runner sent to that parent's child; a single-user server, with no other caller to forge it, skips that proof.",
+            "title": "Source Session Id"
+          },
           "stream_message_id": {
             "anyOf": [
               {

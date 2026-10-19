@@ -89,6 +89,7 @@ from omnigent.native.failure_telemetry import (
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
+    public_agent_name,
 )
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.policies.types import EvaluationContext
@@ -8051,6 +8052,8 @@ def _extract_persistent_item_from_sse(
             item_type,
         )
         return None
+    if isinstance(data, MessageData):
+        data = data.without_source()
 
     return NewConversationItem(
         type=item_type,
@@ -10494,6 +10497,80 @@ def _require_cost_control_label_authority(
     )
 
 
+_MESSAGE_SOURCE_FIELDS: Final = ("source_session_id", "source_agent_name")
+
+
+def _runner_token_binds(
+    tunnel_token: str | None,
+    runner_id: str | None,
+    allowed_tunnel_tokens: frozenset[str] | None,
+) -> bool:
+    """Whether a runner tunnel token is allow-listed or bound to ``runner_id``."""
+    token = (tunnel_token or "").strip()
+    if not token:
+        return False
+    if allowed_tunnel_tokens is not None and token in allowed_tunnel_tokens:
+        return True
+    return runner_id is not None and token_bound_runner_id(token) == runner_id
+
+
+def _message_source_fields(data: Mapping[str, Any]) -> dict[str, str] | None:
+    """Return the sender fields :func:`_resolve_message_source` kept on *data*."""
+    fields = {
+        key: value
+        for key in _MESSAGE_SOURCE_FIELDS
+        if isinstance(value := data.get(key), str) and value
+    }
+    return fields or None
+
+
+async def _resolve_message_source(
+    body: SessionEventInput,
+    *,
+    parent_session_id: str | None,
+    speaks_for: Callable[[Conversation], bool],
+    conversation_store: ConversationStore,
+    agent_store: AgentStore,
+) -> SessionEventInput:
+    """
+    Keep a user message's sender session only when that session's runner sent it.
+
+    Agents message their own child sessions, so the claimed sender must be the
+    receiving session's parent and *speaks_for* must accept the sender. An
+    unproven claim is dropped rather than rejected, so delivery never depends
+    on it. The sender's display name always comes from the server's own records.
+
+    :param body: Event to deliver; returned unchanged unless it is a message
+        that carries a source field.
+    :param parent_session_id: Parent of the receiving session, or ``None``.
+    :param speaks_for: Whether the caller may act for a sender session, e.g.
+        its runner tunnel token is bound to that session's runner.
+    :param conversation_store: Store to load the sender session from.
+    :param agent_store: Store to read the sender's agent name from.
+    :returns: The event with only verified source fields.
+    """
+    if body.type != "message" or not any(key in body.data for key in _MESSAGE_SOURCE_FIELDS):
+        return body
+    data = {key: value for key, value in body.data.items() if key not in _MESSAGE_SOURCE_FIELDS}
+    claimed = body.data.get("source_session_id")
+    source = (
+        await asyncio.to_thread(conversation_store.get_conversation, claimed)
+        if body.data.get("role") == "user"
+        and isinstance(claimed, str)
+        and claimed == parent_session_id
+        else None
+    )
+    if source is not None and speaks_for(source):
+        data["source_session_id"] = source.id
+        agent_name = source.sub_agent_name
+        if not agent_name and source.agent_id:
+            agent = await asyncio.to_thread(agent_store.get, source.agent_id)
+            agent_name = agent.name if agent is not None else None
+        if agent_name:
+            data["source_agent_name"] = public_agent_name(agent_name)
+    return body.model_copy(update={"data": data})
+
+
 def _persist_stored_session_bundle(
     conversation_store: ConversationStore,
     artifact_store: ArtifactStore,
@@ -11992,6 +12069,7 @@ __all__ = [
     "_mcp_tool_result",
     "_merge_claude_permission_launch_args",
     "_merge_pending_file_blocks",
+    "_message_source_fields",
     "_message_text",
     "_model_options_from_wire",
     "_model_usage_bucket",
@@ -12086,10 +12164,12 @@ __all__ = [
     "_require_permission_mode_forward",
     "_resolve_harness",
     "_resolve_llm_model",
+    "_resolve_message_source",
     "_resolve_skill_meta_text_via_runner",
     "_resolve_subagent_spec",
     "_resource_event_item_from_sse",
     "_routing_decision_item_from_sse",
+    "_runner_token_binds",
     "_same_provider_family",
     "_same_provider_family_impl",
     "_seed_missing_title",

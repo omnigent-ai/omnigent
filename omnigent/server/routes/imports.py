@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from omnigent.db.utils import builtin_agent_id
 from omnigent.db.workspace_cache import WorkspaceScopedCache
-from omnigent.entities import NewConversationItem, parse_item_data
+from omnigent.entities import MessageData, NewConversationItem, parse_item_data
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import HostImportLocalByIdFrame, HostImportLocalFrame, encode_host_frame
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
@@ -73,6 +73,9 @@ class ImportItemInput(BaseModel):
         """Validate the type-specific payload and return a new item entity."""
         try:
             data = parse_item_data(self.type, self.data)
+            if isinstance(data, MessageData):
+                # A transcript cannot prove which session sent a message.
+                data = data.without_source()
             return NewConversationItem(type=self.type, response_id=self.response_id, data=data)
         except (TypeError, ValueError) as exc:
             raise OmnigentError(

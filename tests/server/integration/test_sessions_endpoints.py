@@ -723,6 +723,76 @@ async def test_native_transcript_preserves_browser_title_preference(
                 pending_inputs.resolve(session_id, pending["pending_id"])
 
 
+async def test_native_child_keeps_agent_sender_through_transcript_echo(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parent's send to a native child keeps its sender once the transcript echoes it."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+
+    content = [{"type": "input_text", "text": "summarize the logs"}]
+    monkeypatch.setattr(
+        sessions_module,
+        "_ensure_native_terminal_ready",
+        AsyncMock(return_value=_NativeTerminalEnsureOutcome(error=None)),
+    )
+    monkeypatch.setattr(
+        sessions_module, "_ensure_runner_session_initialized", AsyncMock(return_value=True)
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={})),
+        base_url="http://runner",
+    ) as runner:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(
+            "omnigent.server.routes._sessions.orchestration._get_runner_client",
+            AsyncMock(return_value=runner),
+        )
+        agent = await create_test_agent(client, name="claude-native-ui")
+        parent = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+        assert parent.status_code == 201, parent.text
+        parent_id = parent.json()["id"]
+        child = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "parent_session_id": parent_id,
+                "labels": {"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"},
+            },
+        )
+        assert child.status_code == 201, child.text
+        child_id = child.json()["id"]
+        try:
+            posted = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={
+                    "type": "message",
+                    "data": {"role": "user", "content": content, "source_session_id": parent_id},
+                },
+            )
+            assert posted.status_code == 202, posted.text
+            assert pending_inputs.has_pending(child_id)
+            echoed = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={
+                    "type": "external_conversation_item",
+                    "data": {
+                        "item_type": "message",
+                        "item_data": {"role": "user", "content": content},
+                    },
+                },
+            )
+            assert echoed.status_code == 202, echoed.text
+            items = await client.get(f"/v1/sessions/{child_id}/items")
+            [message] = [item for item in items.json()["data"] if item["type"] == "message"]
+            assert message.get("source_session_id") == parent_id
+            assert message.get("source_agent_name") == "Claude"
+        finally:
+            for pending in pending_inputs.snapshot_for(child_id):
+                pending_inputs.resolve(child_id, pending["pending_id"])
+
+
 async def test_native_message_repeat_with_same_stable_id_forwards_once(
     client: httpx.AsyncClient,
     app: Any,

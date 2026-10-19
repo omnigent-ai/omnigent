@@ -40,6 +40,10 @@ export interface MessageItem extends BaseItem {
   interrupted?: boolean;
   /** Native live-preview stream finalized by this persisted assistant message. */
   stream_message_id?: string;
+  /** Parent session whose agent sent this user message; server-verified. */
+  source_session_id?: string;
+  /** Display name of that sending agent, e.g. "Claude Code". */
+  source_agent_name?: string;
 }
 
 export interface FunctionCallItem extends BaseItem {

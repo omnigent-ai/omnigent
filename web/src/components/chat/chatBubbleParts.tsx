@@ -14,6 +14,7 @@ import {
 } from "react";
 import {
   ArrowUpIcon,
+  BotIcon,
   CheckIcon,
   ClockIcon,
   CopyIcon,
@@ -55,7 +56,9 @@ import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
 import { cn } from "@/lib/utils";
 import { mentionItemPath, type MentionItem } from "@/lib/composerMentions";
-import type { ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
+import type { ImageContentBlock, MessageContentBlock, MessageSource } from "@/lib/blocks";
+import { Link, useLocation } from "@/lib/routing";
+import { sessionNavigationSearch } from "@/lib/sessionNavigation";
 import {
   attachmentLabel,
   ELICITATION_RESPONSE_PREFIX,
@@ -709,6 +712,21 @@ function useCopyMessageLink(messageId: string | null): {
   return { isLinkCopied, handleCopyLink };
 }
 
+/** Names the agent session that sent a user message, linking back to it. */
+function MessageSourceLabel({ source }: { source: MessageSource }) {
+  const search = sessionNavigationSearch(useLocation().search);
+  return (
+    <Link
+      to={{ pathname: `/c/${encodeURIComponent(source.sessionId)}`, search }}
+      data-testid="message-source"
+      className="flex items-center gap-1 pb-1 text-[11px] leading-4 text-muted-foreground hover:text-foreground hover:underline"
+    >
+      <BotIcon size={12} aria-hidden />
+      From {source.agentName ?? "parent session"}
+    </Link>
+  );
+}
+
 function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // Scoped so a side-chat bubble builds attachment URLs against the CHILD, not
   // the main conversation the root store projects.
@@ -761,6 +779,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       className={cn("max-w-[640px]", bubble.pending && "animate-user-message-enter")}
     >
       <div className="ml-auto flex w-fit max-w-full flex-col items-end">
+        {bubble.source && <MessageSourceLabel source={bubble.source} />}
         {/* w-fit + ml-auto shrink-wrap the row so the author avatar sits
             immediately left of the right-aligned bubble. */}
         <div className="flex w-fit max-w-full items-center gap-1.5">

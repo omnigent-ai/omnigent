@@ -235,6 +235,8 @@ export interface UserMessageBlock {
   ctx: BlockContext;
   /** Same shape as `MessageItem.content` from the items API. */
   content: MessageContentBlock[];
+  /** Set when another session's agent sent this message, not a person. */
+  source?: MessageSource;
   /**
    * Stable React key for the rendered bubble, set ONLY when this block
    * was promoted from an optimistic `pendingUserMessages` entry on
@@ -245,6 +247,28 @@ export interface UserMessageBlock {
    * Absent on blocks hydrated from history (`items`), which mount fresh.
    */
   stableKey?: string;
+}
+
+/** The session (and its agent) that sent a user message on a person's behalf. */
+export interface MessageSource {
+  sessionId: string;
+  agentName?: string;
+}
+
+/**
+ * Read the server-verified sender of a user message from its wire fields.
+ *
+ * @param data - A message item or `session.input.consumed` item payload.
+ * @returns The sender, or `undefined` for a message a person typed.
+ */
+export function messageSourceFromWire(data: {
+  source_session_id?: unknown;
+  source_agent_name?: unknown;
+}): MessageSource | undefined {
+  const sessionId = data.source_session_id;
+  if (typeof sessionId !== "string" || !sessionId) return undefined;
+  const agentName = data.source_agent_name;
+  return typeof agentName === "string" && agentName ? { sessionId, agentName } : { sessionId };
 }
 
 // ── Tool calls ───────────────────────────────────────────

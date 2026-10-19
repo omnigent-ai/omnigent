@@ -22,6 +22,7 @@ import type {
   AnyBlock,
   ErrorBlock,
   MessageContentBlock,
+  MessageSource,
   NativeToolBlock,
   RoutingDecisionBlock,
   ToolExecution,
@@ -174,6 +175,8 @@ export type Bubble =
       shellCommand?: string;
       /** Human author email, when known. */
       createdBy?: string;
+      /** The session whose agent sent this message, when not a person. */
+      source?: MessageSource;
       /** Epoch seconds of this message, when known — server-stamped from
        *  history, client-stamped while live. Display-only. */
       createdAtS?: number;
@@ -873,6 +876,7 @@ function walkBubbles(
           b.type === "user_message" ? b.content : [{ type: "input_text", text: `!${b.input}` }],
         ...(b.type === "terminal_command" ? { shellCommand: b.input } : {}),
         ...(b.ctx.createdBy !== undefined ? { createdBy: b.ctx.createdBy } : {}),
+        ...(b.type === "user_message" && b.source !== undefined ? { source: b.source } : {}),
         // Server stamp on cold load, client stamp while live — display
         // only, so either clock is correct here.
         ...(b.ctx.createdAtS !== undefined || b.ctx.clientCreatedAtS !== undefined
@@ -1865,6 +1869,8 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
       Boolean(a.pending) !== Boolean(b.pending) ||
       Boolean(a.awaitingAgent) !== Boolean(b.awaitingAgent) ||
       a.createdBy !== b.createdBy ||
+      a.source?.sessionId !== b.source?.sessionId ||
+      a.source?.agentName !== b.source?.agentName ||
       a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||
       a.shellCommand !== b.shellCommand ||

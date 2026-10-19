@@ -230,12 +230,16 @@ class DrainedInput:
     :param interrupted: Whether the person interrupted the turn while this
         entry was queued. Preserved when the entry is restored so it remains
         hidden and settles quietly as an uncertain entry.
+    :param message_source: Verified sender fields of an agent-sent message,
+        e.g. ``{"source_session_id": "conv_parent", "source_agent_name":
+        "Claude"}``; applied to the persisted message.
     """
 
     pending_id: str
     content: list[dict[str, Any]]
     created_by: str | None = None
     stable_id: str | None = None
+    message_source: dict[str, str] | None = None
     background_titles_enabled: bool = True
     interrupted: bool = False
     # Reconstructed entries without original delivery metadata must remain unknown.
@@ -303,12 +307,15 @@ class _Entry:
         pending, is left out of the snapshot, and a later match that jumps over
         it must not call it undelivered. A mirror of its own text still drains
         it normally: the agent did record it.
+    :param message_source: Verified sender fields of an agent-sent message,
+        see :class:`DrainedInput`.
     """
 
     pending_id: str
     content: list[dict[str, Any]]
     created_by: str | None = None
     stable_id: str | None = None
+    message_source: dict[str, str] | None = None
     background_titles_enabled: bool = True
     # Lambda (not ``_now`` directly) so a monkeypatched ``_now`` is
     # resolved at construction time rather than bound at class def.
@@ -362,6 +369,7 @@ def record(
     stable_id: str | None = None,
     *,
     background_titles_enabled: bool = True,
+    message_source: dict[str, str] | None = None,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -385,6 +393,8 @@ def record(
         directly as the persisted item's id so the store-level append is
         idempotent across client retries. ``None`` for clients that do not
         send one.
+    :param message_source: Verified sender fields of an agent-sent message,
+        see :class:`DrainedInput`.
     :returns: The index-assigned pending id, e.g. ``"pending_a1b2c3"``.
 
     Beyond :data:`_MAX_ENTRIES_PER_CONVERSATION` unheld entries the oldest
@@ -408,6 +418,7 @@ def record(
             created_by=created_by,
             stable_id=stable_id,
             background_titles_enabled=background_titles_enabled,
+            message_source=message_source,
         )
         entries = _pending.setdefault(conversation_id, {})
         entries[pending_id] = entry
@@ -748,6 +759,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         content=copy.deepcopy(drained.content),
         created_by=drained.created_by,
         stable_id=drained.stable_id,
+        message_source=drained.message_source,
         background_titles_enabled=drained.background_titles_enabled,
         interrupted=drained.interrupted,
         input_enqueued_at_ms=drained.input_enqueued_at_ms,
@@ -961,6 +973,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         content=copy.deepcopy(entry.content),
         created_by=entry.created_by,
         stable_id=entry.stable_id,
+        message_source=entry.message_source,
         background_titles_enabled=entry.background_titles_enabled,
         interrupted=entry.interrupted,
         input_enqueued_at_ms=entry.input_enqueued_at_ms,

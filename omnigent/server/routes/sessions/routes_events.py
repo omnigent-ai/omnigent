@@ -54,7 +54,7 @@ from omnigent.host.frames import (
     workspace_missing_message as _workspace_missing_message,
 )
 from omnigent.mcp_selection import mcp_selection_revision, selected_mcp_spec
-from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.launch_failure import (
     CODEX_COMPACTION_MODEL_FAILED,
     classify_native_turn_error,
@@ -219,7 +219,9 @@ from omnigent.server.routes._sessions.helpers import (
     _require_external_status_forward,
     _require_filesystem_attachment_harness,
     _resolve_harness,
+    _resolve_message_source,
     _response_agent_name_from_store,
+    _runner_token_binds,
     _session_status_from_cache,
     _signal_harness_elicitation_resolved_by_id,
     _stop_session_via_runner,
@@ -754,13 +756,12 @@ def register_events_routes(
     ) -> bool:
         if isinstance(request, _RunnerEventContext):
             return conv.runner_id == request.runner_id
-        token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
-        if not token:
-            return False
-        if runner_tunnel_tokens is not None and token in runner_tunnel_tokens:
-            return True
         runner_id = getattr(conv, "runner_id", None)
-        return isinstance(runner_id, str) and token_bound_runner_id(token) == runner_id
+        return _runner_token_binds(
+            request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER),
+            runner_id if isinstance(runner_id, str) else None,
+            runner_tunnel_tokens,
+        )
 
     async def _authorized_conversation(
         request: Request | _RunnerEventContext, session_id: str
@@ -1049,6 +1050,16 @@ def register_events_routes(
                 pass
             else:
                 created_by = body_created_by
+        body = await _resolve_message_source(
+            body,
+            parent_session_id=conv.parent_conversation_id,
+            # Single-user servers have no other identity to forge a sender for.
+            speaks_for=lambda source: (
+                permission_store is None or _has_runner_created_by_authority(request, source)
+            ),
+            conversation_store=conversation_store,
+            agent_store=agent_store,
+        )
         # Validate event type at the route boundary. Anything not in
         # ``_ALLOWED_EVENT_TYPES`` is a client mistake — failing here
         # is far better than silently persisting an item the agent

@@ -31,6 +31,7 @@ import {
   type ToolResultBlock,
   type UserMessageBlock,
   answeredElicitationItemId,
+  messageSourceFromWire,
   slashCommandEchoItemId,
   slashCommandEchoText,
   structuredErrorFields,
@@ -330,9 +331,11 @@ function isCompactionSummaryMessage(item: MessageItem): boolean {
 }
 
 function userMessageToBlock(item: MessageItem): UserMessageBlock {
+  const source = messageSourceFromWire(item);
   return {
     type: "user_message",
     ctx: ctxFor(item),
+    ...(source !== undefined ? { source } : {}),
     // Forward the full content array verbatim so the renderer can
     // pluck text, images, and files without the translator imposing
     // an interpretation. Cast restricts to the user-input subset

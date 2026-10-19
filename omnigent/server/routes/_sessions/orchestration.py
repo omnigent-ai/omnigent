@@ -296,6 +296,7 @@ from omnigent.server.routes._sessions.helpers import (
     _mcp_input_required_response,
     _mcp_ok_response,
     _merge_pending_file_blocks,
+    _message_source_fields,
     _message_text,
     _model_usage_bucket,
     _native_coding_agent_for_session,
@@ -3000,6 +3001,11 @@ async def _persist_external_conversation_item_unlocked(
         if drained is not None:
             cleared_pending_id = drained.pending_id
             item = _merge_pending_file_blocks(item, drained.content)
+            # A positional guess cannot vouch for who sent this message.
+            if drained.message_source is not None and match_method != "fifo_fallback":
+                item = item.model_copy(
+                    update={"data": item.data.model_copy(update=drained.message_source)}
+                )
             # Apply the original sender's identity recorded at POST time.
             # The transcript forwarder is the single writer here and has no
             # auth context, so the persisted item would otherwise have
@@ -3157,6 +3163,9 @@ def _new_external_conversation_item(
 ) -> NewConversationItem:
     """Parse an external item event, keyed by its ``source_id`` when it has one."""
     item = _parse_external_conversation_item(body)
+    if isinstance(item.data, MessageData):
+        # Only a verified queued send can name a sender; see the pending-input drain.
+        item = item.model_copy(update={"data": item.data.without_source()})
     return_id = body.data.get("subagent_return_id")
     if (
         isinstance(return_id, str)
@@ -3369,7 +3378,9 @@ async def _settle_undelivered_native_input(
     item = NewConversationItem(
         type="message",
         response_id=response_id or generate_task_id(),
-        data=MessageData(role="user", content=drained.content, user_authored=True),
+        data=MessageData(role="user", content=drained.content, user_authored=True).model_copy(
+            update=drained.message_source or {}
+        ),
         created_by=drained.created_by,
         stable_id=drained.stable_id,
     )
@@ -3481,7 +3492,9 @@ def _build_skipped_native_items(
             NewConversationItem(
                 type="message",
                 response_id=turn_id,
-                data=MessageData(role="user", content=skipped.content, user_authored=True),
+                data=MessageData(
+                    role="user", content=skipped.content, user_authored=True
+                ).model_copy(update=skipped.message_source or {}),
                 created_by=skipped.created_by,
                 stable_id=uuid.uuid5(
                     uuid.NAMESPACE_URL,
@@ -7797,6 +7810,7 @@ async def _dispatch_session_event_to_runner_impl(
                 created_by=created_by,
                 stable_id=web_stable_id,
                 background_titles_enabled=background_titles_enabled,
+                message_source=_message_source_fields(body.data),
             )
             if queues_message
             else None

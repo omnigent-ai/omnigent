@@ -575,6 +575,20 @@ describe("buildBubbles — bubble grouping", () => {
     expect(user.createdBy).toBeUndefined();
   });
 
+  it("propagates a user_message block's source onto the user bubble", () => {
+    const source = { sessionId: "conv_parent", agentName: "Claude" };
+    const blocks: AnyBlock[] = [
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "u1", responseId: "resp_1" }),
+        content: [{ type: "input_text", text: "Hello" }],
+        source,
+      },
+    ];
+    const user = buildBubbles(blocks, null)[0] as Extract<Bubble, { kind: "user" }>;
+    expect(user.source).toEqual(source);
+  });
+
   it("propagates a user_message block's stableKey onto its bubble", () => {
     // A block promoted from an optimistic bubble on session.input.consumed
     // carries stableKey = the optimistic temp id; buildBubbles must surface
@@ -3626,6 +3640,21 @@ describe("bubblesEqual — React.memo comparator", () => {
     expect(bubblesEqual(alice, bob)).toBe(false);
     expect(bubblesEqual(none, alice)).toBe(false);
     expect(bubblesEqual(alice, alice)).toBe(true);
+  });
+
+  it("reports not-equal when a user bubble's source differs", () => {
+    const content: MessageContentBlock[] = [{ type: "input_text", text: "Hello" }];
+    const unnamed: Bubble = { kind: "user", itemId: "u1", content, source: { sessionId: "c1" } };
+    const named: Bubble = {
+      kind: "user",
+      itemId: "u1",
+      content,
+      source: { sessionId: "c1", agentName: "Claude" },
+    };
+    const typed: Bubble = { kind: "user", itemId: "u1", content };
+    expect(bubblesEqual(typed, unnamed)).toBe(false);
+    expect(bubblesEqual(unnamed, named)).toBe(false);
+    expect(bubblesEqual(named, { ...named, source: { ...named.source! } })).toBe(true);
   });
 });
 

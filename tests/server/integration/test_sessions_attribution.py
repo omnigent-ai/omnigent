@@ -26,6 +26,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_EDIT
 from omnigent.server.routes._auth_helpers import attribution_user
+from omnigent.server.routes._sessions.helpers import _runner_token_binds
 from omnigent.server.routes.sessions import _build_new_item
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -557,3 +558,199 @@ async def test_external_conversation_item_direct_terminal_attributes_request_act
     # If this is None, _persist_external_conversation_item stopped reading
     # created_by from the request and direct terminal typing has no author label.
     assert persisted.created_by == "alice@example.com"
+
+
+# ── Agent-sent messages: the server keeps only a verified sender ─────────────
+
+
+def _seed_parent_and_child(db_uri: str, agent_id: str) -> tuple[str, str]:
+    """Create a parent session on *agent_id* and an EDIT-shared child."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    parent = conv_store.create_conversation(agent_id=agent_id)
+    child = conv_store.create_conversation(parent_conversation_id=parent.id)
+    perm_store = SqlAlchemyPermissionStore(db_uri)
+    perm_store.ensure_user("alice@example.com")
+    for session_id in (parent.id, child.id):
+        perm_store.grant("alice@example.com", session_id, LEVEL_EDIT)
+    return parent.id, child.id
+
+
+@pytest.fixture()
+def _stub_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Accept forwarded messages without a live runner."""
+    from omnigent.server.routes import sessions as sessions_mod
+
+    async def _stub(*_: Any, **__: Any) -> _CaptureRunnerClient:
+        return _CaptureRunnerClient()
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", _stub)
+    monkeypatch.setattr(sessions_mod, "_ensure_runner_relay_ready", _noop_relay_ready)
+
+
+@pytest.mark.parametrize(
+    "token,runner_id,allow_list,binds",
+    [
+        (_RUNNER_BINDING_TOKEN, token_bound_runner_id(_RUNNER_BINDING_TOKEN), None, True),
+        (_RUNNER_BINDING_TOKEN, "runner_elsewhere", None, False),
+        ("pool-token", "runner_elsewhere", frozenset({"pool-token"}), True),
+        ("other-token", None, frozenset({"pool-token"}), False),
+        (" ", None, frozenset({" "}), False),
+        (None, None, None, False),
+    ],
+    ids=["bound", "bound-elsewhere", "allow-listed", "not-allow-listed", "blank", "missing"],
+)
+def test_runner_token_binds(
+    token: str | None, runner_id: str | None, allow_list: frozenset[str] | None, binds: bool
+) -> None:
+    """A runner token speaks for a session when allow-listed or bound to its runner."""
+    assert _runner_token_binds(token, runner_id, allow_list) is binds
+
+
+def _agent_message(text: str, **source: str) -> dict[str, Any]:
+    """Return a user message event body carrying the given sender fields."""
+    return {
+        "type": "message",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+            **source,
+        },
+    }
+
+
+@pytest.mark.usefixtures("_stub_runner")
+@pytest.mark.asyncio
+async def test_post_event_keeps_parent_runner_message_source(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """The parent's runner may name the parent as sender; the server names its agent."""
+    agent = await create_test_agent(auth_client, name="claude-native-ui", user="alice@example.com")
+    parent_id, child_id = _seed_parent_and_child(db_uri, agent["id"])
+    runner_headers = _bind_runner(db_uri, parent_id)
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{child_id}/events",
+        json=_agent_message(
+            "do the task", source_session_id=parent_id, source_agent_name="Mallory"
+        ),
+        headers={"X-Forwarded-Email": "alice@example.com", **runner_headers},
+    )
+    assert resp.status_code == 202, resp.text
+
+    items = await asyncio.to_thread(SqlAlchemyConversationStore(db_uri).list_items, child_id)
+    [persisted] = items.data
+    assert isinstance(persisted.data, MessageData)
+    assert persisted.data.source_session_id == parent_id
+    assert persisted.data.source_agent_name == "Claude"
+
+
+@pytest.mark.parametrize("claim", ["no_runner_proof", "not_the_parent", "parent_on_other_runner"])
+@pytest.mark.usefixtures("_stub_runner")
+@pytest.mark.asyncio
+async def test_post_event_drops_unverified_message_source(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    claim: str,
+) -> None:
+    """A sender claim without the parent's runner proof is dropped, not rejected."""
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    parent_id, child_id = _seed_parent_and_child(db_uri, agent["id"])
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    if claim == "no_runner_proof":
+        source_id, headers = parent_id, {}
+    else:
+        # The token's runner really drives this unrelated session, not the child's parent.
+        unrelated_id = conv_store.create_conversation(agent_id=agent["id"]).id
+        headers = _bind_runner(db_uri, unrelated_id)
+        source_id = unrelated_id if claim == "not_the_parent" else parent_id
+        if claim == "parent_on_other_runner":
+            assert conv_store.set_runner_id(parent_id, "runner_elsewhere") is True
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{child_id}/events",
+        json=_agent_message("hi", source_session_id=source_id, source_agent_name="Claude Code"),
+        headers={"X-Forwarded-Email": "alice@example.com", **headers},
+    )
+    assert resp.status_code == 202, resp.text
+
+    items = await asyncio.to_thread(SqlAlchemyConversationStore(db_uri).list_items, child_id)
+    [persisted] = items.data
+    assert (
+        persisted.data.model_dump().keys().isdisjoint({"source_session_id", "source_agent_name"})
+    )
+
+
+@pytest.mark.parametrize("runner_proof", [True, False])
+@pytest.mark.usefixtures("_stub_runner")
+@pytest.mark.asyncio
+async def test_initial_items_keep_only_verified_message_source(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    runner_proof: bool,
+) -> None:
+    """``sys_session_create``'s first message keeps its sender only with the parent's proof."""
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    parent_id, _ = _seed_parent_and_child(db_uri, agent["id"])
+    runner_headers = _bind_runner(db_uri, parent_id) if runner_proof else {}
+
+    resp = await auth_client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent_id,
+            "initial_items": [_agent_message("kick off", source_session_id=parent_id)],
+        },
+        headers={"X-Forwarded-Email": "alice@example.com", **runner_headers},
+    )
+    assert resp.status_code == 201, resp.text
+
+    items = await asyncio.to_thread(
+        SqlAlchemyConversationStore(db_uri).list_items, resp.json()["id"]
+    )
+    [persisted] = items.data
+    assert isinstance(persisted.data, MessageData)
+    if runner_proof:
+        assert persisted.data.source_session_id == parent_id
+        assert persisted.data.source_agent_name == agent["name"]
+    else:
+        assert persisted.data.source_session_id is None
+        assert persisted.data.source_agent_name is None
+
+
+@pytest.mark.asyncio
+async def test_external_conversation_item_strips_forwarded_message_source(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A transcript forwarder cannot name a sender for terminal-typed input."""
+    from omnigent.runtime import pending_inputs
+
+    agent = await create_test_agent(auth_client, user="alice@example.com")
+    parent_id, child_id = _seed_parent_and_child(db_uri, agent["id"])
+    pending_inputs.reset_for_tests()
+
+    resp = await auth_client.post(
+        f"/v1/sessions/{child_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi from terminal"}],
+                    "source_session_id": parent_id,
+                    "source_agent_name": "Claude Code",
+                },
+                "response_id": "resp_terminal_forged",
+            },
+        },
+        headers={"X-Forwarded-Email": "alice@example.com", **_bind_runner(db_uri, child_id)},
+    )
+    assert resp.status_code == 202, resp.text
+
+    items = await asyncio.to_thread(SqlAlchemyConversationStore(db_uri).list_items, child_id)
+    [persisted] = items.data
+    assert isinstance(persisted.data, MessageData)
+    assert persisted.data.source_session_id is None
+    assert persisted.data.source_agent_name is None
