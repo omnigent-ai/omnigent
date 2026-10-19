@@ -146,6 +146,11 @@ class _ConversationStore:
             return self.persisted_by_stable_id[item_id]
         return next((item for item in self.appended_items if item.id == item_id), None)
 
+    def find_web_submission_item_id(self, conversation_id: str, stable_id: str) -> str | None:
+        """Resolve messages recorded in this double's stable-id map."""
+        item = self.get_item(conversation_id, stable_id)
+        return item.id if item is not None and item.type == "message" else None
+
     def list_conversations(
         self,
         *,
