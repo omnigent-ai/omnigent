@@ -260,9 +260,6 @@ export function FilesPanel({
   const runnerWentOffline = useChatStore(
     (s) => s.conversationId === conversationId && s.sessionStatus === "failed",
   );
-  // An idle-stopped managed sandbox is asleep, not failed: its status stays
-  // idle, and with neither a runner nor a host to read the workspace from, the
-  // lists can't load. Say so rather than "No files in workspace".
   const sandboxAsleep = useWorkspaceAsleep(conversationId);
   // The runner is offline but the host still holds the workspace on disk,
   // so the server serves the panel by reading the workspace over the host
@@ -464,6 +461,11 @@ export function FilesPanel({
     : null;
   const dataReady = flatView ? changedQuery.data !== undefined : allFilesQuery.data !== undefined;
   const handleScroll = useScrollRestore(scrollRef, scrollKey, dataReady);
+  // An idle-stopped managed sandbox is asleep, not failed: its status stays
+  // idle, and with neither a runner nor a host to read the workspace from, the
+  // lists can't load. Say so rather than "No files in workspace"; a list
+  // cached before it slept still renders.
+  const showAsleepHint = sandboxAsleep && !dataReady;
 
   return (
     <div
@@ -653,9 +655,8 @@ export function FilesPanel({
         )}
         onScroll={handleScroll}
       >
-        {sandboxAsleep ? (
-          <RunnerAsleepHint />
-        ) : flatView ? (
+        {showAsleepHint && <RunnerAsleepHint />}
+        {!showAsleepHint && flatView && (
           <FlatFileList
             files={changedQuery.data?.data}
             isLoading={changedQuery.isLoading}
@@ -669,7 +670,8 @@ export function FilesPanel({
             conversationId={conversationId}
             runnerWentOffline={runnerWentOffline}
           />
-        ) : (
+        )}
+        {!showAsleepHint && !flatView && (
           <FolderTree
             files={allFilesQuery.data?.data}
             isLoading={allFilesQuery.isLoading}
