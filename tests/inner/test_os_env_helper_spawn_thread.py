@@ -1,21 +1,7 @@
-"""The OS-env helper must outlive the thread that started it (#8956).
+"""Verify helper ownership survives request threads and ends at client teardown.
 
-Under ``linux_bwrap`` the sandbox argv carries ``--die-with-parent``, which sets
-``PR_SET_PDEATHSIG``: the kernel kills the helper when the *thread* that spawned it
-exits. ``run_sync_on_thread`` runs every helper request on a fresh short-lived
-thread, so spawning inline killed the helper as soon as the first request returned.
-The next request paid a whole bwrap + interpreter startup in a new
-``omnigent-osenv-*`` scratch directory, and ``start_in_scratch`` state did not
-survive from one request to the next.
-
-These tests pin the fix: the helper is started from a thread the client owns, and
-that thread stays alive until ``close()`` / ``_stop_locked()`` retires it.
-
-- The first test is platform-neutral and asserts the mechanism itself: the
-  ``Popen`` happens on a thread that outlives the request, and consecutive
-  requests reuse the one helper process.
-- The second is the Linux/bwrap regression the issue asks for: two consecutive
-  requests keep the same helper process (same pid, same scratch dir).
+Linux Bubblewrap binds helper lifetime to its spawning thread. Cross-platform
+checks verify owner lifetime; the Linux case also checks process and scratch-dir reuse.
 """
 
 from __future__ import annotations
@@ -55,14 +41,9 @@ def _inactive_policy() -> SandboxPolicy:
 
 
 def _bwrap_policy(workspace: Path) -> SandboxPolicy:
-    """Resolve an active ``linux_bwrap`` policy a real spec would resolve to.
+    """Resolve a Bubblewrap policy granting workspace writes and package reads.
 
-    The helper is started as ``python -m omnigent.inner.os_env`` with the project
-    root on ``PYTHONPATH`` (see ``_HelperProcessClient._start_locked``), so the
-    sandbox has to be able to *read* that tree: bwrap mounts only ``/usr`` and
-    friends, whatever the cwd is, and the granted roots. Without the grant the
-    helper exits 1 with ``ModuleNotFoundError: omnigent.inner.os_env`` before the
-    request ever reaches it.
+    The helper imports omnigent.inner.os_env from the project root.
 
     :param workspace: Directory the helper may write into.
     :returns: The resolved :class:`SandboxPolicy`.
@@ -79,10 +60,7 @@ def _bwrap_policy(workspace: Path) -> SandboxPolicy:
 
 
 def _request(client: _HelperProcessClient, path: Path) -> dict:
-    """Issue one helper read request through the production thread hop.
-
-    ``run_sync_on_thread`` is what the async surfaces use, and it is the thread it
-    creates — not the client — that a PDEATHSIG-bound helper would die with.
+    """Issue a helper read through the production request-thread hop.
 
     :param client: Helper client under test.
     :param path: File to read.
@@ -94,14 +72,7 @@ def _request(client: _HelperProcessClient, path: Path) -> dict:
 def test_helper_is_spawned_from_a_thread_that_outlives_the_request(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The helper's Popen must not happen on the request's short-lived thread.
-
-    On the base commit the helper is started from inside ``request()``, i.e. on
-    the ``run_sync_on_thread`` worker, so bwrap's ``--die-with-parent`` kills it
-    the moment that worker exits. Recording the spawning thread catches that
-    without needing bwrap on the test host: the recorded thread must still be
-    alive after the request returned, and a second request must reuse the same
-    helper process instead of starting a third thread.
+    """Verify owner-thread lifetime and process reuse without requiring Bubblewrap.
 
     :returns: None.
     """
@@ -141,9 +112,7 @@ def test_helper_is_spawned_from_a_thread_that_outlives_the_request(
         assert client._proc.pid == first_pid, "the helper was replaced between requests"
         assert client._proc.poll() is None, "the helper is no longer running"
 
-        # A helper that dies on its own leaves its owner thread parked even though
-        # the process is gone. The next request must retire that thread, not leak
-        # it, and must start the replacement from a new owner thread.
+        # Replacing a dead helper must also retire its parked owner.
         client._proc.kill()
         client._proc.wait(timeout=5)
 
