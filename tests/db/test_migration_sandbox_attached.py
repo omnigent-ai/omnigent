@@ -28,6 +28,21 @@ def test_attachment_default_and_safe_rollback(tmp_path: Path) -> None:
             0,
         ]
         conn.execute(sa.text("UPDATE hosts SET sandbox_attached = true WHERE name = 'after'"))
+    command.upgrade(config, "no1a2b3c4d5e")
+    with engine.begin() as conn:
+        conn.execute(insert, {"id": bytes.fromhex("03" * 16), "name": "old-writer"})
+        assert (
+            conn.execute(sa.text("SELECT display_name FROM hosts")).scalars().all() == [None] * 3
+        )
+        conn.execute(sa.text("UPDATE hosts SET display_name = 'My project' WHERE name = 'after'"))
+        assert (
+            conn.execute(
+                sa.text("SELECT name FROM hosts WHERE display_name IS NOT NULL")
+            ).scalar_one()
+            == "after"
+        )
+    command.downgrade(config, "nn1a2b3c4d5e")
+    assert "display_name" not in {c["name"] for c in sa.inspect(engine).get_columns("hosts")}
     with pytest.raises(RuntimeError, match="Detach externally owned"):
         command.downgrade(config, "mm1a2b3c4d5e")
     with engine.begin() as conn:
@@ -35,3 +50,26 @@ def test_attachment_default_and_safe_rollback(tmp_path: Path) -> None:
     command.downgrade(config, "mm1a2b3c4d5e")
     assert "sandbox_attached" not in {c["name"] for c in sa.inspect(engine).get_columns("hosts")}
     engine.dispose()
+
+
+@pytest.mark.parametrize("parent", ["no1a2b3c4d5e", "np1a2b3c4d5e", "c8e4f2a6b901"])
+def test_sandbox_schema_merges_with_main(tmp_path: Path, parent: str) -> None:
+    uri = f"sqlite:///{tmp_path / 'merged.db'}"
+    config = _build_alembic_config(uri)
+    command.upgrade(config, parent)
+    command.upgrade(config, "head")
+    engine = sa.create_engine(uri)
+    try:
+        inspector = sa.inspect(engine)
+        assert {"sandbox_attached", "display_name"} <= {
+            column["name"] for column in inspector.get_columns("hosts")
+        }
+        assert "ix_conversation_metadata_host_id" in {
+            index["name"] for index in inspector.get_indexes("omnigent_conversation_metadata")
+        }
+        with engine.connect() as connection:
+            assert connection.execute(
+                sa.text("SELECT version_num FROM alembic_version")
+            ).scalars().all() == ["nq1a2b3c4d5e"]
+    finally:
+        engine.dispose()

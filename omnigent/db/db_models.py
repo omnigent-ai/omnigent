@@ -1324,6 +1324,8 @@ class SqlHost(OmnigentBase):
     # in this schema.
     user_id: Mapped[str] = mapped_column(String(128), nullable=False)
     name: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Owner-assigned label; host.hello continues to update only the registration name.
+    display_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
     # HOST_STATUS: online=1, offline=2).
     status: Mapped[int] = mapped_column(SmallInteger)
