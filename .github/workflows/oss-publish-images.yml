@@ -183,7 +183,7 @@ jobs:
       # the list is a superset, so nothing changes for them.
       - name: Build and push
         id: build-server
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           file: deploy/docker/Dockerfile
@@ -202,7 +202,7 @@ jobs:
       # cache (cached per platform).
       - name: Build and push host image
         id: build-host
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           file: deploy/docker/Dockerfile
@@ -221,7 +221,7 @@ jobs:
       # the shared builder-stage layers from the gha cache.
       - name: Build and push openshell server image
         id: build-openshell
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           file: deploy/docker/Dockerfile
@@ -242,7 +242,7 @@ jobs:
       # the shared builder-stage layers from the gha cache.
       - name: Build and push kubernetes server image
         id: build-kubernetes
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           file: deploy/docker/Dockerfile
@@ -262,7 +262,7 @@ jobs:
       # layers from the gha cache.
       - name: Build and push modal server image
         id: build-modal
-        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           file: deploy/docker/Dockerfile
