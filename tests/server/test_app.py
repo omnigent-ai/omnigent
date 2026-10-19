@@ -2257,6 +2257,7 @@ def _build_minimal_app(
 
     def _capture_router(*args: object, **kwargs: object) -> object:
         captured["callback"] = kwargs.get("on_runner_connect")
+        captured["disconnect"] = kwargs.get("on_runner_disconnect")
         return real_create_router(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(app_module, "create_runner_tunnel_router", _capture_router)
@@ -2270,6 +2271,80 @@ def _build_minimal_app(
         agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
     )
     return app, captured
+
+
+@pytest.mark.asyncio
+async def test_current_tunnel_loss_preserves_owned_predecessor_until_real_loss(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runner.transports.ws_tunnel.frames import TUNNEL_RENEWAL_CAPABILITY, HelloFrame
+    from omnigent.server import shutdown_state
+    from omnigent.server.routes import sessions
+    from tests.server.test_host_registry import FakeWebSocket
+
+    app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
+    registry = app.state.tunnel_registry
+    runner_id = "runner_live_predecessor"
+    [session_id] = _bind_sessions(db_uri, runner_id)
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_session_live_status(session_id, "running")
+    sessions._session_status_cache[session_id] = "running"
+    monkeypatch.setattr(sessions, "RUNNER_DISCONNECT_GRACE_S", 0.0)
+    old = registry.register(
+        runner_id,
+        FakeWebSocket(),
+        HelloFrame(
+            runner_version="test",
+            frame_protocol_version=1,
+            capabilities=[TUNNEL_RENEWAL_CAPABILITY],
+        ),
+    )
+    pending = registry.open_request(runner_id, "accepted", method="POST", path="/command")
+    current = registry.register(
+        runner_id,
+        FakeWebSocket(),
+        HelloFrame(
+            runner_version="test",
+            frame_protocol_version=1,
+            capabilities=[TUNNEL_RENEWAL_CAPABILITY],
+            renewal_permit=old.renewal_permit,
+            continuity_token=old.continuity_token,
+        ),
+    )
+
+    async def settle_timers() -> None:
+        timers = [
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == f"runner-disconnect-grace-{runner_id}"
+        ]
+        await asyncio.gather(*timers)
+
+    try:
+        registry.deregister(runner_id, current, retire=False)
+        assert registry.get(runner_id) is None
+        assert registry.has_live_predecessor(runner_id)
+        await captured["disconnect"](runner_id, current)  # type: ignore[operator]
+        await settle_timers()
+        assert sessions._session_status_cache[session_id] == "running"
+        assert store.get_conversation(session_id).live_status == "running"
+        assert not pending.head_future.done()
+        registry.deregister(runner_id, old, retire=False)
+        with pytest.raises(ConnectionError):
+            await pending.head_future
+        await captured["disconnect"](runner_id, old)  # type: ignore[operator]
+        await settle_timers()
+        assert sessions._session_status_cache[session_id] == "failed"
+        assert shutdown_state.runner_handoff_reason(runner_id) is None
+    finally:
+        registry.deregister(runner_id, old, retire=False)
+        if pending.head_future.done() and not pending.head_future.cancelled():
+            pending.head_future.exception()
+        else:
+            pending.head_future.cancel()
+        sessions._session_status_cache.pop(session_id, None)
 
 
 def _bind_sessions(db_uri: str, runner_id: str, count: int = 1) -> list[str]:

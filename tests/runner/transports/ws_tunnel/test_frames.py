@@ -20,6 +20,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     HelloFrame,
     PingFrame,
     PongFrame,
+    RenewalReadyFrame,
     RequestCancelFrame,
     RequestFrame,
     ResponseBodyFrame,
@@ -33,6 +34,24 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 )
 
 # ── Round-trip per frame kind ────────────────────────────
+
+
+def test_renewal_frames_and_optional_hello_fields_round_trip() -> None:
+    hello = HelloFrame(
+        runner_version="test",
+        frame_protocol_version=1,
+        renewal_permit="permit",
+        continuity_token="process",
+    )
+    for frame in (
+        hello,
+        RenewalReadyFrame("permit", "process"),
+        RenewalReadyFrame(None, "process"),
+    ):
+        assert decode_frame(encode_frame(frame)) == frame
+    legacy = json.loads(encode_frame(HelloFrame(runner_version="old", frame_protocol_version=1)))
+    assert "renewal_permit" not in legacy
+    assert "continuity_token" not in legacy
 
 
 @pytest.mark.parametrize("events", [[], [{}], [{"type": 123}]])
