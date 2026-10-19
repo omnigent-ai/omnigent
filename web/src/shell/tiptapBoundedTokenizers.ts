@@ -22,13 +22,22 @@ function taskListPrefix(source: string): string | null {
   const first = source.slice(start, end);
   if (!TASK_ITEM.test(first)) return null;
   let itemIndent = first.length - first.trimStart().length;
+  let blankStart: number | null = null;
 
   while (end < source.length) {
     start = end + 1;
     end = lineEnd(source, start);
     const line = source.slice(start, end);
-    if (line.trim() === "") continue;
+    if (line.trim() === "") {
+      blankStart ??= start;
+      continue;
+    }
     const indent = line.length - line.trimStart().length;
+    // A blank ends the upstream list unless deeper content follows it.
+    if (blankStart !== null && indent <= itemIndent) {
+      return source.slice(0, blankStart - 1);
+    }
+    blankStart = null;
     if (TASK_ITEM.test(line)) {
       itemIndent = Math.min(itemIndent, indent);
     } else if (indent <= itemIndent) {

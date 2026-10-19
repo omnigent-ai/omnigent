@@ -41,6 +41,11 @@ describe("bounded tokenizer compatibility", () => {
     "- [] missing space\n- [z] invalid\nAfter",
     "- [ ] item\nlazy continuation\n\nAfter",
     "- [ ] item\n\n- [x] separated\n\nAfter",
+    "- [ ] item\n \n\t\n- [x] separated\n\nAfter",
+    "- [ ] parent\n  - [ ] child\n\n  - [x] child two\n\n- [ ] sibling\nAfter",
+    "- [ ] parent\n\n  continuation\n\n  - [ ] child\n\n- [x] sibling\nAfter",
+    "  - [ ] indented\n\n - [x] shallower\n\n  content\nOutside",
+    "- [ ] item\r\n \r\n- [x] sibling\r\nAfter",
     "- [ ] item\n\n\n\nAfter",
     "- [ ] parent\n  - [x] child\n  - [ ] child two\n- [ ] sibling\nAfter",
     "- [ ] parent\n  - [ ] child\n    - [x] grandchild\n  prose\nAfter",
@@ -100,8 +105,15 @@ describe("bounded tokenizer compatibility", () => {
 });
 
 describe("bounded line splitting", () => {
-  it.each([16, 64])("splits only a linear volume of text in the %i KiB CUJ fixture", (kib) => {
-    const source = fixture.repeat(Math.ceil((kib * 1024) / fixture.length));
+  const workloads = [
+    { name: "CUJ fixture", block: fixture },
+    { name: "blank-separated tasks", block: "- [ ] task\n\n" },
+    { name: "whitespace-separated tasks", block: "- [ ] task\n \t\n\n" },
+  ].flatMap((workload) => [16, 64].map((kib) => ({ ...workload, kib })));
+
+  it.each(workloads)("bounds line splitting in $kib KiB of $name", ({ block, kib, name }) => {
+    const repeats = Math.ceil((kib * 1024) / block.length);
+    const source = block.repeat(repeats);
     const split = String.prototype.split;
     let splitCharacters = 0;
     vi.spyOn(String.prototype, "split").mockImplementation(function (this: string, ...args) {
@@ -111,6 +123,10 @@ describe("bounded line splitting", () => {
     });
     const doc = manager.parse(source);
     expect(doc.content?.length).toBeGreaterThan(0);
+    if (name !== "CUJ fixture") {
+      const items = doc.content?.flatMap((node) => (node.type === "taskList" ? node.content! : []));
+      expect(items).toHaveLength(repeats);
+    }
     expect(splitCharacters).toBeLessThan(source.length * 16);
   });
 });
