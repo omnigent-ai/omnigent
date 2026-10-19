@@ -9,6 +9,12 @@ entry plus a missing tmux socket surfaced as ``503 claude_native_*_failed``.
 
 from __future__ import annotations
 
+import contextlib
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -32,6 +38,8 @@ from tests.runner.conftest import (
     _ScriptedHarnessClient,
 )
 from tests.runner.helpers import NullServerClient
+
+_REAL_WAIT_FOR_INPUT_READY = claude_native_bridge.wait_for_input_ready
 
 
 def _native_spec() -> AgentSpec:
@@ -203,8 +211,9 @@ async def test_session_change_heals_dead_registered_missing_tmux_socket(
         timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        ready_timeout_s: float | None = None,
     ) -> None:
-        del timeout_s, auto_confirm, confirm_hint
+        del timeout_s, auto_confirm, confirm_hint, ready_timeout_s
         if not auto_create_calls:
             real_inject(inject_bridge_dir, command=command, timeout_s=1.0)
             raise AssertionError(
@@ -304,8 +313,9 @@ async def test_model_change_heals_before_read_model_env(
         timeout_s: float = 1.0,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        ready_timeout_s: float | None = None,
     ) -> None:
-        del command, timeout_s, auto_confirm, confirm_hint
+        del command, timeout_s, auto_confirm, confirm_hint, ready_timeout_s
         if not auto_create_calls:
             real_inject(inject_bridge_dir, command="/model claude-opus-4-7", timeout_s=1.0)
 
@@ -374,8 +384,9 @@ async def test_session_change_live_pane_does_not_recreate(
         timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        ready_timeout_s: float | None = None,
     ) -> None:
-        del bridge_dir, timeout_s, auto_confirm, confirm_hint
+        del bridge_dir, timeout_s, auto_confirm, confirm_hint, ready_timeout_s
         captured.append(command)
 
     def _ready(bridge_dir: Path) -> bool:
@@ -409,11 +420,14 @@ def _plant_live_claude_pane(
     conv_id: str,
     tmp_path: Path,
     bridge_dir: Path,
+    *,
+    socket_path: Path | None = None,
 ) -> None:
     """Register a live Claude pane advertising a socket that exists."""
-    sock = tmp_path / "omnigent-terminal-live" / "tmux.sock"
-    sock.parent.mkdir(parents=True, exist_ok=True)
-    sock.touch()
+    sock = socket_path or tmp_path / "omnigent-terminal-live" / "tmux.sock"
+    if socket_path is None:
+        sock.parent.mkdir(parents=True, exist_ok=True)
+        sock.touch()
     live = TerminalInstance(
         name="claude",
         session_key="main",
@@ -599,18 +613,35 @@ async def test_recreated_pane_is_waited_for_before_injection(
         monkeypatch.setattr(target, _recreating_launch)
 
     captured: list[str] = []
+    booted = False
+    draft = ""
     # Not ready for the first two polls, as a booting TUI would be.
     readiness = iter([False, False, True])
 
-    monkeypatch.setattr(
-        claude_native_bridge,
-        "inject_slash_command",
-        lambda _bridge_dir, *, command, **_kwargs: captured.append(command),
-    )
+    def _capture(_socket: str, _target: str) -> str:
+        nonlocal booted
+        booted = next(readiness, True)
+        if not booted:
+            return "Claude Code is connecting..."
+        return f"{'─' * 80}\n❯ {draft}\n{'─' * 80}\n"
+
+    def _send(_socket: str, *args: str) -> None:
+        nonlocal draft
+        claude_native_bridge._check_injection_cancelled()
+        assert booted, "a settings key reached the recreated pane before its prompt"
+        if "-l" in args:
+            draft = args[-1]
+            captured.append(draft)
+        elif args[-1] == "Enter":
+            draft = ""
+
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", _capture)
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _send)
+    monkeypatch.setattr(claude_native_bridge, "_confirm_tui_dialog", lambda *_a, **_k: False)
     monkeypatch.setattr(
         claude_native_bridge,
         "claude_pane_ready",
-        lambda _bridge_dir: next(readiness, True),
+        lambda _bridge_dir: pytest.fail("slash controls must use their own bounded prompt gate"),
     )
 
     async with _runner_client(app) as client:
@@ -625,6 +656,101 @@ async def test_recreated_pane_is_waited_for_before_injection(
     assert next(readiness, "exhausted") == "exhausted", (
         "the poll must keep probing until the booting pane reports ready"
     )
+
+
+_CAPTURE_BOOT_INPUT = """\
+import os
+import sys
+import tty
+from pathlib import Path
+tty.setraw(sys.stdin.fileno())
+print("Claude Code is connecting...", flush=True)
+while True:
+    typed = os.read(sys.stdin.fileno(), 65536)
+    Path(sys.argv[1]).write_bytes(typed)
+"""
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"type": "model_change", "model": "claude-opus-4-7"},
+        {"type": "effort_change", "effort": "high"},
+        {"type": "compact"},
+    ],
+    ids=["model", "effort", "compact"],
+)
+@pytest.mark.timeout(20)
+async def test_recreated_silent_pane_uses_the_control_prompt_budget(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, event: dict[str, Any]
+) -> None:
+    """A real recreated tmux pane that never mounts fails within the slash-control budget."""
+    conv_id = "18293a4b5c6d7e8f901a2b3c4d5e6f71"
+    auto_create_calls: list[str] = []
+    app, registry = await _open_claude_native_session(
+        monkeypatch, conv_id=conv_id, auto_create_calls=auto_create_calls
+    )
+    auto_create_calls.clear()
+    monkeypatch.setattr(native_controls, "_CLAUDE_CONTROL_PROMPT_WAIT_S", 0.4)
+    monkeypatch.setattr(native_controls, "_CLAUDE_PANE_READY_TIMEOUT_S", 5.0)
+    monkeypatch.setattr(claude_native_bridge, "wait_for_input_ready", _REAL_WAIT_FOR_INPUT_READY)
+    bridge_dir = bridge_dir_for_conversation_id(conv_id)
+    _plant_dead_claude_pane(registry, conv_id, tmp_path, bridge_dir)
+    typed = tmp_path / "typed.bin"
+    with tempfile.TemporaryDirectory(prefix="claude-control-", dir="/tmp") as socket_dir:
+        socket_path = Path(socket_dir) / "tmux.sock"
+        tmux = ["tmux", "-S", str(socket_path)]
+
+        async def _launch(ctx: Any) -> SessionResourceView:
+            auto_create_calls.append(ctx.session_id)
+            subprocess.run(
+                [
+                    *tmux,
+                    "-f",
+                    "/dev/null",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    "claude",
+                    shlex.join([sys.executable, "-c", _CAPTURE_BOOT_INPUT, str(typed)]),
+                ],
+                check=True,
+                capture_output=True,
+                timeout=5,
+            )
+            _plant_live_claude_pane(
+                registry, ctx.session_id, tmp_path, bridge_dir, socket_path=socket_path
+            )
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=ctx.session_id,
+                name="claude",
+            )
+
+        for target in (
+            "omnigent.runner.native.orchestration._launch_claude",
+            "omnigent.runner.native._launch_claude",
+        ):
+            monkeypatch.setattr(target, _launch)
+        try:
+            started = time.monotonic()
+            async with _runner_client(app) as client:
+                response = await client.post(f"/v1/sessions/{conv_id}/events", json=event)
+            elapsed = time.monotonic() - started
+            assert response.status_code == 503, response.text
+            assert (
+                response.json()["error"]
+                == f"claude_native_{event['type'].removesuffix('_change')}_failed"
+            )
+            assert elapsed < 3.0, f"the separate recreate wait consumed {elapsed:.1f}s"
+            assert auto_create_calls == [conv_id]
+            assert not typed.exists(), "a settings key reached a booting pane"
+        finally:
+            with contextlib.suppress(subprocess.SubprocessError):
+                subprocess.run([*tmux, "kill-server"], capture_output=True, timeout=5)
 
 
 @pytest.mark.asyncio
