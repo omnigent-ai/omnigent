@@ -12,8 +12,12 @@ export interface SidebarViewPreferences {
   show: readonly SidebarShowField[];
 }
 
-// Status grouping stays hidden until working/idle detection is reliable.
-export const SIDEBAR_GROUPINGS: readonly SidebarGrouping[] = ["default", "created", "updated"];
+export const SIDEBAR_GROUPINGS: readonly SidebarGrouping[] = [
+  "default",
+  "status",
+  "created",
+  "updated",
+];
 export const SIDEBAR_ORDERINGS: readonly SidebarOrdering[] = ["updated", "created"];
 export const SIDEBAR_SHOW_FIELDS: readonly SidebarShowField[] = [
   "updated",

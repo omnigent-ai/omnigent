@@ -231,6 +231,15 @@ def pi_session_records_from_session_items(
     Interrupted assistant turns (and the rest of their response group) are
     skipped so a cancelled turn isn't restored as completed history.
 
+    Items can commit out of order, so a response's text may land between a call
+    and its result, or between parallel results. Every result is moved directly
+    after the message holding its call (within the same user turn), whether or
+    not the items carry response ids. Otherwise Pi answers the call with a
+    synthetic result and strands the real one after the next message, which
+    Anthropic rejects with ``unexpected tool_use_id``. Late text stays after the
+    results: a shared ``response_id`` does not prove it preceded them. Missing
+    and orphan results are left unchanged.
+
     :param items: Flat Omnigent item dicts in chronological order, e.g.
         ``{"type": "message", "role": "user", "content": [...]}``.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``. Used
@@ -252,23 +261,16 @@ def pi_session_records_from_session_items(
         "timestamp": timestamp,
         "cwd": str(cwd),
     }
-    records: list[_JsonObject] = [header]
-    parent_id: str | None = None
+    entries: list[_JsonObject] = []
     skip_response_ids = _interrupted_response_ids(items)
     replayed_call_ids: set[str] = set()
     group: _AssistantResponseGroup | None = None
-
-    def append_entry(entry: _JsonObject) -> None:
-        nonlocal parent_id
-        entry["parentId"] = parent_id
-        records.append(entry)
-        parent_id = cast(str, entry["id"])
 
     def flush_group() -> None:
         nonlocal group
         if group is None:
             return
-        append_entry(
+        entries.append(
             {
                 "type": "message",
                 "id": group.entry_id,
@@ -306,7 +308,7 @@ def pi_session_records_from_session_items(
                 # to nothing (e.g. reasoning) must not split the response, or its
                 # parallel tool results would be orphaned from their calls again.
                 flush_group()
-                append_entry(entry)
+                entries.append(entry)
             continue
         rid = response_id if isinstance(response_id, str) and response_id else None
         item_model = item.get("model")
@@ -329,7 +331,46 @@ def pi_session_records_from_session_items(
                 model=eff_model,
             )
     flush_group()
+    records: list[_JsonObject] = [header, *_pair_pi_tool_results(entries)]
+    parent_id: str | None = None
+    for entry in records[1:]:
+        entry["parentId"] = parent_id
+        parent_id = cast(str, entry["id"])
     return records
+
+
+def _pair_pi_tool_results(entries: list[_JsonObject]) -> list[_JsonObject]:
+    """Move each tool result directly after the assistant entry holding its call.
+
+    Only results of calls earlier in the same user turn move, in their original
+    relative order. Orphan results stay where they are.
+
+    :param entries: Pi message entries in chronological order (no header).
+    :returns: The same entries, reordered.
+    """
+    owners: dict[str, int] = {}
+    results: dict[int, list[_JsonObject]] = {}
+    moved: set[int] = set()
+    for index, entry in enumerate(entries):
+        message = cast(_JsonObject, entry["message"])
+        role = message["role"]
+        if role == "user":
+            owners.clear()
+        elif role == "assistant":
+            for block in cast(list[_JsonObject], message["content"]):
+                if block.get("type") == "toolCall":
+                    owners[cast(str, block["id"])] = index
+        elif role == "toolResult":
+            owner = owners.pop(cast(str, message["toolCallId"]), None)
+            if owner is not None:
+                results.setdefault(owner, []).append(entry)
+                moved.add(index)
+    paired: list[_JsonObject] = []
+    for index, entry in enumerate(entries):
+        if index not in moved:
+            paired.append(entry)
+            paired.extend(results.get(index, []))
+    return paired
 
 
 @dataclass

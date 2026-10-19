@@ -963,6 +963,27 @@ async def test_handle_launch_fails_for_bad_workspace(
     assert "/nonexistent/path/that/does/not/exist" in output
 
 
+async def test_host_boot_skips_managed_gateway_with_malformed_profile(
+    tmp_path, monkeypatch, caplog
+):
+    from omnigent.host.connect import _generate_ucode_configs
+
+    profile = tmp_path / "databrickscfg"
+    profile.write_text("token = private-malformed-secret\n")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(profile))
+
+    def unexpected_configure(*args, **kwargs):
+        pytest.fail("Malformed profiles must not reach managed gateway setup")
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.ucode_setup.configure_ucode_for_sandbox", unexpected_configure
+    )
+    _generate_ucode_configs()
+    assert "repair the Databricks profile file" in caplog.text
+    assert "private-malformed-secret" not in caplog.text
+    assert not any(record.exc_info for record in caplog.records)
+
+
 async def test_handle_launch_attributes_spawn_failure_to_host(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
@@ -1791,6 +1812,72 @@ async def test_watch_runner_reports_unexpected_exit(
     assert maintenance_reasons == ["runner_exited"]
 
 
+@pytest.mark.parametrize("connected", [False, True])
+async def test_watch_runner_reports_refused_credentials_as_sign_in(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    connected: bool,
+) -> None:
+    """A runner refused on credentials before connecting asks for a new sign-in.
+
+    The exit is a setup problem the person must fix, so it is categorized as
+    config at launch; any other exit stays a runner fault.
+    """
+    from omnigent.runner.identity import RUNNER_AUTH_REJECTED_EXIT_CODE
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+    host._ws = tunnel  # type: ignore[assignment] — duck-typed send
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    original_popen = subprocess.Popen
+    script = (
+        f"echo 'tunnel rejected (HTTP 401)' >&2; sleep 0.2; exit {RUNNER_AUTH_REJECTED_EXIT_CODE}"
+    )
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Spawn a runner that exits with the credential-rejection code."""
+        return original_popen(
+            ["sh", "-c", script],
+            stdin=subprocess.DEVNULL,
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+        )
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_auth", binding_token="tok_auth", workspace=str(workspace)
+    )
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+        result = await host._handle_launch(frame)
+    assert result.status == "launched", result.error
+    handle = host._runners[token_bound_runner_id("tok_auth")]
+    assert handle.connect_marker is not None
+    if connected:
+        handle.connect_marker.touch()
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=5.0)
+
+    [report] = [decode_host_frame(sent) for sent in tunnel.sent]
+    assert isinstance(report, HostRunnerExitedFrame)
+    died = next(
+        record for record in caplog.records if getattr(record, "event_name", None) == "runner_died"
+    )
+    assert "tunnel rejected (HTTP 401)" in report.error
+    if connected:
+        assert not report.error.startswith("The server rejected")
+        assert died.attributes["error_category"] == "runner"
+        assert died.attributes["error_phase"] == "unknown"
+    else:
+        assert report.error.startswith("The server rejected this host's credentials")
+        assert " login " in report.error
+        assert died.attributes["error_category"] == "config"
+        assert died.attributes["error_phase"] == "runner_launch"
+
+
 def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
     """Redact credentials before exit reports reach the server or SPA."""
     log = tmp_path / "runner-x.log"
@@ -2147,6 +2234,52 @@ async def test_connect_watchdog_silent_when_runner_connects(
 
     assert [r for r in caplog.records if r.levelno == logging.ERROR] == []
     _cleanup_host(host)
+
+
+async def test_connect_watchdog_allows_the_runner_sign_in_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A runner connecting after its allowed sign-in wait is not reported as hung."""
+    from omnigent.host import connect as connect_module
+    from omnigent.runner.transports.ws_tunnel.serve import _SIGN_IN_PENDING_WAIT_S
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    host = _make_host_process()
+    marker = tmp_path / "connected"
+    runner_id = "runner_pending_sign_in"
+    host._runners[runner_id] = _RunnerHandle(
+        proc=Mock(pid=1234),
+        log_path=tmp_path / "runner.log",
+        connect_marker=marker,
+        session_id="conv_pending_sign_in",
+    )
+    exit_watcher = asyncio.create_task(asyncio.Event().wait())
+
+    async def _connect_after_sign_in(tasks: set[asyncio.Task[None]], *, timeout: float) -> None:
+        # Advance the host wait to a connect just after the runner's permitted wait.
+        if timeout >= _SIGN_IN_PENDING_WAIT_S + 1:
+            marker.touch()
+
+    monkeypatch.setattr(
+        connect_module,
+        "asyncio",
+        SimpleNamespace(**{**vars(asyncio), "wait": _connect_after_sign_in}),
+    )
+    try:
+        with caplog.at_level(logging.ERROR, logger="omnigent.host.connect"):
+            await host._watch_runner_connect(runner_id, exit_watcher=exit_watcher)
+    finally:
+        host._runners.pop(runner_id)
+        exit_watcher.cancel()
+        await asyncio.gather(exit_watcher, return_exceptions=True)
+
+    assert not [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_never_connected"
+    ]
 
 
 async def test_connect_watchdog_silent_on_intentional_stop(
@@ -6411,6 +6544,30 @@ def test_run_host_process_mirrors_structured_logs_on_foreground_tty(
     configure_logging.assert_called_once_with("host", log_to_stderr=True)
 
 
+def test_run_host_process_keys_its_tunnel_from_the_launch_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A managed launch's ``host.slice_key_enabled`` keys the very first tunnel handshake."""
+    host_id = "0123456789abcdef0123456789abcdef"
+    config = tmp_path / "config.yaml"
+    config.write_text("host:\n  slice_key_enabled: true\n")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / ".omnigent"))
+    monkeypatch.setenv("OMNIGENT_HOST_ID", host_id)
+    monkeypatch.setenv("OMNIGENT_HOST_NAME", "managed-01234567")
+    monkeypatch.delenv("OMNIGENT_RUNNER_SLICE_KEY", raising=False)
+    # Set first so teardown restores the variable the startup export writes.
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "")
+    monkeypatch.delenv("OMNIGENT_HOST_SLICE_KEY_ENABLED")
+    spy = _ConnectSpy([asyncio.CancelledError()])
+    _patch_connect(monkeypatch, spy)
+
+    run_host_process(server_url="https://srv.example.com", config_path=config)
+
+    headers = spy.calls[0]["additional_headers"]
+    assert headers["X-Databricks-Omnigent-Slice-Key"] == host_id  # type: ignore[index]
+
+
 def test_run_host_process_announces_session_log_dir_on_start(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -8903,3 +9060,56 @@ def test_run_host_process_classifies_how_the_host_ended(
         )
 
     assert _host_exit_reasons(caplog) == [expected]
+
+
+@pytest.mark.parametrize(
+    "state", ["pending", "dead", "untracked", "stopped", "rebound", "stop_during_read"]
+)
+async def test_runner_status_only_exposes_pending_sign_in_for_its_live_launch(
+    tmp_path, monkeypatch, state
+) -> None:
+    from omnigent.host.connect import _RunnerHandle
+    from omnigent.runner.identity import mark_sign_in_pending
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
+    host = _make_host_process()
+    connected = tmp_path / "owned.connected"
+    monkeypatch.setenv(RUNNER_CONNECT_MARKER_ENV_VAR, str(connected))
+    mark_sign_in_pending("runner-owned", time.monotonic() + 20)
+    proc = Mock(pid=123, returncode=None)
+    proc.poll.return_value = 1 if state == "dead" else None
+    handle = _RunnerHandle(
+        proc, tmp_path / "runner.log", "session-owned", connected, state == "stopped"
+    )
+    if state != "untracked":
+        host._runners["runner-owned"] = handle
+    if state in {"rebound", "stop_during_read"}:
+
+        def replaced(*_args):
+            if state == "rebound":
+                host._runners.pop("runner-owned")
+            else:
+                handle.stop_requested = True
+            return True
+
+        monkeypatch.setattr("omnigent.host.connect.runner_sign_in_is_pending", replaced)
+    result = await host._handle_runner_status(HostRunnerStatusFrame("status", "runner-owned"))
+    assert (result.status == "sign_in_pending") is (state == "pending")
+    proc.terminate.assert_not_called()
+    proc.kill.assert_not_called()
+
+
+async def test_host_publishes_stored_workspace_at_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host's rows carry the recorded workspace id before it ever connects."""
+    from omnigent.cli_auth import store_databricks_org_id
+
+    server_url = "https://example.databricks.com/api/2.0/omnigent"
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    store_databricks_org_id(server_url, "1965859176160743")
+
+    host = _host(server_url)
+
+    assert host._origin_workspace_id == "1965859176160743"
+    assert os.environ[debug_logging.ORIGIN_WORKSPACE_ID_ENV_VAR] == "1965859176160743"

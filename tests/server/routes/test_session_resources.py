@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import threading
@@ -4734,7 +4735,30 @@ async def test_relay_dedupes_duplicate_error_persistence_but_forwards_live_frame
 
 
 @pytest.mark.asyncio
-async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error() -> None:
+@pytest.mark.parametrize(
+    "failure_context",
+    [
+        pytest.param(None, id="legacy"),
+        pytest.param("malformed", id="malformed-context"),
+        pytest.param(
+            {
+                "failure_id": "err_synthetic_startup",
+                "failure_source": "native_terminal_start",
+                "exception_type": "RuntimeError",
+                "exception_cause_type": "FileNotFoundError",
+                "native_launch_os_errno": 2,
+                "native_launch_os_errno_name": "ENOENT",
+                "origin": "forged",
+                "exception_message": "private launch path",
+            },
+            id="structured-context",
+        ),
+    ],
+)
+async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error(
+    caplog: pytest.LogCaptureFixture,
+    failure_context: object,
+) -> None:
     """Definitive native terminal failure consumes the user message quickly.
 
     The Omnigent server first asks the runner to ensure the native terminal.
@@ -4755,7 +4779,10 @@ async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error
                     "error": {
                         "code": "native_terminal_start_failed",
                         "message": "Native Claude requires the 'claude' CLI on PATH.",
-                    }
+                    },
+                    **(
+                        {"failure_context": failure_context} if failure_context is not None else {}
+                    ),
                 },
             )
         }
@@ -4797,6 +4824,18 @@ async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error
     assert len(errors) == 1
     assert errors[0].data.code == "native_terminal_start_failed"
     assert errors[0].data.message == "Native Claude requires the 'claude' CLI on PATH."
+    [record] = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "session_turn_failed"
+    ]
+    assert record.attributes["origin"] == "native_terminal_boot_failed"
+    if isinstance(failure_context, dict):
+        assert record.attributes["failure_id"] == failure_context["failure_id"]
+        assert record.attributes["exception_cause_type"] == "FileNotFoundError"
+        assert record.attributes["native_launch_os_errno"] == "2"
+        assert record.attributes["native_launch_os_errno_name"] == "ENOENT"
+        assert "private launch path" not in str(record.attributes)
+    else:
+        assert "failure_id" not in record.attributes
 
 
 @pytest.mark.asyncio
@@ -9538,6 +9577,76 @@ async def test_claude_native_slash_command_drains_its_queued_entry_under_either_
 
         assert [item.type for item in store.appended_items] == ["slash_command"]
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [older]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_top_level_local_command_echo_drains_its_queued_entry(
+    tmp_path: Path,
+) -> None:
+    """A ``/model`` Claude records as a top-level ``local_command`` settles its web entry.
+
+    Only the matching entry drains: an older message and a different queued
+    command keep waiting for their own mirrors.
+    """
+    from omnigent.harnesses.claude_native.bridge import read_transcript_items_since
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "system",
+                "subtype": "local_command",
+                "uuid": "model-echo",
+                "content": (
+                    "<command-name>/model</command-name>"
+                    "<command-message>model</command-message>"
+                    "<command-args>example-model</command-args>"
+                ),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+    assert len(items) == 1
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    older = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
+    pending_inputs.record(sid, [{"type": "input_text", "text": "/model example-model"}])
+    later = pending_inputs.record(sid, [{"type": "input_text", "text": "/effort high"}])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": items[0].item_type,
+            "item_data": items[0].data,
+            "response_id": items[0].response_id,
+            "source_id": items[0].source_id,
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["slash_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            older,
+            later,
+        ]
     finally:
         pending_inputs.reset_for_tests()
 

@@ -2865,6 +2865,8 @@ describe("Run on this machine (desktop host enrollment)", () => {
     const userAgent = vi
       .spyOn(navigator, "userAgent", "get")
       .mockReturnValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)");
+    // An unrelated stopped host is hidden and must not replace the action with a notice.
+    mockHosts([host("offline", 2)]);
     renderLanding();
     await act(async () => {});
     await openHostMenu();
@@ -2873,6 +2875,10 @@ describe("Run on this machine (desktop host enrollment)", () => {
     expect(item).toHaveTextContent("This Mac");
     expect(within(item).getByTestId("new-chat-landing-use-this-machine")).toHaveTextContent(
       "Use this machine",
+    );
+    expect(screen.queryByTestId("new-chat-landing-host-host_2")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-host-menu")).not.toHaveTextContent(
+      "No hosts online.",
     );
     userAgent.mockRestore();
   });
@@ -2890,6 +2896,7 @@ describe("Run on this machine (desktop host enrollment)", () => {
   it("shows Use this machine on a known local host after it disconnects", async () => {
     mockHosts([
       { host_id: "this-machine", name: "jackson-laptop", owner: "me", status: "offline" },
+      host("offline", 2),
     ]);
     renderLanding();
     await act(async () => {});
@@ -2901,6 +2908,13 @@ describe("Run on this machine (desktop host enrollment)", () => {
     expect(screen.getByTestId("new-chat-landing-use-this-machine")).toHaveTextContent(
       "Use this machine",
     );
+    // The reconnect action stays outside the collapsed offline group.
+    expect(screen.queryByTestId("new-chat-landing-host-host_2")).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Offline hosts (1)" }));
+    expect(
+      within(screen.getByRole("group", { name: "Offline hosts" })).getAllByRole("menuitem"),
+    ).toHaveLength(1);
+    expect(screen.getAllByTestId("new-chat-landing-run-on-this-machine")).toHaveLength(1);
   });
 
   it("hides Use this machine while the local host is connected", async () => {
@@ -3089,6 +3103,8 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
       expect(await screen.findByTestId("new-chat-landing-run-on-arca")).toHaveTextContent(
         /^Run on Arca$/,
       );
+      // A stopped instance is reached through Run on Arca, not a dead Cloud row.
+      expect(screen.queryByTestId("new-chat-landing-host-arca-1")).toBeNull();
     },
   );
 
@@ -3268,7 +3284,7 @@ describe("NewChatLandingScreen", () => {
         RECENT_KEY,
         JSON.stringify({ host_1: ["/Users/corey/repo"], host_2: ["/work/repo"] }),
       );
-      mockHosts([host("online", 1), host("offline", 2)]);
+      mockHosts([host("online", 1), host("offline", 2), host("offline", 3)]);
       renderLanding({ managed_sandboxes_enabled: managedSandboxesEnabled });
 
       const chip = screen.getByTestId("new-chat-landing-host-chip");
@@ -3289,11 +3305,124 @@ describe("NewChatLandingScreen", () => {
         "data-active",
         "true",
       );
+      // The remembered host stays visible without also appearing in the offline group.
+      expect(screen.queryByTestId("new-chat-landing-host-host_3")).toBeNull();
+      fireEvent.click(screen.getByRole("menuitem", { name: "Offline hosts (1)" }));
+      expect(
+        within(screen.getByRole("group", { name: "Offline hosts" })).getAllByRole("menuitem"),
+      ).toHaveLength(1);
+      expect(screen.getAllByTestId("new-chat-landing-host-host_2")).toHaveLength(1);
+      expect(screen.getByTestId("new-chat-landing-host-host_1")).not.toHaveAttribute(
+        "aria-disabled",
+      );
       fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
       await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
       expect(localStorage.getItem("omnigent:last-host-choice")).toBe("host_1");
     },
   );
+
+  it("keeps offline hosts collapsed and reveals them five at a time", async () => {
+    mockHosts([
+      host("online", 1),
+      // API recency order deliberately differs from name/id order.
+      ...[4, 2, 8, 3, 6, 7, 5, 10, 9, 12, 13, 11].map((i) => host("offline", i)),
+    ]);
+    renderLanding();
+
+    const chip = screen.getByTestId("new-chat-landing-host-chip");
+    await waitFor(() => expect(chip).toHaveAccessibleName(/, Online$/));
+    fireEvent.pointerDown(chip, { button: 0 });
+    const toggle = screen.getByRole("menuitem", { name: "Offline hosts (12)" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByTestId("new-chat-landing-host-host_2")).toBeNull();
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    const offline = screen.getByRole("group", { name: "Offline hosts" });
+    expect(within(offline).getAllByRole("menuitem")).toHaveLength(5);
+    expect(
+      within(offline)
+        .getAllByRole("menuitem")
+        .map((row) => row.getAttribute("data-testid")),
+    ).toEqual([4, 2, 8, 3, 6].map((i) => `new-chat-landing-host-host_${i}`));
+    expect(screen.getByTestId("new-chat-landing-host-host_2")).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    expect(screen.queryByTestId("new-chat-landing-host-host_7")).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Show more (7 remaining)" }));
+    expect(within(offline).getAllByRole("menuitem")).toHaveLength(10);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Show more (2 remaining)" }));
+    expect(within(offline).getAllByRole("menuitem")).toHaveLength(12);
+    expect(screen.queryByRole("menuitem", { name: /Show more/ })).toBeNull();
+
+    fireEvent.click(toggle);
+    expect(screen.queryByRole("group", { name: "Offline hosts" })).toBeNull();
+    fireEvent.click(toggle);
+    expect(
+      within(screen.getByRole("group", { name: "Offline hosts" })).getAllByRole("menuitem"),
+    ).toHaveLength(5);
+    fireEvent.click(screen.getByTestId("new-chat-landing-host-host_1"));
+    fireEvent.pointerDown(chip, { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "Offline hosts (12)" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+  });
+
+  it.each([
+    {
+      name: "no hosts",
+      hosts: [] as Host[],
+      chip: /No host selected/,
+      text: "No hosts connected yet.",
+    },
+    {
+      name: "every host offline",
+      hosts: [host("offline", 1), host("offline", 2)],
+      chip: /No host selected/,
+      text: "No hosts online.",
+    },
+    {
+      name: "only a cloud host",
+      hosts: [
+        { host_id: "cloud-1", name: "team-cloud-box", owner: "me", status: "online" },
+      ] as Host[],
+      chip: /, Online$/,
+      text: "No hosts connected yet.",
+    },
+  ])(
+    "explains an empty My machines list ($name) instead of listing dead rows",
+    async ({ hosts, chip: chipName, text }) => {
+      mockHosts(hosts);
+      renderLanding();
+
+      const chip = screen.getByTestId("new-chat-landing-host-chip");
+      await waitFor(() => expect(chip).toHaveAccessibleName(chipName));
+      fireEvent.pointerDown(chip, { button: 0 });
+      const menu = screen.getByTestId("new-chat-landing-host-menu");
+      expect(menu.querySelectorAll('[data-testid^="new-chat-landing-host-host_"]')).toHaveLength(0);
+      expect(menu).toHaveTextContent(text);
+    },
+  );
+
+  it("keeps the My machines notice when only a cloud host is online", async () => {
+    mockHosts([
+      { host_id: "cloud-1", name: "team-cloud-box", owner: "me", status: "online" },
+      host("offline", 2),
+    ]);
+    renderLanding();
+
+    const chip = screen.getByTestId("new-chat-landing-host-chip");
+    await waitFor(() =>
+      expect(chip).toHaveAccessibleName(/^Host: (This machine|team-cloud-box), Online$/),
+    );
+    fireEvent.pointerDown(chip, { button: 0 });
+    const menu = screen.getByTestId("new-chat-landing-host-menu");
+    expect(screen.getByTestId("new-chat-landing-host-cloud-1")).toBeVisible();
+    expect(screen.queryByTestId("new-chat-landing-host-host_2")).toBeNull();
+    expect(menu).toHaveTextContent("No hosts online.");
+  });
 
   it.each(["offline", "missing"])(
     "blocks creation when the selected host becomes %s and recovers when it returns",
@@ -7347,6 +7476,14 @@ describe("NewChatLandingScreen", () => {
       body: { detail: "managed host did not come online within 120s" },
       expected: "managed host did not come online within 120s",
     },
+    {
+      // Usually a duplicate of this create already holds the id; resending
+      // would start a second session.
+      name: "chosen host id conflict",
+      status: 409,
+      body: { error: { code: "already_exists", message: "host 0123 already exists" } },
+      expected: "host 0123 already exists",
+    },
   ])("surfaces the $name from a failed managed create", async ({ status, body, expected }) => {
     authenticatedFetchMock.mockResolvedValue({
       ok: false,
@@ -7367,7 +7504,36 @@ describe("NewChatLandingScreen", () => {
       expect(screen.getByTestId("new-chat-landing-error").textContent).toContain(expected),
     );
     expect(screen.queryByTestId("new-chat-landing-provisioning")).toBeNull();
+    expect(authenticatedFetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it.each([true, false])(
+    "chooses the sandbox host's id only on a server that accepts it (%s)",
+    async (accepts) => {
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as unknown as Response);
+      renderLanding({
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "modal",
+        request_managed_sandbox_host_id: accepts,
+      });
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "audit the repo" },
+      });
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+      const [, init] = authenticatedFetchMock.mock.calls[0];
+      const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+      expect(body.host_type).toBe("managed");
+      if (accepts) {
+        expect(body.host_id).toMatch(/^[0-9a-f]{32}$/);
+      } else {
+        expect("host_id" in body).toBe(false);
+      }
+    },
+  );
 
   it("sends the added repositories as the managed workspaces list", async () => {
     authenticatedFetchMock.mockResolvedValue({

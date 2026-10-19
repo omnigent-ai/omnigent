@@ -72,6 +72,11 @@ from omnigent.harnesses.claude_native import delivery_diagnostics
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
+from omnigent.harnesses.claude_native.submit_verification import (
+    SubmitBoundary,
+    capture_submit_boundary,
+    has_matching_hook_refusal,
+)
 from omnigent.harnesses.diagnostics import (
     detect_sign_in_prompt,
     sign_in_next_step,
@@ -367,14 +372,19 @@ _PERMISSION_MODE_FOOTERS: dict[str, str] = {
     "acceptEdits": "accept edits on",
     "plan": "plan mode on",
     "auto": "auto mode on",
-    # Launch-only, but readable: a pane launched into bypass must report
-    # its own mode so the cycler has a starting point to leave it from.
+    # Launch-only, but readable: a pane launched into bypass or don't-ask
+    # must report its own mode so the cycler has a starting point to leave
+    # it from.
     "bypassPermissions": "bypass permissions on",
+    "dontAsk": "don't ask on",
 }
 # Modes shift+tab can reach from any session. ``dontAsk`` is never in the
 # cycle and ``bypassPermissions`` only joins it when launched into, so
 # neither is a switch target.
-CYCLEABLE_PERMISSION_MODES = frozenset(_PERMISSION_MODE_FOOTERS) - {"bypassPermissions"}
+CYCLEABLE_PERMISSION_MODES = frozenset(_PERMISSION_MODE_FOOTERS) - {
+    "bypassPermissions",
+    "dontAsk",
+}
 # Cap on shift+tab presses. The cycle is 3-5 modes wide depending on which
 # optional modes are enabled, so a full lap plus slack proves the target is
 # unreachable rather than slow.
@@ -400,10 +410,20 @@ _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S = 1.5
 # What :func:`_occupying_surface` reports when no input box is drawn.
 _OVERLAY_SURFACE = "an overlay"
 # The dismissal every surface drawn over the input box advertises in its
-# footer ("Esc to cancel", "Esc to clear"). A screen without a composer that
-# lacks it is not such a surface — e.g. a launch wrapper's output before
-# Claude Code has drawn its input box — and an Escape cannot clear it.
-_ESCAPE_DISMISS_HINT = re.compile(r"\bEsc to \w", re.IGNORECASE)
+# footer ("Esc to cancel", "Esc to clear"). Claude Code joins keys that share
+# an action with "/", so the task details panels print "Esc/Enter/Space to
+# close". A screen without a composer that lacks it is not such a surface —
+# e.g. a launch wrapper's output before Claude Code has drawn its input box —
+# and an Escape cannot clear it.
+_ESCAPE_DISMISS_HINT = re.compile(r"\b(?:\w+/)*Esc(?:/\w+)* to \w", re.IGNORECASE)
+# Headlines of startup dialogs whose "Esc to cancel" quits Claude Code rather
+# than closing the dialog (2.1.299: the settings error exits 1, the folder-trust
+# question exits 0). Only the person may answer them.
+_ESCAPE_QUITS_DIALOG_HEADLINES = (
+    "Settings Error",
+    "Accessing workspace",
+    "Do you trust the files in this folder",
+)
 # Titles of the confirmation dialog Claude Code pops when a switch invalidates
 # the prompt cache — one component, titled for what is being switched. It only
 # appears on a session with history, and it took ~1.9s to render on a warm
@@ -627,6 +647,10 @@ class ClaudeUserPromptPending(RuntimeError):
 
 class ClaudeMessageNotAccepted(RuntimeError):
     """The submitted draft remained in Claude's input box until the deadline."""
+
+
+class ClaudeSubmitBlockedUnconfirmed(RuntimeError):
+    """A fresh matching native refusal stops retries without proving web ownership."""
 
 
 @contextlib.contextmanager
@@ -2111,7 +2135,7 @@ def record_model_vocabulary(
     # vocabulary refresh (e.g. serving model options) can never replace a
     # concurrent bridge preparation's config — sandbox settings included —
     # with its own stale read.
-    with _bridge_config_write_lock(bridge_dir):
+    with _bridge_metadata_write_lock(bridge_dir):
         config = _read_json_file(bridge_dir / _CONFIG_FILE)
         if not isinstance(config, dict) or not config:
             # No prepared bridge config yet (missing/malformed reads as {}):
@@ -2138,18 +2162,13 @@ def record_model_vocabulary(
 
 
 @contextlib.contextmanager
-def _bridge_config_write_lock(bridge_dir: Path) -> Iterator[None]:
-    """Cross-process mutual exclusion for bridge-config read-modify-writes.
+def _bridge_metadata_write_lock(bridge_dir: Path) -> Iterator[None]:
+    """Cross-process mutual exclusion for bridge metadata read-modify-writes.
 
-    Uses the same on-disk lock file as bridge-dir preparation
-    (``<bridge root>/.locks/<bridge dir>.lock``), so config rewrites and
+    Shares bridge-dir preparation's on-disk lock, so metadata updates and
     :func:`prepare_bridge_dir` exclude each other across processes.
     """
-    from filelock import FileLock
-
-    lock_dir = bridge_dir.parent / ".locks"
-    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with FileLock(str(lock_dir / f"{bridge_dir.name}.lock"), mode=0o600):
+    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
         yield
 
 
@@ -2178,13 +2197,14 @@ def write_active_session_id(bridge_dir: Path, session_id: str) -> None:
     :returns: None.
     :raises RuntimeError: If the bridge config does not exist.
     """
-    config = _read_json_file(bridge_dir / _CONFIG_FILE)
-    if not config:
-        raise RuntimeError(f"bridge config missing: {bridge_dir / _CONFIG_FILE}")
-    config["active_session_id"] = session_id
-    config["conversation_id"] = session_id
-    config["updated_at"] = time.time()
-    _write_json_file(bridge_dir / _CONFIG_FILE, config)
+    with _bridge_metadata_write_lock(bridge_dir):
+        config = _read_json_file(bridge_dir / _CONFIG_FILE)
+        if not config:
+            raise RuntimeError(f"bridge config missing: {bridge_dir / _CONFIG_FILE}")
+        config["active_session_id"] = session_id
+        config["conversation_id"] = session_id
+        config["updated_at"] = time.time()
+        _write_json_file(bridge_dir / _CONFIG_FILE, config)
 
 
 def read_permission_hook_config(bridge_dir: Path) -> _JsonObject:
@@ -2897,50 +2917,49 @@ def record_hook_event(bridge_dir: Path, payload: _JsonObject) -> None:
     :returns: None.
     """
     _ensure_secure_dir(bridge_dir)
-    envelope = {
-        "recorded_at": time.time(),
-        "payload": payload,
-    }
-    with (bridge_dir / _HOOKS_FILE).open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(envelope, separators=(",", ":")) + "\n")
+    with _bridge_metadata_write_lock(bridge_dir):
+        envelope = {
+            "recorded_at": time.time(),
+            "payload": payload,
+        }
+        with (bridge_dir / _HOOKS_FILE).open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(envelope, separators=(",", ":")) + "\n")
 
-    state = _read_json_file(bridge_dir / _STATE_FILE)
-    if not isinstance(state, dict):
-        state = {}
-    event_name = payload.get("hook_event_name")
-    if isinstance(event_name, str) and event_name:
-        state["last_hook_event_name"] = event_name
-    claude_session_id = payload.get("session_id")
-    pinned = state.get("claude_session_id")
-    # Identity pin: the transcript path and session identity may change only
-    # via a SessionStart announcement (startup / clear / resume / compact all
-    # fire one) or an event from the already-pinned session. A side-channel
-    # event carrying another session's identity (e.g. a background Task
-    # agent's edge) must not re-aim the forwarder at a foreign transcript.
-    identity_allowed = event_name == "SessionStart" or (
-        isinstance(claude_session_id, str)
-        and claude_session_id != ""
-        and (not isinstance(pinned, str) or not pinned or claude_session_id == pinned)
-    )
-    if identity_allowed:
-        transcript_path = payload.get("transcript_path")
-        if isinstance(transcript_path, str) and transcript_path:
-            state["transcript_path"] = transcript_path
-        if isinstance(claude_session_id, str) and claude_session_id:
-            state["claude_session_id"] = claude_session_id
-            seen = read_seen_claude_session_ids(bridge_dir)
-            seen.add(claude_session_id)
-            state["seen_claude_session_ids"] = sorted(seen)
-    else:
-        _logger.debug(
-            "Ignoring identity fields from side-channel hook event; "
-            "event=%s session_id=%s pinned=%s",
-            event_name,
-            claude_session_id,
-            pinned,
+        state = _read_json_file(bridge_dir / _STATE_FILE)
+        if not isinstance(state, dict):
+            state = {}
+        event_name = payload.get("hook_event_name")
+        if isinstance(event_name, str) and event_name:
+            state["last_hook_event_name"] = event_name
+        claude_session_id = payload.get("session_id")
+        pinned = state.get("claude_session_id")
+        # Identity pin: only a SessionStart or an event from the already-pinned
+        # session may change transcript/session identity; a side-channel event
+        # (e.g. a background Task agent's edge) must not re-aim the forwarder.
+        identity_allowed = event_name == "SessionStart" or (
+            isinstance(claude_session_id, str)
+            and claude_session_id != ""
+            and (not isinstance(pinned, str) or not pinned or claude_session_id == pinned)
         )
-    state["updated_at"] = time.time()
-    _write_json_file(bridge_dir / _STATE_FILE, state)
+        if identity_allowed:
+            transcript_path = payload.get("transcript_path")
+            if isinstance(transcript_path, str) and transcript_path:
+                state["transcript_path"] = transcript_path
+            if isinstance(claude_session_id, str) and claude_session_id:
+                state["claude_session_id"] = claude_session_id
+                seen = read_seen_claude_session_ids(bridge_dir)
+                seen.add(claude_session_id)
+                state["seen_claude_session_ids"] = sorted(seen)
+        else:
+            _logger.debug(
+                "Ignoring identity fields from side-channel hook event; "
+                "event=%s session_id=%s pinned=%s",
+                event_name,
+                claude_session_id,
+                pinned,
+            )
+        state["updated_at"] = time.time()
+        _write_json_file(bridge_dir / _STATE_FILE, state)
 
 
 def read_transcript_path(bridge_dir: Path) -> Path | None:
@@ -4308,6 +4327,9 @@ def _paste_and_submit(
             "Answer the pending Claude question or permission request before sending a message."
         )
     delivery_diagnostics.set_stage("pasting")
+    # Space returns focus to the input box if the footer (shells item or agent
+    # list) holds it. Either way it types a space, which the clear removes.
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
     # Clear stale text first: raw controls can otherwise become pasted text.
     # CSI-u sends Ctrl+A/Ctrl+K literally so Claude handles them as keys.
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[97;5u")
@@ -4380,6 +4402,13 @@ def _paste_and_submit(
             "Claude is waiting for an explicit answer; message not sent."
         )
     delivery_diagnostics.set_stage("submitting")
+    transcript_path = read_transcript_path(bridge_dir)
+    native_session_id = read_claude_session_id(bridge_dir)
+    submit_boundary = (
+        capture_submit_boundary(transcript_path, native_session_id)
+        if transcript_path is not None and native_session_id is not None
+        else None
+    )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     delivery_diagnostics.record_details(submit_sent=True)
     if not draft_seen:
@@ -4401,6 +4430,8 @@ def _paste_and_submit(
             needle=needle,
             what="submitted message",
             bridge_dir=bridge_dir,
+            submit_boundary=submit_boundary,
+            submitted_text=text,
         )
     except ClaudeUserPromptPending as exc:
         # The Enter already went out, so the prompt may belong to this message's own turn.
@@ -4423,6 +4454,8 @@ def _verify_submit_accepted(
     needle: str,
     what: str,
     bridge_dir: Path | None = None,
+    submit_boundary: SubmitBoundary | None = None,
+    submitted_text: str | None = None,
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
@@ -4442,8 +4475,12 @@ def _verify_submit_accepted(
     :param needle: Draft marker from :func:`_submit_needle`.
     :param what: Label for log lines, e.g. ``"submitted message"``.
     :param bridge_dir: Bridge whose pending questions protect submit retries.
+    :param submit_boundary: Native transcript boundary captured before Enter.
+    :param submitted_text: Full submitted text; a marker alone cannot identify a refusal.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
+    :raises ClaudeSubmitBlockedUnconfirmed: A fresh matching refusal appeared;
+        ownership of the web input remains unconfirmed.
     """
     start = time.monotonic()
     last_enter = start
@@ -4456,6 +4493,26 @@ def _verify_submit_accepted(
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
         pane = _capture_pane(socket_path, tmux_target)
         polls += 1
+        if (
+            bridge_dir is not None
+            and submit_boundary is not None
+            and submitted_text is not None
+            and _fresh_matching_hook_block(bridge_dir, submit_boundary, submitted_text)
+        ):
+            delivery_diagnostics.record_verification(
+                draft_still_present=_draft_in_input_box(pane, needle),
+                pane=pane,
+                needle=needle,
+                prompt_glyph=_CLAUDE_PROMPT_GLYPH,
+                start=start,
+                retries=retries,
+                polls=polls,
+            )
+            delivery_diagnostics.record_details(verification="hook_block_unowned")
+            raise ClaudeSubmitBlockedUnconfirmed(
+                "A hook blocked a matching prompt in Claude's terminal. Web message delivery "
+                "could not be confirmed; inspect the terminal before retrying."
+            )
         if not _draft_in_input_box(pane, needle):
             delivery_diagnostics.record_verification(
                 draft_still_present=False,
@@ -4500,6 +4557,23 @@ def _verify_submit_accepted(
         polls=polls,
     )
     return False
+
+
+def _fresh_matching_hook_block(
+    bridge_dir: Path, boundary: SubmitBoundary, submitted_text: str
+) -> bool:
+    """A matching refusal prevents retries; it never establishes input ownership."""
+    if read_claude_session_id(bridge_dir) != boundary.native_session_id:
+        return False
+    path = read_transcript_path(bridge_dir)
+    try:
+        if path is None or path.resolve() != boundary.path:
+            return False
+    except (OSError, ValueError, RuntimeError):
+        return False
+    return has_matching_hook_refusal(
+        boundary, submitted_text, normalize_prompt=_unwrap_pasted_content_markers
+    )
 
 
 def _count_unknown_command_rejections(pane: str, needle: str) -> int:
@@ -4713,7 +4787,9 @@ def inject_slash_command(
     # ``C-u`` clears any draft the user is mid-typing; otherwise the
     # paste below concatenates with their text and Enter submits
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
-    # not interrupt an in-flight generation.
+    # not interrupt an in-flight generation. Space first refocuses the input
+    # box from the footer, as in :func:`_paste_and_submit`; C-u clears its space.
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-u")
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
@@ -5751,8 +5827,9 @@ def _restore_occupied_input(
     in two shapes, both reported by :func:`_occupying_surface`: an overlay
     drawn where the input box was (the ctrl+r prompt-history search, a
     hand-opened ``/model`` picker, the double-Escape rewind dialog, a
-    ``/config`` or ``/resume`` panel), or the box itself switched to
-    another input mode (``!`` shell mode). Keystrokes injected into either
+    ``/config`` or ``/resume`` panel, a background task's details panel),
+    or the box itself switched to another input mode (``!`` shell mode).
+    Keystrokes injected into either
     do not become a chat message: the history search filters on the pasted
     text and its Enter replays an old prompt, the rewind dialog's Enter
     restores a checkpoint, and shell mode runs the message as a bash
@@ -5761,7 +5838,9 @@ def _restore_occupied_input(
     the web-UI message wins the pane.
 
     Questions and permission prompts are protected by their hook wait markers
-    and visible decision controls; they require an explicit answer.
+    and visible decision controls; they require an explicit answer. So are the
+    startup dialogs whose Escape quits Claude Code instead of closing them
+    (:func:`_escape_quits_claude`): they are left for the person to answer.
 
     Escape is only sent while the surface is verifiably on screen —
     never blind, because on the bare composer Escape interrupts an
@@ -5817,8 +5896,10 @@ def _restore_occupied_input(
             )
             return surface
         # Nothing an Escape can clear: launcher output before the input box
-        # mounts, or a dialog that offers no dismissal.
-        unclearable = surface == _OVERLAY_SURFACE and not _ESCAPE_DISMISS_HINT.search(pane)
+        # mounts, a dialog that offers no dismissal, or one Escape would quit.
+        unclearable = surface == _OVERLAY_SURFACE and (
+            not _ESCAPE_DISMISS_HINT.search(pane) or _escape_quits_claude(pane)
+        )
         if not confirmed:
             # One sighting is not enough to spend an Escape on: on a bare
             # composer Escape interrupts the running turn, and a single frame
@@ -5837,6 +5918,18 @@ def _restore_occupied_input(
             last_escape = now
         unclearable_seen = unclearable
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+
+
+def _escape_quits_claude(pane: str) -> bool:
+    """
+    Return whether the dialog on screen quits Claude Code on Escape.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` for a startup dialog named in
+        :data:`_ESCAPE_QUITS_DIALOG_HEADLINES`.
+    """
+    headline = _terminal_dialog_headline(pane)
+    return headline is not None and headline.startswith(_ESCAPE_QUITS_DIALOG_HEADLINES)
 
 
 def _occupying_surface(pane: str) -> str | None:
@@ -8085,6 +8178,12 @@ def _transcript_items_from_entry(
             agent_name=agent_name,
             current_response_id=current_response_id,
         )
+    # Only ``user``/``assistant`` records are conversation turns. Other typed
+    # records can carry a ``message`` too, e.g. ``api-request-blob`` copies of
+    # API requests that include injected ``<system-reminder>`` context.
+    entry_type = entry.get("type")
+    if isinstance(entry_type, str) and entry_type not in ("user", "assistant"):
+        return current_response_id, []
     message = entry.get("message")
     if not isinstance(message, dict):
         return current_response_id, []
@@ -8541,6 +8640,57 @@ def _parse_slash_command_record(content: str) -> _SlashCommandPayload | None:
     return _SlashCommandPayload(name=name, arguments=arguments, output=output)
 
 
+def _is_slash_command_echo(content: str) -> bool:
+    """
+    Whether *content* is Claude Code's own slash-command echo markup.
+
+    Claude writes the echo with ``<command-name>`` first, or with
+    ``<command-message>`` first for skills invoked with arguments. Command
+    tags appearing later — inside shell output, command stdout, or user
+    prose — are not an echo.
+
+    :param content: Raw transcript record content.
+    :returns: ``True`` when the content begins with a command tag.
+    """
+    return content.lstrip().startswith(("<command-name>", "<command-message>"))
+
+
+def _slash_command_item_from_echo(
+    content: str,
+    *,
+    source_key: str,
+    agent_name: str,
+    response_id: str,
+) -> ClaudeTranscriptItem | None:
+    """
+    Build the ``slash_command`` item for a Claude slash-command echo.
+
+    :param content: Echo markup accepted by :func:`_is_slash_command_echo`.
+    :param source_key: Base transcript record key used for the source id.
+    :param agent_name: Agent/model name attributed to the invocation.
+    :param response_id: Response id that opens the command's turn.
+    :returns: The item, or ``None`` for unparseable markup and UI-only
+        built-ins that are never surfaced.
+    """
+    payload = _parse_slash_command_record(content)
+    if payload is None or payload.name in _CLAUDE_CLI_DROPPED_COMMANDS:
+        return None
+    data: _JsonObject = {
+        "agent": agent_name,
+        "kind": "command" if payload.name in _CLAUDE_CLI_SURFACED_COMMANDS else "skill",
+        "name": payload.name,
+        "arguments": payload.arguments,
+    }
+    if payload.output is not None:
+        data["output"] = payload.output
+    return ClaudeTranscriptItem(
+        source_id=_source_id(source_key, 0, "slash_command"),
+        item_type="slash_command",
+        data=data,
+        response_id=response_id,
+    )
+
+
 def _is_trusted_agent_notification_text(text: str, *, origin: object = None) -> bool:
     """Honor native peer provenance and the existing task-notification boundary."""
     if isinstance(origin, dict) and origin.get("kind") == "peer":
@@ -8604,12 +8754,12 @@ def _local_command_transcript_items_from_entry(
     """
     Parse a top-level Claude ``local_command`` transcript entry.
 
-    Newer Claude Code builds can record shell-mode ``!cmd`` activity
-    as top-level transcript records with ``subtype="local_command"``
-    and a string ``content`` field instead of wrapping the same markup
-    inside ``message.role=user``. Only ``<bash-*>`` records are
-    conversation-visible here; slash-command local records are still
-    handled by hook/fork detection and otherwise ignored.
+    Newer Claude Code builds can record shell-mode ``!cmd`` activity and
+    slash-command echoes (e.g. ``/model``) as top-level transcript records
+    with ``subtype="local_command"`` and a string ``content`` field instead
+    of wrapping the same markup inside ``message.role=user``. Both are
+    parsed exactly as their ``role=user`` counterparts; command stdout
+    records stay hidden apart from the ``/compact`` refusal.
 
     :param entry: Decoded Claude transcript record.
     :param line_number: One-based transcript line number.
@@ -8619,8 +8769,8 @@ def _local_command_transcript_items_from_entry(
     :param current_response_id: Response id for an in-progress shell
         command group, if the input record was parsed in an earlier
         line.
-    :returns: Updated active response id and parsed terminal-command
-        items.
+    :returns: Updated active response id and parsed slash-command or
+        terminal-command items.
     """
     content = entry.get("content")
     if not isinstance(content, str) or not content:
@@ -8650,6 +8800,16 @@ def _local_command_transcript_items_from_entry(
             )
         ]
     fallback_response_id = _response_id_from_source(source_key)
+    if _is_slash_command_echo(content):
+        item = _slash_command_item_from_echo(
+            content,
+            source_key=source_key,
+            agent_name=agent_name,
+            response_id=fallback_response_id,
+        )
+        if item is None:
+            return current_response_id, []
+        return fallback_response_id, [item]
     response_id = (
         fallback_response_id
         if _BASH_INPUT_RE.search(content) is not None
@@ -8824,38 +8984,22 @@ def _user_transcript_items_from_entry(
                 items,
             )
         stripped = content.lstrip()
-        # Skill invocations with args ship the tag order
-        # ``<command-message>…<command-name>…<command-args>…`` — i.e.
-        # ``<command-name>`` is NOT the first tag. Detect it anywhere
-        # in the content, not just at the start.
-        if "<command-name>" in stripped:
-            payload = _parse_slash_command_record(content)
+        if _is_slash_command_echo(content):
             # Drop unparseable markup rather than letting it fall through
             # to the user-bubble path — that rendered the markup verbatim
             # in the original bug.
-            if payload is None or payload.name in _CLAUDE_CLI_DROPPED_COMMANDS:
-                return current_response_id, []
-            kind = "command" if payload.name in _CLAUDE_CLI_SURFACED_COMMANDS else "skill"
-            data: _JsonObject = {
-                "agent": agent_name,
-                "kind": kind,
-                "name": payload.name,
-                "arguments": payload.arguments,
-            }
-            if payload.output is not None:
-                data["output"] = payload.output
-            items.append(
-                ClaudeTranscriptItem(
-                    source_id=_source_id(source_key, 0, "slash_command"),
-                    item_type="slash_command",
-                    data=data,
-                    response_id=fallback_response_id,
-                )
+            item = _slash_command_item_from_echo(
+                content,
+                source_key=source_key,
+                agent_name=agent_name,
+                response_id=fallback_response_id,
             )
+            if item is None:
+                return current_response_id, []
             # Slash command opens a new logical turn; subsequent
             # assistant text must inherit this id so it clusters with
             # the indicator, not the prior bubble.
-            return fallback_response_id, items
+            return fallback_response_id, [item]
         # ``!cmd`` terminal commands may arrive here in older Claude
         # builds; newer builds use top-level ``local_command`` records.
         # In both shapes, surface the command and result as their own

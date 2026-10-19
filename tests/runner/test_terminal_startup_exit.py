@@ -135,9 +135,16 @@ async def test_dead_before_observation_records_exit_without_publishing_a_resourc
         runtime_name,
         exited.value,
     )
-    assert events == [
-        ("failed-child", {"type": "session.status", "status": "failed", "error": error})
-    ]
+    assert len(events) == 1
+    session_id, event = events[0]
+    assert session_id == "failed-child"
+    assert event["type"] == "session.status"
+    assert event["status"] == "failed"
+    assert event["error"] == error
+    assert "failure_context" in event
+    assert event["failure_context"]["exception_type"] == "TerminalExitedDuringLaunch"
+    assert event["failure_context"]["failure_source"] == "native_terminal_start"
+    assert event["failure_context"]["failure_id"] == error["error_id"]
     assert error["code"] == "native_terminal_start_failed"
     message = error["message"]
     if capture == "1":

@@ -211,8 +211,9 @@ export function filterConversations(
   });
 }
 
-// Newest first. Freeze update timestamps for the active chat and hovered list;
-// creation timestamps stay immutable, including when the selected order changes.
+// Newest first; equal timestamps fall back to id, so arrival order never shows.
+// Freeze update timestamps for the active chat and hovered list; creation
+// timestamps stay immutable, including when the selected order changes.
 export function sortConversations(
   conversations: Conversation[],
   activeOverride: ActiveChatOverride | null,
@@ -225,10 +226,7 @@ export function sortConversations(
     frozenKeys?.set(c.id, updatedAt);
     return sortBy === "created_at" ? c.created_at : updatedAt;
   };
-  return [...conversations].sort(
-    (a, b) =>
-      effective(b) - effective(a) || (sortBy === "created_at" ? b.id.localeCompare(a.id) : 0),
-  );
+  return [...conversations].sort((a, b) => effective(b) - effective(a) || b.id.localeCompare(a.id));
 }
 
 /** Status groups, in the order the grouped sidebar renders them. */
@@ -267,7 +265,7 @@ export function dateBucket(timestamp: number, now: Date): DateBucket {
 }
 
 /**
- * Split `rows` into non-empty groups in `order`, keeping input order within each
+ * Split `rows` into groups in `order`, keeping input order within each
  * group. A row with no key (or one outside `order`) lands in the last group
  * rather than vanishing.
  */
@@ -275,6 +273,7 @@ export function groupConversations<K extends string>(
   rows: readonly Conversation[],
   keyOf: (c: Conversation) => K | undefined,
   order: readonly K[],
+  keepEmpty?: K,
 ): { title: K; conversations: Conversation[] }[] {
   const byKey = new Map<K, Conversation[]>(order.map((key) => [key, []]));
   const fallback = byKey.get(order[order.length - 1]);
@@ -285,7 +284,7 @@ export function groupConversations<K extends string>(
   }
   return order.flatMap((title) => {
     const conversations = byKey.get(title) ?? [];
-    return conversations.length > 0 ? [{ title, conversations }] : [];
+    return conversations.length > 0 || title === keepEmpty ? [{ title, conversations }] : [];
   });
 }
 

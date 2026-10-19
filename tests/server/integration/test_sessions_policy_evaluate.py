@@ -740,6 +740,59 @@ def _patch_default_policies(monkeypatch: pytest.MonkeyPatch, fn_path: str) -> No
     )
 
 
+@pytest.mark.parametrize("tool_name", ["sys_scheduled_task_create", "sys_scheduled_task_update"])
+async def test_scheduled_changes_require_explicit_approval_without_custom_policies(
+    client: httpx.AsyncClient,
+    tool_name: str,
+) -> None:
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+    drain = asyncio.create_task(_drain_elicitation_id(session_id))
+    await asyncio.sleep(0.05)
+    evaluate = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_tool_call_request(tool_name),
+        )
+    )
+    try:
+        # The built-in scheduled-task gate must fire even with no custom policies.
+        elicitation_id = await asyncio.wait_for(drain, timeout=5)
+        assert not evaluate.done()
+        response = await client.post(
+            f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+            json={"action": "accept"},
+        )
+        assert response.status_code == 202, response.text
+        response = await asyncio.wait_for(evaluate, timeout=5)
+        assert response.status_code == 200, response.text
+        assert response.json()["result"] == "POLICY_ACTION_ALLOW"
+    finally:
+        for task in (drain, evaluate):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(drain, evaluate, return_exceptions=True)
+
+
+@pytest.mark.parametrize("tool_name", ["sys_scheduled_task_list", "sys_scheduled_task_delete"])
+async def test_schedule_read_and_removal_do_not_require_new_approval(
+    client: httpx.AsyncClient,
+    tool_name: str,
+) -> None:
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+    # A regression that gates these tools would park the request; fail fast instead.
+    response = await asyncio.wait_for(
+        client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_tool_call_request(tool_name),
+        ),
+        timeout=5,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["result"] == "POLICY_ACTION_ALLOW"
+
+
 async def test_tool_call_ask_holds_gate_and_returns_allow_on_accept(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

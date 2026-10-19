@@ -434,6 +434,28 @@ describe("forkSession", () => {
     expect(JSON.parse(init.body as string)).toEqual({ title: "My clone" });
   });
 
+  it("sends a managed fork's chosen sandbox host id", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_fork",
+        agent_id: "agent_clone",
+        status: "idle",
+        created_at: 1704067200,
+      }),
+    );
+
+    await forkSession("conv_src", {
+      sandbox: { workspace: null, hostId: "0123456789abcdef0123456789abcdef" },
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      host_type: "managed",
+      workspace: null,
+      host_id: "0123456789abcdef0123456789abcdef",
+    });
+  });
+
   it("forwards run-config overrides (model / effort / launch args)", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({

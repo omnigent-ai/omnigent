@@ -8,6 +8,8 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { buildBrowserActionScript } = require("./browserActionScript.mjs");
+const { decodeLegacyBrowserAction } = require("./browserLegacyAction");
 const { buildDesignModeScript } = require("./designModeScript");
 
 // Max age of a real native input event for a design-mode submit marker to be
@@ -301,10 +303,11 @@ function registerBrowserIpc({
     const navigate = (registry) =>
       registry.openOrNavigate(conversationId, url, bounds, {
         force: !!opts?.force,
-        agent: !!opts?.agent,
+        // Renderer flags do not establish user intent.
+        agent: true,
         // The first-party renderer supplies the source-session host; main owns
         // the target and eligibility. Caller exception flags never establish identity.
-        agentContext: opts?.agent ? getAgentContextForEvent(event, opts?.sourceHostId) : null,
+        agentContext: getAgentContextForEvent(event, opts?.sourceHostId),
       });
     let r = navigate(g.registry);
     let recovered = false;
@@ -419,25 +422,28 @@ function registerBrowserIpc({
     }
   });
 
-  // Run relay-template JS in the conversation's view. PRIVATE to the relay's
-  // fixed templates (snapshot / click / type) — NOT an agent-facing generic
-  // `evaluate` (trust boundary; see README).
-  ipcMain.handle("omnigent:browser-execute", async (event, args) => {
+  // Both transports converge on main-owned scripts and the same sender gate.
+  async function performBrowserAction(event, args, legacy = false) {
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
-    const { conversationId, js } = args ?? {};
-    if (typeof js !== "string") return { ok: false, error: "js must be a string" };
+    const { conversationId } = args ?? {};
     const entry = g.registry.get(conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
     try {
-      // `true` = user gesture, so the page can call gesture-gated APIs.
-      const result = await entry.view.webContents.executeJavaScript(js, true);
-      // Normalize to a string — the relay JSON.parses snapshot/upload results.
+      const { action, params } = legacy ? decodeLegacyBrowserAction(args?.js) : (args ?? {});
+      const js = buildBrowserActionScript(action, params);
+      const result = await entry.view.webContents.executeJavaScript(js, false);
       return { ok: true, result: typeof result === "string" ? result : JSON.stringify(result) };
     } catch (e) {
       return { ok: false, error: e && e.message ? e.message : String(e) };
     }
-  });
+  }
+  ipcMain.handle("omnigent:browser-perform-action", (event, args) =>
+    performBrowserAction(event, args),
+  );
+  ipcMain.handle("omnigent:browser-execute", (event, args) =>
+    performBrowserAction(event, args, true),
+  );
 
   // Whether a view currently exists for a conversation. Lets a (re)mounting
   // pane re-attach an already-created view without waiting for a create event.

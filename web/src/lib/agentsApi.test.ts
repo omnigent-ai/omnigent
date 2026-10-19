@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { installAgentBundle } from "./agentsApi";
+import { getAgentConfig, patchAgentConfig, installAgentBundle } from "./agentsApi";
 import { authenticatedFetch } from "./identity";
 
 vi.mock("./identity", () => ({
@@ -50,5 +50,35 @@ describe("installAgentBundle", () => {
   it("rejects a success response without an id and name", async () => {
     mockFetch.mockResolvedValue(response({ ok: true }));
     await expect(installAgentBundle(bundle)).rejects.toThrow(/Unexpected response/);
+  });
+});
+
+describe("configuration API", () => {
+  it("reads the exact revision and sends it with a minimal PATCH", async () => {
+    const signal = new AbortController().signal;
+    mockFetch.mockResolvedValue(
+      new Response(JSON.stringify({ id: "a/b" }), { headers: { ETag: '"revision"' } }),
+    );
+    const loaded = await getAgentConfig("a/b", signal);
+    expect(loaded.etag).toBe('"revision"');
+    expect(mockFetch).toHaveBeenLastCalledWith("/v1/agents/a%2Fb/config", { signal });
+    mockFetch.mockResolvedValue(new Response('{"id":"a/b"}', { headers: { ETag: '"new"' } }));
+    await patchAgentConfig("a/b", loaded.etag!, { description: null });
+    expect(mockFetch).toHaveBeenLastCalledWith("/v1/agents/a%2Fb", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", "If-Match": '"revision"' },
+      body: '{"description":null}',
+    });
+  });
+  it("preserves missing revision information and exposes conflicts", async () => {
+    mockFetch.mockResolvedValue(new Response("{}"));
+    expect((await getAgentConfig("a")).etag).toBeNull();
+    mockFetch.mockResolvedValue(
+      new Response('{"error":{"code":"precondition_failed","message":"Reload"}}', { status: 412 }),
+    );
+    await expect(patchAgentConfig("a", '"old"', {})).rejects.toMatchObject({
+      status: 412,
+      code: "precondition_failed",
+    });
   });
 });

@@ -2337,6 +2337,64 @@ class TestSkillsFilterTranslation(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Tests: Bundle plugin gating (skill-less bundles emit no --plugin-dir)
+# ---------------------------------------------------------------------------
+
+
+class TestBundlePluginGating(unittest.TestCase):
+    def _plugins_for_bundle(self, bundle_dir):
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+        executor = ClaudeSDKExecutor(
+            gateway=True,
+            gateway_host="https://gateway.example.com",
+            base_url_override="https://gateway.example.com/v1",
+            gateway_auth_command="printf token",
+            bundle_dir=bundle_dir,
+            agent_name="my-agent",
+        )
+
+        captured: dict[str, object] = {}
+
+        async def fake_get_or_create_client(sdk, *, session_key, options, model):
+            captured["plugins"] = getattr(options, "plugins", None)
+            raise RuntimeError("stop after options built")
+
+        async def _t():
+            with patch.object(
+                executor,
+                "_get_or_create_client",
+                side_effect=fake_get_or_create_client,
+            ):
+                with self.assertRaises(RuntimeError):
+                    async for _ in executor.run_turn([{"role": "user", "content": "hi"}], [], ""):
+                        pass
+
+        _run(_t())
+        return captured["plugins"]
+
+    def test_skill_less_bundle_emits_no_plugin(self):
+        # No `skills/` directory -> empty `plugins` and no manifest written
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp)
+            self.assertEqual(self._plugins_for_bundle(bundle), [])
+            self.assertFalse((bundle / ".claude-plugin" / "plugin.json").exists())
+
+    def test_bundle_with_skills_registers_plugin(self):
+        # `skills/` directory -> local plugin for bundle and manifest written
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp)
+            skill_dir = bundle / "skills" / "demo"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("# demo\n")
+            self.assertEqual(
+                self._plugins_for_bundle(bundle),
+                [{"type": "local", "path": str(bundle)}],
+            )
+            self.assertTrue((bundle / ".claude-plugin" / "plugin.json").exists())
+
+
+# ---------------------------------------------------------------------------
 # Tests: StreamEvent-based streaming
 # ---------------------------------------------------------------------------
 
@@ -5612,3 +5670,84 @@ async def test_live_cached_client_is_reused_between_turns() -> None:
     assert fake_sdk.created_clients == []
     assert executor._clients["sess-1"].client is live_client
     assert live_client.prompts == ["second question"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_effort", [None, "low"])
+@pytest.mark.parametrize(
+    "compact_content",
+    [
+        None,
+        "/compact",
+        [{"type": "text", "text": "/compact"}],
+        [{"type": "input_text", "text": "/compact"}],
+    ],
+)
+async def test_effort_changes_rebuild_client_with_history(initial_effort, compact_content) -> None:
+    """Changing or clearing effort reaches the next query without losing history."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import ExecutorConfig
+
+    fake_sdk = _make_recovery_fake_sdk()
+    executor = ClaudeSDKExecutor()
+    messages = []
+    efforts = [initial_effort, "max", "max", None]
+    with (
+        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk),
+        patch.object(executor, "_force_close_client", new_callable=AsyncMock) as close,
+    ):
+        for index, effort in enumerate(efforts):
+            if index == 1:
+                initial_client = executor._clients["effort"].client
+                if compact_content is not None:
+                    messages.append({"role": "user", "content": compact_content})
+                    compact_events = [
+                        event
+                        async for event in executor.run_turn(
+                            messages, [], "", ExecutorConfig(extra={"reasoning_effort": effort})
+                        )
+                    ]
+                    assert not [
+                        event for event in compact_events if isinstance(event, ExecutorError)
+                    ]
+                    assert executor._clients["effort"].client is initial_client
+                    assert executor._clients["effort"].effort == initial_effort
+                    assert initial_client.prompts[-1] == "/compact"
+                    messages.append({"role": "assistant", "content": "compacted summary"})
+                # No pending input must not replay an already-completed turn.
+                query_count = len(initial_client.prompts)
+                empty_events = [
+                    event
+                    async for event in executor.run_turn(
+                        messages, [], "", ExecutorConfig(extra={"reasoning_effort": effort})
+                    )
+                ]
+                assert empty_events == [TurnComplete(response=None)]
+                assert executor._clients["effort"].client is initial_client
+                assert len(initial_client.prompts) == query_count
+                assert len(fake_sdk.created_clients) == 1
+                close.assert_not_awaited()
+            messages.append(
+                {"role": "user", "content": f"question {index}", "session_id": "effort"}
+            )
+            events = [
+                event
+                async for event in executor.run_turn(
+                    messages, [], "", ExecutorConfig(extra={"reasoning_effort": effort})
+                )
+            ]
+            assert not [event for event in events if isinstance(event, ExecutorError)]
+            assert any(isinstance(event, TurnComplete) for event in events)
+            client = executor._clients["effort"].client
+            assert client.options.effort == effort
+            prompt = client.prompts[-1]
+            if index == 2:
+                assert prompt == "question 2"
+            else:
+                for previous in range(index):
+                    assert f"question {previous}" in prompt
+                    assert f"answer {previous}" in prompt
+            messages.append({"role": "assistant", "content": f"answer {index}"})
+
+    assert len(fake_sdk.created_clients) == 3
+    assert [call.args[0] for call in close.await_args_list] == fake_sdk.created_clients[:2]
