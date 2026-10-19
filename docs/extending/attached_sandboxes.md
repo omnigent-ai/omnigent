@@ -168,8 +168,9 @@ host identity and token; returning an HTTP endpoint alone is insufficient.
 ## Friendly names owned by Omnigent
 
 `hosts.display_name` is an optional user-owned label, independent of the existing
-registration `name` and the provider's sandbox ID. After selecting a static
-sandbox in New session or Clone session, use **Edit** to rename it.
+registration `name` and the provider's sandbox ID. In the New session or Clone session host picker, use **Edit** beside a static
+sandbox entry to rename it. Editing does not select or wake the box. With a row
+focused, press Right Arrow to edit its name.
 The label appears in host pickers, the session badge, and host setup screens.
 Clearing it restores the existing host name. Duplicate display names are allowed.
 

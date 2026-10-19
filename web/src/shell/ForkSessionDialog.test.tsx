@@ -2,7 +2,7 @@ import { testAgent } from "@/test/agentFixtures";
 import type * as ReactRouterDomModule from "react-router-dom";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
@@ -1453,6 +1453,12 @@ describe("ForkSessionDialog", () => {
             setHosts([
               host(),
               host({ host_id: "host_existing", name: "Existing box", sandbox_attached: true }),
+              host({
+                host_id: "host_other",
+                name: "Other box",
+                status: "offline",
+                sandbox_attached: true,
+              }),
             ]);
             return new Response(JSON.stringify({ host_id: "host_existing" }));
           }
@@ -1483,7 +1489,29 @@ describe("ForkSessionDialog", () => {
             screen.queryByRole("dialog", { name: "Choose existing static sandbox" }),
           ).not.toBeInTheDocument();
           expect(forkSessionMock).not.toHaveBeenCalled();
-          fireEvent.click(screen.getByRole("button", { name: "Edit static sandbox name" }));
+          expect(screen.queryByText("Edit", { exact: true })).not.toBeInTheDocument();
+          openHostSelect();
+          expect(
+            within(screen.getByTestId("fork-session-host-option-host_1")).queryByText("Edit"),
+          ).not.toBeInTheDocument();
+          const offline = screen.getByTestId("fork-session-host-option-host_other");
+          fireEvent.keyDown(offline, { key: "Enter" });
+          expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Existing box");
+          fireEvent.keyDown(offline, { key: "ArrowRight" });
+          expect(screen.getByRole("textbox", { name: "Sandbox name" })).toHaveAttribute(
+            "placeholder",
+            "Other box",
+          );
+          fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+          await waitFor(() => expect(screen.getByTestId("fork-session-host-select")).toHaveFocus());
+          expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Existing box");
+          expect(screen.getByTestId("fork-session-host-select")).not.toHaveTextContent("Edit");
+          openHostSelect();
+          fireEvent.click(
+            within(screen.getByTestId("fork-session-host-option-host_existing")).getByText("Edit", {
+              exact: true,
+            }),
+          );
           expect(screen.getByRole("dialog", { name: "Rename static sandbox" })).toBeInTheDocument();
           fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
         } finally {

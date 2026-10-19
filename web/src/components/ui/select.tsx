@@ -120,8 +120,8 @@ function SelectLabel({ className, ...props }: React.ComponentProps<typeof Select
 
 const SelectItem = React.forwardRef<
   React.ElementRef<typeof SelectPrimitive.Item>,
-  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Item>
->(function SelectItem({ className, children, ...props }, ref) {
+  React.ComponentPropsWithoutRef<typeof SelectPrimitive.Item> & { action?: React.ReactNode }
+>(function SelectItem({ className, children, action, ...props }, ref) {
   return (
     <SelectPrimitive.Item
       ref={ref}
@@ -138,6 +138,7 @@ const SelectItem = React.forwardRef<
         </SelectPrimitive.ItemIndicator>
       </span>
       <SelectPrimitive.ItemText>{children}</SelectPrimitive.ItemText>
+      {action}
     </SelectPrimitive.Item>
   );
 });

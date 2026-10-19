@@ -3485,6 +3485,7 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
             browser = await pw.chromium.launch()
             page = await browser.new_page(
                 viewport={"width": 1280, "height": 900},
+                has_touch=True,
                 record_video_dir=str(tmp_path / "video"),
                 record_video_size={"width": 1280, "height": 900},
             )
@@ -3633,13 +3634,28 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
                 await page.screenshot(
                     path=str(tmp_path / "attached-sandbox-picker.png"), animations="disabled"
                 )
+                selection_before_edit = await chip.get_attribute("aria-label")
+                await row.focus()
+                await row.press("ArrowRight")
+                naming = page.get_by_role("dialog", name="Rename static sandbox")
+                await expect(naming.get_by_role("textbox", name="Sandbox name")).to_be_focused()
+                await naming.get_by_role("button", name="Cancel", exact=True).click()
+                await expect(chip).to_be_focused()
+                await expect(chip).to_have_attribute("aria-label", selection_before_edit)
+                assert not wake_calls and not rename_calls
+                await expect(page.locator("[data-sandbox-edit]")).to_have_count(0)
+                await chip.click()
                 await row.click()
                 await expect(chip).to_have_attribute("aria-label", "Host: My devbox, Online")
                 assert wake_calls == ["POST"]
-                await page.get_by_role(
-                    "button", name="Edit static sandbox name", exact=True
-                ).click()
-                naming = page.get_by_role("dialog", name="Rename static sandbox")
+                await expect(page.locator("[data-sandbox-edit]")).to_have_count(0)
+                await chip.click()
+                await row.hover()
+                await expect(row.get_by_text("Edit", exact=True)).to_be_visible()
+                await page.screenshot(
+                    path=str(tmp_path / "edit-in-host-picker.png"), animations="disabled"
+                )
+                await row.get_by_text("Edit", exact=True).click()
                 await naming.get_by_role("textbox", name="Sandbox name").fill("My project")
                 await naming.get_by_role("button", name="Save", exact=True).click()
                 await expect(naming).to_be_hidden()
@@ -3679,13 +3695,25 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
                 await expect(clone.get_by_test_id("fork-session-host-select")).to_contain_text(
                     "My project"
                 )
-                await clone.get_by_role("button", name="Edit static sandbox name").click()
+                await expect(page.locator("[data-sandbox-edit]")).to_have_count(0)
+                await expect(clone.get_by_test_id("fork-session-host-select")).not_to_contain_text(
+                    "Edit"
+                )
+                await clone.get_by_test_id("fork-session-host-select").tap()
+                clone_row = page.get_by_test_id("fork-session-host-option-host_devbox")
+                await expect(clone_row.get_by_text("Edit", exact=True)).to_be_visible()
+                await page.screenshot(
+                    path=str(tmp_path / "edit-in-clone-picker.png"), animations="disabled"
+                )
+                await clone_row.get_by_text("Edit", exact=True).tap()
                 await naming.get_by_role("textbox", name="Sandbox name").fill("")
                 await naming.get_by_role("button", name="Save", exact=True).click()
                 await expect(naming).to_be_hidden()
                 await expect(clone.get_by_test_id("fork-session-host-select")).to_contain_text(
                     "My devbox"
                 )
+                await expect(page.locator("[data-sandbox-edit]")).to_have_count(0)
+                await expect(clone.get_by_test_id("fork-session-host-select")).to_be_focused()
                 assert rename_calls == [{"display_name": "My project"}, {"display_name": None}]
                 assert wake_calls == ["POST"] and len(attach_calls) == 2
                 await page.screenshot(

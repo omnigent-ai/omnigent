@@ -90,7 +90,7 @@ import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferen
 import { resolveWorkspacePath, useResolvedHostHome } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { StaticSandboxPicker } from "./StaticSandboxPicker";
-import { StaticSandboxName } from "./StaticSandboxName";
+import { StaticSandboxEdit, StaticSandboxName } from "./StaticSandboxName";
 import { WorkspacePathField } from "./WorkspacePathField";
 import {
   ConnectHostInstructions,
@@ -817,6 +817,13 @@ function SupportedForkSessionForm({
   // Provider the sandbox pick launches on; null for a server that names none.
   const [sandboxProvider, setSandboxProvider] = useState<string | null>(null);
   const [discoveryProvider, setDiscoveryProvider] = useState<string | null>(null);
+  const [hostMenuOpen, setHostMenuOpen] = useState(false);
+  const hostPickerRef = useRef<HTMLButtonElement>(null);
+  const [editingHost, setEditingHost] = useState<Host | null>(null);
+  const editSandboxName = (host: Host) => {
+    setHostMenuOpen(false);
+    setEditingHost(host);
+  };
   // Repository cloned into the sandbox, split across two inputs and
   // recomposed into the request's `<url>[#<branch>]` workspace.
   const [sandboxRepoUrl, setSandboxRepoUrl] = useState("");
@@ -836,7 +843,6 @@ function SupportedForkSessionForm({
   // never shows the host field).
   const { data: hosts } = useHosts({ enabled: isCodingSource });
   const allHosts = hosts ?? [];
-  const selectedHost = allHosts.find((host) => host.host_id === selectedHostId);
   const onlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "online"), [hosts]);
   const offlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "offline"), [hosts]);
   const sourceHostOnline = onlineHosts.some((h) => h.host_id === sourceHostId);
@@ -1501,12 +1507,7 @@ function SupportedForkSessionForm({
               or the connect instructions directly when none is. */}
         {isCodingSource && (
           <div className="flex flex-col gap-2">
-            <div className="flex items-center justify-between">
-              <span className="text-sm font-medium text-muted-foreground">Host</span>
-              {!sandboxSelected && selectedHost?.sandbox_attached && (
-                <StaticSandboxName host={selectedHost} />
-              )}
-            </div>
+            <span className="text-sm font-medium text-muted-foreground">Host</span>
             {hosts === undefined ? (
               <p className="text-sm text-muted-foreground" data-testid="fork-session-no-hosts">
                 Loading hosts…
@@ -1529,6 +1530,8 @@ function SupportedForkSessionForm({
             ) : (
               <>
                 <Select
+                  open={hostMenuOpen}
+                  onOpenChange={setHostMenuOpen}
                   value={
                     sandboxSelected ? sandboxHostChoice(sandboxProvider) : (selectedHostId ?? "")
                   }
@@ -1547,6 +1550,7 @@ function SupportedForkSessionForm({
                   }}
                 >
                   <SelectTrigger
+                    ref={hostPickerRef}
                     id={FORK_FIELD_IDS.host}
                     className="w-full text-sm"
                     data-testid="fork-session-host-select"
@@ -1558,7 +1562,11 @@ function SupportedForkSessionForm({
                       }
                     />
                   </SelectTrigger>
-                  <SelectContent>
+                  <SelectContent
+                    onCloseAutoFocus={(event) => {
+                      if (editingHost) event.preventDefault();
+                    }}
+                  >
                     {/* Server-provisioned sandbox — only advertised when
                         /v1/info reports managed_sandboxes_enabled. Pinned
                         first, above the connected-host list. */}
@@ -1589,21 +1597,40 @@ function SupportedForkSessionForm({
                         </SelectItem>
                       ))}
                     {managedSandboxesEnabled && allHosts.length > 0 && <SelectSeparator />}
-                    {onlineHosts.map((host) => (
+                    {[...onlineHosts, ...offlineHosts].map((host) => (
                       <SelectItem
                         key={host.host_id}
                         value={host.host_id}
+                        disabled={host.status === "offline" && !host.sandbox_attached}
                         data-testid={`fork-session-host-option-${host.host_id}`}
-                      >
-                        <HostLabel host={host} />
-                      </SelectItem>
-                    ))}
-                    {offlineHosts.map((host) => (
-                      <SelectItem
-                        key={host.host_id}
-                        value={host.host_id}
-                        disabled
-                        data-testid={`fork-session-host-option-${host.host_id}`}
+                        className="group/sandbox"
+                        aria-description={
+                          host.sandbox_attached
+                            ? "Right Arrow to edit the sandbox name."
+                            : undefined
+                        }
+                        onPointerUp={(event) => {
+                          if (host.status === "offline") event.preventDefault();
+                        }}
+                        onClick={(event) => {
+                          if (host.status === "offline") event.preventDefault();
+                        }}
+                        onKeyDown={(event) => {
+                          if (host.sandbox_attached && event.key === "ArrowRight") {
+                            event.preventDefault();
+                            editSandboxName(host);
+                          } else if (
+                            host.status === "offline" &&
+                            ["Enter", " "].includes(event.key)
+                          ) {
+                            event.preventDefault();
+                          }
+                        }}
+                        action={
+                          host.sandbox_attached && (
+                            <StaticSandboxEdit onEdit={() => editSandboxName(host)} />
+                          )
+                        }
                       >
                         <HostLabel host={host} />
                       </SelectItem>
@@ -1627,6 +1654,16 @@ function SupportedForkSessionForm({
                     ))}
                   </SelectContent>
                 </Select>
+                {editingHost && (
+                  <StaticSandboxName
+                    host={editingHost}
+                    onClose={() => setEditingHost(null)}
+                    onCloseAutoFocus={(event) => {
+                      event.preventDefault();
+                      hostPickerRef.current?.focus();
+                    }}
+                  />
+                )}
                 {discoveryProvider !== null && (
                   <StaticSandboxPicker
                     provider={discoveryProvider}

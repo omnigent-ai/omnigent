@@ -281,7 +281,8 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/start_session/test_start_session.py::test_attached_sandbox_wakes_and_remains_a_reusable_picker_target`
   checks controller discovery (including error, empty and retry states), attachment,
   optional static-provider creation, discovery with creation disabled and no
-  registered reusable hosts, optional controller state, rename and reload,
+  registered reusable hosts, optional controller state, rename from the sandbox
+  row inside the picker (pointer, keyboard and mobile touch), focus restoration and reload,
   wake and reuse across two create requests, and clearing the label in mobile Clone session;
   ad hoc sandbox hosts stay hidden. Clone session shares the discovery dialog,
   covered with creation enabled and disabled by
