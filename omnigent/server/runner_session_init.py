@@ -119,6 +119,29 @@ class RunnerSessionInitializer:
         if self.generation_for(runner_id, runner_client) != generation:
             raise ConnectionError("runner tunnel changed during session recovery")
 
+    def is_initialized(self, conversation: Conversation, runner_client: httpx.AsyncClient) -> bool:
+        """Whether initialization accepted this session on its current tunnel."""
+        runner_id, agent_id = conversation.runner_id, conversation.agent_id
+        if runner_id is None or agent_id is None:
+            return False
+        session_key = (
+            runner_id,
+            self.generation_for(runner_id, runner_client),
+            conversation.id,
+            agent_id,
+            conversation.sub_agent_name,
+        )
+        for recovery in (False, True):
+            task = self._tasks.get((*session_key, recovery))
+            if task is None or not task.done() or task.cancelled() or task.exception() is not None:
+                continue
+            response = task.result()
+            if 200 <= response.status_code < 300 and runner_inference_verified(
+                conversation, response
+            ):
+                return True
+        return False
+
     async def initialize(
         self,
         conversation: Conversation,

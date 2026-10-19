@@ -1563,7 +1563,8 @@ def create_app(
     from omnigent.server.routes._host_launch import configure_host_sharding
 
     configure_host_sharding(host_sharded)
-    tunnel_registry = TunnelRegistry()
+    # A tunnel this replica retires on purpose is a handoff, not a lost runner.
+    tunnel_registry = TunnelRegistry(on_retire=shutdown_state.note_runner_tunnel_retired)
     host_registry = HostRegistry()
     runner_router = RunnerRouter(
         registry=tunnel_registry,
@@ -3547,6 +3548,16 @@ def create_app(
                 runner_id,
             )
             return
+        # The same holds for one runner this replica handed to another replica.
+        handoff_reason = shutdown_state.runner_handoff_reason(runner_id)
+        if handoff_reason is not None:
+            _logger.info(
+                "Runner %s dropped because this server handed it off (%s); "
+                "skipping offline-marking",
+                runner_id,
+                handoff_reason,
+            )
+            return
         if reconnected is not None:
             _logger.info(
                 "Runner %s reconnected within the liveness lease; skipping offline-marking",
@@ -3664,6 +3675,7 @@ def create_app(
                 runner_id=runner_id,
                 peer_close_reason=connection.peer_close_reason,
                 idle_shutdown=idle_shutdown,
+                **shutdown_state.disconnect_attributes(runner_id),
             ),
         )
         if idle_shutdown:
@@ -3675,9 +3687,12 @@ def create_app(
         # one we wrote ourselves (the clear itself never erases this record).
         reference_stamp = session_live_state.last_liveness_stamp(runner_id)
         # Graceful disconnect: clear the persisted liveness stamp so other replicas
-        # flip offline at once. Not on our own shutdown: the runner is alive and
-        # re-tunnels to the replacement, which must not settle its turns to idle.
-        if shutdown_state.server_shutting_down():
+        # flip offline at once. Not on our own shutdown or a handoff: the runner is
+        # alive and re-tunnels elsewhere, which must not settle its turns to idle.
+        if (
+            shutdown_state.server_shutting_down()
+            or shutdown_state.runner_handoff_reason(runner_id) is not None
+        ):
             session_live_state.touch_runner_liveness([runner_id])
         else:
             session_live_state.clear_runner_liveness(runner_id)
@@ -3784,6 +3799,8 @@ def create_app(
             "Runner connected",
             extra=debug_event("runner_connected", runner_id=runner_id),
         )
+        # A runner back on this replica is this replica's to reconcile again.
+        shutdown_state.clear_runner_handoff(runner_id)
         # Other replicas must see the runner online before the first liveness sweep.
         session_live_state.touch_runner_liveness([runner_id])
         # The by-runner lookup is read-after-write consistent and includes archived

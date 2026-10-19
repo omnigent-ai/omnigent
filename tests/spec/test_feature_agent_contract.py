@@ -168,6 +168,8 @@ def test_feature_handoff_passes_the_shared_review_gate() -> None:
                 "`<!-- omnigent-feature-managed -->`",
                 "Never approve or merge",
                 "**never** commit `recordings/`",
+                "`gh pr comment <pr> --body-file <file> --attach <clip> …`",
+                "Only these uploaded URLs count as recordings",
                 "leave `pr_url` empty",
             ],
         ),

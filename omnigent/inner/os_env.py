@@ -18,6 +18,7 @@ import tempfile
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict, cast
@@ -434,6 +435,9 @@ class _HelperProcessClient:
         self._egress_handle: EgressProxyHandle | None = None
         self._git_ssh_broker: GitSshBroker | None = None
         self._lock = threading.Lock()
+        # bwrap --die-with-parent kills the helper when the thread that spawned it
+        # exits, and each request runs on its own short-lived thread.
+        self._spawner = ThreadPoolExecutor(max_workers=1, thread_name_prefix="os-env-helper")
         self._closed = False
         atexit.register(self.close)
 
@@ -445,6 +449,8 @@ class _HelperProcessClient:
         with self._lock:
             self._closed = True
             self._stop_locked()
+        self._spawner.shutdown(wait=False)
+        atexit.unregister(self.close)
 
     def _request_locked(
         self,
@@ -649,17 +655,19 @@ class _HelperProcessClient:
         if r_fd is not None:
             popen_kwargs["pass_fds"] = (r_fd,)
         try:
-            self._proc = subprocess.Popen(
-                spawn_argv,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-                cwd="/" if sandbox.copy_on_write_namespace else str(self.cwd),
-                env=env,
-                **popen_kwargs,
-            )
+            self._proc = self._spawner.submit(
+                lambda: subprocess.Popen(
+                    spawn_argv,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    cwd="/" if sandbox.copy_on_write_namespace else str(self.cwd),
+                    env=env,
+                    **popen_kwargs,
+                )
+            ).result()
         except Exception:
             self._stop_locked()
             raise

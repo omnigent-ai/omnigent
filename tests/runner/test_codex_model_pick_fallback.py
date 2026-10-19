@@ -268,6 +268,22 @@ async def test_unavailable_pick_resets_only_after_fallback_terminal_launch(
 
 
 @pytest.mark.asyncio
+async def test_unavailable_pick_also_pinned_by_the_spec_launches_on_the_default(
+    codex_launch_harness: _LaunchHarness,
+) -> None:
+    """`omnigent codex --model` pins one unlisted id in both places; neither may launch."""
+    harness = codex_launch_harness
+    assert isinstance(harness.agent_spec, AgentSpec)
+    harness.agent_spec.executor.config["model"] = _RETIRED_PICK
+    harness.seed_catalog([{"id": "gpt-5.6-sol", "isDefault": True}, {"id": _PROVIDER_DEFAULT}])
+
+    await harness.launch()
+
+    assert harness.builds[0]["model"] == _PROVIDER_DEFAULT
+    assert harness.resets == [{"expected_model_override": _RETIRED_PICK}]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("refresh", ["hit", "miss", "empty", "error"])
 async def test_stale_miss_awaits_reprobe_before_deciding_fallback(
     refresh: str, codex_launch_harness: _LaunchHarness

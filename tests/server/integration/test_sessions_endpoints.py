@@ -10147,6 +10147,7 @@ async def test_retry_session_retries_native_terminal_ensure_after_runner_reconne
 async def test_native_message_is_refused_with_input_kept_when_host_runner_tunnel_drops(
     client: httpx.AsyncClient,
     db_uri: str,
+    app: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A send as a host runner's tunnel drops is refused, not recorded as a failed turn."""
@@ -10168,10 +10169,14 @@ async def test_native_message_is_refused_with_input_kept_when_host_runner_tunnel
     store.replace_runner_id(session["id"], "native-runner")
     terminals_path = f"/v1/sessions/{session['id']}/resources/terminals"
     runner_paths: list[str] = []
-    tunnel_up = False
+    tunnel_up = True
 
     def runner(request: httpx.Request) -> httpx.Response:
         runner_paths.append(request.url.path)
+        if request.url.path == "/v1/sessions":
+            return httpx.Response(
+                201, json={"session_init_protocol_version": 2, "terminal_ready": False}
+            )
         if request.url.path == terminals_path:
             if not tunnel_up:
                 # What WSTunnelTransport raises when the tunnel dies under the request.
@@ -10197,6 +10202,15 @@ async def test_native_message_is_refused_with_input_kept_when_host_runner_tunnel
         monkeypatch.setattr(
             "omnigent.server.routes.sessions._ensure_runner_relay_ready", AsyncMock()
         )
+        bound = store.get_conversation(session["id"])
+        assert bound is not None
+        initialized = await app.state.runner_session_initializer.initialize(
+            bound, runner_client, timeout=5, suppress_recovery_turn=True
+        )
+        assert initialized.status_code == 201
+        assert runner_paths == ["/v1/sessions"]
+        runner_paths.clear()
+        tunnel_up = False
         try:
             refused = await client.post(f"/v1/sessions/{session['id']}/events", json=message)
 

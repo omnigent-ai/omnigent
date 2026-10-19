@@ -138,6 +138,9 @@ def api():
                 {"id": run_id, "head_sha": HEAD, "status": "completed", "conclusion": "success"}
             ]
         }
+    routes[f"{PREFIX}/actions/runs/12/jobs?per_page=100&page=1"]["jobs"].extend(
+        {"name": name, "conclusion": "success"} for name in ("CI scope", "Pytest (codex-parity)")
+    )
     routes[f"{PREFIX}/actions/runs/11/artifacts?per_page=100"] = {
         "total_count": 1,
         "artifacts": [{"name": "trivy-cve-report-repository", "id": 12, "expired": False}],
@@ -877,6 +880,61 @@ def test_expanded_updates_require_their_actual_jobs(tmp_path, expanded_update):
     assert process.returncode == 0, process.stderr
     assert "human review or retry required" in process.stdout
     assert not any(call[:2] == ["pr", "merge"] for call in calls)
+
+
+@pytest.mark.parametrize("expanded_update", ["npm", "cargo", "pre-commit"], indirect=True)
+@pytest.mark.parametrize("result", ["success", "failure", "skipped", "pending", "missing"])
+def test_scoped_dependency_ci_requires_executed_consumer_jobs(tmp_path, expanded_update, result):
+    ecosystem, api = expanded_update
+    ci_jobs = api["routes"][f"{PREFIX}/actions/runs/12/jobs?per_page=100&page=1"]["jobs"]
+    for job in ci_jobs:
+        if job["name"] == "Pytest (runtime-core)":
+            job["conclusion"] = "skipped"
+    if ecosystem == "cargo":
+        jobs = [
+            {"name": f"E2E UI Tests (shard {index}/2)", "conclusion": "success"}
+            for index in range(2)
+        ]
+        api["routes"][f"{PREFIX}/actions/runs/17/jobs?per_page=100&page=1"]["jobs"] = jobs
+        api["routes"]["Browser Contract UI"]["check_runs"][0]["conclusion"] = "skipped"
+        required = jobs[0]
+    else:
+        jobs = ci_jobs
+        required = next(job for job in jobs if job["name"] == "CI scope")
+    if result == "missing":
+        jobs.remove(required)
+        if ecosystem == "cargo":
+            jobs.clear()
+    else:
+        required["conclusion"] = None if result == "pending" else result
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert any(call[:2] == ["pr", "merge"] for call in calls) == (result == "success"), (
+        process.stdout
+    )
+
+
+@pytest.mark.parametrize("expanded_update", ["npm", "pre-commit"], indirect=True)
+def test_pre_selection_heads_can_finish_their_full_ci(tmp_path, expanded_update):
+    _ecosystem, api = expanded_update
+    route = api["routes"][f"{PREFIX}/actions/runs/12/jobs?per_page=100&page=1"]
+    route["jobs"] = [job for job in route["jobs"] if job["name"] != "CI scope"]
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert any(call[:2] == ["pr", "merge"] for call in calls), process.stdout
+
+
+def test_lockfile_guards_are_in_the_required_lint_job():
+    workflow = yaml.safe_load((ROOT / ".github/workflows/lint.yml").read_text())
+    job = next(job for job in workflow["jobs"].values() if job.get("name") == "Pre-commit checks")
+    guard = next(
+        step
+        for step in job["steps"]
+        if step.get("name") == "Check locked dependency regression guards"
+    )
+    assert "tests/e2e/test_lockfile_vulnerable_pins.py" in guard["run"]
+    assert "-p tests._helpers.required_tests" in guard["run"]
+    assert "if" not in guard
 
 
 @pytest.fixture

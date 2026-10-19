@@ -7,6 +7,7 @@ Resume uses the same verdict. Empty turns warn and stay idle, as do clean turns.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -1047,6 +1048,48 @@ _CERTIFICATE_LINE = (
     "Failed to fetch safe flags from proxy: [SSL: SSLV3_ALERT_CERTIFICATE_EXPIRED] "
     "ssl/tls alert certificate expired (_ssl.c:2580)"
 )
+
+
+@pytest.mark.parametrize(
+    ("message", "turn_id", "reason"),
+    [
+        ("Failed to shutdown thread persistence", None, "thread_persistence_shutdown"),
+        ("private-error-detail", "child-turn", "unclassified"),
+        ("x" * 5000 + "Failed to shutdown thread persistence", "child-turn", "unclassified"),
+    ],
+)
+async def test_status_audit_correlates_child_errors_without_copying_error_text(
+    caplog: pytest.LogCaptureFixture,
+    message: str,
+    turn_id: str | None,
+    reason: str,
+) -> None:
+    caplog.set_level(logging.INFO, logger=fwd._logger.name)
+    client = _RecordingClient()
+    await fwd._post_turn_status_edge(
+        client,
+        "child-session",
+        fwd._CodexTurnStatusEdge(
+            status="failed",
+            turn_id=turn_id,
+            source="error",
+            error=fwd._CodexTerminalError(message=message, kind=fwd._CODEX_ERROR_KIND_GENERIC),
+        ),
+    )
+    [record] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "codex_turn_status"
+    ]
+    assert record.session_id == "child-session"
+    assert record.attributes["has_turn_id"] is (turn_id is not None)
+    assert record.attributes["has_error"] is True
+    assert record.attributes["native_error_kind"] == "generic"
+    assert record.attributes["native_error_reason"] == reason
+    assert record.attributes["protocol_source"] == "error"
+    assert "private-error-detail" not in json.dumps(record.attributes)
+    assert message not in record.getMessage()
+    assert client.posts[0][1]["data"]["output"] == message
 
 
 def _connection_retry_params(*, http_status: int | None = None) -> dict:
