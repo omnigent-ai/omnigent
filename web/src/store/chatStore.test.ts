@@ -43,7 +43,7 @@ import {
   promoteSessionDraft,
   setSessionDraft,
 } from "@/lib/sessionDrafts";
-import { getCurrentAuthorId } from "@/lib/identity";
+import { getCurrentAuthorId, subscribeIdentity } from "@/lib/identity";
 import { PRESENCE_IDLE_AFTER_MS } from "@/lib/presenceIdle";
 import { getSessionHost, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import {
@@ -113,7 +113,11 @@ const realSend = useChatStore.getState().send;
 // identity never leaks across tests.
 vi.mock("@/lib/identity", async (importOriginal) => {
   const actual = await importOriginal<typeof IdentityModule>();
-  return { ...actual, getCurrentAuthorId: vi.fn<() => string | null>(() => null) };
+  return {
+    ...actual,
+    getCurrentAuthorId: vi.fn<() => string | null>(() => null),
+    subscribeIdentity: vi.fn(actual.subscribeIdentity),
+  };
 });
 
 function userMessage(responseId: string, text: string): ConversationItem {
@@ -19535,6 +19539,30 @@ describe("a send cut off by a reload", () => {
     expect(peekUnsentSend("conv_existing")).toBeNull();
   });
 
+  it("doesn't keep a side chat's send, which its composer can't take back", async () => {
+    seedSession("conv_child");
+    seedSession("conv_parent");
+    await useChatStore.getState().switchTo("conv_child");
+    await useChatStore.getState().switchTo("conv_parent");
+    let answer: (() => void) | undefined;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_child/events")) {
+        return new Promise<Response>((resolve) => {
+          answer = () => resolve(mockResponse({ queued: true, item_id: "ci_mock" }));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const sending = useChatStore.getState().send("rerun the failing test", "agent_xyz", undefined, {
+      pinnedConversationId: "conv_child",
+    });
+    await vi.waitFor(() => expect(answer).toBeDefined());
+    expect(peekUnsentSend("conv_child")).toBeNull();
+    answer!();
+    await sending;
+  });
+
   it("forgets the record when the POST fails, handing the text back in memory", async () => {
     useChatStore.setState({
       conversationId: "conv_existing",
@@ -19659,17 +19687,36 @@ describe("a send cut off by a reload", () => {
     expect(peekUnsentSend("conv_reload")).toBeNull();
   });
 
-  it("keeps a send for a later bind while identity is unresolved", async () => {
+  it("restores a send once identity resolves", async () => {
     seedSession("conv_reload", []);
     rememberUnsentSend("conv_reload", {
       stableId: "stable_reload",
       text: "rerun the failing test",
       authorId: "user_a",
     });
+    let identityChanged: (() => void) | undefined;
+    vi.mocked(subscribeIdentity).mockImplementationOnce((listener) => {
+      identityChanged = listener;
+      return () => {};
+    });
 
     await useChatStore.getState().switchTo("conv_reload");
 
+    // No sender to check against yet, so the record waits.
     expect(useChatStore.getState().failedSendDraft).toBeNull();
     expect(peekUnsentSend("conv_reload")?.text).toBe("rerun the failing test");
+    // A probe that fails in transit leaves identity unresolved.
+    identityChanged!();
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+
+    vi.mocked(getCurrentAuthorId).mockReturnValue("user_a");
+    identityChanged!();
+
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      conversationId: "conv_reload",
+      text: "rerun the failing test",
+      stableId: "stable_reload",
+    });
+    expect(peekUnsentSend("conv_reload")).toBeNull();
   });
 });

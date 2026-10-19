@@ -135,7 +135,7 @@ import { fetchHarnessCatalog, type HarnessCatalog } from "@/lib/agentLabels";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
 import { codexPlanModeFromSession, isCodexNativeSession } from "@/lib/codexPlanMode";
-import { getCurrentAuthorId, resolveSessionHost } from "@/lib/identity";
+import { getCurrentAuthorId, resolveSessionHost, subscribeIdentity } from "@/lib/identity";
 import { getOmnigentHostConfig, isDatabricksWorkspace } from "@/lib/host";
 // Routing-free emit primitive (not "@/lib/analytics", which pulls in useLocation
 // and would form a routing↔store import cycle).
@@ -2573,6 +2573,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // target afterward would leak the message into the now-active session.
     // An explicit pin (navigate-first background POST) wins over the visible id.
     const submitConversationId = pinnedId ?? get().conversationId;
+    // Only the composer on screen takes back a send cut off by a reload (see
+    // `unsentSendToRestore`); a side chat posts to its child beside the parent.
+    const sentOnScreen = pinnedId === null || pinnedId === get().conversationId;
 
     // Take our place in THIS conversation's send chain: wait for its prior
     // send's network work, then hand off to the next via `releaseSend` in the
@@ -2602,7 +2605,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       postedSessionId = sessionId;
       // Until this send settles, the server may hold the message without persisting
       // it, so keep its text where a reload can find it (see `unsentSendToRestore`).
-      if (!compacts && text.trim()) {
+      if (!compacts && sentOnScreen && text.trim()) {
         rememberUnsentSend(sessionId, {
           stableId,
           text,
@@ -7001,8 +7004,11 @@ function unsentSendToRestore(
   // A send still open in this tab settles on its own.
   if (unsent === null || inFlightSends.has(unsent.stableId)) return null;
   const authorId = getCurrentAuthorId();
-  // The sender can't be checked before identity resolves; a later bind can.
-  if (authorId === null && unsent.authorId !== null) return null;
+  // The sender can't be checked before identity resolves; try again once it does.
+  if (authorId === null && unsent.authorId !== null) {
+    restoreUnsentSendOnceIdentified(conversationId, items);
+    return null;
+  }
   forgetUnsentSend(conversationId, unsent.stableId);
   // Another account has signed in to this tab since.
   if (unsent.authorId !== authorId) return null;
@@ -7015,6 +7021,31 @@ function unsentSendToRestore(
     ...(unsent.replyDraft ? { replyDraft: unsent.replyDraft } : {}),
     serverRefused: false,
   };
+}
+
+/**
+ * Finish a restore `unsentSendToRestore` put off until `/v1/me` names the viewer.
+ * The bind has already painted, so the draft goes straight onto the session's
+ * entry. Subscribing keeps a failed probe retrying.
+ *
+ * @param conversationId - The session whose bind put the restore off.
+ * @param items - That bind's snapshot items.
+ */
+function restoreUnsentSendOnceIdentified(
+  conversationId: string,
+  items: readonly { id: string }[],
+): void {
+  const unsubscribe = subscribeIdentity(() => {
+    if (getCurrentAuthorId() === null) return;
+    unsubscribe();
+    // An evicted session keeps the record for its next bind.
+    if (isConversationDisposed(conversationId)) return;
+    const draft = unsentSendToRestore(conversationId, items);
+    if (draft === null) return;
+    setterFor(conversationId)((state) =>
+      state.failedSendDraft === null ? { failedSendDraft: draft } : {},
+    );
+  });
 }
 
 /**

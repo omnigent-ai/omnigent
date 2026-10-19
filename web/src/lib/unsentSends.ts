@@ -77,6 +77,7 @@ export function peekUnsentSend(conversationId: string): UnsentSend | null {
   return read()[conversationId] ?? null;
 }
 
+/** Clear every record, for isolated tests. */
 export function clearUnsentSends(): void {
   write({});
 }
