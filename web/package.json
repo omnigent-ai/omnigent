@@ -120,7 +120,7 @@
     "@types/three": "0.185.1",
     "@vitejs/plugin-react": "^6.0.1",
     "@vitest/coverage-v8": "^4.1.11",
-    "ai": "^6.0.169",
+    "ai": "^6.0.304",
     "ai-elements": "^1.9.0",
     "fake-indexeddb": "^6.2.5",
     "jsdom": "^29.1.1",
