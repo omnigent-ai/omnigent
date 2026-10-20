@@ -13024,10 +13024,16 @@ def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None
     """
     databricks_bin = shutil.which("databricks")
     if databricks_bin is None:
-        raise click.ClickException(
-            "The Databricks CLI is required to log in to a workspace. "
-            "Install it first: https://docs.databricks.com/dev-tools/cli/install.html"
+        from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+
+        exc = click.ClickException(
+            "Databricks CLI executable `databricks` was not found on PATH. "
+            "Install it: https://docs.databricks.com/dev-tools/cli/install.html\n"
+            "The omnigent[databricks] Python extra does not install this executable. "
+            "Run `databricks --version` in this terminal, then retry your original command."
         )
+        setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
+        raise exc
     login_host = _host_with_org(workspace_host, org_id)
     # Pin the grant to a profile named for the workspace's first DNS label so
     # distinct workspaces don't clobber each other under the CLI's ``DEFAULT``.

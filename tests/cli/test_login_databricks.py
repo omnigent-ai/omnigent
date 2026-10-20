@@ -429,6 +429,28 @@ def test_login_apps_fails_loud_without_databricks_extra(
     assert load_databricks_workspace_host(_APPS_URL) is None
 
 
+def test_login_apps_fails_loud_without_databricks_cli(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path
+) -> None:
+    """The Python extra alone cannot complete a fresh workspace browser login."""
+    from omnigent.cli_auth import load_databricks_workspace_host
+
+    fake = _FakeHttpx(responses=[_response(302, headers={"location": _APPS_REDIRECT})])
+    login_calls = _patch_login_env(monkeypatch, fake_httpx=fake, cached_tokens=[None])
+    monkeypatch.setattr(cli_mod.shutil, "which", lambda name: None)
+
+    result = CliRunner().invoke(cli_group, ["login", _APPS_URL])
+
+    assert result.exit_code != 0
+    assert "Databricks CLI executable `databricks` was not found on PATH" in result.output
+    assert "https://docs.databricks.com/dev-tools/cli/install.html" in result.output
+    assert "omnigent[databricks] Python extra does not install this executable" in result.output
+    assert "Run `databricks --version` in this terminal" in result.output
+    assert "retry your original command" in result.output
+    assert login_calls == []
+    assert load_databricks_workspace_host(_APPS_URL) is None
+
+
 def test_login_runs_databricks_auth_login_when_no_cached_grant(
     monkeypatch: pytest.MonkeyPatch, token_dir: Path
 ) -> None:
