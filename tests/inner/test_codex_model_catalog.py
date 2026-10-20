@@ -765,3 +765,29 @@ def test_a_brokered_home_never_runs_the_unsandboxed_check(
     )
 
     assert written == ["/sandboxed/codex"]
+
+
+async def test_the_session_checks_the_catalog_with_its_own_codex(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured codex binary, not the one on PATH, decides whether the catalog loads."""
+
+    class _Stop(Exception):
+        pass
+
+    seen: list[object] = []
+
+    def _populate(*args: Any, **kwargs: Any) -> None:
+        seen.append(kwargs.get("codex_path"))
+        raise _Stop
+
+    monkeypatch.setattr(codex_executor, "_find_codex_cli", lambda: "/ambient/codex")
+    monkeypatch.setattr(codex_executor, "_populate_codex_home_config", _populate)
+    session = codex_executor._CodexAppServerSession(
+        codex_path="/selected/codex", cwd=str(tmp_path), env={}, tool_executor=None
+    )
+
+    with pytest.raises(_Stop):
+        await session.start()
+
+    assert seen == ["/selected/codex"]

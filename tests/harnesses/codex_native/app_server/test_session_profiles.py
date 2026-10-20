@@ -322,11 +322,10 @@ async def test_the_catalog_check_reads_the_config_a_selected_profile_produced(
     monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
     _disable_codex_startup_rpc(monkeypatch)
     _stub_model_catalog_probe(monkeypatch)
-    checked: list[str] = []
+    checked: list[tuple[str, str | None]] = []
 
     def _record(config_path: Path, codex_path: str | None) -> bool:
-        del codex_path
-        checked.append(config_path.read_text(encoding="utf-8"))
+        checked.append((config_path.read_text(encoding="utf-8"), codex_path))
         return False
 
     monkeypatch.setattr(app_server, "drop_unparseable_model_catalog", _record)
@@ -338,5 +337,6 @@ async def test_the_catalog_check_reads_the_config_a_selected_profile_produced(
     await server.start()
     await server.close()
 
-    [final_config] = checked
+    [(final_config, codex_path)] = checked
     assert "/profile/catalog.json" in final_config
+    assert codex_path == server.codex_path

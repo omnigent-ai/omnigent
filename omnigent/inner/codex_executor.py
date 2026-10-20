@@ -3065,6 +3065,7 @@ class _CodexAppServerSession:
             inject_hooks=router_bridge_dir is not None,
             extend_model_catalog=codex_extended_catalog_requested(self._env),
             include_credentials=self._signer is None,
+            codex_path=self._codex_path,
             required_brokered_probe=(
                 (
                     self._codex_path,
