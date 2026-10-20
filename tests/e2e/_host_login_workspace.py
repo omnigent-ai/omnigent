@@ -59,6 +59,7 @@ class HostLoginWorkspace(AbstractContextManager):
         self.server.daemon_threads = True
         self.server.workspace = self
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(str(self.cert), str(key))
         self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
         self.url = f"https://127.0.0.1:{self.server.server_port}"
@@ -86,7 +87,7 @@ class _WorkspaceHandler(BaseHTTPRequestHandler):
         body = json.dumps(payload).encode()
         self.send_response(status)
         for name, value in headers.items():
-            self.send_header(name, value)
+            self.send_header(name, value.replace("\r", "").replace("\n", ""))
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()

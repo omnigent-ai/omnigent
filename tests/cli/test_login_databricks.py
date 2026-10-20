@@ -430,22 +430,27 @@ def test_login_apps_fails_loud_without_databricks_extra(
 
 
 def test_login_apps_fails_loud_without_databricks_cli(
-    monkeypatch: pytest.MonkeyPatch, token_dir: Path
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The Python extra alone cannot complete a fresh workspace browser login."""
     from omnigent.cli_auth import load_databricks_workspace_host
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
 
     fake = _FakeHttpx(responses=[_response(302, headers={"location": _APPS_REDIRECT})])
     login_calls = _patch_login_env(monkeypatch, fake_httpx=fake, cached_tokens=[None])
     monkeypatch.setattr(cli_mod.shutil, "which", lambda name: None)
 
-    result = CliRunner().invoke(cli_group, ["login", _APPS_URL])
+    result = CliRunner().invoke(cli_group, ["login", _APPS_URL], standalone_mode=False)
 
     assert result.exit_code != 0
-    assert "Databricks CLI not found on PATH" in result.output
-    assert "Install it, then retry this command." in result.output
-    assert "https://docs.databricks.com/dev-tools/cli/install.html" in result.output
-    error_lines = result.output[result.output.index("Error:") :].splitlines()
+    assert isinstance(result.exception, click.ClickException), result.output
+    assert suppresses_recovery_hint(result.exception)
+    result.exception.show()
+    error_output = capsys.readouterr().err
+    assert "Databricks CLI not found on PATH" in error_output
+    assert "Install it, then retry this command." in error_output
+    assert "https://docs.databricks.com/dev-tools/cli/install.html" in error_output
+    error_lines = error_output.splitlines()
     assert len(error_lines) == 2
     assert all(len(line) <= 80 for line in error_lines)
     assert login_calls == []
