@@ -5688,3 +5688,68 @@ async def test_events_codex_side_chat_message_failure_is_structured(
     if detail is not None:
         assert response.json()["detail"] == detail
     assert fake_client.closed
+
+
+_QUESTION_ANSWER_EVENT = {
+    "type": "claude_native_question_answer",
+    "elicitation_id": f"elicit_claude_{'ab' * 16}",
+    "questions": [{"question": "Color?", "options": [{"label": "Red"}, {"label": "Blue"}]}],
+    "answers": {"Color?": "Blue"},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "outcome", "body", "expected_status", "expected_calls"),
+    [
+        ("claude-native", True, _QUESTION_ANSWER_EVENT, 200, 1),
+        ("claude-native", False, _QUESTION_ANSWER_EVENT, 409, 1),
+        ("claude-native", RuntimeError("tmux send-keys failed"), _QUESTION_ANSWER_EVENT, 409, 1),
+        (
+            "claude-native",
+            FileNotFoundError(2, "No such file", "tmux"),
+            _QUESTION_ANSWER_EVENT,
+            409,
+            1,
+        ),
+        ("claude-native", True, {**_QUESTION_ANSWER_EVENT, "answers": ["Blue"]}, 400, 0),
+        ("codex-native", True, _QUESTION_ANSWER_EVENT, 204, 0),
+    ],
+    ids=["answered", "not-answerable", "tmux-error", "tmux-missing", "malformed", "other-harness"],
+)
+async def test_events_question_answer_reports_whether_the_picker_took_it(
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    outcome: bool | Exception,
+    body: dict[str, Any],
+    expected_status: int,
+    expected_calls: int,
+) -> None:
+    """Only a confirmed picker answer returns 200; the server keeps the verdict otherwise."""
+    session_id = "c7e9584b9bb34910a0068521106c1abd"
+    calls: list[tuple[Path, list[Any], dict[str, Any]]] = []
+
+    def _answer(bridge_dir: Path, *, questions: list[Any], answers: dict[str, Any]) -> bool:
+        calls.append((bridge_dir, questions, answers))
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(claude_native_bridge, "answer_question_dialog", _answer)
+    app, _ = await _build_app_for_spec(_harness_spec(harness))
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert created.status_code == 201, created.text
+        resp = await client.post(f"/v1/sessions/{session_id}/events", json=body)
+
+    assert resp.status_code == expected_status, resp.text
+    assert len(calls) == expected_calls
+    if calls:
+        assert calls[0] == (
+            bridge_dir_for_conversation_id(session_id),
+            _QUESTION_ANSWER_EVENT["questions"],
+            _QUESTION_ANSWER_EVENT["answers"],
+        )

@@ -1062,6 +1062,8 @@ def _signal_terminal_resolved_harness_elicitation_impl(
     :param tool_input: Tool input the result is for, e.g.
         ``{"command": "ls"}``, or ``None`` if unavailable.
     """
+    if tool_name == "AskUserQuestion":
+        _supersede_hookless_question_verdicts(session_id, tool_input)
     candidates = [
         parked
         for parked in _harness_parked_elicitations.values()
@@ -1093,6 +1095,33 @@ def _signal_terminal_resolved_harness_elicitation_impl(
         session_id,
         len(candidates),
     )
+
+
+def _supersede_hookless_question_verdicts(
+    session_id: str, tool_input: dict[str, Any] | None
+) -> None:
+    """
+    Drop web answers waiting on hook-less questions the terminal already answered.
+
+    The saved answer would otherwise still be typed into Claude's picker, which
+    may by then show a later, identical question.
+
+    :param session_id: Session whose forwarder mirrored the result, e.g. ``"conv_abc123"``.
+    :param tool_input: Mirrored ``AskUserQuestion`` input, e.g. ``{"questions": [...]}``.
+    :returns: None.
+    """
+    structured = _structured_ask_user_question(tool_input)
+    if structured is None:
+        return
+    for elicitation_id, tombstone in _harness_pre_resolved_elicitations.items():
+        if (
+            tombstone.session_id == session_id
+            and tombstone.result is not None
+            and tombstone.questions == structured["questions"]
+        ):
+            _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
+                session_id=session_id, created_at=time.time()
+            )
 
 
 def _client_supplied_hook_elicitation_id(

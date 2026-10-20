@@ -246,6 +246,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
 # Lower-layer helpers (SSE builders, publishers, persistence, runner-forward
 # primitives) live in _sessions.helpers.
 from omnigent.server.routes._sessions.helpers import (
+    _TUI_INJECT_FORWARD_TIMEOUT_S,
     SessionLiveness,
     _antigravity_subagent_labels_from_body,
     _antigravity_subagent_title,
@@ -2340,28 +2341,46 @@ async def _resolve_elicitation(
             pre_resolved = ElicitationResult.model_validate(result_payload)
         except ValidationError:
             pre_resolved = None
-        if pre_resolved is not None:
+        pending_entry = pending_elicitations.lookup(elicitation_id)
+        _prune_pre_resolved_harness_elicitations()
+        earlier = _harness_pre_resolved_elicitations.get(elicitation_id)
+        # A repeated answer to an already-resolved prompt keeps the first answer and its delivery.
+        repeated = (
+            pending_entry is None and earlier is not None and earlier.session_id == session_id
+        )
+        if pre_resolved is not None and not repeated:
             # The pending index still holds the answered prompt (the
             # resolved fan-out below drains it), so fingerprint the
             # tombstone with the question's params: a later, different
             # question that reuses this id must not inherit the verdict.
             gap_fingerprint: str | None = None
-            pending_entry = pending_elicitations.lookup(elicitation_id)
+            pending_params: Any = None
             if pending_entry is not None and pending_entry[0] == session_id:
+                pending_params = pending_entry[1].get("params")
                 try:
                     gap_fingerprint = _harness_elicitation_request_fingerprint(
-                        ElicitationRequestParams.model_validate(pending_entry[1].get("params"))
+                        ElicitationRequestParams.model_validate(pending_params)
                     )
                 except ValidationError:
                     gap_fingerprint = None
-            _prune_pre_resolved_harness_elicitations()
-            _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
+            question_answer = _claude_question_answer_event(
+                elicitation_id, pending_params, pre_resolved
+            )
+            if gap_fingerprint is None:
+                question_answer = None
+            gap_tombstone = _PreResolvedHarnessElicitation(
                 session_id=session_id,
                 created_at=time.time(),
                 result=pre_resolved,
                 request_fingerprint=gap_fingerprint,
+                questions=None if question_answer is None else question_answer["questions"],
             )
+            _harness_pre_resolved_elicitations[elicitation_id] = gap_tombstone
             _prune_pre_resolved_harness_elicitations()
+            if question_answer is not None:
+                _spawn_question_tui_answer(
+                    session_id, elicitation_id, gap_tombstone, question_answer, runner_router
+                )
     # Wake a currently-parked long-poll via resolved_elsewhere, not only its
     # Future: setting the Future alone races the sever/re-park cycle and the
     # ASK-gated call hangs. Set the event directly; the signal helper's
@@ -2389,6 +2408,89 @@ async def _resolve_elicitation(
     # Runner-side elicitations (policy approvals, scaffold dispatch)
     # resolve when the canonical approval event reaches the runner.
     await _forward_approval_to_runner(session_id, data, runner_router)
+
+
+def _claude_question_answer_event(
+    elicitation_id: str, params: Any, verdict: ElicitationResult
+) -> dict[str, Any] | None:
+    """
+    Build the runner event that types a web answer into Claude's own question picker.
+
+    :param elicitation_id: Hook-minted id, e.g. ``"elicit_claude_0f3a..."``.
+    :param params: The pending prompt's request params as published.
+    :param verdict: The web card's verdict.
+    :returns: A ``claude_native_question_answer`` event, or ``None`` unless this
+        is an accepted, answered Claude ``AskUserQuestion`` prompt.
+    """
+    if not elicitation_id.startswith("elicit_claude_") or verdict.action != "accept":
+        return None
+    if not isinstance(params, dict) or params.get("tool_name") != "AskUserQuestion":
+        return None
+    structured = params.get("ask_user_question")
+    questions = structured.get("questions") if isinstance(structured, dict) else None
+    if not isinstance(questions, list) or not isinstance(verdict.content, dict):
+        return None
+    if not verdict.content:
+        return None
+    return {
+        "type": "claude_native_question_answer",
+        "elicitation_id": elicitation_id,
+        "questions": questions,
+        "answers": verdict.content,
+    }
+
+
+def _spawn_question_tui_answer(
+    session_id: str,
+    elicitation_id: str,
+    tombstone: _PreResolvedHarnessElicitation,
+    event: dict[str, Any],
+    runner_router: RunnerRouter | None,
+) -> None:
+    """
+    Deliver an answered question through Claude's picker when its hook never re-parks.
+
+    A permission hook that dies mid-wait leaves Claude's own picker blocking
+    while the verdict tombstone waits for a re-park that never comes. After a
+    short grace with the tombstone unconsumed, this asks the runner to answer
+    the picker; the tombstone stays claimable by a re-park or a terminal answer
+    meanwhile. A confirmed answer, or a re-park that took the verdict, leaves a
+    terminal-side tombstone so a late re-park fail-asks; otherwise the verdict
+    stays for a retry.
+
+    :param session_id: Session that owns the prompt, e.g. ``"conv_abc123"``.
+    :param elicitation_id: Hook-minted id, e.g. ``"elicit_claude_0f3a..."``.
+    :param tombstone: The verdict tombstone written for the unparked gap.
+    :param event: Runner event from :func:`_claude_question_answer_event`.
+    :param runner_router: Router used to reach the session's runner.
+    :returns: None.
+    """
+
+    async def _answer_after_grace() -> None:
+        from omnigent.server.routes import sessions as _facade
+
+        await asyncio.sleep(_facade._HARNESS_QUESTION_TUI_ANSWER_DELAY_S)
+        if (
+            _harness_pre_resolved_elicitations.get(elicitation_id) is not tombstone
+            or elicitation_id in _harness_elicitation_registry
+        ):
+            return
+        forwarded = await _forward_session_change_to_runner(
+            session_id, runner_router, event, timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S
+        )
+        delivered = forwarded is not None and forwarded.status_code == 200
+        current = _harness_pre_resolved_elicitations.get(elicitation_id)
+        # A missing tombstone means a re-park took the verdict during the forward.
+        if current is None or (current is tombstone and delivered):
+            _prune_pre_resolved_harness_elicitations()
+            _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
+                session_id=session_id, created_at=time.time()
+            )
+            _prune_pre_resolved_harness_elicitations()
+
+    task = asyncio.create_task(_answer_after_grace())
+    _native_popup_forward_tasks.add(task)
+    task.add_done_callback(_native_popup_forward_tasks.discard)
 
 
 def _spawn_native_approval_popup_forward(

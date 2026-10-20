@@ -98,12 +98,17 @@ class _PreResolvedHarnessElicitation:
         verdict-carrying tombstone without a fingerprint fails closed at
         consume time (dropped, prompt re-published) rather than falling
         back to adopt-by-id.
+    :param questions: ``AskUserQuestion`` questions a hook-less verdict
+        answers, e.g. ``[{"question": "Color?", ...}]``. A mirrored
+        terminal result for the same questions supersedes the verdict.
+        ``None`` for every other tombstone.
     """
 
     session_id: str
     created_at: float
     result: ElicitationResult | None = None
     request_fingerprint: str | None = None
+    questions: list[Any] | None = None
 
 
 # Maps ``elicitation_id`` to its parked-elicitation state. Populated

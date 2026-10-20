@@ -5734,13 +5734,18 @@ def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
     return claude_pane_text_ready(instance.last_pane_text() or "")
 
 
+def _decision_dialog_region(pane: str) -> str:
+    """Return the rows a bottom-docked decision dialog occupies."""
+    lines = [line for line in pane.splitlines() if line.strip()]
+    rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
+    return "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
+
+
 def _user_prompt_visible(pane: str) -> bool:
     """Recognize a native decision dialog, excluding text above a mounted composer."""
     if not pane.strip() or _composer_row(pane) is not None:
         return False
-    lines = [line for line in pane.splitlines() if line.strip()]
-    rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
-    region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
+    region = _decision_dialog_region(pane)
     return (
         _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_CONSENT)
         or "Do you want to " in region
@@ -8264,6 +8269,161 @@ def dismiss_btw_overlay(bridge_dir: Path) -> bool:
         return False
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
     return True
+
+
+_QUESTION_ANSWER_TIMEOUT_S = 10.0
+_QUESTION_ANSWER_POLL_S = 0.2
+_QUESTION_REVIEW_HINT = "Review your answers"
+_QUESTION_OPTION_ROW = re.compile(r"^\s*(?:❯\s*)?(\d+)\.\s+(.*\S)\s*$")
+_QUESTION_BUILT_IN_OPTIONS = ("Type something.", "Chat about this")
+
+
+def _single_line(text: str) -> str:
+    """Return *text* with whitespace runs, including Ink's soft wraps, as single spaces."""
+    return " ".join(text.split())
+
+
+def _question_answer_keys(
+    questions: Sequence[Any], answers: Mapping[str, Any]
+) -> list[tuple[str, list[str], str]] | None:
+    """
+    Map single-select ``AskUserQuestion`` answers to the digit keys Claude's picker takes.
+
+    :param questions: The tool input's ``questions`` list.
+    :param answers: Answer label per question text, e.g. ``{"Color?": "Blue"}``.
+    :returns: ``(question, option labels, key)`` per question, or ``None`` when
+        any answer is multi-select, free text, or otherwise not one listed option.
+    """
+    plan: list[tuple[str, list[str], str]] = []
+    for question in questions:
+        if not isinstance(question, dict) or question.get("multiSelect"):
+            return None
+        text = question.get("question")
+        options = question.get("options")
+        if not isinstance(text, str) or not text.strip() or not isinstance(options, list):
+            return None
+        labels = [option.get("label") if isinstance(option, dict) else None for option in options]
+        answer = answers.get(text)
+        if not all(isinstance(label, str) and label.strip() for label in labels):
+            return None
+        if answer not in labels or labels.index(answer) >= 9:
+            return None
+        plan.append((text, cast(list[str], labels), str(labels.index(answer) + 1)))
+    if not plan or len({text for text, _, _ in plan}) != len(plan) or len(plan) != len(answers):
+        return None
+    return plan
+
+
+def _question_dialog_shows(pane: str, question: str, labels: Sequence[str]) -> bool:
+    """Whether the bottom dialog asks exactly *question* with exactly *labels* as its options."""
+    if not _user_prompt_visible(pane):
+        return False
+    lines = _decision_dialog_region(pane).splitlines()
+    option_rows: list[tuple[int, re.Match[str]]] = []
+    for index, line in enumerate(lines):
+        match = _QUESTION_OPTION_ROW.match(line)
+        if match is not None:
+            option_rows.append((index, match))
+    if len(option_rows) <= len(labels):
+        return False
+    prompt = lines[: option_rows[0][0]]
+    # A soft-wrapped question must still equal whole rows directly above the options.
+    asks_question = any(
+        _single_line(" ".join(prompt[start:])) == _single_line(question)
+        for start in range(len(prompt))
+    )
+    # Claude's own rows follow the provided options, so no further provided option can hide.
+    listed = [(match[1], _single_line(match[2])) for _, match in option_rows]
+    expected = [
+        (str(number), _single_line(label))
+        for number, label in enumerate((*labels, *_QUESTION_BUILT_IN_OPTIONS), 1)
+    ]
+    return asks_question and listed == expected[: len(listed)]
+
+
+def _question_review_shows(pane: str, answered: Sequence[tuple[str, str]]) -> bool:
+    """Whether a multi-question picker's review step lists exactly *answered*, in order."""
+    if _composer_row(pane) is not None:
+        return False
+    _, found, review = pane.rpartition(_QUESTION_REVIEW_HINT)
+    listed: list[tuple[str, str]] = []
+    question_rows: list[str] | None = None
+    submit_offered = False
+    for line in review.splitlines():
+        row = line.strip()
+        option = _QUESTION_OPTION_ROW.match(line)
+        if option is not None:
+            if (option[1], _single_line(option[2])) == ("1", "Submit answers"):
+                submit_offered = True
+        elif row.startswith("●"):
+            question_rows = [row[1:]]
+        elif row.startswith("→") and question_rows is not None:
+            listed.append((_single_line(" ".join(question_rows)), _single_line(row[1:])))
+            question_rows = None
+        elif question_rows is not None:
+            question_rows.append(row)
+    expected = [(_single_line(question), _single_line(answer)) for question, answer in answered]
+    return bool(found) and submit_offered and listed == expected
+
+
+def _wait_for_pane(
+    socket_path: str, tmux_target: str, ready: Callable[[str], bool], deadline: float
+) -> str | None:
+    """Poll the pane until *ready* accepts a capture, or return ``None`` at *deadline*."""
+    while True:
+        pane = _capture_pane(socket_path, tmux_target)
+        if ready(pane):
+            return pane
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(_QUESTION_ANSWER_POLL_S)
+
+
+@_serialize_bridge_injection
+def answer_question_dialog(
+    bridge_dir: Path, *, questions: Sequence[Any], answers: Mapping[str, Any]
+) -> bool:
+    """
+    Answer Claude's own ``AskUserQuestion`` picker with a verdict its hook never received.
+
+    Every key goes only to a verified dialog for that exact question and its
+    options. A pane that diverges stops the sequence, so keys never reach the
+    composer.
+
+    :param bridge_dir: Bridge directory path, e.g. ``/tmp/omnigent/claude-native/<digest>``.
+    :param questions: The tool input's ``questions`` list.
+    :param answers: Answer label per question text, e.g. ``{"Color?": "Blue"}``.
+    :returns: ``True`` once the picker closed with the answers submitted.
+    :raises RuntimeError: If tmux rejects a keystroke.
+    :raises OSError: If the tmux binary cannot be run.
+    """
+    plan = _question_answer_keys(questions, answers)
+    payload = _read_json_file(bridge_dir / _TMUX_FILE)
+    if plan is None or not isinstance(payload, dict):
+        return False
+    socket_path = payload.get("socket_path")
+    tmux_target = payload.get("tmux_target")
+    if not isinstance(socket_path, str) or not isinstance(tmux_target, str):
+        return False
+    deadline = time.monotonic() + _QUESTION_ANSWER_TIMEOUT_S
+    for question, labels, key in plan:
+        shows_question = functools.partial(
+            _question_dialog_shows, question=question, labels=labels
+        )
+        if _wait_for_pane(socket_path, tmux_target, shows_question, deadline) is None:
+            return False
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, key)
+    if len(plan) > 1:
+        # Claude always reviews multiple answers first; a composer without it means a cancel.
+        answered = [(question, labels[int(key) - 1]) for question, labels, key in plan]
+        review = functools.partial(_question_review_shows, answered=answered)
+        if _wait_for_pane(socket_path, tmux_target, review, deadline) is None:
+            return False
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "1")
+    pane = _wait_for_pane(
+        socket_path, tmux_target, lambda pane: _composer_row(pane) is not None, deadline
+    )
+    return pane is not None
 
 
 def read_claude_status_model(bridge_dir: Path) -> str | None:

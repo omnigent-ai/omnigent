@@ -247,6 +247,9 @@ class NativeControls:
     handle_claude_native_permission_mode_change: Callable[
         [str, str | None], Coroutine[Any, Any, Response]
     ]
+    handle_claude_native_question_answer: Callable[
+        [str, list[Any], dict[str, Any]], Coroutine[Any, Any, Response]
+    ]
     handle_claude_sdk_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_codex_native_approval_mode_change: Callable[[str, str], Coroutine[Any, Any, Response]]
     handle_codex_native_compact: Callable[[str], Coroutine[Any, Any, Response]]
@@ -1100,6 +1103,40 @@ def build_native_controls(
             # Nothing to recover: the pane overlay closes on the next inject.
             return Response(status_code=204)
         return Response(status_code=200)
+
+    async def _handle_claude_native_question_answer(
+        conv_id: str, questions: list[Any], answers: dict[str, Any]
+    ) -> Response:
+        """
+        Answer the pane's ``AskUserQuestion`` picker after its permission hook is gone.
+
+        200 means the bridge saw the picker take the answers; 409 tells the
+        server nothing was confirmed, so it keeps the verdict for a re-park.
+        """
+        from omnigent.harnesses.claude_native.bridge import (
+            answer_question_dialog,
+            bridge_dir_for_bridge_id,
+        )
+
+        bridge_id = await _claude_native_bridge_id_for_session(
+            server_client=server_client,
+            session_id=conv_id,
+        )
+        try:
+            delivered = await asyncio.to_thread(
+                answer_question_dialog,
+                bridge_dir_for_bridge_id(bridge_id),
+                questions=questions,
+                answers=answers,
+            )
+        except (RuntimeError, ValueError, OSError):
+            _logger.warning(
+                "Could not answer the claude-native question picker for session=%s",
+                conv_id,
+                exc_info=True,
+            )
+            delivered = False
+        return Response(status_code=200 if delivered else 409)
 
     async def _prepare_claude_native_pane_for_injection(
         conv_id: str,
@@ -2357,6 +2394,7 @@ def build_native_controls(
         handle_claude_native_effort_change=_handle_claude_native_effort_change,
         handle_claude_native_model_change=_handle_claude_native_model_change,
         handle_claude_native_permission_mode_change=_handle_claude_native_permission_mode_change,
+        handle_claude_native_question_answer=_handle_claude_native_question_answer,
         handle_claude_sdk_compact=_handle_claude_sdk_compact,
         handle_codex_native_approval_mode_change=_handle_codex_native_approval_mode_change,
         handle_codex_native_compact=_handle_codex_native_compact,

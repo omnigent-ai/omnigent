@@ -6980,6 +6980,23 @@ def create_runner_app(
                 return await _handle_claude_native_btw_dismiss(conversation_id)
             return Response(status_code=204)
 
+        if body_type == "claude_native_question_answer":
+            questions = body.get("questions") if isinstance(body, dict) else None
+            answers = body.get("answers") if isinstance(body, dict) else None
+            if not isinstance(questions, list) or not isinstance(answers, dict):
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_input",
+                        "detail": "Body 'questions' must be a list and 'answers' an object",
+                    },
+                )
+            if _session_harness_name(conversation_id) == "claude-native":
+                return await _handle_claude_native_question_answer(
+                    conversation_id, questions, answers
+                )
+            return Response(status_code=204)
+
         if body_type == "codex_approval_mode_change":
             harness = _session_harness_name(conversation_id)
             if harness == "codex-native":
@@ -7340,6 +7357,7 @@ def create_runner_app(
     _handle_claude_native_permission_mode_change = (
         _native_controls.handle_claude_native_permission_mode_change
     )
+    _handle_claude_native_question_answer = _native_controls.handle_claude_native_question_answer
     _handle_claude_sdk_compact = _native_controls.handle_claude_sdk_compact
     _handle_codex_native_approval_mode_change = (
         _native_controls.handle_codex_native_approval_mode_change

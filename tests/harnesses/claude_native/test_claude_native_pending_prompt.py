@@ -320,3 +320,204 @@ def test_submit_retry_respects_a_hook_even_when_the_draft_is_still_visible(
             bridge_dir=native_bridge,
         )
     assert sent == []
+
+
+_RULE = "─" * 80
+_BRIDGE_QUESTION = {
+    "question": "Which bridge should we use?",
+    "header": "Bridge",
+    "options": [{"label": "Keep overlay"}, {"label": "Try PYTHONPATH"}],
+    "multiSelect": False,
+}
+_COLOR_QUESTION = {
+    "question": "Which color should the new button use?",
+    "options": [{"label": "Red"}, {"label": "Blue"}],
+    "multiSelect": False,
+}
+_SIZE_QUESTION = {
+    "question": "Which size should the new button be?",
+    "options": [{"label": "Small"}, {"label": "Medium"}, {"label": "Large"}],
+    "multiSelect": False,
+}
+# Two-question picker screens as captured from Claude Code 2.1.283.
+_COLOR_TAB = f"""\
+{_RULE}
+←  ☐ Color  ☐ Size  ✔ Submit  →
+Which color should the new button use?
+❯ 1. Red
+     Use red.
+  2. Blue
+     Use blue.
+  3. Type something.
+{_RULE}
+  4. Chat about this
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+"""
+_SIZE_TAB = f"""\
+{_RULE}
+←  ☒ Color  ☐ Size  ✔ Submit  →
+Which size should the new button be?
+❯ 1. Small
+     Use small.
+  2. Medium
+     Use medium.
+  3. Large
+     Use large.
+  4. Type something.
+{_RULE}
+  5. Chat about this
+Enter to select · Tab/Arrow keys to navigate · Esc to cancel
+"""
+_REVIEW_TAB = f"""\
+{_RULE}
+←  ☒ Color  ☒ Size  ✔ Submit  →
+Review your answers
+ ● Which color should the new button use?
+   → Blue
+ ● Which size should the new button be?
+   → Large
+Ready to submit your answers?
+❯ 1. Submit answers
+  2. Cancel
+"""
+_ANSWERED = "● User answered Claude's questions:" + _COMPOSER
+
+
+def _script_picker(monkeypatch: pytest.MonkeyPatch, screens: list[str]) -> list[str]:
+    """Show ``screens[n]`` after the nth key and return the recorded keys."""
+    keys: list[str] = []
+    monkeypatch.setattr(
+        bridge, "_capture_pane", lambda *_: screens[min(len(keys), len(screens) - 1)]
+    )
+
+    def send(socket_path: str, *args: str) -> None:
+        assert (socket_path, *args[:3]) == ("/tmp/example.sock", "send-keys", "-t", "main")
+        keys.append(args[3])
+
+    monkeypatch.setattr(bridge, "_run_tmux", send)
+    monkeypatch.setattr(bridge, "_QUESTION_ANSWER_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(bridge, "_QUESTION_ANSWER_POLL_S", 0.01)
+    return keys
+
+
+@pytest.mark.parametrize(
+    ("questions", "answers", "screens", "expected_keys"),
+    [
+        (
+            [_BRIDGE_QUESTION],
+            {"Which bridge should we use?": "Try PYTHONPATH"},
+            [_QUESTION, _ANSWERED],
+            ["2"],
+        ),
+        (
+            [_COLOR_QUESTION, _SIZE_QUESTION],
+            {
+                "Which color should the new button use?": "Blue",
+                "Which size should the new button be?": "Large",
+            },
+            [_COLOR_TAB, _SIZE_TAB, _REVIEW_TAB, _ANSWERED],
+            ["2", "3", "1"],
+        ),
+    ],
+    ids=["single-question", "two-questions-with-review"],
+)
+def test_question_picker_receives_the_web_answer(
+    native_bridge: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    questions: list[dict[str, object]],
+    answers: dict[str, str],
+    screens: list[str],
+    expected_keys: list[str],
+) -> None:
+    keys = _script_picker(monkeypatch, screens)
+    assert bridge.answer_question_dialog(native_bridge, questions=questions, answers=answers)
+    assert keys == expected_keys
+
+
+@pytest.mark.parametrize(
+    ("questions", "answers", "screen"),
+    [
+        (
+            [{**_BRIDGE_QUESTION, "multiSelect": True}],
+            {"Which bridge should we use?": ["Try PYTHONPATH"]},
+            _QUESTION,
+        ),
+        ([_BRIDGE_QUESTION], {"Which bridge should we use?": "Something else"}, _QUESTION),
+        ([_BRIDGE_QUESTION], {"Which bridge should we use?": "Try PYTHONPATH"}, _COMPOSER),
+        ([_COLOR_QUESTION], {"Which color should the new button use?": "Blue"}, _QUESTION),
+        (
+            [{**_BRIDGE_QUESTION, "options": [{"label": "Keep overlay"}, {"label": "Rewrite"}]}],
+            {"Which bridge should we use?": "Rewrite"},
+            _QUESTION,
+        ),
+        (
+            [{**_BRIDGE_QUESTION, "question": "bridge should we use?"}],
+            {"bridge should we use?": "Try PYTHONPATH"},
+            _QUESTION,
+        ),
+        (
+            [{**_BRIDGE_QUESTION, "options": [{"label": "Keep"}, {"label": "Try"}]}],
+            {"Which bridge should we use?": "Try"},
+            _QUESTION,
+        ),
+        (
+            [{**_BRIDGE_QUESTION, "options": [{"label": "Keep overlay"}]}],
+            {"Which bridge should we use?": "Keep overlay"},
+            _QUESTION,
+        ),
+    ],
+    ids=[
+        "multi-select",
+        "free-text",
+        "composer",
+        "other-question",
+        "other-options",
+        "longer-question",
+        "longer-options",
+        "extra-option",
+    ],
+)
+def test_question_picker_refuses_answers_it_cannot_verify(
+    native_bridge: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    questions: list[dict[str, object]],
+    answers: dict[str, object],
+    screen: str,
+) -> None:
+    keys = _script_picker(monkeypatch, [screen])
+    assert not bridge.answer_question_dialog(native_bridge, questions=questions, answers=answers)
+    assert keys == []
+
+
+@pytest.mark.parametrize(
+    ("screens", "expected_keys"),
+    [
+        ([_COLOR_TAB, _COMPOSER], ["2"]),
+        ([_COLOR_TAB, _SIZE_TAB, _COMPOSER], ["2", "3"]),
+        ([_COLOR_TAB, _SIZE_TAB, _REVIEW_TAB.replace("→ Large", "→ Small")], ["2", "3"]),
+        ([_COLOR_TAB, _SIZE_TAB, _REVIEW_TAB.replace("→ Large", "→ Large print")], ["2", "3"]),
+    ],
+    ids=[
+        "picker-closed-mid-answer",
+        "picker-closed-before-review",
+        "review-lists-other-answers",
+        "review-lists-longer-answer",
+    ],
+)
+def test_question_picker_stops_when_the_pane_diverges(
+    native_bridge: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    screens: list[str],
+    expected_keys: list[str],
+) -> None:
+    """No key follows a screen that is not the expected next picker step."""
+    keys = _script_picker(monkeypatch, screens)
+    assert not bridge.answer_question_dialog(
+        native_bridge,
+        questions=[_COLOR_QUESTION, _SIZE_QUESTION],
+        answers={
+            "Which color should the new button use?": "Blue",
+            "Which size should the new button be?": "Large",
+        },
+    )
+    assert keys == expected_keys
