@@ -152,6 +152,8 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * it to the user's Arcas and Arclets. Resolves a `{ ok, error? }` result.
    */
   refreshDbcert: () => ipcRenderer.invoke("omnigent:dbcert-refresh"),
+  /** Check the laptop's dbcert, renewing and rechecking it only when invalid. */
+  ensureDbcert: () => ipcRenderer.invoke("omnigent:dbcert-ensure"),
 
   /**
    * Subscribe to host status-change pings. Fired only on real events (a host

@@ -4926,6 +4926,12 @@ function registerIpc() {
   // Companion then copies it to the user's boxes. Same gates as arca-extend.
   // Clicks from several windows share one sign-in.
   let dbcertRefresh = null;
+  const refreshDbcert = (deps = {}) => {
+    dbcertRefresh ??= arca.runDbcertRefresh(deps).finally(() => {
+      dbcertRefresh = null;
+    });
+    return dbcertRefresh;
+  };
   ipcMain.handle("omnigent:dbcert-refresh", async (event) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("dbcert-refresh is only available to a connected server page");
@@ -4933,10 +4939,21 @@ function registerIpc() {
     if (!canExtendArca(event)) {
       return { ok: false, error: "dbcert refresh is not enabled for this server." };
     }
-    dbcertRefresh ??= arca.runDbcertRefresh().finally(() => {
-      dbcertRefresh = null;
+    return refreshDbcert();
+  });
+
+  let dbcertPreflight = null;
+  ipcMain.handle("omnigent:dbcert-ensure", async (event) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("dbcert-ensure is only available to a connected server page");
+    }
+    if (!canExtendArca(event)) {
+      return { ok: false, error: "dbcert sign-in is not enabled for this server." };
+    }
+    dbcertPreflight ??= arca.ensureDbcert({ refreshDbcert }).finally(() => {
+      dbcertPreflight = null;
     });
-    return dbcertRefresh;
+    return dbcertPreflight;
   });
 
   // Push a status ping when a host child connects or exits on its own (no

@@ -2979,6 +2979,154 @@ describe("Run on this machine (desktop host enrollment)", () => {
   });
 });
 
+describe("desktop Arclet credential preflight", () => {
+  const ensureDbcert = vi.fn<() => Promise<{ ok: true } | { ok: false; error: string }>>();
+  const arcletInfo = { managed_sandboxes_enabled: true, sandbox_provider: "arclet" };
+
+  beforeEach(() => {
+    setupLandingMocks();
+    vi.mocked(isElectronShell).mockReturnValue(true);
+    vi.mocked(getDesktopFeatures).mockResolvedValue({
+      databricksInternalFeatures: true,
+      canRefreshDbcert: true,
+    });
+    Object.defineProperty(window, "omnigentDesktop", {
+      configurable: true,
+      value: { kind: "electron", ensureDbcert },
+    });
+    ensureDbcert.mockReset().mockResolvedValue({ ok: true });
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+  });
+
+  afterEach(() => {
+    cleanup();
+    Reflect.deleteProperty(window, "omnigentDesktop");
+    vi.mocked(isElectronShell).mockReturnValue(false);
+    vi.mocked(getDesktopFeatures).mockResolvedValue(null);
+  });
+
+  async function start() {
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Keep this task while I sign in" },
+    });
+    await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+  }
+
+  it("waits for laptop sign-in before creating exactly one Arclet with the original task", async () => {
+    let finish!: (result: { ok: true }) => void;
+    ensureDbcert.mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    renderLanding(arcletInfo);
+    await start();
+    await waitFor(() =>
+      expect(
+        ensureDbcert.mock.calls.length + authenticatedFetchMock.mock.calls.length,
+      ).toBeGreaterThan(0),
+    );
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    expect(ensureDbcert).toHaveBeenCalledOnce();
+    expect(screen.getByTestId("new-chat-landing-dbcert-status")).toHaveTextContent(/browser/i);
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Enter" });
+    await act(async () => finish({ ok: true }));
+    const { body } = await readCreateBody();
+    expect(body).toMatchObject({ host_type: "managed", sandbox_provider: "arclet" });
+    expect(setPendingInitialPrompt).toHaveBeenCalledWith(
+      "conv_new",
+      expect.objectContaining({ text: "Keep this task while I sign in" }),
+    );
+    expect(
+      authenticatedFetchMock.mock.calls.filter(([url]) => url === "/v1/sessions"),
+    ).toHaveLength(1);
+  });
+
+  it("keeps the draft and shows a credential error without provisioning, then allows retry", async () => {
+    ensureDbcert.mockResolvedValueOnce({
+      ok: false,
+      error: "Laptop sign-in was canceled. Try again.",
+    });
+    renderLanding(arcletInfo);
+    await start();
+    expect(await screen.findByTestId("new-chat-landing-error")).toHaveTextContent(
+      "Laptop sign-in was canceled",
+    );
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(
+      "Keep this task while I sign in",
+    );
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await readCreateBody();
+    expect(ensureDbcert).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not provision after the user cancels a pending sign-in", async () => {
+    let finish!: (result: { ok: true }) => void;
+    ensureDbcert.mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    renderLanding(arcletInfo);
+    await start();
+    fireEvent.click(await screen.findByRole("button", { name: "Cancel launch" }));
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+    await act(async () => finish({ ok: true }));
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(
+      "Keep this task while I sign in",
+    );
+  });
+
+  it("does not provision after leaving the form while sign-in is pending", async () => {
+    let finish!: (result: { ok: true }) => void;
+    ensureDbcert.mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    const mounted = renderLanding(arcletInfo);
+    await start();
+    await waitFor(() => expect(ensureDbcert).toHaveBeenCalledOnce());
+    mounted.unmount();
+    await act(async () => finish({ ok: true }));
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    renderLanding(arcletInfo);
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(
+      "Keep this task while I sign in",
+    );
+  });
+
+  it.each(["browser", "older shell", "disabled feature", "other provider", "connected host"])(
+    "does not invoke laptop sign-in for %s",
+    async (kind) => {
+      if (kind === "browser" || kind === "older shell") {
+        Object.defineProperty(window, "omnigentDesktop", {
+          configurable: true,
+          value: kind === "older shell" ? { kind: "electron" } : undefined,
+        });
+      }
+      if (kind === "disabled feature") vi.mocked(getDesktopFeatures).mockResolvedValue(null);
+      if (kind === "connected host") localStorage.setItem("omnigent:last-host-choice", "host_1");
+      renderLanding({
+        ...arcletInfo,
+        sandbox_provider: kind === "other provider" ? "modal" : "arclet",
+      });
+      await start();
+      await readCreateBody();
+      expect(ensureDbcert).not.toHaveBeenCalled();
+      expect(screen.queryByTestId("new-chat-landing-dbcert-status")).toBeNull();
+    },
+  );
+});
+
 describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
   beforeEach(() => {
     setupLandingMocks();

@@ -124,6 +124,29 @@ into the nearby floating editor, and confirm the field remains `W41`. Escape
 should close only the editor. Reopen it and use Send or Enter to submit an
 instruction to chat. No instruction bar should appear below the browser URL.
 
+## Arclet laptop credentials
+
+`desktop_dbcert_preflight.e2e.js` drives New Session → Arclet Sandbox through
+the real SPA, preload, main process, CLI subprocess, and local server. It checks
+that provisioning waits for credential renewal, the original task resumes once,
+and valid credentials skip renewal. The dbcert executable and machine policy
+are fixtures; cloud allocation remains gated. This test does not cover macOS
+SSO or Companion's credential transfer.
+
+```sh
+OMNIGENT_PYTHON=/path/to/venv/bin/python \
+  OMNIGENT_PW_NO_SANDBOX=1 \
+  OMNIGENT_DESKTOP_RECORD_DIR=/absolute/path/outside/repo \
+  xvfb-run -a node --test e2e/desktop_dbcert_preflight.e2e.js
+```
+
+Human check: use the updated desktop shell and web bundle on a managed server,
+with Arca Companion running. With an expired or missing laptop dbcert, submit
+a task to Arclet Sandbox. Finish the browser sign-in and confirm the same task
+starts automatically. Repeat with a valid dbcert and confirm no sign-in opens.
+During a pending sign-in, Cancel launch should preserve the draft and prevent
+Arclet creation even if sign-in later finishes.
+
 ## Authoring a desktop reproduction
 
 For macOS titlebar clearance, build the SPA and run

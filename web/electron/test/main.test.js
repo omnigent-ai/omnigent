@@ -147,6 +147,7 @@ function loadNavigationHarness({
   arcaResult = { ok: true, alreadyRunning: false },
   arcaExtendResult = { ok: true, shutdownAt: null },
   dbcertRefreshResult = { ok: true },
+  dbcertPreflightResult = { ok: true },
   arcaLoginResult = { ok: true },
   arcaConsentResult,
   loadServer = async () => {},
@@ -183,6 +184,7 @@ function loadNavigationHarness({
     arcaConnects: [],
     arcaExtends: [],
     dbcertRefreshes: 0,
+    dbcertPreflights: 0,
     arcaConsentRuns: [],
     cookiesSet: [],
     oidc: { refresh: 0, signIn: 0, signOut: 0 },
@@ -480,6 +482,12 @@ function loadNavigationHarness({
         return typeof dbcertRefreshResult === "function"
           ? dbcertRefreshResult()
           : dbcertRefreshResult;
+      },
+      ensureDbcert: async (deps) => {
+        calls.dbcertPreflights += 1;
+        return typeof dbcertPreflightResult === "function"
+          ? dbcertPreflightResult(deps)
+          : dbcertPreflightResult;
       },
       isExecutableFile: (p) => p === arcaPath,
       startArcaConnect: (url) => {
@@ -837,6 +845,44 @@ describe("dbcert refresh IPC", () => {
       /connected server page/,
     );
     assert.equal(h.calls.dbcertRefreshes, 0);
+    await assert.rejects(
+      h.ipc.get("omnigent:dbcert-ensure")({
+        sender: h.webContents,
+        senderFrame: { url: "https://evil.example" },
+      }),
+      /connected server page/,
+    );
+    assert.equal(h.calls.dbcertPreflights, 0);
+  });
+
+  it("shares preflights and sign-in with an existing banner refresh", async (t) => {
+    let finish;
+    const pending = new Promise((resolve) => {
+      finish = resolve;
+    });
+    const h = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      dbcertRefreshResult: () => pending,
+      dbcertPreflightResult: ({ refreshDbcert }) => refreshDbcert(),
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+    const refresh = h.ipc.get("omnigent:dbcert-refresh")(event);
+    const ensure = h.ipc.get("omnigent:dbcert-ensure");
+    const first = ensure(event);
+    const second = ensure(event);
+    assert.equal(h.calls.dbcertRefreshes, 1);
+    assert.equal(h.calls.dbcertPreflights, 1);
+    finish({ ok: true });
+    assert.deepEqual(await Promise.all([refresh, first, second]), [
+      { ok: true },
+      { ok: true },
+      { ok: true },
+    ]);
+    assert.deepEqual(await ensure(event), { ok: true });
+    assert.equal(h.calls.dbcertPreflights, 2);
   });
 
   for (const [what, options] of [
@@ -851,6 +897,8 @@ describe("dbcert refresh IPC", () => {
       assert.equal(h.ipc.get("omnigent:get-desktop-features")(event).canRefreshDbcert, false);
       assert.equal((await h.ipc.get("omnigent:dbcert-refresh")(event)).ok, false);
       assert.equal(h.calls.dbcertRefreshes, 0);
+      assert.equal((await h.ipc.get("omnigent:dbcert-ensure")(event)).ok, false);
+      assert.equal(h.calls.dbcertPreflights, 0);
     });
   }
 });

@@ -204,6 +204,8 @@ interface ElectronDesktopApi extends NativeShellApi {
   extendArca?: (mode: ArcaExtendMode) => Promise<ArcaExtendResult>;
   /** Renew this machine's dbcert; Arca Companion copies it to the user's Arca and Arclets. */
   refreshDbcert?: () => Promise<DbcertRefreshResult>;
+  /** Check local credentials before an Arclet launch, renewing only when invalid. */
+  ensureDbcert?: () => Promise<DbcertRefreshResult>;
 
   /** The local `omni` CLI status (installed, resolved path, version, source). */
   getCliStatus?: () => Promise<CliStatus | null>;
@@ -1053,6 +1055,22 @@ export async function extendArca(mode: ArcaExtendMode): Promise<ArcaExtendResult
 /** Present only in desktop shells that can renew this machine's dbcert. */
 export function hasDbcertRefreshBridge(): boolean {
   return typeof electronApi()?.refreshDbcert === "function";
+}
+
+export function hasDbcertPreflightBridge(): boolean {
+  return typeof electronApi()?.ensureDbcert === "function";
+}
+
+/** Resolves only when the laptop has usable credentials or sign-in has failed. */
+export async function ensureDbcert(): Promise<DbcertRefreshResult> {
+  const bridge = electronApi()?.ensureDbcert;
+  if (!bridge) return { ok: false, error: "Laptop sign-in is unavailable in this app." };
+  try {
+    return await bridge();
+  } catch (error) {
+    console.warn("[nativeBridge] electron ensureDbcert failed:", error);
+    return { ok: false, error: "Couldn't check your laptop's dbcert. Try again." };
+  }
 }
 
 /** Renew the laptop's dbcert through the desktop shell, which runs `dbcert --force`. */

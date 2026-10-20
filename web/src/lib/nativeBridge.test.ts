@@ -2,7 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   applyMacElectronShellAttribute,
+  ensureDbcert,
   getServerPicker,
+  hasDbcertPreflightBridge,
   isAndroidShell,
   isElectronShell,
   isIOSShell,
@@ -141,6 +143,32 @@ afterEach(() => {
   setElectron(false);
   setIOS(false);
   setAndroid(false);
+});
+
+describe("dbcert preflight bridge", () => {
+  it("detects older shells and browsers without the new method", async () => {
+    setElectron(false);
+    expect(hasDbcertPreflightBridge()).toBe(false);
+    expect((await ensureDbcert()).ok).toBe(false);
+    setElectron(true);
+    expect(hasDbcertPreflightBridge()).toBe(false);
+    expect((await ensureDbcert()).ok).toBe(false);
+  });
+
+  it("passes through the native result and turns an IPC failure into a retryable error", async () => {
+    const nativeEnsure = vi.fn().mockResolvedValue({ ok: true });
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      ensureDbcert: nativeEnsure,
+    };
+    expect(hasDbcertPreflightBridge()).toBe(true);
+    expect(await ensureDbcert()).toEqual({ ok: true });
+    nativeEnsure.mockRejectedValue(new Error("IPC channel closed"));
+    expect(await ensureDbcert()).toEqual({
+      ok: false,
+      error: "Couldn't check your laptop's dbcert. Try again.",
+    });
+  });
 });
 
 describe("isNativeShell / isElectronShell", () => {

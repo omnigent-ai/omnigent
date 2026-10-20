@@ -8,6 +8,7 @@ const {
   buildLoginArgs,
   connectArcaHost,
   describeConnectFailure,
+  ensureDbcert,
   readArcaStatus,
   resolveArcaPath,
   runArcaExtend,
@@ -183,6 +184,87 @@ describe("dbcert refresh", () => {
     } finally {
       clearTimeout(keepAlive);
     }
+  });
+});
+
+describe("Arclet dbcert preflight", () => {
+  const depsFor = (outputs) => ({
+    ...commandDeps(outputs),
+    resolveDbcertPath: () => "/bin/dbcert",
+  });
+
+  it("leaves a valid certificate alone", async () => {
+    const deps = depsFor([{ code: 0 }]);
+    assert.deepEqual(await ensureDbcert(deps), { ok: true });
+    assert.deepEqual(deps.calls, [["status"]]);
+  });
+
+  it("renews invalid credentials locally and verifies them before continuing", async () => {
+    const deps = depsFor([{ code: 1 }, { code: 0 }, { code: 0 }]);
+    const spawn = deps.spawn;
+    const environments = [];
+    deps.spawn = (binary, args, options) => {
+      environments.push(options.env);
+      return spawn(binary, args);
+    };
+    assert.deepEqual(await ensureDbcert(deps), { ok: true });
+    assert.deepEqual(deps.calls, [
+      ["status"],
+      ["--force", "--caller-name", "omnigent"],
+      ["status"],
+    ]);
+    assert.equal(environments[1].DBCERT_SKIP_ARCA_SYNC, "1");
+    assert.equal(environments[1].PATH, process.env.PATH);
+    assert.equal(environments[0], undefined);
+  });
+
+  it("does not accept a successful login process that left invalid credentials", async () => {
+    const deps = depsFor([{ code: 1 }, { code: 0 }, { code: 1 }]);
+    const result = await ensureDbcert(deps);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /still invalid after sign-in/);
+    assert.equal(deps.calls.length, 3);
+  });
+
+  it("stops when sign-in fails instead of rechecking or retrying it", async () => {
+    const deps = depsFor([{ code: 1 }, { code: 1, stderr: "Sign-in canceled" }]);
+    assert.deepEqual(await ensureDbcert(deps), { ok: false, error: "Sign-in canceled" });
+    assert.equal(deps.calls.length, 2);
+  });
+
+  it("reports a missing CLI without attempting sign-in", async () => {
+    const deps = { ...depsFor([]), resolveDbcertPath: () => null };
+    const result = await ensureDbcert(deps);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /Install dbcert/);
+    assert.deepEqual(deps.calls, []);
+  });
+
+  it("does not turn a stuck status check into an interactive renewal", async () => {
+    const child = fakeConnectChild();
+    const deps = depsFor([]);
+    const result = await ensureDbcert({
+      ...deps,
+      spawn: () => child,
+      timeoutMs: 5,
+      killGraceMs: 5,
+      refreshDbcert: () => assert.fail("status failure must not start login"),
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /Couldn't check/);
+    assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+  });
+
+  it("does not renew if the status process cannot start", async () => {
+    const result = await ensureDbcert({
+      ...depsFor([]),
+      spawn: () => {
+        throw new Error("spawn EACCES");
+      },
+      refreshDbcert: () => assert.fail("spawn failure must not start login"),
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /Couldn't check/);
   });
 });
 
