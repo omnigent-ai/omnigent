@@ -6,14 +6,23 @@ import asyncio
 from collections.abc import Mapping
 from typing import Literal
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.extensions import ExtensionManifest, ExtensionPluginState
 from omnigent.extensions.assets import ASSET_SCRIPT, ASSET_STYLES, ResolvedBundle
+from omnigent.extensions.manager import ExtensionManager
+from omnigent.extensions.packs import ResolvedAgentContribution
+from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes._origin import require_trusted_origin
+from omnigent.server.routes.builtin_agents import _to_agent_object, install_user_agent
+from omnigent.server.schemas import AgentObject
+from omnigent.stores import AgentStore
+from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.permission_store import PermissionStore
 
 
@@ -61,6 +70,27 @@ class ExtensionResponse(BaseModel):
     pages: list[ExtensionPageResponse]
     primary_navigation: list[ExtensionPrimaryNavigationResponse]
     browser: ExtensionBrowserBundleResponse
+    owner: str | None = None
+    agents: list[ExtensionAgentResponse] = []
+    policies: list[ExtensionPolicyResponse] = []
+
+
+class ExtensionAgentResponse(BaseModel):
+    """A portable agent template available from an active extension."""
+
+    id: str
+    title: str
+    version: str
+    digest: str
+    bundle_url: str
+
+
+class ExtensionPolicyResponse(BaseModel):
+    """A policy preset available for explicit attachment or agent composition."""
+
+    id: str
+    title: str
+    policies: dict[str, object]
 
 
 class ExtensionListResponse(BaseModel):
@@ -86,6 +116,14 @@ class ExtensionAssetErrorResponse(BaseModel):
     error: str
 
 
+class ExtensionActivationErrorResponse(BaseModel):
+    """An operator grant, resource check, or lifecycle failure."""
+
+    extension_id: str
+    status: Literal["disabled"] = "disabled"
+    error: str
+
+
 class ExtensionDiagnosticsResponse(BaseModel):
     """Administrator view of accepted and rejected extensions."""
 
@@ -93,11 +131,14 @@ class ExtensionDiagnosticsResponse(BaseModel):
     extensions: list[ExtensionResponse]
     load_errors: list[ExtensionLoadErrorResponse]
     asset_errors: list[ExtensionAssetErrorResponse]
+    disabled_extensions: list[str] = []
+    activation_errors: list[ExtensionActivationErrorResponse] = []
 
 
 def _serialize_manifest(
     manifest: ExtensionManifest,
     bundle: ResolvedBundle | None = None,
+    manager: ExtensionManager | None = None,
 ) -> ExtensionResponse:
     """Convert a validated manifest into stable JSON-safe catalog metadata."""
     unavailable = manifest.entrypoints.browser is not None and bundle is None
@@ -145,6 +186,27 @@ def _serialize_manifest(
                 else None
             ),
         ),
+        owner=manifest.owner,
+        agents=[
+            ExtensionAgentResponse(
+                id=agent.id,
+                title=agent.title,
+                version=agent.version,
+                digest=agent.digest,
+                bundle_url=agent.url,
+            )
+            for agent in sorted(manager.agents.values(), key=lambda item: item.id)
+            if agent.extension_id == manifest.id
+        ]
+        if manager is not None
+        else [],
+        policies=[
+            ExtensionPolicyResponse(id=item.id, title=item.title, policies=item.policies)
+            for item in sorted(manager.policies.values(), key=lambda item: item.id)
+            if item.extension_id == manifest.id
+        ]
+        if manager is not None
+        else [],
     )
 
 
@@ -180,15 +242,22 @@ def create_extensions_router(
     asset_errors: Mapping[str, str] | None = None,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    manager: ExtensionManager | None = None,
+    agent_store: AgentStore | None = None,
+    artifact_store: ArtifactStore | None = None,
+    agent_cache: AgentCache | None = None,
 ) -> APIRouter:
     """Build the installed-extension catalog router, mounted under ``/v1``."""
     router = APIRouter()
     resolved_bundles = bundles or {}
-    catalog = tuple(
-        _serialize_manifest(manifest, resolved_bundles.get(manifest.id))
-        for manifest in sorted(state.manifests, key=lambda item: item.id)
-    )
-    by_id = {item.id: item for item in catalog}
+
+    def catalog() -> list[ExtensionResponse]:
+        active_state = manager.state if manager is not None else state
+        return [
+            _serialize_manifest(manifest, resolved_bundles.get(manifest.id), manager)
+            for manifest in sorted(active_state.manifests, key=lambda item: item.id)
+        ]
+
     diagnostics = tuple(
         ExtensionLoadErrorResponse(entry_point=entry_point, error=_diagnostic_message(error))
         for entry_point, error in sorted(state.load_errors.items())
@@ -200,13 +269,9 @@ def create_extensions_router(
 
     @router.get("/extensions", response_model=ExtensionListResponse)
     async def list_extensions(request: Request) -> ExtensionListResponse:
-        """List extensions installed and enabled when the server started.
-
-        V1 treats operator installation as enablement. Installing, removing, or
-        upgrading a package requires a server restart to refresh this snapshot.
-        """
+        """List active extensions; installation and configuration changes require restart."""
         require_user(request, auth_provider)
-        return ExtensionListResponse(data=list(catalog))
+        return ExtensionListResponse(data=catalog())
 
     # Keep this static path above ``/{extension_id}`` so it cannot be consumed
     # as an extension identifier.
@@ -215,18 +280,91 @@ def create_extensions_router(
         """Show accepted extensions and concise discovery failures to administrators."""
         await _require_admin(request, auth_provider, permission_store)
         return ExtensionDiagnosticsResponse(
-            extensions=list(catalog),
+            extensions=catalog(),
             load_errors=list(diagnostics),
             asset_errors=list(asset_diagnostics),
+            disabled_extensions=list(manager.disabled) if manager is not None else [],
+            activation_errors=[
+                ExtensionActivationErrorResponse(
+                    extension_id=key, error=_diagnostic_message(error)
+                )
+                for key, error in sorted(manager.errors.items())
+            ]
+            if manager is not None
+            else [],
         )
 
     @router.get("/extensions/{extension_id}", response_model=ExtensionResponse)
     async def get_extension(request: Request, extension_id: str) -> ExtensionResponse:
         """Return one installed extension's public contribution metadata."""
         require_user(request, auth_provider)
-        extension = by_id.get(extension_id)
+        extension = next((item for item in catalog() if item.id == extension_id), None)
         if extension is None:
             raise OmnigentError("Extension not found", code=ErrorCode.NOT_FOUND)
         return extension
+
+    def agent_contribution(extension_id: str, contribution_id: str) -> ResolvedAgentContribution:
+        agent = manager.agents.get(contribution_id) if manager is not None else None
+        if agent is None or agent.extension_id != extension_id:
+            raise OmnigentError("Extension agent not found", code=ErrorCode.NOT_FOUND)
+        return agent
+
+    @router.get(
+        "/extensions/{extension_id}/agents/{contribution_id}/{digest}/bundle",
+        response_class=Response,
+        responses={
+            200: {
+                "content": {"application/gzip": {"schema": {"type": "string", "format": "binary"}}}
+            }
+        },
+    )
+    async def agent_bundle(
+        request: Request, extension_id: str, contribution_id: str, digest: str
+    ) -> Response:
+        """Download one immutable template without expanding server environment variables."""
+        require_user(request, auth_provider)
+        agent = agent_contribution(extension_id, contribution_id)
+        if agent.digest != digest:
+            raise OmnigentError("Extension agent not found", code=ErrorCode.NOT_FOUND)
+        return Response(
+            content=agent.content,
+            media_type="application/gzip",
+            headers={
+                "Cache-Control": "private, no-store",
+                "ETag": f'"{agent.digest}"',
+                "Content-Disposition": f'attachment; filename="{agent.id}.tar.gz"',
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    @router.post("/extensions/{extension_id}/agents/{contribution_id}/{digest}/install")
+    async def install_agent(
+        request: Request, extension_id: str, contribution_id: str, digest: str
+    ) -> AgentObject:
+        """Copy an operator-approved template into the caller's own agent catalog."""
+        require_trusted_origin(request)
+        user_id = require_user(request, auth_provider)
+        contribution = agent_contribution(extension_id, contribution_id)
+        if contribution.digest != digest:
+            raise OmnigentError(
+                "Extension agent changed; refresh the catalog", code=ErrorCode.CONFLICT
+            )
+        if (
+            agent_store is None
+            or artifact_store is None
+            or agent_cache is None
+            or not agent_store.supports_user_agents
+        ):
+            raise HTTPException(status_code=501, detail="user agents are not configured")
+        agent = await asyncio.to_thread(
+            install_user_agent,
+            agent_store,
+            artifact_store,
+            agent_cache,
+            owner=user_id,
+            name=f"{contribution.id}@{contribution.version}",
+            bundle_bytes=contribution.content,
+        )
+        return await asyncio.to_thread(_to_agent_object, agent, agent_cache)
 
     return router

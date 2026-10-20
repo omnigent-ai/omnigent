@@ -4959,6 +4959,9 @@ def _publish_status(
     _session_status_cache[session_id] = status
     if previous_status != status:
         _publish_child_status_to_parent(session_id, status)
+        from omnigent.extensions.runtime import notify_session_status
+
+        notify_session_status(session_id, status, response_id)
     # Mirror the transition onto the conversation row (best-effort,
     # deduplicated, off-loop) so replicas that don't hold this session's
     # runner tunnel serve the same sidebar status.

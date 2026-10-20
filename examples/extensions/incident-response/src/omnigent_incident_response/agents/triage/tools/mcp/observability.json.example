@@ -1,0 +1,6 @@
+{
+  "name": "observability",
+  "transport": "streamable-http",
+  "url": "${OBSERVABILITY_MCP_URL}",
+  "headers": {"Authorization": "Bearer ${OBSERVABILITY_MCP_TOKEN}"}
+}

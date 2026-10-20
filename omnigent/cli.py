@@ -52,6 +52,7 @@ from omnigent.cli_config import (
     _run_configure_harnesses_interactive,
     _warn_missing_harness_dependencies,
 )
+from omnigent.cli_extensions import register as _register_extension_commands
 from omnigent.cli_invocation import WRAPPER_COMMAND_ENV, cli_invocation
 from omnigent.cli_native import register_native_commands as _register_native_commands
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
@@ -5157,6 +5158,9 @@ def extensions_doctor(extension_id: str) -> None:
         raise click.ClickException(f"Browser bundle unresolved: {exc}") from exc
     suffix = " (development override)" if override is not None else ""
     click.echo(f"browser bundle: ok ({bundle.digest}){suffix}")
+
+
+_register_extension_commands(extensions_cli)
 
 
 @cli.command("diagnose")

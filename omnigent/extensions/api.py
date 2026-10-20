@@ -21,6 +21,7 @@ class ExtensionPermission(StrEnum):
     PROJECTS_WRITE = "projects.write"
     SESSIONS_READ = "sessions.read"
     STORAGE_USER = "storage.user"
+    EVENTS_SUBSCRIBE = "events.subscribe"
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,34 @@ class ExtensionEntrypoints:
 
     browser: str | None = None
     browser_css: str | None = None
+    server: str | None = None
+
+
+@dataclass(frozen=True)
+class ExtensionDependency:
+    """An installed extension required before this extension can activate."""
+
+    id: str
+    version: str
+
+
+@dataclass(frozen=True)
+class AgentContribution:
+    """A portable agent directory, including its skills, tools, and MCP config."""
+
+    id: str
+    title: str
+    path: str
+    policies: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PolicyContribution:
+    """A YAML policy preset using the existing default-policy format."""
+
+    id: str
+    title: str
+    path: str
 
 
 @dataclass(frozen=True)
@@ -77,6 +106,10 @@ class ExtensionManifest:
     pages: tuple[PageContribution, ...] = ()
     primary_navigation: tuple[PrimaryNavigationContribution, ...] = ()
     commands: tuple[CommandContribution, ...] = ()
+    owner: str | None = None
+    dependencies: tuple[ExtensionDependency, ...] = ()
+    agents: tuple[AgentContribution, ...] = ()
+    policies: tuple[PolicyContribution, ...] = ()
 
 
 @dataclass(frozen=True)

@@ -1,0 +1,3 @@
+acme.incident-response.approve-os-tools:
+  type: function
+  function: omnigent.policies.builtins.safety.ask_on_os_tools

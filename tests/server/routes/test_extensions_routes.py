@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 from dataclasses import replace
 from pathlib import Path
 
@@ -86,6 +87,7 @@ def _build_app(
     extension_state: ExtensionPluginState | None = None,
     permission_store: SqlAlchemyPermissionStore | None = None,
     auth_provider: AuthProvider | None = None,
+    server_config: dict | None = None,
 ) -> FastAPI:
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     return create_app(
@@ -97,6 +99,7 @@ def _build_app(
         permission_store=permission_store,
         auth_provider=auth_provider,
         extension_state=extension_state,
+        server_config=server_config,
     )
 
 
@@ -106,6 +109,181 @@ def _client(app: FastAPI, email: str | None = None) -> httpx.AsyncClient:
         base_url="http://test",
         headers={"X-Forwarded-Email": email} if email else {},
     )
+
+
+@pytest.fixture
+def team_state(monkeypatch: pytest.MonkeyPatch) -> ExtensionPluginState:
+    source = Path(__file__).parents[3] / "examples/extensions/incident-response/src"
+    monkeypatch.syspath_prepend(str(source))
+    manifest = importlib.import_module("omnigent_incident_response.plugin").get_manifest()
+    return ExtensionPluginState(
+        manifests=(manifest,), asset_packages={manifest.id: "omnigent_incident_response"}
+    )
+
+
+def _team_config(enabled: bool = True) -> dict:
+    return {
+        "extensions": {
+            "acme.incident-response": {
+                "enabled": enabled,
+                "version": "==0.1.0",
+                "permissions": ["events.subscribe"],
+            }
+        }
+    }
+
+
+async def test_team_pack_requires_activation_and_has_admin_diagnostics(
+    db_uri, tmp_path, team_state
+) -> None:
+    app = _build_app(db_uri, tmp_path, extension_state=team_state, server_config={})
+    async with _client(app) as client:
+        catalog = await client.get("/v1/extensions")
+        detail = await client.get("/v1/extensions/acme.incident-response")
+        diagnostics = await client.get("/v1/extensions/diagnostics")
+    assert catalog.json()["data"] == []
+    assert detail.status_code == 404
+    assert diagnostics.json()["disabled_extensions"] == ["acme.incident-response"]
+
+
+async def test_team_agent_download_and_install_are_content_addressed_and_owned(
+    db_uri, tmp_path, team_state
+) -> None:
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user(_USER)
+    permissions.ensure_user(_ADMIN, is_admin=True)
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        extension_state=team_state,
+        server_config=_team_config(),
+        permission_store=permissions,
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+    )
+    async with _client(app, _USER) as client:
+        catalog = (await client.get("/v1/extensions")).json()["data"][0]
+        assert catalog["owner"] == "team-reliability"
+        assert catalog["policies"][0]["id"] == "acme.incident-response.approvals"
+        template = catalog["agents"][0]
+        assert template["id"] == "acme.incident-response.triage"
+        assert "path" not in template
+        bundle = await client.get(template["bundle_url"])
+        assert bundle.status_code == 200
+        assert bundle.headers["etag"] == f'"{template["digest"]}"'
+        install_url = template["bundle_url"].removesuffix("/bundle") + "/install"
+        installed = await client.post(install_url)
+        repeated = await client.post(install_url)
+        invalid = await client.post(install_url.replace(template["digest"], "0" * 64))
+        own_agents = await client.get("/v1/agents?scope=user")
+    assert installed.status_code == 200, installed.text
+    assert repeated.status_code == 200
+    assert installed.json()["id"] == repeated.json()["id"]
+    assert installed.json()["name"] == "acme.incident-response.triage@0.1.0"
+    assert {agent["id"] for agent in own_agents.json()["data"]} == {installed.json()["id"]}
+    assert invalid.status_code == 409
+    async with _client(app, _ADMIN) as client:
+        other_agents = await client.get("/v1/agents?scope=user")
+        other_detail = await client.get(f"/v1/agents/{installed.json()['id']}")
+    assert other_agents.json()["data"] == []
+    assert other_detail.status_code == 404
+
+
+async def test_team_pack_download_and_install_require_authentication(
+    db_uri, tmp_path, team_state
+) -> None:
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user(_USER)
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        extension_state=team_state,
+        server_config=_team_config(),
+        permission_store=permissions,
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+    )
+    async with _client(app, _USER) as client:
+        catalog = (await client.get("/v1/extensions")).json()
+        url = catalog["data"][0]["agents"][0]["bundle_url"]
+        denied_origin = await client.post(
+            url.removesuffix("/bundle") + "/install",
+            headers={"Origin": "https://untrusted.example"},
+        )
+    async with _client(app) as client:
+        download = await client.get(url)
+        install = await client.post(url.removesuffix("/bundle") + "/install")
+    assert download.status_code == 401
+    assert install.status_code == 401
+    assert denied_origin.status_code == 403
+
+
+async def test_disabled_pack_removes_downloads_but_retains_owned_agent_copy(
+    db_uri, tmp_path, team_state
+) -> None:
+    app = _build_app(
+        db_uri,
+        tmp_path,
+        extension_state=team_state,
+        server_config=_team_config(),
+    )
+    async with _client(app) as client:
+        catalog = (await client.get("/v1/extensions")).json()["data"][0]
+        url = catalog["agents"][0]["bundle_url"]
+        installed = await client.post(url.removesuffix("/bundle") + "/install")
+        assert installed.status_code == 200, installed.text
+    disabled = _build_app(
+        db_uri,
+        tmp_path,
+        extension_state=team_state,
+        server_config=_team_config(False),
+    )
+    async with _client(disabled) as client:
+        catalog = await client.get("/v1/extensions")
+        download = await client.get(url)
+        install = await client.post(url.removesuffix("/bundle") + "/install")
+        own = await client.get(f"/v1/agents/{installed.json()['id']}")
+    assert catalog.json()["data"] == []
+    assert download.status_code == 404
+    assert install.status_code == 404
+    assert own.status_code == 200
+
+
+async def test_extension_upgrade_installs_new_agent_without_updating_old_copy(
+    db_uri, tmp_path, team_state
+) -> None:
+    app = _build_app(db_uri, tmp_path, extension_state=team_state, server_config=_team_config())
+    async with _client(app) as client:
+        template = (await client.get("/v1/extensions")).json()["data"][0]["agents"][0]
+        original = await client.post(template["bundle_url"].removesuffix("/bundle") + "/install")
+        assert original.status_code == 200, original.text
+    store = SqlAlchemyAgentStore(db_uri)
+    original_location = store.get(original.json()["id"]).bundle_location
+    upgraded_manifest = replace(team_state.manifests[0], version="0.2.0")
+    upgraded_state = replace(team_state, manifests=(upgraded_manifest,))
+    config = _team_config()
+    config["extensions"][upgraded_manifest.id]["version"] = "==0.2.0"
+    upgraded = _build_app(
+        db_uri,
+        tmp_path,
+        extension_state=upgraded_state,
+        server_config=config,
+    )
+    async with _client(upgraded) as client:
+        template = (await client.get("/v1/extensions")).json()["data"][0]["agents"][0]
+        latest = await client.post(template["bundle_url"].removesuffix("/bundle") + "/install")
+        assert latest.status_code == 200, latest.text
+    assert original.json()["id"] != latest.json()["id"]
+    assert store.get(original.json()["id"]).bundle_location == original_location
+
+
+async def test_quarantined_extension_disappears_from_catalog_and_downloads(
+    db_uri, tmp_path, team_state
+) -> None:
+    app = _build_app(db_uri, tmp_path, extension_state=team_state, server_config=_team_config())
+    async with _client(app) as client:
+        template = (await client.get("/v1/extensions")).json()["data"][0]["agents"][0]
+        app.state.extension_manager._reject("acme.incident-response", "synthetic failure")
+        assert (await client.get("/v1/extensions")).json()["data"] == []
+        assert (await client.get(template["bundle_url"])).status_code == 404
 
 
 @pytest.fixture
@@ -142,6 +320,9 @@ async def test_catalog_serializes_only_public_v1_contributions(catalog_app: Fast
                 "distribution": "omnigent-acme-review",
                 "version": "1.2.0",
                 "extension_api": 1,
+                "owner": None,
+                "agents": [],
+                "policies": [],
                 "status": "unavailable",
                 "permissions": ["navigation", "sessions.read", "storage.user"],
                 "pages": [],

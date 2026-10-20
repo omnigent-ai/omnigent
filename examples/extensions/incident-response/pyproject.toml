@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omnigent-incident-response"
+version = "0.1.0"
+description = "Reference team extension with a portable incident agent and lifecycle observer"
+requires-python = ">=3.12"
+dependencies = ["omnigent>=0.19.0.dev0,<1"]
+
+[project.entry-points."omnigent.extensions"]
+incident-response = "omnigent_incident_response.plugin:get_manifest"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+omnigent_incident_response = ["agents/**/*", "policies/*.yaml"]

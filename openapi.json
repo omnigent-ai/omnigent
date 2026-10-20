@@ -2310,6 +2310,65 @@
         "title": "ErrorResponse",
         "type": "object"
       },
+      "ExtensionActivationErrorResponse": {
+        "description": "An operator grant, resource check, or lifecycle failure.",
+        "properties": {
+          "error": {
+            "title": "Error",
+            "type": "string"
+          },
+          "extension_id": {
+            "title": "Extension Id",
+            "type": "string"
+          },
+          "status": {
+            "const": "disabled",
+            "default": "disabled",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "extension_id",
+          "error"
+        ],
+        "title": "ExtensionActivationErrorResponse",
+        "type": "object"
+      },
+      "ExtensionAgentResponse": {
+        "description": "A portable agent template available from an active extension.",
+        "properties": {
+          "bundle_url": {
+            "title": "Bundle Url",
+            "type": "string"
+          },
+          "digest": {
+            "title": "Digest",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "version",
+          "digest",
+          "bundle_url"
+        ],
+        "title": "ExtensionAgentResponse",
+        "type": "object"
+      },
       "ExtensionAssetErrorResponse": {
         "description": "Concise diagnostic for one unresolved browser bundle.",
         "properties": {
@@ -2390,11 +2449,27 @@
       "ExtensionDiagnosticsResponse": {
         "description": "Administrator view of accepted and rejected extensions.",
         "properties": {
+          "activation_errors": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ExtensionActivationErrorResponse"
+            },
+            "title": "Activation Errors",
+            "type": "array"
+          },
           "asset_errors": {
             "items": {
               "$ref": "#/components/schemas/ExtensionAssetErrorResponse"
             },
             "title": "Asset Errors",
+            "type": "array"
+          },
+          "disabled_extensions": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Disabled Extensions",
             "type": "array"
           },
           "extensions": {
@@ -2503,6 +2578,31 @@
         "title": "ExtensionPageResponse",
         "type": "object"
       },
+      "ExtensionPolicyResponse": {
+        "description": "A policy preset available for explicit attachment or agent composition.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "policies": {
+            "additionalProperties": true,
+            "title": "Policies",
+            "type": "object"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "policies"
+        ],
+        "title": "ExtensionPolicyResponse",
+        "type": "object"
+      },
       "ExtensionPrimaryNavigationResponse": {
         "description": "One primary-sidebar navigation contribution.",
         "properties": {
@@ -2560,6 +2660,14 @@
       "ExtensionResponse": {
         "description": "Public metadata for one accepted extension.",
         "properties": {
+          "agents": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ExtensionAgentResponse"
+            },
+            "title": "Agents",
+            "type": "array"
+          },
           "browser": {
             "$ref": "#/components/schemas/ExtensionBrowserBundleResponse"
           },
@@ -2586,6 +2694,17 @@
             "title": "Object",
             "type": "string"
           },
+          "owner": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner"
+          },
           "pages": {
             "items": {
               "$ref": "#/components/schemas/ExtensionPageResponse"
@@ -2598,6 +2717,14 @@
               "type": "string"
             },
             "title": "Permissions",
+            "type": "array"
+          },
+          "policies": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ExtensionPolicyResponse"
+            },
+            "title": "Policies",
             "type": "array"
           },
           "primary_navigation": {
@@ -10706,7 +10833,7 @@
     },
     "/v1/extensions": {
       "get": {
-        "description": "List extensions installed and enabled when the server started.\n\nV1 treats operator installation as enablement. Installing, removing, or\nupgrading a package requires a server restart to refresh this snapshot.",
+        "description": "List active extensions; installation and configuration changes require restart.",
         "operationId": "list_extensions_v1_extensions_get",
         "responses": {
           "200": {
@@ -10786,6 +10913,129 @@
           }
         },
         "summary": "Get Extension",
+        "tags": [
+          "extensions"
+        ]
+      }
+    },
+    "/v1/extensions/{extension_id}/agents/{contribution_id}/{digest}/bundle": {
+      "get": {
+        "description": "Download one immutable template without expanding server environment variables.",
+        "operationId": "agent_bundle_v1_extensions__extension_id__agents__contribution_id___digest__bundle_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "extension_id",
+            "required": true,
+            "schema": {
+              "title": "Extension Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "contribution_id",
+            "required": true,
+            "schema": {
+              "title": "Contribution Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "digest",
+            "required": true,
+            "schema": {
+              "title": "Digest",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/gzip": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Agent Bundle",
+        "tags": [
+          "extensions"
+        ]
+      }
+    },
+    "/v1/extensions/{extension_id}/agents/{contribution_id}/{digest}/install": {
+      "post": {
+        "description": "Copy an operator-approved template into the caller's own agent catalog.",
+        "operationId": "install_agent_v1_extensions__extension_id__agents__contribution_id___digest__install_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "extension_id",
+            "required": true,
+            "schema": {
+              "title": "Extension Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "contribution_id",
+            "required": true,
+            "schema": {
+              "title": "Contribution Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "digest",
+            "required": true,
+            "schema": {
+              "title": "Digest",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Install Agent",
         "tags": [
           "extensions"
         ]
