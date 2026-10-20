@@ -28,7 +28,7 @@ from typing import Any
 
 import httpx
 import pytest
-from playwright.sync_api import Browser, Locator, Page, expect
+from playwright.sync_api import Browser, ElementHandle, Locator, Page, expect
 
 from tests.e2e_ui.conftest import seed_committed_turn
 from tests.e2e_ui.sessions._sidebar_helpers import enable_grouping_ui
@@ -573,15 +573,27 @@ def _assert_touch_folder_actions_are_keyboard_reachable(
             document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2)
         );
     }""")
+    # The open menu hides the header from the accessibility tree, so hold its title node.
+    title = header.locator("span.truncate").element_handle()
     page.keyboard.press("Enter")
     menu = page.get_by_role("menu")
     expect(menu.get_by_role("menuitem", name="Rename project")).to_be_visible()
     expect(menu.get_by_role("menuitem", name="Project settings")).to_be_visible()
+    # Focus moves into the menu, but the open trigger stays painted beside the title.
+    expect(kebab).to_have_attribute("aria-expanded", "true")
+    _assert_touch_actions_clear_the_title(title, kebab)
     page.keyboard.press("Escape")
     expect(menu).to_be_hidden()
     expect(kebab).to_be_focused()
     # Space opens the project menu as Enter does.
     page.keyboard.press(" ")
+    expect(kebab).to_have_attribute("aria-expanded", "true")
+    expect(menu.get_by_role("menuitem", name="Rename project")).to_be_visible()
+    page.keyboard.press("Escape")
+    expect(menu).to_be_hidden()
+    expect(kebab).to_be_focused()
+    # Screen readers may activate with a bare click: no pointer press or key.
+    kebab.dispatch_event("click")
     expect(kebab).to_have_attribute("aria-expanded", "true")
     expect(menu.get_by_role("menuitem", name="Rename project")).to_be_visible()
     page.keyboard.press("Escape")
@@ -595,6 +607,18 @@ def _assert_touch_folder_actions_are_keyboard_reachable(
     assert title_box["x"] + title_box["width"] <= action_box["x"]
     page.keyboard.press("Enter")
     expect(page).to_have_url(re.compile(r"/\?project="))
+    page.go_back()
+    shortcut.dispatch_event("click")
+    expect(page).to_have_url(re.compile(r"/\?project="))
+
+
+def _assert_touch_actions_clear_the_title(title: ElementHandle, control: Locator) -> None:
+    """Revealed touch controls take a real box and the title stops before them."""
+    actions = control.locator("xpath=../..").bounding_box()
+    title_box = title.bounding_box()
+    assert actions is not None and title_box is not None
+    assert actions["width"] > 1 and actions["height"] > 1
+    assert title_box["x"] + title_box["width"] <= actions["x"]
 
 
 def _assert_visually_hidden(control: Locator) -> None:
