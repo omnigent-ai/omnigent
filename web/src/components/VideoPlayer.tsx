@@ -20,9 +20,12 @@ import {
   downloadWorkspaceFile,
   fetchWorkspaceFileBlob,
   useFileContent,
+  usesDirectFileDownload,
+  workspaceFileDownloadUrl,
   workspaceFileMediaUrl,
 } from "@/hooks/useFileContent";
 import { showToast } from "@/components/ui/toast";
+import { withBasePath } from "@/lib/basePath";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 import { cn } from "@/lib/utils";
 import { formatVideoTime } from "@/lib/video";
@@ -50,11 +53,15 @@ function VideoPlayerContent(props: VideoPlayerProps) {
   const [requested, setRequested] = useState(false);
   const [blobSrc, setBlobSrc] = useState<string>();
   // Resolved once per Play so a later routing-key change can't swap the source mid-playback.
-  const directSrc = useMemo(
-    () =>
-      requested && conversationId && path ? workspaceFileMediaUrl(conversationId, path) : null,
-    [requested, conversationId, path],
-  );
+  const directSrc = useMemo(() => {
+    if (!requested || !conversationId || !path) return null;
+    const hostedUrl = workspaceFileMediaUrl(conversationId, path);
+    if (hostedUrl) return hostedUrl;
+    // Standalone browsers stream the download URL; routed hosts keep the authenticated fetch.
+    return usesDirectFileDownload()
+      ? withBasePath(workspaceFileDownloadUrl(conversationId, path))
+      : null;
+  }, [requested, conversationId, path]);
   const src = requested ? (remoteSrc ?? directSrc ?? blobSrc) : undefined;
   const [failed, setFailed] = useState(false);
   const [time, setTime] = useState(0);
@@ -101,6 +108,7 @@ function VideoPlayerContent(props: VideoPlayerProps) {
   };
 
   // Recordings can be large. Fetch only on Play, and release bytes on close.
+  // Skip fetching if using direct download URLs (range requests handled by browser).
   useEffect(() => {
     if (!requested || !conversationId || !path || directSrc) return;
     const controller = new AbortController();
