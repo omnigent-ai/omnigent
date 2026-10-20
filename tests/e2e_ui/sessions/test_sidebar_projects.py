@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from typing import Any
 
 import httpx
 import pytest
@@ -352,22 +353,33 @@ def test_project_actions_are_keyboard_accessible_on_desktop(
     expect(page).to_have_url(f"{base_url}/?project={project.replace(' ', '%20')}")
 
 
+# Chromium blink settings for a touchscreen laptop: fine primary pointer and
+# hover, with touch also available (pointer bits: coarse=2, fine=4).
+_HYBRID_POINTER_FLAG = (
+    "--blink-settings=primaryPointerType=4,availablePointerTypes=6,"
+    "primaryHoverType=2,availableHoverTypes=3"
+)
+
+
 @pytest.mark.parametrize(
-    "viewport,has_touch",
+    "viewport,has_touch,hybrid",
     [
-        ({"width": 390, "height": 780}, True),
-        ({"width": 834, "height": 1194}, True),
-        ({"width": 1194, "height": 834}, True),
-        ({"width": 500, "height": 780}, False),
+        ({"width": 390, "height": 780}, True, False),
+        ({"width": 834, "height": 1194}, True, False),
+        ({"width": 1194, "height": 834}, True, False),
+        ({"width": 500, "height": 780}, False, False),
+        ({"width": 1194, "height": 834}, False, True),
     ],
-    ids=["phone", "ipad-portrait", "ipad-landscape", "narrow-mouse"],
+    ids=["phone", "ipad-portrait", "ipad-landscape", "narrow-mouse", "touch-laptop"],
 )
 def test_project_actions_follow_the_input_type(
     browser: Browser,
+    browser_type_launch_args: dict[str, Any],
     page: Page,
     seeded_session: tuple[str, str],
     viewport: dict[str, int],
     has_touch: bool,
+    hybrid: bool,
 ) -> None:
     """Touch preference changes project header actions without changing mouse behavior."""
     base_url, session_id = seeded_session
@@ -377,7 +389,17 @@ def test_project_actions_follow_the_input_type(
     _folder_header(page, project).hover()
     expect(page.get_by_role("link", name=f"New session in {project}", exact=True)).to_be_visible()
 
-    context = browser.new_context(viewport=viewport, has_touch=has_touch)
+    hybrid_browser = (
+        browser.browser_type.launch(
+            **{
+                **browser_type_launch_args,
+                "args": [*browser_type_launch_args.get("args", []), _HYBRID_POINTER_FLAG],
+            }
+        )
+        if hybrid
+        else None
+    )
+    context = (hybrid_browser or browser).new_context(viewport=viewport, has_touch=has_touch)
     touch = context.new_page()
     try:
         if has_touch:
@@ -385,6 +407,7 @@ def test_project_actions_follow_the_input_type(
             assert touch.evaluate("matchMedia('(pointer: coarse)').matches")
         else:
             assert touch.evaluate("matchMedia('(hover: hover) and (pointer: fine)').matches")
+            assert touch.evaluate("matchMedia('(any-pointer: coarse)').matches") == hybrid
 
         touch.goto(f"{base_url}/settings/appearance")
         toggle = touch.get_by_test_id("show-project-header-actions-on-touch-toggle")
@@ -445,21 +468,28 @@ def test_project_actions_follow_the_input_type(
             for expanded in [True, False]:
                 if header.get_attribute("aria-expanded") != str(expanded).lower():
                     header.click()
-                    touch.mouse.move(viewport["width"] - 1, 0)
+                touch.mouse.move(viewport["width"] - 1, 0)
+                if viewport["width"] >= 768:
+                    # Wide fine-hover layouts keep controls hidden until hover.
+                    expect(kebab.locator("xpath=../..")).to_have_css("opacity", "0")
+                    header.hover()
                 expect(kebab).to_be_visible()
                 assert kebab.evaluate("""element => {
                     for (let node = element; node; node = node.parentElement) {
                         if (getComputedStyle(node).opacity === '0') return false;
                     }
                     const box = element.getBoundingClientRect();
-                    return box.width >= 24 && box.height >= 24 && element.contains(
+                    const sized = box.width >= 24 && box.width < 44 && box.height >= 24;
+                    return sized && element.contains(
                         document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2)
                     );
                 }""")
-                title_box = header.locator("span.truncate").bounding_box()
-                action_box = shortcut.bounding_box()
-                assert title_box is not None and action_box is not None
-                assert title_box["x"] + title_box["width"] <= action_box["x"]
+                if expanded or viewport["width"] < 768:
+                    # Wide collapsed folders overlay their marker column on hover.
+                    title_box = header.locator("span.truncate").bounding_box()
+                    action_box = shortcut.bounding_box()
+                    assert title_box is not None and action_box is not None
+                    assert title_box["x"] + title_box["width"] <= action_box["x"]
 
             before = header.get_attribute("aria-expanded")
             kebab.click()
@@ -470,9 +500,14 @@ def test_project_actions_follow_the_input_type(
             touch.keyboard.press("Escape")
             shortcut.click()
             expect(touch).to_have_url(f"{base_url}/?project={project.replace(' ', '%20')}")
-            expect(touch.get_by_role("button", name="Open sidebar", exact=True)).to_be_visible()
+            if viewport["width"] < 768:
+                expect(
+                    touch.get_by_role("button", name="Open sidebar", exact=True)
+                ).to_be_visible()
     finally:
         context.close()
+        if hybrid_browser is not None:
+            hybrid_browser.close()
 
 
 def _folder_header(page: Page, project: str, *, include_hidden: bool = False) -> Locator:
@@ -489,8 +524,8 @@ def _assert_touch_folder_uses_long_press(
     for expanded in [True, False]:
         if header.get_attribute("aria-expanded") != str(expanded).lower():
             header.tap()
-        expect(shortcut.locator("xpath=../..")).to_have_css("opacity", "0")
-        expect(kebab.locator("xpath=../..")).to_have_css("opacity", "0")
+        _assert_visually_hidden(shortcut)
+        _assert_visually_hidden(kebab)
         # No control column is reserved, so the title keeps the row's own inset.
         assert header.evaluate("element => getComputedStyle(element).paddingRight") == "8px"
 
@@ -515,12 +550,18 @@ def _assert_touch_folder_actions_are_keyboard_reachable(
     page: Page, header: Locator, shortcut: Locator, kebab: Locator
 ) -> None:
     """With touch actions off, keyboard focus reveals both sibling controls."""
-    expect(shortcut.locator("xpath=../..")).to_have_css("opacity", "0")
+    _assert_visually_hidden(shortcut)
     header.focus()
     page.keyboard.press("Tab")
     expect(shortcut).to_be_focused()
     page.keyboard.press("Tab")
     expect(kebab).to_be_focused()
+    assert kebab.evaluate("""element => {
+        const box = element.getBoundingClientRect();
+        return box.width >= 24 && element.contains(
+            document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2)
+        );
+    }""")
     page.keyboard.press("Enter")
     menu = page.get_by_role("menu")
     expect(menu.get_by_role("menuitem", name="Rename project")).to_be_visible()
@@ -536,6 +577,13 @@ def _assert_touch_folder_actions_are_keyboard_reachable(
     assert title_box["x"] + title_box["width"] <= action_box["x"]
     page.keyboard.press("Enter")
     expect(page).to_have_url(re.compile(r"/\?project="))
+
+
+def _assert_visually_hidden(control: Locator) -> None:
+    """A hidden header control keeps its accessible name but takes no layout or hit area."""
+    expect(control).to_have_accessible_name(re.compile(r"\S"))
+    box = control.locator("xpath=../..").bounding_box()
+    assert box is not None and box["width"] <= 1 and box["height"] <= 1
 
 
 def _assert_touch_folder_actions_are_visible(
