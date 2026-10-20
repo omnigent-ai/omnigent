@@ -42,10 +42,12 @@ import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import { Button } from "@/components/ui/button";
 import {
+  type ConversationState,
   EMPTY_SIDE_CHAT_COMPOSER,
   ensureConversationStreamed,
   useChatStore,
 } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
@@ -89,6 +91,43 @@ function writeInheritedBoundary(childId: string, ids: Set<string>): void {
   } catch {
     // Storage disabled/full — the boundary just won't survive a reload.
   }
+}
+
+// Null until the load settles: a null harness is an unbound/abandoned entry and
+// a native Codex fork already holds only its own turns. Pure; callers persist.
+function forkedInBoundary(state: ConversationState): Set<string> | null {
+  if (
+    state.loadingConversation ||
+    state.conversationLoadError !== null ||
+    state.sessionHarness === null ||
+    usesNativeSideChatFork(state.sessionHarness)
+  ) {
+    return null;
+  }
+  return new Set(
+    state.blocks
+      .map((b) => (b as { ctx?: { itemId?: string | null } }).ctx?.itemId)
+      .filter((id): id is string => typeof id === "string"),
+  );
+}
+
+// Snapshot and persist the boundary for a child whose load settled OFF SCREEN
+// (the pane unmounted mid-load), reusing an already-persisted boundary.
+function captureInheritedBoundary(childId: string, state: ConversationState): Set<string> | null {
+  const persisted = readInheritedBoundary(childId);
+  if (persisted !== null) return persisted;
+  const ids = forkedInBoundary(state);
+  if (ids !== null) writeInheritedBoundary(childId, ids);
+  return ids;
+}
+
+// Open the child's stream and capture the boundary when ITS load settles, even
+// if this pane unmounted meanwhile (a rail-tab switch mid-load): no render sees
+// that completion, so the next mount would show the parent's copied transcript.
+async function streamSideChat(childId: string): Promise<void> {
+  if (!(await ensureConversationStreamed(childId))) return;
+  const entry = conversationRegistry.peek(childId);
+  if (entry !== undefined) captureInheritedBoundary(childId, entry.getState());
 }
 
 // Accurate for every harness: a side chat is a fork that stays out of the main
@@ -147,7 +186,7 @@ export function SideChatPane({
   // here. The store guards a double-bind and re-binds a failed entry, so
   // re-mounts / tab switches / retries are cheap.
   useEffect(() => {
-    if (!pending) void ensureConversationStreamed(childId);
+    if (!pending) void streamSideChat(childId);
   }, [pending, childId]);
   // A real tab reads the child entry; a pending tab has none (null → empty).
   const state = useConversationEntryState(pending ? null : childId);
@@ -178,36 +217,32 @@ export function SideChatPane({
     childId: string;
     ids: Set<string> | null;
     loadSeen: boolean;
+    persisted: boolean;
   } | null>(null);
   if (boundaryRef.current === null || boundaryRef.current.childId !== childId) {
-    boundaryRef.current = {
-      childId,
-      ids: filterHistory && !pending ? readInheritedBoundary(childId) : null,
-      loadSeen: false,
-    };
+    const stored = filterHistory && !pending ? readInheritedBoundary(childId) : null;
+    boundaryRef.current = { childId, ids: stored, loadSeen: false, persisted: stored !== null };
   }
   if (loadingConversation) boundaryRef.current.loadSeen = true;
-  // Capture once, when the fork's load has actually completed — even if it is
-  // EMPTY (a parent with no history), so the side chat's first message isn't
-  // mistaken for inherited history and hidden. Snapshot the inherited item ids
-  // and persist so later mounts/reloads hide the same set, not new turns.
+  // Compute the boundary in render once the load has settled — even if EMPTY
+  // (a parent with no history) — so visibleBlocks is right the same frame; the
+  // effect below persists it, keeping storage writes out of the render body.
   if (
     boundaryRef.current.ids === null &&
     !pending &&
     filterHistory &&
-    boundaryRef.current.loadSeen &&
-    !loadingConversation &&
-    conversationLoadError === null
+    boundaryRef.current.loadSeen
   ) {
-    const ids = new Set(
-      blocks
-        .map((b) => (b as { ctx?: { itemId?: string | null } }).ctx?.itemId)
-        .filter((id): id is string => typeof id === "string"),
-    );
-    boundaryRef.current.ids = ids;
-    writeInheritedBoundary(childId, ids);
+    boundaryRef.current.ids = forkedInBoundary(state);
   }
   const inherited = boundaryRef.current.ids;
+  useEffect(() => {
+    const ref = boundaryRef.current;
+    if (ref === null || ref.persisted || inherited === null) return;
+    // Write-once: never clobber a boundary an off-screen capture already stored.
+    if (readInheritedBoundary(childId) === null) writeInheritedBoundary(childId, inherited);
+    ref.persisted = true;
+  }, [childId, inherited]);
   const visibleBlocks = useMemo(
     () =>
       inherited === null
@@ -325,7 +360,7 @@ export function SideChatPane({
                 size="sm"
                 variant="outline"
                 className="mt-1"
-                onClick={() => void ensureConversationStreamed(childId)}
+                onClick={() => void streamSideChat(childId)}
               >
                 Retry
               </Button>

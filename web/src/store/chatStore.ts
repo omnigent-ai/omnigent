@@ -4095,9 +4095,12 @@ function mirrorActiveEntry(): void {
  * can recover on retry (a plain membership check would strand it forever).
  *
  * @param id Conversation id to stream, e.g. a side-chat child.
+ * @returns `true` once this call initiated a bind (the load usually settles by
+ *   then, but a dispose while binding can abandon it — re-check the registry);
+ *   `false` for a no-op.
  */
-export async function ensureConversationStreamed(id: string): Promise<void> {
-  if (id === "" || isTempConvId(id)) return;
+export async function ensureConversationStreamed(id: string): Promise<boolean> {
+  if (id === "" || isTempConvId(id)) return false;
   const existing = conversationRegistry.peek(id);
   if (existing !== undefined) {
     // Reuse only while a load is in flight (guards a double-bind) or the stream
@@ -4105,13 +4108,14 @@ export async function ensureConversationStreamed(id: string): Promise<void> {
     // controller WITHOUT setting a load error, so an error-free entry can still
     // be dead — reusing it would strand a remounted pane on stale state. This
     // mirrors switchTo's `isConversationStreamCurrent` liveness gate.
-    if (existing.getState().loadingConversation || isConversationStreamCurrent(id)) return;
+    if (existing.getState().loadingConversation || isConversationStreamCurrent(id)) return false;
     // Dead or failed: drop the entry so the acquire below rebinds.
     conversationRegistry.release(id);
   }
   const entry = conversationRegistry.acquire(id);
   entry.setState({ loadingConversation: true, conversationLoadError: null });
   await bindStream(id, entrySetter(entry), entryGetter(entry), true);
+  return true;
 }
 
 // Route `useChatStore.setState` so a conversation-scoped write reaches the

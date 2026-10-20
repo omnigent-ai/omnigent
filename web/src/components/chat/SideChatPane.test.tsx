@@ -5,16 +5,19 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { UserMessageBlock } from "@/lib/blocks";
 import * as sessionsApi from "@/lib/sessionsApi";
 import type * as ChatStoreModule from "@/store/chatStore";
-import { useChatStore, type ChatState } from "@/store/chatStore";
+import { ensureConversationStreamed, useChatStore, type ChatState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { SideChatPane } from "./SideChatPane";
 
 vi.mock("@/store/chatStore", async (importOriginal) => ({
   ...(await importOriginal<typeof ChatStoreModule>()),
-  ensureConversationStreamed: vi.fn().mockResolvedValue(undefined),
+  // The no-op result from the real `Promise<boolean>` contract; cases that
+  // drive a load override this with a `true` resolution.
+  ensureConversationStreamed: vi.fn().mockResolvedValue(false),
 }));
 
 vi.mock("@/components/composer/ComposerAddMenu", () => ({ ComposerAddMenu: () => null }));
@@ -635,6 +638,156 @@ describe("side chat sealed by the server", () => {
     await waitFor(() =>
       expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", childId] }),
     );
+  });
+});
+
+describe("inherited history boundary", () => {
+  function userBlock(id: string, text: string): UserMessageBlock {
+    return {
+      type: "user_message",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: id, itemId: id },
+      content: [{ type: "input_text", text }],
+    };
+  }
+  const parentTurns = [
+    userBlock("parent_1", "main: summarize what we found"),
+    userBlock("parent_2", "main: list the important caveats"),
+  ];
+  const sideTurn = userBlock("side_1", "side: answer this side question");
+
+  /** Mount the pane on a child whose first transcript page is still loading. */
+  function mountLoadingChild() {
+    let finishLoad!: (loaded: boolean) => void;
+    vi.mocked(ensureConversationStreamed).mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          finishLoad = resolve;
+        }),
+    );
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: null,
+      sessionStatus: "idle",
+      loadingConversation: true,
+    });
+    const view = renderPane(<SideChatPane childId={childId} />);
+    // The page lands in the entry, then the stream call that fetched it resolves.
+    const settleLoad = async (blocks: UserMessageBlock[], harness = "openai-agents") => {
+      act(() =>
+        conversationRegistry.acquire(childId).setState({
+          sessionHarness: harness,
+          blocks,
+          loadingConversation: false,
+        }),
+      );
+      await act(async () => finishLoad(true));
+    };
+    return { view, settleLoad };
+  }
+
+  it("hides the forked-in history when its first load settles while the pane is unmounted", async () => {
+    const { view, settleLoad } = mountLoadingChild();
+    // Switching rail tabs unmounts the pane before the first page arrives.
+    view.unmount();
+    await settleLoad(parentTurns);
+
+    renderPane(<SideChatPane childId={childId} />);
+    expect(screen.queryByText("main: list the important caveats")).toBeNull();
+    expect(
+      screen.getByText("Ask a question here without affecting the main conversation."),
+    ).toBeInTheDocument();
+
+    act(() =>
+      conversationRegistry.acquire(childId).setState({ blocks: [...parentTurns, sideTurn] }),
+    );
+    expect(screen.getByText("side: answer this side question")).toBeInTheDocument();
+    expect(screen.queryByText("main: summarize what we found")).toBeNull();
+  });
+
+  it("keeps the side chat's own turns after a reload that follows an off-screen load", async () => {
+    const first = mountLoadingChild();
+    first.view.unmount();
+    await first.settleLoad(parentTurns);
+
+    // A reload drops the registry; the child's first page now holds its own turn too.
+    conversationRegistry.clear();
+    const reloaded = mountLoadingChild();
+    await reloaded.settleLoad([...parentTurns, sideTurn]);
+
+    expect(screen.getByText("side: answer this side question")).toBeInTheDocument();
+    expect(screen.queryByText("main: list the important caveats")).toBeNull();
+  });
+
+  it("hides the forked-in history when the load settles on screen", async () => {
+    const { settleLoad } = mountLoadingChild();
+    await settleLoad(parentTurns);
+
+    expect(screen.queryByText("main: list the important caveats")).toBeNull();
+    act(() =>
+      conversationRegistry.acquire(childId).setState({ blocks: [...parentTurns, sideTurn] }),
+    );
+    expect(screen.getByText("side: answer this side question")).toBeInTheDocument();
+  });
+
+  it("never persists a native Codex child's own first turn as inherited", async () => {
+    const first = mountLoadingChild();
+    await first.settleLoad([sideTurn], "codex-native");
+    expect(screen.getByText("side: answer this side question")).toBeInTheDocument();
+
+    // A boundary wrongly captured here would hide this turn on the next mount.
+    first.view.unmount();
+    conversationRegistry.clear();
+    const reloaded = mountLoadingChild();
+    await reloaded.settleLoad([sideTurn], "codex-native");
+    expect(screen.getByText("side: answer this side question")).toBeInTheDocument();
+  });
+
+  it("ignores an abandoned bind that resolves before the load settles", async () => {
+    // A dispose mid-bind can re-acquire a fresh entry (no harness, no blocks)
+    // while `ensureConversationStreamed` still resolves true. Capturing then
+    // would persist an empty boundary and permanently reveal inherited history.
+    let finishAbandoned!: (loaded: boolean) => void;
+    vi.mocked(ensureConversationStreamed).mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          finishAbandoned = resolve;
+        }),
+    );
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: null,
+      sessionStatus: "idle",
+      loadingConversation: true,
+    });
+    const abandoned = renderPane(<SideChatPane childId={childId} />);
+    abandoned.unmount();
+    conversationRegistry.clear();
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: null,
+      conversationLoadError: null,
+      blocks: [],
+      loadingConversation: false,
+    });
+    await act(async () => finishAbandoned(true));
+
+    // The genuine load then settles off screen with the parent transcript.
+    conversationRegistry.clear();
+    const reloaded = mountLoadingChild();
+    reloaded.view.unmount();
+    await reloaded.settleLoad(parentTurns);
+
+    renderPane(<SideChatPane childId={childId} />);
+    expect(screen.queryByText("main: list the important caveats")).toBeNull();
+  });
+
+  it("never overwrites a boundary already persisted by an off-screen capture", async () => {
+    const key = `omnigent.sideChatInherited:${childId}`;
+    const { settleLoad } = mountLoadingChild();
+    // The off-screen continuation persisted the correct parent-only boundary
+    // after this mount's first pre-settle render.
+    localStorage.setItem(key, JSON.stringify(["parent_1", "parent_2"]));
+    // The load then settles with the child's own turn already in blocks; the
+    // render-time capture must not re-persist a wider, poisoning boundary.
+    await settleLoad([...parentTurns, sideTurn]);
+    expect(localStorage.getItem(key)).toBe(JSON.stringify(["parent_1", "parent_2"]));
   });
 });
 
