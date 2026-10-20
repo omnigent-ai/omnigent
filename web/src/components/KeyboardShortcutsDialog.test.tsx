@@ -92,6 +92,14 @@ describe("KeyboardShortcutsDialog", () => {
     expect(keysFor("Find a session by name")).toEqual(["Ctrl", "Alt", "S"]);
   });
 
+  it("keeps native new-session keys and updates the Settings reference", () => {
+    const { rerender } = render(<KeyboardShortcutsList variant="settings" />);
+    expect(keysFor("Start a new session")).toEqual(["Ctrl", "Shift", "O"]);
+    isNativeShell.mockReturnValue(true);
+    rerender(<KeyboardShortcutsList variant="settings" />);
+    expect(keysFor("Start a new session")).toEqual(["Ctrl", "Alt", "N"]);
+  });
+
   it("renders nothing until opened", () => {
     render(<KeyboardShortcutsDialog />);
     expect(screen.queryByText("Send message")).toBeNull();
@@ -104,7 +112,7 @@ describe("KeyboardShortcutsDialog", () => {
     expect(screen.getByText("Keyboard shortcuts")).toBeTruthy();
     // General / In chats / Navigation / View / Slash commands — one each.
     expect(screen.getByText("Start a new session")).toBeTruthy();
-    expect(keysFor("Start a new session")).toEqual(["Ctrl", "Alt", "N"]);
+    expect(keysFor("Start a new session")).toEqual(["Ctrl", "Shift", "O"]);
     expect(screen.getByText("Open command palette")).toBeTruthy();
     expect(keysFor("Open Settings")).toEqual(["Ctrl", "Alt", ","]);
     expect(screen.getByText("Show keyboard shortcuts")).toBeTruthy();

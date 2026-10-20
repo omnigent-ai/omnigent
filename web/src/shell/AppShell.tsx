@@ -1771,7 +1771,7 @@ export function AppShell() {
       setCommandPaletteOpen((prev) => !sessionSearch || !prev);
     },
   );
-  useNewSessionHotkey(!isEmbedded);
+  useNewSessionHotkey();
   useSettingsHotkey();
 
   // Mobile back button: close the open file and return to the files/changes

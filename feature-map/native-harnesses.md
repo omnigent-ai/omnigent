@@ -23,6 +23,9 @@ implements them separately, so a fix for one harness does not reach the others.
   `--resume` picker that lists only this host's sessions) or by reopening it.
 - `steer`: sending while the harness is mid-turn steers the active turn.
 - `chat-render`: the harness's output renders in chat like other harnesses.
+- `working-status`: quiet work stays working; waiting for input is explained;
+  completion, interruption and process exit settle the indicator. A following
+  turn and reconnect must not leave a stale idle or working state.
 - `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups
   stay in that thread, and closing it leaves the parent usable.
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
@@ -57,6 +60,13 @@ implements them separately, so a fix for one harness does not reach the others.
 **Web:** start a new session, choose the harness in the harness picker, open its
 configuration for model and effort, and send. Approval cards and the Terminal
 view appear in the session.
+
+**Working status:** watch the session's Chat indicator after sending from the
+new-session composer, an existing-session composer, or the agent terminal.
+Switch Terminal → Chat, close/reopen the viewer, and reload during quiet work.
+Repeat the Chat and header-menu Terminal paths at phone width. A locally
+launched `omnigent claude` session is a separate launch path; inspect its linked
+Chat session as well as the local terminal.
 
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
@@ -156,6 +166,48 @@ the extra fields. Resolver and raw-tunnel checks:
 `tests/server/integration/test_host_tunnel_route.py::test_startup_http_through_real_tunnel`.
 
 Cross-harness journeys:
+
+- **`working-status`, Claude (component and real-process checks):** run with
+  plain `uv run --no-sync pytest`, `--reruns 0 -n 0`:
+  `tests/runner/test_resource_registry.py::test_claude_program_status_real_launch_and_fallback`,
+  `tests/runner/test_resource_registry.py::test_program_status_respects_flag_and_claude_role`,
+  `tests/runner/test_resource_registry.py::test_queued_turn_republishes_running_after_stop`,
+  `tests/runner/test_resource_registry.py::test_failed_hook_does_not_republish_stale_running_status`,
+  `tests/harnesses/claude_native/test_claude_native_program_status.py`, and
+  `tests/harnesses/claude_native/test_claude_native_status_file.py`.
+  The launch matrix uses a scripted protocol peer through real tmux, with and
+  without the available OS sandbox. It covers OSC on, an enabled non-emitting
+  peer and flag off; quiet work, blocked reasons, completion/error, child
+  isolation, reconnect/forwarded-idle replay, fallback, and exit. The concurrency
+  tests pause real file reads; they are not elapsed-time or live-Claude canaries.
+  Legacy-file and role-gating results do not prove other vendor CLIs ran.
+- **`working-status`, Claude (real CLI and browser):** requires Claude Code
+  2.1.295+ for OSC. In an isolated host/runner, leave `OMNIGENT_FEATURES` unset
+  to exercise the enabled default, restart and launch a fresh session. Do not set
+  `CLAUDE_CODE_DISABLE_TERMINAL_TITLE`, which also suppresses program status.
+  Confirm OSC negotiation and emitted Claude root state in the terminal evidence;
+  flag-on alone does not prove the OSC path was exercised. Run the matrix's
+  Claude render-parity test through `verify-env run` for existing-composer and
+  embedded-terminal turns, final output, idle settlement and duplicate checks.
+  This test does not cover quiet work, interruption or the new-session composer.
+  For each remaining entry point above, hold a harmless tool operation open
+  beyond the pane idle threshold, observe working with the viewer closed, then
+  open/reopen it and reload. Trigger a permission/question prompt and confirm
+  the blocked explanation points to the input surface; answer and finish.
+  Separately interrupt active work and complete a follow-up; queue a follow-up
+  across completion and check it runs once. Compare Chat with the session REST
+  status and keep a recording plus terminal transcript. Restart the isolated
+  runner and repeat with `OMNIGENT_FEATURES=-claude_osc_status` (the kill
+  switch), and separately with a pre-2.1.295 CLI under the default. Record each version, gate, sandbox and surface separately.
+  Machine-managed Claude provider settings can prevent the scripted endpoint
+  from being used: report that blocker or use an isolated test container.
+  Do not change machine policy to obtain a passing run.
+- **`working-status`, browser presentation only:** the existing
+  `tests/e2e_ui/chat/test_blocked_dialog_terminal_routing.py::test_chat_blocked_on_terminal_dialog_routes_user_to_terminal`
+  injects a status event through the real server to check the blocked hint.
+  It does not launch Claude or verify OSC production. Shared terminal launch
+  and cleanup checks, including Codex-role and auxiliary-shell controls, are
+  in [Terminals](./terminals.md); they do not establish full harness acceptance.
 
 - **Antigravity permission choices (Chat and Inbox):**
   `tests/e2e_ui/approvals/test_agy_permission_full_prompt.py::test_agy_permission_persist_request_round_trip`
