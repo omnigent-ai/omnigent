@@ -3839,6 +3839,67 @@ async def test_last_runner_leaving_retires_host_whose_runtime_is_gone(
         proc.wait()
 
 
+@pytest.mark.parametrize("path", ["stop", "watcher"])
+async def test_runner_still_being_reported_holds_off_runtime_gone_retirement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """A failed launch finishing mid-departure doesn't retire the host early.
+
+    The stop handler and the watcher untrack the runner before their frame is
+    sent, so the launch's recheck must wait until that frame goes out.
+    """
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "deleted-venv" / "bin" / "python"))
+    host = _make_host_process()
+    proc = subprocess.Popen(["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    paused = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _paused(*_args: object) -> None:
+        paused.set()
+        await release.wait()
+
+    try:
+        host._runners["runner_last"] = _RunnerHandle(proc=proc, log_path=tmp_path / "runner.log")
+        host._note_runtime_gone()
+        tunnel = _FakeTunnel()
+        host._ws = tunnel  # type: ignore[assignment] — duck-typed ws
+        if path == "stop":
+            monkeypatch.setattr(host, "_stop_runner_and_trigger", _paused)
+            host._start_frame_task(
+                tunnel,  # type: ignore[arg-type]
+                encode_host_frame(
+                    HostStopRunnerFrame(request_id="req_last", runner_id="runner_last")
+                ),
+            )
+            departing: asyncio.Future[None] = asyncio.ensure_future(_drain_frame_tasks(host))
+        else:
+            monkeypatch.setattr(host, "_report_unexpected_exit", _paused)
+            proc.kill()
+            proc.wait()
+            departing = asyncio.ensure_future(host._watch_runner("runner_last"))
+        await asyncio.wait_for(paused.wait(), timeout=5.0)
+
+        # A failed launch's frame task ends while the runner is still leaving.
+        host._launches_in_flight = 1
+        host._finish_accepted_launch(Mock())
+        retire = [
+            task for task in host._frame_tasks if task.get_name() == "host-runtime-gone-retire"
+        ]
+        await asyncio.wait_for(asyncio.gather(*retire), timeout=10.0)
+        assert not host.lifecycle_lost
+        assert tunnel.closed_after_sent is None
+
+        release.set()
+        await asyncio.wait_for(departing, timeout=10.0)
+        assert host.runtime_gone
+        # The stop result goes out before the close; the watcher's report is stubbed.
+        assert tunnel.closed_after_sent == (1 if path == "stop" else 0)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+
+
 async def test_handle_stop_unknown_runner() -> None:
     """
     Verify that _handle_stop returns status='failed' for an

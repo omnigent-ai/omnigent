@@ -1358,6 +1358,9 @@ class HostProcess:
         # Launch frames received but whose handler hasn't finished; retirement
         # waits for them.
         self._launches_in_flight = 0
+        # Runners untracked but whose stop result or exit report is still being
+        # sent; retirement waits for them too.
+        self._runner_departures = 0
 
     def _tracked_runner_pids(self) -> set[int]:
         """Return child PIDs whose exit status still belongs to a process handle.
@@ -1436,6 +1439,15 @@ class HostProcess:
         if reaped:
             _logger.debug("orphan reaper reaped %d process(es)", reaped)
         return reaped
+
+    @contextlib.contextmanager
+    def _runner_departure(self) -> Iterator[None]:
+        """Hold off a deleted-runtime retirement while a leaving runner is reported."""
+        self._runner_departures += 1
+        try:
+            yield
+        finally:
+            self._runner_departures -= 1
 
     @contextlib.contextmanager
     def _host_subprocess_op(self) -> Iterator[None]:
@@ -2500,9 +2512,10 @@ class HostProcess:
             # _handle_stop (or _cleanup_runners) removed it first —
             # an intentional termination, not a crash to report.
             return
-        self._runners.pop(runner_id)
         try:
-            await self._report_unexpected_exit(runner_id, handle)
+            with self._runner_departure():
+                self._runners.pop(runner_id)
+                await self._report_unexpected_exit(runner_id, handle)
         finally:
             await self._retire_if_runtime_gone()
 
@@ -4157,6 +4170,7 @@ class HostProcess:
             self._runtime_gone
             and not self._runners
             and not self._launches_in_flight
+            and not self._runner_departures
             and not self._lifecycle_lost.is_set()
             and self._ws is not None
             and not self._unreported_exits
@@ -4885,11 +4899,12 @@ class HostProcess:
         try:
             # Reports raised while disconnected must wait until registration;
             # the server cannot route them before this connection owns the host.
-            for runner_id, report in list(self._unreported_exits.items()):
-                del self._unreported_exits[runner_id]
-                await self._report_runner_exit(
-                    runner_id, report.error, had_connected=report.had_connected
-                )
+            with self._runner_departure():
+                for runner_id, report in list(self._unreported_exits.items()):
+                    del self._unreported_exits[runner_id]
+                    await self._report_runner_exit(
+                        runner_id, report.error, had_connected=report.had_connected
+                    )
             # Runners that died while disconnected may have been the last ones.
             await self._retire_if_runtime_gone()
             print(
@@ -5183,9 +5198,10 @@ class HostProcess:
                 completion.set_result(None)
             await self._send_text(ws, encode_host_frame(launch_result))
         elif isinstance(frame, HostStopRunnerFrame):
-            async with self._runner_lifecycle_lock:
-                stop_result = await self._handle_stop(frame)
-            await self._send_text(ws, encode_host_frame(stop_result))
+            with self._runner_departure():
+                async with self._runner_lifecycle_lock:
+                    stop_result = await self._handle_stop(frame)
+                await self._send_text(ws, encode_host_frame(stop_result))
             await self._retire_if_runtime_gone()
         elif isinstance(frame, HostRunnerStatusFrame):
             await self._send_text(ws, encode_host_frame(await self._handle_runner_status(frame)))
