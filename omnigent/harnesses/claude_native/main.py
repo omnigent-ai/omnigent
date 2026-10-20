@@ -83,6 +83,7 @@ from omnigent._wrapper_labels import (
 from omnigent.claude_launcher import resolve_claude_launch
 from omnigent.cli_invocation import cli_invocation
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
@@ -209,6 +210,9 @@ _CLAUDE_CODE_NESTED_SESSION_ENV = "CLAUDECODE"
 _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV = "CLAUDE_CODE_API_KEY_HELPER_TTL_MS"
 _CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV = "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"
 _CLAUDE_CODE_USE_GATEWAY_ENV = "CLAUDE_CODE_USE_GATEWAY"
+# The Databricks gateway rejects the advisor tool for its models with a 400 that
+# Claude Code does not retry without the tool, failing every turn.
+_CLAUDE_CODE_DISABLE_ADVISOR_TOOL_ENV = "CLAUDE_CODE_DISABLE_ADVISOR_TOOL"
 #: Kill-switch Claude Code treats as covering nonessential startup traffic;
 #: the probe strips it so speed knobs never mask harness output.
 _CLAUDE_NONESSENTIAL_TRAFFIC_ENV = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
@@ -2899,17 +2903,10 @@ def _ucode_config_for_profile(
     env: dict[str, str] = {
         _UCODE_CLAUDE_BASE_URL_ENV: base_url,
         _CLAUDE_CODE_API_KEY_HELPER_TTL_ENV: str(refresh_interval_ms),
-        # This path always launches in gateway mode (CLAUDE_CODE_USE_GATEWAY=1),
-        # in which Claude Code negotiates the anthropic-beta set with the gateway
-        # rather than sending every flag blindly — so we do NOT disable
-        # experimental betas here. Disabling them also turns off MCP tool search
-        # (it rides on ``advanced-tool-use``), which reloads every MCP tool
-        # schema eagerly and inflates the context window. The Databricks gateway
-        # now accepts the flags Claude Code sends under CLAUDE_CODE_USE_GATEWAY=1
-        # (advanced-tool-use / prompt-caching-scope / advisor-tool), so the
-        # earlier ``CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`` workaround for
-        # 400 "invalid beta flag" is no longer needed on this path.
+        # Gateway mode keeps experimental betas on so MCP tool search still defers
+        # tool schemas; the gateway rejects only the advisor tool.
         _CLAUDE_CODE_USE_GATEWAY_ENV: "1",
+        _CLAUDE_CODE_DISABLE_ADVISOR_TOOL_ENV: "1",
         _CLAUDE_CODE_CUSTOM_HEADERS_ENV: _DATABRICKS_CODING_AGENT_HEADER,
     }
     # Pin each Claude Code model-tier alias to the corresponding Databricks
@@ -3094,6 +3091,11 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
             **(
                 {_CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS_ENV: "1"}
                 if os.environ.get("CLAUDE_CODE_USE_GATEWAY") != "1"
+                else {}
+            ),
+            **(
+                {_CLAUDE_CODE_DISABLE_ADVISOR_TOOL_ENV: "1"}
+                if is_databricks_ai_gateway_url(family.base_url)
                 else {}
             ),
         },
@@ -3354,6 +3356,7 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
     env = {
         _UCODE_CLAUDE_BASE_URL_ENV: f"{workspace_host}/ai-gateway/anthropic",
         _CLAUDE_CODE_USE_GATEWAY_ENV: "1",
+        _CLAUDE_CODE_DISABLE_ADVISOR_TOOL_ENV: "1",
         _CLAUDE_CODE_CUSTOM_HEADERS_ENV: _DATABRICKS_CODING_AGENT_HEADER,
     }
     model = _connect_broker_default_model()

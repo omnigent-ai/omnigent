@@ -1260,6 +1260,8 @@ def _resolve_gateway_env(
     # that cannot negotiate betas keeps the original workaround.
     if is_databricks_ai_gateway_url(base_url):
         gateway_env["CLAUDE_CODE_USE_GATEWAY"] = "1"
+        # The gateway rejects the advisor tool with a 400 Claude Code won't retry.
+        gateway_env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] = "1"
     else:
         gateway_env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
     return gateway_env
