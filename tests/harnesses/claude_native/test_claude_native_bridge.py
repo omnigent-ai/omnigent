@@ -5716,7 +5716,7 @@ def test_tmux_injections_are_serialized_per_bridge(
     )
     monkeypatch.setattr(claude_native_bridge, "_paste_and_submit", lambda *_a, **_k: None)
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda *_args: None)
-    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_args: "")
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_args: _composer_pane())
     monkeypatch.setattr(claude_native_bridge, "_PASTE_COMMIT_TIMEOUT_S", 0.0)
     monkeypatch.setattr(claude_native_bridge, "_PASTE_SETTLE_S", 0.0)
 
@@ -10811,7 +10811,14 @@ class _EditableComposer:
 
     _RULE = "──────────────────────────────"
 
-    def __init__(self, draft: str, *, cursor: int, visible_rows: int | None = None) -> None:
+    def __init__(
+        self,
+        draft: str,
+        *,
+        cursor: int,
+        visible_rows: int | None = None,
+        unavailable_clear_captures: int = 0,
+    ) -> None:
         """
         :param draft: Text the person left in the box.
         :param cursor: Cursor offset into *draft*.
@@ -10820,10 +10827,14 @@ class _EditableComposer:
             the closing rule shows framed; a taller one is cut off at the
             bottom of the pane without it (the ``_SLIVER_MULTILINE_DRAFT_PANE``
             geometry). ``None`` shows the whole box.
+        :param unavailable_clear_captures: Captures that fail after clearing
+            starts; readiness captures remain readable.
         """
         self.text = draft
         self.cursor = cursor
         self._visible_rows = visible_rows
+        self._unavailable_clear_captures = unavailable_clear_captures
+        self._clearing_started = False
         self.submitted: list[str] = []
         self._paste_buffer = ""
         self._actions = {
@@ -10854,6 +10865,7 @@ class _EditableComposer:
                 self._actions[sequence]()
                 keys = keys[len(sequence) :]
         elif args[0] == "send-keys" and args[-1] == "Space":
+            self._clearing_started = True
             self._insert(" ")
         elif args[0] == "send-keys" and args[-1] == "Enter":
             self.submitted.append(self.text)
@@ -10861,6 +10873,9 @@ class _EditableComposer:
 
     def _capture_pane(self, socket_path: str, tmux_target: str) -> str:
         del socket_path, tmux_target
+        if self._clearing_started and self._unavailable_clear_captures:
+            self._unavailable_clear_captures -= 1
+            return ""
         first, *rest = self.text.split("\n")
         rows = [f"❯ {first}", *(f"  {row}" for row in rest)]
         if self._visible_rows is not None and len(rows) >= self._visible_rows:
@@ -10994,6 +11009,55 @@ def test_a_draft_the_clearing_budget_cannot_empty_is_refused_not_submitted(
 
     assert composer.submitted == []
     assert "FOUR" in composer.text, "The leftover line should still be the person's to deal with."
+
+
+@pytest.mark.parametrize(
+    ("inject", "expected"),
+    [
+        (
+            lambda bridge_dir: inject_user_message(bridge_dir, content="hello from the web"),
+            "hello from the web",
+        ),
+        (
+            lambda bridge_dir: claude_native_bridge.inject_slash_command(
+                bridge_dir, command="/effort high"
+            ),
+            "/effort high",
+        ),
+    ],
+    ids=["web-message", "slash-command"],
+)
+@pytest.mark.parametrize(
+    "unavailable_clear_captures",
+    [1, claude_native_bridge._COMPOSER_CLEAR_MAX_ROUNDS + 1],
+    ids=["one-failed-capture", "persistent-failed-captures"],
+)
+def test_unavailable_composer_capture_never_submits_the_leftover_draft(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    inject: Callable[[Path], None],
+    expected: str,
+    unavailable_clear_captures: int,
+) -> None:
+    """Retry a transient unreadable box; refuse when it stays unreadable."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    composer = _EditableComposer(
+        _STALE_MULTILINE_DRAFT,
+        cursor=0,
+        unavailable_clear_captures=unavailable_clear_captures,
+    )
+    composer.install(monkeypatch)
+
+    if unavailable_clear_captures > 1:
+        with pytest.raises(
+            claude_native_bridge.ClaudeComposerNotCleared, match="nothing was sent"
+        ):
+            inject(bridge_dir)
+        assert composer.submitted == []
+        assert "STALE TWO\nSTALE THREE" in composer.text
+    else:
+        inject(bridge_dir)
+        assert [text.strip() for text in composer.submitted] == [expected]
 
 
 @pytest.mark.parametrize(
