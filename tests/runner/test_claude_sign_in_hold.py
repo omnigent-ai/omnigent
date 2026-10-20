@@ -621,8 +621,6 @@ async def test_ready_notice_lands_before_the_held_message_is_resent(
 ) -> None:
     """The queue stays paused while the "signed in" notice posts, even past the wait's end."""
     monkeypatch.setattr(sign_in_watch, "_SIGN_IN_WATCH_INTERVAL_S", 0.01)
-    if wait_ends == "during-notice":
-        monkeypatch.setattr(runner_app, "_SIGN_IN_HOLD_MAX_S", 0.1)
     sid = uuid.uuid4().hex
 
     async def read(scrollback: int = 0, *, join_wrapped: bool = False) -> dict[str, object]:
@@ -635,6 +633,9 @@ async def test_ready_notice_lands_before_the_held_message_is_resent(
 
     async def slow_ready_notice(body: Any) -> None:
         if _notice_code(body) == "databricks_sign_in_completed":
+            if wait_ends == "during-notice":
+                # Expire the wait only once the watcher has claimed the release.
+                app.state.sign_in_holds[sid].deadline = 0.0
             await asyncio.sleep(0.3)
             resent_during_notice.append(len(harness.posted_bodies) - 1)
 
