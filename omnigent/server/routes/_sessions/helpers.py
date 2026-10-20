@@ -5083,6 +5083,9 @@ def reconcile_orphaned_running_status(
     session_id: str,
     conversation_store: ConversationStore,
     stale_before: int,
+    *,
+    preserve_interruption: bool = False,
+    owner_runner_id: str | None = None,
 ) -> bool:
     """
     Settle a session that reads ``running`` but whose runner is
@@ -5106,17 +5109,88 @@ def reconcile_orphaned_running_status(
     :param session_id: Session/conversation identifier to settle.
     :param conversation_store: Store performing the conditional transition.
     :param stale_before: Runner stamps at or after this epoch are fresh.
+    :param preserve_interruption: Settle to ``failed`` with the same
+        ``runner_disconnected`` cause the disconnect sweep records, instead of
+        ``idle``, so interrupted-session recovery can still find and resume it.
+    :param owner_runner_id: Runner the preserved failure belongs to, matching the
+        attribution the disconnect sweep writes.
     :returns: Whether this call performed the transition.
     """
-    if not conversation_store.settle_orphaned_live_status(session_id, stale_before):
+    status: Literal["idle", "failed"] = "failed" if preserve_interruption else "idle"
+    if not conversation_store.settle_orphaned_live_status(session_id, stale_before, status=status):
         return False
+    error = (
+        ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly.")
+        if preserve_interruption
+        else None
+    )
+    if error is not None:
+        try:
+            conversation_store.set_labels(
+                session_id,
+                _session_status_error_label_updates(error, owner_runner_id=owner_runner_id),
+            )
+        except Exception:  # noqa: BLE001
+            # A failure without its cause is never recovered; settle idle instead.
+            _logger.exception(
+                "Failed to persist disconnect labels for %s; settling idle",
+                session_id,
+                extra={"session_id": session_id},
+            )
+            status, error = "idle", None
+            session_live_state.persist_live_status(session_id, "idle")
     _publish_status(
         session_id,
-        "idle",
+        status,
+        error,
         persist_live_status=False,
         scheduled_run_outcome="failed",
+        failure_origin="orphaned_running_reconcile" if error is not None else None,
     )
+    if error is not None:
+        _yield_to_reconnected_runner(session_id, conversation_store, stale_before)
     return True
+
+
+def _yield_to_reconnected_runner(
+    session_id: str, conversation_store: ConversationStore, stale_before: int
+) -> None:
+    """Undo a disconnect settlement that raced a runner reconnect.
+
+    The status, labels, and cache are written one after another, so a runner
+    whose reconnect hook ran in between saw a half-written failure and neither
+    resumed nor cleared it. Its liveness stamp, written before that hook,
+    shows it is back; settle idle as the reconnect would have.
+    """
+    try:
+        binding = conversation_store.get_runner_liveness(session_id)
+    except Exception:  # noqa: BLE001
+        _logger.warning(
+            "Cannot recheck runner liveness for %s after orphan settlement",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return
+    if binding is None or binding[1] is None or binding[1] < stale_before:
+        return
+    # A newer edge (e.g. a resumed turn's ``running``) already superseded ours.
+    if _session_status_cache.get(session_id) != "failed":
+        return
+    _session_status_cache[session_id] = "idle"
+    session_live_state.persist_live_status(session_id, "idle")
+    event = SessionStatusEvent(
+        type="session.status", conversation_id=session_id, status="idle", error=None
+    )
+    session_stream.publish(session_id, event.model_dump())
+    try:
+        conversation_store.set_labels(session_id, _session_status_error_label_updates(None))
+    except Exception:  # noqa: BLE001
+        _logger.exception(
+            "Failed to clear session status error labels for %s",
+            session_id,
+            extra={"session_id": session_id},
+        )
 
 
 def _truncate_label(value: str, limit: int = _LABEL_VALUE_MAX_LEN) -> str:
@@ -5204,11 +5278,32 @@ async def _persist_session_status_error_labels(
     :param item_id: Persisted item a ``runner_rejected_event`` failure refers to, so
         a client whose POST answer was lost can match the refusal to its own send.
     """
+    updates = _session_status_error_label_updates(
+        error, owner_runner_id=owner_runner_id, agent_name=agent_name, item_id=item_id
+    )
+    try:
+        await asyncio.to_thread(conversation_store.set_labels, session_id, updates)
+    except Exception:  # noqa: BLE001
+        _logger.exception(
+            "Failed to persist session status error labels for %s",
+            session_id,
+            extra={"session_id": session_id},
+        )
+
+
+def _session_status_error_label_updates(
+    error: ErrorDetail | None,
+    *,
+    owner_runner_id: str | None = None,
+    agent_name: str | None = None,
+    item_id: str | None = None,
+) -> dict[str, str]:
+    """Build the label upserts that persist (or clear, for ``None``) a status failure."""
     # Structured fields are optional (present only when the runner classified
     # the failure). Always write all keys — empty when absent — because the
     # label store is upsert-only and a stale title/cause from a prior failure
     # must not leak onto a later, unclassified one.
-    updates = (
+    return (
         {
             _LAST_TASK_ERROR_CODE_LABEL_KEY: _truncate_label(error.code),
             _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: _truncate_error_message_label(error.message),
@@ -5231,14 +5326,6 @@ async def _persist_session_status_error_labels(
             _LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY: "",
         }
     )
-    try:
-        await asyncio.to_thread(conversation_store.set_labels, session_id, updates)
-    except Exception:  # noqa: BLE001
-        _logger.exception(
-            "Failed to persist session status error labels for %s",
-            session_id,
-            extra={"session_id": session_id},
-        )
 
 
 def _last_task_error_from_labels(labels: Mapping[str, str]) -> dict[str, str] | None:

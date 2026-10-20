@@ -56,7 +56,10 @@ from omnigent.server.schemas import (
 from omnigent.spec.types import (
     StateUpdate,
 )
-from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
+from omnigent.stores.conversation_store import (
+    LAST_TASK_ERROR_CODE_LABEL_KEY,
+    RUNNER_LIVENESS_TTL_S,
+)
 
 # Pinned to the historical module path so log records keep landing on the
 # ``omnigent.server.routes.sessions`` logger after the split into this package.
@@ -293,7 +296,7 @@ _LAST_CONTEXT_TOKENS_LABEL_KEY: str = "omnigent.last_context_tokens"
 _LAST_CONTEXT_WINDOW_LABEL_KEY: str = "omnigent.last_context_window"
 
 
-_LAST_TASK_ERROR_CODE_LABEL_KEY: str = "omnigent.last_task_error_code"
+_LAST_TASK_ERROR_CODE_LABEL_KEY: str = LAST_TASK_ERROR_CODE_LABEL_KEY
 
 
 _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: str = "omnigent.last_task_error_message"

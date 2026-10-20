@@ -38,6 +38,7 @@ from omnigent.onboarding.sandboxes.registry import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
+from omnigent.server.interrupted_session_recovery import InterruptedSessionRecoverer
 from omnigent.server.managed_hosts import (
     BOXLITE_MANAGED_TOKEN_TTL_S,
     DAYTONA_MANAGED_TOKEN_TTL_S,
@@ -51,6 +52,7 @@ from omnigent.server.managed_hosts import (
     ManagedHostLaunch,
     ManagedLaunch,
     ManagedLaunchTracker,
+    ManagedSandboxAutoResumeConfig,
     ManagedSandboxConfig,
     ManagedSandboxDeployment,
     RepoWorkspace,
@@ -233,6 +235,83 @@ def test_parse_reaper_rejects_per_provider_override() -> None:
                 "providers": [
                     {"provider": "modal", "reaper": {"enabled": True}},
                     {"provider": "e2b"},
+                ],
+            }
+        )
+
+
+def test_parse_auto_resume_defaults_disabled() -> None:
+    """Auto-resume of interrupted sessions is opt-in."""
+    config = parse_sandbox_config({"provider": "modal", "server_url": "https://s.example.com"})
+    assert config is not None
+    assert config.auto_resume_interrupted == ManagedSandboxAutoResumeConfig()
+    assert config.auto_resume_interrupted.enabled is False
+    assert config.auto_resume_interrupted.sweep_interval_s == 60
+    assert config.auto_resume_interrupted.max_attempts == 3
+    assert config.auto_resume_interrupted.max_interrupted_age_s == 86400
+    assert "host machine restarted" in config.auto_resume_interrupted.recovery_prompt
+
+
+@pytest.mark.parametrize("multi", [False, True])
+def test_parse_auto_resume_is_deployment_wide(multi: bool) -> None:
+    block = {
+        "enabled": True,
+        "sweep_interval_s": 30,
+        "max_attempts": 5,
+        "max_interrupted_age_s": 3600,
+        "recovery_prompt": "Pick up where you left off.",
+    }
+    raw: dict[str, object] = {
+        "server_url": "https://s.example.com",
+        "auto_resume_interrupted": block,
+    }
+    if multi:
+        raw["providers"] = [{"provider": "modal"}, {"provider": "e2b"}]
+    else:
+        raw["provider"] = "modal"
+    config = parse_sandbox_config(raw)
+    assert config is not None
+    assert config.auto_resume_interrupted == ManagedSandboxAutoResumeConfig(
+        enabled=True,
+        sweep_interval_s=30,
+        max_attempts=5,
+        max_interrupted_age_s=3600,
+        recovery_prompt="Pick up where you left off.",
+    )
+
+
+@pytest.mark.parametrize(
+    ("block", "expected_fragment"),
+    [
+        (True, "must be a mapping"),
+        ({"enabled": "yes"}, "enabled.*boolean"),
+        ({"sweep_interval_s": 0}, "positive integer"),
+        ({"max_attempts": True}, "positive integer"),
+        ({"max_attempts": "3"}, "positive integer"),
+        ({"max_interrupted_age_s": -1}, "positive integer"),
+        ({"recovery_prompt": ""}, "non-empty string"),
+        ({"recovery_prompt": 3}, "non-empty string"),
+        ({"attempts": 3}, "unknown key"),
+    ],
+)
+def test_parse_auto_resume_rejects_malformed_config(block: object, expected_fragment: str) -> None:
+    with pytest.raises(ValueError, match=expected_fragment):
+        parse_sandbox_config(
+            {
+                "provider": "modal",
+                "server_url": "https://s.example.com",
+                "auto_resume_interrupted": block,
+            }
+        )
+
+
+def test_parse_auto_resume_rejects_per_provider_override() -> None:
+    with pytest.raises(ValueError, match="deployment-wide"):
+        parse_sandbox_config(
+            {
+                "server_url": "https://s.example.com",
+                "providers": [
+                    {"provider": "modal", "auto_resume_interrupted": {"enabled": True}},
                 ],
             }
         )
@@ -2325,6 +2404,37 @@ async def test_lifespan_gates_one_deployment_wide_managed_sandbox_reaper(
 
     if enabled:
         assert reaper._task is None
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_lifespan_gates_interrupted_session_recoverer(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    enabled: bool,
+) -> None:
+    """The recoverer loop only runs when auto-resume is enabled."""
+    config = parse_sandbox_config(
+        {
+            "server_url": "https://s.example.com",
+            "provider": "modal",
+            "auto_resume_interrupted": {"enabled": enabled},
+        }
+    )
+    assert config is not None
+    app = _capability_probe_app(db_uri, tmp_path, config, host_store=HostStore(db_uri))
+
+    async with app.router.lifespan_context(app):
+        recoverer = getattr(app.state, "interrupted_session_recoverer", None)
+        if enabled:
+            assert isinstance(recoverer, InterruptedSessionRecoverer)
+            assert recoverer._task is not None
+            assert not recoverer._task.done()
+        else:
+            assert recoverer is None
+
+    if enabled:
+        assert recoverer._task is None
 
 
 @pytest.mark.parametrize(

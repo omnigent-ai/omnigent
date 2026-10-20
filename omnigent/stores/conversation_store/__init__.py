@@ -6,7 +6,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, TypedDict
 
 from omnigent.entities import (
     Agent,
@@ -23,6 +23,13 @@ MAX_PENDING_INPUTS = 100
 
 if TYPE_CHECKING:
     from omnigent.db.account_authority import AccountAuthority
+
+# Durable code of a session's latest status failure, e.g. ``runner_disconnected``.
+LAST_TASK_ERROR_CODE_LABEL_KEY = "omnigent.last_task_error_code"
+
+# Keyset position ``(live_status_code, workspace_id, conversation_id)`` for
+# :meth:`ConversationStore.list_interrupted_host_sessions`.
+InterruptedSessionCursor: TypeAlias = tuple[int, int, str]
 
 # Label set on a fork of a session that had a working directory, or a
 # runner-bound native session whose working-directory metadata was lost.
@@ -1608,8 +1615,14 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    def settle_orphaned_live_status(self, conversation_id: str, stale_before: int) -> bool:
-        """Atomically settle a stale running session to idle.
+    def settle_orphaned_live_status(
+        self,
+        conversation_id: str,
+        stale_before: int,
+        *,
+        status: Literal["idle", "failed"] = "idle",
+    ) -> bool:
+        """Atomically settle a stale running session to ``status``.
 
         The update must require a bound runner, ``running``/``waiting`` live
         status, and a missing or older ``runner_last_seen`` stamp. It must not
@@ -1617,7 +1630,33 @@ class ConversationStore(ABC):
 
         :param conversation_id: Session/conversation identifier.
         :param stale_before: Runner stamps at or after this epoch are fresh.
+        :param status: Resting status to write, ``"idle"`` or ``"failed"``.
         :returns: Whether this call performed the transition.
+        """
+        ...
+
+    @abstractmethod
+    def list_interrupted_host_sessions(
+        self,
+        *,
+        stale_before: int,
+        after: InterruptedSessionCursor | None,
+        limit: int,
+    ) -> tuple[list[tuple[int, Conversation]], InterruptedSessionCursor | None]:
+        """Page host-bound top-level sessions a runner loss left mid-turn.
+
+        This privileged recovery scan spans workspaces. A session qualifies
+        when it is unarchived, has no parent, has ``host_id`` set, and either
+        reads ``running``/``waiting`` with a missing or older
+        ``runner_last_seen`` stamp, or reads ``failed`` with a persisted
+        ``runner_disconnected`` cause.
+
+        :param stale_before: Runner stamps at or after this epoch are fresh.
+        :param after: Exclusive keyset cursor returned by the prior page.
+        :param limit: Maximum candidate rows examined by this call.
+        :returns: ``(workspace_id, conversation)`` matches, which may be fewer
+            than ``limit``, and the cursor for the next page, or ``None`` once
+            the scan is complete.
         """
         ...
 
