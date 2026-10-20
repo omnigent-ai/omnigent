@@ -2154,12 +2154,14 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     spec = captured["spec"]
     # The gateway env points ``claude`` at the Databricks gateway, and
     # ENABLE_TOOL_SEARCH forces Claude Code to defer MCP tool schemas
-    # instead of loading all 200+ bridge tools into startup context.
+    # instead of loading all 200+ bridge tools into startup context. The
+    # gateway serves no canonical ids, so the refusal fallback is off.
     assert spec.env == {
         **gateway_env,
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
+        "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1",
     }
     assert spec.command == "claude"
     # The gateway default model is applied (no per-session override here).
