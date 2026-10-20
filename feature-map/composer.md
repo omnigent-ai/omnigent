@@ -47,10 +47,18 @@ and steers messages while the agent is busy.
   such as `/help` is handled locally; a recognised skill routes through
   `slash_command` so it runs on an in-process harness. A native terminal side
   chat shows no menu and sends slash text to the vendor TUI.
+- `codex-plugin-skills`: typing `$` lists enabled Codex plugin skills in both
+  composers, including cached plugins whose marketplace inventory is unavailable.
+  Selecting a row inserts its namespaced identifier.
 - `new-command`: `/new` opens a blank new-session composer in the same project;
   working-directory selection follows the project's defaults, not the old session.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
   be removed. State: unsupported file type rejected without losing the message.
+- `dictation`: the microphone button beside the message box dictates speech
+  into the composer at the caret; ⌘/Ctrl+Alt+V toggles it unless focus is in a
+  terminal or code editor. While listening, Enter keeps the dictated text and
+  Escape discards it. The button is absent when neither the browser nor the
+  server can transcribe.
 - `send-shortcut`: Enter or Mod+Enter, chosen in settings; only one gesture sends.
   Shift+Enter and Alt/Option+Enter insert a newline in both composers.
 - `list-formatting`: typing `-`, `*`, `1.` or `1)` then Space at the start of a
@@ -58,7 +66,9 @@ and steers messages while the agent is busy.
   (numbers increment) and ends it after an empty item.
 - `focus-hotkey`: Ctrl+Shift+L focuses the in-session message box from anywhere
   in the session view (not on mobile).
-- `new-session-hotkey`: ⌘/Ctrl+Alt+N opens and focuses the new-session composer.
+- `new-session-hotkey`: ⌘+Shift+O on macOS or Ctrl+Shift+O on Windows/Linux
+  opens and focuses the new-session composer in browsers. Native shells retain
+  ⌘/Ctrl+Alt+N. Embedded apps require focus inside the app.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
   can be steered into the running turn.
 - `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
@@ -70,6 +80,10 @@ and steers messages while the agent is busy.
 - `delivered-send-recovery`: a sent message stays out of the composer when its
   HTTP acknowledgement is lost. Delivery during draft restoration clears the
   untouched draft; user edits remain.
+- `managed-first-input`: submitting a new managed session saves its first input
+  and attachments before provisioning. Follow-ups sent during startup are saved
+  in order too. They run even if the creating browser closes; reopening shows
+  each message once.
 - `import-bundle`: Create custom agent → Import bundle installs a `.tar.gz` agent
   bundle and selects it. States: import in flight (Cancel and Create locked),
   rejected bundle, imported agent missing from the refreshed list, and hidden on
@@ -99,6 +113,10 @@ and steers messages while the agent is busy.
   return to Chat.
 - Type `/` in the message box; attach files with the button, by paste, or by
   dropping them on the transcript.
+- For Codex plugin skills, type `$<skill-name>` in Chat and select the
+  namespaced suggestion. The vendor terminal owns its own completion menu.
+- Click the microphone button, or press ⌘/Ctrl+Alt+V, to dictate into the
+  message box; press Enter to keep the text or Escape to discard it.
 - Send while the agent is working to queue a message, then steer it.
 - Type `/n`, press Tab to complete `/new`, then Enter to open the new-session
   page in the same project. Selecting **/new** in Commands also opens it.
@@ -116,7 +134,8 @@ and steers messages while the agent is busy.
 - Open the host chip, expand **Offline hosts (N)**, then **Show more**. Check the
   same menu on mobile and with a managed sandbox available. Offline rows remain
   disabled; a remembered offline selection still requires an explicit switch.
-- From any page, press ⌘/Ctrl+Alt+N to open and focus a clean new-session
+- With the browser app focused, press ⌘+Shift+O (macOS) or
+  Ctrl+Shift+O (Windows/Linux) to open and focus a clean new-session
   composer.
 - Hover the model/effort pill to see the tooltip.
 - Hover the host chip to see the selected host or sandbox and its connection.
@@ -134,6 +153,16 @@ and steers messages while the agent is busy.
   `tests/e2e_ui/start_session/test_sandbox_gateway_models_without_binding.py`
   and `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_optional_gateway_preview_without_a_host`.
 - Attach files or type `/` before the first send.
+- For a managed sandbox, submit a prompt and close the browser once the session
+  URL appears, while provisioning is still in progress. Reopen that URL after
+  startup and check that the first turn completed without another send. Repeat
+  with an attachment and with the original tab left open.
+- While the managed session is still starting, send two more messages from the
+  in-session composer, then close the browser. Reopen after startup and check
+  that all three reached the agent in order. Ordinary busy-session queueing
+  resumes after the first input is delivered.
+- Select a Codex host and workspace, then type `$<skill-name>` and select the
+  namespaced plugin suggestion before starting the session.
 - Open **MCPs** in the workspace bar above the composer (the plug icon when space is tight), then turn
   services on or off in **Tools for this session** before launching on a host or
   sandbox. Turning a service off keeps its account connected. Explicit selections
@@ -145,6 +174,7 @@ and steers messages while the agent is busy.
   to select it; for Databricks, first enter the workspace URL and choose
   **Connect workspace**. Bearer-token services require **Manage MCP accounts**
   before selection. Use **Reconnect** if a selected service loses its connection.
+- Dictate with the microphone button or ⌘/Ctrl+Alt+V before the first send.
 - Open the agent picker's custom agents, then Create custom agent → Import
   bundle: pick a `.tar.gz` agent bundle. It installs, closes the dialog, and
   selects the agent, which stays listed after a reload. A rejected bundle (for
@@ -282,10 +312,37 @@ Other connection providers alone do not enable the managed MCP picker.
 - **`slash-menu`:**
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`,
   `tests/e2e_ui/chat/test_side_chat_slash_command.py::test_side_chat_slash_menu_and_skill_invocation`
+- **`codex-plugin-skills`, both composers:**
+  `tests/e2e_ui/chat/test_codex_plugin_skills.py::test_plugin_skill_in_both_composers_after_inventory_failure`
+  installs an enabled local plugin using the real Codex CLI, moves away its
+  marketplace, asserts inventory failure, then opens and selects the cached
+  skill in an existing session and on the landing page. It restores remembered
+  host/harness/workspace choices; it does not test picker interaction or send
+  a model turn. Run through the instance with recording enabled as above.
+  Requires Codex; a missing CLI is a skip, not a verified journey.
+  Run the model-free process contract separately:
+
+  ```sh
+  uv run --no-sync pytest tests/harnesses/codex_native/test_skill_discovery.py --reruns 0
+  ```
+
+  Repeat with `OMNIGENT_CODEX_PATH` pointing to the CI-pinned CLI and the
+  installed CLI. This covers the loaded catalog, numeric prereleases, preferred
+  `local`, disable/re-enable, and uninstall with stale cache. Manually refresh
+  both composers after disabling the plugin and confirm its skill disappears.
+  Catalog/process checks do not prove browser rendering or live-model invocation.
 - **`attachments`:**
   `tests/browser_ui/chat/test_composer_attachments.py::test_attach_supported_files_and_remove`,
   `tests/browser_ui/chat/test_composer_attachments.py::test_file_dropped_on_the_transcript_attaches`,
   `tests/browser_ui/chat/test_composer_attachments.py::test_landing_rejects_unsupported_type_and_keeps_message`
+- **`dictation`, in-session composer (own environment):**
+  `tests/e2e_ui/chat/test_dictation.py` streams a fake microphone through the
+  server's fake transcription engine, which only the test's own server enables;
+  run it with plain `uv run pytest`. It covers the button, the hotkey, Enter
+  keeping the text, Escape discarding it, and insertion at the caret.
+- **`dictation`, new-session composer:** no browser-level coverage. Manually:
+  on the landing page, click the microphone (or press ⌘/Ctrl+Alt+V), speak,
+  and expect the text in the message box; Escape restores the previous draft.
 - **`send-shortcut`:**
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_submit_with_mod_enter_persists_and_is_the_only_send_gesture`,
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_alt_enter_inserts_newline_in_both_composers`
@@ -326,6 +383,23 @@ Other connection providers alone do not enable the managed MCP picker.
   runs with a phone viewport. Run the same lost-ack journey at a desktop viewport
   for the desktop entry point. The restore/delivery ordering and preservation of
   user edits are covered in `web/src/pages/ChatPage.composer.test.tsx`.
+- **`managed-first-input`, new-session composer (own environments):**
+  `tests/e2e_ui/start_session/test_managed_first_input_tab_close.py::test_managed_first_input_runs_after_browser_closes`
+  closes the entire browser during provisioning, on both the creating replica
+  and another replica. It requires a persisted reply before opening a fresh
+  browser, then checks reload for duplicates.
+  `tests/e2e_ui/start_session/test_managed_first_message_routing.py::test_managed_first_message_rebinds_live_stream_across_replicas`
+  keeps the tab open and requires two live turns across the replica handoff.
+  `tests/e2e_ui/start_session/test_managed_initial_attachment.py::test_managed_initial_attachment_survives_browser_close`
+  covers attachments with an SDK agent and the real native Codex CLI (Codex and
+  tmux required).
+  `tests/e2e_ui/start_session/test_managed_startup_followups.py::test_startup_followups_survive_browser_close`
+  sends three messages during provisioning with both harness types, closes the
+  browser, and verifies ordered input delivery and a fresh-browser reload.
+  These tests use real servers, host, runner and browser; only
+  cloud allocation and model output are local substitutes. Backend coverage in
+  `tests/server/integration/test_managed_startup_inputs.py` checks native
+  transcript ownership, bundle uploads, recovery, access revocation and deletion.
 - **`new-session-hotkey`:**
   `tests/e2e_ui/sessions/test_new_session_hotkey.py::test_new_session_hotkey_from_focused_composer`
 - **`import-bundle`:** no browser-level coverage; the web unit tests for the
@@ -339,6 +413,9 @@ Other connection providers alone do not enable the managed MCP picker.
 
 ## Gotchas
 
+- Session choices and server-stored project defaults are separate from local
+  YAML and the shared-preference foundation; see
+  [Preferences and config defaults](./preferences.md) for those boundaries.
 - Chat `/new` is local navigation, not a message to the agent. Native TUI
   `/new` is unchanged.
 
@@ -366,3 +443,8 @@ Other connection providers alone do not enable the managed MCP picker.
   connections. Bearer-token accounts must be connected in settings first.
 - Managed MCP browser tests stub launch and authentication. They prove composer
   wiring; the HTTP integration test proves the real provider boundary.
+- Dictation normally uses browser speech recognition, with server fallback
+  when unavailable or a network error occurs. The desktop app prefers the
+  server when available. A verification instance without a transcription engine
+  depends on browser support; a missing microphone there does not prove that
+  dictation is unavailable on a configured server.

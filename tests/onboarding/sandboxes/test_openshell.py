@@ -527,7 +527,6 @@ class _SDKState:
     waited: tuple[str, int | None] | None = None
     got: list[str] = field(default_factory=list)
     resumed: list[tuple[str, str]] = field(default_factory=list)
-    ready_id: str = "id-1"
     execs: list[tuple[str, list[str], bytes | None]] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)
     closed: bool = False
@@ -537,6 +536,7 @@ class _SDKState:
     stream_exit_code: int = 0
     last_workdir: str | None = None
     last_env: dict[str, str] | None = None
+    last_workspace: str | None = None
     created_workspace: str | None = None
 
 
@@ -584,7 +584,7 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> _SDKState:
             self, name: str, *, workspace: str, timeout_seconds: int | None = None
         ) -> _SandboxRef:
             state.waited = (name, timeout_seconds)
-            return _SandboxRef(id=state.ready_id, name=name)
+            return _SandboxRef(id="id-1", name=name)
 
         def get(self, name: str, *, workspace: str) -> _SandboxRef:
             state.got.append(name)
@@ -599,31 +599,35 @@ def sdk(monkeypatch: pytest.MonkeyPatch) -> _SDKState:
 
         def exec(
             self,
-            sandbox_id: str,
+            sandbox: str,
             command: Any,
             *,
+            workspace: str,
             stdin: bytes | None = None,
             timeout_seconds: int | None = None,
             workdir: str | None = None,
             env: dict[str, str] | None = None,
         ) -> _FakeExecResult:
-            state.execs.append((sandbox_id, list(command), stdin))
+            state.execs.append((sandbox, list(command), stdin))
             state.last_workdir = workdir
             state.last_env = env
+            state.last_workspace = workspace
             return state.exec_result
 
         def exec_stream(
             self,
-            sandbox_id: str,
+            sandbox: str,
             command: Any,
             *,
+            workspace: str,
             timeout_seconds: int | None = None,
             workdir: str | None = None,
             env: dict[str, str] | None = None,
         ) -> Any:
-            state.stream_calls.append((sandbox_id, list(command)))
+            state.stream_calls.append((sandbox, list(command)))
             state.last_workdir = workdir
             state.last_env = env
+            state.last_workspace = workspace
             for stream, data in state.stream_chunks:
                 yield _FakeExecChunk(stream=stream, data=data)
             yield _FakeExecResult(exit_code=state.stream_exit_code)
@@ -697,26 +701,25 @@ def test_client_create_sandbox_custom_workspace(sdk: _SDKState) -> None:
     assert sdk.created_workspace == "team-beta"
 
 
-def test_client_execute_maps_name_to_id(sdk: _SDKState) -> None:
-    """exec uses the opaque sandbox id, resolved from the petname."""
-    client = _OpenShellClient()
-    client.create_sandbox(image="img", env={})
+@pytest.mark.parametrize("exec_path", ["execute", "run_foreground", "exec_background"])
+def test_client_execs_address_the_sandbox_by_name_in_its_workspace(
+    sdk: _SDKState, exec_path: str
+) -> None:
+    """Every exec path reaches the sandbox by name in the client's workspace, with no lookup."""
+    client = _OpenShellClient(workspace="team-beta")
 
-    client.execute("petname-new", ["echo", "hi"])
+    if exec_path == "execute":
+        client.execute("other-box", ["ls"])
+    elif exec_path == "run_foreground":
+        client.run_foreground("other-box", ["ls"], timeout=60)
+    else:
+        client.exec_background("other-box", ["ls"], timeout=60)
+        client._bg_threads[-1].join(timeout=5)
 
-    # Cached from create — no extra get() needed; exec keyed by id.
-    assert sdk.execs[-1][0] == "id-1"
+    calls = sdk.execs if exec_path == "execute" else sdk.stream_calls
+    assert calls[-1][0] == "other-box"
+    assert sdk.last_workspace == "team-beta"
     assert sdk.got == []
-
-
-def test_client_execute_resolves_unknown_name(sdk: _SDKState) -> None:
-    """An un-cached name is resolved to its id via get() before exec."""
-    client = _OpenShellClient()
-
-    client.execute("other-box", ["ls"])
-
-    assert sdk.got == ["other-box"]
-    assert sdk.execs[-1][0] == "id-for-other-box"
 
 
 def test_client_execute_pins_sandbox_home(sdk: _SDKState) -> None:
@@ -734,24 +737,19 @@ def test_client_execute_pins_sandbox_home(sdk: _SDKState) -> None:
     assert sdk.last_env == {"HOME": "/sandbox"}
 
 
-def test_client_resume_waits_ready_and_recaches_id(sdk: _SDKState) -> None:
-    """resume_sandbox drives the SDK start primitive, waits ready, refreshes the id.
+def test_client_resume_waits_ready(sdk: _SDKState) -> None:
+    """resume_sandbox drives the SDK start primitive and waits until the sandbox is ready.
 
-    The resumed instance may carry a fresh opaque id, so subsequent execs
-    must use the id reported by the post-resume readiness wait — without an
-    extra ``get()`` round-trip.
+    The resumed sandbox keeps its name, which is all a later exec needs.
     """
     client = _OpenShellClient()
-    client.execute("box", ["true"])  # cache the pre-stop id via get()
-    sdk.ready_id = "id-resumed"
 
     client.resume_sandbox("box")
 
     assert sdk.resumed == [("box", "default")]
     assert sdk.waited == ("box", 300)
     client.execute("box", ["ls"])
-    assert sdk.execs[-1][0] == "id-resumed"
-    assert sdk.got == ["box"]  # no re-get: the resume refreshed the cache
+    assert sdk.execs[-1][0] == "box"
 
 
 def test_client_resume_missing_sandbox_raises_gone(sdk: _SDKState) -> None:
@@ -843,7 +841,7 @@ def test_client_run_foreground_streams_and_returns_exit(
     code = client.run_foreground("other-box", ["bash", "-lc", "echo hi"], timeout=60)
 
     assert code == 3
-    assert sdk.stream_calls[-1] == ("id-for-other-box", ["bash", "-lc", "echo hi"])
+    assert sdk.stream_calls[-1] == ("other-box", ["bash", "-lc", "echo hi"])
     out, err = capsys.readouterr()
     assert "hello" in out
     assert "warn" in err

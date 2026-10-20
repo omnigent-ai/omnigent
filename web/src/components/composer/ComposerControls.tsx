@@ -156,6 +156,7 @@ export function ComposerPermissionPicker({
   selectedValue,
   options,
   disabled = false,
+  disabledReason,
   iconOnly = false,
   loading = false,
   interactiveWhileLoading = false,
@@ -168,6 +169,8 @@ export function ComposerPermissionPicker({
   selectedValue?: string | null;
   options: readonly { value: string; label: string }[];
   disabled?: boolean;
+  /** Hover text explaining why the picker is disabled. */
+  disabledReason?: string;
   /** Hide the visible value; it stays in the accessible name. */
   iconOnly?: boolean;
   loading?: boolean;
@@ -187,7 +190,7 @@ export function ComposerPermissionPicker({
             loading && "disabled:opacity-100",
           )}
           aria-label={`${label}: ${value}`}
-          title={`${label}: ${value}`}
+          title={disabled && disabledReason ? disabledReason : `${label}: ${value}`}
           data-testid={`${testIdPrefix}-permission-chip`}
           data-permission-concept={permissionModeConcept(harness, selectedValue)}
         >

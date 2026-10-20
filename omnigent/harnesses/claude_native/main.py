@@ -3412,7 +3412,9 @@ def resolve_native_claude_config(
        model → ambient detection), falling back to the spec's own
        ``executor.profile`` (ucode) when it routed to legacy databricks;
     2. when spec-less (``omnigent claude``): an explicit per-family default
-       → global ``auth:`` (→ ucode) → ambient detection;
+       → global ``auth:`` (→ ucode, or ``None`` when Claude Code managed
+       gateway settings own routing) → ambient detection. A spec that pins no
+       auth/profile also takes the global ``auth:`` step after step 1;
     3. otherwise ``None`` (Claude's own login).
 
     Credentials are controlled exclusively by the spec or by
@@ -3433,6 +3435,7 @@ def resolve_native_claude_config(
         resolve_bound_model,
         resolve_bound_provider,
     )
+    from omnigent.onboarding.ambient import claude_managed_gateway_routes
     from omnigent.onboarding.detected import effective_config_with_detected
     from omnigent.onboarding.provider_config import (
         default_provider_for_harness,
@@ -3473,6 +3476,20 @@ def resolve_native_claude_config(
         )
         if ucode_config is not None:
             return ucode_config
+        if spec.executor.auth is None and not (
+            spec.executor.profile or spec.executor.config.get("profile")
+        ):
+            # A spec that pins no route must match the spec-less New Chat
+            # preview (step 2), which also routes a global databricks ``auth:``.
+            global_auth = _load_global_auth()
+            if isinstance(global_auth, DatabricksAuth):
+                if claude_managed_gateway_routes(_managed_settings_paths()):
+                    return None
+                ucode_config = _ucode_config_for_profile(
+                    global_auth.profile, refresh_models=refresh_models
+                )
+                if ucode_config is not None:
+                    return ucode_config
         # The spec named no provider and no usable ucode profile — fall through to
         # the managed-connect-host broker fallback (step 4) rather than giving up.
     else:
@@ -3484,6 +3501,10 @@ def resolve_native_claude_config(
         # A global databricks auth block → ucode.
         global_auth = _load_global_auth()
         if isinstance(global_auth, DatabricksAuth):
+            if claude_managed_gateway_routes(_managed_settings_paths()):
+                # Claude Code's managed settings override any env we pass, so a
+                # ucode route would only mislabel where inference goes.
+                return None
             return _ucode_config_for_profile(global_auth.profile, refresh_models=refresh_models)
         if global_auth is not None:
             # A global api_key auth: let Claude's own login handle it (parity

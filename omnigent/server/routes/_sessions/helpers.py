@@ -81,7 +81,11 @@ from omnigent.harness_plugins import (
 from omnigent.host.frames import RUNNER_LOG_TAIL_HEADING
 from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.models.model_metadata import concrete_reported_model
-from omnigent.native.failure_telemetry import failure_log_attributes
+from omnigent.native.failure_telemetry import (
+    FailureContext,
+    failure_log_attributes,
+    normalize_failure_context,
+)
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
@@ -238,6 +242,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
+    _unbound_managed_launch_tasks,
     build_policy_engine,
     get_agent_cache,
     get_caps,
@@ -294,6 +299,7 @@ from omnigent.server.schemas import (
     ToolOutputDeltaEvent,
 )
 from omnigent.server.session_metadata_logging import harness_attributes
+from omnigent.server.startup_inputs import StartupInputContext
 from omnigent.spec.types import (
     AgentSpec,
     Phase,
@@ -6220,6 +6226,9 @@ async def _launch_runner_on_host_locked(
                 inference_config=(
                     conv.inference_snapshot["runtime_config"] if conv.inference_snapshot else None
                 ),
+                # Only the binding we just replaced: an unbound session's old
+                # runner may now serve its /clear or /switch successor.
+                superseded_runner_ids=(superseded_runner_id,) if superseded_runner_id else (),
             )
         )
         try:
@@ -6287,24 +6296,44 @@ async def _launch_runner_on_host_locked(
         return _HostLaunchAttempt(runner_id=new_runner_id, acknowledged=True)
 
 
-async def cancel_managed_launch_tasks() -> None:
+async def cancel_managed_launch_tasks(drain_s: float = 0.0) -> None:
     """
-    Cancel and await every in-flight background managed launch.
+    Let in-flight managed launches bind their host, then cancel them.
 
-    Lifespan-teardown hook: without it, a slow provision outlives the
-    ASGI shutdown and dies wherever the loop teardown happens to kill
-    it. Cancellation is deterministic teardown of the TASK only — an
-    already-provisioned sandbox is not terminated here (there is no
-    time budget for provider calls during shutdown); its armed launch
-    token expires with the provider lifetime cap that also reaps the
-    sandbox.
+    Lifespan-teardown hook. A launch cancelled before it binds the session
+    to its host strands the session: no other replica knows which host it
+    belongs to, so its sandbox never serves it and its saved messages are
+    never delivered. Once bound, whichever replica the host tunnels to
+    starts the runner and delivers them, so only the bind is waited for.
+    A launch still unbound after *drain_s* is cancelled and records itself
+    failed. Cancellation stops the TASK only — an already-provisioned
+    sandbox is reaped by the provider lifetime cap.
 
+    :param drain_s: Longest wait for unbound launches, in seconds — the
+        deployment's :attr:`ManagedSandboxDeployment.shutdown_drain_s`.
     :returns: None once every task has settled (cancellations and any
         in-flight failures are absorbed via ``return_exceptions``).
     """
     tasks = list(_managed_launch_tasks)
     if not tasks:
         return
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + drain_s
+    if _unbound_managed_launch_tasks and drain_s > 0:
+        _logger.info(
+            "Waiting up to %gs for %d managed launch(es) to bind their host before shutdown",
+            drain_s,
+            len(_unbound_managed_launch_tasks),
+        )
+    while _unbound_managed_launch_tasks and loop.time() < deadline:
+        await asyncio.sleep(0.2)
+    if _unbound_managed_launch_tasks:
+        _logger.warning(
+            "Cancelling %d managed launch(es) still unbound after %gs",
+            len(_unbound_managed_launch_tasks),
+            drain_s,
+        )
+    tasks = list(_managed_launch_tasks)
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
@@ -6706,9 +6735,9 @@ def _native_terminal_failure_from_runner_response(
     resp: httpx.Response,
     *,
     display_name: str,
-) -> ErrorData:
+) -> _NativeTerminalEnsureOutcome:
     """
-    Convert a failed runner terminal-ensure response into durable error data.
+    Convert a failed runner terminal-ensure response into an error and safe evidence.
 
     The runner's terminal ensure endpoint must return structured
     ``{"error": {"code": ..., "message": ...}}`` for definitive startup
@@ -6721,8 +6750,8 @@ def _native_terminal_failure_from_runner_response(
     :param resp: Non-2xx response from
         ``POST /v1/sessions/{id}/resources/terminals``.
     :param display_name: Human-readable runtime name, e.g. ``"Codex"``.
-    :returns: Error data suitable for a persisted ``type="error"``
-        conversation item.
+    :returns: A definitive error suitable for persistence and optional bounded
+        failure evidence for the existing failed-status log.
     """
     try:
         body = resp.json()
@@ -6739,18 +6768,19 @@ def _native_terminal_failure_from_runner_response(
                 and isinstance(raw_message, str)
                 and raw_message.strip()
             ):
-                return ErrorData(
-                    source="execution",
-                    code=raw_code,
-                    message=raw_message,
+                return _NativeTerminalEnsureOutcome(
+                    error=ErrorData(source="execution", code=raw_code, message=raw_message),
+                    failure_context=normalize_failure_context(body.get("failure_context")),
                 )
-    return ErrorData(
-        source="execution",
-        code=_NATIVE_TERMINAL_ENSURE_FAILED_CODE,
-        message=(
-            f"Native {display_name} terminal ensure failed with malformed "
-            f"runner response (HTTP {resp.status_code})."
-        ),
+    return _NativeTerminalEnsureOutcome(
+        error=ErrorData(
+            source="execution",
+            code=_NATIVE_TERMINAL_ENSURE_FAILED_CODE,
+            message=(
+                f"Native {display_name} terminal ensure failed with malformed "
+                f"runner response (HTTP {resp.status_code})."
+            ),
+        )
     )
 
 
@@ -6799,10 +6829,13 @@ class _NativeTerminalEnsureOutcome:
         old or the hook could not be trusted), or ``None`` when
         enforcement is active. Non-fatal: surfaced once as a durable
         banner, never blocks the turn.
+    :param failure_context: Optional normalized runner evidence, independent
+        of the error's display text and status policy.
     """
 
     error: ErrorData | None
     policy_notice: str | None = None
+    failure_context: FailureContext | None = None
 
 
 def _policy_notice_from_ensure_response(resp: httpx.Response) -> str | None:
@@ -7601,6 +7634,7 @@ async def _dispatch_skill_slash_command_to_runner(
     has_mcp_servers: bool,
     created_by: str | None,
     legacy_skill_names: Mapping[str, str] | None = None,
+    startup_input: StartupInputContext | None = None,
 ) -> str:
     """
     Persist a skill slash command and forward hidden skill context.
@@ -7651,6 +7685,9 @@ async def _dispatch_skill_slash_command_to_runner(
         runner_client,
         legacy_name=(legacy_skill_names or {}).get(skill_name),
     )
+    if startup_input is not None and not await startup_input.claim(conversation_store, session_id):
+        return startup_input.input_id
+    startup_input_id = startup_input.input_id if startup_input is not None else None
 
     response_id = f"turn_{uuid.uuid4().hex}"
     meta_content = [{"type": "input_text", "text": meta_text}]
@@ -7664,6 +7701,8 @@ async def _dispatch_skill_slash_command_to_runner(
             arguments=arguments,
         ),
         created_by=created_by,
+        stable_id=startup_input_id,
+        replaces_pending_id=startup_input_id,
     )
     meta_item = NewConversationItem(
         type="message",
@@ -8968,7 +9007,9 @@ async def _apply_pending_policy_ask_writes(
         await asyncio.to_thread(engine.apply_label_writes, pending.set_labels)
     if pending.state_updates:
         with contextlib.suppress(ConversationNotFoundError):
-            await asyncio.to_thread(engine.apply_state_updates, pending.state_updates)
+            await asyncio.to_thread(
+                engine.apply_state_updates, pending.state_updates, approved=True
+            )
 
 
 def _build_actor(user_id: str | None) -> dict[str, str] | None:

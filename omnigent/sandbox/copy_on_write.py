@@ -130,6 +130,7 @@ class CopyOnWriteEnvironment:
                     "--",
                     sys.executable,
                     "-u",
+                    "-P",
                     "-m",
                     "omnigent.sandbox.copy_on_write",
                     "--keeper",
@@ -200,6 +201,7 @@ def wrap_shared_namespace(argv: list[str], policy: SandboxPolicy) -> list[str]:
         raise RuntimeError("copy_on_write requires an owned, prepared OS environment")
     return [
         sys.executable,
+        "-P",
         "-m",
         "omnigent.sandbox.copy_on_write",
         json.dumps(namespace),
