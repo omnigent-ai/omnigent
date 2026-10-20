@@ -20,10 +20,13 @@
  *   the fallback for unknown tools).
  * - `body`: the dynamic payload (path, command, session id). Empty
  *   string when the title is verb-only (e.g. "Read inbox").
+ * - `filePath`: set when the call targets exactly one file, as the agent
+ *   passed it (relative or absolute); the trigger row links it.
  */
 export interface ToolTitle {
   verb: string | null;
   body: string;
+  filePath?: string;
 }
 
 type ArgFormatter = (args: Record<string, unknown>) => ToolTitle | null;
@@ -35,9 +38,9 @@ const FORMATTERS: Record<string, ArgFormatter> = {
     const cmd = asString(args.command);
     return cmd === null ? null : { verb: null, body: cmd };
   },
-  sys_os_read: (args) => withPath("Read", toolFilePath("sys_os_read", args)),
-  sys_os_write: (args) => withPath("Write", toolFilePath("sys_os_write", args)),
-  sys_os_edit: (args) => withPath("Edit", toolFilePath("sys_os_edit", args)),
+  sys_os_read: (args) => withPath("Read", args.path),
+  sys_os_write: (args) => withPath("Write", args.path),
+  sys_os_edit: (args) => withPath("Edit", args.path),
 
   // Sub-agent session tools — single-quote the `<tool> - <session>`
   // pair so it reads as one identity.
@@ -136,11 +139,11 @@ const FORMATTERS: Record<string, ArgFormatter> = {
     const cmd = asString(args.command);
     return cmd === null ? null : { verb: null, body: cmd };
   },
-  Read: (args) => withPath("Read", toolFilePath("Read", args)),
-  Write: (args) => withPath("Write", toolFilePath("Write", args)),
-  Edit: (args) => withPath("Edit", toolFilePath("Edit", args)),
-  MultiEdit: (args) => withPath("Edit", toolFilePath("MultiEdit", args)),
-  NotebookEdit: (args) => withPath("Edit", toolFilePath("NotebookEdit", args)),
+  Read: (args) => withPath("Read", args.file_path),
+  Write: (args) => withPath("Write", args.file_path),
+  Edit: (args) => withPath("Edit", args.file_path),
+  MultiEdit: (args) => withPath("Edit", args.file_path),
+  NotebookEdit: (args) => withPath("Edit", args.notebook_path),
   Grep: (args) => {
     const pattern = asString(args.pattern);
     return pattern === null ? null : { verb: "Search:", body: pattern };
@@ -172,8 +175,12 @@ const FORMATTERS: Record<string, ArgFormatter> = {
   apply_patch: (args) => {
     const changes = Array.isArray(args.changes) ? args.changes : null;
     if (changes === null || changes.length === 0) return null;
-    const path = toolFilePath("apply_patch", args);
-    if (path !== null) return { verb: "Edit", body: path };
+    if (changes.length === 1) {
+      const only = changes[0];
+      const path = only !== null && typeof only === "object" ? Reflect.get(only, "path") : null;
+      const title = withPath("Edit", path);
+      if (title !== null) return title;
+    }
     return { verb: "Edit", body: `${changes.length} files` };
   },
 
@@ -183,9 +190,9 @@ const FORMATTERS: Record<string, ArgFormatter> = {
     const cmd = asString(args.command);
     return cmd === null ? null : { verb: null, body: cmd };
   },
-  read: (args) => withPath("Read", toolFilePath("read", args)),
-  edit: (args) => withPath("Edit", toolFilePath("edit", args)),
-  write: (args) => withPath("Write", toolFilePath("write", args)),
+  read: (args) => withPath("Read", args.filePath ?? args.path),
+  edit: (args) => withPath("Edit", args.filePath ?? args.path),
+  write: (args) => withPath("Write", args.filePath ?? args.path),
 
   // Web tools.
   web_search: (args) => {
@@ -200,37 +207,6 @@ const FORMATTERS: Record<string, ArgFormatter> = {
     return null;
   },
 };
-
-/** Where each single-file tool carries its target path, per harness. */
-const FILE_PATH_ARGS: Record<string, (args: Record<string, unknown>) => unknown> = {
-  sys_os_read: (args) => args.path,
-  sys_os_write: (args) => args.path,
-  sys_os_edit: (args) => args.path,
-  Read: (args) => args.file_path,
-  Write: (args) => args.file_path,
-  Edit: (args) => args.file_path,
-  MultiEdit: (args) => args.file_path,
-  NotebookEdit: (args) => args.notebook_path,
-  // Only a single-file patch names one file to open.
-  apply_patch: (args) => {
-    const changes = Array.isArray(args.changes) ? args.changes : null;
-    if (changes === null || changes.length !== 1) return null;
-    const only = changes[0];
-    return only !== null && typeof only === "object" ? Reflect.get(only, "path") : null;
-  },
-  read: (args) => args.filePath ?? args.path,
-  edit: (args) => args.filePath ?? args.path,
-  write: (args) => args.filePath ?? args.path,
-};
-
-/**
- * The file a tool call reads or writes, as the agent passed it (relative or
- * absolute), or null when the tool doesn't target exactly one file.
- */
-export function toolFilePath(name: string, args: Record<string, unknown>): string | null {
-  const pathOf = FILE_PATH_ARGS[name];
-  return pathOf === undefined ? null : asString(pathOf(args));
-}
 
 /**
  * Compute the title shown in a tool-call trigger row. Tries the
@@ -389,7 +365,7 @@ function verbOnly(verb: string): ToolTitle {
 
 function withPath(verb: string, raw: unknown): ToolTitle | null {
   const path = asString(raw);
-  return path === null ? null : { verb, body: path };
+  return path === null ? null : { verb, body: path, filePath: path };
 }
 
 function sessionTitle(verb: string, args: Record<string, unknown>): ToolTitle | null {

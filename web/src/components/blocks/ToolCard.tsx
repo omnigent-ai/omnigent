@@ -35,7 +35,6 @@ import {
   type ToolTitle,
   formatToolRunLabel,
   formatToolTitle,
-  toolFilePath,
 } from "@/lib/toolTitle";
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
 import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
@@ -183,14 +182,13 @@ export function ToolCard({
   const elapsedDuration = useElapsedDuration(state === "input-available" ? startedAt : null);
   const displayDuration = duration ?? elapsedDuration;
 
-  // When this is a file-path tool and we're inside AppShell, make the path
-  // in the trigger row a clickable link that opens the FileViewer.
-  // Absolute paths collapse onto the workspace like chat file links do.
+  // Link a file tool's path to the FileViewer, resolved like chat file links.
   const openFile = useFileViewer();
   const { root, home } = useWorkspacePaths();
-  const toolPath = toolFilePath(name, args);
   const linkPath =
-    toolPath === null ? null : (resolveChatFilePath(toolPath, root, home)?.path ?? null);
+    title.filePath === undefined
+      ? null
+      : (resolveChatFilePath(title.filePath, root, home)?.path ?? null);
   const onBodyClick = openFile && linkPath ? () => openFile(linkPath) : undefined;
 
   return (
