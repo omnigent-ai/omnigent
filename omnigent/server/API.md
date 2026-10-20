@@ -597,6 +597,39 @@ This preserves the existing sessions API contract for clients that
 already uploaded or registered an agent. The response is the full
 `SessionResponse` shape with `id` set to the new conversation id.
 
+  initial_input (object or null)
+    When `/v1/info` advertises `durable_initial_input: true`, managed creates
+    can include one user `message` or SDK skill `slash_command` event. For example:
+    `{"type":"message","data":{"role":"user","content":[{"type":"input_text","text":"Run the tests"}]}}`.
+    The server saves the input before accepting the create (a create whose input
+    can't be saved is refused and leaves no session), then dispatches it
+    through the normal event handler on the replica holding the new host.
+    Closing the creating browser after acceptance does not cancel delivery.
+    Do not also POST that input to `/events`. `initial_items` keeps its existing
+    history-seeding behavior and cannot be combined with `initial_input`.
+    Attribution comes from the authenticated creator; EDIT permission and input
+    policies are checked again at dispatch. Pending input appears in the session
+    snapshot's `pending_inputs`. Additional messages sent to `/events` during
+    startup are also saved and acknowledged immediately, in submission order,
+    unless the launch already failed or the bound host is gone; those take the
+    ordinary error or relaunch path.
+    Up to 100 pending inputs are accepted per session; excess sends are refused.
+
+    Pending messages use the existing conversation items and status fields.
+    SDK dispatch activates them into ordinary history; native transcript echoes
+    replace their pending rows. The normal SDK history recovery is unchanged.
+    A failure before submission retains the saved input for `retry_session`.
+    After native submission, recovery restores receipt matching without resending
+    the prompt: a missing acknowledgement cannot prove it was not executed.
+    `interrupt` and `stop_session` cancel inputs that have not been submitted,
+    keeping them out of runner recovery history and forks.
+
+    To include files, send `multipart/form-data` with the same JSON request in a
+    `metadata` part and repeated `initial_files` file parts. Upload validation,
+    quotas and session file ownership match the ordinary file upload endpoint.
+    Bundled managed creates can also include `initial_input` in their metadata
+    and `initial_files` alongside the agent bundle.
+
   host_type (string, "external" | "managed", default "external")
     How the session's host is obtained. `"external"` (the default,
     and the pre-existing behavior): the session runs on
@@ -605,8 +638,19 @@ already uploaded or registered an agent. The response is the full
     `"managed"`: the SERVER provisions a sandbox host from its
     `sandbox:` config (see `omnigent/server/managed_hosts.py`),
     starts `omnigent host` inside it, binds the session to it, and
-    launches the runner there. With `"managed"`, `host_id` and
-    `workspace` must NOT be set (422) — the server chooses both.
+    launches the runner there. With `"managed"`, `workspace` must
+    NOT be set (422) — the server chooses it — and `host_id`, when
+    set, names the NEW sandbox host rather than an existing one: 32
+    lowercase hex characters, sent only when `GET /v1/info` reports
+    `request_managed_sandbox_host_id`, so the caller can route the
+    session's requests by it before the host connects. It is recorded
+    in the `omnigent.sandbox.requested_host_id` label until the host
+    binds; null lets the server mint one. A malformed id, or one on a
+    child (`parent_session_id`) create, is a 422; an id that names an
+    existing host, or whose `managed-<first 8 hex>` name one of the
+    caller's hosts already uses, is a 409 `already_exists`, raised
+    before the session is created. JSON creates only: the multipart
+    bundle create does not take it.
     Provisioning runs in the BACKGROUND: the create returns
     immediately with `host_id` / `workspace` null, and they appear
     on `GET /v1/sessions/{id}` once the sandbox host registers. A
@@ -649,6 +693,8 @@ already uploaded or registered an agent. The response is the full
 
 400 Bad Request - invalid terminal_launch_args (count / length bounds)
 404 Not Found - no agent with that id
+409 Conflict - a managed create's host_id names an existing host, or
+  its `managed-<first 8 hex>` name is already taken
 422 Unprocessable Entity - invalid request body
 
 ### List Sessions
@@ -968,7 +1014,12 @@ Request body matches `SessionEventInput`:
       - "external_conversation_item"
                                 — internal terminal-observed item
                                   envelope; appends/broadcasts without
-                                  starting a duplicate task
+                                  starting a duplicate task. Requires
+                                  LEVEL_OWNER or the session's bound
+                                  runner credential, also in batches;
+                                  editors and managers receive `403`.
+                                  Integrations that posted as an editor
+                                  must post as the owner or via the runner.
       - "external_output_text_delta"
                                 — internal terminal-observed assistant
                                   text delta; publishes a transient
@@ -1193,6 +1244,14 @@ Request body matches `SessionForkRequest`:
     server's `sandbox_providers`); null takes the server's first.
     Only valid with `host_type: "managed"` (422 otherwise).
 
+  host_id (string | null, optional)
+    Id for the fork's new sandbox host: 32 lowercase hex characters,
+    sent only when `GET /v1/info` reports
+    `request_managed_sandbox_host_id`. Recorded in the
+    `omnigent.sandbox.requested_host_id` label until the host binds;
+    null lets the server mint one. Only valid with
+    `host_type: "managed"` (422 otherwise).
+
   workspace (string | null, optional)
     Git repository URL, optionally `#<branch>`, cloned into the
     fork's sandbox as its working directory. Omitting the field
@@ -1217,9 +1276,11 @@ Request body matches `SessionForkRequest`:
   server has not configured
 404 Not Found — no session with that source_id, or the source's
   agent row is missing
-422 Unprocessable Entity — sandbox_provider / workspace without
-  `host_type: "managed"`, or a managed workspace that is not a
-  repository URL
+409 Conflict — host_id names an existing host, or its
+  `managed-<first 8 hex>` name is already taken
+422 Unprocessable Entity — host_id / sandbox_provider / workspace without
+  `host_type: "managed"`, a malformed host_id, or a managed
+  workspace that is not a repository URL
 ```
 
 Creates a new session by deep-copying every item from the source

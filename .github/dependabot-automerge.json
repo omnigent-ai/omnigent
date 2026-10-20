@@ -153,7 +153,10 @@
     ".github/workflows/e2e.yml": "e2e.yml",
     ".github/workflows/e2e-ui.yml": "e2e-ui.yml",
     ".github/workflows/integration.yml": "integration.yml",
-    ".github/actions/setup-pnpm/action.yml": "web-tests.yml"
+    ".github/actions/setup-pnpm/action.yml": "web-tests.yml",
+    ".github/actions/e2e-run/action.yml": "e2e.yml",
+    ".github/actions/integration-run/action.yml": "integration.yml",
+    ".github/actions/setup-uv/action.yml": "ci.yml"
   },
   "pre_commit": [
     "https://github.com/pre-commit/pre-commit-hooks"
@@ -194,6 +197,46 @@
       "unicode-ident",
       "itoa",
       "ryu"
+    ]
+  },
+  "dependency_workflow_test_jobs": {
+    "npm": {
+      "ci.yml": ["CI scope"]
+    },
+    "pre-commit": {
+      "ci.yml": ["CI scope"]
+    },
+    "cargo": {
+      "ci.yml": ["Pytest (codex-parity)"],
+      "e2e-ui.yml": ["E2E UI Tests (shard *)"]
+    }
+  },
+  "workflow_test_jobs": {
+    "ci.yml": [
+      "Pytest (runtime-core)"
+    ],
+    "lint.yml": [
+      "Pre-commit checks"
+    ],
+    "trivy.yml": [
+      "Trivy CVE Scan (repository)",
+      "Trivy CVE Scan (dev-tools)"
+    ],
+    "integration.yml": [
+      "Integration (openai-agents)"
+    ],
+    "e2e.yml": [
+      "E2E Tests (shard *)"
+    ],
+    "web-tests.yml": [
+      "web test"
+    ],
+    "e2e-ui.yml": [
+      "Browser Contract UI",
+      "E2E UI Tests (shard *)"
+    ],
+    "docker-build.yml": [
+      "Docker build"
     ]
   }
 }

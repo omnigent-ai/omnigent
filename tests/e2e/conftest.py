@@ -54,6 +54,7 @@ from tests._helpers.compat import (
     runner_executable,
     server_executable,
 )
+from tests._helpers.live_server import find_free_port
 from tests._helpers.session import post_session_bundle
 from tests._model_pools import current_attempt, resolve_model
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
@@ -195,19 +196,6 @@ _SYS_TERMINAL_TEST_DIR = _REPO_ROOT / "tests" / "resources" / "agents" / "sys-te
 # only binds built-in agents, and plain (not the polly supervisor) so a
 # recall assertion isn't flaky.
 _SDK_CHAT_BUILTIN_SPEC = _REPO_ROOT / "tests" / "resources" / "agents" / "sdk-chat-builtin.yaml"
-
-
-def find_free_port() -> int:
-    """
-    Find a free TCP port by binding to port 0.
-
-    :returns: An available port number.
-    """
-    import socket
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def wait_for_server(base_url: str, timeout: float = 20.0) -> None:

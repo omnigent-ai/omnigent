@@ -63,6 +63,10 @@ class OAuthError(RuntimeError):
     """A login step failed in a way the user must resolve."""
 
 
+class PerUserLoginUnavailableError(OAuthError):
+    """Server configuration provides no delegated login flow for this bot."""
+
+
 class AuthorizationPendingError(OAuthError):
     """The user has not yet finished — keep polling."""
 
@@ -206,10 +210,10 @@ async def start_login(
     if mode is AuthMode.OIDC:
         return await _start_cli_ticket_login(server_url)
     if mode is AuthMode.HEADER:
-        raise OAuthError(
-            "This server uses header/proxy authentication, which this bot "
-            "can't log in to per user. Put the bot behind the same identity "
-            "proxy, or run the server in accounts or OIDC mode."
+        raise PerUserLoginUnavailableError(
+            "This server accepts anonymous requests or uses header/proxy authentication. "
+            "Ask your administrator to enable accounts or OIDC authentication for "
+            "individual Slack logins, or configure Databricks Apps web-auth enrollment."
         )
     return await _start_device_login(server_url, client_id=client_id, client_secret=client_secret)
 

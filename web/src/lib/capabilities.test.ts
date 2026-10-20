@@ -90,6 +90,15 @@ describe("sandboxProviderOptions", () => {
 });
 
 describe("resolveServerInfo sandbox_providers", () => {
+  it.each([undefined, false, "true", true])(
+    "requires an explicit durable-input capability (%s)",
+    async (value) => {
+      expect((await probe({ durable_initial_input: value })).durable_initial_input).toBe(
+        value === true,
+      );
+    },
+  );
+
   it.each([undefined, null, "", "manage", 2, true])(
     "defaults an absent or invalid public ceiling %s to Read",
     async (value) => {
@@ -177,6 +186,17 @@ describe("resolveServerInfo archive_worktree_cleanup", () => {
   });
 });
 
+describe("resolveServerInfo request_managed_sandbox_host_id", () => {
+  it.each([
+    [true, true],
+    [undefined, false],
+    ["true", false],
+  ])("parses %s strictly as %s", async (advertised, expected) => {
+    const parsed = await probe({ request_managed_sandbox_host_id: advertised });
+    expect(parsed.request_managed_sandbox_host_id).toBe(expected);
+  });
+});
+
 describe("resolveServerInfo smart_routing_sources", () => {
   it("reads an explicit field verbatim", async () => {
     const parsed = await probe({
@@ -250,6 +270,12 @@ describe("resolveServerInfo branding", () => {
 });
 
 describe("custom agents settings capability", () => {
+  it.each([undefined, false, "true", true])(
+    "parses agent_config_edit strictly: %s",
+    async (edit) => {
+      expect((await probe({ agent_config_edit: edit })).agent_config_edit).toBe(edit === true);
+    },
+  );
   it.each([undefined, false, "true", true])("parses agent_detail strictly: %s", async (detail) => {
     const parsed = await probe({ agent_detail: detail });
     expect(parsed.agent_detail).toBe(detail === true);

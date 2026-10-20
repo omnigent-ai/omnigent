@@ -9,6 +9,8 @@ falls back to the PTY watcher when the file never appears or vanishes.
 from __future__ import annotations
 
 import json
+import os
+import threading
 import time
 from pathlib import Path
 
@@ -181,6 +183,50 @@ def test_poller_publishes_edges_only(tmp_path: Path) -> None:
     _write_session_file(sessions, pid=1, session_id="s", status="idle")
     poller.tick()
     assert published == [RUNNING, IDLE]
+
+
+def test_resync_during_tick_survives_the_in_flight_read(tmp_path: Path, monkeypatch) -> None:
+    """A forwarded idle edge cannot be lost to a concurrent file poll."""
+    path = _write_session_file(tmp_path / "sessions", pid=1, session_id="s", status="busy")
+    published: list[str] = []
+    poller = SessionStatusPoller(
+        on_status=lambda status, _reason: published.append(status),
+        pane_pid_getter=_StubPidGetter(1),
+        session_id_getter=lambda: "s",
+        config_dir=tmp_path,
+    )
+    poller.tick()
+    assert published == [RUNNING]
+
+    _write_session_file(tmp_path / "sessions", pid=1, session_id="s", status="busy")
+    old_mtime = path.stat().st_mtime
+    os.utime(path, (old_mtime + 2, old_mtime + 2))
+    entered = threading.Event()
+    release = threading.Event()
+    original_stat = Path.stat
+
+    def pause_stat(file: Path, *args, **kwargs):
+        result = original_stat(file, *args, **kwargs)
+        if file == path and threading.current_thread() is worker:
+            entered.set()
+            assert release.wait(5), "poller did not resume"
+        return result
+
+    monkeypatch.setattr(Path, "stat", pause_stat)
+    worker = threading.Thread(target=poller.tick)
+    worker.start()
+    try:
+        assert entered.wait(5), "poller did not reach the file read"
+        poller.resync()
+    finally:
+        release.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert published == [RUNNING]
+    poller.tick()
+    assert published == [RUNNING, RUNNING]
+    poller.tick()
+    assert published == [RUNNING, RUNNING]
 
 
 def test_poller_gives_up_when_file_never_appears(tmp_path: Path) -> None:

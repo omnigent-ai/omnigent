@@ -179,6 +179,28 @@ def test_exec_launcher_wrapper_subprocess_emits_markers_to_stderr() -> None:
     assert "[omnigent-sandbox] target exited rc=0" in result.stderr, result.stderr
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX launcher script")
+def test_exec_launcher_ignores_workspace_modules(tmp_path: pathlib.Path) -> None:
+    """Modules in the spawner's cwd never replace the launcher's own imports."""
+    for name in ("logging", "json", "base64"):
+        (tmp_path / f"{name}.py").write_text(f"raise ImportError('{name} loaded from the cwd')\n")
+    wrapper_path = create_exec_launcher(sys.executable, _noop_policy())
+    try:
+        result = subprocess.run(
+            [wrapper_path, "-c", "print('target ran')"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(wrapper_path)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "target ran"
+
+
 def test_run_launcher_wraps_target_with_strace_when_env_set(monkeypatch, caplog) -> None:
     """
     ``OMNIGENT_SANDBOX_STRACE=1`` must prepend ``strace -f -y -e

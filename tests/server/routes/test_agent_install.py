@@ -32,6 +32,7 @@ from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from tests._helpers.session import bundle_files
 from tests.server.helpers import build_agent_bundle
 
 ALICE = {"X-Forwarded-Email": "alice@example.com"}
@@ -142,6 +143,202 @@ async def test_reinstall_updates_in_place(client) -> None:
     assert [row["description"] for row in (await _mine(client, ALICE))["data"]] == ["v2"]
 
 
+async def test_config_patch_preserves_identity_and_omitted_fields(client, agent_store) -> None:
+    installed = (await _install(client, ALICE, "orion")).json()
+    path = f"/v1/agents/{installed['id']}"
+    config = await client.get(f"{path}/config", headers=ALICE)
+    assert config.status_code == 200, config.text
+    assert config.headers["cache-control"] == "no-store"
+    assert config.headers["access-control-expose-headers"] == "ETag"
+    before = agent_store.get(installed["id"])
+    headers = {**ALICE, "If-Match": config.headers["etag"]}
+    for patch in ({}, {"description": "v1"}):
+        no_op = await client.patch(path, headers=headers, json=patch)
+        assert no_op.status_code == 200, no_op.text
+        assert no_op.headers["etag"] == config.headers["etag"]
+        assert agent_store.get(installed["id"]) == before
+
+    changed = await client.patch(path, headers=headers, json={"description": "updated"})
+    assert changed.status_code == 200, changed.text
+    assert changed.json() == {
+        **config.json(),
+        "description": "updated",
+        "version": installed["version"] + 1,
+    }
+    assert changed.headers["etag"] != config.headers["etag"]
+    assert (await client.patch(path, headers=headers, json={})).status_code == 412
+    cleared = await client.patch(
+        path, headers={**ALICE, "If-Match": changed.headers["etag"]}, json={"description": None}
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["description"] is None
+    assert (await client.get(path, headers=ALICE)).json()["description"] is None
+    reinstalled = await _install(client, ALICE, "orion", "reinstalled")
+    assert reinstalled.json()["description"] == "reinstalled"
+
+
+async def test_config_patch_checks_owner_before_preconditions(client, agent_store) -> None:
+    owned = (await _install(client, BOB, "orion")).json()["id"]
+    unowned = agent_store.create_user_agent(generate_agent_id(), "legacy", "missing", owner=None)
+    server = agent_store.create(generate_agent_id(), "server", "missing")
+    for agent_id in (owned, unowned.id, server.id, generate_agent_id()):
+        for method, suffix, kwargs in (("GET", "/config", {}), ("PATCH", "", {"json": {}})):
+            path = f"/v1/agents/{agent_id}{suffix}"
+            assert (await client.request(method, path, headers=ALICE, **kwargs)).status_code == 404
+            assert (await client.request(method, path, **kwargs)).status_code == 401
+
+
+async def test_config_patch_preserves_effective_stored_description(client, agent_store) -> None:
+    installed = (await _install(client, ALICE, "orion", "bundle description")).json()
+    agent = agent_store.get(installed["id"])
+    before = agent_store.update(agent.id, agent.bundle_location, description="stored description")
+    path = f"/v1/agents/{agent.id}"
+    config = await client.get(f"{path}/config", headers=ALICE)
+    assert config.json()["description"] == "stored description"
+    patched = await client.patch(
+        path,
+        headers={**ALICE, "If-Match": config.headers["etag"]},
+        json={"description": config.json()["description"]},
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json() == config.json()
+    assert patched.headers["etag"] == config.headers["etag"]
+    assert agent_store.get(agent.id) == before
+
+
+async def test_config_read_reports_unsupported_format_and_missing_bundle(
+    client, agent_store, artifact_store
+) -> None:
+    bundle = bundle_files(
+        {"agent.yaml": b"name: old\nprompt: hi\nexecutor: {harness: claude-sdk}\n"}
+    )
+    installed = await client.post(
+        "/v1/agents",
+        headers=ALICE,
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    assert installed.status_code == 200, installed.text
+    path = f"/v1/agents/{installed.json()['id']}/config"
+    config = await client.get(path, headers=ALICE)
+    assert config.status_code == 409, config.text
+    assert config.json()["error"]["code"] == "agent_config_not_editable"
+    agent = agent_store.get(installed.json()["id"])
+    artifact_store.delete(agent.bundle_location)
+    missing = await client.get(path, headers=ALICE)
+    assert missing.status_code == 500
+    assert "mcp_servers" not in missing.json()
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"name": "renamed"},
+        {"version": 100},
+        {"model": None},
+        {"model": " "},
+        {"harness": None},
+        {"mcp_servers": None},
+        {"mcp_servers": {"docs": {"args": None}}},
+        {"mcp_servers": {"docs": {"headers": {"Authorization": "[REDACTED]"}}}},
+        {"description": {"private": "never-echo-this"}},
+    ],
+)
+async def test_config_patch_rejects_invalid_fields_without_echoing_input(
+    client, agent_store, patch: dict
+) -> None:
+    installed = (await _install(client, ALICE, "orion")).json()
+    path = f"/v1/agents/{installed['id']}"
+    config = await client.get(f"{path}/config", headers=ALICE)
+    before = agent_store.get(installed["id"])
+    result = await client.patch(
+        path, headers={**ALICE, "If-Match": config.headers["etag"]}, json=patch
+    )
+    assert result.status_code == 422, result.text
+    assert result.json() == {
+        "error": {"code": "invalid_input", "message": "Invalid agent configuration patch"}
+    }
+    assert agent_store.get(installed["id"]) == before
+
+
+async def test_config_patch_preconditions_and_body_limit(client, monkeypatch) -> None:
+    from omnigent.server.routes import builtin_agents
+
+    installed = (await _install(client, ALICE, "orion")).json()
+    path = f"/v1/agents/{installed['id']}"
+    config = await client.get(f"{path}/config", headers=ALICE)
+    assert (await client.patch(path, headers=ALICE, json={})).status_code == 428
+    for tag in ("*", "W/" + config.headers["etag"], config.headers["etag"] + ', "other"'):
+        result = await client.patch(path, headers={**ALICE, "If-Match": tag}, json={})
+        assert result.status_code == 400, result.text
+    headers = {**ALICE, "If-Match": config.headers["etag"]}
+    result = await client.patch(
+        path, headers={**headers, "Content-Type": "text/plain"}, content="{}"
+    )
+    assert result.status_code == 415
+    assert result.json()["error"]["code"] == "invalid_input"
+    monkeypatch.setattr(builtin_agents, "MAX_INSTALL_BUNDLE_BYTES", 1024)
+    result = await client.patch(path, headers=headers, json={"instructions": "x" * 2048})
+    assert result.status_code == 413
+    assert result.json()["error"]["code"] == "payload_too_large"
+    assert result.headers["cache-control"] == "no-store"
+    monkeypatch.setattr(builtin_agents, "MAX_INSTALL_BUNDLE_BYTES", 1)
+    result = await client.get(f"{path}/config", headers=ALICE)
+    assert result.status_code == 413
+    assert result.json()["error"]["code"] == "payload_too_large"
+
+
+@pytest.mark.parametrize("race", ["update", "identical_update", "delete", "artifact_failure"])
+async def test_config_patch_does_not_overwrite_racing_changes(
+    client, agent_store, artifact_store, monkeypatch, race: str
+) -> None:
+    installed = (await _install(client, ALICE, "orion")).json()
+    path = f"/v1/agents/{installed['id']}"
+    config = await client.get(f"{path}/config", headers=ALICE)
+    before = agent_store.get(installed["id"])
+    original_put = artifact_store.put
+
+    def put(location, data):
+        if race == "artifact_failure":
+            raise OSError("artifact storage unavailable")
+        original_put(location, data)
+        if race == "delete":
+            agent_store.delete(installed["id"])
+        elif race == "identical_update":
+            agent_store.update(installed["id"], location, description="loser")
+        else:
+            agent_store.update(installed["id"], before.bundle_location)
+
+    monkeypatch.setattr(artifact_store, "put", put)
+    if race == "artifact_failure":
+        with pytest.raises(OSError, match="artifact storage unavailable"):
+            await client.patch(
+                path,
+                headers={**ALICE, "If-Match": config.headers["etag"]},
+                json={"description": "loser"},
+            )
+        assert agent_store.get(installed["id"]) == before
+    else:
+        result = await client.patch(
+            path,
+            headers={**ALICE, "If-Match": config.headers["etag"]},
+            json={"description": "loser"},
+        )
+        assert result.status_code == 412, result.text
+        after = agent_store.get(installed["id"])
+        if race == "delete":
+            assert after is None
+        else:
+            if race == "identical_update":
+                assert after.bundle_location != before.bundle_location
+                assert artifact_store.get(after.bundle_location)
+                config = await client.get(f"{path}/config", headers=ALICE)
+                assert config.status_code == 200, config.text
+                assert config.json()["description"] == "loser"
+            else:
+                assert after.bundle_location == before.bundle_location
+            assert after.version == before.version + 1
+
+
 async def test_agent_detail_returns_current_summary(client) -> None:
     for description in ("v1", "v2"):
         installed = (await _install(client, ALICE, "orion", description)).json()
@@ -195,6 +392,16 @@ async def test_agent_detail_on_authless_server(agent_store, artifact_store, tmp_
         assert response.status_code == 200, response.text
         assert response.json() == {**installed, "user_owned": True}
 
+        config = await c.get(f"/v1/agents/{installed['id']}/config")
+        assert config.status_code == 200, config.text
+        patched = await c.patch(
+            f"/v1/agents/{installed['id']}",
+            headers={"If-Match": config.headers["etag"]},
+            json={"description": "authless edit"},
+        )
+        assert patched.status_code == 200, patched.text
+        assert patched.json()["description"] == "authless edit"
+
 
 async def test_agent_detail_redacts_mcp_headers(client, monkeypatch) -> None:
     monkeypatch.setenv("AGENT_DESCRIPTION", "server environment value")
@@ -226,6 +433,21 @@ async def test_agent_detail_redacts_mcp_headers(client, monkeypatch) -> None:
     assert response.json()["description"] == "${AGENT_DESCRIPTION}"
     assert response.json()["mcp_servers"][0]["headers"] == {"Authorization": "[REDACTED]"}
     assert "test-token" not in response.text
+
+    path = f"/v1/agents/{installed.json()['id']}"
+    config = await client.get(f"{path}/config", headers=ALICE)
+    assert config.status_code == 200, config.text
+    assert config.json()["mcp_servers"]["docs"]["configured_header_names"] == ["Authorization"]
+    assert "test-token" not in config.text
+    patched = await client.patch(
+        path,
+        headers={**ALICE, "If-Match": config.headers["etag"]},
+        json={"mcp_servers": {"docs": {"url": "https://example.com/mcp"}}},
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["mcp_servers"]["docs"]["configured_header_names"] == ["Authorization"]
+    assert patched.json()["description"] == "${AGENT_DESCRIPTION}"
+    assert "test-token" not in patched.text
 
 
 def _retarred(bundle: bytes, mtime: int) -> bytes:
@@ -849,8 +1071,9 @@ async def test_mcp_edits_change_the_agent_for_every_session_using_it(
     assert "read-only" in refused.text
 
 
+@pytest.mark.parametrize("edit", ["reinstall", "patch"])
 async def test_reinstall_reaches_every_session_on_its_next_turn(
-    multi_user_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+    multi_user_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch, edit: str
 ) -> None:
     """A reinstall keeps the id, so each turn names the bundle revision (a
     create's initial items too); every session's runner sees the new one on its
@@ -892,14 +1115,27 @@ async def test_reinstall_reaches_every_session_on_its_next_turn(
             f"/v1/sessions/{sessions[1]['id']}/events", json=message, headers=ALICE
         )
         assert sent.status_code == 202, sent.text
-        await _install(c, ALICE, "orion", "v2")
+        if edit == "patch":
+            config = await c.get(f"/v1/agents/{orion['id']}/config", headers=ALICE)
+            updated = await c.patch(
+                f"/v1/agents/{orion['id']}",
+                headers={**ALICE, "If-Match": config.headers["etag"]},
+                json={"description": "v2"},
+            )
+            assert updated.status_code == 200, updated.text
+        else:
+            await _install(c, ALICE, "orion", "v2")
         for session in sessions:
             sent = await c.post(
                 f"/v1/sessions/{session['id']}/events", json=message, headers=ALICE
             )
             assert sent.status_code == 202, sent.text
 
+        new_session = await c.post("/v1/sessions", json=kickoff, headers=ALICE)
+        assert new_session.status_code == 201, new_session.text
+
     v2 = SqlAlchemyAgentStore(db_uri).get(orion["id"]).bundle_location
+    assert forwarded[new_session.json()["id"]] == [v2]
     for session in sessions:
         before, after = forwarded[session["id"]]
         assert before != after == v2

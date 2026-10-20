@@ -9,9 +9,14 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "web/**"
+      - "editors/vscode/**"
+      - "sdks/web-extension/**"
+      - "examples/extensions/hello-page/web/**"
+      - ".github/ci-deps/**"
       - "package.json"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
+      - "patches/**"
       - ".npmrc"
       - ".github/actions/setup-pnpm/**"
       - ".github/workflows/web-tests.yml"
@@ -20,9 +25,14 @@ on:
       - main
     paths:
       - "web/**"
+      - "editors/vscode/**"
+      - "sdks/web-extension/**"
+      - "examples/extensions/hello-page/web/**"
+      - ".github/ci-deps/**"
       - "package.json"
       - "pnpm-lock.yaml"
       - "pnpm-workspace.yaml"
+      - "patches/**"
       - ".npmrc"
       - ".github/actions/setup-pnpm/**"
       - ".github/workflows/web-tests.yml"
@@ -42,16 +52,32 @@ jobs:
   gate:
     uses: ./.github/workflows/security-gate.yml
 
+  scope:
+    name: Web scope
+    needs: gate
+    runs-on: ubuntu-latest
+    outputs:
+      web: ${{ steps.scope.outputs.web }}
+      ios: ${{ steps.scope.outputs.ios }}
+      dependency: ${{ steps.scope.outputs.dependency }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - id: scope
+        uses: ./.github/actions/dependency-ci-scope
+
   web-test:
     name: web test
-    needs: gate
-    if: ${{ !github.event.pull_request.draft }}
+    needs: scope
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.web == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
       - name: Check out repo
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up pnpm
         uses: ./.github/actions/setup-pnpm
@@ -66,8 +92,30 @@ jobs:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: pnpm install --frozen-lockfile --filter web
 
-      - name: Run Electron Design-mode unit regressions
-        run: node --test web/electron/test/designModeScript.test.js
+      - name: Run Electron DOM and IPC regressions
+        # DOM suites use web's jsdom; IPC and preload suites stub Electron.
+        run: >-
+          node --test
+          web/electron/test/designModeScript.test.js
+          web/electron/test/browserActionScript.test.js
+          web/electron/test/browserIpc.test.js
+          web/electron/test/preload_update.test.js
+
+      - name: Install other workspace dependencies
+        if: needs.scope.outputs.dependency == 'true'
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: pnpm install --frozen-lockfile --filter ./editors/vscode --filter ./sdks/web-extension --filter ./examples/extensions/hello-page/web --filter ./web/electron
+
+      - name: Test and build workspace consumers
+        if: needs.scope.outputs.dependency == 'true'
+        run: |
+          pnpm --dir editors/vscode run type-check
+          pnpm --dir editors/vscode test
+          pnpm --dir editors/vscode run build
+          pnpm --dir sdks/web-extension run type-check
+          pnpm --dir examples/extensions/hello-page/web run build
+          node --test web/electron/test/*.test.js
 
       - name: Check formatting
         run: pnpm --filter web run format:check
@@ -104,8 +152,54 @@ jobs:
 
       - name: Upload UI coverage summary
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: ui-coverage-summary-${{ github.run_id }}
           path: web/ui-coverage-summary/
           retention-days: 14
+
+  ios:
+    name: iOS dependency tools
+    needs: scope
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.ios == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BUNDLE_FROZEN: 'true'
+      FASTLANE_SKIP_UPDATE_CHECK: '1'
+      FASTLANE_HIDE_CHANGELOG: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a # v1
+        with:
+          ruby-version: '3.3'
+          working-directory: web/ios
+          bundler-cache: true
+      - name: Check the locked Fastlane environment
+        working-directory: web/ios
+        run: |
+          bundle check
+          bundle exec fastlane --version
+
+  result:
+    name: Web result
+    if: always()
+    needs: [scope, web-test, ios]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require successful test selection
+        env:
+          SELECTION_RESULT: ${{ needs.scope.result }}
+        run: test "$SELECTION_RESULT" = success
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          sparse-checkout: .github/scripts/ci
+          persist-credentials: false
+      - name: Require selected consumer results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+        run: python3 .github/scripts/ci/require_results.py web

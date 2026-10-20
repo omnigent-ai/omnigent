@@ -24,6 +24,7 @@ const path = require("node:path");
 
 const {
   desktopDepsAvailable,
+  execInBrowserView,
   openBrowserFixture,
   spawnServer,
   launchDesktop,
@@ -44,7 +45,6 @@ delete process.env.no_proxy;
 delete process.env.NO_PROXY;
 
 const deps = desktopDepsAvailable();
-const RECORD_DIR = path.join(__dirname, "recordings", "desktop-session-expiry-browser-view");
 
 // The fake workspace sign-in page the gate serves once the session expires.
 // The anchor navigates back to "/" so "signing back in" is a plain click.
@@ -182,13 +182,6 @@ async function openView(window, conversationId, url) {
   return openBrowserFixture(window, conversationId, url);
 }
 
-async function execInView(window, conversationId, js) {
-  return window.evaluate(
-    ([cid, code]) => window.omnigentDesktop.browserExecute(cid, code),
-    [conversationId, js],
-  );
-}
-
 async function setActive(window, conversationId) {
   return window.evaluate((cid) => window.omnigentDesktop.browserSetActive(cid), conversationId);
 }
@@ -202,7 +195,7 @@ async function waitForViewOnOrigin(window, conversationId, origin, timeoutMs = 3
   for (;;) {
     // oxlint-disable-next-line no-await-in-loop -- Poll each navigation probe sequentially.
     const r = await Promise.race([
-      execInView(window, conversationId, "location.origin"),
+      execInBrowserView(window, conversationId, "location.origin"),
       new Promise((resolve) => {
         setTimeout(() => resolve(null), 3_000);
       }),
@@ -239,10 +232,14 @@ describe(
   { skip: deps.ok ? false : `missing deps: ${deps.missing.join(", ")}` },
   () => {
     let tmpDir;
+    let recordDir;
     let server;
     let gate;
 
     before(async () => {
+      recordDir =
+        process.env.OMNIGENT_DESKTOP_RECORD_DIR ||
+        fs.mkdtempSync(path.join(os.tmpdir(), "desktop-session-expiry-"));
       tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "omni-desktop-e2e-"));
       server = await spawnServer(tmpDir);
       gate = await startAuthGate(server.serverUrl);
@@ -257,10 +254,11 @@ describe(
     it(
       "logged-out reload does not leave the browser view painting over the window",
       { timeout: 300_000 },
-      async () => {
+      async (t) => {
+        t.diagnostic(`Recordings: ${recordDir}`);
         // Boot straight onto the gated server (the failure is past connect).
-        const { electronApp, userDataDir } = await launchDesktop({
-          recordDir: RECORD_DIR,
+        const { electronApp, userDataDir, stopDisplayCapture } = await launchDesktop({
+          recordDir,
           serverUrl: gate.url,
         });
         let attachedOnLoginPage;
@@ -289,7 +287,7 @@ describe(
           assert.equal(opened.ok, true, `browser view open failed: ${opened.error}`);
           await setActive(window, "conv_A");
           await waitForViewOnOrigin(window, "conv_A", server.serverUrl);
-          const painted = await execInView(
+          const painted = await execInBrowserView(
             window,
             "conv_A",
             `document.body.innerHTML = '<div style="font: 28px sans-serif; padding: 40px; background: #1a7f37; color: white; height: 100vh;">' +
@@ -337,7 +335,8 @@ describe(
           );
         } finally {
           await electronApp.close();
-          saveRecording(RECORD_DIR, "before-expiry-overlay");
+          await stopDisplayCapture();
+          saveRecording(recordDir, "before-expiry-overlay");
           fs.rmSync(userDataDir, { recursive: true, force: true });
         }
 

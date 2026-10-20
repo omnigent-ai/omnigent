@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import json
 import os
 import signal
 import subprocess
@@ -49,10 +50,14 @@ class LocalManagedHost(SandboxHostLauncher):
 
     provider: ClassVar[str] = "modal"
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, keyed_url: str, unkeyed_url: str) -> None:
         self.root = root
+        self.keyed_url = keyed_url
+        self.unkeyed_url = unkeyed_url
         self.gate = threading.Event()
         self.provisioning = threading.Event()
+        # Set to make the next provision fail like a cloud allocation error.
+        self.fail_provision = False
         self.process: subprocess.Popen[bytes] | None = None
 
     def prepare(self) -> None:
@@ -61,6 +66,8 @@ class LocalManagedHost(SandboxHostLauncher):
     def provision(self, name: str) -> str:
         self.provisioning.set()
         assert self.gate.wait(timeout=120), "browser never released sandbox provisioning"
+        if self.fail_provision:
+            raise RuntimeError("injected sandbox allocation failure")
         return name
 
     def start_host(
@@ -75,7 +82,12 @@ class LocalManagedHost(SandboxHostLauncher):
         host_config: dict[str, object] | None = None,
         on_stage: Callable[[str], None] | None = None,
     ) -> str:
-        assert not repos and host_config is None
+        assert not repos
+        host = (host_config or {}).get("host")
+        keyed = isinstance(host, dict) and host.get("slice_key_enabled") is True
+        # Stands in for the ingress routing the host's tunnel by its key: a host
+        # keyed by its id reaches B, an unkeyed one the default replica.
+        url = self.keyed_url if keyed else self.unkeyed_url
         workspace = self.root / "workspace"
         workspace.mkdir(exist_ok=True)
         if on_stage:
@@ -88,7 +100,7 @@ class LocalManagedHost(SandboxHostLauncher):
                     "omnigent",
                     "host",
                     "--server",
-                    server_url,
+                    url,
                     "--non-interactive",
                 ],
                 env={
@@ -109,7 +121,9 @@ class LocalManagedHost(SandboxHostLauncher):
             self.process = None
 
 
-def replica_app(root: Path, replica: str, runner_url: str) -> tuple[FastAPI, LocalManagedHost]:
+def replica_app(
+    root: Path, replica: str, *, keyed_url: str, unkeyed_url: str
+) -> tuple[FastAPI, LocalManagedHost]:
     """Build the product app with shared durable stores, never shared registries."""
     from omnigent.runtime import init
     from omnigent.runtime.agent_cache import AgentCache
@@ -134,13 +148,18 @@ def replica_app(root: Path, replica: str, runner_url: str) -> tuple[FastAPI, Loc
         artifact_store=artifacts,
         agent_cache=cache,
     )
-    launcher = LocalManagedHost(root)
+    launcher = LocalManagedHost(root, keyed_url=keyed_url, unkeyed_url=unkeyed_url)
     control = APIRouter()
 
     @control.post("/provision/release")
     async def release() -> dict[str, bool]:
         launcher.gate.set()
         return {"released": True}
+
+    @control.post("/provision/fail")
+    async def fail_provision() -> dict[str, bool]:
+        launcher.fail_provision = True
+        return {"failing": True}
 
     @control.post("/host/stop")
     async def stop_host() -> dict[str, bool]:
@@ -166,7 +185,7 @@ def replica_app(root: Path, replica: str, runner_url: str) -> tuple[FastAPI, Loc
         extra_routers=[(control, "/__test", ["test-control"])],
         sandbox_config=ManagedSandboxDeployment.single(
             ManagedSandboxConfig(
-                server_url=runner_url,
+                server_url=unkeyed_url,
                 token_ttl_s=3600,
                 provider=launcher.provider,
                 launcher_factory=lambda: launcher,
@@ -177,8 +196,13 @@ def replica_app(root: Path, replica: str, runner_url: str) -> tuple[FastAPI, Loc
     return app, launcher
 
 
-def ingress_app(replica_a: str, replica_b: str) -> FastAPI:
-    """Forward keyless traffic to A and host-keyed traffic to B, including SSE."""
+def ingress_app(replica_a: str, replica_b: str, *, strip_host_id: bool = False) -> FastAPI:
+    """
+    Forward keyless traffic to A and host-keyed traffic to B, including SSE.
+
+    With *strip_host_id*, a managed create loses its ``host_id`` and key, as
+    one from a client that doesn't choose the id (the SDK, Slack).
+    """
     exchanges: list[dict[str, Any]] = []
 
     @contextlib.asynccontextmanager
@@ -198,8 +222,38 @@ def ingress_app(replica_a: str, replica_b: str) -> FastAPI:
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
     async def forward(request: Request, path: str) -> StreamingResponse:
         key = request.headers.get(SLICE_KEY)
-        target = replica_b if key else replica_a
         body = await request.body()
+        headers = {k: v for k, v in request.headers.items() if k not in _HOP_HEADERS}
+        if strip_host_id and request.method == "POST" and request.url.path == "/v1/sessions":
+            content_type = request.headers.get("content-type", "")
+            if content_type.startswith("multipart/form-data"):
+                # A create carrying attachments sends its JSON as the
+                # ``metadata`` part; re-encode the form without the id.
+                form = await request.form()
+                create = json.loads(str(form["metadata"]))
+                create.pop("host_id", None)
+                files = [
+                    ("initial_files", (part.filename, await part.read(), part.content_type))
+                    for part in form.getlist("initial_files")
+                    if not isinstance(part, str)
+                ]
+                encoded = httpx.Request(
+                    "POST", replica_a, data={"metadata": json.dumps(create)}, files=files
+                )
+                body = encoded.read()
+                content_type = encoded.headers["content-type"]
+            else:
+                create = json.loads(body)
+                create.pop("host_id", None)
+                body = json.dumps(create).encode()
+            key = None
+            headers = {
+                k: v
+                for k, v in headers.items()
+                if k.lower() not in {SLICE_KEY, "content-length", "content-type"}
+            }
+            headers["content-type"] = content_type
+        target = replica_b if key else replica_a
         record: dict[str, Any] = {
             "path": request.url.path,
             "method": request.method,
@@ -217,7 +271,7 @@ def ingress_app(replica_a: str, replica_b: str) -> FastAPI:
                 request.method,
                 f"{target}/{path}",
                 params=request.query_params,
-                headers={k: v for k, v in request.headers.items() if k not in _HOP_HEADERS},
+                headers=headers,
                 content=body,
             ),
             stream=True,
@@ -249,12 +303,28 @@ def main() -> None:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--replica-a", required=True)
     parser.add_argument("--replica-b", required=True)
+    parser.add_argument("--strip-host-id", action="store_true")
+    # A sandbox host that keys by its id regardless of the launch (one whose
+    # omnigent predates the per-launch setting, on a sharded mount).
+    parser.add_argument("--legacy-host", action="store_true")
+    # Shortens how long a message waits on an in-flight launch, so a test can
+    # outlast it without holding provisioning for minutes.
+    parser.add_argument("--message-launch-wait-s", type=float)
     args = parser.parse_args()
+    if args.message_launch_wait_s is not None:
+        import omnigent.server.managed_hosts as managed_hosts
+
+        managed_hosts.MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S = args.message_launch_wait_s
     launcher = None
     if args.role == "ingress":
-        app = ingress_app(args.replica_a, args.replica_b)
+        app = ingress_app(args.replica_a, args.replica_b, strip_host_id=args.strip_host_id)
     else:
-        app, launcher = replica_app(args.root, args.role, args.replica_b)
+        app, launcher = replica_app(
+            args.root,
+            args.role,
+            keyed_url=args.replica_b,
+            unkeyed_url=args.replica_b if args.legacy_host else args.replica_a,
+        )
     try:
         uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="info")
     finally:

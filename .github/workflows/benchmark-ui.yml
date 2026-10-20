@@ -39,13 +39,25 @@ jobs:
     outputs:
       ui: ${{ steps.changes.outputs.ui }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - id: scope
+        uses: ./.github/actions/dependency-ci-scope
       - id: changes
         env:
+          DEPENDENCY: ${{ steps.scope.outputs.dependency }}
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
           PR_CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
           REPO: ${{ github.repository }}
         run: |
+          if [ "$DEPENDENCY" = true ]; then
+            echo "ui=false" >> "$GITHUB_OUTPUT"
+            echo "Dependency-only PR: performance benchmarking remains on scheduled runs."
+            exit 0
+          fi
           # The files API truncates successful responses at 3,000 entries.
           if [ -z "${PR:-}" ] || [ "${PR_CHANGED_FILES:-0}" -ge 3000 ]; then
             echo "ui=true" >> "$GITHUB_OUTPUT"
@@ -70,7 +82,7 @@ jobs:
     timeout-minutes: 25
     steps:
       - name: Check out candidate
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 2
@@ -84,7 +96,7 @@ jobs:
           git worktree add --detach ui-baseline 'HEAD^1'
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version-file: ".python-version"
 
@@ -97,7 +109,7 @@ jobs:
         uses: ./.github/actions/setup-pnpm
 
       - name: Cache Playwright browsers
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ms-playwright
           key: ${{ runner.os }}-playwright-${{ hashFiles('uv.lock') }}
@@ -155,7 +167,7 @@ jobs:
 
       - name: Upload UI benchmark results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: benchmark-results-ui-${{ github.run_id }}
           path: artifacts/ui-benchmark/
