@@ -660,7 +660,7 @@ def test_the_catalog_check_gets_no_inherited_credentials(
     ]
     assert "OPENAI_API_KEY" not in probe_env
     assert "DATABRICKS_TOKEN" not in probe_env
-    assert probe_env["CODEX_HOME"] == probe_env["HOME"] == str(private.parent)
+    assert probe_env["CODEX_HOME"] == str(private.parent)
     assert "model_catalog_json" not in tomllib.loads(private.read_text())
 
 
@@ -700,3 +700,68 @@ def test_a_caller_that_rewrites_the_config_can_defer_the_check(tmp_path: Path) -
     assert not (tmp_path / "probe-env.jsonl").exists()
     assert codex_executor.drop_unparseable_model_catalog(target / "config.toml", codex) is True
     assert "model_catalog_json" not in tomllib.loads((target / "config.toml").read_text())
+
+
+def test_a_home_relative_catalog_resolves_against_the_sessions_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Codex expands ``~`` with the launch HOME, not the private CODEX_HOME.
+    user_home = tmp_path / "user-home"
+    user_home.mkdir()
+    catalog = user_home / "bad.json"
+    catalog.write_text("{}")
+    monkeypatch.setenv("HOME", str(user_home))
+    script = tmp_path / "codex"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "path = os.path.join(os.environ.get('HOME', ''), 'bad.json')\n"
+        "verb = 'parse' if os.path.exists(path) else 'read'\n"
+        "sys.stderr.write(f'Error: failed to {verb} model_catalog_json path `{path}` as JSON')\n"
+        "sys.exit(1)\n"
+    )
+    script.chmod(0o755)
+
+    private = _populate_with_user_catalog(
+        tmp_path, str(script), f'model_catalog_json = "~/bad.json"\n\n{_PROVIDER_TABLE}'
+    )
+
+    assert "model_catalog_json" not in tomllib.loads(private.read_text())
+
+
+def test_a_brokered_home_never_runs_the_unsandboxed_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its catalog comes from the sandboxed bundled probe, so a raw codex run is never needed."""
+
+    class _Probe:
+        launch_path = "/sandboxed/codex"
+
+        def close(self) -> None:
+            pass
+
+    def _unexpected(*args: object, **kwargs: object) -> bool:
+        raise AssertionError("brokered population ran the unsandboxed catalog check")
+
+    monkeypatch.setattr(codex_executor, "prepare_codex_catalog_probe", lambda **kwargs: _Probe())
+    written: list[str] = []
+    monkeypatch.setattr(
+        codex_executor,
+        "write_required_brokered_model_catalog",
+        lambda target_dir, *, codex_path: written.append(codex_path),
+    )
+    monkeypatch.setattr(codex_executor, "drop_unparseable_model_catalog", _unexpected)
+    source = tmp_path / "user-codex"
+    source.mkdir()
+    (source / "config.toml").write_text('model_catalog_json = "/x.json"\n')
+    target = tmp_path / "private"
+    target.mkdir()
+
+    codex_executor._populate_codex_home_config(
+        target,
+        source,
+        include_credentials=False,
+        required_brokered_probe=("/raw/codex", tmp_path, object()),  # type: ignore[arg-type]
+    )
+
+    assert written == ["/sandboxed/codex"]

@@ -46,7 +46,9 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         title_workdir = temp_root / "workspace"
         codex_home.mkdir(mode=0o700)
         title_workdir.mkdir()
-        _populate_codex_home_config(
+        # Copying the home can run a short ``codex`` config check; keep it off the loop.
+        await asyncio.to_thread(
+            _populate_codex_home_config,
             codex_home,
             _codex_home_config_source_from_env(),
             minimal_config=True,

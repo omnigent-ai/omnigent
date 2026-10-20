@@ -1175,9 +1175,9 @@ def _populate_codex_home_config(
         calls :func:`drop_unparseable_model_catalog` on the final file.
     """
     if required_brokered_probe is not None:
-        codex_path, cwd, os_env = required_brokered_probe
+        probe_codex_path, cwd, os_env = required_brokered_probe
         probe = prepare_codex_catalog_probe(
-            codex_path=codex_path,
+            codex_path=probe_codex_path,
             cwd=cwd,
             codex_home=target_dir,
             os_env=os_env,
@@ -1292,7 +1292,8 @@ def _populate_codex_home_config(
                 )
                 if catalog_path is not None:
                     set_codex_model_catalog_path(dest_path, catalog_path)
-    if validate_model_catalog:
+    # A brokered home's catalog comes from the sandboxed probe above, never a user file.
+    if validate_model_catalog and required_brokered_probe is None:
         # A reused private home keeps its copy, so check it on every start.
         drop_unparseable_model_catalog(target_dir / "config.toml", codex_path or _find_codex_cli())
 
@@ -2068,14 +2069,15 @@ def drop_unparseable_model_catalog(
     ]
     if not any("model_catalog_json" in table for table in tables):
         return False
-    # Only parsing is under test, so the probe gets no inherited credentials.
+    # Only parsing is under test, so the probe gets no inherited credentials. HOME
+    # stays the session's own so a ``~/`` catalog path resolves as it does at launch.
     env = {
         name: value
-        for name in ("PATH", "LANG", "LC_ALL", "TZ")
+        for name in ("PATH", "LANG", "LC_ALL", "TZ", "HOME")
         if (value := os.environ.get(name)) is not None
     }
     env.setdefault("PATH", os.defpath)
-    env["HOME"] = env["CODEX_HOME"] = str(config_path.parent)
+    env["CODEX_HOME"] = str(config_path.parent)
     try:
         completed = subprocess.run(
             [codex_path, "debug", "models"],

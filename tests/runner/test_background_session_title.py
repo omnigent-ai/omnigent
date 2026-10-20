@@ -1399,3 +1399,42 @@ async def test_background_title_timeout_releases_process(
     assert response.json()["error"] == "title_harness_timeout"
     [process_key] = process_manager.released
     assert uuid.UUID(process_key).hex == process_key
+
+
+@pytest.mark.asyncio
+async def test_codex_native_title_copies_the_codex_home_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Copying the home can run a ``codex`` config check, which must not stall the runner."""
+    from omnigent.inner import codex_executor
+
+    populate_threads: list[bool] = []
+
+    def _populate(*args: object, **kwargs: object) -> None:
+        populate_threads.append(threading.current_thread() is threading.main_thread())
+        raise OSError("stop after populate")
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.resolve_native_codex_launch",
+        lambda *, model, spec=None: NativeCodexLaunch([], model, None),
+    )
+    monkeypatch.setattr(codex_executor, "_populate_codex_home_config", _populate)
+    monkeypatch.setattr(codex_executor, "_codex_home_config_source_from_env", lambda: tmp_path)
+    make_temp_dir = codex_native_titles.tempfile.TemporaryDirectory
+    monkeypatch.setattr(
+        codex_native_titles.tempfile,
+        "TemporaryDirectory",
+        lambda **kwargs: make_temp_dir(dir=tmp_path, **kwargs),
+    )
+
+    with pytest.raises(OSError, match="stop after populate"):
+        await codex_native_titles.generate_background_title(
+            BackgroundTitleContext(
+                prompt="Investigate startup latency",
+                harness="codex-native",
+                spawn_env={},
+                process_manager=None,
+            )
+        )
+
+    assert populate_threads == [False]
