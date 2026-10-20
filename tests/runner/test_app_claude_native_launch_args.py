@@ -13,6 +13,7 @@ passed. See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
@@ -322,6 +323,41 @@ def test_build_native_claude_terminal_env_rejects_raw_key_on_helper_path() -> No
     )
     with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
         build_native_claude_terminal_env(leaking)
+
+
+@pytest.mark.parametrize(
+    ("config_base_url", "managed_base_url", "disabled"),
+    [
+        ("https://dbc-example.cloud.databricks.com/anthropic", None, True),
+        ("https://api.anthropic.com", None, False),
+        (None, "https://dbc-example.cloud.databricks.com/anthropic", True),
+        (None, None, False),
+    ],
+)
+def test_claude_terminal_env_disables_refusal_fallback_only_on_gateways(
+    config_base_url: str | None,
+    managed_base_url: str | None,
+    disabled: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gateway can't serve the canonical model Claude Code retries a refusal on."""
+    from omnigent.harnesses.claude_native import main as claude_native
+
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_env = {"ANTHROPIC_BASE_URL": managed_base_url} if managed_base_url else {}
+    managed_settings.write_text(json.dumps({"env": managed_env}))
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,))
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    config = (
+        ClaudeNativeUcodeConfig(env={"ANTHROPIC_BASE_URL": config_base_url})
+        if config_base_url
+        else None
+    )
+
+    terminal_env = build_native_claude_terminal_env(config)
+
+    assert (terminal_env.get("CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK") == "1") is disabled
 
 
 def test_claude_terminal_env_databricks_gateway_helper_path() -> None:

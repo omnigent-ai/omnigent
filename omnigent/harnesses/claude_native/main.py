@@ -244,6 +244,10 @@ _CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV = "CLAUDE_CODE_DISABLE_AGENT_VIEW"
 # only in the pane, so a web-driven session shows an unanswerable prompt —
 # often with nobody attached to the terminal at all.
 _CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV = "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"
+# When a model refuses a request, Claude Code retries on a canonical Anthropic
+# fallback (e.g. claude-opus-4-8). A gateway serves only its own model ids, so
+# that retry fails as "model not found" and hides the refusal.
+_CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK_ENV = "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK"
 # Claude Code env vars that pin each model-tier alias to a provider-specific
 # model ID.  When set, the /model picker shows these IDs as options rather
 # than normalising to canonical Anthropic names (which the Databricks gateway
@@ -472,6 +476,17 @@ def _ambient_env_is_non_anthropic_gateway() -> bool:
     return host != "anthropic.com" and not host.endswith(".anthropic.com")
 
 
+def _launch_serves_canonical_anthropic_ids(claude_config: ClaudeNativeUcodeConfig | None) -> bool:
+    """Whether the endpoint a launch reaches accepts canonical Anthropic ids.
+
+    :param claude_config: The resolved launch config, or ``None`` when Claude
+        Code uses its own login and managed settings.
+    """
+    if claude_config is None:
+        return not _ambient_env_is_non_anthropic_gateway()
+    return _serves_canonical_anthropic_ids(claude_config)
+
+
 def _claude_family(token: str) -> str | None:
     """
     The family alias a model id or alias folds onto, bracket markers dropped.
@@ -513,9 +528,7 @@ def claude_catalog_serves_model(
 
     if catalog_contains(rows, model):
         return True
-    if claude_config is None and _ambient_env_is_non_anthropic_gateway():
-        return False
-    if claude_config is not None and not _serves_canonical_anthropic_ids(claude_config):
+    if not _launch_serves_canonical_anthropic_ids(claude_config):
         return False
     if not model.lower().startswith("claude-"):
         return False
@@ -1352,10 +1365,7 @@ async def claude_model_catalog(
         return []
     rows = list(probe.alias_rows)
     declared_models = set(claude_config.routable_models) if claude_config is not None else set()
-    _non_canonical = (
-        claude_config is not None and not _serves_canonical_anthropic_ids(claude_config)
-    ) or (claude_config is None and _ambient_env_is_non_anthropic_gateway())
-    if _non_canonical:
+    if not _launch_serves_canonical_anthropic_ids(claude_config):
         rows = [
             row
             for row in rows
@@ -1382,11 +1392,8 @@ async def claude_model_catalog(
         # Append the observed default as its own honest row — but never
         # claim a bare Anthropic id is launchable on an endpoint that
         # rejects that spelling.
-        _canonical_ids_ok = (
-            claude_config is None and not _ambient_env_is_non_anthropic_gateway()
-        ) or (claude_config is not None and _serves_canonical_anthropic_ids(claude_config))
         servable = (
-            _canonical_ids_ok
+            _launch_serves_canonical_anthropic_ids(claude_config)
             or not default_model.startswith("claude-")
             or default_model in declared_models
         )
@@ -1523,7 +1530,9 @@ def build_native_claude_terminal_env(
     terminal stays pinned to the session the Omnigent UI is showing, and
     disables the in-TUI feedback surveys, which a web-driven session
     cannot see or answer (see
-    :data:`_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV`).
+    :data:`_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV`). On a gateway it also
+    disables the refusal fallback, whose canonical target the gateway
+    doesn't serve (see :data:`_CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK_ENV`).
 
     :param claude_config: Optional provider/ucode launch config, e.g.
         one carrying ``{"ANTHROPIC_BASE_URL": "https://example.com"}``.
@@ -1541,6 +1550,8 @@ def build_native_claude_terminal_env(
         terminal_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
         terminal_env[_CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV] = "1"
         terminal_env[_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV] = "1"
+    if not _launch_serves_canonical_anthropic_ids(claude_config):
+        terminal_env[_CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK_ENV] = "1"
     # On the apiKeyHelper path the credential reaches Claude Code via the
     # helper; a raw ANTHROPIC_API_KEY here re-triggers Claude Code's "Detected a
     # custom API key" menu, which hangs tmux delivery. Fail loud if one leaks.
