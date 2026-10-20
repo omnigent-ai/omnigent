@@ -133,7 +133,7 @@ only starts on click, and the preserved task launches only on a later submit.
 It also checks that prelaunch renewal skips kubeconfig updates and existing-Arca
 sync, verifies the local credentials before clearing the banner, and skips
 renewal for valid credentials. Choosing Skip during a pending check starts one
-session without waiting, and a late invalid result does not interrupt the launch.
+session without waiting; the component suite covers late-result UI state.
 The dbcert executable and machine policy
 are fixtures; cloud allocation remains gated. This test does not cover macOS
 SSO or Companion's credential transfer.

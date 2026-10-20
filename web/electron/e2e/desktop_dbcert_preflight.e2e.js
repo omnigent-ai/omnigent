@@ -30,7 +30,7 @@ it(
   async () => {
     const { expect } = require("playwright/test");
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "omni-dbcert-preflight-"));
-    const recordDir = process.env.OMNIGENT_DESKTOP_RECORD_DIR || `${root}-recording`;
+    const recordDir = process.env.OMNIGENT_DESKTOP_RECORD_DIR || path.join(root, "recording");
     const port = await findFreePort();
     const serverUrl = `http://127.0.0.1:${port}`;
     const bin = path.join(root, "bin");
@@ -261,7 +261,6 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[3]))
       await page.screenshot({ path: path.join(recordDir, "skipped-credential-check.png") });
       fs.rmSync(path.join(root, "hold-status"));
       assert.deepEqual(await pendingStatus, { ok: true, valid: false });
-      await expect(page.getByRole("button", { name: "Refresh dbcert" })).toBeHidden();
       assert.equal(creates.length, 2);
       const finalCommands = fs
         .readFileSync(path.join(root, "commands.jsonl"), "utf8")
@@ -279,20 +278,29 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[3]))
           /* Already exited. */
         }
       }
-      if (desktop) {
-        await desktop.electronApp.close();
-        await desktop.stopDisplayCapture();
-        saveRecording(recordDir, "dbcert-preflight");
+      try {
+        if (desktop) {
+          try {
+            await desktop.electronApp.close();
+          } finally {
+            await desktop.stopDisplayCapture();
+          }
+          saveRecording(recordDir, "dbcert-preflight");
+        }
+      } finally {
+        await fetch(`${serverUrl}/__test/provision/release`, {
+          method: "POST",
+          signal: AbortSignal.timeout(2000),
+        }).catch(() => {});
+        server.kill("SIGTERM");
+        const kill = setTimeout(() => server.kill("SIGKILL"), 5000);
+        await serverClosed;
+        clearTimeout(kill);
+        fs.closeSync(log);
+        fs.mkdirSync(recordDir, { recursive: true });
+        fs.copyFileSync(serverLog, path.join(recordDir, "server.log"));
+        fs.rmSync(root, { recursive: true, force: true });
       }
-      await fetch(`${serverUrl}/__test/provision/release`, { method: "POST" }).catch(() => {});
-      server.kill("SIGTERM");
-      const kill = setTimeout(() => server.kill("SIGKILL"), 5000);
-      await serverClosed;
-      clearTimeout(kill);
-      fs.closeSync(log);
-      fs.mkdirSync(recordDir, { recursive: true });
-      fs.copyFileSync(serverLog, path.join(recordDir, "server.log"));
-      fs.rmSync(root, { recursive: true, force: true });
     }
   },
 );

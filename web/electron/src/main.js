@@ -4926,6 +4926,7 @@ function registerIpc() {
   // Companion then copies it to the user's boxes. Same gates as arca-extend.
   // Clicks from several windows share one sign-in.
   let dbcertPreflight = null;
+  let dbcertGeneration = 0;
   let dbcertRefresh = null;
   ipcMain.handle("omnigent:dbcert-refresh", async (event, options) => {
     if (!isPinnedOriginSender(event)) {
@@ -4937,7 +4938,10 @@ function registerIpc() {
     if (!dbcertRefresh) {
       const refresh = {
         renewal: arca.runDbcertRefresh({ skipArcaSync: true }).then((result) => {
-          if (result.ok) dbcertPreflight = null;
+          if (result.ok) {
+            dbcertGeneration += 1;
+            dbcertPreflight = null;
+          }
           return result;
         }),
         sync: null,
@@ -4957,6 +4961,19 @@ function registerIpc() {
     return refresh.sync;
   });
 
+  const checkCurrentDbcert = () => {
+    if (!dbcertPreflight) {
+      const generation = dbcertGeneration;
+      const pending = arca
+        .checkDbcert()
+        .then((result) => (generation === dbcertGeneration ? result : checkCurrentDbcert()))
+        .finally(() => {
+          if (dbcertPreflight === pending) dbcertPreflight = null;
+        });
+      dbcertPreflight = pending;
+    }
+    return dbcertPreflight;
+  };
   ipcMain.handle("omnigent:dbcert-check", async (event) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("dbcert-check is only available to a connected server page");
@@ -4964,13 +4981,7 @@ function registerIpc() {
     if (!canExtendArca(event)) {
       return { ok: false, error: "dbcert checks are not enabled for this server." };
     }
-    if (!dbcertPreflight) {
-      const pending = arca.checkDbcert().finally(() => {
-        if (dbcertPreflight === pending) dbcertPreflight = null;
-      });
-      dbcertPreflight = pending;
-    }
-    return dbcertPreflight;
+    return checkCurrentDbcert();
   });
 
   // Push a status ping when a host child connects or exits on its own (no

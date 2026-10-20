@@ -978,7 +978,7 @@ describe("dbcert refresh IPC", () => {
     assert.equal(h.calls.dbcertRefreshes, 0);
   });
 
-  it("invalidates pre-renewal status without letting its completion clear the new check", async (context) => {
+  it("rechecks pending status after renewal without clearing fresh verification", async (context) => {
     let finishStaleCheck;
     let finishFreshCheck;
     const pendingChecks = [
@@ -998,7 +998,11 @@ describe("dbcert refresh IPC", () => {
     harness.api.registerIpc();
     const event = { sender: harness.webContents, senderFrame: { url: serverUrl } };
     const check = harness.ipc.get("omnigent:dbcert-check");
-    const stale = check(event);
+    let staleResult;
+    const stale = check(event).then((result) => {
+      staleResult = result;
+      return result;
+    });
     assert.deepEqual(
       await harness.ipc.get("omnigent:dbcert-refresh")(event, { skipArcaSync: true }),
       { ok: true },
@@ -1006,11 +1010,15 @@ describe("dbcert refresh IPC", () => {
     const fresh = check(event);
     assert.equal(harness.calls.dbcertPreflights, 2);
     finishStaleCheck({ ok: true, valid: false });
-    assert.deepEqual(await stale, { ok: true, valid: false });
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    assert.equal(staleResult, undefined);
     const joined = check(event);
     assert.equal(harness.calls.dbcertPreflights, 2);
     finishFreshCheck({ ok: true, valid: true });
-    assert.deepEqual(await Promise.all([fresh, joined]), [
+    assert.deepEqual(await Promise.all([stale, fresh, joined]), [
+      { ok: true, valid: true },
       { ok: true, valid: true },
       { ok: true, valid: true },
     ]);
