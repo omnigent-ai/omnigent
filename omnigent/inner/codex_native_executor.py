@@ -72,8 +72,10 @@ from omnigent.inner.native_attachments import (
     codex_resize_metadata_path,
     materialize_attachment,
     materialize_text,
+    mirrored_text_fits,
     parse_data_uri,
     requires_filesystem,
+    restore_spilled_text,
     unresolved_attachment_marker,
 )
 from omnigent.native.input_diagnostics import (
@@ -113,6 +115,24 @@ class _CodexNativeInputUndelivered(RuntimeError):
     def __init__(self, failure: CodexStartupFailure) -> None:
         self.failure = failure
         super().__init__(failure.message)
+
+
+# A paste moved to a file is mirrored back in full, so it has to fit one session event.
+_MIRROR_TOO_LARGE_FAILURE = CodexStartupFailure(
+    message="This message is too large to keep in the conversation history, so it was not sent.",
+    code=_INPUT_TOO_LARGE_CODE,
+    title="Message too long for Codex",
+    remediation="Shorten the message, or attach the text as a file.",
+)
+
+
+def _spilled_mirror_fits(input_items: list[dict[str, object]], bridge_dir: Path) -> bool:
+    """Whether the forwarder can mirror this input with its spilled pastes restored."""
+    text = "\n\n".join(
+        value for item in input_items if isinstance(value := item.get("text"), str) and value
+    )
+    restored = restore_spilled_text(text, bridge_dir)
+    return restored == text or mirrored_text_fits(restored)
 
 
 async def _pre_delivery_request(
@@ -463,6 +483,8 @@ async def _inject_codex_turn(
     settings_overrides: Mapping[str, object],
 ) -> None:
     """Steer an active turn or start one, recovering one proven stale steer."""
+    if not _spilled_mirror_fits(input_items, bridge_dir):
+        raise _CodexNativeInputUndelivered(_MIRROR_TOO_LARGE_FAILURE)
     if state.active_turn_id is None:
         await _start_codex_turn(
             client,

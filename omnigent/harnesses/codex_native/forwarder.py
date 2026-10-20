@@ -63,7 +63,7 @@ from omnigent.harnesses.codex_native.elicitation import (
 from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
-from omnigent.inner.native_attachments import restore_spilled_text
+from omnigent.inner.native_attachments import mirrored_text_fits, restore_spilled_text
 from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
@@ -101,8 +101,6 @@ _POST_RETRY_DELAY_SECONDS = 0.1
 _POST_RETRY_MAX_DELAY_SECONDS = 30.0
 _POST_RETRY_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 _DURABLE_ITEM_POST_TIMEOUT_SECONDS = 5.0
-# Room left in one session event for everything around a mirrored message's text.
-_EVENT_ENVELOPE_HEADROOM_BYTES = 64 * 1024
 _SOURCE_ID_MAX_CHARS = 256
 # Startup dead-letter replay budget (#1579). Bounded so a large dead-letter file
 # or a slow/hung server cannot stall forwarder startup: each re-POST is a single
@@ -8566,17 +8564,15 @@ def _with_spilled_pastes_restored(text: str, bridge_dir: Path) -> str:
     Mirror the paste the person sent in place of the file reference Codex saw.
 
     The server then records and matches the message as sent, whatever its
-    version. A restored message too large for one event keeps the reference.
+    version. The executor refuses a paste whose restored message could not fit
+    one event, so the reference survives only if that check was bypassed.
 
     :param text: User message text as Codex echoed it.
     :param bridge_dir: The session's bridge directory.
     :returns: The text to mirror.
     """
     restored = restore_spilled_text(text, bridge_dir)
-    if restored != text and (
-        len(json.dumps(restored, ensure_ascii=False).encode("utf-8"))
-        > MAX_SESSION_EVENT_REQUEST_BYTES - _EVENT_ENVELOPE_HEADROOM_BYTES
-    ):
+    if restored != text and not mirrored_text_fits(restored):
         _logger.warning("Codex user message too large to mirror with its paste restored")
         return text
     return restored

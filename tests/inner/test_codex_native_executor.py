@@ -1535,6 +1535,34 @@ def test_run_turn_sends_an_oversized_message_as_an_attachment_reference(
     assert _referenced_file(params["input"][0]).read_text(encoding="utf-8") == text
 
 
+def test_a_paste_too_large_to_mirror_is_refused_before_codex_sees_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """History holds the paste as sent, so a message that cannot be mirrored is not sent."""
+    from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
+
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _start_state(tmp_path)
+
+    events = _collect_turn_events(
+        CodexNativeExecutor(bridge_dir=tmp_path), "z" * MAX_SESSION_EVENT_REQUEST_BYTES
+    )
+
+    [error] = events
+    assert isinstance(error, ExecutorError)
+    assert error.code == "input_too_large"
+    assert error.undelivered is True
+    assert all(
+        method not in {"turn/start", "turn/steer"} for method, _ in _FakeCodexNativeClient.requests
+    )
+
+
 def test_steering_sends_an_oversized_message_as_an_attachment_reference(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

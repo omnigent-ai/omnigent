@@ -5256,8 +5256,9 @@ async def test_kiro_native_dispatch_clears_pending_when_injection_fails(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("earlier_pending", ["none", "source_id", "source_less"])
+@pytest.mark.parametrize("paste_size", ["small", "near_event_limit"])
 async def test_codex_spilled_paste_is_mirrored_as_sent_and_settles_its_own_input(
-    earlier_pending: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    earlier_pending: str, paste_size: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A paste Codex got as a file is recorded as sent, on any server, and survives the cache."""
     from omnigent.harnesses.codex_native import forwarder
@@ -5275,7 +5276,8 @@ async def test_codex_spilled_paste_is_mirrored_as_sent_and_settles_its_own_input
     conv.labels["omnigent.wrapper"] = "codex-native-ui"
     bridge = tmp_path / "bridge"
     monkeypatch.setattr(codex_native_executor, "_MAX_INLINE_TEXT_CHARS", 350)
-    paste = "r\u00e9sum\u00e9 line\n" * 120
+    # The large paste's submission and its full mirror both fit one event.
+    paste = "r\u00e9sum\u00e9 line\n" * 120 if paste_size == "small" else "x" * 10_450_000
     original = [
         {"type": "input_text", "text": paste},
         {"type": "input_text", "text": "keep this tail inline"},

@@ -19,6 +19,7 @@ import binascii
 import contextlib
 import errno
 import hashlib
+import json
 import logging
 import os
 import re
@@ -35,6 +36,7 @@ import httpx
 
 from omnigent.debug_logging import debug_event
 from omnigent.process_logging import data_dir
+from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 
 _logger = logging.getLogger(__name__)
 _ATTACHMENT_READ_ATTEMPTS = 3
@@ -235,6 +237,21 @@ def restore_spilled_text(text: str, bridge_dir: Path) -> str:
     return reference.sub(original, text)
 
 
+# What a mirrored user message's event spends outside its text: keys, ids, a bounded source id.
+_MIRRORED_MESSAGE_ENVELOPE_BYTES = 4 * 1024
+
+
+def mirrored_text_fits(text: str) -> bool:
+    """
+    Whether a user message with *text* fits one session event once mirrored.
+
+    :param text: The message text the forwarder would post, pastes restored.
+    :returns: ``True`` when its JSON encoding leaves room for the event envelope.
+    """
+    encoded = json.dumps(text, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return len(encoded) <= MAX_SESSION_EVENT_REQUEST_BYTES - _MIRRORED_MESSAGE_ENVELOPE_BYTES
+
+
 def _read_cached_file(cache: Path, name: str) -> bytes | None:
     """
     Read the regular file *name* from *cache* without following symlinks.
@@ -257,7 +274,10 @@ def _read_cached_file(cache: Path, name: str) -> bytes | None:
             os.close(dir_fd)
         try:
             info = os.fstat(fd)
-            return _read_fd(fd, info.st_size) if stat.S_ISREG(info.st_mode) else None
+            # No restorable paste exceeds one session event, so a larger file is never read.
+            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SESSION_EVENT_REQUEST_BYTES:
+                return None
+            return _read_fd(fd, info.st_size)
         finally:
             os.close(fd)
     except OSError:

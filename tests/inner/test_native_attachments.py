@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from omnigent.inner import native_attachments
 from omnigent.inner.native_attachments import (
     ATTACHMENT_MARKER_STRIP_PATTERN,
     UNRESOLVED_ATTACHMENT_MARKER_PATTERN,
@@ -28,6 +29,7 @@ from omnigent.inner.native_attachments import (
     restore_spilled_text,
     unresolved_attachment_marker,
 )
+from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 
 # A 1x1 transparent PNG, base64-encoded — small but a real decodable image.
 _PNG_B64 = (
@@ -458,9 +460,11 @@ def test_restore_spilled_text_puts_each_paste_back_in_place(tmp_path: Path) -> N
     assert restore_spilled_text(echoed, tmp_path) == "\n\n".join(["Compare these:", first, second])
 
 
-@pytest.mark.parametrize("case", ["other-session", "edited", "missing", "symlink", "inline"])
+@pytest.mark.parametrize(
+    "case", ["other-session", "edited", "missing", "symlink", "inline", "oversized"]
+)
 def test_restore_spilled_text_leaves_unverified_references_alone(
-    tmp_path: Path, case: str
+    tmp_path: Path, case: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Only this session's cache file, still holding the digested text, is read back."""
     bridge = tmp_path / "bridge"
@@ -474,6 +478,15 @@ def test_restore_spilled_text_leaves_unverified_references_alone(
         path.write_text("edited after the spill", encoding="utf-8")
     elif case == "missing":
         path.unlink()
+    elif case == "oversized":
+        # Sparse, so the test stays cheap; a read would allocate the whole file.
+        with path.open("r+b") as handle:
+            handle.truncate(MAX_SESSION_EVENT_REQUEST_BYTES + 1)
+
+        def _unexpected_read(fd: int, size: int) -> bytes:
+            raise AssertionError(f"read {size} bytes of an oversized cache file")
+
+        monkeypatch.setattr(native_attachments, "_read_fd", _unexpected_read)
     elif case == "symlink":
         outside = tmp_path / "outside.txt"
         outside.write_text("original paste", encoding="utf-8")

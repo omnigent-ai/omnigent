@@ -8,6 +8,7 @@ import pytest
 
 from omnigent.harnesses.codex_native import forwarder as fwd
 from omnigent.inner.native_attachments import materialize_text
+from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from tests.harnesses.codex_native.forwarder._support import (
     _RecordingClient,
 )
@@ -121,12 +122,25 @@ async def test_post_user_message_mirrors_a_spilled_paste_as_sent(
 
 
 @pytest.mark.asyncio
-async def test_post_user_message_keeps_the_reference_when_the_paste_would_not_fit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_post_user_message_restores_a_paste_whose_whole_event_fits(tmp_path: Path) -> None:
+    """Sizing uses the real event, so a paste just under the limit is mirrored in full."""
+    paste = "x" * 10_450_000
+    reference = f"[Attached file: {materialize_text(paste, tmp_path)}]"
+    item = {"type": "userMessage", "content": [{"type": "text", "text": reference}]}
+    client = _RecordingClient()
+
+    await fwd._post_user_message(client, "conv_x", {"turnId": "t1"}, item, bridge_dir=tmp_path)
+
+    [(_url, body)] = client.posts
+    assert body["data"]["item_data"]["content"] == [{"type": "input_text", "text": paste}]
+
+
+async def test_post_user_message_keeps_the_reference_only_past_the_event_limit(
+    tmp_path: Path,
 ) -> None:
-    """A restored message too large for one event is mirrored with its reference instead."""
-    monkeypatch.setattr(fwd, "MAX_SESSION_EVENT_REQUEST_BYTES", fwd._EVENT_ENVELOPE_HEADROOM_BYTES)
-    reference = f"[Attached file: {materialize_text('x' * 1_000, tmp_path)}]"
+    """The executor refuses such a paste first; this only guards a bypassed check."""
+    paste = "x" * MAX_SESSION_EVENT_REQUEST_BYTES
+    reference = f"[Attached file: {materialize_text(paste, tmp_path)}]"
     item = {"type": "userMessage", "content": [{"type": "text", "text": reference}]}
     client = _RecordingClient()
 
