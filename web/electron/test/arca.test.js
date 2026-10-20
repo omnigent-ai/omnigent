@@ -8,11 +8,12 @@ const {
   buildLoginArgs,
   connectArcaHost,
   describeConnectFailure,
-  ensureDbcert,
+  checkDbcert,
   readArcaStatus,
   resolveArcaPath,
   runArcaExtend,
   runDbcertRefresh,
+  runDbcertArcaSync,
   startArcaConnect,
   startArcaLogin,
 } = require("../src/arca");
@@ -152,11 +153,41 @@ describe("dbcert refresh", () => {
     resolveDbcertPath: () => "/bin/dbcert",
   });
 
-  it("forces a new certificate and names Omnigent as the caller", async () => {
+  it("renews for Omnigent without updating kubeconfig", async () => {
     const deps = dbcertDeps([{ stdout: "All credentials successfully written" }]);
     assert.deepEqual(await runDbcertRefresh(deps), { ok: true });
-    assert.deepEqual(deps.calls, [["--force", "--caller-name", "omnigent"]]);
+    assert.deepEqual(deps.calls, [
+      ["--force", "--caller-name", "omnigent", "--update-kubeconfig=false"],
+    ]);
   });
+
+  it("can sync already-renewed credentials without another browser sign-in", async () => {
+    const deps = dbcertDeps([{ code: 0 }]);
+    assert.deepEqual(await runDbcertArcaSync(deps), { ok: true });
+    assert.deepEqual(deps.calls, [["sync-arca"]]);
+  });
+
+  for (const skipArcaSync of [false, true]) {
+    it(`sets local-only renewal environment only when requested (${skipArcaSync})`, async () => {
+      const deps = dbcertDeps([{ code: 0 }]);
+      const inheritedSkip = process.env.DBCERT_SKIP_ARCA_SYNC;
+      let environment;
+      const result = await runDbcertRefresh({
+        ...deps,
+        skipArcaSync,
+        spawn: (binary, args, options) => {
+          environment = options.env;
+          return deps.spawn(binary, args);
+        },
+      });
+      assert.deepEqual(result, { ok: true });
+      assert.deepEqual(
+        environment,
+        skipArcaSync ? { ...process.env, DBCERT_SKIP_ARCA_SYNC: "1" } : undefined,
+      );
+      assert.equal(process.env.DBCERT_SKIP_ARCA_SYNC, inheritedSkip);
+    });
+  }
 
   it("reports the last line dbcert printed when it fails", async () => {
     const deps = dbcertDeps([{ code: 1, stderr: "Opening browser\nlogin was canceled\n" }]);
@@ -195,46 +226,30 @@ describe("Arclet dbcert preflight", () => {
 
   it("leaves a valid certificate alone", async () => {
     const deps = depsFor([{ code: 0 }]);
-    assert.deepEqual(await ensureDbcert(deps), { ok: true });
+    assert.deepEqual(await checkDbcert(deps), { ok: true, valid: true });
     assert.deepEqual(deps.calls, [["status"]]);
   });
 
-  it("renews invalid credentials locally and verifies them before continuing", async () => {
-    const deps = depsFor([{ code: 1 }, { code: 0 }, { code: 0 }]);
-    const spawn = deps.spawn;
-    const environments = [];
-    deps.spawn = (binary, args, options) => {
-      environments.push(options.env);
-      return spawn(binary, args);
-    };
-    assert.deepEqual(await ensureDbcert(deps), { ok: true });
-    assert.deepEqual(deps.calls, [
-      ["status"],
-      ["--force", "--caller-name", "omnigent"],
-      ["status"],
-    ]);
-    assert.equal(environments[1].DBCERT_SKIP_ARCA_SYNC, "1");
-    assert.equal(environments[1].PATH, process.env.PATH);
-    assert.equal(environments[0], undefined);
+  it("reports missing or expired credentials without starting sign-in", async () => {
+    const deps = depsFor([{ code: 1 }]);
+    assert.deepEqual(await checkDbcert(deps), { ok: true, valid: false });
+    assert.deepEqual(deps.calls, [["status"]]);
   });
 
-  it("does not accept a successful login process that left invalid credentials", async () => {
-    const deps = depsFor([{ code: 1 }, { code: 0 }, { code: 1 }]);
-    const result = await ensureDbcert(deps);
-    assert.equal(result.ok, false);
-    assert.match(result.error, /still invalid after sign-in/);
-    assert.equal(deps.calls.length, 3);
-  });
-
-  it("stops when sign-in fails instead of rechecking or retrying it", async () => {
-    const deps = depsFor([{ code: 1 }, { code: 1, stderr: "Sign-in canceled" }]);
-    assert.deepEqual(await ensureDbcert(deps), { ok: false, error: "Sign-in canceled" });
-    assert.equal(deps.calls.length, 2);
-  });
+  for (const exitCode of [2, 127]) {
+    it(`reports status exit ${exitCode} as a check failure, not invalid credentials`, async () => {
+      const deps = depsFor([{ code: exitCode }]);
+      assert.deepEqual(await checkDbcert(deps), {
+        ok: false,
+        error: `Couldn't check your laptop's dbcert (exit ${exitCode}).`,
+      });
+      assert.deepEqual(deps.calls, [["status"]]);
+    });
+  }
 
   it("reports a missing CLI without attempting sign-in", async () => {
     const deps = { ...depsFor([]), resolveDbcertPath: () => null };
-    const result = await ensureDbcert(deps);
+    const result = await checkDbcert(deps);
     assert.equal(result.ok, false);
     assert.match(result.error, /Install dbcert/);
     assert.deepEqual(deps.calls, []);
@@ -243,12 +258,11 @@ describe("Arclet dbcert preflight", () => {
   it("does not turn a stuck status check into an interactive renewal", async () => {
     const child = fakeConnectChild();
     const deps = depsFor([]);
-    const result = await ensureDbcert({
+    const result = await checkDbcert({
       ...deps,
       spawn: () => child,
       timeoutMs: 5,
       killGraceMs: 5,
-      refreshDbcert: () => assert.fail("status failure must not start login"),
     });
     assert.equal(result.ok, false);
     assert.match(result.error, /Couldn't check/);
@@ -256,12 +270,11 @@ describe("Arclet dbcert preflight", () => {
   });
 
   it("does not renew if the status process cannot start", async () => {
-    const result = await ensureDbcert({
+    const result = await checkDbcert({
       ...depsFor([]),
       spawn: () => {
         throw new Error("spawn EACCES");
       },
-      refreshDbcert: () => assert.fail("spawn failure must not start login"),
     });
     assert.equal(result.ok, false);
     assert.match(result.error, /Couldn't check/);

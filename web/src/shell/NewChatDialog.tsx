@@ -70,6 +70,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
+import { LaptopDbcertBanner } from "@/components/DbcertBanner";
 import { iconForAgent } from "@/components/AgentCard";
 import claudeCodeLogo from "@/assets/claude-code-logo.svg";
 import { showToast } from "@/components/ui/toast";
@@ -263,7 +264,7 @@ import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
   controlHost,
-  ensureDbcert,
+  checkDbcert,
   getDesktopFeatures,
   getHostIdentity,
   hasDbcertPreflightBridge,
@@ -2298,6 +2299,7 @@ export function NewChatLandingScreen() {
         };
 
   const [message, setMessage] = useState<string>(() => restoredDraft?.message ?? "");
+  const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
@@ -2322,7 +2324,9 @@ export function NewChatLandingScreen() {
 
   // Drag-and-drop — as in the in-session composer, a file dropped anywhere on
   // the landing surface attaches here. Declared after ``landingSurface``.
-  const isDragActive = useFileDropTarget(landingSurface, addFiles);
+  const isDragActive = useFileDropTarget(landingSurface, (droppedFiles) => {
+    if (!checkingDbcert) addFiles(droppedFiles);
+  });
 
   // Gates the sandbox host option: only servers whose sandbox
   // config can actually serve a managed launch advertise it. "loading"
@@ -2626,8 +2630,9 @@ export function NewChatLandingScreen() {
   // Controlled so selecting an existing worktree can close the popover.
   const [worktreePopoverOpen, setWorktreePopoverOpen] = useState(false);
   const [creating, setCreating] = useState(false);
-  const [checkingDbcert, setCheckingDbcert] = useState(false);
+  const [dbcertRequired, setDbcertRequired] = useState(false);
   const createAttemptRef = useRef<symbol | null>(null);
+  const skipDbcertCheckRef = useRef<(() => void) | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
   // "Connect a host" instructions modal, opened from the host dropdown.
   const [connectOpen, setConnectOpen] = useState(false);
@@ -5420,8 +5425,12 @@ export function NewChatLandingScreen() {
         const features = await getDesktopFeatures();
         if (!onScreenRef.current || window.location.href !== createLocation) return;
         if (features?.databricksInternalFeatures === true && features.canRefreshDbcert === true) {
+          const skipCheck = new Promise<null>((resolve) => {
+            skipDbcertCheckRef.current = () => resolve(null);
+          });
           setCheckingDbcert(true);
-          const credentials = await ensureDbcert();
+          const credentials = await Promise.race([checkDbcert(), skipCheck]);
+          skipDbcertCheckRef.current = null;
           if (
             createAttemptRef.current !== createAttempt ||
             !onScreenRef.current ||
@@ -5429,13 +5438,16 @@ export function NewChatLandingScreen() {
           )
             return;
           setCheckingDbcert(false);
-          if (!credentials.ok) {
+          if (credentials !== null && !credentials.ok) {
             setCreateError(credentials.error);
             return;
           }
+          const needsDbcert = credentials !== null && !credentials.valid;
+          setDbcertRequired(needsDbcert);
+          if (needsDbcert) return;
         }
       }
-      // Spend the draft only once provisioning starts, after laptop sign-in.
+      // Spend the draft only once provisioning starts, after the laptop credential check.
       submittedDraftRevisionRef.current = landingDraftRevision;
       submittedRef.current = true;
       const trimmedBranch = branchName.trim();
@@ -5969,6 +5981,7 @@ export function NewChatLandingScreen() {
     } finally {
       if (createAttemptRef.current === createAttempt) {
         createAttemptRef.current = null;
+        skipDbcertCheckRef.current = null;
         setCheckingDbcert(false);
         setCreating(false);
       }
@@ -6137,9 +6150,10 @@ export function NewChatLandingScreen() {
         </div>
         {/* Drop cue, spanning the landing surface. */}
         {isDragActive && landingSurface ? <FileDropOverlay container={landingSurface} /> : null}
-        <div
+        <fieldset
+          disabled={checkingDbcert}
           className={cn(
-            "relative flex flex-col gap-0 max-md:w-[calc(100%-1rem)]",
+            "relative flex min-w-0 flex-col gap-0 max-md:w-[calc(100%-1rem)]",
             COMPOSER_COLUMN_WIDTH,
           )}
           data-testid="new-chat-landing-composer-surface"
@@ -7196,7 +7210,7 @@ export function NewChatLandingScreen() {
                 : undefined
             }
           />
-        </div>
+        </fieldset>
         <div className="mt-1 flex w-full flex-col gap-1" data-testid="new-chat-landing-notices">
           {supportsAgySkipPermissions &&
             !autoRoutingSelected &&
@@ -7305,23 +7319,23 @@ export function NewChatLandingScreen() {
               data-testid="new-chat-landing-dbcert-status"
             >
               <Spinner className="size-4 shrink-0" />
-              <p role="status">
-                Checking laptop credentials. Complete any browser sign-in to start your Arclet
-                automatically.
-              </p>
+              <p role="status">Checking laptop credentials…</p>
               <Button
                 type="button"
                 variant="ghost"
                 size="sm"
-                onClick={() => {
-                  createAttemptRef.current = null;
-                  setCheckingDbcert(false);
-                  setCreating(false);
-                }}
+                onClick={() => skipDbcertCheckRef.current?.()}
               >
-                Cancel launch
+                Skip
               </Button>
             </div>
+          )}
+
+          {dbcertRequired && sandboxSelected && effectiveSandboxProvider === "arclet" && (
+            <LaptopDbcertBanner
+              onReady={() => setDbcertRequired(false)}
+              onDismiss={() => setDbcertRequired(false)}
+            />
           )}
 
           {connectError && (

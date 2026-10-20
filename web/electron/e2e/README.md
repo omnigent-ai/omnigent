@@ -128,8 +128,13 @@ instruction to chat. No instruction bar should appear below the browser URL.
 
 `desktop_dbcert_preflight.e2e.js` drives New Session → Arclet Sandbox through
 the real SPA, preload, main process, CLI subprocess, and local server. It checks
-that provisioning waits for credential renewal, the original task resumes once,
-and valid credentials skip renewal. The dbcert executable and machine policy
+that missing or expired credentials block launch with a refresh banner, renewal
+only starts on click, and the preserved task launches only on a later submit.
+It also checks that prelaunch renewal skips kubeconfig updates and existing-Arca
+sync, verifies the local credentials before clearing the banner, and skips
+renewal for valid credentials. Choosing Skip during a pending check starts one
+session without waiting, and a late invalid result does not interrupt the launch.
+The dbcert executable and machine policy
 are fixtures; cloud allocation remains gated. This test does not cover macOS
 SSO or Companion's credential transfer.
 
@@ -142,10 +147,18 @@ OMNIGENT_PYTHON=/path/to/venv/bin/python \
 
 Human check: use the updated desktop shell and web bundle on a managed server,
 with Arca Companion running. With an expired or missing laptop dbcert, submit
-a task to Arclet Sandbox. Finish the browser sign-in and confirm the same task
-starts automatically. Repeat with a valid dbcert and confirm no sign-in opens.
-During a pending sign-in, Cancel launch should preserve the draft and prevent
-Arclet creation even if sign-in later finishes.
+a task to Arclet Sandbox. Confirm a yellow banner appears, the draft stays, and
+no browser or sandbox opens. Click Refresh dbcert, finish browser sign-in, and
+confirm the banner clears without launching anything. Submit again to launch
+the original task. Prelaunch refresh waits for local renewal and validation, not
+sync to an existing Arca; Companion transfers credentials separately. Repeat
+with a valid dbcert and confirm no sign-in opens.
+Dismiss the warning while the cert is invalid and submit again: the warning
+must return without creating an Arclet. A canceled or failed refresh should
+leave the draft and offer a retry.
+While the credential-check spinner is visible, click Skip to continue without
+verification. Confirm this starts one session without sign-in; later launches
+must check credentials again. Skipping does not guarantee sandbox authentication.
 
 ## Authoring a desktop reproduction
 

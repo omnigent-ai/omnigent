@@ -22,7 +22,7 @@ const {
 const deps = desktopDepsAvailable();
 
 it(
-  "desktop waits for laptop credentials before creating an Arclet",
+  "desktop supports refreshing or skipping an Arclet credential check",
   {
     skip: deps.ok ? false : `missing deps: ${deps.missing.join(", ")}`,
     timeout: 90_000,
@@ -50,17 +50,26 @@ const root = process.env.OMNIGENT_DBCERT_TEST_DIR;
 const file = name => path.join(root, name);
 const args = process.argv.slice(2);
 fs.appendFileSync(file("commands.jsonl"), JSON.stringify(args) + "\\n");
-if (args[0] === "status") process.exit(fs.existsSync(file("valid")) ? 0 : 1);
-if (process.env.DBCERT_SKIP_ARCA_SYNC !== "1") process.exit(2);
-fs.writeFileSync(file("sign-in-pid"), String(process.pid));
-process.on("exit", () => fs.rmSync(file("sign-in-pid"), { force: true }));
-fs.writeFileSync(file("sign-in-started"), "");
-const poll = setInterval(() => {
-  if (!fs.existsSync(file("complete-sign-in"))) return;
-  clearInterval(poll);
-  fs.writeFileSync(file("valid"), "");
-  process.exit(0);
-}, 20);
+if (args[0] === "status") {
+  fs.writeFileSync(file("status-started"), "");
+  const finishStatus = () => {
+    if (!fs.existsSync(file("hold-status"))) process.exit(fs.existsSync(file("valid")) ? 0 : 1);
+  };
+  finishStatus();
+  setInterval(finishStatus, 20);
+} else {
+  if (!args.includes("--update-kubeconfig=false")) process.exit(2);
+  if (process.env.DBCERT_SKIP_ARCA_SYNC !== "1") process.exit(3);
+  fs.writeFileSync(file("sign-in-pid"), String(process.pid));
+  process.on("exit", () => fs.rmSync(file("sign-in-pid"), { force: true }));
+  fs.writeFileSync(file("sign-in-started"), "");
+  const poll = setInterval(() => {
+    if (!fs.existsSync(file("complete-sign-in"))) return;
+    clearInterval(poll);
+    fs.writeFileSync(file("valid"), "");
+    process.exit(0);
+  }, 20);
+}
 `,
       { mode: 0o755 },
     );
@@ -152,24 +161,31 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[3]))
       const prompt = "Keep this task until laptop sign-in finishes.";
       await page.getByTestId("new-chat-landing-input").fill(prompt);
       await page.getByTestId("new-chat-landing-submit").click();
-      await expect
-        .poll(() => creates.length > 0 || fs.existsSync(path.join(root, "sign-in-started")))
-        .toBe(true);
+      await expect(page.getByRole("button", { name: "Refresh dbcert" })).toBeVisible();
       assert.equal(creates.length, 0, "Arclet creation must wait for usable laptop credentials");
-      await expect.poll(() => fs.existsSync(path.join(root, "sign-in-started"))).toBe(true);
-      await expect(page.getByTestId("new-chat-landing-dbcert-status")).toContainText(
-        "browser sign-in",
-      );
-      assert.equal(creates.length, 0);
+      assert.equal(fs.existsSync(path.join(root, "sign-in-started")), false);
+      await expect(page.getByTestId("new-chat-landing-input")).toHaveValue(prompt);
       const before = await fetch(`${serverUrl}/__test/state`).then((response) => response.json());
       assert.equal(before.provisioning, false);
+      await page.screenshot({ path: path.join(recordDir, "credentials-required.png") });
+      await page.getByRole("button", { name: "Refresh dbcert" }).click();
+      await expect.poll(() => fs.existsSync(path.join(root, "sign-in-started"))).toBe(true);
+      await expect(page.getByText("Opening browser sign-in.", { exact: false })).toBeVisible();
+      assert.equal(creates.length, 0);
       await page.screenshot({ path: path.join(recordDir, "waiting-for-sign-in.png") });
+      fs.writeFileSync(path.join(root, "complete-sign-in"), "");
+      await expect(page.getByRole("button", { name: "Refreshing…" })).toBeHidden();
+      await expect(
+        page.getByText("Your laptop's dbcert is missing or expired.", { exact: false }),
+      ).toBeHidden();
+      assert.equal(creates.length, 0, "Finishing sign-in must not automatically create an Arclet");
+      await expect(page.getByTestId("new-chat-landing-input")).toHaveValue(prompt);
       const createdResponse = page.waitForResponse(
         (response) =>
           response.request().method() === "POST" &&
           new URL(response.url()).pathname === "/v1/sessions",
       );
-      fs.writeFileSync(path.join(root, "complete-sign-in"), "");
+      await page.getByTestId("new-chat-landing-submit").click();
       const response = await createdResponse;
       assert.equal(response.status(), 201, await response.text());
       assert.equal(creates.length, 1);
@@ -183,7 +199,8 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[3]))
         .map(JSON.parse);
       assert.deepEqual(commands, [
         ["status"],
-        ["--force", "--caller-name", "omnigent"],
+        ["--force", "--caller-name", "omnigent", "--update-kubeconfig=false"],
+        ["status"],
         ["status"],
       ]);
       await expect
@@ -192,8 +209,9 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[3]))
         )
         .toBe(true);
       // An already-valid laptop does not open another sign-in.
-      assert.deepEqual(await page.evaluate(() => window.omnigentDesktop.ensureDbcert()), {
+      assert.deepEqual(await page.evaluate(() => window.omnigentDesktop.checkDbcert()), {
         ok: true,
+        valid: true,
       });
       const laterCommands = fs
         .readFileSync(path.join(root, "commands.jsonl"), "utf8")
@@ -202,7 +220,49 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[3]))
         .map(JSON.parse);
       assert.deepEqual(laterCommands.at(-1), ["status"]);
       assert.equal(laterCommands.filter((args) => args[0] === "--force").length, 1);
+
+      fs.rmSync(path.join(root, "valid"));
+      fs.rmSync(path.join(root, "status-started"));
+      fs.writeFileSync(path.join(root, "hold-status"), "");
+      await page.goto(serverUrl);
+      await page.getByTestId("new-chat-landing-agent-select").click();
+      await page.getByTestId(`new-chat-landing-agent-${agentId}`).click();
+      const skippedPrompt = "Continue without waiting for laptop credentials.";
+      await page.getByTestId("new-chat-landing-input").fill(skippedPrompt);
+      await page.getByTestId("new-chat-landing-submit").click();
+      await expect(page.getByText("Checking laptop credentials…", { exact: true })).toBeVisible();
+      await expect(page.getByTestId("new-chat-landing-input")).toBeDisabled();
+      await expect(page.getByTestId("new-chat-landing-repo-chip")).toBeDisabled();
+      await expect(page.getByTestId("new-chat-landing-agent-select")).toBeDisabled();
+      await expect.poll(() => fs.existsSync(path.join(root, "status-started"))).toBe(true);
+      assert.equal(creates.length, 1);
+      await page.screenshot({ path: path.join(recordDir, "skippable-credential-check.png") });
+      const pendingStatus = page.evaluate(() => window.omnigentDesktop.checkDbcert());
+      const skippedCreateResponse = page.waitForResponse(
+        (candidateResponse) =>
+          candidateResponse.request().method() === "POST" &&
+          new URL(candidateResponse.url()).pathname === "/v1/sessions",
+      );
+      await page.getByRole("button", { name: "Skip", exact: true }).click();
+      const skippedResponse = await skippedCreateResponse;
+      assert.equal(skippedResponse.status(), 201, await skippedResponse.text());
+      assert.equal(creates.length, 2);
+      assert.equal(creates[1].postDataJSON().initial_input.data.content[0].text, skippedPrompt);
+      assert.equal(fs.existsSync(path.join(root, "hold-status")), true);
+      await expect(page.getByText("Checking laptop credentials…", { exact: true })).toBeHidden();
+      await page.screenshot({ path: path.join(recordDir, "skipped-credential-check.png") });
+      fs.rmSync(path.join(root, "hold-status"));
+      assert.deepEqual(await pendingStatus, { ok: true, valid: false });
+      await expect(page.getByRole("button", { name: "Refresh dbcert" })).toBeHidden();
+      assert.equal(creates.length, 2);
+      const finalCommands = fs
+        .readFileSync(path.join(root, "commands.jsonl"), "utf8")
+        .trim()
+        .split("\n")
+        .map(JSON.parse);
+      assert.equal(finalCommands.filter((args) => args[0] === "--force").length, 1);
     } finally {
+      fs.rmSync(path.join(root, "hold-status"), { force: true });
       if (fs.existsSync(path.join(root, "sign-in-pid"))) {
         const pid = Number(fs.readFileSync(path.join(root, "sign-in-pid"), "utf8"));
         try {
@@ -219,7 +279,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[3]))
       await fetch(`${serverUrl}/__test/provision/release`, { method: "POST" }).catch(() => {});
       server.kill("SIGTERM");
       const kill = setTimeout(() => server.kill("SIGKILL"), 5000);
-      if (server.exitCode === null)
+      if (server.exitCode === null && server.signalCode === null)
         await new Promise((resolve) => {
           server.once("close", resolve);
         });

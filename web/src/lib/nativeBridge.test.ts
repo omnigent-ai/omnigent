@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   applyMacElectronShellAttribute,
-  ensureDbcert,
+  checkDbcert,
   getServerPicker,
   hasDbcertPreflightBridge,
   isAndroidShell,
@@ -10,6 +10,7 @@ import {
   isIOSShell,
   isNativeShell,
   nativeNotify,
+  refreshDbcert,
   onNativeNotificationActivated,
   onNativeSidebarDrag,
   PRE_MANIFEST_BASELINE,
@@ -146,25 +147,51 @@ afterEach(() => {
 });
 
 describe("dbcert preflight bridge", () => {
+  it("forwards local-only renewal options without changing ordinary refresh calls", async () => {
+    const nativeRefresh = vi.fn().mockResolvedValue({ ok: true });
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      refreshDbcert: nativeRefresh,
+    };
+    expect(await refreshDbcert({ skipArcaSync: true })).toEqual({ ok: true });
+    expect(nativeRefresh).toHaveBeenLastCalledWith({ skipArcaSync: true });
+    expect(await refreshDbcert()).toEqual({ ok: true });
+    expect(nativeRefresh).toHaveBeenLastCalledWith();
+  });
+
   it("detects older shells and browsers without the new method", async () => {
     setElectron(false);
     expect(hasDbcertPreflightBridge()).toBe(false);
-    expect((await ensureDbcert()).ok).toBe(false);
+    expect((await checkDbcert()).ok).toBe(false);
     setElectron(true);
     expect(hasDbcertPreflightBridge()).toBe(false);
-    expect((await ensureDbcert()).ok).toBe(false);
+    expect((await checkDbcert()).ok).toBe(false);
   });
 
+  it.each(["checkDbcert", "refreshDbcert", "ensureDbcert"])(
+    "requires both checking and refresh, not just %s",
+    (method) => {
+      (window as unknown as Record<string, unknown>).omnigentDesktop = {
+        kind: "electron",
+        [method]: vi.fn(),
+      };
+      expect(hasDbcertPreflightBridge()).toBe(false);
+    },
+  );
+
   it("passes through the native result and turns an IPC failure into a retryable error", async () => {
-    const nativeEnsure = vi.fn().mockResolvedValue({ ok: true });
+    const nativeCheck = vi.fn().mockResolvedValue({ ok: true, valid: false });
     (window as unknown as Record<string, unknown>).omnigentDesktop = {
       kind: "electron",
-      ensureDbcert: nativeEnsure,
+      checkDbcert: nativeCheck,
+      refreshDbcert: vi.fn(),
     };
     expect(hasDbcertPreflightBridge()).toBe(true);
-    expect(await ensureDbcert()).toEqual({ ok: true });
-    nativeEnsure.mockRejectedValue(new Error("IPC channel closed"));
-    expect(await ensureDbcert()).toEqual({
+    expect(await checkDbcert()).toEqual({ ok: true, valid: false });
+    nativeCheck.mockResolvedValueOnce({ ok: true, valid: true });
+    expect(await checkDbcert()).toEqual({ ok: true, valid: true });
+    nativeCheck.mockRejectedValue(new Error("IPC channel closed"));
+    expect(await checkDbcert()).toEqual({
       ok: false,
       error: "Couldn't check your laptop's dbcert. Try again.",
     });

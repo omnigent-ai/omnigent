@@ -857,29 +857,40 @@ function resolveDbcertPathAsync(deps = {}) {
 
 /**
  * Renew this machine's dbcert with `dbcert --force`, which signs in through
- * the browser. dbcert then syncs the primary Arca itself, and Arca Companion,
- * which watches `~/.dbcert`, copies the new certificate to the user's other
- * Arcas and Arclets. `--force` mints a new certificate even while this
+ * the browser. Unless skipped, dbcert syncs the primary Arca itself. Arca Companion
+ * watches `~/.dbcert` and copies the certificate to the user's Arcas and Arclets.
+ * `--force` mints a new certificate even while this
  * machine's is valid, so a box that missed the last copy gets one too.
  *
  * @param {{ resolveDbcertPath?: () => string | null | Promise<string | null>, spawn?: typeof spawn, timeoutMs?: number, killGraceMs?: number, skipArcaSync?: boolean }} [deps]
  * @returns {Promise<{ ok: true } | { ok: false, error: string }>}
  */
 async function runDbcertRefresh(deps = {}) {
+  return runDbcertCommand(
+    ["--force", "--caller-name", "omnigent", "--update-kubeconfig=false"],
+    "sign-in",
+    deps,
+  );
+}
+
+async function runDbcertArcaSync(deps = {}) {
+  return runDbcertCommand(["sync-arca"], "Arca sync", deps);
+}
+
+async function runDbcertCommand(args, action, deps) {
   try {
     const dbcertPath = await (deps.resolveDbcertPath || resolveDbcertPathAsync)();
     if (!dbcertPath) return { ok: false, error: "dbcert was not found on this machine." };
-    const run = await runArca(dbcertPath, ["--force", "--caller-name", "omnigent"], {
+    const run = await runArca(dbcertPath, args, {
       spawn: deps.spawn,
       timeoutMs: deps.timeoutMs ?? DBCERT_REFRESH_TIMEOUT_MS,
       killGraceMs: deps.killGraceMs,
       maxOutputBytes: MAX_CLI_OUTPUT_BYTES,
-      // Preflight only needs local credentials; Companion handles the new Arclet.
       ...(deps.skipArcaSync ? { env: { ...process.env, DBCERT_SKIP_ARCA_SYNC: "1" } } : {}),
     });
     if (run.spawnError)
       return { ok: false, error: `Couldn't run dbcert: ${run.spawnError.message}` };
-    if (run.timedOut) return { ok: false, error: "The dbcert sign-in timed out." };
+    if (run.timedOut) return { ok: false, error: `The dbcert ${action} timed out.` };
     if (run.code !== 0) {
       const output = run.stderr.trim() || run.stdout.trim();
       return {
@@ -907,16 +918,18 @@ async function readDbcertStatus(dbcertPath, deps) {
       error: "Couldn't check your laptop's dbcert. Try again, or check dbcert in Arca Companion.",
     };
   }
+  if (run.code !== 0 && run.code !== 1) {
+    return { ok: false, error: `Couldn't check your laptop's dbcert (exit ${run.code}).` };
+  }
   return { ok: true, valid: run.code === 0 };
 }
 
 /**
- * Ensure local credentials are usable before provisioning an Arclet.
- * An injected refresh shares sign-in with other desktop windows.
- * @param {Parameters<typeof runDbcertRefresh>[0] & { refreshDbcert?: typeof runDbcertRefresh }} [deps]
- * @returns {Promise<{ ok: true } | { ok: false, error: string }>}
+ * Check local credentials before provisioning an Arclet without starting sign-in.
+ * @param {Parameters<typeof runDbcertRefresh>[0]} [deps]
+ * @returns {Promise<{ ok: true, valid: boolean } | { ok: false, error: string }>}
  */
-async function ensureDbcert(deps = {}) {
+async function checkDbcert(deps = {}) {
   try {
     const dbcertPath = await (deps.resolveDbcertPath || resolveDbcertPathAsync)();
     if (!dbcertPath) {
@@ -925,25 +938,7 @@ async function ensureDbcert(deps = {}) {
         error: "dbcert is not installed on this laptop. Install dbcert, then try again.",
       };
     }
-    const status = await readDbcertStatus(dbcertPath, deps);
-    if (!status.ok) return status;
-    if (status.valid) return { ok: true };
-    const renewed = await (deps.refreshDbcert || runDbcertRefresh)({
-      ...deps,
-      resolveDbcertPath: () => dbcertPath,
-      skipArcaSync: true,
-    });
-    if (!renewed.ok) return renewed;
-    const verified = await readDbcertStatus(dbcertPath, deps);
-    if (!verified.ok) return verified;
-    if (!verified.valid) {
-      return {
-        ok: false,
-        error:
-          "Your laptop's dbcert is still invalid after sign-in. Renew it in Arca Companion, then try again.",
-      };
-    }
-    return { ok: true };
+    return await readDbcertStatus(dbcertPath, deps);
   } catch {
     return { ok: false, error: "Couldn't check your laptop's dbcert. Try again." };
   }
@@ -955,7 +950,8 @@ module.exports = {
   EXTEND_TIMEOUT_MS,
   DBCERT_REFRESH_TIMEOUT_MS,
   runDbcertRefresh,
-  ensureDbcert,
+  runDbcertArcaSync,
+  checkDbcert,
   parseArcaStatus,
   readArcaStatus,
   runArcaExtend,
