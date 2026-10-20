@@ -109,7 +109,7 @@ function GridSidebarRow({
     return (
       <li>
         <SidebarEditRow
-          initialTitle={title}
+          initialTitle={grid.name ?? ""}
           label="Rename grid"
           onCancel={() => setEditing(false)}
           onCommit={(name) => {

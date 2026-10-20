@@ -1,9 +1,18 @@
-import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactNode,
+} from "react";
 import { toast } from "sonner";
 import { useViewerId } from "@/hooks/useViewerId";
 import { getOmnigentServerIdentity } from "@/lib/host";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
+import { randomUUID } from "@/lib/randomUUID";
 import { useNavigate, useParams } from "@/lib/routing";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { isTempConvId } from "@/lib/tempConversationId";
@@ -47,15 +56,24 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
   const conversationId = isTempConvId(routeConversationId) ? undefined : routeConversationId;
   const navigate = useNavigate();
   const storageKey = `omnigent:session-grids:${getOmnigentServerIdentity() ?? "default"}:${viewerId ?? "anonymous"}`;
-  const read = () => {
+  const read = useCallback(() => {
     try {
       return parseSessionGrids(localStorage.getItem(storageKey));
     } catch {
       return [];
     }
-  };
+  }, [storageKey]);
   const [saved, setSaved] = useState(() => ({ key: storageKey, grids: read() }));
   if (saved.key !== storageKey) setSaved({ key: storageKey, grids: read() });
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== null && event.key !== storageKey) return;
+      if (event.storageArea !== localStorage) return;
+      setSaved({ key: storageKey, grids: read() });
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [storageKey, read]);
   const grids = saved.key === storageKey ? saved.grids : EMPTY_GRIDS;
   const activeGrid = grids.find((grid) => grid.id === gridId);
   const value = useMemo<GridSessionsContextValue>(() => {
@@ -82,7 +100,7 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
         if (!layout) return;
         const next = splitGrid(layout, targetId, sessionId, edge);
         if (!next) return;
-        const grid = { ...activeGrid, id: activeGrid?.id ?? crypto.randomUUID(), layout: next };
+        const grid = { ...activeGrid, id: activeGrid?.id ?? randomUUID(), layout: next };
         save(
           activeGrid
             ? grids.map((entry) => (entry.id === grid.id ? grid : entry))

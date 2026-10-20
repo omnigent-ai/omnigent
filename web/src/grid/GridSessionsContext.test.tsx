@@ -4,7 +4,7 @@ import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { toast } from "sonner";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { gridSessionIds } from "./gridLayout";
+import { gridSessionIds, splitGrid } from "./gridLayout";
 import { GridSessionsProvider, useGridSessions } from "./GridSessionsContext";
 
 const identity = vi.hoisted(() => ({ viewer: "alice", server: "one" }));
@@ -72,9 +72,12 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
-it("persists across reloads, scopes grids to server and user, and collapses the last split", () => {
+it.each([true, false])("persists and scopes grids (secure context: %s)", (secureContext) => {
+  if (!secureContext)
+    vi.stubGlobal("crypto", { getRandomValues: crypto.getRandomValues.bind(crypto) });
   const view = render(tree("/c/first"));
   fireEvent.click(screen.getByText("Split"));
   const path = screen.getByTestId("path").textContent!;
@@ -100,6 +103,13 @@ it("persists across reloads, scopes grids to server and user, and collapses the 
 it("gates creation and keeps an unsaved grid usable when storage is full", () => {
   const read = vi.spyOn(Storage.prototype, "getItem");
   const view = render(tree("/c/first", false));
+  fireEvent(
+    window,
+    new StorageEvent("storage", {
+      key: "omnigent:session-grids:one:alice",
+      storageArea: localStorage,
+    }),
+  );
   expect(read).not.toHaveBeenCalledWith("omnigent:session-grids:one:alice");
   fireEvent.click(screen.getByText("Split"));
   expect(screen.getByTestId("path")).toHaveTextContent("/c/first");
@@ -113,6 +123,43 @@ it("gates creation and keeps an unsaved grid usable when storage is full", () =>
   expect(screen.getByTestId("path").textContent).toMatch(/^\/grid\//);
   expect(screen.getByTestId("count")).toHaveTextContent("1");
   expect(warning).toHaveBeenCalledOnce();
+  fireEvent.click(screen.getByText("Rename"));
+  fireEvent.click(screen.getByText("Add third"));
+  expect(screen.getByTestId("name")).toHaveTextContent("My work");
+  expect(screen.getByTestId("order")).toHaveTextContent("first,third,second");
+});
+
+it("syncs other tabs' grids before editing and observes removals", () => {
+  const key = "omnigent:session-grids:one:alice";
+  const layout = splitGrid("first", "first", "second", "right")!;
+  const grid = { id: "shared", layout };
+  localStorage.setItem(key, JSON.stringify([grid]));
+  render(tree("/grid/shared"));
+  const other = { id: "other", name: "Other work", layout };
+  const latest = [{ ...grid, name: "Renamed in another tab" }, other];
+  localStorage.setItem(key, JSON.stringify(latest));
+  fireEvent(window, new StorageEvent("storage", { key, storageArea: sessionStorage }));
+  fireEvent(
+    window,
+    new StorageEvent("storage", { key: `${key}-other`, storageArea: localStorage }),
+  );
+  expect(screen.getByTestId("count")).toHaveTextContent("1");
+  fireEvent(window, new StorageEvent("storage", { key, storageArea: localStorage }));
+  expect(screen.getByTestId("count")).toHaveTextContent("2");
+  expect(screen.getByTestId("name")).toHaveTextContent("Renamed in another tab");
+  fireEvent.click(screen.getByText("Add third"));
+  expect(JSON.parse(localStorage.getItem(key)!)).toEqual([
+    { ...latest[0], layout: splitGrid(layout, "first", "third", "bottom") },
+    other,
+  ]);
+  localStorage.setItem(key, JSON.stringify([other]));
+  fireEvent(window, new StorageEvent("storage", { key, storageArea: localStorage }));
+  fireEvent.click(screen.getByText("Add third"));
+  expect(screen.getByTestId("order")).toBeEmptyDOMElement();
+  expect(JSON.parse(localStorage.getItem(key)!)).toEqual([other]);
+  localStorage.clear();
+  fireEvent(window, new StorageEvent("storage", { key: null, storageArea: localStorage }));
+  expect(screen.getByTestId("count")).toHaveTextContent("0");
 });
 
 it("keeps a trimmed custom name through layout changes and reloads", () => {

@@ -116,6 +116,12 @@ def test_session_grid_drag_persist_live_updates_and_close(
         grid_nav = page.get_by_role("region", name="Grids")
         grid_nav.get_by_role("link").dblclick()
         rename = page.get_by_role("textbox", name="Rename grid")
+        page.get_by_role("heading", name="Grid · 2 sessions", exact=True).click()
+        _move_cell(page, "grid-0", "grid-1")
+        expect(grid_nav.get_by_role("link")).to_have_text("Grid session 1 + Grid session 0")
+        _move_cell(page, "grid-0", "grid-1")
+        expect(grid_nav.get_by_role("link")).to_have_text("Grid session 0 + Grid session 1")
+        grid_nav.get_by_role("link").dblclick()
         rename.fill("Cancelled title")
         rename.press("Escape")
         expect(grid_nav.get_by_role("link")).not_to_contain_text("Cancelled title")
@@ -231,7 +237,13 @@ def test_session_grid_drag_persist_live_updates_and_close(
         second = page.locator('[data-grid-session="grid-1"]')
         first.get_by_role("textbox").fill("Keep this draft")
         second.get_by_role("textbox").fill("Send to session one")
-        second.get_by_role("button", name="Send message", exact=True).click()
+        with page.expect_response(
+            lambda response: (
+                response.url.endswith(f"/{sessions[1].session_id}/events")
+                and response.request.method == "POST"
+            )
+        ):
+            second.get_by_role("button", name="Send message", exact=True).click()
         expect(first.get_by_role("textbox")).to_have_value("Keep this draft")
         expect(second.get_by_role("textbox")).to_have_value("")
         assert len(sessions[1].event_posts) == 1
