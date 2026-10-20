@@ -206,13 +206,9 @@ export interface ForkRunConfigValue {
   modelOverride?: string;
   reasoningEffort?: string;
   terminalLaunchArgs?: string[];
-  /**
-   * DANGEROUS codex full-bypass opt-in. Only emitted (as `true`) when the
-   * user explicitly picks "Bypass approvals & sandbox" for a codex target;
-   * the fork request carries it as `codex_bypass_sandbox` and the server
-   * stamps the bypass label. Absent otherwise — the source's own bypass is
-   * always dropped, so a fork is never silently armed.
-   */
+  /** DANGEROUS codex full-bypass opt-in, sent as `codex_bypass_sandbox` whenever
+   * the Approval row shows bypass behind its danger banner. The server stamps the
+   * bypass label from it and never copies the source's label. */
   codexBypassSandbox?: boolean;
 }
 
@@ -236,6 +232,8 @@ export interface ForkRunConfigValue {
  * inherit / reset-by-family path decides — which is exactly the seeded meaning.
  * This is what keeps the section honest against the async model catalog: a
  * submit before the catalog resolves can't emit a spurious `model_override`.
+ * A shown Codex bypass is the exception: the server never inherits it, so it
+ * is always sent.
  *
  * @param targetHarness - Effective target harness key (e.g. "claude-native"),
  *   or null for a non-native target (the section renders nothing).
@@ -349,9 +347,8 @@ function ForkRunConfig({
         ? CURSOR_NATIVE_DEFAULT_EXEC_MODE
         : AGY_NATIVE_DEFAULT_SKIP_MODE;
     // Codex bypass rides a LABEL, not launch args, so match it first: a
-    // same-agent fork of a bypass-armed codex source seeds the bypass option.
-    // (The source label is still dropped server-side; re-selecting here is the
-    // explicit opt-in that re-arms it — never automatic.)
+    // same-agent fork of a bypass-armed codex source seeds the bypass option,
+    // and the bannered value is what the fork submits.
     if (
       isCodex &&
       sameAgentAsSource &&
@@ -422,10 +419,9 @@ function ForkRunConfig({
     if (!touched.mode) setMode(seededModeValue);
   }, [seededModeValue, touched.mode]);
 
-  // Report the ready-to-send value on every change. Each field is included
-  // ONLY when its control was touched (see `touched` above); an untouched
-  // section therefore emits `{}` and the server inherits/resets as it would
-  // for a fork that sent no run-config at all.
+  // Report the ready-to-send value on every change. Untouched controls are
+  // omitted so the server inherits/resets them, except a shown Codex bypass,
+  // which the server never inherits.
   useEffect(() => {
     const value: ForkRunConfigValue = {};
     if (showModel && touched.model) {
@@ -441,16 +437,14 @@ function ForkRunConfig({
             ? []
             : ["--permission-mode", permission];
       }
+    } else if (hasApproval && isCodex && mode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE) {
+      // Bypass is a LABEL, not launch args. A pick clears preset flags; an
+      // untouched seed keeps the source's inherited args.
+      if (touched.mode) value.terminalLaunchArgs = [];
+      value.codexBypassSandbox = true;
     } else if (hasApproval && touched.mode) {
-      if (isCodex && mode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE) {
-        // Bypass is a LABEL, not launch args: clear any preset flags and set
-        // the dedicated opt-in the server turns into the bypass label.
-        value.terminalLaunchArgs = [];
-        value.codexBypassSandbox = true;
-      } else {
-        value.terminalLaunchArgs =
-          CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === mode)?.args ?? [];
-      }
+      value.terminalLaunchArgs =
+        CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === mode)?.args ?? [];
     } else if (hasCursor && touched.mode) {
       value.terminalLaunchArgs = CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === mode)?.args ?? [];
     } else if (hasAgySkip && touched.mode) {
@@ -554,10 +548,8 @@ function ForkRunConfig({
             <DescribedSelect
               value={mode}
               onValueChange={changeMode}
-              // Codex offers the DANGEROUS full-bypass as a 4th option, exactly
-              // as the new-session dialog does; other approval harnesses list
-              // only the three presets. Selecting it arms bypass on the fork
-              // (a fresh, deliberate opt-in — the source's is always dropped).
+              // Codex adds the DANGEROUS full-bypass option, as the new-session dialog
+              // does; showing it (picked or seeded from the source) arms bypass on the fork.
               options={
                 isCodex
                   ? [...CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_BYPASS_APPROVAL_OPTION]

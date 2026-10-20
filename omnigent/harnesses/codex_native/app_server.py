@@ -4381,6 +4381,8 @@ def _codex_resume_permission_params(terminal_launch_args: Sequence[str] | None) 
     params: CodexParams = {}
     typed_params: CodexParams = {}
     args = normalize_codex_permission_launch_args(terminal_launch_args)
+    bypass = False
+    approve_for_me = False
     index = 0
     while index < len(args):
         arg = args[index]
@@ -4388,7 +4390,10 @@ def _codex_resume_permission_params(terminal_launch_args: Sequence[str] | None) 
             break
         value: str | None = None
         if arg == "--dangerously-bypass-approvals-and-sandbox":
+            bypass = True
             typed_params.update(approvalPolicy="never", sandbox="danger-full-access")
+        elif arg == "--approve-for-me":
+            approve_for_me = True
         elif arg in {"--ask-for-approval", "-a", "--sandbox", "-s"}:
             if index + 1 < len(args):
                 value = args[index + 1]
@@ -4408,14 +4413,17 @@ def _codex_resume_permission_params(terminal_launch_args: Sequence[str] | None) 
             key, _, value = arg.split("=", 1)[1].partition("=")
             _set_codex_resume_config_param(params, key, value)
         index += 1
-    if "--approve-for-me" in args:
+    if approve_for_me:
         if "sandbox" in typed_params:
             raise ValueError("--approve-for-me conflicts with sandbox and bypass flags")
         params.update(
             approvalsReviewer="auto_review", approvalPolicy="on-request", sandbox="workspace-write"
         )
     params.update(typed_params)
-    if "permissions" in params:
+    if bypass:
+        # A profile written back while the thread ran sandboxed must not undo bypass.
+        params.pop("permissions", None)
+    elif "permissions" in params:
         params.pop("sandbox", None)
     return params
 
@@ -4733,6 +4741,11 @@ def _strip_approval_sandbox_flags(codex_args: tuple[str, ...]) -> list[str]:
     return cleaned
 
 
+def codex_bypass_launch_args(codex_args: Sequence[str]) -> list[str]:
+    """Replace the approval/sandbox flags in ``codex_args`` with the full-bypass flag."""
+    return [_CODEX_BYPASS_SANDBOX_FLAG, *_strip_approval_sandbox_flags(tuple(codex_args))]
+
+
 def _strip_codex_resume_permission_args(codex_args: tuple[str, ...]) -> list[str]:
     """Omit permissions configured on the app-server at startup or thread/resume."""
     args = _strip_approval_sandbox_flags(codex_args)
@@ -4840,7 +4853,8 @@ def build_codex_remote_args(
         prompts and the command sandbox; it is gated behind an explicit,
         typed-confirmation opt-in in the web UI. Default ``False`` keeps
         the granular flags untouched. On Codex 0.154+, resumed terminals
-        omit these flags and use the existing preload path. See issue #657.
+        omit these flags; pass :func:`codex_bypass_launch_args` to the
+        preload instead. See issue #657.
     :param bypass_hook_trust: When ``True``, emit
         ``--dangerously-bypass-hook-trust`` so the TUI runs all enabled
         hooks without the interactive "Hooks need review" trust prompt.
@@ -4867,9 +4881,8 @@ def build_codex_remote_args(
             )
         override_args.extend(["-c", override])
     if bypass_sandbox:
-        # Strip the conflicting granular flags, then prepend one canonical
-        # bypass flag (a global flag, so it precedes any ``resume``).
-        passthrough = [_CODEX_BYPASS_SANDBOX_FLAG, *_strip_approval_sandbox_flags(codex_args)]
+        # A global flag, so it precedes any ``resume``.
+        passthrough = codex_bypass_launch_args(codex_args)
     else:
         passthrough = normalize_codex_permission_launch_args(codex_args)
     passthrough = without_codex_config_profile(passthrough)

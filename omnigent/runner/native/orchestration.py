@@ -4945,6 +4945,7 @@ async def _auto_create_codex_terminal(
         CodexAppServerResponseError,
         apply_codex_thread_effort,
         build_codex_native_server,
+        codex_bypass_launch_args,
         codex_remote_resume_omits_permission_args,
         codex_session_meta_model_provider,
         fresh_codex_launch_catalog,
@@ -5546,7 +5547,13 @@ async def _auto_create_codex_terminal(
             retained_resume_client = await preload_codex_thread_for_resume(
                 codex_ws_url,
                 launch_config.external_session_id,
-                terminal_launch_args=launch_config.terminal_launch_args,
+                # Codex 0.154+ resumed TUIs carry no permission flags, so the
+                # bypass label must reach the thread through this preload.
+                terminal_launch_args=(
+                    codex_bypass_launch_args(launch_config.terminal_launch_args or ())
+                    if launch_config.bypass_sandbox
+                    else launch_config.terminal_launch_args
+                ),
                 cwd=Path(workspace),
                 model_provider=(
                     _session_meta_provider

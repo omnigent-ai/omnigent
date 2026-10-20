@@ -226,6 +226,32 @@ def test_codex_resume_permission_params_parse_legacy_flags() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("launch_args", "expected"),
+    [
+        pytest.param(
+            [
+                '-c=default_permissions=":workspace"',
+                "--",
+                "--dangerously-bypass-approvals-and-sandbox",
+            ],
+            {"permissions": ":workspace"},
+            id="positional-bypass-keeps-profile",
+        ),
+        pytest.param(
+            codex_native_app_server.codex_bypass_launch_args(["--", "--approve-for-me"]),
+            {"approvalPolicy": "never", "sandbox": "danger-full-access"},
+            id="label-bypass-with-positional-approve-for-me",
+        ),
+    ],
+)
+def test_codex_resume_permission_params_ignore_flags_after_terminator(
+    launch_args: list[str], expected: dict[str, str]
+) -> None:
+    """Tokens after ``--`` are positional, not permission flags."""
+    assert codex_native_app_server._codex_resume_permission_params(launch_args) == expected
+
+
 def test_codex_resume_permission_params_repairs_legacy_full_access_profile() -> None:
     """An incomplete stored Full Access profile resumes as the matching preset."""
     args = [
@@ -292,6 +318,16 @@ def test_codex_resume_permission_params_repairs_legacy_full_access_profile() -> 
         ),
         (
             ("--dangerously-bypass-approvals-and-sandbox",),
+            {"approvalPolicy": "never", "sandbox": "danger-full-access"},
+        ),
+        (
+            (
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-c",
+                'default_permissions=":workspace"',
+                "-c",
+                'approval_policy="on-request"',
+            ),
             {"approvalPolicy": "never", "sandbox": "danger-full-access"},
         ),
     ],

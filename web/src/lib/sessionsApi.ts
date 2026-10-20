@@ -799,7 +799,8 @@ export async function createBundledSession(
  *   it. The permission-/approval-mode selector rides `terminalLaunchArgs`
  *   (e.g. `["--permission-mode", "auto"]`); `[]` clears the source's launch
  *   args. `codexBypassSandbox: true` (Codex only) arms the dangerous
- *   full-bypass on the fork — sent only on an explicit, banner-gated pick.
+ *   full-bypass on the fork — sent only when the dialog shows it behind its
+ *   danger banner.
  * @param options.sandbox - Present when the fork should run on a
  *   server-provisioned sandbox instead of a host the caller binds. It asks
  *   for the same background launch a `host_type: "managed"` create

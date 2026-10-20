@@ -677,7 +677,7 @@ describe("ForkSessionDialog", () => {
     });
   });
 
-  it("arms Codex bypass only on an explicit pick, with a danger banner", async () => {
+  it("arms Codex bypass on an explicit pick, with a danger banner", async () => {
     forkSessionMock.mockResolvedValue({
       id: "conv_fork",
     } as unknown as Awaited<ReturnType<typeof forkSession>>);
@@ -703,6 +703,72 @@ describe("ForkSessionDialog", () => {
       upToResponseId: undefined,
       config: { terminalLaunchArgs: [], codexBypassSandbox: true },
       sandbox: undefined,
+    });
+  });
+
+  function mockCodexSource(labels: Partial<Record<string, string>>) {
+    setAgents(AVAILABLE_AGENTS, "codex-native");
+    useSessionMock.mockReturnValue({
+      session: { harness: "codex-native", labels, terminalLaunchArgs: ["--search"] },
+      isLoading: false,
+      error: null,
+    } as unknown as ReturnType<typeof useSession>);
+    forkSessionMock.mockResolvedValue({
+      id: "conv_fork",
+    } as unknown as Awaited<ReturnType<typeof forkSession>>);
+  }
+
+  it.each([
+    {
+      source: "a bypass-armed",
+      labels: { "omnigent.codex_native.bypass_sandbox": "1" },
+      banner: true,
+      // The server never copies the source's bypass label, so the fork must ask for it.
+      config: { codexBypassSandbox: true },
+    },
+    { source: "a sandboxed", labels: {}, banner: false, config: {} },
+  ])(
+    "submits the Codex approval it displays for an untouched fork of $source source",
+    async ({ labels, banner, config }) => {
+      mockCodexSource(labels);
+      renderDialog();
+
+      expect(screen.queryByTestId("fork-session-codex-bypass-banner") !== null).toBe(banner);
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      expect(forkSessionMock.mock.calls[0][1]?.config).toEqual(config);
+    },
+  );
+
+  it("does not carry a source's Codex bypass to a different agent", async () => {
+    mockCodexSource({ "omnigent.codex_native.bypass_sandbox": "1" });
+    renderDialog();
+
+    expect(screen.getByTestId("fork-session-codex-bypass-banner")).toBeInTheDocument();
+    openAgentSelect();
+    fireEvent.click(screen.getByTestId("fork-session-agent-option-ag_codex_native"));
+    expect(screen.queryByTestId("fork-session-codex-bypass-banner")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+    expect(forkSessionMock.mock.calls[0][1]).toMatchObject({ agentId: "ag_codex_native" });
+    expect(forkSessionMock.mock.calls[0][1]?.config).toEqual({});
+  });
+
+  it("drops a seeded Codex bypass when a sandboxed approval is picked", async () => {
+    mockCodexSource({ "omnigent.codex_native.bypass_sandbox": "1" });
+    renderDialog();
+
+    expect(screen.getByTestId("fork-session-codex-bypass-banner")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("fork-session-config-approval"));
+    fireEvent.click(screen.getByRole("option", { name: "Read only" }));
+    expect(screen.queryByTestId("fork-session-codex-bypass-banner")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+    expect(forkSessionMock.mock.calls[0][1]?.config).toEqual({
+      terminalLaunchArgs: ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
     });
   });
 
