@@ -21,6 +21,7 @@ import pytest
 
 from omnigent.debug_logging import record_to_row
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harnesses.codex_native.app_server import CodexDatabricksNoCodexModelsError
 from omnigent.harnesses.codex_native.launch_args import CodexTransportArgsError
 from omnigent.inner.terminal import TerminalInstance, TmuxUnavailableError
 from omnigent.runner.native import orchestration
@@ -282,6 +283,7 @@ def test_outdated_pi_cli_surfaces_its_actionable_message() -> None:
             "Claude",
         ),
         (CodexTransportArgsError("app-server"), "Codex"),
+        (CodexDatabricksNoCodexModelsError("prof"), "Codex"),
     ],
 )
 def test_host_setup_error_surfaces_its_remedy(

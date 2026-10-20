@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from omnigent.models.databricks_model_discovery import discover_databricks_claude_catalog
+from omnigent.models.model_metadata import ModelWireAPI
 
 # One-shot stubs for the two discovery endpoints: ``(status, json_payload)``,
 # with a ``None`` payload meaning "no body" (a bare error response).
@@ -372,6 +373,137 @@ def test_discover_codex_models_filters_non_codex_and_ranks_curated_first(
 def test_discover_codex_models_empty_listing_is_authoritative() -> None:
     """A listing that serves no codex model returns an empty tuple, not an error."""
     assert _discover_codex([{"name": "model-services/system.ai.claude-opus-5"}]) == ()
+
+
+def test_discover_codex_models_requires_an_advertised_responses_route() -> None:
+    """A GPT-named service whose routes carry no Responses API is not codex-servable.
+
+    The model-services listing advertises each service's wire routes in
+    ``supported_api_types``. A service that only speaks chat-completions and the
+    MLflow gateway cannot be served by the Codex Responses route no matter what
+    its name says, while a service without route metadata keeps the legacy
+    family fallback.
+    """
+    servable = _discover_codex(
+        [
+            {
+                "name": "model-services/system.ai.gpt-99-chat-only",
+                "supported_api_types": ["mlflow/v1/chat/completions", "mlflow/v1/responses"],
+            },
+            {
+                "name": "model-services/system.ai.gpt-5-5",
+                "supported_api_types": ["openai/v1/responses", "mlflow/v1/chat/completions"],
+            },
+            {"name": "model-services/system.ai.gpt-6-1"},
+        ]
+    )
+
+    assert servable == ("system.ai.gpt-5-5", "system.ai.gpt-6-1")
+
+
+@pytest.mark.parametrize(
+    ("metadata", "servable"),
+    [
+        pytest.param({"supported_api_types": None}, True, id="null"),
+        pytest.param({"supported_api_types": "openai/v1/responses"}, True, id="not-a-list"),
+        pytest.param({"supported_api_types": [None]}, True, id="no-string-entries"),
+        pytest.param({"supported_api_types": []}, False, id="advertises-no-route"),
+        pytest.param({"supported_api_types": ["mlflow/v1/responses"]}, False, id="mlflow-only"),
+    ],
+)
+def test_discover_codex_models_route_metadata_edge_cases(
+    metadata: dict[str, object], servable: bool
+) -> None:
+    """Unusable route metadata keeps the name rule; an advertised route set is authoritative."""
+    discovered = _discover_codex([{"name": "model-services/system.ai.gpt-9-9", **metadata}])
+
+    assert discovered == (("system.ai.gpt-9-9",) if servable else ())
+
+
+def test_discover_codex_models_rejects_a_malformed_listing() -> None:
+    """A wrong-type ``model_services`` field is malformed, not an authoritative empty listing."""
+    from omnigent.models.databricks_model_discovery import discover_databricks_codex_models
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"model_services": "oops"}, request=request)
+
+    with pytest.raises(ValueError, match="must be a list"):
+        discover_databricks_codex_models(
+            "https://workspace.example.com", "token", transport=httpx.MockTransport(_handler)
+        )
+
+
+@pytest.mark.parametrize("names_codex_model", [False, True], ids=["none-named", "gpt-named"])
+def test_discover_codex_models_truncated_listing_cannot_establish_absence(
+    names_codex_model: bool,
+) -> None:
+    """A listing cut off by the page budget is authoritative only for what it names."""
+    from omnigent.models.databricks_model_discovery import discover_databricks_codex_models
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        token = request.url.params.get("page_token", "0")
+        name = (
+            "system.ai.gpt-5-5"
+            if names_codex_model and token == "0"
+            else f"system.ai.claude-opus-{token}"
+        )
+        return httpx.Response(
+            200,
+            json={
+                "model_services": [{"name": f"model-services/{name}"}],
+                "next_page_token": str(int(token) + 1),
+            },
+            request=request,
+        )
+
+    def _discover() -> tuple[str, ...]:
+        return discover_databricks_codex_models(
+            "https://workspace.example.com", "token", transport=httpx.MockTransport(_handler)
+        )
+
+    if names_codex_model:
+        assert _discover() == ("system.ai.gpt-5-5",)
+    else:
+        with pytest.raises(ValueError, match="truncated"):
+            _discover()
+
+
+@pytest.mark.parametrize(
+    ("api_types", "expected"),
+    [
+        pytest.param(None, None, id="missing"),
+        pytest.param([None, 3], None, id="no-string-entries"),
+        pytest.param([], frozenset(), id="empty"),
+        pytest.param(["mlflow/v1/responses"], frozenset(), id="unrecognized"),
+        pytest.param(["codex/v1/responses"], frozenset(), id="codex-only"),
+        pytest.param(
+            ["codex/v1/responses", "openai/v1/responses"],
+            frozenset({ModelWireAPI.OPENAI_RESPONSES}),
+            id="codex-and-generic-responses",
+        ),
+        pytest.param(
+            ["OpenAI/v1/Responses", "mlflow/v1/chat/completions", None],
+            frozenset({ModelWireAPI.OPENAI_RESPONSES, ModelWireAPI.OPENAI_CHAT}),
+            id="mixed-case-with-null",
+        ),
+        pytest.param(
+            ["anthropic/v1/messages"],
+            frozenset({ModelWireAPI.ANTHROPIC_MESSAGES}),
+            id="anthropic",
+        ),
+    ],
+)
+def test_model_service_wire_apis_normalizes_advertised_routes(
+    api_types: object, expected: frozenset[ModelWireAPI] | None
+) -> None:
+    """``None`` marks unusable metadata; a route list normalizes to the shared vocabulary."""
+    from omnigent.models.databricks_model_discovery import model_service_wire_apis
+
+    service: dict[str, object] = {"name": "model-services/system.ai.gpt-5-5"}
+    if api_types is not None:
+        service["supported_api_types"] = api_types
+
+    assert model_service_wire_apis(service) == expected
 
 
 def test_select_servable_model_matches_legacy_spelling() -> None:
