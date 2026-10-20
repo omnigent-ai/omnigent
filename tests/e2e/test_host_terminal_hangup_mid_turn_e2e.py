@@ -42,6 +42,8 @@ _RUNNER_ONLINE_TIMEOUT_S = 90.0
 _GATE_TIMEOUT_S = 60.0
 _TURN_TIMEOUT_S = 120.0
 _REPLY = "HANGUP_SURVIVOR_REPLY"
+_FINISH_WORK_TIMEOUT_S = 15.0
+_FINISHING_LINE = "parent process hung up with work in flight; finishing it before exiting"
 _AGENT_YAML = """\
 spec_version: 1
 name: hangup-turn-agent
@@ -160,6 +162,13 @@ def _pid_running(pid: int) -> bool:
     return state not in {"Z", "X"}
 
 
+def _runner_log_text(host_root: Path, session_id: str) -> str:
+    logs = (host_root / "home" / ".omnigent" / "logs" / "runner").glob(
+        f"runner-{session_id}-*.log"
+    )
+    return "".join(path.read_text(errors="replace") for path in logs)
+
+
 def _wait_until(predicate: Callable[[], object], timeout: float, interval: float = 0.25) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -268,11 +277,15 @@ def test_terminal_hangup_lets_in_flight_turn_finish(
                 f"host survived the terminal hangup (test precondition): {host_exit}"
             )
             assert host_exit[1] == signal.SIGHUP, f"host should die by SIGHUP, not {host_exit}"
-            time.sleep(2.0)
+            # Without finish-work mode the runner shuts down on its own after
+            # the parent dies, so wait for the runner's own record of it first.
+            assert _wait_until(
+                lambda: _FINISHING_LINE in _runner_log_text(tmp_path / "host", session_id),
+                _FINISH_WORK_TIMEOUT_S,
+            ), "runner never entered finish-work mode after the terminal hangup"
             runner_alive_at_release = _pid_running(runner_pid)
             assert runner_alive_at_release, (
-                "runner must outlive the host's terminal hangup, but it exited "
-                f"within 2s of the SIGHUP (host exit {host_exit})"
+                f"runner exited before the model replied (host exit {host_exit})"
             )
             release_mock_gate(mock_url)
             print(

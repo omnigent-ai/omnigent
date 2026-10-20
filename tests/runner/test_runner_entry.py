@@ -47,7 +47,6 @@ from omnigent.runner._entry import (
     _runner_workspace_from_env,
     _RunnerDatabricksAuth,
     _server_url_from_env,
-    _work_still_active,
     main,
 )
 from omnigent.runner.identity import (
@@ -2445,8 +2444,11 @@ def test_run_parent_death_killer_finishes_in_flight_work_after_hangup() -> None:
 
     def has_active_work() -> bool:
         probes.append("probe")
+        # A probe failure of any type counts as active, so the watchdog keeps going.
         if len(probes) == 2:
             raise RuntimeError("dictionary changed size during iteration")
+        if len(probes) == 3:
+            raise ValueError("state mutated during probe")
         return len(probes) < 5
 
     events = _finish_work_killer(has_active_work)
@@ -2474,14 +2476,15 @@ def test_run_parent_death_killer_without_hangup_stops_despite_active_work() -> N
 def test_run_parent_death_killer_bounds_finishing_work(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Work that never finishes is stopped once the bound passes."""
+    """Work that keeps arriving is stopped once the bound from the hangup passes."""
     started = time.monotonic()
     with caplog.at_level(logging.WARNING, logger="omnigent.runner._entry"):
-        events = _finish_work_killer(lambda: True, finish_work_max_s=0.05)
+        events = _finish_work_killer(lambda: True, finish_work_max_s=0.3)
     elapsed = time.monotonic() - started
 
     assert events == ["stop", "exit"]
     assert any("did not finish" in record.message for record in caplog.records)
+    assert elapsed >= 0.3, "finishing work must not stop before its bound"
     assert elapsed < 2.0, "finishing work must stop at its bound, not run unbounded"
 
 
@@ -2533,15 +2536,6 @@ def test_run_parent_death_killer_waits_for_a_late_finish_work_signal() -> None:
     assert events == ["idle_close", "exit"], (
         "a finish-work signal arriving after parent death must still finish the turn"
     )
-
-
-def test_work_still_active_treats_any_exception_as_active() -> None:
-    """A probe failure of any type counts as active so the watchdog never dies."""
-
-    def boom() -> bool:
-        raise ValueError("state mutated during probe")
-
-    assert _work_still_active(boom) is True
 
 
 def test_ignore_finish_work_signal_until_handled_masks_the_default_kill() -> None:
