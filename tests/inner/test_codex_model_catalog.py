@@ -9,11 +9,13 @@ codex's own catalog plus the gateway-only arms.
 from __future__ import annotations
 
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Any
 
 import pytest
+import tomllib
 
 from omnigent.inner import codex_executor
 from omnigent.inner.codex_executor import (
@@ -517,3 +519,115 @@ def test_required_brokered_catalog_write_failure_leaves_no_partial_file(
 
     assert not (tmp_path / "model_catalog.json").exists()
     assert not list(tmp_path.glob("model_catalog.json.*"))
+
+
+def _fake_codex(tmp_path: Path, *, stderr: str, returncode: int) -> str:
+    """A codex binary whose ``debug models`` answers with *stderr* and *returncode*."""
+    script = tmp_path / "codex"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "home = os.environ['CODEX_HOME']\n"
+        f"sys.stderr.write({stderr!r}.replace('{{home}}', home))\n"
+        f"sys.exit({returncode})\n"
+    )
+    script.chmod(0o755)
+    return str(script)
+
+
+def _populate_with_user_catalog(tmp_path: Path, codex_path: str, config: str) -> Path:
+    source = tmp_path / "user-codex"
+    source.mkdir()
+    (source / "config.toml").write_text(config)
+    target = tmp_path / "private"
+    target.mkdir()
+    codex_executor._populate_codex_home_config(target, source, codex_path=codex_path)
+    return target / "config.toml"
+
+
+_PROVIDER_TABLE = (
+    '[model_providers.Databricks]\nname = "Databricks"\nbase_url = "https://example.invalid"\n'
+)
+
+
+def test_a_catalog_this_codex_cannot_parse_is_dropped_from_the_private_copy(
+    tmp_path: Path,
+) -> None:
+    # Codex reads such a config as invalid and loads its defaults, which have
+    # no "Databricks" provider, so the app-server exits before the session starts.
+    catalog = tmp_path / "isaac-app-model-catalog.json"
+    catalog.write_text('{"models": []}')
+    codex = _fake_codex(
+        tmp_path,
+        stderr=(
+            f"Error: failed to parse model_catalog_json path `{catalog}` as JSON: "
+            "missing field `supports_parallel_tool_calls` at line 129 column 5\n"
+        ),
+        returncode=1,
+    )
+    user_config = (
+        f'model_provider = "Databricks"\nmodel_catalog_json = "{catalog}"\n\n{_PROVIDER_TABLE}'
+    )
+
+    private = _populate_with_user_catalog(tmp_path, codex, user_config)
+
+    document = tomllib.loads(private.read_text())
+    assert "model_catalog_json" not in document
+    assert document["model_provider"] == "Databricks"
+    assert document["model_providers"]["Databricks"]["name"] == "Databricks"
+    # The user's own config is left for its owner to repair.
+    assert (tmp_path / "user-codex" / "config.toml").read_text() == user_config
+
+
+def test_a_profile_catalog_this_codex_cannot_parse_is_dropped(tmp_path: Path) -> None:
+    catalog = tmp_path / "old-catalog.json"
+    catalog.write_text("{}")
+    codex = _fake_codex(
+        tmp_path,
+        stderr=f"Error: failed to parse model_catalog_json path `{catalog}` as JSON: x\n",
+        returncode=1,
+    )
+
+    private = _populate_with_user_catalog(
+        tmp_path,
+        codex,
+        f'profile = "work"\n\n[profiles.work]\nmodel = "m"\nmodel_catalog_json = "{catalog}"\n',
+    )
+
+    document = tomllib.loads(private.read_text())
+    assert document["profiles"]["work"] == {"model": "m"}
+
+
+@pytest.mark.parametrize(
+    ("stderr", "returncode"),
+    [
+        ("", 0),
+        # Any other failure is not the catalog's fault; the user's choice stands.
+        ("Error: could not load auth.json\n", 1),
+    ],
+)
+def test_a_catalog_codex_can_load_is_kept(tmp_path: Path, stderr: str, returncode: int) -> None:
+    catalog = tmp_path / "mine.json"
+    catalog.write_text("{}")
+    codex = _fake_codex(tmp_path, stderr=stderr, returncode=returncode)
+
+    private = _populate_with_user_catalog(
+        tmp_path, codex, f'model_catalog_json = "{catalog}"\n\n{_PROVIDER_TABLE}'
+    )
+
+    assert tomllib.loads(private.read_text())["model_catalog_json"] == str(catalog)
+
+
+def test_a_config_without_a_catalog_never_runs_the_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _unexpected(*args: object, **kwargs: object) -> None:
+        raise AssertionError("codex debug models must not run")
+
+    monkeypatch.setattr(codex_executor.subprocess, "run", _unexpected)
+
+    private = _populate_with_user_catalog(
+        tmp_path, "/bin/codex", f'model = "m"\n\n{_PROVIDER_TABLE}'
+    )
+
+    assert tomllib.loads(private.read_text())["model"] == "m"

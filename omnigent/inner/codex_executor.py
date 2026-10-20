@@ -1116,6 +1116,7 @@ def _populate_codex_home_config(
     supported_efforts: frozenset[str] = CODEX_EFFORTS,
     include_credentials: bool = True,
     required_brokered_probe: tuple[str, Path, OSEnvSpec] | None = None,
+    codex_path: str | None = None,
 ) -> None:
     """
     Bridge user config files from the real ``CODEX_HOME`` into the temp one.
@@ -1166,6 +1167,8 @@ def _populate_codex_home_config(
         in the trusted signer process.
     :param required_brokered_probe: Codex path, working directory, and active
         sandbox used to write a network-denied bundled catalog.
+    :param codex_path: The codex binary the session launches, used to check a
+        copied ``model_catalog_json``; ``None`` resolves it from ``PATH``.
     """
     if required_brokered_probe is not None:
         codex_path, cwd, os_env = required_brokered_probe
@@ -1277,6 +1280,7 @@ def _populate_codex_home_config(
         shutil.copy2(source_file, dest_path)
         if filename == "config.toml":
             _normalize_copied_codex_effort(dest_path, supported_efforts=supported_efforts)
+            drop_unparseable_model_catalog(dest_path, codex_path or _find_codex_cli())
             if extend_model_catalog:
                 # Routed turns and spawns can land on an arm codex's bundled
                 # catalog has no entry for, which it then refuses client-side.
@@ -1996,12 +2000,17 @@ def set_codex_model_catalog_path(config_path: Path, catalog_path: Path) -> bool:
     if "model_catalog_json" in document:
         return False
     document["model_catalog_json"] = str(catalog_path)
+    return _write_private_codex_config(config_path, tomlkit.dumps(document))
+
+
+def _write_private_codex_config(config_path: Path, text: str) -> bool:
+    """Atomically replace the private ``config.toml``; ``False`` when the write failed."""
     config_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(config_path.parent))
     try:
         os.chmod(tmp_name, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(tomlkit.dumps(document))
+            handle.write(text)
         os.replace(tmp_name, config_path)
         os.chmod(config_path, 0o600)
     except OSError as exc:
@@ -2010,6 +2019,78 @@ def set_codex_model_catalog_path(config_path: Path, catalog_path: Path) -> bool:
     finally:
         with suppress(FileNotFoundError):
             os.unlink(tmp_name)
+    return True
+
+
+_UNPARSEABLE_MODEL_CATALOG_RE = re.compile(r"failed to parse model_catalog_json path `([^`]+)`")
+
+
+def drop_unparseable_model_catalog(
+    config_path: Path,
+    codex_path: str | None,
+    *,
+    timeout: float = 5.0,
+) -> bool:
+    """
+    Remove a ``model_catalog_json`` this Codex cannot parse from the private config.
+
+    Codex treats an unparseable catalog as an invalid config and loads its
+    defaults instead, dropping the provider tables, so the app-server exits on a
+    ``model_provider`` it no longer defines. A catalog written for another Codex
+    release (a field this one requires is missing) is the usual source. Without
+    the key the session runs on codex's bundled catalog.
+
+    :param config_path: The copied ``config.toml`` inside the private home.
+    :param codex_path: The codex binary the session launches, or ``None`` when
+        unresolved (nothing is checked).
+    :param timeout: Seconds to wait for ``codex debug models``.
+    :returns: ``True`` when a key was removed.
+    """
+    import tomlkit
+
+    if codex_path is None:
+        return False
+    try:
+        document = tomlkit.parse(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    profiles = document.get("profiles")
+    tables = [document] + [
+        table
+        for table in (profiles.values() if isinstance(profiles, dict) else ())
+        if isinstance(table, dict)
+    ]
+    if not any("model_catalog_json" in table for table in tables):
+        return False
+    try:
+        completed = subprocess.run(
+            [codex_path, "debug", "models"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**os.environ, "CODEX_HOME": str(config_path.parent)},
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    match = _UNPARSEABLE_MODEL_CATALOG_RE.search(completed.stderr or "")
+    if completed.returncode == 0 or match is None:
+        return False
+    unparseable = Path(match.group(1))
+    removed = [
+        table
+        for table in tables
+        if isinstance(value := table.get("model_catalog_json"), str)
+        and (config_path.parent / Path(value).expanduser()).resolve() == unparseable.resolve()
+    ]
+    for table in removed:
+        del table["model_catalog_json"]
+    if not removed or not _write_private_codex_config(config_path, tomlkit.dumps(document)):
+        return False
+    logger.warning(
+        "Codex cannot parse model_catalog_json %s; the session uses codex's bundled catalog",
+        unparseable,
+    )
     return True
 
 

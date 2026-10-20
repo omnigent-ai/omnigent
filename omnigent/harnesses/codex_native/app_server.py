@@ -2111,6 +2111,7 @@ class CodexNativeAppServer:
             extend_model_catalog=codex_extended_catalog_requested(self.env),
             supported_efforts=CODEX_NATIVE_EFFORTS,
             minimal_config=minimal_config,
+            codex_path=self.codex_path,
         )
         compose_profile_instructions = _materialize_codex_profile_for_start(
             self.codex_home,
