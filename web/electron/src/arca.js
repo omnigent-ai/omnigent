@@ -40,6 +40,7 @@ const EXTEND_TIMEOUT_MS = 120_000;
 /** A dbcert refresh waits for the user to finish its browser sign-in. */
 const DBCERT_REFRESH_TIMEOUT_MS = 5 * 60 * 1000;
 const DBCERT_STATUS_TIMEOUT_MS = 10_000;
+const DBCERT_ARCA_SYNC_TIMEOUT_MS = 60_000;
 const ARCA_EXTEND_MODES = Object.freeze(["overnight", "workweek"]);
 const ARCA_AUTH_RE = /arca (auth )?login|certificate.*expired|permission denied \(publickey/i;
 const MAX_CLI_OUTPUT_BYTES = 256 * 1024;
@@ -874,7 +875,10 @@ async function runDbcertRefresh(deps = {}) {
 }
 
 async function runDbcertArcaSync(deps = {}) {
-  return runDbcertCommand(["sync-arca"], "Arca sync", deps);
+  return runDbcertCommand(["sync-arca"], "Arca sync", {
+    ...deps,
+    timeoutMs: deps.timeoutMs ?? DBCERT_ARCA_SYNC_TIMEOUT_MS,
+  });
 }
 
 async function runDbcertCommand(args, action, deps) {

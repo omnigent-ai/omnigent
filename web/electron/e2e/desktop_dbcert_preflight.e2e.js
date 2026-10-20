@@ -123,12 +123,20 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[3]))
         stdio: ["ignore", log, log],
       },
     );
+    let serverError;
+    server.on("error", (error) => {
+      serverError = error;
+    });
+    const serverClosed = new Promise((resolve) => {
+      server.once("close", resolve);
+    });
     let desktop;
     const creates = [];
     try {
       await expect
         .poll(
           async () => {
+            assert.ifError(serverError);
             assert.equal(server.exitCode, null, fs.readFileSync(serverLog, "utf8"));
             return fetch(`${serverUrl}/health`)
               .then((response) => response.status)
@@ -279,10 +287,7 @@ uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[3]))
       await fetch(`${serverUrl}/__test/provision/release`, { method: "POST" }).catch(() => {});
       server.kill("SIGTERM");
       const kill = setTimeout(() => server.kill("SIGKILL"), 5000);
-      if (server.exitCode === null && server.signalCode === null)
-        await new Promise((resolve) => {
-          server.once("close", resolve);
-        });
+      await serverClosed;
       clearTimeout(kill);
       fs.closeSync(log);
       fs.mkdirSync(recordDir, { recursive: true });

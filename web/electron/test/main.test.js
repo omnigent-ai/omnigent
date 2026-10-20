@@ -841,7 +841,8 @@ describe("dbcert refresh IPC", () => {
     assert.equal(h.calls.dbcertRefreshes, 1);
     assert.deepEqual(await refresh(event), { ok: true });
     assert.equal(h.calls.dbcertRefreshes, 2);
-    assert.deepEqual(refreshOptions, [{ skipArcaSync: true }, { skipArcaSync: false }]);
+    assert.deepEqual(refreshOptions, [{ skipArcaSync: true }, { skipArcaSync: true }]);
+    assert.equal(h.calls.dbcertSyncs, 1);
   });
 
   for (const localFirst of [false, true]) {
@@ -875,10 +876,21 @@ describe("dbcert refresh IPC", () => {
       assert.equal(harness.calls.dbcertSyncs, 0);
       finishRenewal({ ok: true });
       assert.deepEqual(await (localFirst ? first : second), { ok: true });
-      assert.equal(harness.calls.dbcertSyncs, localFirst ? 1 : 0);
-      if (localFirst) assert.equal(hostDone, false);
+      assert.equal(harness.calls.dbcertSyncs, 1);
+      assert.equal(hostDone, false);
+      let lateLocalResult;
+      const lateLocal = refresh(event, { skipArcaSync: true }).then((result) => {
+        lateLocalResult = result;
+        return result;
+      });
+      await new Promise((resolve) => {
+        setImmediate(resolve);
+      });
+      assert.deepEqual(lateLocalResult, { ok: true });
+      assert.equal(hostDone, false);
       finishSync({ ok: true });
-      assert.deepEqual(await Promise.all([first, second, anotherHost]), [
+      assert.deepEqual(await Promise.all([first, second, anotherHost, lateLocal]), [
+        { ok: true },
         { ok: true },
         { ok: true },
         { ok: true },
@@ -964,6 +976,44 @@ describe("dbcert refresh IPC", () => {
     assert.deepEqual(await check(event), { ok: true, valid: false });
     assert.equal(h.calls.dbcertPreflights, 2);
     assert.equal(h.calls.dbcertRefreshes, 0);
+  });
+
+  it("invalidates pre-renewal status without letting its completion clear the new check", async (context) => {
+    let finishStaleCheck;
+    let finishFreshCheck;
+    const pendingChecks = [
+      new Promise((resolve) => {
+        finishStaleCheck = resolve;
+      }),
+      new Promise((resolve) => {
+        finishFreshCheck = resolve;
+      }),
+    ];
+    const harness = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      dbcertPreflightResult: () => pendingChecks.shift(),
+    });
+    context.after(harness.cleanup);
+    harness.api.registerIpc();
+    const event = { sender: harness.webContents, senderFrame: { url: serverUrl } };
+    const check = harness.ipc.get("omnigent:dbcert-check");
+    const stale = check(event);
+    assert.deepEqual(
+      await harness.ipc.get("omnigent:dbcert-refresh")(event, { skipArcaSync: true }),
+      { ok: true },
+    );
+    const fresh = check(event);
+    assert.equal(harness.calls.dbcertPreflights, 2);
+    finishStaleCheck({ ok: true, valid: false });
+    assert.deepEqual(await stale, { ok: true, valid: false });
+    const joined = check(event);
+    assert.equal(harness.calls.dbcertPreflights, 2);
+    finishFreshCheck({ ok: true, valid: true });
+    assert.deepEqual(await Promise.all([fresh, joined]), [
+      { ok: true, valid: true },
+      { ok: true, valid: true },
+    ]);
   });
 
   for (const [what, options] of [

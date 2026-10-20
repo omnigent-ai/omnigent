@@ -4925,16 +4925,8 @@ function registerIpc() {
   // SPA → renew this machine's dbcert from the expired-dbcert banner; Arca
   // Companion then copies it to the user's boxes. Same gates as arca-extend.
   // Clicks from several windows share one sign-in.
+  let dbcertPreflight = null;
   let dbcertRefresh = null;
-  const trackDbcertRefresh = (pending, skipArcaSync) => {
-    const refresh = {
-      skipArcaSync,
-      promise: pending.finally(() => {
-        if (dbcertRefresh === refresh) dbcertRefresh = null;
-      }),
-    };
-    dbcertRefresh = refresh;
-  };
   ipcMain.handle("omnigent:dbcert-refresh", async (event, options) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("dbcert-refresh is only available to a connected server page");
@@ -4942,19 +4934,29 @@ function registerIpc() {
     if (!canExtendArca(event)) {
       return { ok: false, error: "dbcert refresh is not enabled for this server." };
     }
-    const skipArcaSync = options?.skipArcaSync === true;
     if (!dbcertRefresh) {
-      trackDbcertRefresh(arca.runDbcertRefresh({ skipArcaSync }), skipArcaSync);
-    } else if (!skipArcaSync && dbcertRefresh.skipArcaSync) {
-      trackDbcertRefresh(
-        dbcertRefresh.promise.then((result) => (result.ok ? arca.runDbcertArcaSync() : result)),
-        false,
-      );
+      const refresh = {
+        renewal: arca.runDbcertRefresh({ skipArcaSync: true }).then((result) => {
+          if (result.ok) dbcertPreflight = null;
+          return result;
+        }),
+        sync: null,
+      };
+      refresh.renewal = refresh.renewal.finally(() => {
+        if (!refresh.sync && dbcertRefresh === refresh) dbcertRefresh = null;
+      });
+      dbcertRefresh = refresh;
     }
-    return dbcertRefresh.promise;
+    const refresh = dbcertRefresh;
+    if (options?.skipArcaSync === true) return refresh.renewal;
+    refresh.sync ??= refresh.renewal
+      .then((result) => (result.ok ? arca.runDbcertArcaSync() : result))
+      .finally(() => {
+        if (dbcertRefresh === refresh) dbcertRefresh = null;
+      });
+    return refresh.sync;
   });
 
-  let dbcertPreflight = null;
   ipcMain.handle("omnigent:dbcert-check", async (event) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("dbcert-check is only available to a connected server page");
@@ -4962,9 +4964,12 @@ function registerIpc() {
     if (!canExtendArca(event)) {
       return { ok: false, error: "dbcert checks are not enabled for this server." };
     }
-    dbcertPreflight ??= arca.checkDbcert().finally(() => {
-      dbcertPreflight = null;
-    });
+    if (!dbcertPreflight) {
+      const pending = arca.checkDbcert().finally(() => {
+        if (dbcertPreflight === pending) dbcertPreflight = null;
+      });
+      dbcertPreflight = pending;
+    }
     return dbcertPreflight;
   });
 

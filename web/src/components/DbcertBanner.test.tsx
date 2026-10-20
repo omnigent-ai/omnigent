@@ -372,21 +372,26 @@ describe("LaptopDbcertBanner", () => {
     expect(onReady).toHaveBeenCalledOnce();
   });
 
-  it("ignores a refresh that finishes after the banner unmounts", async () => {
-    const onReady = vi.fn();
-    let finish!: (result: { ok: true }) => void;
-    desktopRefresh.mockReturnValue(
-      new Promise((resolve) => {
-        finish = resolve;
-      }),
-    );
-    const view = render(<LaptopDbcertBanner onReady={onReady} onDismiss={vi.fn()} />);
-    fireEvent.click(screen.getByRole("button", { name: "Refresh dbcert" }));
-    expect(screen.getByRole("button", { name: "Refreshing…" })).toHaveProperty("disabled", true);
-    view.unmount();
-    finish({ ok: true });
-    await settle();
-    expect(onReady).not.toHaveBeenCalled();
-    expect(desktopCheck).not.toHaveBeenCalled();
-  });
+  it.each([false, true])(
+    "ignores results after unmount (verification pending=%s)",
+    async (verifying) => {
+      const onReady = vi.fn();
+      let finish!: (result: { ok: true; valid?: boolean }) => void;
+      const pending = verifying ? desktopCheck : desktopRefresh;
+      pending.mockReturnValue(
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+      );
+      const view = render(<LaptopDbcertBanner onReady={onReady} onDismiss={vi.fn()} />);
+      fireEvent.click(screen.getByRole("button", { name: "Refresh dbcert" }));
+      await settle();
+      expect(screen.getByRole("button", { name: "Refreshing…" })).toHaveProperty("disabled", true);
+      view.unmount();
+      finish(verifying ? { ok: true, valid: true } : { ok: true });
+      await settle();
+      expect(onReady).not.toHaveBeenCalled();
+      expect(desktopCheck).toHaveBeenCalledTimes(verifying ? 1 : 0);
+    },
+  );
 });

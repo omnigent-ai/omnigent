@@ -5372,10 +5372,6 @@ export function NewChatLandingScreen() {
     if (!canSubmit || createAttemptRef.current !== null) return;
     const createAttempt = Symbol();
     createAttemptRef.current = createAttempt;
-    // A create is actually happening: report it for pointer clicks (via the
-    // form submit) and Enter-key sends alike. After the guard so guarded no-ops
-    // don't emit, matching the disabled Start button.
-    trackClick("new_chat.start_session", "button");
     // BrowserRouter may defer its React update even though history already
     // changed. Remember the submit location so a late create cannot redirect
     // after the user has navigated elsewhere while this component is still
@@ -5393,12 +5389,6 @@ export function NewChatLandingScreen() {
         typeof destination === "string" ? destination : destination.pathname,
       );
     };
-    // Remember the repos/branches for next time (seeds the picker on the next
-    // visit). Only when a repo is actually set — a no-repo session leaves the
-    // remembered repos untouched rather than clearing them.
-    if (sandboxRepoSelections.length > 0) {
-      writeLastSandboxRepos(sandboxRepoSelections);
-    }
     setCreating(true);
     setCreateError(null);
     let localConv: {
@@ -5422,34 +5412,47 @@ export function NewChatLandingScreen() {
     };
     try {
       if (sandboxSelected && effectiveSandboxProvider === "arclet" && hasDbcertPreflightBridge()) {
-        const features = await getDesktopFeatures();
-        if (!onScreenRef.current || window.location.href !== createLocation) return;
-        if (features?.databricksInternalFeatures === true && features.canRefreshDbcert === true) {
-          const skipCheck = new Promise<null>((resolve) => {
-            skipDbcertCheckRef.current = () => resolve(null);
-          });
-          setCheckingDbcert(true);
-          const credentials = await Promise.race([checkDbcert(), skipCheck]);
-          skipDbcertCheckRef.current = null;
-          if (
-            createAttemptRef.current !== createAttempt ||
-            !onScreenRef.current ||
-            window.location.href !== createLocation
-          )
-            return;
-          setCheckingDbcert(false);
-          if (credentials !== null && !credentials.ok) {
-            setCreateError(credentials.error);
-            return;
-          }
-          const needsDbcert = credentials !== null && !credentials.valid;
-          setDbcertRequired(needsDbcert);
-          if (needsDbcert) return;
+        const skipCheck = new Promise<null>((resolve) => {
+          skipDbcertCheckRef.current = () => resolve(null);
+        });
+        setCheckingDbcert(true);
+        setDbcertRequired(false);
+        const credentials = await Promise.race([
+          getDesktopFeatures().then((features) =>
+            createAttemptRef.current === createAttempt &&
+            skipDbcertCheckRef.current !== null &&
+            onScreenRef.current &&
+            window.location.href === createLocation &&
+            features?.databricksInternalFeatures === true &&
+            features.canRefreshDbcert === true
+              ? checkDbcert()
+              : null,
+          ),
+          skipCheck,
+        ]);
+        skipDbcertCheckRef.current = null;
+        if (
+          createAttemptRef.current !== createAttempt ||
+          !onScreenRef.current ||
+          window.location.href !== createLocation
+        )
+          return;
+        setCheckingDbcert(false);
+        if (credentials !== null && !credentials.ok) {
+          setCreateError(credentials.error);
+          return;
         }
+        const needsDbcert = credentials !== null && !credentials.valid;
+        setDbcertRequired(needsDbcert);
+        if (needsDbcert) return;
       }
       // Spend the draft only once provisioning starts, after the laptop credential check.
       submittedDraftRevisionRef.current = landingDraftRevision;
       submittedRef.current = true;
+      trackClick("new_chat.start_session", "button");
+      if (sandboxRepoSelections.length > 0) {
+        writeLastSandboxRepos(sandboxRepoSelections);
+      }
       const trimmedBranch = branchName.trim();
       const composerContextLabels = composerContextToLabels(composerContextState);
       // `shouldCreateWorktree` (component scope): true only when a branch is

@@ -161,10 +161,17 @@ describe("dbcert refresh", () => {
     ]);
   });
 
-  it("can sync already-renewed credentials without another browser sign-in", async () => {
+  it("syncs existing credentials with a shorter non-interactive timeout", async (context) => {
+    const timeouts = [];
+    const schedule = global.setTimeout;
+    context.mock.method(global, "setTimeout", (callback, delay, ...args) => {
+      timeouts.push(delay);
+      return schedule(callback, delay, ...args);
+    });
     const deps = dbcertDeps([{ code: 0 }]);
     assert.deepEqual(await runDbcertArcaSync(deps), { ok: true });
     assert.deepEqual(deps.calls, [["sync-arca"]]);
+    assert.equal(timeouts[0], 60_000);
   });
 
   for (const skipArcaSync of [false, true]) {
@@ -200,22 +207,27 @@ describe("dbcert refresh", () => {
     assert.deepEqual(deps.calls, []);
   });
 
-  it("ends an abandoned sign-in", async () => {
-    const child = fakeConnectChild();
-    const keepAlive = setTimeout(() => {}, 1000);
-    try {
-      const result = await runDbcertRefresh({
-        resolveDbcertPath: () => "/bin/dbcert",
-        spawn: () => child,
-        timeoutMs: 5,
-        killGraceMs: 5,
-      });
-      assert.deepEqual(result, { ok: false, error: "The dbcert sign-in timed out." });
-      assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
-    } finally {
-      clearTimeout(keepAlive);
-    }
-  });
+  for (const [action, runCommand] of [
+    ["sign-in", runDbcertRefresh],
+    ["Arca sync", runDbcertArcaSync],
+  ]) {
+    it(`ends an abandoned ${action}`, async () => {
+      const child = fakeConnectChild();
+      const keepAlive = setTimeout(() => {}, 1000);
+      try {
+        const result = await runCommand({
+          resolveDbcertPath: () => "/bin/dbcert",
+          spawn: () => child,
+          timeoutMs: 5,
+          killGraceMs: 5,
+        });
+        assert.deepEqual(result, { ok: false, error: `The dbcert ${action} timed out.` });
+        assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+      } finally {
+        clearTimeout(keepAlive);
+      }
+    });
+  }
 });
 
 describe("Arclet dbcert preflight", () => {
