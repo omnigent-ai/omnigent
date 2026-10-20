@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -519,6 +520,54 @@ def test_workflows_connect_selection_to_jobs():
         assert validate["run"] == f"python3 .github/scripts/ci/require_results.py {suite}"
 
 
+def _run_merge_gate(
+    tmp_path: Path, snapshots: list[dict[str, Any]]
+) -> subprocess.CompletedProcess[str]:
+    """Run evaluate-checks.sh against a fake ``gh`` serving API snapshots.
+
+    Each read of the check runs advances to the next snapshot (the last one
+    repeats), so a test can model checks that GitHub updates between reads.
+    """
+    fixtures = tmp_path / "api.json"
+    fixtures.write_text(json.dumps(snapshots))
+    gh = tmp_path / "gh"
+    gh.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, subprocess, sys\n"
+        "from pathlib import Path\n"
+        "snapshots = json.loads(Path(os.environ['TEST_GATE_API']).read_text())\n"
+        "reads = Path(os.environ['TEST_GATE_API'] + '.reads')\n"
+        "count = int(reads.read_text()) if reads.exists() else 0\n"
+        "if '/check-runs' in sys.argv[2]:\n"
+        "    count += 1\n"
+        "    reads.write_text(str(count))\n"
+        "api = snapshots[min(max(count, 1), len(snapshots)) - 1]\n"
+        "response = api['checks' if '/check-runs' in sys.argv[2] else 'runs']\n"
+        "subprocess.run(['jq', '-r', sys.argv[sys.argv.index('--jq')+1]], "
+        "input=json.dumps(response), text=True, check=True)\n"
+    )
+    gh.chmod(0o755)
+    return subprocess.run(
+        ["bash", str(ROOT / ".github/scripts/merge-ready/evaluate-checks.sh")],
+        env=dict(
+            os.environ,
+            PATH=f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
+            TEST_GATE_API=str(fixtures),
+            REPO="example/project",
+            SHA="a" * 40,
+            GITHUB_OUTPUT=str(tmp_path / "gate-output"),
+            MERGE_READY_LAG_DELAY_S="0",
+        ),
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+
+def _check_reads(tmp_path: Path) -> int:
+    return int((tmp_path / "api.json.reads").read_text())
+
+
 @pytest.mark.parametrize(
     "fault",
     [
@@ -625,33 +674,109 @@ def test_merge_gate_waits_for_selected_rust_checks(tmp_path, fault):
                 "completed_at": None,
             }
         )
-    fixtures = tmp_path / "api.json"
-    fixtures.write_text(json.dumps(api))
-    gh = tmp_path / "gh"
-    gh.write_text(
-        f"#!{sys.executable}\n"
-        "import json, os, subprocess, sys\n"
-        "from pathlib import Path\n"
-        "api = json.loads(Path(os.environ['TEST_GATE_API']).read_text())\n"
-        "response = api['checks' if '/check-runs' in sys.argv[2] else 'runs']\n"
-        "subprocess.run(['jq', '-r', sys.argv[sys.argv.index('--jq')+1]], "
-        "input=json.dumps(response), text=True, check=True)\n"
-    )
-    gh.chmod(0o755)
-    process = subprocess.run(
-        ["bash", str(ROOT / ".github/scripts/merge-ready/evaluate-checks.sh")],
-        env=dict(
-            os.environ,
-            PATH=f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
-            TEST_GATE_API=str(fixtures),
-            REPO="example/project",
-            SHA="a" * 40,
-            GITHUB_OUTPUT=str(tmp_path / "gate-output"),
-        ),
-        text=True,
-        capture_output=True,
-        timeout=30,
-    )
+    process = _run_merge_gate(tmp_path, [api])
     assert (process.returncode == 0) == (fault in {"none", "old_workflows"}), (
         process.stdout + process.stderr
     )
+
+
+_E2E_SHARDS = [f"E2E Tests (shard {index}/4)" for index in range(4)] + [
+    f"E2E Tests (shard {index}/2)" for index in range(2)
+]
+
+
+def _gate_snapshot(
+    shard_status: str,
+    e2e_runs: tuple[tuple[str, str], ...] = (("completed", "2026-10-19T10:00:00Z"),),
+    failed: str | None = None,
+) -> dict[str, Any]:
+    """One API snapshot in which only ``E2E Tests (shard 1/4)`` may be unfinished.
+
+    :param shard_status: Status of that shard's check run.
+    :param e2e_runs: ``(status, created_at)`` for each E2E Tests workflow run.
+    :param failed: A required check to report as completed with a failure.
+    """
+    checks = dict.fromkeys(["DCO", "Pre-commit checks", *_E2E_SHARDS], "completed")
+    checks["E2E Tests (shard 1/4)"] = shard_status
+    runs = [
+        {
+            "name": name,
+            "status": "completed",
+            "conclusion": "success",
+            "created_at": "2026-10-19T10:00:00Z",
+        }
+        for name in ("CI", "E2E UI Tests", "Integration Tests")
+    ] + [
+        {
+            "name": "E2E Tests",
+            "status": status,
+            "conclusion": "success" if status == "completed" else None,
+            "created_at": created_at,
+        }
+        for status, created_at in e2e_runs
+    ]
+    return {
+        "checks": {
+            "check_runs": [
+                {
+                    "id": index,
+                    "name": name,
+                    "status": status,
+                    "conclusion": (
+                        ("failure" if name == failed else "success")
+                        if status == "completed"
+                        else None
+                    ),
+                }
+                for index, (name, status) in enumerate(checks.items(), start=1)
+            ]
+        },
+        "runs": {"workflow_runs": runs},
+    }
+
+
+def test_merge_gate_rereads_a_check_that_lags_its_completed_workflow(tmp_path):
+    """A completed workflow's check that still reads as running is re-read, not failed."""
+    lagging = _gate_snapshot("in_progress")
+    settled = _gate_snapshot("completed")
+    process = _run_merge_gate(tmp_path, [lagging, lagging, settled])
+    assert process.returncode == 0, process.stdout + process.stderr
+    assert _check_reads(tmp_path) == 3
+    assert "All required checks green" in process.stdout
+
+
+def test_merge_gate_reports_red_after_the_lag_rereads_run_out(tmp_path):
+    process = _run_merge_gate(tmp_path, [_gate_snapshot("in_progress")])
+    assert process.returncode == 1, process.stdout + process.stderr
+    assert _check_reads(tmp_path) == 6
+    assert "E2E Tests (shard 1/4)" in (tmp_path / "gate-output").read_text()
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        _gate_snapshot("in_progress", (("in_progress", "2026-10-19T10:00:00Z"),)),
+        _gate_snapshot("in_progress", failed="Pre-commit checks"),
+        _gate_snapshot(
+            "in_progress",
+            (("completed", "2026-10-19T10:00:00Z"), ("in_progress", "2026-10-19T10:05:00Z")),
+        ),
+    ],
+    ids=["workflow-running", "with-a-failed-check", "newest-run-running"],
+)
+def test_merge_gate_reports_red_without_rereading_when_a_red_check_is_not_lagging(
+    tmp_path, snapshot
+):
+    process = _run_merge_gate(tmp_path, [snapshot])
+    assert process.returncode == 1, process.stdout + process.stderr
+    assert _check_reads(tmp_path) == 1
+
+
+def test_merge_gate_follows_the_newest_workflow_run_when_rereading(tmp_path):
+    """An older running attempt does not stop a re-read once the newest run completed."""
+    runs = (("in_progress", "2026-10-19T10:00:00Z"), ("completed", "2026-10-19T10:05:00Z"))
+    process = _run_merge_gate(
+        tmp_path, [_gate_snapshot("in_progress", runs), _gate_snapshot("completed", runs)]
+    )
+    assert process.returncode == 0, process.stdout + process.stderr
+    assert _check_reads(tmp_path) == 2

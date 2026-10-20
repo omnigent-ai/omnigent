@@ -10,8 +10,10 @@ available through the CLI or UI yet.
 
 - `user-defaults`: set, list, and remove defaults on this machine; cover empty
   config, invalid keys, legacy scalar harness settings, and custom config homes.
-- `project-defaults`: project YAML overrides user YAML; cover absent files,
-  per-harness fields, explicit clears, and scalar harness replacement.
+- `project-defaults`: project YAML overrides user YAML for the model and the
+  default harness; cover absent files, explicit clears, and scalar harness
+  selection. Server selection and per-harness commands and arguments are read
+  only from user YAML, and `config list` names any ignored project entries.
 - `launch-choice`: explicit invocation choices take precedence over defaults;
   keep configured startup arguments ordered before invocation arguments.
 - `inspect-host-defaults`: inspect the selected host's startup settings and
@@ -27,7 +29,8 @@ available through the CLI or UI yet.
 `harness=<harness>` saves a user default. Omit `--global` to save in the current
 project. Use `omnigent config list` to inspect the files and
 `omnigent config unset [--global] model` to remove a value. Startup commands
-and argument lists are configured in the files' per-harness mappings.
+and argument lists are configured in the user file's per-harness mappings;
+`config list` names any project-file entries it ignores.
 
 **Launch:** run `omnigent run` with an agent/default agent and optional model
 or harness flags, or use a native command such as `omnigent codex` with
@@ -72,9 +75,9 @@ uv run --no-sync pytest tests/test_config.py tests/test_harness_startup_config.p
 - `user-defaults`, `project-defaults`: the config loader tests cover file
   precedence and clears; CLI tests cover writes, removal, inspection, and scalar
   harness migration. Removing a project value allows the user default to apply.
-  The adopted-preference clear matrix also covers aliases such as `claude` for
-  `claude-sdk`: clearing the entry or its arguments removes inherited arguments,
-  a command-only override keeps them, and a session choice can still override.
+  The adopted-preference matrix also covers aliases such as `claude` for
+  `claude-sdk`: project per-harness entries never replace user arguments,
+  and a session choice can still override.
 - `launch-choice`: CLI dispatch tests check explicit choices and Pi argument
   ordering. The native startup tests check Claude/Codex pass-through arguments
   remain unmerged until the runner, so the configured base is applied once.
@@ -116,8 +119,8 @@ directly to the resolver does not verify the live path.
   `tests/e2e_ui/start_session/test_project_config_prefill.py` exercise the former,
   not reading host YAML or syncing workspace preferences.
 - A missing setting, an explicit project clear, an empty argument list, and a
-  disabled plugin have different meanings. A scalar project harness replaces
-  the whole lower harness value; a mapping merges per field.
+  disabled plugin have different meanings. A project harness, scalar or
+  `default`, only selects the default; per-harness fields stay user-owned.
 - Startup commands and credentials stay local. Selecting a harness or copying
   its arguments does not install the binary or make referenced paths available.
 - Read-only plugin inventory is not proof that enable/disable preferences can

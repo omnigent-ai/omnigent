@@ -16,6 +16,7 @@ record omissions rather than treating unselected checks as passed.
 | ID | Priority | Observable acceptance |
 | --- | --- | --- |
 | `launch-reply` | P0 | Launch through the supported entry point; streamed output and the final answer appear once. Usage is reported where supported. |
+| `working-status` | P0 | A demonstrably active turn stays working through quiet model/tool work. Supported blocked states explain what input is needed. Completion, interruption and process exit settle the indicator; the next turn works. Opening or closing a terminal viewer does not change the reported state. |
 | `tool-history` | P0 | A real tool returns a value; a later turn uses that value without repeating the tool. Tool events and results remain visible. |
 | `model-effort` | P0 | Pre-launch and in-session selections reach the intended model/request. Supported effort survives a tool round trip and a later change without losing history; rejected changes do not falsely appear applied. |
 | `interrupt-continue` | P0 | Interrupt a demonstrably active turn, then complete another turn in the same session without stale work or a stuck running state. |
@@ -79,6 +80,7 @@ no harness-specific tests exist. No passing per-harness results are implied.
 | Checklist ID | Bench dimensions | Existing automation / remaining gap |
 | --- | --- | --- |
 | `launch-reply` | `basic_turn`, `streaming`, `cost_tracking` | Server/runner observations; browser launch/rendering and exact-once presentation need the owning UI tests. |
+| `working-status` | — | No shared status-continuity probe. Use the [native working-status recipe](./native-harnesses.md#driving-it-with-the-repro-environment) for Claude OSC/file fallback and UI status routing; SDK lifecycle and other natives need their own evidence. A completed basic turn does not prove quiet-work or blocked-state accuracy. |
 | `tool-history` | `tool_calling` | Tool round trip only. Later-turn recall is not a shared probe; reuse the Pi scenarios below and identify other harness coverage explicitly. |
 | `model-effort` | `model_override`, `reasoning` | Native-TUI model override is currently skipped; SDK routing/reasoning observations are narrower than selection persistence. Reasoning output does not prove outgoing effort, tool continuity, High→Low or UI state. |
 | `interrupt-continue` | `interrupt` | Cancellation signal/early termination; follow-up recovery needs a separate assertion in the same session. |

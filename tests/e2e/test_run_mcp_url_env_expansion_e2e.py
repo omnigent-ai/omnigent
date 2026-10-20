@@ -30,6 +30,7 @@ import httpx
 import pytest
 import yaml
 
+from tests._helpers.live_server import find_free_port
 from tests.e2e.conftest import configure_mock_llm, get_mock_requests, reset_mock_llm
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -53,12 +54,6 @@ _SESSION_LINE_RE = re.compile(r"Omnigent session: (?P<base>https?://[^/\s]+)/c/(
 _PROXY_VARS = frozenset({"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"})
 
 
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
 def _wait_for_listen(port: int, timeout_s: float = 30.0) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -72,7 +67,7 @@ def _wait_for_listen(port: int, timeout_s: float = 30.0) -> None:
 @pytest.fixture(scope="module")
 def echo_mcp_base_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     """A real streamable-HTTP MCP server; ``${PIPESHUB_MCP_URL}`` resolves to its base URL."""
-    port = _free_port()
+    port = find_free_port()
     log_path = tmp_path_factory.mktemp("echo_mcp") / "echo_mcp.log"
     with log_path.open("w") as log:
         proc = subprocess.Popen(

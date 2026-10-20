@@ -426,6 +426,69 @@ async def test_supervise_transcript_parks_new_call_then_releases_on_resolve(
     assert any(j.get("type") == "external_elicitation_resolved" for _, j in posts)
 
 
+async def test_supervise_transcript_parks_call_in_cold_resumed_chat(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A resumed chat predating the launch is found via the pre-seeded bridge state."""
+    from omnigent.harnesses.cursor_native import forwarder as cnf
+
+    chats_root = tmp_path / "chats"
+    monkeypatch.setattr(cnf, "_cursor_chats_root", lambda: chats_root)
+    workspace = "/ws"
+    launch_epoch_ms = 1_800_000_000_000
+    chat_dir = chats_root / cnf._workspace_hash(workspace) / "chat_resumed"
+    chat_dir.mkdir(parents=True)
+    # Created a day before this launch, as on a server-driven cold resume.
+    (chat_dir / "meta.json").write_text(
+        _json.dumps({"createdAtMs": launch_epoch_ms - 86_400_000}), encoding="utf-8"
+    )
+    _write_store(
+        chat_dir / "store.db",
+        [_framed(_pending_tool_call_obj("call_r\nfc", "Shell", {"command": "rm -rf build"}))],
+    )
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    assert cnf.preseed_resume_state(bridge_dir, workspace, "chat_resumed", launch_epoch_ms)
+    # Recency-filtered discovery alone cannot see the resumed chat.
+    assert cnf._discover_store(workspace, launch_epoch_ms) is None
+
+    posts: list[tuple[str, dict]] = []
+    parked = asyncio.Event()
+
+    class _Client:
+        async def post(self, url: str, json: dict | None = None, **_k):
+            posts.append((url, json or {}))
+            if "hooks/cursor-permission-request" in url:
+                parked.set()
+                await asyncio.Event().wait()  # parked until cancelled
+            return httpx.Response(200)
+
+    monkeypatch.setattr(cnp.httpx, "AsyncClient", lambda **_k: _FakeAsyncCM(_Client()))
+
+    task = asyncio.create_task(
+        cnp.supervise_cursor_transcript_elicitations(
+            base_url="http://x",
+            headers={},
+            session_id="conv_r",
+            bridge_dir=bridge_dir,
+            workspace=workspace,
+            launch_epoch_ms=launch_epoch_ms,
+            poll_interval_s=0.01,
+            settle_s=0.0,
+        )
+    )
+    try:
+        await asyncio.wait_for(parked.wait(), timeout=budget(2.0))
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    hook_posts = [j for u, j in posts if "hooks/cursor-permission-request" in u]
+    assert len(hook_posts) == 1
+    assert hook_posts[0]["content_preview"] == "rm -rf build"
+
+
 async def test_supervise_transcript_debounces_autoapproved_call(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

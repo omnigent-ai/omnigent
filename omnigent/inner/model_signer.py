@@ -149,7 +149,7 @@ class ModelSignerSession(Protocol):
 
 
 def _signer_child_argv() -> list[str]:
-    return [sys.executable, "-m", "omnigent.inner.model_signer_service"]
+    return [sys.executable, "-P", "-m", "omnigent.inner.model_signer_service"]
 
 
 class SubprocessModelSigner:

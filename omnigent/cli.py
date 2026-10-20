@@ -57,6 +57,8 @@ from omnigent.cli_native import register_native_commands as _register_native_com
 from omnigent.cli_sandbox import lakebox as _lakebox_alias_group
 from omnigent.cli_sandbox import sandbox as _sandbox_group
 from omnigent.config import (
+    _ignored_project_harness_keys,
+    _merge_effective_config,
     global_config_path,
     load_global_config,
     load_local_config,
@@ -643,7 +645,7 @@ _GLOBAL_CONFIG_KEYS: frozenset[str] = frozenset(
         _AUTO_OPEN_CONVERSATION_CONFIG_KEY,
     }
 )
-_USER_LEVEL_ONLY_CONFIG_KEYS: frozenset[str] = frozenset({"session_title_instructions"})
+_USER_LEVEL_ONLY_CONFIG_KEYS: frozenset[str] = frozenset({"server", "session_title_instructions"})
 _BOOLEAN_CONFIG_KEYS: frozenset[str] = frozenset({_AUTO_OPEN_CONVERSATION_CONFIG_KEY})
 _CONFIG_TRUE_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 _CONFIG_FALSE_VALUES: frozenset[str] = frozenset({"0", "false", "no", "off"})
@@ -824,14 +826,9 @@ def _load_effective_config() -> dict[str, Any]:  # type: ignore[explicit-any]
     """
     Merge global and project-level config.
 
-    Precedence (highest last): global (``~/.omnigent/config.yaml``)
-    → local (``.omnigent/config.yaml`` in cwd).  Project config
-    always wins so per-repo settings override user defaults.
-
-    The ``harness`` mapping is deep-merged (per-harness sub-keys, local
-    winning per-field) via :func:`omnigent.config.resolve_effective_config`
-    so a project's per-harness overrides augment — rather than replace —
-    the user's global ones. Every other key is a shallow replace.
+    Project defaults override user defaults, except harness executables and
+    arguments, which remain user-owned. Projects may select the default harness.
+    :func:`omnigent.config._merge_effective_config` applies this boundary.
 
     :returns: Merged config dict.
     """
@@ -1636,8 +1633,8 @@ def _validate_agent_policy_functions(  # type: ignore[explicit-any]  # spec type
 
     Walks the root spec and all sub-agents. For each function policy
     it resolves ``function.path`` with the same importer the runtime
-    uses at evaluation time (``_resolve_dotted_path``) — resolution
-    behavior is unchanged; this only surfaces a failure early. The
+    uses at evaluation time (``_resolve_dotted_path``). The callable
+    must be installed in the CLI environment as well as the runtime. The
     factory (if any) is not invoked; this checks import + attribute
     lookup only.
 
@@ -1667,9 +1664,10 @@ def _validate_agent_policy_functions(  # type: ignore[explicit-any]  # spec type
                     f"--agent {agent_source}: agent {current.name!r} policy "
                     f"{policy.name!r} references function {path!r}, which "
                     f"cannot be resolved from sys.path "
-                    f"({type(exc).__name__}: {exc}). Every message on this "
-                    f"agent would be denied; ship the module on the server's "
-                    f"sys.path or fix the policy path.",
+                    f"({type(exc).__name__}: {exc}). Install the trusted callable "
+                    f"package in both the Omnigent CLI and server/runtime environments, "
+                    f"or correct the policy path. CLI preflight does not import "
+                    f"modules from the workspace directory.",
                 ) from exc
 
 
@@ -2230,14 +2228,6 @@ def main() -> None:
     shape (``omnigent [--flags] [prompt]``) is rejected here so it
     cannot fall back to the legacy in-process runner path.
 
-    Also inserts the current working directory at ``sys.path[0]``
-    so dotted callables declared in user YAMLs (``callable:
-    mypackage.mymodule.my_fn``) resolve against the user's project,
-    not the console-script's install directory. Console entry
-    points put the script's own directory at sys.path[0] by
-    default, which is almost never what a CLI that imports
-    user-authored modules wants.
-
     Sets up the always-on CLI diagnostics log before Click dispatch
     so unhandled exceptions are captured even when the user didn't
     enable ``--log`` or ``--debug-events``.
@@ -2256,10 +2246,6 @@ def main() -> None:
     # setting OMNIGENT_REQUIRE_WRAPPER; the wrapper sets OMNIGENT_WRAPPER_BYPASS
     # to pass through. Refuse naked calls before any work happens.
     _enforce_wrapper_guard()
-
-    cwd = os.getcwd()
-    if cwd not in sys.path:
-        sys.path.insert(0, cwd)
 
     # Legacy-codepage stdio (Windows ANSI, C locale, PYTHONIOENCODING)
     # can't encode the CLI's glyphs; harden the streams before any command
@@ -8643,8 +8629,8 @@ def run(
     if smart_routing:
         raise click.ClickException(_run_smart_routing_removed())
     # Apply config defaults for any value the user did not pass explicitly.
-    # Explicit CLI args always take precedence; project-local config overrides
-    # global config, which provides user-level defaults.
+    # Explicit CLI args always take precedence; project defaults override
+    # user defaults except for user-owned harness launch settings.
     server_source = click.get_current_context().get_parameter_source("server")
     server_from_cli = server_source is not None and server_source.name == "COMMANDLINE"
     # ``--server local`` (or ``--server ""``) is the documented "ignore any
@@ -10958,7 +10944,7 @@ def _harness_deep_merge_keys(
 
 
 def _validate_config_set_scope(settings: Mapping[str, object], *, is_global: bool) -> None:
-    """Reject project-local writes for settings owned by the shared server."""
+    """Reject project-local writes for user-owned server settings."""
     if is_global:
         return
     user_only = sorted(settings.keys() & _USER_LEVEL_ONLY_CONFIG_KEYS)
@@ -10966,7 +10952,7 @@ def _validate_config_set_scope(settings: Mapping[str, object], *, is_global: boo
         names = ", ".join(repr(key) for key in user_only)
         raise click.ClickException(
             f"Config key(s) {names} can only be set with --global because they "
-            "configure the shared local server."
+            "configure user-level server behavior."
         )
 
 
@@ -11059,7 +11045,8 @@ def _print_config_defaults() -> None:
     """Print the effective CLI defaults (user + project-level).
 
     The ``KEY=VALUE`` defaults from ``~/.omnigent/config.yaml`` (user) and
-    ``.omnigent/config.yaml`` in the cwd (project, takes precedence).
+    ``.omnigent/config.yaml`` in the cwd (project defaults). Harness launch
+    overrides are user-owned; project configuration can select the default.
     Used by ``omnigent config list``.
 
     :returns: None. Side effect: writes to stdout.
@@ -11075,12 +11062,15 @@ def _print_config_defaults() -> None:
     ignored_local_keys = (
         [] if local_is_global else sorted(raw_local_cfg.keys() & _USER_LEVEL_ONLY_CONFIG_KEYS)
     )
+    ignored_harness_keys = [] if local_is_global else _ignored_project_harness_keys(raw_local_cfg)
     local_cfg = {
         k: v
         for k, v in raw_local_cfg.items()
         if local_is_global or k not in _USER_LEVEL_ONLY_CONFIG_KEYS
     }
-    if not global_cfg and not local_cfg and not ignored_local_keys:
+    if not local_is_global:
+        local_cfg = _merge_effective_config({}, local_cfg)
+    if not global_cfg and not local_cfg and not ignored_local_keys and not ignored_harness_keys:
         click.echo(
             f"  (none set — `{cli_invocation()} config set key=value` for project,\n"
             f"   or `{cli_invocation()} config set --global key=value` for user-level)"
@@ -11103,6 +11093,11 @@ def _print_config_defaults() -> None:
         click.echo(
             "  # ignored user-level-only setting(s): "
             f"{', '.join(ignored_local_keys)} (set with --global)"
+        )
+    if ignored_harness_keys:
+        click.echo(
+            f"  # ignored project harness launch overrides: {', '.join(ignored_harness_keys)} "
+            f"(move to {_display_config_path(global_path)})"
         )
 
 
@@ -11182,7 +11177,7 @@ def _slack_installed() -> bool:
 
 def _slack_argv() -> list[str]:
     """Argv that runs the Slack bot in the current interpreter."""
-    return [sys.executable, "-m", _SLACK_PACKAGE]
+    return [sys.executable, "-P", "-m", _SLACK_PACKAGE]
 
 
 def _integration_state_dir() -> Path:
@@ -11399,11 +11394,13 @@ def config_set(is_global: bool, settings: tuple[str, ...]) -> None:
     Without ``--global``, pairs are written to ``.omnigent/config.yaml``
     in the current directory (project-level, like ``.git/config``); with
     ``--global`` to ``~/.omnigent/config.yaml`` (user-level, like
-    ``~/.gitconfig``). Project values take precedence.
+    ``~/.gitconfig``). Project defaults take precedence except for harness
+    executables and arguments, which are user-owned.
 
     Supported keys: auto_open_conversation, default_agent, harness,
-    model, server, session_title_instructions. Session title instructions
-    configure the shared local server and require ``--global``.
+    model, server, session_title_instructions. Server selection and session
+    title instructions require ``--global``. A project-local ``server`` is
+    ignored; use ``--server`` for a per-invocation destination.
 
     :param is_global: When ``True``, write to ``~/.omnigent/config.yaml``;
         when ``False``, to ``.omnigent/config.yaml`` in cwd.
@@ -11847,7 +11844,9 @@ def agent_add(source: str, yes: bool, list_only: bool, server: str | None) -> No
             _clone_github_source(clone_url, ref, checkout)
         except click.ClickException as exc:
             if not source.startswith(("github:", "https://")):
-                exc.message += f"\n(If {source!r} is a local path, it doesn't exist.)"
+                raise _agent_cli_error(
+                    f"{exc.message}\n(If {source!r} is a local path, it doesn't exist.)"
+                ) from None
             raise
         # The parser rejects `..`, so only a symlinked component can leave the subpath.
         root = checkout / subpath
@@ -13025,10 +13024,14 @@ def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None
     """
     databricks_bin = shutil.which("databricks")
     if databricks_bin is None:
-        raise click.ClickException(
-            "The Databricks CLI is required to log in to a workspace. "
-            "Install it first: https://docs.databricks.com/dev-tools/cli/install.html"
+        from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+
+        exc = click.ClickException(
+            "Databricks CLI not found on PATH. Install it, then retry this command.\n"
+            "https://docs.databricks.com/dev-tools/cli/install.html"
         )
+        setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
+        raise exc
     login_host = _host_with_org(workspace_host, org_id)
     # Pin the grant to a profile named for the workspace's first DNS label so
     # distinct workspaces don't clobber each other under the CLI's ``DEFAULT``.
@@ -14110,8 +14113,4 @@ _register_native_commands(cli)
 
 
 if __name__ == "__main__":
-    # Omnigent is already loaded from the selected installation. Restore the
-    # workspace path for local tools, matching the console entry point.
-    if (_cwd := os.getcwd()) not in sys.path:
-        sys.path.insert(0, _cwd)
     cli()

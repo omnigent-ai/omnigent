@@ -207,8 +207,19 @@ def render(draft=""):
 
 render()
 draft, lines = "", []
+pending = ""
+clear_keys = ("\x1b[107;5u", "\x1b[117;5u")
 while True:
-    for ch in os.read(fd, 65536).decode(errors="ignore"):
+    pending += os.read(fd, 65536).decode(errors="ignore")
+    while pending:
+        clear_key = next((key for key in clear_keys if pending.startswith(key)), None)
+        if clear_key is not None:
+            draft = ""
+            pending = pending[len(clear_key):]
+            continue
+        if any(key.startswith(pending) for key in clear_keys):
+            break
+        ch, pending = pending[0], pending[1:]
         if ch == "\x15":
             draft = ""
         elif ch == "\r":

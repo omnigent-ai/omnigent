@@ -20,10 +20,13 @@
  *   the fallback for unknown tools).
  * - `body`: the dynamic payload (path, command, session id). Empty
  *   string when the title is verb-only (e.g. "Read inbox").
+ * - `filePath`: set when the call targets exactly one file, as the agent
+ *   passed it (relative or absolute); the trigger row links it.
  */
 export interface ToolTitle {
   verb: string | null;
   body: string;
+  filePath?: string;
 }
 
 type ArgFormatter = (args: Record<string, unknown>) => ToolTitle | null;
@@ -175,8 +178,8 @@ const FORMATTERS: Record<string, ArgFormatter> = {
     if (changes.length === 1) {
       const only = changes[0];
       const path = only !== null && typeof only === "object" ? Reflect.get(only, "path") : null;
-      const p = asString(path);
-      if (p !== null) return { verb: "Edit", body: p };
+      const title = withPath("Edit", path);
+      if (title !== null) return title;
     }
     return { verb: "Edit", body: `${changes.length} files` };
   },
@@ -362,7 +365,7 @@ function verbOnly(verb: string): ToolTitle {
 
 function withPath(verb: string, raw: unknown): ToolTitle | null {
   const path = asString(raw);
-  return path === null ? null : { verb, body: path };
+  return path === null ? null : { verb, body: path, filePath: path };
 }
 
 function sessionTitle(verb: string, args: Record<string, unknown>): ToolTitle | null {

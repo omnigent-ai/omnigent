@@ -13,6 +13,8 @@ The expression receives the full ``PolicyEvent`` dict as an
 ``{"key": string, "action": "set"|"increment"|"delete"|"append", "value": any}``.
 ``value`` is required for ``set``, ``increment``, and ``append``, and ignored
 for ``delete``.
+Keys beginning with ``_policy_`` belong to the runtime and cannot be changed
+by CEL expressions.
 
 Register statically in an agent's YAML, or dynamically on a running
 session via the policy API.
@@ -77,6 +79,7 @@ from omnigent.policies.schema import (
     PolicyCallable,
     PolicyEvent,
     PolicyResponse,
+    is_reserved_state_key,
     request_user_text,
 )
 
@@ -179,6 +182,12 @@ def cel_policy(
             state_updates = _plain_cel_value(result[_state_updates_key])
             if not isinstance(state_updates, list):
                 raise TypeError("CEL policy: state_updates must be a list of maps.")
+            # Approval checkpoints may only be written by trusted runtime policies.
+            for update in state_updates:
+                if isinstance(update, dict):
+                    key = update.get("key")
+                    if isinstance(key, str) and is_reserved_state_key(key):
+                        raise ValueError("CEL policy: state_updates cannot change reserved keys.")
             out["state_updates"] = state_updates  # type: ignore[typeddict-item]
         return out
 
@@ -252,6 +261,9 @@ POLICY_REGISTRY: list[dict[str, object]] = (
                             '"set"|"increment"|"delete"|"append", "value": any}; '
                             "`value` is required for set/increment/append and ignored "
                             "for delete. "
+                            "Keys beginning with `_policy_` are reserved for the runtime. "
+                            "Attempting to update one denies the event and discards this "
+                            "CEL result's entire state-update list. "
                             "Event fields: "
                             'event.type ("request"|"tool_call"|"tool_result"|'
                             '"response"|"llm_request"|"llm_response"|"output_logged"); '

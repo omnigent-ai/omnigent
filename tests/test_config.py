@@ -19,8 +19,9 @@ from omnigent.config import (
 )
 
 
-def test_effective_config_deep_merges_harness_mapping(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("loader", ["shared", "cli"])
+def test_effective_config_keeps_user_harness_launch_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture, loader: str
 ) -> None:
     config_home = tmp_path / "home"
     project = tmp_path / "project"
@@ -28,30 +29,47 @@ def test_effective_config_deep_merges_harness_mapping(
     (project / ".omnigent").mkdir(parents=True)
     (config_home / "config.yaml").write_text(
         "harness:\n  default: claude-sdk\n  claude-sdk:\n    command: /global/claude\n"
-        "  codex:\n    args: [--config, k=v]\n"
+        "  codex:\n    command: /global/codex\n    args: [--config, k=v]\n"
     )
     (project / ".omnigent" / "config.yaml").write_text(
-        "harness:\n  codex:\n    command: /local/codex\n"
+        "harness:\n  default: codex\n  codex:\n    command: /local/codex\n"
+        "    args: [--project-option]\n  pi:\n    command: /local/pi\n"
     )
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
     monkeypatch.chdir(project)
 
-    cfg = load_effective_config()
+    if loader == "cli":
+        from omnigent.cli import _load_effective_config
+
+        cfg = _load_effective_config()
+    else:
+        cfg = load_effective_config()
+    assert "Ignoring project harness launch overrides: harness.codex, harness.pi" in caplog.text
+    assert str(config_home / "config.yaml") in caplog.text
+    assert "/local/codex" not in caplog.text
+    assert "--project-option" not in caplog.text
     harness = cfg["harness"]
-    assert harness["default"] == "claude-sdk"
+    assert harness["default"] == "codex"
     # Global-only entry preserved (a flat merge would have dropped it).
     assert harness["claude-sdk"] == {"command": "/global/claude"}
-    # Local per-harness entry augments the global one: local command wins,
-    # global args preserved (per-field, not whole-entry replace).
-    assert harness["codex"] == {"args": ["--config", "k=v"], "command": "/local/codex"}
+    assert harness["codex"] == {"command": "/global/codex", "args": ["--config", "k=v"]}
+    assert "pi" not in harness
+    from omnigent.harness_startup_config import resolve_harness_args, resolve_harness_command
+
+    assert resolve_harness_command("codex", default="codex", cfg=cfg) == "/global/codex"
+    assert resolve_harness_args("codex", ["--verbose"], cfg=cfg) == [
+        "--config",
+        "k=v",
+        "--verbose",
+    ]
 
 
-def test_merge_effective_config_scalar_local_overrides_mapping_global() -> None:
-    # A scalar on either side is an explicit whole-value override: the
-    # shallow {**global, **local} result holds (no deep-merge).
+def test_merge_effective_config_scalar_local_preserves_user_overrides() -> None:
     g = {"harness": {"default": "claude-sdk", "codex": {"args": ["x"]}}}
     loc = {"harness": "codex"}
-    assert _merge_effective_config(g, loc) == {"harness": "codex"}
+    assert _merge_effective_config(g, loc) == {
+        "harness": {"default": "codex", "codex": {"args": ["x"]}}
+    }
 
 
 def test_merge_effective_config_scalar_global_no_deep_merge() -> None:
@@ -63,10 +81,35 @@ def test_merge_effective_config_scalar_global_no_deep_merge() -> None:
 
 
 def test_merge_effective_config_no_harness_key_unchanged() -> None:
-    assert _merge_effective_config({"model": "x"}, {"server": "y"}) == {
+    assert _merge_effective_config({"model": "x"}, {"profile": "y"}) == {
         "model": "x",
-        "server": "y",
+        "profile": "y",
     }
+
+
+@pytest.mark.parametrize("global_server", [None, "https://configured.example.com"])
+@pytest.mark.parametrize("explicit_workspace", [False, True])
+def test_project_config_cannot_select_the_server(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    global_server: str | None,
+    explicit_workspace: bool,
+) -> None:
+    config_home = tmp_path / "home"
+    project = tmp_path / "project"
+    config_home.mkdir()
+    (project / ".omnigent").mkdir(parents=True)
+    (config_home / "config.yaml").write_text(
+        f"server: {global_server}\n" if global_server else "{}\n"
+    )
+    (project / ".omnigent" / "config.yaml").write_text(
+        "server: https://project.example.com\nprofile: project-profile\n"
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    monkeypatch.chdir(project)
+    cfg = load_effective_config(workspace=project if explicit_workspace else None)
+    assert cfg.get("server") == global_server
+    assert cfg["profile"] == "project-profile"
 
 
 def test_global_config_path_respects_config_home(
@@ -120,7 +163,7 @@ def test_effective_config_uses_explicit_workspace(
 
     assert load_effective_config(workspace=workspace) == {
         "profile": "global",
-        "harness": {"claude-native": {"command": "project-claude", "args": ["--verbose"]}},
+        "harness": {"claude-native": {"command": "global-claude", "args": ["--verbose"]}},
     }
 
 
@@ -302,11 +345,12 @@ def test_adopted_preferences_flow_from_yaml_to_launch_without_rewriting_files(
     assert overrides["codex-native"]["command"] == "/local/wrapper"
     assert resolve_harness_args("codex-native", ("--profile", "invocation"), cfg=cfg) == [
         "--profile",
-        "project",
+        "shared",
         "--profile",
         "invocation",
     ]
-    assert result.preferences[args].source == PreferenceScope.PROJECT
+    # Project harness arguments are ignored; launch arguments stay user-owned.
+    assert result.preferences[args].source == PreferenceScope.SHARED
     assert result.preferences[plugin].value is False
     assert "plugins" not in cfg
     inherited = load_effective_config(
@@ -369,6 +413,7 @@ def test_preference_adoption_requires_context_and_owns_project_layer():
         ("codex-native", {"harness": {"default": None}}),
         ("codex-native", {"harness": {"codex-native": None}}),
         ("codex-native", {"harness": {"codex-native": {"args": None}}}),
+        ("codex-native", {"harness": {"codex-native": {"args": ["--project"]}}}),
         ("claude", {"harness": {"claude": None}}),
         ("claude", {"harness": {"claude": {"args": None}}}),
         ("claude", {"harness": {"claude": {"command": "local-wrapper"}}}),
