@@ -1584,6 +1584,42 @@ async def test_stop_session_requires_confirmed_host_runner_exit(
         routes_events._interrupt_fenced_sessions.discard(session_id)
 
 
+@pytest.mark.parametrize("host_row_offline", [True, False])
+async def test_stop_session_settles_when_host_and_runner_are_unreachable(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    host_row_offline: bool,
+) -> None:
+    """Stop succeeds when neither the runner nor its offline host can be reached.
+
+    A turn held for a sleeping laptop would otherwise refuse Stop until the
+    laptop wakes. A host live on another replica could still take the stop,
+    so its row must read offline before the route stops asking.
+    """
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes.sessions import routes_events
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    await comm.send_input({"type": "websocket.disconnect", "code": 1001})
+    await comm.wait(timeout=budget(5.0))
+    monkeypatch.setattr(sessions, "_stop_session_via_runner", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        routes_events, "_stop_host_runner_intentionally", AsyncMock(return_value=False)
+    )
+    row_check = AsyncMock(return_value=host_row_offline)
+    monkeypatch.setattr(routes_events, "_host_row_offline", row_check)
+
+    response = await client.post(
+        f"/v1/sessions/{session_id}/events", json={"type": "stop_session"}
+    )
+
+    assert response.status_code == (202 if host_row_offline else 503), response.text
+    row_check.assert_awaited_once()
+
+
 async def test_stopped_host_session_writes_no_label_and_host_stays_online(
     client: httpx.AsyncClient,
     app: FastAPI,

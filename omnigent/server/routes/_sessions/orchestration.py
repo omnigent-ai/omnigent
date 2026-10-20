@@ -8160,6 +8160,45 @@ _NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S: float = 30.0
 # failure. ``waiting`` counts because the turn's background work (shells,
 # sub-agents) outlives the turn and dies with the runner.
 _MID_TURN_STATUSES = ("running", "waiting")
+# A laptop that sleeps or loses its network takes its runner with it and often
+# resumes the turn hours later, so a turn interrupted that way waits this long.
+HOST_OFFLINE_HOLD_S: float = 24 * 3600.0
+# How often a host-offline hold re-checks whether the host came back.
+HOST_OFFLINE_RECHECK_S: float = 60.0
+
+# Set at app startup: whether a lost relay's turn is being held by the
+# runner's disconnect task because its host went offline too.
+_relay_turn_held_for_host: Callable[[str, str], Awaitable[bool]] | None = None
+
+
+def set_relay_host_offline_probe(probe: Callable[[str, str], Awaitable[bool]] | None) -> None:
+    """
+    Register how a relay learns its runner's turns wait for an offline host.
+
+    :param probe: Called with ``(runner_id, session_id)``; ``None`` clears it.
+    :returns: None.
+    """
+    global _relay_turn_held_for_host
+    _relay_turn_held_for_host = probe
+
+
+async def _host_row_offline(host_store: HostStore | None, host_id: str) -> bool:
+    """
+    Report whether a user-run host's row shows it offline on every replica.
+
+    :param host_store: Persistent host registrations, or ``None`` without hosts.
+    :param host_id: The host to check.
+    :returns: ``True`` for a stale non-sandbox host; ``False`` when it is live,
+        managed, missing, or its row can't be read.
+    """
+    if host_store is None:
+        return False
+    try:
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+    except Exception:  # noqa: BLE001 — an unreadable row proves nothing
+        _logger.warning("Host lookup failed for host=%s", host_id, exc_info=True)
+        return False
+    return host is not None and host.sandbox_provider is None and not host_is_live(host)
 
 
 class _RelayTransportLost(Exception):
@@ -8655,6 +8694,12 @@ async def _relay_runner_stream(
                 session_id, conversation_store, outage_runner_id
             ):
                 decision = "rebound"
+            elif (
+                _relay_turn_held_for_host is not None
+                and outage_runner_id is not None
+                and await _relay_turn_held_for_host(outage_runner_id, session_id)
+            ):
+                decision = "held_host_offline"
             elif await _runner_disconnect_requires_failure(
                 session_id, conversation_store, origin="runner_disconnected_mid_turn"
             ):
@@ -8725,6 +8770,10 @@ async def _relay_runner_stream(
                     outage_runner_id,
                     extra={"session_id": session_id},
                 )
+            elif decision == "held_host_offline":
+                # The disconnect task holds the turn until the host returns;
+                # the runner's reconnect restarts this relay.
+                pass
             elif decision == "idle_no_failure":
                 # No evidence of an interrupted turn. Liveness drives the
                 # reconnect affordance; preserve status and prior error labels.

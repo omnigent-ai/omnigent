@@ -2438,3 +2438,98 @@ async def test_parent_reconnect_restores_interrupted_child_on_old_runner(
         )
         assert store.get_conversation(child.id).runner_id == _RUNNER_ID
         assert store.get_conversation(finished.id).runner_id == child_runner
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize(
+    "scenario", ["reconnect", "expired", "host_back_without_runner", "host_online"]
+)
+async def test_runner_disconnect_holds_turn_while_host_offline(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+) -> None:
+    """A mid-turn session whose host went offline waits for it instead of failing.
+
+    A sleeping laptop takes its runner along and resumes the turn on wake, so
+    the turn fails only when the hold expires or the host returns without its
+    runner. A host that stayed online fails the turn at the grace, as before.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_app = tunnel_three_layer_stack.ap_app
+    grace = 0.2
+    hold = 30.0 if scenario in ("reconnect", "host_back_without_runner") else 0.6
+    monkeypatch.setattr(sessions_module, "RUNNER_DISCONNECT_GRACE_S", grace)
+    monkeypatch.setattr(sessions_module, "HOST_OFFLINE_HOLD_S", hold)
+    monkeypatch.setattr(sessions_module, "HOST_OFFLINE_RECHECK_S", 0.05)
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+    host_checks: list[str] = []
+
+    async def scripted_host_row_offline(host_store: object, host_id: str) -> bool:
+        host_checks.append(host_id)
+        if scenario == "host_online":
+            return False
+        # The host returns on its third check in the host-back scenario.
+        return not (scenario == "host_back_without_runner" and len(host_checks) > 2)
+
+    monkeypatch.setattr(sessions_module, "_host_row_offline", scripted_host_row_offline)
+
+    response = await tunnel_three_layer_stack.ap_client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={"bundle": ("agent.tar.gz", _build_harness_agent_bundle(), "application/gzip")},
+    )
+    assert response.status_code == 201, response.text
+    session_id = response.json()["session_id"]
+    runner_id = f"runner-host-offline-{scenario}"
+    host_id = "0123456789abcdef0123456789abcdef"
+    store = get_conversation_store()
+    store.replace_runner_id(session_id, runner_id)
+    store.set_host_id(session_id, host_id, workspace="/tmp/host-offline")
+
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+    sessions_module._session_status_cache[session_id] = "running"
+    reconnect: ApplicationCommunicator | None = None
+
+    async def _failed() -> dict[str, str]:
+        # The status publishes first; the cause labels persist on a later await.
+        while True:
+            conv = store.get_conversation(session_id)
+            error = sessions_module._last_task_error_from_labels(conv.labels) if conv else None
+            if sessions_module._session_status_cache.get(session_id) == "failed" and error:
+                return error
+            await asyncio.sleep(0.02)
+
+    try:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        await communicator.wait(timeout=budget(2.0))
+        if scenario == "host_online":
+            await asyncio.wait_for(_failed(), timeout=budget(5.0))
+            return
+        # Well past the grace, the turn is held rather than failed.
+        await asyncio.sleep(grace * 2)
+        assert sessions_module._session_status_cache.get(session_id) == "running"
+        assert host_checks[0] == host_id
+
+        if scenario == "reconnect":
+            reconnect = await _connect_runner_tunnel(ap_app, runner_id)
+            await _send_hello_and_wait(
+                reconnect, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME]
+            )
+            await asyncio.sleep(grace * 2)
+            assert sessions_module._session_status_cache.get(session_id) == "running"
+            return
+        # Expiry, or one more grace after the host returned: the turn fails.
+        error = await asyncio.wait_for(_failed(), timeout=budget(5.0))
+        assert error["code"] == "runner_disconnected"
+        assert ("did not come back within" in error["message"]) == (scenario == "expired")
+    finally:
+        if reconnect is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await reconnect.send_input({"type": "websocket.disconnect", "code": 1000})
+            with contextlib.suppress(asyncio.TimeoutError, Exception):
+                await reconnect.wait(timeout=budget(2.0))
