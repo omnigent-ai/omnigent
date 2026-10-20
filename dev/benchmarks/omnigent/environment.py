@@ -155,6 +155,8 @@ _POLICY_ALLOW = '{"action": "allow", "reason": ""}'
 # wheel). The server loads it via the ``debug_router_modules`` config key to
 # expose ``GET /debug/server-metrics`` for per-journey request counting.
 _DEBUG_ROUTER_MODULE = "dev.benchmarks.omnigent.debug_router"
+# Registers the handler the policy_evaluate journey uploads (see bench_policies).
+_BENCH_POLICY_MODULE = "dev.benchmarks.omnigent.bench_policies"
 _SERVER_METRICS_PATH = "/debug/server-metrics"
 
 
@@ -678,7 +680,10 @@ class BenchEnvironment:
         # counting). In runner mode it additionally routes the server-side
         # policy-classifier LLM at the mock, mirroring live_server — without
         # that the classifier's client defaults to api.openai.com and errors.
-        server_config: dict[str, object] = {"debug_router_modules": [_DEBUG_ROUTER_MODULE]}
+        server_config: dict[str, object] = {
+            "debug_router_modules": [_DEBUG_ROUTER_MODULE],
+            "policy_modules": [_BENCH_POLICY_MODULE],
+        }
         if self.with_runner:
             server_config["llm"] = {
                 "model": _POLICY_LLM_KEY,
