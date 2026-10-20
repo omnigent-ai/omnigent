@@ -90,6 +90,15 @@ describe("sandboxProviderOptions", () => {
 });
 
 describe("resolveServerInfo sandbox_providers", () => {
+  it.each([undefined, false, "true", true])(
+    "requires an explicit durable-input capability (%s)",
+    async (value) => {
+      expect((await probe({ durable_initial_input: value })).durable_initial_input).toBe(
+        value === true,
+      );
+    },
+  );
+
   it.each([undefined, null, "", "manage", 2, true])(
     "defaults an absent or invalid public ceiling %s to Read",
     async (value) => {

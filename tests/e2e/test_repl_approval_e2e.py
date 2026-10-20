@@ -209,6 +209,10 @@ def repl_env(
         "OMNIGENT_DATA_DIR": str(config_home),
         "DATABRICKS_CONFIG_FILE": str(real_databrickscfg),
         "OMNIGENT_SKIP_ONBOARD": "1",
+        # Test tool callables live in this repo's ``tests`` package.
+        "PYTHONPATH": os.pathsep.join(
+            filter(None, (str(Path(__file__).resolve().parents[2]), os.environ.get("PYTHONPATH")))
+        ),
         # Force ANSI on — pexpect captures everything, stripping
         # happens per-assertion via _strip_ansi.
         "TERM": "xterm-256color",

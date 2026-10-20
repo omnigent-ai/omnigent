@@ -1566,6 +1566,13 @@ describe("derivePullRequestPanelState", () => {
     expect(derivePullRequestPanelState(q({ error: new Error("boom") })).kind).toBe("error");
   });
 
+  it("reads an offline sandbox as sandbox-offline unless info was cached before it stopped", () => {
+    const asleep = (over: Parameters<typeof q>[0]) => ({ ...q(over), sandboxAsleep: true });
+    expect(derivePullRequestPanelState(asleep({ isLoading: true })).kind).toBe("sandbox-offline");
+    expect(derivePullRequestPanelState(asleep({})).kind).toBe("sandbox-offline");
+    expect(derivePullRequestPanelState(asleep({ data: ready })).kind).toBe("ready");
+  });
+
   it("maps each unavailable reason to its own state", () => {
     expect(derivePullRequestPanelState(q({ data: undefined })).kind).toBe("unavailable");
     expect(

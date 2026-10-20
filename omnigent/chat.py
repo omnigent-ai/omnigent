@@ -3704,6 +3704,7 @@ def _start_local_server(
             server_proc: subprocess.Popen[bytes] = subprocess.Popen(
                 [
                     sys.executable,
+                    "-P",
                     "-m",
                     "omnigent.cli",
                     "server",

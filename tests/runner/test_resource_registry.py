@@ -6,6 +6,8 @@ import asyncio
 import json
 import logging
 import os
+import shutil
+import sys
 import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -35,6 +37,212 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.terminals import TerminalRegistry
 from tests.runner.helpers import make_test_terminal_instance
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux not installed")
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", ["osc", "legacy", "disabled"])
+@pytest.mark.parametrize(
+    "sandbox_type",
+    [
+        "none",
+        pytest.param(
+            "darwin_seatbelt" if sys.platform == "darwin" else "linux_bwrap",
+            marks=pytest.mark.skipif(
+                shutil.which("sandbox-exec" if sys.platform == "darwin" else "bwrap") is None,
+                reason="native sandbox unavailable",
+            ),
+        ),
+    ],
+)
+async def test_claude_program_status_real_launch_and_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, protocol: str, sandbox_type: str
+) -> None:
+    """Exercise startup negotiation, raw PTY transport, status arbitration and cleanup."""
+    monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    if protocol == "disabled":
+        monkeypatch.setenv("OMNIGENT_FEATURES", "-claude_osc_status")
+    config = tmp_path / "claude-config"
+    sessions = config / "sessions"
+    sessions.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    peer = tmp_path / "peer.py"
+    peer.write_text(
+        "import os,sys,tty\n"
+        "tty.setraw(0)\n"
+        "if sys.argv[1]=='osc':\n"
+        " os.write(1,b'\\x1b]7501;?\\x1b\\\\\\x1b[c')\n"
+        " reply=b''\n"
+        " while not reply.endswith(b'\\x1b\\\\'): reply+=os.read(0,1)\n"
+        " assert reply.startswith(b'\\x1b]7501;?')\n"
+        " reply=b''\n"
+        " while not reply.endswith(b'c'): reply+=os.read(0,1)\n"
+        " os.write(1,b'\\x1b]7501;state=working:app=claude-code\\x07')\n"
+        "reports={b'b':b'state=blocked:kind=permission',b'd':b'state=done',"
+        "b'i':b'state=idle',b'e':b'state=error',b'w':b'state=working',"
+        "b'c':b'state=clear',b'u':b'state=clear',b'x':b'state=idle:id=child',"
+        "b'o':b'state=idle:app=other',b'a':b'state=clear:app=other',"
+        "b'y':b'state=clear:id=child'}\n"
+        "while True:\n"
+        " key=os.read(0,1)\n"
+        " if key==b'q': break\n"
+        " if key==b'r':\n"
+        "  open(sys.argv[2],'w').write(str(tuple(os.get_terminal_size())))\n"
+        "  continue\n"
+        " body=(b'' if key==b'u' else b'app=claude-code:')+reports[key]\n"
+        " os.write(1,b'\\x1b]7501;'+body+b'\\x1b\\\\')\n"
+    )
+    terminals = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminals)
+    statuses: list[tuple[str, str | None]] = []
+    registry.set_session_status_publisher(
+        lambda _, state, reason: statuses.append((state, reason))
+    )
+    spec = TerminalEnvSpec(
+        command=sys.executable,
+        args=[str(peer), protocol, str(tmp_path / "size")],
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(
+                type=sandbox_type,
+                read_paths=[str(Path(__file__).resolve().parents[2])],
+                write_paths=[str(tmp_path)],
+            ),
+        ),
+        keep_alive_after_exit=True,
+    )
+
+    async def wait_status(state: str, reason: str | None = None) -> None:
+        async with asyncio.timeout(10):
+            while not statuses or statuses[-1] != (state, reason):
+                await asyncio.sleep(0.02)
+
+    try:
+        await registry.launch_required_terminal(
+            "osc-test", "claude", "main", spec, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
+        )
+        instance = terminals.get("osc-test", "claude", "main")
+        assert instance is not None
+        reader = instance.program_status
+        if protocol == "disabled":
+            assert reader is None
+            status_pid = instance.pane_pid_sync()
+            assert status_pid is not None
+        else:
+            assert reader is not None
+            async with asyncio.timeout(5):
+                while reader.child_pid is None:
+                    await asyncio.sleep(0.02)
+            status_pid = reader.child_pid
+        status_file = sessions / f"{status_pid}.json"
+        status_file.write_text(json.dumps({"kind": "interactive", "status": "busy"}))
+        await wait_status("running")
+        await instance._tmux("resize-window", "-t", "main", "-x", "93", "-y", "37")
+        async with asyncio.timeout(5):
+            while (
+                not (tmp_path / "size").exists() or (tmp_path / "size").read_text() != "(93, 37)"
+            ):
+                assert await instance.is_alive(), instance.last_exit_text()
+                await instance.send(keys="r")
+                await asyncio.sleep(0.05)
+        if protocol != "osc":
+            assert reader is None or reader.status is None
+            status_file.write_text(json.dumps({"kind": "interactive", "status": "idle"}))
+            await wait_status("idle")
+            return
+        assert reader is not None
+        async with asyncio.timeout(5):
+            while reader.status is None:
+                await asyncio.sleep(0.02)
+        assert reader.status.state == "working"
+        # A contradictory file and a quiet screen must not override live OSC.
+        status_file.write_text(json.dumps({"kind": "interactive", "status": "idle"}))
+        await asyncio.sleep(1.4)  # Real elapsed time, longer than the pane idle threshold.
+        assert statuses == [("running", None)]
+        for key in ("x", "o", "a", "y"):
+            await instance.send(keys=key)
+        await asyncio.sleep(0.3)
+        assert reader.status is not None and reader.status.state == "working"
+        assert statuses == [("running", None)]
+        await instance.send(keys="b")
+        await wait_status("running", "permission prompt")
+        for source in ("reconnect", "forwarded_idle"):
+            before = len(statuses)
+            if source == "reconnect":
+                registry.resync_session_statuses()
+            else:
+                registry.note_external_session_status("osc-test", "idle")
+            async with asyncio.timeout(5):
+                while len(statuses) == before:
+                    await asyncio.sleep(0.02)
+            assert statuses[-1] == ("running", "permission prompt")
+        for key, state in (("d", "idle"), ("w", "running"), ("i", "idle"), ("e", "failed")):
+            await instance.send(keys=key)
+            await wait_status(state)
+        for key in ("c", "u"):
+            await instance.send(keys=key)
+            await wait_status("idle")  # Falls back to the still-unchanged status file.
+            await instance.send(keys="w")
+            await wait_status("running")
+        reader.path.unlink()
+        reader.path.mkdir()  # Make snapshot replacement fail while the command keeps running.
+        await instance.send(keys="b")
+        await wait_status("idle")
+        assert await instance.is_alive()
+        reader.path.rmdir()
+        await instance.send(keys="q")
+        async with asyncio.timeout(5):
+            while await instance.is_alive():
+                await asyncio.sleep(0.05)
+    finally:
+        await terminals.shutdown()
+    assert reader.status is None
+    assert not reader.path.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("role", "features", "expected"),
+    [
+        (CLAUDE_NATIVE_TERMINAL_ROLE, None, "claude-code"),
+        (CLAUDE_NATIVE_TERMINAL_ROLE, "", "claude-code"),
+        (CLAUDE_NATIVE_TERMINAL_ROLE, "usage_page", "claude-code"),
+        (CLAUDE_NATIVE_TERMINAL_ROLE, "claude_osc_status", "claude-code"),
+        (CLAUDE_NATIVE_TERMINAL_ROLE, "-claude_osc_status", None),
+        (PI_NATIVE_TERMINAL_ROLE, None, None),
+        (CODEX_NATIVE_TERMINAL_ROLE, None, None),
+        (None, None, None),
+    ],
+)
+async def test_program_status_respects_flag_and_claude_role(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    role: str | None,
+    features: str | None,
+    expected: str | None,
+) -> None:
+    monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    if features is not None:
+        monkeypatch.setenv("OMNIGENT_FEATURES", features)
+    monkeypatch.setenv("OMNIGENT_CLAUDE_OSC_STATUS", "1")
+    terminals = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminals)
+    # Like server release flags, the runner keeps one startup snapshot.
+    monkeypatch.setenv(
+        "OMNIGENT_FEATURES", "-claude_osc_status" if expected else "claude_osc_status"
+    )
+    seen = []
+
+    async def launch(**kwargs):
+        seen.append(kwargs.get("program_status_app"))
+        return make_test_terminal_instance("agent", "main", tmp_path)
+
+    monkeypatch.setattr(terminals, "launch", launch)
+    await registry.launch_required_terminal(
+        "flag-test", "agent", "main", TerminalEnvSpec(), resource_role=role
+    )
+    assert seen == [expected]
 
 
 @dataclass

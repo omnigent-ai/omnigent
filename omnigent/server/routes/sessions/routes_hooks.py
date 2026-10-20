@@ -49,6 +49,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     AuthProvider,
 )
+from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
@@ -207,7 +208,7 @@ def register_hooks_routes(
 
         user_id = _get_user_id(request, auth_provider)
         await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
         try:
             payload = await request.json()
@@ -658,7 +659,24 @@ def register_hooks_routes(
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
-        is_read_only = access.level is not None and access.level < LEVEL_EDIT
+        is_read_only = permission_store is not None and (
+            access.level is None or access.level < LEVEL_EDIT
+        )
+        if (
+            permission_store is not None
+            and access.conversation is not None
+            and access.conversation.parent_conversation_id is not None
+        ):
+            # Child display levels do not describe the parent's mutation authority.
+            is_read_only = not await asyncio.to_thread(
+                check_session_access,
+                user_id,
+                session_id,
+                LEVEL_EDIT,
+                permission_store,
+                conversation_store,
+                access.conversation,
+            )
         try:
             payload = await request.json()
         except json.JSONDecodeError as exc:
@@ -1123,7 +1141,7 @@ def register_hooks_routes(
         """
         user_id = _get_user_id(request, auth_provider)
         await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
         try:
             payload = await request.json()
@@ -1214,7 +1232,7 @@ def register_hooks_routes(
         """
         user_id = _get_user_id(request, auth_provider)
         await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
         try:
             payload = await request.json()
@@ -1313,7 +1331,7 @@ def register_hooks_routes(
         """
         user_id = _get_user_id(request, auth_provider)
         await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
         try:
             payload = await request.json()
@@ -1430,7 +1448,7 @@ def register_hooks_routes(
         """
         user_id = _get_user_id(request, auth_provider)
         await _require_access(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
         )
         try:
             payload = await request.json()

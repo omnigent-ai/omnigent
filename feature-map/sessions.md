@@ -36,13 +36,16 @@ the header menu), and each place is a separate entry point.
   menu of an archived session.
 - `delete`: confirmed, then removed from the list and the server.
 - `export`: Export in the header menu saves the transcript as a local file.
-- `unread`: Mark as unread re-lights a row's unread dot and Mark as read clears
-  it; the state survives a reload.
+- `unread`: Mark as unread flags a session to revisit and survives a reload,
+  including for the session being viewed. Its dot appears once the turn is
+  idle; approval and error indicators can take precedence. A row showing the
+  unread dot offers Mark as read instead. Bulk selection also offers these actions.
 - `project`: Add to project (Move session once filed) puts a session in a
   project folder from the row menu, the header menu, or the header's folder tag.
 - `project-rename`: the project menu opens a dialog with the name selected;
   typing replaces it without losing characters as the menu closes.
-- `bulk-actions`: select several rows, then archive, unarchive, or delete them.
+- `bulk-actions`: select several rows, then mark as read or unread, archive,
+  unarchive, or delete them.
 - `fork`: fork the whole session or from a message; the fork keeps images and
   their files, elapsed "worked for" time, and can switch agent or host.
   For a native target, the fork dialog also offers model, reasoning effort,
@@ -145,7 +148,7 @@ the Pinned section, or drop an unpinned row onto a pinned row to pin it into
 that slot.
 
 **Bulk selection:** select several rows in the sidebar, then use the selection
-actions (archive, unarchive, delete).
+actions (mark as read or unread, archive, unarchive, delete).
 
 **Session header menu:** open a session and use the menu next to its title for
 pin, fork, export, rename, mark as unread, add to project, archive or
@@ -351,10 +354,21 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`export`, header menu (own environment):**
   `tests/e2e_ui/sessions/test_export_chat_menu.py::test_header_session_menu_offers_export`,
   `tests/e2e_ui/sessions/test_export_chat_menu.py::test_header_export_downloads_transcript`
-  seed the transcript into the spawned server's database.
-- **`unread`, sidebar row:**
-  `tests/e2e_ui/sessions/test_sidebar_mark_unread.py::test_mark_unread_lights_the_dot_and_persists_across_reload`.
-  Repeat from the header menu by hand and expect the row's unread dot.
+  seed the transcript into the spawned server's database; run them with plain
+  `uv run pytest`, outside `verify-env run`.
+- **`unread`, sidebar row menu:**
+  `tests/e2e_ui/sessions/test_sidebar_mark_unread.py::test_mark_unread_lights_the_dot_and_persists_across_reload`,
+  `tests/e2e_ui/sessions/test_sidebar_mark_unread.py::test_unread_dot_survives_reload_from_localStorage_when_server_seed_is_empty`.
+  The header-menu rename test above lists Mark as unread; manually choose it
+  and expect the row's dot. The row dropdown's Mark as read action has coverage
+  in `web/src/shell/Sidebar.readStateActions.test.tsx`. Right-click read-state
+  actions need a manual check: mark an idle row unread, expect its dot, then
+  choose Mark as read and expect it cleared.
+- **`unread`, bulk selection:** coverage in
+  `web/src/shell/Sidebar.readStateActions.test.tsx`, without a browser test. Select
+  idle sessions with at least one unread row, choose Mark as read, and expect
+  their dots to clear and selection mode to close. Select only read sessions,
+  choose Mark as unread, and expect their dots to appear and selection to close.
 - **`project`, sidebar row and header folder tag:**
   `tests/e2e_ui/sessions/test_move_to_project.py::test_move_session_into_project_regroups_sidebar_row`
   and, seeding its own environment,

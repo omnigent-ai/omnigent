@@ -220,6 +220,12 @@ function loadNavigationHarness({
     },
   });
   const defaultSession = {
+    setPermissionRequestHandler(handler) {
+      this.request = handler;
+    },
+    setPermissionCheckHandler(handler) {
+      this.check = handler;
+    },
     cookies: network?.cookies ?? cookies,
     webRequest: {
       onBeforeRequest: (fn) => {
@@ -622,7 +628,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, cancelReconnect };";
+    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -2162,6 +2168,29 @@ describe("Databricks auth mode wiring", () => {
 });
 
 describe("browser permission wiring", () => {
+  it("grants fullscreen only to the pinned server's top-level page", (t) => {
+    const serverUrl = "https://server.example/omnigent";
+    const h = loadNavigationHarness({ serverUrl });
+    t.after(h.cleanup);
+    h.webContents.isDestroyed = () => false;
+    h.api.registerPermissions();
+    const ses = h.electron.session.defaultSession;
+    const request = (permission, requestingUrl) => {
+      let granted;
+      ses.request(h.webContents, permission, (value) => (granted = value), { requestingUrl });
+      return granted;
+    };
+    assert.equal(ses.check(h.webContents, "fullscreen", serverUrl), true);
+    assert.equal(request("fullscreen", `${serverUrl}/c/session`), true);
+    assert.equal(request("fullscreen", "https://foreign.example/video"), false);
+    assert.equal(ses.check(h.webContents, "fullscreen", "https://foreign.example"), false);
+    assert.equal(ses.check(null, "fullscreen", serverUrl), false);
+    assert.equal(request("clipboard-read", serverUrl), false);
+    h.setUrl("https://foreign.example");
+    assert.equal(request("fullscreen", serverUrl), false);
+    assert.equal(ses.check(h.webContents, "fullscreen", serverUrl), false);
+  });
+
   it("installs isolated consent handlers before construction and only prompts for the visible pane", async () => {
     const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
     try {
