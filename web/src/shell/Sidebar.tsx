@@ -7271,7 +7271,7 @@ function ProjectFolderMenu({
   showOnTouch: boolean;
 }) {
   const [open, setOpen] = useState(false);
-  const mouseToggledRef = useRef(false);
+  const touchPressRef = useRef(false);
   return (
     <DropdownMenu open={open} onOpenChange={setOpen}>
       <DropdownMenuTrigger asChild>
@@ -7284,13 +7284,13 @@ function ProjectFolderMenu({
           className={cn("text-muted-foreground", showOnTouch && "no-fine-hover:size-11")}
           onPointerDown={(e) => {
             // Touch and pen open on click so a scroll starting here never opens the menu.
-            mouseToggledRef.current = e.pointerType === "mouse";
-            if (!mouseToggledRef.current) e.preventDefault();
+            touchPressRef.current = e.pointerType !== "mouse";
+            if (touchPressRef.current) e.preventDefault();
           }}
           onClick={(e) => {
             e.stopPropagation();
-            if (!mouseToggledRef.current) setOpen((wasOpen) => !wasOpen);
-            mouseToggledRef.current = false;
+            if (touchPressRef.current) setOpen((wasOpen) => !wasOpen);
+            touchPressRef.current = false;
           }}
         >
           <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />

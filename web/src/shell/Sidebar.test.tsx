@@ -3031,6 +3031,9 @@ describe("Sidebar project sections", () => {
     expect(revealWrapper).not.toHaveClass("no-fine-hover:sr-only");
     expect(header).toHaveClass("no-fine-hover:min-h-11");
 
+    // A click without a pointer press (keyboard Space keyup) leaves Radix in charge.
+    fireEvent.click(menuButton);
+    expect(menuButton).toHaveAttribute("aria-expanded", "false");
     // A touch press alone (the start of a scroll) leaves the menu closed.
     fireEvent.pointerDown(menuButton, { button: 0, ctrlKey: false, pointerType: "touch" });
     expect(menuButton).toHaveAttribute("aria-expanded", "false");
