@@ -810,28 +810,36 @@ class AzureDevOpsPullRequests:
         return _token() is not None
 
     def pr_title(
+        self, root: str, reference: PullRequestRef, deadline: float
+    ) -> tuple[str | None, bool]:
+        """Read one PR's title; the request timeout is the time left before ``deadline``."""
+        title, _, timed_out = self.pr_title_and_state(root, reference, deadline)
+        return title, timed_out
+
+    def pr_title_and_state(
         self,
         root: str,  # noqa: ARG002 - the title is read from Azure DevOps
         reference: PullRequestRef,
         deadline: float,
-    ) -> tuple[str | None, bool]:
-        """Read one PR's title; the request timeout is the time left before ``deadline``."""
+    ) -> tuple[str | None, str | None, bool]:
+        """Read one PR's title and state, timing the request out at ``deadline``."""
         repo = _reference_repo(reference)
         if repo is None:
-            return None, False
+            return None, None, False
         if time.monotonic() >= deadline:
-            return None, True
+            return None, None, True
         token = _token()
         if token is None:
-            return None, False
+            return None, None, False
         try:
             with self._client(repo.org, token, deadline=deadline) as client:
                 pr = _call(client.get_pull_request, repo.project, repo.repo, reference.number)
         except _RestFailure as failure:
             # The request timeout is the time left, so a timeout means the deadline passed.
-            return None, failure.timed_out
+            return None, None, failure.timed_out
         title = pr.get("title")
-        return (title.strip() or None) if isinstance(title, str) else None, False
+        state = _PR_STATES.get(str(pr.get("status") or "").lower())
+        return (title.strip() or None) if isinstance(title, str) else None, state, False
 
     def verify_accessible(
         self,
