@@ -20,7 +20,7 @@ from omnigent.inner.codex_worker import (
     prepare_codex_catalog_probe,
     prepare_codex_worker,
 )
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TcpEgressRoute
 from omnigent.inner.model_signer import SignerReadiness
 from omnigent.inner.sandbox import SandboxPolicy, with_additional_write_roots
 
@@ -76,6 +76,19 @@ def test_active_sandbox_wrap_failure_is_not_downgraded(
             codex_home=codex_home,
             os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt")),
             spawn_env_names=["PATH", "CODEX_HOME"],
+        )
+
+
+def test_codex_worker_rejects_unwired_tcp_egress(tmp_path: Path) -> None:
+    route = TcpEgressRoute("db", "db.example.test", 5432)
+    with pytest.raises(ValueError, match="does not support tcp_egress"):
+        prepare_codex_worker(
+            codex_path=str(tmp_path / "codex"),
+            cwd=tmp_path,
+            codex_home=tmp_path / "codex-home",
+            os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="darwin_seatbelt", tcp_egress=[route])),
+            spawn_env_names=[],
+            worker_env={},
         )
 
 

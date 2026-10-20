@@ -512,6 +512,67 @@ os_env:
 Inside the sandbox, `databricks --profile dbc-adb7b1a3-9097 current-user me`
 works; the sandbox holds only `oa_cred_*` placeholders, never a live token.
 
+### Named TCP egress from a sandbox
+
+`sandbox.tcp_egress` permits a sandbox to open an opaque TCP stream to one
+named, exact host and port without giving it general network access. The
+parent resolves DNS on each connection, checks **every** returned address
+against the route's policy, and dials a pinned address. The sandbox cannot
+choose the dialed IP or port. This setting supplies **no credentials** and
+does not verify the server's identity: configure TLS or host-key verification
+in the client.
+
+```yaml
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: auto # linux_bwrap or darwin_seatbelt
+    tcp_egress:
+      - name: analytics_db
+        host: db.internal.example
+        port: 5432
+        allowed_cidrs: [10.42.0.0/16]
+      - name: git_host
+        host: github.com
+        port: 22
+terminals:
+  shell:
+    command: bash
+    os_env: inherit
+```
+
+The parent resolves DNS on every connection. A public DNS name that resolves
+to a private address is **denied by default**; permit the smallest relevant
+private CIDR explicitly with `allowed_cidrs`. **Every** A/AAAA answer must
+match the CIDRs when specified; a mixed public/private answer is denied unless
+every address is explicitly allowed. The chosen IP is pinned for the dial,
+so a later DNS change cannot redirect an established connection.
+Loopback, link-local, metadata, cloud control addresses, and mixed
+allowed/blocked DNS answers remain denied. The broker permits up to eight
+concurrent streams per sandbox. Each stream has a 30-minute lifetime, a
+five-minute idle limit, and a 2 GiB total-transfer limit; the connector exits
+nonzero if the broker closes it early. A peer that stops reading for ten
+seconds also closes the stream, even if the idle limit has not elapsed.
+A sandbox cannot configure
+`tcp_egress` and HTTP `egress_rules` together: even a different DNS name
+could lead to the same HTTP endpoint and bypass method/path restrictions.
+Opaque routes on ports 80/443 are also rejected. Clients
+that support a stdin/stdout proxy can run
+`omnigent-egress-connect analytics_db` from `sys_os_shell` or an inherited
+sandboxed terminal. For example, OpenSSH can use
+`ssh -o 'ProxyCommand=omnigent-egress-connect git_host' git@github.com`
+with the `git_host` route above, a separately available SSH credential, and
+its own pinned host key. A
+plain `psql -h db.internal.example` cannot use this connector directly;
+PostgreSQL client wiring and secretless credentials require the separate
+PostgreSQL capability. Native Codex workers and sandbox backends other than
+`linux_bwrap` and `darwin_seatbelt` reject `tcp_egress` rather than silently
+discarding the route. Native launchers that have not started a TCP broker
+also fail at spawn rather than retaining direct network access. Git SSH
+bindings can coexist with named TCP routes;
+HTTP `egress_rules` cannot coexist until an explicit overlap policy exists.
+
 ### Git over SSH from a sandbox
 
 `sandbox.git_ssh` grants one Git repository and one SSH operation at a time.

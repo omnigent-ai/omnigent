@@ -55,6 +55,7 @@ from .sandbox import (
     with_additional_read_roots,
     with_additional_write_roots,
 )
+from .tcp_egress import TcpEgressBroker, apply_tcp_egress_env, start_tcp_egress_broker
 
 if TYPE_CHECKING:
     import asyncio
@@ -437,6 +438,7 @@ class _HelperProcessClient:
         # the handle when present.
         self._egress_handle: EgressProxyHandle | None = None
         self._git_ssh_broker: GitSshBroker | None = None
+        self._tcp_egress_broker: TcpEgressBroker | None = None
         self._lock = threading.Lock()
         # bwrap --die-with-parent kills the helper when the thread that spawned it
         # exits, and each request runs on its own short-lived thread.
@@ -584,6 +586,12 @@ class _HelperProcessClient:
             self._git_ssh_broker = start_git_ssh_broker(sandbox.git_ssh, self._tmpdir)
             apply_git_ssh_env(env, self._git_ssh_broker)
             sandbox = replace(sandbox, git_ssh_socket_path=str(self._git_ssh_broker.socket_path))
+        if sandbox.tcp_egress and self._tmpdir is not None:
+            self._tcp_egress_broker = start_tcp_egress_broker(sandbox.tcp_egress, self._tmpdir)
+            apply_tcp_egress_env(env, self._tcp_egress_broker)
+            sandbox = replace(
+                sandbox, tcp_egress_socket_path=str(self._tcp_egress_broker.socket_path)
+            )
 
         if self._tmpdir is not None:
             set_sandbox_env(env, self._tmpdir)
@@ -776,6 +784,12 @@ class _HelperProcessClient:
                 except Exception:
                     logger.exception("Git SSH broker stop failed")
                 self._git_ssh_broker = None
+            if self._tcp_egress_broker is not None:
+                try:
+                    self._tcp_egress_broker.stop()
+                except Exception:
+                    logger.exception("TCP egress broker stop failed")
+                self._tcp_egress_broker = None
             cleanup_private_tmpdir(self._tmpdir)
             self._tmpdir = None
 
