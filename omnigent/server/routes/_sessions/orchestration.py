@@ -8078,10 +8078,8 @@ _NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S: float = 30.0
 _MID_TURN_STATUSES = ("running", "waiting")
 
 
-# A sleeping or offline laptop takes its runner with it and usually returns
-# minutes to hours later (a laptop closed overnight, the next morning) with
-# the turn still running, so a turn interrupted that way waits this long for
-# its host before it fails.
+# Longest a mid-turn session waits for its offline host (a laptop closed
+# overnight) before it fails.
 HOST_OFFLINE_HOLD_S: float = 24 * 3600.0
 # How often a held runner re-checks its host and cross-replica liveness.
 _HOST_OFFLINE_RECHECK_S: float = 60.0
@@ -8297,6 +8295,10 @@ async def _relay_host_offline(
         handle = _runner_relay_tasks.get(session_id)
         conv = handle.status_snapshot if handle is not None else None
     if conv is None:
+        return False
+    # Only an interrupted turn is held; an idle session settles as before.
+    status = _session_status_cache.get(session_id) or conv.live_status
+    if status not in _MID_TURN_STATUSES:
         return False
     host_id = await _session_host_id(conv, conversation_store)
     return await _host_offline_state(host_id) is True

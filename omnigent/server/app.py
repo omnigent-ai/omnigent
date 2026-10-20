@@ -3709,14 +3709,9 @@ def create_app(
     ) -> "tuple[str, list[Conversation]]":
         """Wait for a runner whose host went offline mid-turn, and report how it ended.
 
-        Holding the interrupted turns instead of failing them lets a laptop that
-        slept or lost its network resume the turn when it returns. The hold
-        lives in the runner's disconnect-grace slot, so a reconnect resolves it
-        and a crash report cancels it. A host that returns without its runner
-        gets one more grace for the runner, then the turns fail as before.
-        Unreadable rows keep the deadline and retry on the next check; at the
-        deadline the check repeats until a read succeeds, so nothing fails unread.
-        Every hold logs its end, including ``"cancelled"`` by a crash report.
+        The hold sits in the runner's disconnect-grace slot, so a reconnect
+        resolves it and a crash report cancels it. Nothing fails unread: a failed
+        read retries on the next check, including at the deadline.
 
         :param runner_id: The dropped runner.
         :param host_id: The offline host the runner ran on.
@@ -3755,9 +3750,7 @@ def create_app(
         # A crash report cancels the hold; its end still gets a row.
         outcome = "cancelled"
         hold_labels = {HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY: hold_value}
-        # A task, so a crash report's cancel leaves the write for the cleanup
-        # below to wait on; retried on every re-check until each held session
-        # carries its deadline.
+        # Separate task, so a cancel can't leave a late label write behind.
         to_fail: list[Conversation] = []
         label_write = asyncio.ensure_future(_mark_hold(held, hold_labels))
         try:
@@ -3827,9 +3820,8 @@ def create_app(
                 outcome=outcome,
                 held_s=round(loop.time() - started, 3),
             )
-            # An expired hold's caller clears the label once it has settled the
-            # turns. A replica shutting down keeps it, so other replicas leave
-            # the turns running until the deadline.
+            # Clear unless the caller settles first or the server is shutting
+            # down; other replicas honor a kept label only while the host is offline.
             concluded = outcome not in ("expired", "host_back_without_runner")
             await asyncio.shield(
                 _settle_hold_labels(label_write, held, hold_value, clear=concluded)

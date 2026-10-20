@@ -835,6 +835,24 @@ async def test_patch_rejects_client_supplied_host_offline_hold_label(
     assert conv.labels[HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY] == "2000000000"
 
 
+async def test_create_rejects_client_supplied_host_offline_hold_label(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A client can't seed a host-offline hold's deadline when it creates a session."""
+    from omnigent.stores.conversation_store import HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY
+
+    agent_id = generate_agent_id()
+    SqlAlchemyAgentStore(db_uri).create(
+        agent_id, name="test-agent", bundle_location="test:///bundle"
+    )
+    resp = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent_id, "labels": {HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY: "9999999999"}},
+    )
+    assert resp.status_code == 400
+
+
 async def test_list_sessions_pinned_filter(
     client: httpx.AsyncClient,
     db_uri: str,

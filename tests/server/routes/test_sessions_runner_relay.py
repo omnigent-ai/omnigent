@@ -3916,13 +3916,17 @@ def test_runner_disconnect_grace_exceeds_runner_worst_case_reconnect() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("host_offline", "disconnect_task_owns", "held"),
+    ("host_offline", "disconnect_task_owns", "status", "decision"),
     [
-        pytest.param(True, True, True, id="host-offline-runner-dropped"),
-        pytest.param(False, True, False, id="host-online"),
+        pytest.param(True, True, "running", "held_host_offline", id="host-offline-runner-dropped"),
+        pytest.param(False, True, "running", "failed_mid_turn", id="host-online"),
         # The runner's tunnel is still registered (only the stream failed), so no
         # disconnect task exists to hold the turn; the relay keeps its own handling.
-        pytest.param(True, False, False, id="host-offline-runner-still-registered"),
+        pytest.param(
+            True, False, "running", "failed_mid_turn", id="host-offline-runner-still-registered"
+        ),
+        # Only an interrupted turn is held.
+        pytest.param(True, True, "idle", "idle_no_failure", id="host-offline-idle"),
     ],
 )
 async def test_relay_leaves_a_turn_on_an_offline_host_to_the_disconnect_hold(
@@ -3930,7 +3934,8 @@ async def test_relay_leaves_a_turn_on_an_offline_host_to_the_disconnect_hold(
     caplog: pytest.LogCaptureFixture,
     host_offline: bool,
     disconnect_task_owns: bool,
-    held: bool,
+    status: str,
+    decision: str,
 ) -> None:
     """
     A relay that loses a mid-turn runner whose host went offline does not fail it.
@@ -3938,7 +3943,8 @@ async def test_relay_leaves_a_turn_on_an_offline_host_to_the_disconnect_hold(
     The disconnect task holds that turn until the host returns, so the relay
     records ``held_host_offline`` and publishes no failure. A host that is
     still online means the runner itself died, and the turn fails as before;
-    so does a turn with no disconnect task to take it over.
+    so does a turn with no disconnect task to take it over. An idle session
+    has no turn to hold.
     """
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
@@ -3960,7 +3966,7 @@ async def test_relay_leaves_a_turn_on_an_offline_host_to_the_disconnect_hold(
     caplog.set_level(logging.INFO)
     sessions_module._runner_relay_tasks.clear()
     gate = asyncio.Event()
-    frames = ['data: {"type": "session.status", "status": "running"}\n\n']
+    frames = [f'data: {{"type": "session.status", "status": "{status}"}}\n\n']
     fake_runner = _ScriptedThenDropRunnerClient(frames, gate)
     store = _RecordingLabelStore()
     session_id = "2f3e4d5c6b7a8998a7b6c5d4e3f2a1b0"
@@ -3981,13 +3987,12 @@ async def test_relay_leaves_a_turn_on_an_offline_host_to_the_disconnect_hold(
             if getattr(r, "event_name", None) == "runner_stream_disconnected"
         )
         error = sessions_module._last_task_error_from_labels(store.labels.get(session_id, {}))
-        if held:
-            assert record.attributes["decision"] == "held_host_offline"
-            assert sessions_module._session_status_cache.get(session_id) == "running"
-            assert error is None
-        else:
-            assert record.attributes["decision"] == "failed_mid_turn"
+        assert record.attributes["decision"] == decision
+        if decision == "failed_mid_turn":
             assert sessions_module._session_status_cache.get(session_id) == "failed"
+        else:
+            assert sessions_module._session_status_cache.get(session_id) == status
+            assert error is None
     finally:
         gate.set()
         handle = sessions_module._runner_relay_tasks.get(session_id)
