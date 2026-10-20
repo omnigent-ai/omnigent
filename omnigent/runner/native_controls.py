@@ -1345,15 +1345,16 @@ def build_native_controls(
         )
         from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
+        deadline = _ClaudeControlDeadline()
+        # Any later effort pick, even a cleared or unknown one, supersedes a queued switch.
+        await _retire_settings_after_prompt(conv_id, "effort", deadline)
         if effort is None or effort not in CLAUDE_EFFORTS:
             return Response(status_code=204)
-        deadline = _ClaudeControlDeadline()
         bridge_id = await _claude_native_bridge_id_for_session(
             server_client=server_client,
             session_id=conv_id,
         )
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-        await _retire_settings_after_prompt(conv_id, "effort", deadline)
         await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
         command = f"/effort {effort}"
 
@@ -1476,11 +1477,13 @@ def build_native_controls(
             picker_command_values,
         )
 
-        if model is None or not model.strip():
-            return Response(status_code=204)
         # The server rolls the pick back after its forward timeout, so no key may
         # reach the terminal past this deadline.
         deadline = _ClaudeControlDeadline()
+        if model is None or not model.strip():
+            # A cleared pick supersedes a queued switch, so the pane keeps its model.
+            await _retire_settings_after_prompt(conv_id, "model", deadline)
+            return Response(status_code=204)
         bridge_id = await _claude_native_bridge_id_for_session(
             server_client=server_client,
             session_id=conv_id,

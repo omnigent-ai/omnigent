@@ -2350,6 +2350,41 @@ async def test_events_newer_model_pick_replaces_one_waiting_for_a_prompt(
     assert commands == ["/model sonnet"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("queued", "cleared"),
+    [
+        ({"type": "model_change", "model": "claude-opus-4-7"}, {"type": "model_change"}),
+        (
+            {"type": "model_change", "model": "claude-opus-4-7"},
+            {"type": "model_change", "model": " "},
+        ),
+        ({"type": "effort_change", "effort": "high"}, {"type": "effort_change"}),
+        (
+            {"type": "effort_change", "effort": "high"},
+            {"type": "effort_change", "effort": "not-an-effort"},
+        ),
+    ],
+    ids=["model-cleared", "model-blank", "effort-cleared", "effort-unknown"],
+)
+async def test_events_cleared_pick_cancels_one_waiting_for_a_prompt(
+    monkeypatch: pytest.MonkeyPatch, queued: dict[str, str], cleared: dict[str, str]
+) -> None:
+    """Clearing the selection drops a queued switch, so answering the prompt types nothing."""
+    prompt_open = [True]
+    commands = _patch_settings_behind_prompt(monkeypatch, prompt_open)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    url = f"/v1/sessions/{_PROMPT_SESSION_ID}/events"
+    async with _runner_client(app) as client:
+        await _create_prompt_session(client)
+        for event in (queued, cleared):
+            resp = await client.post(url, json=event)
+            assert resp.status_code == 204, resp.text
+        prompt_open[0] = False
+        await asyncio.sleep(0.2)
+    assert commands == []
+
+
 async def _create_prompt_session(client: httpx.AsyncClient) -> None:
     resp = await client.post(
         "/v1/sessions",
