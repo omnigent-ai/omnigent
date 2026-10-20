@@ -1264,6 +1264,7 @@ def build_native_controls(
     ) -> Response:
         from omnigent.harnesses.claude_native.bridge import (
             SWITCH_MODEL_DIALOG_HINT,
+            ClaudeInjectionCancelled,
             ClaudePromptTimeout,
             bridge_dir_for_bridge_id,
             confirm_dialog_if_open,
@@ -1391,25 +1392,6 @@ def build_native_controls(
         if wait_error is not None:
             return _model_failed(wait_error)
         baseline = await asyncio.to_thread(read_claude_status_model, bridge_dir)
-        try:
-            # Accepted trade-off: ``/model <id>`` also saves the pick as the
-            # person's global default in ``~/.claude/settings.json``. Driving
-            # the interactive picker instead avoided that write but needed
-            # ~35s of fragile tmux automation, so the write stands.
-            await _drive_claude_pane(
-                deadline,
-                inject_slash_command,
-                bridge_dir,
-                command=command,
-                timeout_s=1.0,
-                # A boot that used the prompt budget still leaves the injection a
-                # short wait for a torn capture right after the prompt rendered.
-                ready_timeout_s=min(deadline.remaining_s(), max(1.0, prompt_budget_s - waited_s)),
-                auto_confirm=True,
-                confirm_hint=SWITCH_MODEL_DIALOG_HINT,
-            )
-        except (RuntimeError, ValueError, OSError) as exc:
-            return _model_failed(exc)
         # Verify against the statusLine snapshot the forwarder already polls:
         # Claude rewrites it on every render, including right after ``/model``.
         # Expected spellings come from this session's own catalog rows (every
@@ -1427,6 +1409,35 @@ def build_native_controls(
                 row_model = row.get("model")
                 if isinstance(row_model, str) and row_model:
                     expected.add(row_model)
+
+        def _switched(current: str | None) -> bool:
+            return bool(current and (current in expected or (baseline and current != baseline)))
+
+        try:
+            # Accepted trade-off: ``/model <id>`` also saves the pick as the
+            # person's global default in ``~/.claude/settings.json``. Driving
+            # the interactive picker instead avoided that write but needed
+            # ~35s of fragile tmux automation, so the write stands.
+            await _drive_claude_pane(
+                deadline,
+                inject_slash_command,
+                bridge_dir,
+                command=command,
+                timeout_s=1.0,
+                # A boot that used the prompt budget still leaves the injection a
+                # short wait for a torn capture right after the prompt rendered.
+                ready_timeout_s=min(deadline.remaining_s(), max(1.0, prompt_budget_s - waited_s)),
+                auto_confirm=True,
+                confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+            )
+        except ClaudeInjectionCancelled as exc:
+            # The budget can lapse in the dialog watch after ``/model`` was submitted;
+            # a pane that already switched must not be rolled back. Read only, no keys.
+            if _switched(await asyncio.to_thread(read_claude_status_model, bridge_dir)):
+                return Response(status_code=204)
+            return _model_failed(exc)
+        except (RuntimeError, ValueError, OSError) as exc:
+            return _model_failed(exc)
         # The prompt wait comes out of this window, keeping the whole request
         # inside the server's forward timeout.
         confirm_window_s = min(_CLAUDE_MODEL_CONFIRM_TIMEOUT_S, deadline.remaining_s())
@@ -1435,7 +1446,7 @@ def build_native_controls(
         was_busy = _native_pane_status.get(conv_id) in ("running", "waiting")
         while True:
             current = await asyncio.to_thread(read_claude_status_model, bridge_dir)
-            if current and (current in expected or (baseline and current != baseline)):
+            if _switched(current):
                 # The pane switched. When it landed somewhere other than the
                 # expected spelling, the forwarder's verbatim report is the
                 # truth the UI will settle on — the command still took effect.

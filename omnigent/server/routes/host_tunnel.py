@@ -54,6 +54,7 @@ from omnigent.host.frames import (
     HostMcpToolsResultFrame,
     HostModelOptionsResultFrame,
     HostPluginsResultFrame,
+    HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
@@ -957,6 +958,20 @@ async def _receive_loop(
             install_future = conn.pending_installs.pop(frame.request_id, None)
             if install_future is not None and not install_future.done():
                 install_future.set_result(
+                    {
+                        "status": frame.status,
+                        "configured_harnesses": frame.configured_harnesses,
+                        "version": frame.version,
+                        "gateway_inference": frame.gateway_inference,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostRefreshHarnessesResultFrame):
+            refresh_future = conn.pending_harness_refreshes.pop(frame.request_id, None)
+            if refresh_future is not None and not refresh_future.done():
+                refresh_future.set_result(
                     {
                         "status": frame.status,
                         "configured_harnesses": frame.configured_harnesses,

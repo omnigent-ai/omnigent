@@ -1057,7 +1057,7 @@ async def test_concurrent_cost_asks_serialize_and_collapse_sibling(
         elif entries == 2:
             second_in_gate.set()
         if result.state_updates:
-            engine.apply_state_updates(result.state_updates)
+            engine.apply_state_updates(result.state_updates, approved=True)
         return True
 
     monkeypatch.setattr(sessions_routes, "_hold_native_ask_gate", _controllable_gate)
@@ -1511,7 +1511,7 @@ async def _seed_authenticated_session(auth_client: httpx.AsyncClient, db_uri: st
                             "allow_all": {
                                 "type": "function",
                                 "on": ["tool_call"],
-                                "function": "tests.runtime.policies.conftest._always_allow",
+                                "function": "omnigent.policies.builtins.safety.ask_on_os_tools",
                             }
                         }
                     },
@@ -1576,7 +1576,7 @@ async def test_authenticated_evaluate_route_sql_budget(
     payload = {
         "event": {
             "type": "PHASE_TOOL_CALL",
-            "data": {"name": "Bash", "arguments": {"command": "ls"}},
+            "data": {"name": "echo", "arguments": {}},
         }
     }
     # Warm the spec / policy / ACL caches so the count is the steady-state one.

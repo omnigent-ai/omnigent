@@ -190,6 +190,7 @@ function loadNavigationHarness({
     arcaLoginCancels: 0,
   };
   const pickers = [];
+  const findBars = [];
   const ipc = new Map();
   const webRequest = {};
   const jar = new Map();
@@ -220,6 +221,12 @@ function loadNavigationHarness({
     },
   });
   const defaultSession = {
+    setPermissionRequestHandler(handler) {
+      this.request = handler;
+    },
+    setPermissionCheckHandler(handler) {
+      this.check = handler;
+    },
     cookies: network?.cookies ?? cookies,
     webRequest: {
       onBeforeRequest: (fn) => {
@@ -347,6 +354,20 @@ function loadNavigationHarness({
           });
           pickers.push(picker);
           return picker;
+        }
+        if (options?.webPreferences?.preload?.endsWith("find_preload.js")) {
+          let destroyed = false;
+          const bar = Object.assign(new EventEmitter(), {
+            webContents: { send: () => {} },
+            isDestroyed: () => destroyed,
+            close() {
+              destroyed = true;
+              this.emit("closed");
+            },
+            loadFile: async () => {},
+          });
+          findBars.push(bar);
+          return bar;
         }
         return win;
       },
@@ -622,7 +643,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, cancelReconnect };";
+    "\nmodule.exports.testApi = { buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -679,6 +700,7 @@ function loadNavigationHarness({
     webContents,
     settingsPath: path.join(userData, "settings.json"),
     pickers,
+    findBars,
     emit: (eventName, ...args) => webContents.emit(eventName, ...args),
     emitWindow: (eventName) => {
       for (const listener of winListeners.get(eventName) ?? []) listener();
@@ -2162,6 +2184,29 @@ describe("Databricks auth mode wiring", () => {
 });
 
 describe("browser permission wiring", () => {
+  it("grants fullscreen only to the pinned server's top-level page", (t) => {
+    const serverUrl = "https://server.example/omnigent";
+    const h = loadNavigationHarness({ serverUrl });
+    t.after(h.cleanup);
+    h.webContents.isDestroyed = () => false;
+    h.api.registerPermissions();
+    const ses = h.electron.session.defaultSession;
+    const request = (permission, requestingUrl) => {
+      let granted;
+      ses.request(h.webContents, permission, (value) => (granted = value), { requestingUrl });
+      return granted;
+    };
+    assert.equal(ses.check(h.webContents, "fullscreen", serverUrl), true);
+    assert.equal(request("fullscreen", `${serverUrl}/c/session`), true);
+    assert.equal(request("fullscreen", "https://foreign.example/video"), false);
+    assert.equal(ses.check(h.webContents, "fullscreen", "https://foreign.example"), false);
+    assert.equal(ses.check(null, "fullscreen", serverUrl), false);
+    assert.equal(request("clipboard-read", serverUrl), false);
+    h.setUrl("https://foreign.example");
+    assert.equal(request("fullscreen", serverUrl), false);
+    assert.equal(ses.check(h.webContents, "fullscreen", serverUrl), false);
+  });
+
   it("installs isolated consent handlers before construction and only prompts for the visible pane", async () => {
     const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
     try {
@@ -4814,6 +4859,37 @@ describe("OIDC system-browser sign-in wiring", () => {
       assert.equal(h.api.windows.get(h.win).authKind, null, url);
     }
     /* oxlint-enable no-await-in-loop */
+  });
+});
+
+describe("find bar teardown (src/main.js)", () => {
+  function openBar() {
+    const h = loadNavigationHarness();
+    const stops = [];
+    h.webContents.isDestroyed = () => false;
+    h.webContents.stopFindInPage = (action) => stops.push(action);
+    h.win.removeListener = () => {};
+    h.api.openFindBar(h.win);
+    return { h, stops, bar: h.findBars[0] };
+  }
+
+  it("clears the search and refocuses the parent when the bar closes", (t) => {
+    const { h, stops, bar } = openBar();
+    t.after(h.cleanup);
+    bar.close();
+    assert.deepEqual(stops, ["clearSelection"]);
+    assert.equal(h.calls.focused, 1);
+  });
+
+  it("skips the parent's webContents once Cmd+W has destroyed them", (t) => {
+    const { h, bar } = openBar();
+    t.after(h.cleanup);
+    h.webContents.isDestroyed = () => true;
+    h.webContents.stopFindInPage = () => {
+      throw new TypeError("Object has been destroyed");
+    };
+    assert.doesNotThrow(() => bar.close());
+    assert.equal(h.calls.focused, undefined);
   });
 });
 

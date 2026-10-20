@@ -75,6 +75,11 @@ _UVICORN_LOG_LEVEL = "warning"
 # cause of SIGTERM-resistant orphaned runners.
 _GRACEFUL_SHUTDOWN_TIMEOUT_S = float(os.environ.get("OMNIGENT_HARNESS_SHUTDOWN_TIMEOUT_S", "5"))
 
+# Idle keep-alive lifetime for the runner's connection. It must outlast the
+# runner client's 5 s idle expiry, or a request sent right at 5 s reuses a
+# connection the harness is closing ("Server disconnected without sending a response").
+_KEEP_ALIVE_TIMEOUT_S = 75
+
 # Interval between parent-PID liveness probes in the watchdog
 # thread. 1 s is responsive enough (parent crash → runner exit
 # within ~1 s) without measurably loading the kernel's
@@ -381,6 +386,7 @@ def _create_uvicorn_config(
             log_level=_UVICORN_LOG_LEVEL,
             log_config=None,
             timeout_graceful_shutdown=graceful_timeout,
+            timeout_keep_alive=_KEEP_ALIVE_TIMEOUT_S,
         )
     if bind:
         host, _, port = bind.rpartition(":")
@@ -391,6 +397,7 @@ def _create_uvicorn_config(
             log_level=_UVICORN_LOG_LEVEL,
             log_config=None,
             timeout_graceful_shutdown=graceful_timeout,
+            timeout_keep_alive=_KEEP_ALIVE_TIMEOUT_S,
         )
     sys.exit("runner: exactly one of --socket or --bind is required")
 

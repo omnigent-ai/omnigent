@@ -2622,7 +2622,8 @@ async def test_events_model_change_sends_no_key_past_its_budget(
     assert resp.status_code == 503, resp.text
     assert resp.json()["error"] == "claude_native_model_failed"
     keys = [key for _, key in tui.sent]
-    assert keys[:4] == ["Space", "C-u", "/model claude-opus-4-7", "Enter"], keys
+    clear_composer = "\x1b[107;5u" * 2 + "\x1b[117;5u" * 2
+    assert keys[:4] == ["Space", clear_composer, "/model claude-opus-4-7", "Enter"], keys
     late = [
         (round(at - started_at, 2), key) for at, key in tui.sent if at >= started_at + budget_s
     ]
@@ -2630,6 +2631,41 @@ async def test_events_model_change_sends_no_key_past_its_budget(
     assert (
         clock.now - started_at <= budget_s + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S * 2
     )
+
+
+@pytest.mark.asyncio
+async def test_events_model_change_keeps_a_switch_that_landed_before_its_budget_lapsed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow recreation can spend the budget in the dialog watch after ``/model``.
+
+    Claude applies the switch at once and opens no dialog, but the watch for one
+    outlasts the request's budget and the injection is cancelled. The statusLine
+    already shows the pick, so the reply is success, not a rollback.
+    """
+    clock = _VirtualClock()
+    submitted = False
+
+    def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
+        del bridge_dir, ready_timeout_s, timeout_s
+        clock.sleep(native_controls._CLAUDE_CONTROL_PROMPT_WAIT_S)
+
+    def _inject(bridge_dir: Any, **kwargs: Any) -> None:
+        nonlocal submitted
+        del bridge_dir, kwargs
+        submitted = True
+        clock.sleep(native_controls._CLAUDE_CONTROL_BUDGET_S)
+        raise claude_native_bridge.ClaudeInjectionCancelled("budget lapsed in the dialog watch")
+
+    resp = await _post_model_change_through_a_boot(
+        monkeypatch,
+        wait=_wait,
+        inject=_inject,
+        status=lambda _bridge_dir: "claude-opus-4-7" if submitted else "claude-opus-4-6",
+        clock=clock,
+    )
+
+    assert resp.status_code == 204, resp.text
 
 
 @pytest.mark.asyncio

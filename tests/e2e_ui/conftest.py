@@ -65,6 +65,7 @@ from tests._helpers.compat import (
     server_executable,
 )
 from tests._helpers.native_session import create_native_session
+from tests._helpers.operator_agents import operator_agent_store, post_operator_session
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests._helpers.workspace_geometry import (
     workspace_bar_needs_collapse as workspace_bar_needs_collapse,
@@ -1256,7 +1257,8 @@ def live_server(
     set_fallback_mock_llm(mock_url, "gpt-4o-mini", "Mock LLM response.")
 
     try:
-        yield base_url
+        with operator_agent_store(base_url, f"sqlite:///{db_path}", artifact_dir):
+            yield base_url
     finally:
         _server_state.clear()
         if runner_proc.poll() is None:
@@ -2586,23 +2588,26 @@ def _bind_session_runner(base_url: str, session_id: str, runner_id: str) -> None
     bind_session_runner(httpx.patch, base_url, session_id, runner_id, timeout=10.0)
 
 
-def _create_bundled_session(base_url: str, runner_id: str, yaml_text: str) -> str:
+def _create_bundled_session(
+    base_url: str, runner_id: str, yaml_text: str, *, operator_authored: bool = False
+) -> str:
     """Register a session-scoped agent from *yaml_text* and bind its session.
 
-    The multipart ``POST /v1/sessions`` both registers the agent and creates
-    the session it is scoped to, returning that ``session_id`` directly — so
-    no separate create call is needed.
+    HTTP uploads validate user-authored specs. Operator fixtures with Python
+    tools or host paths use trusted local registration before creating by id.
 
     :param base_url: Spawned server base URL.
     :param runner_id: The token-bound runner id to bind.
     :param yaml_text: The agent spec body.
+    :param operator_authored: Provision a trusted operator fixture through local stores.
     :returns: The new session/conversation id.
     """
 
     data = yaml_text.encode()
     bundle_bytes = bundle_files({"config.yaml": data})
 
-    create = post_session_bundle(httpx.post, f"{base_url}/v1/sessions", bundle_bytes, timeout=30.0)
+    provision = post_operator_session if operator_authored else post_session_bundle
+    create = provision(httpx.post, f"{base_url}/v1/sessions", bundle_bytes, timeout=30.0)
     create.raise_for_status()
     session_id = str(create.json()["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)

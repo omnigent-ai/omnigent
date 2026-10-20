@@ -26,6 +26,7 @@ from omnigent.runner.native.orchestration import (
     _pi_native_model_from_spec,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from tests._helpers.pi_native import seed_pi_own_login_catalog
 
 
 def _spec(model: str | None) -> AgentSpec:
@@ -404,3 +405,117 @@ async def test_auto_create_pi_terminal_bakes_tunnel_token_into_config(
         )
     )
     assert config["authHeaders"][RUNNER_TUNNEL_TOKEN_HEADER] == "tok-abc"
+
+
+@pytest.mark.asyncio
+async def test_auto_create_pi_terminal_cold_resume_keeps_persisted_pi_login_pick(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cold resume keeps a persisted Pi own-login pick on Pi's login: with an
+    OpenRouter ``default: pi`` provider, ``--model openai-codex/gpt-5.6-sol`` passes
+    through with no managed config dir instead of ``omnigent/...`` on the gateway."""
+    import omnigent.harnesses.pi_native.bridge as pi_bridge
+    import omnigent.harnesses.pi_native.credentials as creds
+
+    def _openrouter_pi_default_config() -> dict[str, Any]:
+        return {
+            "providers": {
+                "openrouter": {
+                    "kind": "key",
+                    "default": ["pi"],
+                    "openai": {
+                        "base_url": "https://openrouter.ai/api/v1",
+                        "api_key": "sk-e2e-openrouter-fake",
+                        "models": {"default": "openai/gpt-4o"},
+                    },
+                }
+            }
+        }
+
+    session_id = "conv_pi_cold_resume_own_login"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    own_login_dir = tmp_path / "pi-own-login"
+    seed_pi_own_login_catalog(own_login_dir, "openai-codex", ["gpt-5.6-sol"])
+    monkeypatch.setenv(creds.PI_CODING_AGENT_DIR_ENV_VAR, str(own_login_dir))
+    monkeypatch.setattr(pi_bridge, "_BRIDGE_ROOT", tmp_path / "pi-native")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(
+        "omnigent.harnesses.pi_native.main.resolve_pi_executable", lambda: "/usr/bin/pi"
+    )
+
+    real_resolve = creds.resolve_pi_native_provider
+
+    def _resolve_with_test_config(
+        *, model: str | None = None, config_loader: Any = None, auth: Any = None
+    ):
+        del config_loader, auth
+        return real_resolve(model=model, config_loader=_openrouter_pi_default_config)
+
+    monkeypatch.setattr(creds, "resolve_pi_native_provider", _resolve_with_test_config)
+
+    class _ColdResumeSnapshotClient:
+        async def get(
+            self, url: str, *, timeout: float, params: dict[str, str] | None = None
+        ) -> httpx.Response:
+            del url, timeout, params
+            return httpx.Response(
+                200,
+                json={
+                    "workspace": str(workspace),
+                    "terminal_launch_args": None,
+                    "external_session_id": None,
+                    "model_override": "openai-codex/gpt-5.6-sol",
+                },
+                request=httpx.Request("GET", f"/v1/sessions/{session_id}"),
+            )
+
+    launched: dict[str, Any] = {}
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            *,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            del terminal_name, session_key, resource_role, parent_os_env
+            launched["args"] = list(spec.args)
+            launched["env"] = dict(spec.env)
+            return SessionResourceView(
+                id="terminal_pi_main",
+                type="terminal",
+                session_id=session_id,
+                name="pi",
+            )
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="pi-cold-resume-own-login",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "pi-native"}, model=None),
+    )
+
+    await _auto_create_pi_terminal(
+        session_id,
+        _FakeResourceRegistry(),  # type: ignore[arg-type]
+        lambda _sid, _event: None,
+        server_client=_ColdResumeSnapshotClient(),  # type: ignore[arg-type]
+        agent_spec=spec,
+    )
+
+    args = launched["args"]
+    assert "--provider" not in args, args
+    assert "--model" in args, args
+    assert args[args.index("--model") + 1] == "openai-codex/gpt-5.6-sol", args
+    # No managed config dir means Pi's ``/model`` picker keeps Pi's own catalog
+    # rather than collapsing to a lone gateway entry.
+    assert creds.PI_CODING_AGENT_DIR_ENV_VAR not in launched["env"], launched["env"]

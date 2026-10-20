@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import dataclasses
 import os
 import shutil
 import signal
@@ -423,6 +424,29 @@ async def test_turn_session_rotates_every_n_samples() -> None:
     assert warmed == ["s1", "s2"]  # each fresh session gets its warm-up turn
     assert ctx.session_id == "s2"
     assert ctx.samples == 1
+
+
+@pytest.mark.asyncio
+async def test_cold_start_stops_each_runner_before_the_next_sample() -> None:
+    """Cold-start runners are stopped off the clock instead of piling up for the suite."""
+    events: list[str] = []
+
+    class _Env:
+        async def cold_start_first_delta(self, agent_id: str, _text: str) -> str:
+            events.append(f"start {agent_id}")
+            return f"s{sum(e.startswith('start') for e in events)}"
+
+        async def stop_session_runner(self, session_id: str) -> None:
+            events.append(f"stop {session_id}")
+
+    async def _setup(_env: BenchEnvironment) -> object:
+        return bench_journeys._ColdStartContext(agent_id="a")
+
+    journey = dataclasses.replace(ALL_JOURNEYS["session_cold_start"], setup=_setup)
+    result = await run_latency(journey, cast(BenchEnvironment, _Env()), iterations=2, warmup=1)
+
+    assert result.n_success == 2
+    assert events == ["start a", "stop s1", "start a", "stop s2", "start a", "stop s3"]
 
 
 @pytest.mark.asyncio
