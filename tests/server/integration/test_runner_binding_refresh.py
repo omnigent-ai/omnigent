@@ -26,7 +26,7 @@ async def test_binding_change_does_not_hide_offline_runner(
     original_runner_id: str | None,
     replacement_runner_id: str | None,
 ) -> None:
-    """Re-address a concurrent rebind once; a stable offline binding still fails."""
+    """Re-address a concurrent rebind once; a stable offline binding is still refused."""
     agent = await create_test_agent(client)
     created = await client.post(
         "/v1/sessions",
@@ -67,11 +67,11 @@ async def test_binding_change_does_not_hide_offline_runner(
         assert not [item for item in items if item["type"] in {"message", "error"}], items
         response = await client.post(f"/v1/sessions/{session_id}/events", json=body)
 
-    assert response.status_code == 202, response.text
+    # No host can relaunch this terminal-owned session, so the send is refused.
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "runner_unavailable", response.text
+    assert f"--resume {session_id}" in response.json()["error"]["message"]
     items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
-    assert len([item for item in items if item["type"] == "message"]) == 1, items
-    errors = [item for item in items if item["type"] == "error"]
-    assert len(errors) == 1, items
-    assert errors[0]["code"] == "runner_failed_to_start"
+    assert not [item for item in items if item["type"] in {"message", "error"}], items
     snapshot = (await client.get(f"/v1/sessions/{session_id}")).json()
-    assert snapshot["status"] == "failed", snapshot
+    assert snapshot["status"] != "failed", snapshot

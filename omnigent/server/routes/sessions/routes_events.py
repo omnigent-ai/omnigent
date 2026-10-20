@@ -186,6 +186,7 @@ from omnigent.server.routes._sessions.helpers import (
     _is_codex_native_subagent,
     _is_devin_native_subagent,
     _launch_runner_on_host,
+    _native_coding_agent_for_session,
     _parse_background_tasks,
     _persist_external_acp_subagent_start,
     _persist_external_assistant_message,
@@ -550,6 +551,17 @@ def _host_offline_message() -> str:
     return (
         "The host for this session is offline. "
         f"Start it with `{cli_invocation()} host` (or reconnect it) and send the message again."
+    )
+
+
+def _closed_terminal_message(conv: Conversation) -> str:
+    """Return the refusal text for a send to a terminal-owned session whose runner is gone."""
+    agent = _native_coding_agent_for_session(conv)
+    verb = agent.key if agent is not None else "run"
+    return (
+        "This session ran in a terminal that has closed, so nothing can run your message. "
+        f"Resume it on that machine with `{cli_invocation()} {verb} --resume {conv.id}`, "
+        "then send the message again."
     )
 
 
@@ -2858,6 +2870,18 @@ def register_events_routes(
                         "The host for this session is not responding. "
                         "Wait for it to reconnect and send the message again.",
                         code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
+                if (
+                    conv.host_id is None
+                    and conv.kind != "sub_agent"
+                    and (conv.labels or {}).get(SIDE_CHAT_LABEL_KEY) != "1"
+                    and not exit_cause
+                ):
+                    # Nothing can relaunch a terminal-owned session's runner: the
+                    # terminal that ran it is closed. Refuse so the client keeps the
+                    # message, instead of consuming it into a failed turn.
+                    raise OmnigentError(
+                        _closed_terminal_message(conv), code=ErrorCode.RUNNER_UNAVAILABLE
                     )
                 if host_offline and _client_holds_host_offline_sends(request.headers):
                     # Nothing reaches the harness, so nothing is recorded; the

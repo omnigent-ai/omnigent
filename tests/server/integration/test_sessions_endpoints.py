@@ -12608,18 +12608,16 @@ async def test_external_codex_subagent_terminal_status_accepted_without_runner(
     )
 
 
-async def test_native_message_persisted_when_runner_offline(
+async def test_native_message_to_closed_terminal_session_is_refused(
     client: httpx.AsyncClient,
 ) -> None:
     """
-    A native message is persisted (not dropped) when no runner is reachable.
+    A message to a terminal-owned session whose runner is gone is refused.
 
-    Repro of the desktop bug: a native terminal session whose runner
-    crashed before connecting. Posting a message used to raise
-    RUNNER_UNAVAILABLE and silently drop the message — the user's input
-    vanished on reload while the session stalled. The fix persists the
-    user message together with a runner-failure error so both survive,
-    and the turn settles ``failed`` instead of 5xx-ing.
+    Without a host nothing can relaunch the runner: the terminal that ran it
+    has closed. Recording a failed turn would show a misleading "see the host
+    logs" error, so the server refuses with a resume command and records
+    nothing. The client keeps the message.
     """
     agent = await create_test_agent(client)
     # Native terminal-first session, no host/runner bound → runner offline.
@@ -12637,31 +12635,15 @@ async def test_native_message_persisted_when_runner_offline(
             "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
         },
     )
-    # Queued (not RUNNER_UNAVAILABLE) and the persisted user item is returned.
-    assert resp.status_code == 202, resp.text
-    body = resp.json()
-    assert body["queued"] is True
-    assert body.get("item_id"), f"expected a persisted item_id, got {body}"
+    assert resp.status_code == 503, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    assert f"claude --resume {sid}" in error["message"]
 
     items = (await client.get(f"/v1/sessions/{sid}/items")).json()["data"]
-    # The user's message is durable history — the whole point of the fix.
-    user_msgs = [
-        i
-        for i in items
-        if i["type"] == "message" and i.get("content", [{}])[0].get("text") == "hello"
-    ]
-    assert len(user_msgs) == 1, f"user message not persisted: {items}"
-    # A sibling error item explains the failure on reload.
-    error_items = [i for i in items if i["type"] == "error"]
-    assert len(error_items) == 1, f"expected one error item, got {items}"
-    assert error_items[0]["code"] == "runner_failed_to_start"
-
-    # The turn settles failed (not 5xx); the durable error item above is
-    # what the web re-renders on reload via itemsToBlocks. (The separate
-    # last_task_error snapshot field is the exit-report durability path,
-    # which needs a bound runner_id — covered by the snapshot unit test.)
+    assert not [i for i in items if i["type"] in {"message", "error"}], items
     snap = (await client.get(f"/v1/sessions/{sid}")).json()
-    assert snap["status"] == "failed"
+    assert snap["status"] != "failed"
 
 
 async def test_runner_re_tunnelled_to_sibling_returns_wrong_replica(
