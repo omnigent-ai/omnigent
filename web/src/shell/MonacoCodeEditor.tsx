@@ -1,4 +1,4 @@
-// Monaco-based viewer/editor for non-markdown files in the file viewer.
+// Monaco-based source viewer/editor, including large Markdown files.
 //
 // One component serves both modes, switched by permission:
 //   • read-only (no edit permission) → Monaco with readOnly:true; selection,
@@ -87,6 +87,7 @@ interface MonacoCodeEditorProps extends CommentProps {
    * on the visible prefix stay available.
    */
   truncated?: boolean;
+  largeMarkdown?: boolean;
   /** Reports unsaved-edit state up to FileViewer (navigation guard, etc.). */
   onDirtyChange?: (isDirty: boolean) => void;
   /** Reports the auto-save lifecycle up to FileViewer's toolbar status chip. */
@@ -116,7 +117,7 @@ interface MonacoCodeEditorProps extends CommentProps {
  * and feeds same-file external updates in through `setContentRef`.
  *
  * @param props See {@link MonacoCodeEditorProps}.
- * @returns The Monaco code editor for non-markdown files.
+ * @returns The Monaco source editor.
  */
 export function MonacoCodeEditor({
   position,
@@ -125,6 +126,7 @@ export function MonacoCodeEditor({
   path,
   isSettled,
   truncated = false,
+  largeMarkdown = false,
   onDirtyChange,
   onSaveStatusChange,
   searchOpen,
@@ -162,6 +164,7 @@ export function MonacoCodeEditor({
       path={path}
       canEdit={canEdit}
       truncated={truncated}
+      largeMarkdown={largeMarkdown}
       isDirty={isDirty}
       setDirty={setDirty}
       hasExternalUpdate={hasExternalUpdate}
@@ -189,6 +192,7 @@ interface InnerProps extends CommentProps {
   path: string;
   canEdit: boolean;
   truncated: boolean;
+  largeMarkdown: boolean;
   isDirty: boolean;
   setDirty: (dirty: boolean) => void;
   hasExternalUpdate: boolean;
@@ -218,6 +222,7 @@ function MonacoCodeEditorInner({
   path,
   canEdit,
   truncated,
+  largeMarkdown,
   isDirty,
   setDirty,
   hasExternalUpdate,
@@ -507,6 +512,11 @@ function MonacoCodeEditorInner({
 
   return (
     <div className="flex h-full flex-col">
+      {largeMarkdown && (
+        <div className="shrink-0 border-b border-border bg-muted/50 px-4 py-2 text-sm text-muted-foreground">
+          Large Markdown file opened as source to keep the viewer responsive.
+        </div>
+      )}
       {truncated && <TruncatedBanner />}
       {canEdit &&
         isDirty &&

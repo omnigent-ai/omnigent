@@ -113,6 +113,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 ## Features
 
+- [Workspace content search](./workspace-content-search.md) covers runner-backed
+  text search, result navigation and its release flag.
+
 - [Harness acceptance](./harness-acceptance.md) standardizes the SDK/native
   checklist, connects existing bench probes to user journeys, and records
   per-harness coverage gaps separately from observed results.
@@ -130,11 +133,16 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 - [Native harnesses](./native-harnesses.md) is the matrix of every native
   harness against launch, authentication, model and effort selection,
   approvals, resume, and terminal behavior, with native disconnect test boundaries.
+- [Preferences and config defaults](./preferences.md) covers local user/project
+  defaults, invocation overrides, related settings surfaces, and the boundary
+  between the shared-preference foundation and user journeys not yet available.
 - [Login and host authentication](./login-and-host-auth.md) covers
   `omnigent login`, host daemon credentials, Databricks auth modes, and embedded
   authentication for project writes.
 - [Sessions](./sessions.md) covers the sidebar, whole-session and message forks,
   custom-agent targets, fork access checks, archive, reconnect, and resume.
+- [Video recordings](./video-rendering.md) covers inline chat playback, remote
+  recording links, file previews, and download fallbacks.
 
 - [GitLab merge requests](./gitlab.md) covers the shared MR panel, composer,
   Canvas links, and native tracking.
@@ -188,7 +196,8 @@ map an area, remove it here in the same change.
 **CLI commands:**
 
 - Setup and diagnostics: `omnigent setup`, `omnigent config`, `omnigent doctor`,
-  `omnigent diagnose`, `omnigent debug`, `omnigent usage`
+  `omnigent diagnose`, `omnigent debug`, `omnigent usage` (config defaults are
+  mapped; credential configuration and the other commands remain unmapped)
 - Install lifecycle: `omnigent upgrade`, `omnigent update`, `omnigent uninstall`
 - Running agents and servers: `omnigent run`, `omnigent start`, `omnigent stop`,
   `omnigent server`, `omnigent attach`, `omnigent resume`, `omnigent session`,

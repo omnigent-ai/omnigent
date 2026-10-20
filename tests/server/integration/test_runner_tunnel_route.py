@@ -2373,6 +2373,8 @@ class _FakeSenderWebSocket:
         record the frame instead.
     :param application_state: Post-raise state, mimicking Starlette's
         synchronous state flip when a concurrent close wins the race.
+    :param client_state: Receive-side state; ``DISCONNECTED`` once the
+        peer's close was received.
     """
 
     def __init__(
@@ -2380,6 +2382,7 @@ class _FakeSenderWebSocket:
         *,
         raises: Exception | None = None,
         application_state: object = None,
+        client_state: object = None,
     ) -> None:
         from starlette.websockets import WebSocketState
 
@@ -2387,6 +2390,7 @@ class _FakeSenderWebSocket:
         self.application_state = (
             application_state if application_state is not None else WebSocketState.CONNECTED
         )
+        self.client_state = client_state if client_state is not None else WebSocketState.CONNECTED
         self.sent: list[str] = []
 
     async def send_text(self, data: str) -> None:
@@ -2432,6 +2436,106 @@ async def test_sender_loop_swallows_send_after_close_race() -> None:
     )
     session.outbound_queue.put_nowait(OutboundFrame("frame", queued_at=time.monotonic()))
     await runner_tunnel._sender_loop(ws, session)  # returns without raising
+
+
+_UVICORN_SEND_AFTER_CLOSE = (
+    "Unexpected ASGI message 'websocket.send', after sending "
+    "'websocket.close' or response already completed."
+)
+
+
+async def test_sender_loop_ends_quietly_when_the_peer_close_was_received() -> None:
+    """uvicorn rejects a send once the peer's close was received, even though
+    the server never sent its own close; the receive helper owns that disconnect."""
+    from types import SimpleNamespace
+
+    from starlette.websockets import WebSocketState
+
+    from omnigent.server.routes import runner_tunnel
+
+    ws = _FakeSenderWebSocket(
+        raises=RuntimeError(_UVICORN_SEND_AFTER_CLOSE),
+        application_state=WebSocketState.CONNECTED,
+        client_state=WebSocketState.DISCONNECTED,
+    )
+    session = SimpleNamespace(
+        runner_id=_RUNNER_ID, outbound_queue=asyncio.Queue(), diagnostics=TunnelDiagnostics()
+    )
+    session.outbound_queue.put_nowait(OutboundFrame("frame", queued_at=time.monotonic()))
+    await runner_tunnel._sender_loop(ws, session)  # returns without raising
+
+
+async def _peer_close_racing_a_send(close_reason: str, connection_id: str) -> list[str | None]:
+    """Close the tunnel from the peer while a frame is queued behind it.
+
+    Sends after the peer's close raise the way uvicorn does once its
+    receive side saw the close.
+
+    :param close_reason: Reason in the peer's close frame.
+    :param connection_id: Runner-minted connection id to advertise.
+    :returns: ``peer_close_reason`` values seen by the disconnect hook.
+    """
+    registry = TunnelRegistry()
+    reasons: list[str | None] = []
+
+    async def on_disconnect(_runner_id: str, connection: RunnerSession) -> None:
+        reasons.append(connection.peer_close_reason)
+
+    app = FastAPI()
+    app.include_router(
+        create_runner_tunnel_router(registry, on_runner_disconnect=on_disconnect),
+        prefix="/v1",
+    )
+    peer_closed = False
+
+    async def uvicorn_like(scope, receive, send):  # type: ignore[no-untyped-def]
+        async def tracking_receive():  # type: ignore[no-untyped-def]
+            nonlocal peer_closed
+            message = await receive()
+            peer_closed = peer_closed or message["type"] == "websocket.disconnect"
+            return message
+
+        async def closed_send(message):  # type: ignore[no-untyped-def]
+            if peer_closed and message["type"] == "websocket.send":
+                raise RuntimeError(_UVICORN_SEND_AFTER_CLOSE)
+            await send(message)
+
+        await app(scope, tracking_receive, closed_send)
+
+    communicator = ApplicationCommunicator(uvicorn_like, _websocket_scope(_TUNNEL_PATH))
+    try:
+        await communicator.send_input({"type": "websocket.connect"})
+        accepted = await communicator.receive_output(timeout=budget(1.0))
+        assert accepted["type"] == "websocket.accept"
+        await _send_hello(communicator, registry, connection_id=connection_id)
+        session = registry.get(_RUNNER_ID)
+        assert session is not None
+        await communicator.send_input(
+            {"type": "websocket.disconnect", "code": 1000, "reason": close_reason}
+        )
+        await registry.send_text(session, encode_frame(PingFrame(ts=0)))
+        await asyncio.wait_for(communicator.future, timeout=budget(1.0))
+    finally:
+        communicator.stop(exceptions=False)
+        await asyncio.gather(communicator.future, return_exceptions=True)
+    return reasons
+
+
+async def test_peer_close_racing_a_send_keeps_the_peer_close_reason(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A frame sent after the runner's idle-shutdown close arrived must not turn
+    that close into a tunnel error that drops the reason the disconnect hook reads."""
+    from omnigent.runner.transports.ws_tunnel.frames import RUNNER_IDLE_SHUTDOWN_CLOSE_REASON
+
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
+    # The finished helpers are checked in set order, so repeat to cover both.
+    for attempt in range(8):
+        reasons = await _peer_close_racing_a_send(
+            RUNNER_IDLE_SHUTDOWN_CLOSE_REASON, f"conn-race-{attempt}"
+        )
+        assert reasons == [RUNNER_IDLE_SHUTDOWN_CLOSE_REASON]
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
 
 async def test_sender_loop_reraises_send_failure_while_connected() -> None:

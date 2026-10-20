@@ -7,7 +7,7 @@ import {
 } from "@tanstack/react-query";
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { authenticatedFetch } from "@/lib/identity";
-import { ApiError } from "@/lib/sessionsApi";
+import { ApiError, apiErrorFromResponse } from "@/lib/sessionsApi";
 import type { NativeModelOption } from "@/lib/types";
 
 export interface Host {
@@ -172,10 +172,50 @@ export function useHostModelOptions(
   return query;
 }
 
-interface InstallHarnessResult {
+export interface InstallHarnessResult {
   object: "harness_install";
   harness: string;
   configured_harnesses: Record<string, boolean | string>;
+  version: string | null;
+  gateway_inference: Record<string, boolean> | null;
+}
+
+async function responseDetail(res: Response): Promise<string> {
+  let detail = `${res.status} ${res.statusText}`;
+  try {
+    const body = (await res.json()) as { detail?: unknown };
+    if (typeof body.detail === "string" && body.detail) detail = body.detail;
+  } catch {
+    // Non-JSON error body — keep the status-line detail.
+  }
+  return detail;
+}
+
+export interface RefreshHarnessesResult {
+  configured_harnesses: Record<string, boolean | string>;
+  gateway_inference: Record<string, boolean> | null;
+}
+
+/** Force the selected host to refresh harness readiness. */
+export async function refreshHarnessesOnHost(hostId: string): Promise<RefreshHarnessesResult> {
+  const res = await authenticatedFetch(
+    `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/refresh`,
+    { method: "POST" },
+  );
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return (await res.json()) as RefreshHarnessesResult;
+}
+
+export async function installHarnessOnHost(
+  hostId: string,
+  harness: string,
+): Promise<InstallHarnessResult> {
+  const res = await authenticatedFetch(
+    `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/install`,
+    { method: "POST" },
+  );
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return (await res.json()) as InstallHarnessResult;
 }
 
 /**
@@ -206,23 +246,7 @@ export function useInstallHarness(hostId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationKey: installHarnessMutationKey(hostId),
-    mutationFn: async (harness: string): Promise<InstallHarnessResult> => {
-      const res = await authenticatedFetch(
-        `/v1/hosts/${encodeURIComponent(hostId)}/harnesses/${encodeURIComponent(harness)}/install`,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" },
-      );
-      if (!res.ok) {
-        let detail = `${res.status} ${res.statusText}`;
-        try {
-          const err = (await res.json()) as { detail?: string };
-          if (typeof err.detail === "string" && err.detail) detail = err.detail;
-        } catch {
-          // Non-JSON error body — keep the status-line detail.
-        }
-        throw new Error(detail);
-      }
-      return (await res.json()) as InstallHarnessResult;
-    },
+    mutationFn: (harness: string) => installHarnessOnHost(hostId, harness),
     onSuccess: (result) => {
       // Patch the refreshed readiness into every ["hosts", …] cache entry
       // (filtered + unfiltered) so the badge updates immediately. This lives at
@@ -232,7 +256,13 @@ export function useInstallHarness(hostId: string) {
       // observer's per-call callbacks, which the later mutate() overwrites.
       queryClient.setQueriesData<Host[]>({ queryKey: ["hosts"] }, (hosts) =>
         hosts?.map((h) =>
-          h.host_id === hostId ? { ...h, configured_harnesses: result.configured_harnesses } : h,
+          h.host_id === hostId
+            ? {
+                ...h,
+                configured_harnesses: result.configured_harnesses,
+                gateway_inference: result.gateway_inference,
+              }
+            : h,
         ),
       );
     },
@@ -277,7 +307,7 @@ export interface StoreCredentialInput {
   env_var?: string;
 }
 
-interface StoreCredentialResult {
+export interface StoreCredentialResult {
   object: "harness_credential";
   harness: string;
   configured_harnesses: Record<string, boolean | string>;
@@ -305,16 +335,7 @@ export function useStoreCredential(hostId: string) {
           body: JSON.stringify(body),
         },
       );
-      if (!res.ok) {
-        let detail = `${res.status} ${res.statusText}`;
-        try {
-          const err = (await res.json()) as { detail?: string };
-          if (typeof err.detail === "string" && err.detail) detail = err.detail;
-        } catch {
-          // Non-JSON error body — keep the status-line detail.
-        }
-        throw new Error(detail);
-      }
+      if (!res.ok) throw new Error(await responseDetail(res));
       return (await res.json()) as StoreCredentialResult;
     },
     // This mutation-level onSuccess patches the ["hosts"] cache (badge flip) and

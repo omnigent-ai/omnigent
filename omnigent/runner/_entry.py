@@ -2278,13 +2278,6 @@ def main() -> None:
     _ignore_finish_work_signal_until_handled()
     from omnigent.process_logging import configure_process_logging
 
-    # Spawned with -P, so the workspace is not on sys.path. Re-add it now that
-    # the real omnigent is imported (it can no longer be shadowed) so
-    # spec-declared local tools living in the workspace still import.
-    cwd = os.getcwd()
-    if cwd not in sys.path:
-        sys.path.insert(0, cwd)
-
     configure_process_logging("runner", force=True)
     _install_crash_logging()
     _maybe_prewarm_ambient_detection()

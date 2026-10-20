@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import json
 import os
-import socket
 import threading
 import uuid
 from collections.abc import Iterator
@@ -28,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import httpx
 import pytest
 
+from tests._helpers.live_server import find_free_port
 from tests.e2e.conftest import (
     create_runner_bound_session,
     poll_session_until_terminal,
@@ -35,21 +35,7 @@ from tests.e2e.conftest import (
     send_user_message_to_session,
 )
 
-
-def _reserve_port() -> int:
-    """Reserve a free localhost port for the Extract Templates stub.
-
-    There is a small close-to-rebind window; acceptable for a
-    single-process opt-in e2e run.
-    """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    port = int(sock.getsockname()[1])
-    sock.close()
-    return port
-
-
-_STUB_PORT = _reserve_port()
+_STUB_PORT = find_free_port()
 os.environ["OMNIGENT_NIMBLE_EXTRACT_BASE_URL"] = f"http://127.0.0.1:{_STUB_PORT}"
 
 _SENTINEL_URL = "https://e2e-extract.nimbleway.com/result-1"

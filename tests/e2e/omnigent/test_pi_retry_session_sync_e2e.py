@@ -25,6 +25,8 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.pi_harness import _build_pi_executor
+from omnigent.models.model_catalog import ModelEntry
+from omnigent.models.model_metadata import ModelCapability, ModelMetadata, ModelWireAPI
 from omnigent.onboarding.providers import ModelInfo
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
 from tests.e2e.conftest import configure_mock_llm, get_mock_requests, reset_mock_llm
@@ -133,9 +135,25 @@ def rotating_gateway(
 
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize(
-    ("wire_api", "sandboxed"),
-    [("chat", False), ("chat", True), ("responses", False), ("anthropic", False)],
-    ids=["chat-unsandboxed", "chat-sandboxed", "responses", "anthropic"],
+    ("wire_api", "sandboxed", "databricks", "reasoning"),
+    [
+        ("chat", False, False, True),
+        ("chat", True, False, True),
+        ("responses", False, False, True),
+        ("anthropic", False, False, True),
+        ("chat", False, True, True),
+        ("responses", False, True, True),
+        ("chat", False, True, False),
+    ],
+    ids=[
+        "chat-unsandboxed",
+        "chat-sandboxed",
+        "responses",
+        "anthropic",
+        "gateway-chat",
+        "gateway-responses",
+        "gateway-nonreasoning",
+    ],
 )
 async def test_pi_session_stays_in_sync_after_retry_recovery(
     tmp_path: Path,
@@ -144,6 +162,8 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
     rotating_gateway: tuple[str, Path, list[bool]],
     sandboxed: bool,
     wire_api: str,
+    databricks: bool,
+    reasoning: bool,
 ) -> None:
     """Effort changes, retries and credential rotation preserve process and history."""
     skip_if_harness_cli_missing("pi")
@@ -156,6 +176,33 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
     workspace.mkdir()
 
     mock_model = "mock-pi-retry-session-sync"
+    if databricks:
+        mock_model = f"system.ai.{mock_model}"
+        entry = ModelEntry(
+            id=mock_model,
+            family="other",
+            metadata=ModelMetadata(
+                supported_capabilities=frozenset({ModelCapability.REASONING})
+                if reasoning
+                else frozenset(),
+                wire_apis=frozenset(
+                    {
+                        ModelWireAPI.OPENAI_CHAT
+                        if wire_api == "chat"
+                        else ModelWireAPI.OPENAI_RESPONSES
+                    }
+                ),
+            ),
+        )
+        monkeypatch.setattr(
+            "omnigent.models.model_catalog.fetch_databricks_model_service_entries",
+            lambda *_: [entry],
+        )
+        monkeypatch.setattr("omnigent.models.model_catalog.catalog_model_entries", lambda *_: [])
+        monkeypatch.setattr(
+            "omnigent.inner.pi_executor._databricks_workspace_url_for_gateway",
+            lambda *_args, **_kwargs: gateway_url,
+        )
     monkeypatch.setattr(
         "omnigent.onboarding.providers.find_catalog_models",
         lambda _: [ModelInfo(name=mock_model, provider="openai", supports_reasoning=True)],
@@ -181,7 +228,13 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
     monkeypatch.setenv(
         "HARNESS_PI_GATEWAY_BASE_URLS",
         json.dumps(
-            {"claude": gateway_url} if wire_api == "anthropic" else {"openai": f"{gateway_url}/v1"}
+            {"claude": gateway_url}
+            if wire_api == "anthropic"
+            else {
+                "openai": f"{gateway_url}/ai-gateway/codex/v1"
+                if databricks
+                else f"{gateway_url}/v1"
+            }
         ),
     )
     monkeypatch.setenv("HARNESS_PI_GATEWAY_HOST", gateway_url)
@@ -301,7 +354,7 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
             else r.get("reasoning", {}).get("effort")
             for r in requests
         ]
-        assert efforts == ["high"] * 3 + ["low"] * 4
+        assert efforts == (["high"] * 3 + ["low"] * 4 if reasoning else [None] * 7)
     for request in requests[-2:]:
         history = json.dumps(request.get("messages", request.get("input")))
         assert _FIRST_PROMPT in history

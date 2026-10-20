@@ -584,8 +584,8 @@ let reconnectSlowDelayMs = 60_000;
  * Electron asks the embedder (us) rather than showing Chrome's own prompt.
  * With NO handler wired, Chromium denies by default — which surfaces as a
  * `not-allowed` error the instant `recognition.start()` runs, i.e. "the
- * dictation button does nothing." We grant only the audio-related set and
- * deny everything else.
+ * dictation button does nothing." Grants require an allow-listed permission
+ * from the pinned server's top-level page.
  *
  * NOTE: this clears the FIRST of two gates. Web Speech `SpeechRecognition`
  * also relies on Google's cloud speech backend keyed to official Chrome
@@ -600,12 +600,15 @@ let reconnectSlowDelayMs = 60_000;
  * denies when a permission-check handler is wired and returns false).
  * Sanitized write only lets the page PUT text on the clipboard from a
  * user gesture; ``clipboard-read`` stays denied.
+ * ``fullscreen`` lets recordings use native fullscreen controls on the
+ * pinned server's top-level page.
  */
 const GRANTED_PERMISSIONS = new Set([
   "media",
   "audioCapture",
   "mediaKeySystem",
   "clipboard-sanitized-write",
+  "fullscreen",
 ]);
 
 /**
@@ -2792,13 +2795,15 @@ function openFindBar(target) {
   });
   bar.on("closed", () => {
     findBars.delete(target);
-    if (!target.isDestroyed()) {
-      target.removeListener("resize", reposition);
-      target.removeListener("move", reposition);
-      target.webContents.removeListener("found-in-page", onFound);
-      target.webContents.stopFindInPage("clearSelection");
-      target.focus();
-    }
+    if (target.isDestroyed()) return;
+    target.removeListener("resize", reposition);
+    target.removeListener("move", reposition);
+    target.webContents.removeListener("found-in-page", onFound);
+    // Closing the parent (Cmd+W) destroys its webContents before this child's
+    // "closed" fires, while the parent window itself is not yet destroyed.
+    if (target.webContents.isDestroyed()) return;
+    target.webContents.stopFindInPage("clearSelection");
+    target.focus();
   });
 }
 
@@ -3739,6 +3744,37 @@ function hardenAgentPartition(partition, win, canPrompt, getAnchorBounds) {
   });
 }
 
+// Electron keeps one webRequest listener per event per session, and a
+// conversation's tabs share one partition, so install once per session and let
+// the registry attribute each request to its view.
+const guardedAgentSessions = new WeakSet();
+
+/** Enforce the agent navigation policy on document requests at the network layer. */
+function guardAgentPartitionRequests(partition, registry) {
+  const ses = session.fromPartition(partition);
+  if (guardedAgentSessions.has(ses)) return;
+  guardedAgentSessions.add(ses);
+  // Documents only: frames plus <object>/<embed> content, which also renders.
+  const filter = {
+    urls: ["http://*/*", "https://*/*"],
+    types: ["mainFrame", "subFrame", "object"],
+  };
+  const answer = (decision, callback) =>
+    decision.then(
+      (cancel) => callback({ cancel }),
+      () => callback({ cancel: true }),
+    );
+  ses.webRequest.onBeforeRequest(filter, (details, callback) =>
+    answer(registry.shouldCancelAgentRequest(details), callback),
+  );
+  ses.webRequest.onBeforeSendHeaders(filter, (details, callback) =>
+    callback(registry.agentRequestHeaders(details)),
+  );
+  ses.webRequest.onHeadersReceived(filter, (details, callback) =>
+    answer(registry.shouldCancelAgentResponse(details), callback),
+  );
+}
+
 /**
  * Main-owned recovery scope for a loopback preview request, excluding the
  * renderer-supplied host match that decides whether this session may ask.
@@ -3836,8 +3872,16 @@ function createBrowserRegistryForWindow(win) {
       );
       const view = new WebContentsView(opts);
       policy.attach(view.webContents);
+      guardAgentPartitionRequests(opts.webPreferences.partition, registry);
       return view;
     },
+    // Resolve and look up proxies through the view's own Chromium session, so
+    // the agent checks see what its navigation will use.
+    resolveHost: async (hostname, partition) => {
+      const { endpoints } = await session.fromPartition(partition).resolveHost(hostname);
+      return endpoints.map((endpoint) => endpoint.address);
+    },
+    resolveProxy: (url, partition) => session.fromPartition(partition).resolveProxy(url),
     onSuppressionChange: (suppressed) => {
       if (suppressed) browserPermissionPrompt.dismiss(win);
     },

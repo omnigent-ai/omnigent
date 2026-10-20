@@ -7,7 +7,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { QueuedMessage } from "@/store/chatStore";
-import { QueuedMessagesStrip, queuedMessageCollisionDetection } from "./QueuedMessagesStrip";
+import {
+  QueuedMessagesStrip,
+  queuedMessageCollisionDetection,
+  restrictToQueuedList,
+} from "./QueuedMessagesStrip";
 
 const msg = (queueId: string, text: string): QueuedMessage => ({
   queueId,
@@ -15,7 +19,10 @@ const msg = (queueId: string, text: string): QueuedMessage => ({
   conversationId: "conv_abc",
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 describe("QueuedMessagesStrip", () => {
   it.each([
@@ -351,6 +358,21 @@ describe("QueuedMessagesStrip", () => {
     expect(queuedMessageCollisionDetection(args)).toEqual([]);
   });
 
+  it("keeps the dragged row vertical and inside the queued list", () => {
+    const box = (top: number, bottom: number) =>
+      ({ top, bottom, left: 0, right: 300, width: 300, height: bottom - top }) as const;
+    const restrict = (y: number) =>
+      restrictToQueuedList({
+        transform: { x: 30, y, scaleX: 1, scaleY: 1 },
+        draggingNodeRect: box(48, 92),
+        scrollableAncestorRects: [box(0, 128)],
+      } as unknown as Parameters<typeof restrictToQueuedList>[0]);
+
+    expect(restrict(-20)).toMatchObject({ x: 0, y: -20 });
+    expect(restrict(-80)).toMatchObject({ x: 0, y: -48 });
+    expect(restrict(80)).toMatchObject({ x: 0, y: 36 });
+  });
+
   it("calls onReorder after moving a queued message with the keyboard", async () => {
     const onReorder = vi.fn();
     render(
@@ -382,6 +404,11 @@ describe("QueuedMessagesStrip", () => {
     handles.forEach((handle, index) =>
       vi.spyOn(handle, "getBoundingClientRect").mockReturnValue(rect(index * 32, 24)),
     );
+    vi.spyOn(screen.getByRole("list"), "getBoundingClientRect").mockReturnValue({
+      ...rect(0, 300),
+      bottom: 96,
+      height: 96,
+    });
 
     const handle = handles[0]!;
     handle.focus();
@@ -391,6 +418,61 @@ describe("QueuedMessagesStrip", () => {
     fireEvent.keyDown(handle, { key: " ", code: "Space" });
 
     await waitFor(() => expect(onReorder).toHaveBeenCalledWith("q_1", "q_3"));
+  });
+
+  it("reorders on a touch long-press drag and keeps WebKit's long-press UI off the rows", async () => {
+    const onReorder = vi.fn();
+    render(
+      <QueuedMessagesStrip
+        messages={[msg("q_1", "first"), msg("q_2", "second")]}
+        onDelete={vi.fn()}
+        onEdit={vi.fn()}
+        onReorder={onReorder}
+      />,
+    );
+    const rows = screen.getAllByRole("listitem");
+    const handles = screen.getAllByRole("button", { name: "Reorder queued message" });
+    for (const row of rows) {
+      expect(row).toHaveClass("select-none", "[-webkit-touch-callout:none]");
+    }
+    const rect = (top: number) =>
+      ({
+        x: 0,
+        y: top,
+        top,
+        right: 300,
+        bottom: top + 44,
+        left: 0,
+        width: 300,
+        height: 44,
+        toJSON: () => ({}),
+      }) as DOMRect;
+    rows.forEach((row, index) =>
+      vi.spyOn(row, "getBoundingClientRect").mockReturnValue(rect(index * 48)),
+    );
+    const list = screen.getByRole("list");
+    // jsdom doesn't load Tailwind, so give the list its scroll overflow inline.
+    list.style.overflowY = "auto";
+    vi.spyOn(list, "getBoundingClientRect").mockReturnValue({
+      ...rect(0),
+      bottom: 100,
+      height: 100,
+    });
+
+    const touch = (y: number) => ({ clientX: 20, clientY: y });
+    fireEvent.touchStart(handles[1]!, { touches: [touch(70)] });
+    // Hold past the TouchSensor's 250ms delay before moving.
+    await waitFor(() => expect(handles[1]).toHaveAttribute("aria-pressed", "true"), {
+      timeout: 1000,
+    });
+    fireEvent.touchMove(handles[1]!, { touches: [touch(40)] });
+    fireEvent.touchMove(handles[1]!, { touches: [touch(20)] });
+    // The row follows the finger up but stops at the list's top edge (-48px).
+    await waitFor(() => expect(rows[1]!.style.transform).toBe("translate3d(0, -48px, 0)"));
+    fireEvent.touchEnd(handles[1]!, { changedTouches: [touch(20)] });
+
+    await waitFor(() => expect(onReorder).toHaveBeenCalledWith("q_2", "q_1"));
+    expect(rows[1]!.style.transform).toBe("");
   });
 
   it("caps and scrolls a long backlog instead of growing the composer stack", () => {

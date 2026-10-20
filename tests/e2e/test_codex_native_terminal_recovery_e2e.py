@@ -28,7 +28,8 @@ from omnigent._wrapper_labels import (
 )
 from omnigent.harnesses.codex_native.bridge import bridge_dir_for_bridge_id, read_bridge_state
 from omnigent.harnesses.codex_native.main import _materialize_codex_agent_spec
-from tests._helpers.session import bundle_files, post_session_bundle
+from tests._helpers.operator_agents import post_operator_session
+from tests._helpers.session import bundle_files
 from tests.e2e.conftest import configure_mock_llm, release_mock_gate
 from tests.e2e.test_host_codex_native_e2e import _poll_for_assistant_marker, _send_user_text
 
@@ -116,7 +117,7 @@ def test_codex_terminal_recovery_preserves_inflight_turn(
     spec["os_env"]["cwd"] = str(tmp_path)
     payload = bundle_files({"codex-native-ui.yaml": yaml.safe_dump(spec).encode()})
 
-    create = post_session_bundle(
+    create = post_operator_session(
         http_client.post,
         "/v1/sessions",
         payload,

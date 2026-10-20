@@ -169,7 +169,9 @@ def register_elicitations_routes(
             e.g. ``"elicit_abc123"``.
         :returns: JSON with ``status`` (``"pending"`` or
             ``"resolved"``), and when pending: ``message``,
-            ``phase``, ``policy_name``, ``content_preview``.
+            ``phase``, ``policy_name``, ``content_preview``. Native requests
+            may include ``resolution`` (``"unanswered"`` or ``"confirmed"``)
+            after clearing; absence alone does not prove native confirmation.
         :raises OmnigentError: 404 if the session does not exist.
         """
         user_id = _get_user_id(request, auth_provider)
@@ -181,17 +183,25 @@ def register_elicitations_routes(
             if conv is None:
                 raise _session_not_found()
 
-        found = pending_elicitations.lookup(elicitation_id)
-        if found is None or found[0] != session_id:
-            return {"status": "resolved"}
+        found = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+        if found is None:
+            resolution = pending_elicitations.native_resolution_for(session_id, elicitation_id)
+            return {"status": "resolved", **({"resolution": resolution} if resolution else {})}
 
         _conv_id, event = found
         params_value = event.get("params")
         params = params_value if isinstance(params_value, dict) else {}
+        if params.get("target_session_id") not in (None, session_id):
+            return {"status": "resolved"}
         return {
             "status": "pending",
             "message": params.get("message", "Approval required"),
             "phase": params.get("phase", ""),
             "policy_name": params.get("policy_name", ""),
             "content_preview": params.get("content_preview", ""),
+            **(
+                {"native_delivery": params["native_delivery"]}
+                if "native_delivery" in params
+                else {}
+            ),
         }

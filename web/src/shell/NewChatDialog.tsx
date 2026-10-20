@@ -5564,14 +5564,25 @@ export function NewChatLandingScreen() {
             }
           : { ...(baseLabels ?? {}), ...composerContextLabels };
 
+      const skill = isNativeTerminalAgent
+        ? null
+        : matchSkillInvocation(initialPrompt, availableSkills);
+      const serverOwnsInitialInput =
+        sandboxSelected && info !== "loading" && info.durable_initial_input === true;
+      const initialInput =
+        skill !== null
+          ? {
+              type: "slash_command",
+              data: { kind: "skill", name: skill.name, arguments: skill.args },
+            }
+          : {
+              type: "message",
+              data: { role: "user", content: [{ type: "input_text", text: initialPrompt }] },
+            };
       let data: { id: string };
 
       if (effectiveAgentId === PENDING_AGENT_ID && pendingAgent) {
-        // Custom agent path: build bundle client-side and use multipart POST.
-        // The multipart create only stores the agent + session rows — it does
-        // NOT launch a runner on the host. We must follow up with launchRunner
-        // (POST /v1/hosts/{id}/runners) to bind the session to a runner, the
-        // same way the fork-resume path does.
+        // Custom agents upload their bundle with the session, then launch on the host below.
         const bundle = await buildAgentBundle(pendingAgent);
         const metadata: Record<string, unknown> = { labels: createLabels };
         if (mcpServicesForLaunch.length) {
@@ -5646,110 +5657,115 @@ export function NewChatLandingScreen() {
         const matchOwnCreate = (item: SessionListWireItem) =>
           item.parent_session_id == null &&
           item.labels?.[CLIENT_CREATE_TOKEN_LABEL] === createToken;
+        const createPayload = JSON.stringify({
+          ...(serverOwnsInitialInput ? { initial_input: initialInput } : {}),
+          // Config-seeded agent on a `project_id` create: omitted so the
+          // server default-fills it from the project config.
+          ...(agentFromProjectConfig ? {} : { agent_id: effectiveAgentId }),
+          ...(mcpServicesForLaunch.length ? { mcp_registry_services: mcpServicesForLaunch } : {}),
+          ...(createProjectId !== null ? { project_id: createProjectId } : {}),
+          ...(sandboxSelected
+            ? {
+                host_type: "managed",
+                // The repos to clone in parallel; the agent starts in the one
+                // repo, or the parent that holds them all. Empty = empty
+                // sandbox workspace.
+                workspaces: composeSandboxWorkspaces(sandboxRepoSelections),
+                // On a `project_id` create an ABSENT (path) workspace would be
+                // default-filled with the config's path workspace, which a
+                // managed create rejects — pin an explicit null (explicit
+                // values are never replaced by project hints). Same guard for
+                // a config-stored `git` block: a sandbox has no host for the
+                // server to create a worktree on.
+                ...(createProjectId !== null ? { workspace: null, git: null } : {}),
+                // Omitted when null so a default create is unchanged.
+                ...(sandboxProvider !== null ? { sandbox_provider: sandboxProvider } : {}),
+                // The new sandbox host's id, in the server's minted shape;
+                // keys the create and the session's requests until it binds.
+                ...(info !== "loading" && info.request_managed_sandbox_host_id
+                  ? { host_id: randomUUID().replace(/-/g, "") }
+                  : {}),
+                ...(sandboxPreviewEnabled && sandboxModels.data?.configuration_revision
+                  ? {
+                      inference_configuration_revision: sandboxModels.data.configuration_revision,
+                    }
+                  : {}),
+              }
+            : {
+                host_id: selectedHostId,
+                // Config-seeded workspace on a `project_id` create: omitted
+                // so the server default-fills it (see agent_id above).
+                ...(workspaceFromProjectConfig ? {} : { workspace: workspaceTrimmed }),
+                // Create a new worktree, or bind an existing one
+                // (`existing_worktree` records the branch for the sidebar +
+                // delete flow without creating anything), or neither. Always
+                // explicit when set: the branch name is generated (or typed)
+                // client-side, so the server cannot default-fill it.
+                git: shouldCreateWorktree
+                  ? { branch_name: trimmedBranch, base_branch: baseBranch.trim() || undefined }
+                  : startInExistingWorktree
+                    ? { branch_name: activeWorktree!.branch!, existing_worktree: true }
+                    : createProjectId !== null && workspaceIsNonGit
+                      ? null
+                      : undefined,
+              }),
+          // Native-wrapper labels + codex bypass + the born-filed project
+          // label (see `createLabels` above).
+          // Smart Routing sends none of these: the bound agent is only a
+          // placeholder, so the placeholder's wrapper labels, launch args and
+          // model would all describe a CLI the router may not pick. The
+          // server stamps the routed wrapper's labels once it has rebound.
+          labels: {
+            ...(smartRoutingHarnessSelected ? {} : createLabels),
+            [CLIENT_CREATE_TOKEN_LABEL]: createToken,
+          },
+          // Permission / approval / cursor mode → CLI flag pair, persisted as
+          // terminal_launch_args. Omitted for the default and non-native agents.
+          terminal_launch_args: smartRoutingHarnessSelected
+            ? undefined
+            : agentSupportsPermissionMode &&
+                permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
+              ? ["--permission-mode", permissionMode]
+              : agentSupportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
+                ? (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.args ?? [])
+                : agentSupportsCursorMode && cursorExecMode !== CURSOR_NATIVE_DEFAULT_EXEC_MODE
+                  ? (CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.args ?? [])
+                  : agentSupportsAgySkip && agySkipMode !== AGY_NATIVE_DEFAULT_SKIP_MODE
+                    ? (AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.args ?? [])
+                    : agentSupportsDevinPermission &&
+                        devinPermissionMode !== DEVIN_NATIVE_DEFAULT_PERMISSION_MODE
+                      ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === devinPermissionMode)
+                          ?.args ?? [])
+                      : undefined,
+          // Model + reasoning effort, persisted on the session row before
+          // the runner launches. An unselected ("") knob is omitted so the
+          // harness keeps its own configured/default value.
+          model_override: normalizedModelOverride ?? undefined,
+          reasoning_effort: normalizedReasoningEffort ?? undefined,
+          cost_control_mode_override: costControlOverride,
+          // Top-level Smart Routing sends the same "auto" sentinel the bundle
+          // path does; the server tells them apart by the bound agent being a
+          // native wrapper, and routes at create time (the terminal launches
+          // with the row, so there is no first message to wait for). The
+          // routing hint is separate from first-input delivery.
+          harness_override: smartRoutingHarnessSelected
+            ? AUTO_HARNESS_ID
+            : (pickedHarness ?? undefined),
+          smart_routing_message:
+            smartRoutingHarnessSelected || pinnedNativeRoutes ? initialPrompt : undefined,
+        });
+        const createForm = serverOwnsInitialInput && files.length > 0 ? new FormData() : null;
+        if (createForm !== null) {
+          createForm.append("metadata", createPayload);
+          for (const file of files) createForm.append("initial_files", file, file.name);
+        }
         const createRequest = authenticatedFetch("/v1/sessions", {
           method: "POST",
           headers: {
-            "Content-Type": "application/json",
+            ...(createForm === null ? { "Content-Type": "application/json" } : {}),
             ...backgroundSessionTitlesRequestHeaders(),
           },
-          body: JSON.stringify({
-            // Config-seeded agent on a `project_id` create: omitted so the
-            // server default-fills it from the project config.
-            ...(agentFromProjectConfig ? {} : { agent_id: effectiveAgentId }),
-            ...(mcpServicesForLaunch.length ? { mcp_registry_services: mcpServicesForLaunch } : {}),
-            ...(createProjectId !== null ? { project_id: createProjectId } : {}),
-            ...(sandboxSelected
-              ? {
-                  host_type: "managed",
-                  // The repos to clone in parallel; the agent starts in the one
-                  // repo, or the parent that holds them all. Empty = empty
-                  // sandbox workspace.
-                  workspaces: composeSandboxWorkspaces(sandboxRepoSelections),
-                  // On a `project_id` create an ABSENT (path) workspace would be
-                  // default-filled with the config's path workspace, which a
-                  // managed create rejects — pin an explicit null (explicit
-                  // values are never replaced by project hints). Same guard for
-                  // a config-stored `git` block: a sandbox has no host for the
-                  // server to create a worktree on.
-                  ...(createProjectId !== null ? { workspace: null, git: null } : {}),
-                  // Omitted when null so a default create is unchanged.
-                  ...(sandboxProvider !== null ? { sandbox_provider: sandboxProvider } : {}),
-                  // The new sandbox host's id, in the server's minted shape;
-                  // keys the create and the session's requests until it binds.
-                  ...(info !== "loading" && info.request_managed_sandbox_host_id
-                    ? { host_id: randomUUID().replace(/-/g, "") }
-                    : {}),
-                  ...(sandboxPreviewEnabled && sandboxModels.data?.configuration_revision
-                    ? {
-                        inference_configuration_revision: sandboxModels.data.configuration_revision,
-                      }
-                    : {}),
-                }
-              : {
-                  host_id: selectedHostId,
-                  // Config-seeded workspace on a `project_id` create: omitted
-                  // so the server default-fills it (see agent_id above).
-                  ...(workspaceFromProjectConfig ? {} : { workspace: workspaceTrimmed }),
-                  // Create a new worktree, or bind an existing one
-                  // (`existing_worktree` records the branch for the sidebar +
-                  // delete flow without creating anything), or neither. Always
-                  // explicit when set: the branch name is generated (or typed)
-                  // client-side, so the server cannot default-fill it.
-                  git: shouldCreateWorktree
-                    ? { branch_name: trimmedBranch, base_branch: baseBranch.trim() || undefined }
-                    : startInExistingWorktree
-                      ? { branch_name: activeWorktree!.branch!, existing_worktree: true }
-                      : createProjectId !== null && workspaceIsNonGit
-                        ? null
-                        : undefined,
-                }),
-            // Native-wrapper labels + codex bypass + the born-filed project
-            // label (see `createLabels` above).
-            // Smart Routing sends none of these: the bound agent is only a
-            // placeholder, so the placeholder's wrapper labels, launch args and
-            // model would all describe a CLI the router may not pick. The
-            // server stamps the routed wrapper's labels once it has rebound.
-            labels: {
-              ...(smartRoutingHarnessSelected ? {} : createLabels),
-              [CLIENT_CREATE_TOKEN_LABEL]: createToken,
-            },
-            // Permission / approval / cursor mode → CLI flag pair, persisted as
-            // terminal_launch_args. Omitted for the default and non-native agents.
-            terminal_launch_args: smartRoutingHarnessSelected
-              ? undefined
-              : agentSupportsPermissionMode &&
-                  permissionMode !== CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
-                ? ["--permission-mode", permissionMode]
-                : agentSupportsApprovalMode && approvalMode !== CODEX_NATIVE_DEFAULT_APPROVAL_MODE
-                  ? (CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === approvalMode)?.args ?? [])
-                  : agentSupportsCursorMode && cursorExecMode !== CURSOR_NATIVE_DEFAULT_EXEC_MODE
-                    ? (CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === cursorExecMode)?.args ?? [])
-                    : agentSupportsAgySkip && agySkipMode !== AGY_NATIVE_DEFAULT_SKIP_MODE
-                      ? (AGY_NATIVE_SKIP_MODES.find((m) => m.value === agySkipMode)?.args ?? [])
-                      : agentSupportsDevinPermission &&
-                          devinPermissionMode !== DEVIN_NATIVE_DEFAULT_PERMISSION_MODE
-                        ? (DEVIN_NATIVE_PERMISSION_MODES.find(
-                            (m) => m.value === devinPermissionMode,
-                          )?.args ?? [])
-                        : undefined,
-            // Model + reasoning effort, persisted on the session row before
-            // the runner launches. An unselected ("") knob is omitted so the
-            // harness keeps its own configured/default value.
-            model_override: normalizedModelOverride ?? undefined,
-            reasoning_effort: normalizedReasoningEffort ?? undefined,
-            cost_control_mode_override: costControlOverride,
-            // Top-level Smart Routing sends the same "auto" sentinel the bundle
-            // path does; the server tells them apart by the bound agent being a
-            // native wrapper, and routes at create time (the terminal launches
-            // with the row, so there is no first message to wait for). The
-            // message text rides along for routing only — the client still
-            // delivers the real message after navigation.
-            harness_override: smartRoutingHarnessSelected
-              ? AUTO_HARNESS_ID
-              : (pickedHarness ?? undefined),
-            smart_routing_message:
-              smartRoutingHarnessSelected || pinnedNativeRoutes ? initialPrompt : undefined,
-          }),
+          body: createForm ?? createPayload,
         });
         // Managed launch validation continues after the row is announced, so
         // only its HTTP response can resolve the temp chat.
@@ -5883,9 +5899,6 @@ export function NewChatLandingScreen() {
       // merely browsed past never earns a primary slot.
       if (selectedNativeHarness !== null) addRecentHarness(selectedNativeHarness);
       // SDK invocations resolve on the runner after create; native CLIs receive plain text.
-      const skill = isNativeTerminalAgent
-        ? null
-        : matchSkillInvocation(initialPrompt, availableSkills);
       // Scope the recall entry to the new session id so ArrowUp surfaces it in
       // the freshly-opened chat. Sanitized text so recall reproduces what was sent.
       appendPromptHistoryEntry(initialPrompt, data.id);
@@ -5895,12 +5908,11 @@ export function NewChatLandingScreen() {
         writeLandingDraft(null);
       }
 
-      // `localConv` is set only when a real agent id was resolved up front, so
-      // it's safe to POST the first message with it.
+      // `localConv` is set only when a real agent id was resolved up front.
       if (localConv !== null && effectiveAgentId !== null) {
         const tempConvId = localConv.tempConvId;
         promoteSessionDraft(localConv.tempConvId, data.id);
-        // Hydrate the temp id onto the real id and POST the first message.
+        // Hydrate the temp id, binding server-owned input or sending on older servers.
         hydrateLocalConversation(
           localConv.tempConvId,
           data.id,
@@ -5912,14 +5924,16 @@ export function NewChatLandingScreen() {
           returnToCanvas ? (_to, options) => navigate(sessionLocation(data.id), options) : navigate,
           () => stillViewingLocalSession(tempConvId),
           localProject,
+          serverOwnsInitialInput,
         );
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
       } else {
         // Server-first: a pending custom agent (or no client cache in tests).
-        // Label the row, stash the first message for ChatPage to send, navigate.
+        // Keep a browser delivery draft only when the create did not accept the input.
         recordOptimisticTitle(data.id, initialPrompt);
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
-        setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
+        if (!serverOwnsInitialInput)
+          setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
         if (onScreenRef.current && window.location.href === createLocation) {
           navigate(sessionLocation(data.id));
         }
@@ -5941,9 +5955,7 @@ export function NewChatLandingScreen() {
     : "Describe a task to start a new session…";
 
   const isCloudHostEntry = (host: Host) =>
-    host.host_id === arcaHostId ||
-    !!host.sandbox_provider ||
-    host.name.toLowerCase().includes("cloud");
+    !!host.sandbox_provider || host.name.toLowerCase().includes("cloud");
   const isReconnectRow = (host: Host) =>
     host.status === "offline" && host.host_id === thisMachineHostId && canConnectThisMachine;
   // Keep the selected host and this machine's reconnect action above the fold.

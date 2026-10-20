@@ -1648,6 +1648,96 @@ async def test_interrupt_then_message_without_prev_id_starts_fresh_turn(
         await followup_client.aclose()
 
 
+async def test_steer_after_interrupt_does_not_start_a_stray_turn(
+    use_cancellable: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """A steer landing after its turn was interrupted must not start a turn.
+
+    The runner forwards a mid-turn message (stamped ``injection_id``) while it
+    still sees the turn as live, and also buffers it for a continuation turn.
+    If the harness turn was already interrupted, starting a turn for the steer
+    makes the runner's continuation turn-start get a 204 injection instead —
+    the user's next message fails with "turn failed (status 204)".
+    """
+    conv_id = "conv_steer_after_interrupt"
+    stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    steer_client = _make_side_client(str(manager.socket_path(conv_id)))
+    next_client = _make_side_client(str(manager.socket_path(conv_id)))
+    start_body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
+    followup = [{"type": "input_text", "text": "say hi"}]
+    steer_body = {**start_body, "content": followup, "injection_id": "inj_after_interrupt"}
+    next_body = {**start_body, "content": followup}
+    steer_status: int | None = None
+    next_status: int | None = None
+    try:
+        async with stream_client.stream(
+            "POST", f"/v1/sessions/{conv_id}/events", json=start_body
+        ) as response:
+            async for event in _stream_iter(response):
+                if event.event != "response.in_progress":
+                    continue
+                cancel_resp = await side_client.post(
+                    f"/v1/sessions/{conv_id}/events", json={"type": "interrupt"}
+                )
+                assert cancel_resp.status_code == 204
+                # Hold the steer's response open so a stray turn it starts stays
+                # live while the runner's continuation turn-start arrives.
+                async with steer_client.stream(
+                    "POST", f"/v1/sessions/{conv_id}/events", json=steer_body
+                ) as steer:
+                    steer_status = steer.status_code
+                    async with next_client.stream(
+                        "POST", f"/v1/sessions/{conv_id}/events", json=next_body
+                    ) as nxt:
+                        next_status = nxt.status_code
+                break
+        assert next_status == 200, (
+            f"the continuation turn must start a fresh turn (200), got {next_status}"
+        )
+        assert steer_status == 409, (
+            f"a steer with no live turn must be refused, got {steer_status}"
+        )
+    finally:
+        await side_client.aclose()
+        await steer_client.aclose()
+        await next_client.aclose()
+
+
+async def test_steer_with_injection_id_injects_live_turn(
+    use_injection: None,
+    manager: HarnessProcessManager,
+) -> None:
+    """A runner steer (``injection_id`` set) still injects into a live turn."""
+    conv_id = "conv_steer_live_turn"
+    stream_client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+    side_client = _make_side_client(str(manager.socket_path(conv_id)))
+    start_body = {"type": "message", "role": "user", "model": "test-agent", "content": []}
+    steer_body = {
+        **start_body,
+        "content": [{"type": "input_text", "text": "x"}],
+        "injection_id": "inj_live",
+    }
+    deltas: list[str] = []
+    try:
+        async with stream_client.stream(
+            "POST", f"/v1/sessions/{conv_id}/events", json=start_body
+        ) as response:
+            async for event in _stream_iter(response):
+                if event.event != "response.output_text.delta":
+                    continue
+                deltas.append(event.data["delta"])
+                if event.data["delta"] == "ready:":
+                    steer = await side_client.post(
+                        f"/v1/sessions/{conv_id}/events", json=steer_body
+                    )
+                    assert steer.status_code == 204
+        assert deltas == ["ready:", "got_1"]
+    finally:
+        await side_client.aclose()
+
+
 async def test_interrupt_then_message_with_prev_id_starts_fresh_turn(
     use_cancellable: None,
     manager: HarnessProcessManager,

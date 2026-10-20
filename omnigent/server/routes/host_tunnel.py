@@ -54,6 +54,7 @@ from omnigent.host.frames import (
     HostMcpToolsResultFrame,
     HostModelOptionsResultFrame,
     HostPluginsResultFrame,
+    HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
     HostRunnerStatusResultFrame,
@@ -699,9 +700,9 @@ async def _sender_loop(ws: WebSocket, conn: HostConnection) -> None:
         try:
             await conn.diagnostics.send(ws.send_text, frame.data, app_ping_ts=frame.app_ping_ts)
         except RuntimeError:
-            if ws.application_state is WebSocketState.DISCONNECTED:
-                # The ping loop or registry retirement closed the socket
-                # concurrently; the disconnect is already logged there.
+            if WebSocketState.DISCONNECTED in (ws.application_state, ws.client_state):
+                # A local close (ping timeout, retire) or the peer's close won the
+                # race; the receive helper or closer reports the disconnect.
                 _logger.debug("Host %s send raced a concurrent close", conn.host_id)
                 conn.sender_end_reason = "send_after_close"
                 return
@@ -957,6 +958,20 @@ async def _receive_loop(
             install_future = conn.pending_installs.pop(frame.request_id, None)
             if install_future is not None and not install_future.done():
                 install_future.set_result(
+                    {
+                        "status": frame.status,
+                        "configured_harnesses": frame.configured_harnesses,
+                        "version": frame.version,
+                        "gateway_inference": frame.gateway_inference,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostRefreshHarnessesResultFrame):
+            refresh_future = conn.pending_harness_refreshes.pop(frame.request_id, None)
+            if refresh_future is not None and not refresh_future.done():
+                refresh_future.set_result(
                     {
                         "status": frame.status,
                         "configured_harnesses": frame.configured_harnesses,

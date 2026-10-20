@@ -130,6 +130,9 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/e2e_ui/chat/test_hidden_terminal_scrollbar.py::test_hidden_terminal_scrollbar_never_paints_over_foreground`
 - **`dialog-routing`:**
   `tests/e2e_ui/chat/test_blocked_dialog_terminal_routing.py::test_chat_blocked_on_terminal_dialog_routes_user_to_terminal`
+  injects the blocked event; it does not run a vendor CLI. For Claude's OSC
+  working/blocked status with an attached or closed viewer and the flag-off
+  fallback, use the [native working-status recipe](./native-harnesses.md#driving-it-with-the-repro-environment).
 
 ## Gotchas
 
