@@ -2916,7 +2916,7 @@ def _ucode_config_for_profile(
         # 400 "invalid beta flag" is no longer needed on this path.
         _CLAUDE_CODE_USE_GATEWAY_ENV: "1",
         _CLAUDE_CODE_CUSTOM_HEADERS_ENV: with_gateway_attribution_lines(
-            _DATABRICKS_CODING_AGENT_HEADER, CLAUDE_CODE_AGENT, via_ucode=True
+            _DATABRICKS_CODING_AGENT_HEADER, CLAUDE_CODE_AGENT, via_ug=True
         ),
     }
     # Pin each Claude Code model-tier alias to the corresponding Databricks
@@ -3409,7 +3409,7 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
     env[_CLAUDE_CODE_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
         env.get(_CLAUDE_CODE_CUSTOM_HEADERS_ENV),
         CLAUDE_CODE_AGENT,
-        via_ucode=adopted_ucode_route,
+        via_ug=adopted_ucode_route,
     )
     env[_CLAUDE_CODE_API_KEY_HELPER_TTL_ENV] = str(_BROKER_APIKEY_HELPER_TTL_MS)
     return ClaudeNativeUcodeConfig(env=env, api_key_helper=api_key_helper, model=model)
@@ -6489,7 +6489,6 @@ def _claude_terminal_request(
         model_overrides=claude_config.model_overrides if claude_config is not None else None,
         append_system_prompt=append_system_prompt,
         allowed_tools=allowed_tools,
-        claude_env=claude_config.env if claude_config is not None else None,
     )
     # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
     # command/args to wrap the same fully-augmented Claude launch. Identity by

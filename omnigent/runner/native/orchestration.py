@@ -9075,7 +9075,6 @@ async def _auto_create_claude_terminal(
         # The route-turn hook is registered only when this session can
         # actually route; otherwise every submit would pay its round trip.
         turn_routing=_claude_turn_router is not None,
-        claude_env=claude_config.env if claude_config is not None else None,
     )
 
     # Apply the per-harness startup command/args override from config

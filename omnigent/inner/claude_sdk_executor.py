@@ -46,8 +46,6 @@ from omnigent._platform import resolve_cli_binary, stable_user_id
 from omnigent.cli_invocation import cli_invocation
 from omnigent.databricks_ai_gateway import (
     CLAUDE_CODE_AGENT,
-    claude_settings_attribution_env,
-    gateway_route_via_ug,
     is_databricks_ai_gateway_url,
     with_gateway_attribution_lines,
 )
@@ -1132,16 +1130,12 @@ def _gateway_model_vocabulary(base_url: str, auth_command: str | None) -> _Gatew
 
 
 def _claude_settings_payload(
-    api_key_helper: str | None,
-    model_overrides: dict[str, str],
-    env: dict[str, str] | None = None,
+    api_key_helper: str | None, model_overrides: dict[str, str]
 ) -> str | None:
     """Serialize the invocation-local settings Claude Code launches with.
 
     :param api_key_helper: The gateway ``apiKeyHelper`` command, or ``None``.
     :param model_overrides: Canonical-to-served model id rewrites.
-    :param env: Env that must outrank Claude Code's settings files, e.g. the
-        gateway attribution headers.
     :returns: Compact JSON for ``ClaudeAgentOptions.settings``, or ``None``
         when there is nothing to configure.
     """
@@ -1150,8 +1144,6 @@ def _claude_settings_payload(
         settings["apiKeyHelper"] = api_key_helper
     if model_overrides:
         settings["modelOverrides"] = model_overrides
-    if env:
-        settings["env"] = env
     return json.dumps(settings, separators=(",", ":")) if settings else None
 
 
@@ -1273,9 +1265,7 @@ def _resolve_gateway_env(
     if is_databricks_ai_gateway_url(base_url):
         gateway_env["CLAUDE_CODE_USE_GATEWAY"] = "1"
         gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
-            gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV],
-            CLAUDE_CODE_AGENT,
-            via_ucode=gateway_route_via_ug(),
+            gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV], CLAUDE_CODE_AGENT
         )
     else:
         gateway_env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
@@ -2637,6 +2627,7 @@ class ClaudeSDKExecutor(Executor):
         # for the canonical ids the CLI names itself (the refusal-fallback).
         # No-op off the gateway transport.
         model_overrides = await self._apply_gateway_model_vocabulary(env, api_key_helper)
+        settings_payload = _claude_settings_payload(api_key_helper, model_overrides)
 
         # Capture stderr from the CLI subprocess for diagnostics
         stderr_lines: list[str] = []
@@ -2684,17 +2675,6 @@ class ClaudeSDKExecutor(Executor):
         resolved = _resolve_skills_option(self._skills_filter) or _ResolvedSkills(
             skills="all", setting_sources=None
         )
-        # The SDK loads user and project settings unless told otherwise.
-        header_env = claude_settings_attribution_env(
-            env.get(_ANTHROPIC_CUSTOM_HEADERS_ENV),
-            project_dir=pathlib.Path(self._cwd or os.getcwd()),
-            setting_sources=(
-                resolved.setting_sources
-                if resolved.setting_sources is not None
-                else ("user", "project")
-            ),
-        )
-        settings_payload = _claude_settings_payload(api_key_helper, model_overrides, header_env)
         # Bundle skills are exposed via the SDK's plugin mechanism.
         # The bundle's ``<bundle>/skills/<dir>/SKILL.md`` files are
         # discovered as plugin skills (no ``.claude/`` prefix needed

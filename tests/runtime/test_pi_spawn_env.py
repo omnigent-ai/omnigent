@@ -251,17 +251,3 @@ def test_no_ucode_pi_entry_leaves_model_to_executor_default(
     assert env["HARNESS_PI_DATABRICKS_PROFILE"] == "oss"
     # No producer model — the executor's profile-path default applies.
     assert "HARNESS_PI_MODEL" not in env
-
-
-@pytest.mark.parametrize("with_pi_entry", [True, False])
-def test_ug_route_marker_follows_the_ucode_agent_entry(
-    monkeypatch: pytest.MonkeyPatch, with_pi_entry: bool
-) -> None:
-    """Only a route fed from ug's state is marked for gateway attribution."""
-    from omnigent.databricks_ai_gateway import UG_ROUTE_ENV
-
-    _ucode_state_for_pi(monkeypatch, model=None, with_pi_entry=with_pi_entry)
-
-    env = _build_pi_spawn_env(_make_spec(model=None, profile="oss"), workdir=None)
-
-    assert (env.get(UG_ROUTE_ENV) == "1") is with_pi_entry

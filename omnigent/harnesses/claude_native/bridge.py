@@ -68,7 +68,6 @@ from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
-from omnigent.databricks_ai_gateway import claude_settings_attribution_env
 from omnigent.harnesses.claude_native import delivery_diagnostics
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
@@ -2702,7 +2701,6 @@ def augment_claude_args(
     allowed_tools: tuple[str, ...] = (),
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
-    claude_env: Mapping[str, str] | None = None,
 ) -> list[str]:
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
@@ -2756,9 +2754,6 @@ def augment_claude_args(
         Routing on, threaded to :func:`build_hook_settings` so the
         ``UserPromptSubmit`` first-message routing hook is registered.
         ``False`` keeps every prompt off the routing round trip.
-    :param claude_env: Env Claude Code launches with. Its gateway attribution
-        is re-sent from the invocation settings when a settings file would
-        replace its ``ANTHROPIC_CUSTOM_HEADERS``.
     :returns: Augmented argument list for the terminal resource.
     """
     mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
@@ -2776,21 +2771,6 @@ def augment_claude_args(
         subagent_router_dir=subagent_router_dir,
         turn_routing=turn_routing,
     )
-    if claude_env is not None:
-        requested_sources = _arg_value(claude_args, "--setting-sources")
-        header_env = claude_settings_attribution_env(
-            claude_env.get("ANTHROPIC_CUSTOM_HEADERS"),
-            project_dir=workspace or Path.cwd(),
-            setting_sources=(
-                ()
-                if skills_filter == "none"
-                else requested_sources.split(",")
-                if requested_sources
-                else None
-            ),
-        )
-        if header_env:
-            hook_settings["env"] = header_env
     args = _merge_disallowed_tools(list(claude_args), _OMNIGENT_DISALLOWED_TOOLS)
     args = _merge_allowed_tools(args, allowed_tools)
     settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE

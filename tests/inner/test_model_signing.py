@@ -188,26 +188,3 @@ def test_body_size_is_checked_before_signing() -> None:
             body=b'{"payload":"too large"}',
             max_body_bytes=8,
         )
-
-
-def test_appends_trusted_extra_headers_after_the_rebuilt_ones() -> None:
-    request = reconstruct_signed_request(
-        route=_ROUTE,
-        placeholder=_PLACEHOLDER,
-        bearer_token=_TOKEN,
-        method="POST",
-        connect_host=_HOST,
-        sni_host=_HOST,
-        request_host=_HOST,
-        target=_PATH,
-        headers=[
-            ("Authorization", f"Bearer {_PLACEHOLDER}"),
-            ("Content-Type", "application/json"),
-            ("Databricks-Custom-Client-Surfaces", "spoofed"),
-        ],
-        body=b'{"model":"test"}',
-        extra_headers=(("Databricks-Custom-Client-Surfaces", "omnigent, ug"),),
-    )
-
-    assert request.headers[-1] == ("Databricks-Custom-Client-Surfaces", "omnigent, ug")
-    assert [name for name, _ in request.headers].count("Databricks-Custom-Client-Surfaces") == 1
