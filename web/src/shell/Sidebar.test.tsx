@@ -3034,6 +3034,11 @@ describe("Sidebar project sections", () => {
     // A click without a pointer press (keyboard Space keyup) leaves Radix in charge.
     fireEvent.click(menuButton);
     expect(menuButton).toHaveAttribute("aria-expanded", "false");
+    // A touch press that turns into a scroll is cancelled and must not arm a later click.
+    fireEvent.pointerDown(menuButton, { button: 0, ctrlKey: false, pointerType: "touch" });
+    fireEvent.pointerCancel(menuButton, { pointerType: "touch" });
+    fireEvent.click(menuButton);
+    expect(menuButton).toHaveAttribute("aria-expanded", "false");
     // A touch press alone (the start of a scroll) leaves the menu closed.
     fireEvent.pointerDown(menuButton, { button: 0, ctrlKey: false, pointerType: "touch" });
     expect(menuButton).toHaveAttribute("aria-expanded", "false");

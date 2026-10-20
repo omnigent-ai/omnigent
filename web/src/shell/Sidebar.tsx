@@ -7287,6 +7287,9 @@ function ProjectFolderMenu({
             touchPressRef.current = e.pointerType !== "mouse";
             if (touchPressRef.current) e.preventDefault();
           }}
+          onPointerCancel={() => {
+            touchPressRef.current = false;
+          }}
           onClick={(e) => {
             e.stopPropagation();
             if (touchPressRef.current) setOpen((wasOpen) => !wasOpen);
