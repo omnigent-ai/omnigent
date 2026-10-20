@@ -78,7 +78,8 @@ without a session ID to resume.
 
 **Approval inbox:** open Inbox in the sidebar to answer a pending permission
 without opening its session. Antigravity's Chat and Inbox cards both offer
-the advertised session and saved-rule choices.
+the advertised session and saved-rule choices. Codex file-change cards on both
+surfaces offer **Approve for this session**.
 
 **Skill contents:** Settings → Harnesses → configured harness card (or gear),
 then Skills → a skill, or Plugins → a plugin → a skill. Back returns to the
@@ -349,6 +350,13 @@ Cross-harness journeys:
   (`tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_late_settings_ack_still_reaches_an_older_server`).
 - **`approvals`:**
   `tests/e2e_ui/approvals/test_native_edit_tools_approval_card.py::test_native_file_edit_tools_require_approval_card`
+- **`approvals`, Codex file changes approved for the session (Chat):**
+  `tests/e2e_ui/approvals/test_codex_file_change_approval_remember.py::test_codex_native_file_change_session_approval_skips_later_prompts`
+  runs real Codex against a scripted mock model in the "Read only" mode. After
+  **Approve for this session**, a second edit to the same file needs no card;
+  the one-time **Approve** control is asked again. For Inbox, answer the first
+  card there instead and check the same outcome. The synthetic hook round trip
+  is `tests/e2e_ui/approvals/test_codex_mcp_persistence.py::test_codex_file_change_session_approval_round_trip`.
 - **`resume`, bare picker scoped to this host:**
   `tests/e2e/test_native_resume_picker_cross_host_e2e.py::test_bare_resume_picker_excludes_other_hosts_sessions`
 - **`resume`, Claude and Pi provider selection after a runner restart:**

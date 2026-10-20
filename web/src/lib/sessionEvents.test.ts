@@ -917,6 +917,31 @@ describe("response.elicitation_request (FLAT envelope)", () => {
     expect(ev.codexPersistModes).toEqual(["session", "always"]);
   });
 
+  it("lifts server-advertised Codex persistence modes on file-change approvals", () => {
+    const fileChangeParams = {
+      mode: "form",
+      message: "Codex wants to modify files",
+      phase: "codex_file_change_approval",
+      policy_name: "codex_native_file_change_approval",
+      content_preview: "",
+      requestedSchema: {},
+    };
+    const [advertised] = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_codex_file_change",
+      params: { ...fileChangeParams, codex_persist_modes: ["session", "unsupported"] },
+    }) as ElicitationRequest[];
+    // Servers that predate the field offer only one-time approval.
+    const [legacy] = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_codex_file_change_legacy",
+      params: fileChangeParams,
+    }) as ElicitationRequest[];
+
+    expect(advertised.codexPersistModes).toEqual(["session"]);
+    expect(legacy.codexPersistModes).toEqual([]);
+  });
+
   it("lifts agy permission action description and advertised persist pattern", () => {
     const out = parse("response.elicitation_request", {
       type: "response.elicitation_request",

@@ -2487,6 +2487,54 @@ async def test_codex_mcp_elicitation_hook_persists_web_session_approval(
     }
 
 
+@pytest.mark.parametrize(
+    ("persist", "decision"),
+    [("session", "acceptForSession"), ("always", "accept")],
+)
+async def test_codex_file_change_approval_hook_returns_session_decision(
+    client: httpx.AsyncClient,
+    persist: str,
+    decision: str,
+) -> None:
+    """A file-change card advertises the session scope; other scopes stay one-time."""
+    agent = await create_test_agent(client, f"test-codex-file-change-{persist}")
+    session_id = await _create_session(client, agent["id"])
+    payload = {
+        "id": 21,
+        "method": "item/fileChange/requestApproval",
+        "params": {
+            "threadId": "thread_123",
+            "turnId": "turn_123",
+            "itemId": "item_patch",
+            "startedAtMs": 1,
+            "reason": None,
+            "grantRoot": None,
+        },
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    assert event["params"]["message"] == "Codex wants to modify files"
+    assert event["params"]["codex_persist_modes"] == ["session"]
+    verdict = await client.post(
+        f"/v1/sessions/{session_id}/elicitations/{event['elicitation_id']}/resolve",
+        json={"action": "accept", "_meta": {"persist": persist}},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"decision": decision}
+
+
 async def test_codex_pending_elicitation_survives_session_snapshot_refresh(
     client: httpx.AsyncClient,
 ) -> None:

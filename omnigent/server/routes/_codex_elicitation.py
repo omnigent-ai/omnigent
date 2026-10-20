@@ -19,6 +19,11 @@ _CODEX_PERMISSIONS_REQUEST_APPROVAL_METHOD = "item/permissions/requestApproval"
 _CODEX_EXEC_COMMAND_APPROVAL_METHOD = "execCommandApproval"
 _CODEX_APPLY_PATCH_APPROVAL_METHOD = "applyPatchApproval"
 
+# Codex always accepts a session-scoped file-change approval
+# (``acceptForSession`` / ``approved_for_session``); its own TUI offers
+# "Yes, and don't ask again for these files".
+_CODEX_FILE_CHANGE_PERSIST_MODES: tuple[str, ...] = ("session",)
+
 _CodexParamsBuilder = Callable[[Any, str, dict[str, Any]], ElicitationRequestParams]
 _CodexResponseBuilder = Callable[[ElicitationResult, str, dict[str, Any]], dict[str, Any]]
 
@@ -279,6 +284,20 @@ def _codex_mcp_persist_modes(params: dict[str, Any]) -> set[str]:
     return {value for value in values if isinstance(value, str) and value in {"session", "always"}}
 
 
+def _is_session_accept(result: ElicitationResult) -> bool:
+    """
+    Return whether a web verdict accepts a Codex file change for the session.
+
+    Codex file changes support only the ``session`` scope; any other
+    requested mode stays a one-time accept so Codex still gets an answer.
+
+    :param result: Web-submitted elicitation result.
+    :returns: ``True`` for an accept whose ``_meta.persist`` is ``"session"``.
+    """
+    persist = result.meta.get("persist") if result.meta is not None else None
+    return result.action == "accept" and persist == "session"
+
+
 def _execpolicy_amendment(value: Any) -> list[str] | None:
     """
     Validate a Codex ``ExecPolicyAmendment`` value.
@@ -434,6 +453,10 @@ def _codex_file_change_approval_response(
     """
     Convert a web verdict into Codex file-change approval output.
 
+    A session-scoped accept (``_meta.persist == "session"``) becomes
+    ``acceptForSession`` so Codex stops prompting for later changes to
+    the same files.
+
     :param result: Web-submitted elicitation result.
     :param _method: Codex app-server method, unused because this
         response shape is unique to file-change approvals.
@@ -441,6 +464,8 @@ def _codex_file_change_approval_response(
         response depends only on the web verdict.
     :returns: Codex ``FileChangeRequestApprovalResponse`` payload.
     """
+    if _is_session_accept(result):
+        return {"decision": "acceptForSession"}
     return {
         "decision": {
             "accept": "accept",
@@ -458,6 +483,9 @@ def _codex_apply_patch_approval_response(
     """
     Convert a web verdict into legacy Codex patch approval output.
 
+    A session-scoped accept becomes ``approved_for_session``, the legacy
+    ``ReviewDecision`` spelling of ``acceptForSession``.
+
     :param result: Web-submitted elicitation result.
     :param _method: Codex app-server method, unused because this
         response shape is unique to legacy patch approvals.
@@ -465,6 +493,8 @@ def _codex_apply_patch_approval_response(
         response depends only on the web verdict.
     :returns: Codex ``ApplyPatchApprovalResponse`` payload.
     """
+    if _is_session_accept(result):
+        return {"decision": "approved_for_session"}
     return {
         "decision": {
             "accept": "approved",
@@ -722,6 +752,7 @@ def _codex_file_change_approval_params(
         extras["turn_id"] = turn_id
     if isinstance(item_id, str) and item_id:
         extras["item_id"] = item_id
+    extras["codex_persist_modes"] = list(_CODEX_FILE_CHANGE_PERSIST_MODES)
     message = "Codex wants to modify files"
     if grant_root:
         message = f"Codex wants write access under **{grant_root}**"
@@ -818,6 +849,7 @@ def _codex_apply_patch_approval_params(
         extras["call_id"] = call_id
     if isinstance(files, dict) and files:
         extras["files"] = sorted(str(key) for key in files)
+    extras["codex_persist_modes"] = list(_CODEX_FILE_CHANGE_PERSIST_MODES)
     return ElicitationRequestParams(
         mode="form",
         message="Codex wants to apply a patch",

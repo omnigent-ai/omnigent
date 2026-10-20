@@ -220,7 +220,10 @@ interface ApprovalCardProps {
    * elicitation (edit tools take the ``allowAllEdits`` path instead).
    */
   rememberScope?: RememberScope | null;
-  /** Codex-native MCP persistence scopes advertised by the request. */
+  /**
+   * Codex-native persistence scopes advertised by the request (MCP tool
+   * calls and file changes). ``session`` renders "Approve for this session".
+   */
   codexPersistModes?: CodexPersistMode[];
   /** Antigravity prompt details (see {@link AgyPermission}); null outside agy permission requests. */
   agyPermission?: AgyPermission | null;

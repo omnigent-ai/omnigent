@@ -279,7 +279,7 @@ export interface ElicitationRequest {
    * where the allow rule is meaningful.
    */
   rememberScope?: RememberScope | null;
-  /** Codex-native MCP approval persistence modes advertised by the request. */
+  /** Codex-native approval persistence modes advertised by the request. */
   codexPersistModes?: CodexPersistMode[];
   /** Optional Antigravity action description and advertised persist pattern. */
   agyPermission?: AgyPermission | null;

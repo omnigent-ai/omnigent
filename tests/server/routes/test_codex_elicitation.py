@@ -5,11 +5,16 @@ These are pure-function tests — no HTTP or runtime needed.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import Any
+
 import pytest
 
 from omnigent.errors import OmnigentError
 from omnigent.server.routes._codex_elicitation import (
+    _codex_apply_patch_approval_response,
     _codex_command_preview,
+    _codex_file_change_approval_response,
     _codex_mcp_elicitation_response,
     _codex_mcp_persist_modes,
     _execpolicy_amendment,
@@ -128,6 +133,93 @@ class TestCodexMcpApprovalPersistence:
         }
 
         assert _codex_mcp_persist_modes(params) == {"session"}
+
+
+# ── Codex file-change approval persistence ─────────────────────────────
+
+
+_FILE_CHANGE_METHOD = "item/fileChange/requestApproval"
+_APPLY_PATCH_METHOD = "applyPatchApproval"
+
+
+class TestCodexFileChangeApprovalPersistence:
+    """Tests for Codex's session-scoped file-change approval choice."""
+
+    @pytest.mark.parametrize("method", [_FILE_CHANGE_METHOD, _APPLY_PATCH_METHOD])
+    def test_params_advertise_session_scope(self, method: str) -> None:
+        req = parse_codex_elicitation_request(
+            {
+                "id": 21,
+                "method": method,
+                "params": {"threadId": "thread_1", "turnId": "turn_1", "itemId": "item_1"},
+            }
+        )
+
+        assert req.params.model_dump()["codex_persist_modes"] == ["session"]
+
+    def test_session_accept_returns_accept_for_session(self) -> None:
+        result = ElicitationResult.model_validate(
+            {"action": "accept", "_meta": {"persist": "session"}}
+        )
+
+        response = _codex_file_change_approval_response(result, _FILE_CHANGE_METHOD, {})
+
+        assert response == {"decision": "acceptForSession"}
+
+    def test_legacy_session_accept_returns_approved_for_session(self) -> None:
+        result = ElicitationResult.model_validate(
+            {"action": "accept", "_meta": {"persist": "session"}}
+        )
+
+        response = _codex_apply_patch_approval_response(result, _APPLY_PATCH_METHOD, {})
+
+        assert response == {"decision": "approved_for_session"}
+
+    @pytest.mark.parametrize(
+        ("build_response", "method", "action", "decision"),
+        [
+            (_codex_file_change_approval_response, _FILE_CHANGE_METHOD, "accept", "accept"),
+            (_codex_file_change_approval_response, _FILE_CHANGE_METHOD, "decline", "decline"),
+            (_codex_file_change_approval_response, _FILE_CHANGE_METHOD, "cancel", "cancel"),
+            (_codex_apply_patch_approval_response, _APPLY_PATCH_METHOD, "accept", "approved"),
+            (_codex_apply_patch_approval_response, _APPLY_PATCH_METHOD, "decline", "denied"),
+            (_codex_apply_patch_approval_response, _APPLY_PATCH_METHOD, "cancel", "abort"),
+        ],
+    )
+    def test_one_time_verdicts_keep_plain_decisions(
+        self,
+        build_response: Callable[[ElicitationResult, str, dict[str, Any]], dict[str, Any]],
+        method: str,
+        action: str,
+        decision: str,
+    ) -> None:
+        result = ElicitationResult.model_validate({"action": action})
+
+        assert build_response(result, method, {}) == {"decision": decision}
+
+    @pytest.mark.parametrize(
+        ("build_response", "method", "decline", "accept"),
+        [
+            (_codex_file_change_approval_response, _FILE_CHANGE_METHOD, "decline", "accept"),
+            (_codex_apply_patch_approval_response, _APPLY_PATCH_METHOD, "denied", "approved"),
+        ],
+    )
+    def test_non_session_verdicts_ignore_persistence_meta(
+        self,
+        build_response: Callable[[ElicitationResult, str, dict[str, Any]], dict[str, Any]],
+        method: str,
+        decline: str,
+        accept: str,
+    ) -> None:
+        declined = ElicitationResult.model_validate(
+            {"action": "decline", "_meta": {"persist": "session"}}
+        )
+        unadvertised = ElicitationResult.model_validate(
+            {"action": "accept", "_meta": {"persist": "always"}}
+        )
+
+        assert build_response(declined, method, {}) == {"decision": decline}
+        assert build_response(unadvertised, method, {}) == {"decision": accept}
 
 
 # ── _string_list_answer ──────────────────────────────────────────────

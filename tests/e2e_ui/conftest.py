@@ -2774,6 +2774,8 @@ def _create_native_codex_session(
     runner_id: str,
     *,
     model: str | None = None,
+    workspace: Path | None = None,
+    terminal_launch_args: list[str] | None = None,
 ) -> str:
     """Register the ``codex-native`` wrapper agent and bind its session.
 
@@ -2797,15 +2799,21 @@ def _create_native_codex_session(
     :param base_url: Spawned server base URL.
     :param runner_id: The token-bound runner id to bind.
     :param model: Optional Codex model to pin in the wrapper spec.
+    :param workspace: Session workspace; defaults to the repository root.
+    :param terminal_launch_args: Optional args persisted on the session and
+        passed to ``codex``, e.g. the New Chat dialog's "Read only" preset.
     :returns: The new session/conversation id.
     """
     # Keep workspace session-local; runner-wide cwd changes other file surfaces.
+    metadata: dict[str, Any] = {"workspace": str(workspace or _REPO_ROOT)}
+    if terminal_launch_args is not None:
+        metadata["terminal_launch_args"] = terminal_launch_args
     created = create_native_session(
         httpx,
         base_url,
         harness="codex",
         model=model,
-        metadata={"workspace": str(_REPO_ROOT)},
+        metadata=metadata,
     )
     session_id = str(created["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)
@@ -2900,23 +2908,36 @@ def native_claude_mock_session(
         yield session
 
 
-@pytest.fixture
-def native_codex_mock_session(
+@contextlib.contextmanager
+def native_codex_mock_session_context(
     live_server: str,
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
+    *,
+    workspace: Path | None = None,
+    terminal_launch_args: list[str] | None = None,
 ) -> Iterator[tuple[str, str]]:
     """A real Codex CLI using an explicitly configured mock provider.
 
     Workflow-owned runners reuse their startup config; standalone tests install
     a temporary mock provider regardless of ambient credentials.
+    ``workspace`` and ``terminal_launch_args`` are stored on the session.
     """
     respawned = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
     with _temp_omnigent_mock_config(
         mock_llm_server_url, "codex", workflow_owned=bool(_server_state.get("workflow_owned"))
     ):
-        session_id = _create_native_codex_session(live_server, runner_id)
+        # Forward only set options: test_mock_session_uses_owned_config asserts the default call.
+        session_options = {
+            name: value
+            for name, value in (
+                ("workspace", workspace),
+                ("terminal_launch_args", terminal_launch_args),
+            )
+            if value is not None
+        }
+        session_id = _create_native_codex_session(live_server, runner_id, **session_options)
         try:
             yield (live_server, session_id)
         finally:
@@ -2928,6 +2949,19 @@ def native_codex_mock_session(
                 except subprocess.TimeoutExpired:
                     respawned.kill()
                     respawned.wait(timeout=5)
+
+
+@pytest.fixture
+def native_codex_mock_session(
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A real Codex CLI using an explicitly configured mock provider."""
+    with native_codex_mock_session_context(
+        live_server, mock_llm_server_url, tmp_path_factory
+    ) as session:
+        yield session
 
 
 @dataclass(frozen=True)
