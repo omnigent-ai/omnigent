@@ -70,10 +70,14 @@ fetch_state() {
 #               wait rather than treat the gap as a skip (the #2218 race,
 #               where an E2E shard was cancelled and re-running at the
 #               moment the gate evaluated).
+newest_workflow_run() {
+  printf '%s\n' "$WORKFLOW_RUNS" | awk -F'\t' -v w="$1" '$1 == w' \
+    | sort -t $'\t' -k4,4 | tail -n 1
+}
+
 workflow_run_outcome() {
   local wf="$1" row status concl
-  row=$(printf '%s\n' "$WORKFLOW_RUNS" | awk -F'\t' -v w="$wf" '$1 == w' \
-    | sort -t $'\t' -k4,4 | tail -n 1)
+  row=$(newest_workflow_run "$wf")
   if [[ -z "$row" ]]; then
     echo "none"
     return
@@ -92,9 +96,7 @@ workflow_run_outcome() {
 # Whether the newest run of a workflow for this SHA has completed, whatever
 # its conclusion.
 workflow_run_finished() {
-  local wf="$1"
-  printf '%s\n' "$WORKFLOW_RUNS" | awk -F'\t' -v w="$wf" '$1 == w' \
-    | sort -t $'\t' -k4,4 | tail -n 1 | awk -F'\t' '$2 == "completed" {found=1} END {exit !found}'
+  newest_workflow_run "$1" | awk -F'\t' '$2 == "completed" {found=1} END {exit !found}'
 }
 
 # Sets FAIL, FAILED_LINES, and ONLY_LAGGING (every red check is one that

@@ -680,13 +680,41 @@ def test_merge_gate_waits_for_selected_rust_checks(tmp_path, fault):
     )
 
 
-def _gate_snapshot(shard_status: str, e2e_run_status: str) -> dict[str, Any]:
-    checks = {
-        "DCO": "completed",
-        "Pre-commit checks": "completed",
-        "E2E Tests (shard 0/4)": "completed",
-        "E2E Tests (shard 1/4)": shard_status,
-    }
+_E2E_SHARDS = [f"E2E Tests (shard {index}/4)" for index in range(4)] + [
+    f"E2E Tests (shard {index}/2)" for index in range(2)
+]
+
+
+def _gate_snapshot(
+    shard_status: str,
+    e2e_runs: tuple[tuple[str, str], ...] = (("completed", "2026-10-19T10:00:00Z"),),
+    failed: str | None = None,
+) -> dict[str, Any]:
+    """One API snapshot in which only ``E2E Tests (shard 1/4)`` may be unfinished.
+
+    :param shard_status: Status of that shard's check run.
+    :param e2e_runs: ``(status, created_at)`` for each E2E Tests workflow run.
+    :param failed: A required check to report as completed with a failure.
+    """
+    checks = dict.fromkeys(["DCO", "Pre-commit checks", *_E2E_SHARDS], "completed")
+    checks["E2E Tests (shard 1/4)"] = shard_status
+    runs = [
+        {
+            "name": name,
+            "status": "completed",
+            "conclusion": "success",
+            "created_at": "2026-10-19T10:00:00Z",
+        }
+        for name in ("CI", "E2E UI Tests", "Integration Tests")
+    ] + [
+        {
+            "name": "E2E Tests",
+            "status": status,
+            "conclusion": "success" if status == "completed" else None,
+            "created_at": created_at,
+        }
+        for status, created_at in e2e_runs
+    ]
     return {
         "checks": {
             "check_runs": [
@@ -694,29 +722,23 @@ def _gate_snapshot(shard_status: str, e2e_run_status: str) -> dict[str, Any]:
                     "id": index,
                     "name": name,
                     "status": status,
-                    "conclusion": "success" if status == "completed" else None,
+                    "conclusion": (
+                        ("failure" if name == failed else "success")
+                        if status == "completed"
+                        else None
+                    ),
                 }
                 for index, (name, status) in enumerate(checks.items(), start=1)
             ]
         },
-        "runs": {
-            "workflow_runs": [
-                {
-                    "name": name,
-                    "status": e2e_run_status if name == "E2E Tests" else "completed",
-                    "conclusion": "success" if e2e_run_status == "completed" else None,
-                    "created_at": "2026-10-19T10:00:00Z",
-                }
-                for name in ("CI", "E2E Tests", "E2E UI Tests", "Integration Tests")
-            ]
-        },
+        "runs": {"workflow_runs": runs},
     }
 
 
 def test_merge_gate_rereads_a_check_that_lags_its_completed_workflow(tmp_path):
     """A completed workflow's check that still reads as running is re-read, not failed."""
-    lagging = _gate_snapshot("in_progress", "completed")
-    settled = _gate_snapshot("completed", "completed")
+    lagging = _gate_snapshot("in_progress")
+    settled = _gate_snapshot("completed")
     process = _run_merge_gate(tmp_path, [lagging, lagging, settled])
     assert process.returncode == 0, process.stdout + process.stderr
     assert _check_reads(tmp_path) == 3
@@ -724,13 +746,37 @@ def test_merge_gate_rereads_a_check_that_lags_its_completed_workflow(tmp_path):
 
 
 def test_merge_gate_reports_red_after_the_lag_rereads_run_out(tmp_path):
-    process = _run_merge_gate(tmp_path, [_gate_snapshot("in_progress", "completed")])
+    process = _run_merge_gate(tmp_path, [_gate_snapshot("in_progress")])
     assert process.returncode == 1, process.stdout + process.stderr
     assert _check_reads(tmp_path) == 6
     assert "E2E Tests (shard 1/4)" in (tmp_path / "gate-output").read_text()
 
 
-def test_merge_gate_does_not_wait_while_the_workflow_is_still_running(tmp_path):
-    process = _run_merge_gate(tmp_path, [_gate_snapshot("in_progress", "in_progress")])
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        _gate_snapshot("in_progress", (("in_progress", "2026-10-19T10:00:00Z"),)),
+        _gate_snapshot("in_progress", failed="Pre-commit checks"),
+        _gate_snapshot(
+            "in_progress",
+            (("completed", "2026-10-19T10:00:00Z"), ("in_progress", "2026-10-19T10:05:00Z")),
+        ),
+    ],
+    ids=["workflow-running", "with-a-failed-check", "newest-run-running"],
+)
+def test_merge_gate_reports_red_without_rereading_when_a_red_check_is_not_lagging(
+    tmp_path, snapshot
+):
+    process = _run_merge_gate(tmp_path, [snapshot])
     assert process.returncode == 1, process.stdout + process.stderr
     assert _check_reads(tmp_path) == 1
+
+
+def test_merge_gate_follows_the_newest_workflow_run_when_rereading(tmp_path):
+    """An older running attempt does not stop a re-read once the newest run completed."""
+    runs = (("in_progress", "2026-10-19T10:00:00Z"), ("completed", "2026-10-19T10:05:00Z"))
+    process = _run_merge_gate(
+        tmp_path, [_gate_snapshot("in_progress", runs), _gate_snapshot("completed", runs)]
+    )
+    assert process.returncode == 0, process.stdout + process.stderr
+    assert _check_reads(tmp_path) == 2
