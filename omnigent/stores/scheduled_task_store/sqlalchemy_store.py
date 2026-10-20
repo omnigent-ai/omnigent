@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import builtins
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import and_, asc, delete, desc, func, or_, select, tuple_
+from sqlalchemy import and_, asc, delete, desc, func, or_, select, tuple_, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
@@ -366,6 +367,26 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             return _to_entity(row)
 
         return run_write_transaction(self._session_immediate, "update_task", write)
+
+    def clear_project_id(self, scheduled_task_id: str, project_id: str) -> bool:
+        """Clear the task's project only while it is still *project_id*."""
+
+        def write(session: Session) -> bool:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    update(SqlScheduledTask)
+                    .where(
+                        SqlScheduledTask.workspace_id == current_workspace_id(),
+                        SqlScheduledTask.id == scheduled_task_id,
+                        SqlScheduledTask.project_id == project_id,
+                    )
+                    .values(project_id=None, updated_at=now_epoch())
+                ),
+            )
+            return result.rowcount > 0
+
+        return run_write_transaction(self._session_immediate, "clear_task_project", write)
 
     def delete(self, scheduled_task_id: str) -> bool:
         """Delete a scheduled task and all of its runs. Idempotent: returns ``False`` if not

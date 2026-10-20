@@ -140,6 +140,21 @@ class SysScheduledTaskCreateTool(Tool):
                                 "with it. Requires managed sandboxes configured on the server."
                             ),
                         },
+                        "project_name": {
+                            "type": "string",
+                            "description": (
+                                "Optional project to file every fired session into, by "
+                                "name: your existing project with this name, or a new one "
+                                "if you have none. Do not set project_id with it."
+                            ),
+                        },
+                        "project_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional existing project id to file every fired session "
+                                "into. Do not set project_name with it."
+                            ),
+                        },
                     },
                     "required": ["name", "prompt", "rrule", "agent_id"],
                     "additionalProperties": False,
@@ -263,6 +278,20 @@ class SysScheduledTaskUpdateTool(Tool):
                         "state": {
                             "type": "string",
                             "description": "'active' or 'paused'.",
+                        },
+                        "project_name": {
+                            "type": "string",
+                            "description": (
+                                "File future fired sessions into this project, by name: "
+                                "your existing project with this name, or a new one."
+                            ),
+                        },
+                        "project_id": {
+                            "type": "string",
+                            "description": (
+                                "File future fired sessions into this existing project id. "
+                                "Null stops filing them into a project."
+                            ),
                         },
                     },
                     "required": ["scheduled_task_id"],

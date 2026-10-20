@@ -211,6 +211,8 @@ class ServerInfoResponse(BaseModel):
     agent_detail: bool = False
     # Owner configuration reads and conditional PATCH updates.
     agent_config_edit: bool = False
+    # Scheduled tasks accept ``project_id`` / ``project_name``; older servers reject them.
+    scheduled_task_projects: bool = False
     branding: BrandingInfo
 
 
@@ -1777,6 +1779,7 @@ def create_app(
                 sandbox_config=sandbox_config,
                 managed_launches=app_inst.state.managed_launches,
                 app_state=app_inst.state,
+                project_store=project_store,
             )
             on_fire = build_on_fire(fire_deps)
             # The manual "run now" trigger reuses the same fire path (dispatch /
@@ -3173,6 +3176,7 @@ def create_app(
                 "agent_detail": True,
                 "agent_config_edit": agent_store.supports_config_edit
                 and artifact_store is not None,
+                "scheduled_task_projects": project_store is not None,
                 "branding": branding_snapshot.config(),
             }
         )
@@ -3468,6 +3472,7 @@ def create_app(
                 agent_cache=agent_cache,
                 auth_provider=auth_provider,
                 artifact_store=artifact_store,
+                project_store=project_store,
             ),
             prefix="/v1",
             tags=["scheduled_tasks"],

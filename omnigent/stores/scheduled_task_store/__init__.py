@@ -249,6 +249,20 @@ class ScheduledTaskStore(ABC):
         ...
 
     @abstractmethod
+    def clear_project_id(self, scheduled_task_id: str, project_id: str) -> bool:
+        """
+        Clear the task's ``project_id`` only while it still equals *project_id*.
+
+        A single conditional write, so a concurrent update that moved the task to
+        another project is never overwritten.
+
+        :param scheduled_task_id: The task to update.
+        :param project_id: The project id expected on the row, e.g. a deleted one.
+        :returns: ``True`` if the column was cleared.
+        """
+        ...
+
+    @abstractmethod
     def update_run(
         self,
         run_id: str,

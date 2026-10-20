@@ -759,10 +759,11 @@ class SqlProject(OmnigentBase):
         # created_at in the key so the ORDER BY created_at, id is served by the
         # index (no filesort). Personal display order lives in preferences.
         #
-        # Also covers the two name lookups via its (workspace_id, user_id)
-        # prefix: the store's ``_name_taken`` probe and the ``?project=<name>``
-        # member join. Both then filter ``name`` over the owner's handful of
-        # rows, so neither needs a name-leading index of its own.
+        # Also covers the name lookups via its (workspace_id, user_id) prefix:
+        # the store's ``_name_taken`` probe, ``get_or_create_by_name`` (a
+        # scheduled task's ``project_name``), and the ``?project=<name>`` member
+        # join. Each filters ``name`` over the owner's handful of rows, so none
+        # needs a name-leading index of its own.
         #
         # There is deliberately NO unique index on (workspace_id, user_id, name).
         # Per-owner name uniqueness is a store-level check (``_name_taken``), not

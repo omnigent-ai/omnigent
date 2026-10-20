@@ -10,6 +10,7 @@ import { testAgent } from "@/test/agentFixtures";
 import type * as NativeCodingAgentsModule from "@/lib/nativeCodingAgents";
 import type * as ScheduledTasksApiModule from "@/lib/scheduledTasksApi";
 
+import type React from "react";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -37,6 +38,18 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
   useUpdateScheduledTask: vi.fn(),
 }));
 vi.mock("@/lib/agentLabels", () => ({ useBrainHarnessLabels: () => ({}) }));
+// The project field (and the shared ProjectPicker inside it) lists projects
+// from this hook.
+const PROJECTS = [
+  { id: "proj_1", name: "Triage", icon: null },
+  { id: "proj_2", name: "Reports", icon: null },
+];
+const projectsQuery = vi.hoisted(() => ({
+  current: { data: undefined as unknown, isPending: false },
+}));
+vi.mock("@/hooks/useConversations", () => ({
+  useProjects: () => projectsQuery.current,
+}));
 vi.mock("@/shell/WorkspacePicker", () => ({
   isNavigablePath: (path: string) => path.startsWith("/"),
   WorkspacePicker: ({ onSelect }: { onSelect?: (p: string) => void }) => (
@@ -144,6 +157,7 @@ const mutateAsync = vi.fn();
 const updateMutateAsync = vi.fn();
 
 beforeEach(() => {
+  projectsQuery.current = { data: PROJECTS, isPending: false };
   mutateAsync.mockReset().mockResolvedValue({ id: "st_new" });
   updateMutateAsync.mockReset().mockResolvedValue({ id: "st_1" });
   vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
@@ -196,6 +210,7 @@ function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask>
     workspace: null,
     hostId: null,
     executionTarget: "connected_host",
+    projectId: null,
     state: "active",
     lastRunAt: null,
     lastRunStatus: null,
@@ -934,6 +949,136 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     expect(input.modelOverride).toBeNull();
     expect(input.reasoningEffort).toBe("high");
     expect(input.permissionMode).toBe("plan");
+  });
+});
+
+describe("CreateScheduledTaskDialog project", () => {
+  function renderWithProjects(
+    ui: React.ReactElement = <CreateScheduledTaskDialog open onOpenChange={vi.fn()} />,
+  ) {
+    return render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_projects: true }}
+      >
+        {ui}
+      </CapabilitiesProvider>,
+    );
+  }
+
+  it("hides the project field when the server does not accept task projects", () => {
+    renderDialog();
+    expect(screen.queryByTestId("task-project-field")).not.toBeInTheDocument();
+  });
+
+  function fillRequired() {
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
+  }
+
+  function openProjectMenu() {
+    fireEvent.keyDown(screen.getByTestId("task-project-trigger"), { key: "Enter" });
+  }
+
+  async function submitCreate() {
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    return mutateAsync.mock.calls[0][0];
+  }
+
+  it("sends no project when none is picked", async () => {
+    renderWithProjects();
+    fillRequired();
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("No project");
+    const arg = await submitCreate();
+    expect(arg).not.toHaveProperty("projectName");
+    expect(arg).not.toHaveProperty("projectId");
+  });
+
+  it("files runs into an existing project picked from the menu", async () => {
+    renderWithProjects();
+    fillRequired();
+    openProjectMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Triage" }));
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Triage");
+    expect(await submitCreate()).toMatchObject({ projectId: "proj_1" });
+  });
+
+  it("creates a project from a typed name", async () => {
+    renderWithProjects();
+    fillRequired();
+    openProjectMenu();
+    fireEvent.change(await screen.findByLabelText("Search or create project"), {
+      target: { value: "Nightly reports" },
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Create\s+Nightly reports/ }));
+    expect(await submitCreate()).toMatchObject({ projectName: "Nightly reports" });
+  });
+
+  function renderEditingFiledTask() {
+    renderWithProjects(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ projectId: "proj_1" })}
+      />,
+    );
+  }
+
+  it("keeps an edited task's project when it is not changed", async () => {
+    renderEditingFiledTask();
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Triage");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input).not.toHaveProperty("projectId");
+    expect(input).not.toHaveProperty("projectName");
+  });
+
+  it("labels a deleted saved project and lets the edit unfile the task", async () => {
+    renderWithProjects(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ projectId: "proj_deleted" })}
+      />,
+    );
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Deleted project");
+    openProjectMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "No project" }));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({ projectId: null });
+  });
+
+  it("moves an edited task to another existing project", async () => {
+    renderEditingFiledTask();
+    openProjectMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Reports" }));
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Reports");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({ projectId: "proj_2" });
+  });
+
+  it("shows a loading label, not a deleted one, while projects load", async () => {
+    projectsQuery.current = { data: undefined, isPending: true };
+    renderEditingFiledTask();
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Loading…");
+    openProjectMenu();
+    expect(await screen.findByLabelText("Search or create project")).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "No project" })).not.toBeInTheDocument();
+  });
+
+  it("unfiles an edited task's runs when its project is removed", async () => {
+    renderEditingFiledTask();
+    openProjectMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Remove from Triage" }));
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("No project");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({ projectId: null });
   });
 });
 

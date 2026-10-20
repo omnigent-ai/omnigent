@@ -149,6 +149,8 @@ class FireDeps:
     # ``app.state``, read per fire for the default-public-sessions policy.
     # ``None`` (tests, embedders) leaves every fired session private.
     app_state: Any | None = None
+    # Confirms a task's project still exists before filing the session into it.
+    project_store: Any | None = None
 
 
 @dataclass
@@ -848,6 +850,39 @@ async def _agent_revision(deps: FireDeps, conv: Conversation) -> str | None:
     )
 
 
+async def _fire_project_id(deps: FireDeps, task: ScheduledTask) -> str | None:
+    """Return the project to file a fired session into, or ``None``.
+
+    A deleted project leaves the session unfiled and is cleared from the task.
+    """
+    if task.project_id is None or deps.project_store is None:
+        # Without a store the id can't be verified, so file nothing.
+        return None
+    # A single-user task stores no owner, while its projects belong to "local"
+    # (or to no owner on a server without an auth provider).
+    owners = [task.user_id] if task.user_id is not None else [RESERVED_USER_LOCAL, None]
+    project = None
+    for owner in owners:
+        project = await asyncio.to_thread(deps.project_store.get, task.project_id, user_id=owner)
+        if project is not None:
+            break
+    if project is None:
+        _logger.warning(
+            "scheduled fire: task %s project %s no longer exists; leaving the session unfiled",
+            task.id,
+            task.project_id,
+        )
+        # Clear only if the task still names this project; never fail the run.
+        try:
+            await asyncio.to_thread(
+                deps.scheduled_task_store.clear_project_id, task.id, task.project_id
+            )
+        except Exception:
+            _logger.exception("scheduled fire: task %s could not clear its project", task.id)
+        return None
+    return project.id
+
+
 async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
     """Create a conversation bound to the task's agent, carrying the stored spec."""
     conv: Conversation = await asyncio.to_thread(
@@ -857,6 +892,7 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
         host_id=task.host_id,
         workspace=task.workspace,
         terminal_launch_args=await _permission_mode_launch_args(deps, task),
+        project_id=await _fire_project_id(deps, task),
     )
     reasoning_effort = task.reasoning_effort
     if reasoning_effort is None:

@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -123,6 +124,13 @@ class FakeScheduledTaskStore:
         self.update_workspace_ids.append(current_workspace_id())
         self.updates.append({"id": scheduled_task_id, **kwargs})
         return self._rows.get(scheduled_task_id)
+
+    def clear_project_id(self, scheduled_task_id: str, project_id: str) -> bool:
+        row = self._rows.get(scheduled_task_id)
+        if row is None or row.project_id != project_id:
+            return False
+        self.updates.append({"id": scheduled_task_id, "project_id": None})
+        return True
 
     def create_run(
         self, run_id: str, scheduled_task_id: str, status: str, scheduled_at: int, **kwargs: Any
@@ -330,6 +338,7 @@ def _deps(sched_store: FakeScheduledTaskStore, **overrides: Any) -> FireDeps:
         artifact_store=overrides.get("artifact_store"),
         sandbox_config=overrides.get("sandbox_config"),
         managed_launches=overrides.get("managed_launches"),
+        project_store=overrides.get("project_store"),
     )
 
 
@@ -469,6 +478,90 @@ async def test_active_creates_session_grant_and_run() -> None:
     assert len(store.runs) == 1
     assert any("last_run_at" in u for u in store.updates)
     assert any("last_run_conversation_id" in u for u in store.updates)
+
+
+class FakeProjectStore:
+    def __init__(self, existing: set[tuple[str, str | None]]) -> None:
+        self.existing = existing
+
+    def get(self, project_id: str, *, user_id: str | None) -> SimpleNamespace | None:
+        found = (project_id, user_id) in self.existing
+        return SimpleNamespace(id=project_id) if found else None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("task_owner", "existing", "filed_into"),
+    [
+        ("alice@example.com", {("proj_1", "alice@example.com")}, "proj_1"),
+        ("alice@example.com", {("proj_1", "bob@example.com")}, None),
+        ("alice@example.com", set(), None),
+        # A single-user task stores no owner; its projects belong to "local",
+        # or to no owner on a server without an auth provider.
+        (None, {("proj_1", RESERVED_USER_LOCAL)}, "proj_1"),
+        (None, {("proj_1", None)}, "proj_1"),
+    ],
+    ids=["owned", "other-users", "deleted", "single-user-local", "single-user-no-auth"],
+)
+async def test_fired_session_is_filed_into_the_task_project(
+    task_owner: str | None,
+    existing: set[tuple[str, str | None]],
+    filed_into: str | None,
+) -> None:
+    conv_store = FakeConversationStore()
+    projects = FakeProjectStore(existing)
+    store = FakeScheduledTaskStore(rows={"task_1": _task(user_id=task_owner, project_id="proj_1")})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(store, conversation_store=conv_store, project_store=projects),
+        launch_dispatch=_launch,
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.created[0]["project_id"] == filed_into
+    # A missing project leaves the session unfiled and is cleared from the task;
+    # the run still starts.
+    assert [run["status"] for run in store.runs] == ["running"]
+    cleared = [u for u in store.updates if u.get("project_id", "unset") is None]
+    assert len(cleared) == (0 if filed_into else 1)
+
+
+@pytest.mark.asyncio
+async def test_fire_keeps_a_project_the_task_moved_to_mid_fire() -> None:
+    stale = _task(project_id="proj_1")
+    store = SequencedScheduledTaskStore([stale, stale])
+    # The row has moved on to another project by the time the fire clears it.
+    store._rows["task_1"] = _task(project_id="proj_2")
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(
+        _deps(store, project_store=FakeProjectStore(set())), launch_dispatch=_launch
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert not [u for u in store.updates if "project_id" in u]
+
+
+@pytest.mark.asyncio
+async def test_fire_without_a_project_store_files_nothing() -> None:
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(project_id="proj_1")})
+
+    async def _launch(conv: Any, task: Any) -> None:
+        return None
+
+    on_fire = build_on_fire(_deps(store, conversation_store=conv_store), launch_dispatch=_launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    assert conv_store.created[0]["project_id"] is None
 
 
 @pytest.mark.asyncio

@@ -78,6 +78,20 @@ class ProjectStore(ABC):
         ...
 
     @abstractmethod
+    def get_or_create_by_name(
+        self, project_id: str, name: str, user_id: str | None
+    ) -> tuple[Project, bool]:
+        """
+        Return the owner's oldest project with exactly this name, creating it if absent.
+
+        :param project_id: Pre-generated id used only when a project is created.
+        :param name: Trimmed project name, e.g. ``"Nightly triage"``.
+        :param user_id: Owning user, or ``None`` in single-user mode.
+        :returns: The project, and whether this call created it.
+        """
+        ...
+
+    @abstractmethod
     def list(self, *, user_id: str | None) -> list[Project]:
         """
         List the owner's projects ordered by ``created_at ASC, id ASC``.

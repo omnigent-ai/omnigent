@@ -83,6 +83,7 @@ async def test_create_posts_payload() -> None:
                 "agent_id": "ag_1",
                 "workspace": "/repo",
                 "host_id": "host_1",
+                "project_name": "triage",
                 "base_branch": "main",
                 "unexpected": "dropped",
             }
@@ -98,6 +99,7 @@ async def test_create_posts_payload() -> None:
         "agent_id": "ag_1",
         "workspace": "/repo",
         "host_id": "host_1",
+        "project_name": "triage",
     }  # unknown fields filtered out
     assert json.loads(out)["id"] == "t1"
 
@@ -135,8 +137,8 @@ async def test_update_patches_by_id() -> None:
 
 
 @pytest.mark.asyncio
-async def test_update_forwards_agent_switch_and_cost_cap() -> None:
-    """``agent_id`` / ``max_cost_usd`` reach the PATCH instead of being dropped.
+async def test_update_forwards_agent_switch_cost_cap_and_project() -> None:
+    """``agent_id`` / ``max_cost_usd`` / ``project_id`` reach the PATCH instead of being dropped.
 
     The dispatch allowlist is what an agent's ``sys_scheduled_task_update`` call
     actually travels through, so a field missing from it is silently ignored —
@@ -150,12 +152,13 @@ async def test_update_forwards_agent_switch_and_cost_cap() -> None:
                 "scheduled_task_id": _TASK_ID,
                 "agent_id": "ag_pi",
                 "max_cost_usd": 2.5,
+                "project_id": None,
             }
         ),
         server_client=client,
     )
     _, _, body = client.calls[0]
-    assert body == {"agent_id": "ag_pi", "max_cost_usd": 2.5}
+    assert body == {"agent_id": "ag_pi", "max_cost_usd": 2.5, "project_id": None}
 
 
 @pytest.mark.asyncio

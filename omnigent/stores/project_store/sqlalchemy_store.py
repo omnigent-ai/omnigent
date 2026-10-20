@@ -239,6 +239,44 @@ class SqlAlchemyProjectStore(ProjectStore):
 
         return run_write_transaction(self._session_immediate, "insert_project", write)
 
+    def get_or_create_by_name(
+        self, project_id: str, name: str, user_id: str | None
+    ) -> tuple[Project, bool]:
+        """Return the owner's oldest project named *name*, creating it if absent.
+
+        One owner-scoped read and an optional insert in a single transaction; like
+        :meth:`create`, a concurrent create of the same name can still land.
+        """
+        created_at = now_epoch()
+
+        def write(session: Session) -> tuple[Project, bool]:
+            require_active_account(session, user_id)
+            existing = session.execute(
+                select(SqlProject)
+                .where(
+                    SqlProject.workspace_id == current_workspace_id(),
+                    SqlProject.user_id == user_id,
+                    SqlProject.name == name,
+                )
+                .order_by(asc(SqlProject.created_at), asc(SqlProject.id))
+                .limit(1)
+            ).scalar_one_or_none()
+            if existing is not None:
+                return _to_entity(existing), False
+            row = SqlProject(
+                id=project_id,
+                name=name,
+                user_id=user_id,
+                created_at=created_at,
+                updated_at=None,
+                config=None,
+            )
+            session.add(row)
+            session.flush()
+            return _to_entity(row), True
+
+        return run_write_transaction(self._session_immediate, "get_or_create_project", write)
+
     def get(self, project_id: str, *, user_id: str | None) -> Project | None:
         """Return an owned project by id, or ``None`` if not found."""
         with self._session("select_project_by_id") as session:
