@@ -330,7 +330,7 @@ export function GridSessionPane({
               showFilesPanel={showFiles}
               showGithubTab={showFiles}
               showBrowserTab={supportsBrowser()}
-              onBrowserTabOpened={onOpenWorkspace}
+              onReveal={onOpenWorkspace}
               changedCount={changedFiles.data?.data.length ?? 0}
               subagentsWorking={childSessions.filter((child) => child.busy).length}
               agentCount={childSessions.length + 1}
