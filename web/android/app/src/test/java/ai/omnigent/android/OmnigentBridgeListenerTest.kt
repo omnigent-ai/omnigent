@@ -208,4 +208,26 @@ class OmnigentBridgeListenerTest {
 
         assertEquals(listOf("https://other.example.test"), switchCalls)
     }
+
+    @Test
+    fun `runAuthDebugAction forwards integer ids and drops anything else`() {
+        val requested = mutableListOf<Int>()
+        val wired =
+            OmnigentBridgeListener(
+                notifications = NativeNotificationManager(context),
+                blobSaver = BlobSaver(context),
+                onAuthDebugAction = { requested.add(it) },
+            )
+
+        wired.handle("""{"method":"runAuthDebugAction","id":20101}""")
+        wired.handle("""{"method":"runAuthDebugAction","id":"20101"}""")
+        wired.handle("""{"method":"runAuthDebugAction","id":2.5}""")
+        wired.handle("""{"method":"runAuthDebugAction"}""")
+
+        assertEquals(listOf(20_101), requested)
+        assertTrue(NativeBridgeScript.source.contains("runAuthDebugAction(id)"))
+        assertTrue(
+            NativeBridgeScript.source.contains("offersReload: payload.offersReload === true"),
+        )
+    }
 }

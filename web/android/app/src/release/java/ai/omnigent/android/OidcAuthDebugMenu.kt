@@ -4,7 +4,7 @@ import android.view.Menu
 
 /** Shipping builds expose no authentication fault-injection surface. */
 internal object OidcAuthDebugMenu {
-    const val IS_AVAILABLE = false
+    val ACTIONS = emptyList<AuthDebugAction>()
 
     fun addItems(menu: Menu) = Unit
 

@@ -11,12 +11,14 @@ const getServerPicker = vi.fn();
 const switchServer = vi.fn();
 const openServerSetup = vi.fn();
 const signOutOfServer = vi.fn();
+const runAuthDebugAction = vi.fn();
 
 vi.mock("@/lib/nativeBridge", () => ({
   getServerPicker: () => getServerPicker(),
   switchServer: (url: string) => switchServer(url),
   openServerSetup: () => openServerSetup(),
   signOutOfServer: () => signOutOfServer(),
+  runAuthDebugAction: (id: number) => runAuthDebugAction(id),
 }));
 
 function renderPicker() {
@@ -42,6 +44,7 @@ beforeEach(() => {
   switchServer.mockReset();
   openServerSetup.mockReset();
   signOutOfServer.mockReset();
+  runAuthDebugAction.mockReset();
 });
 
 afterEach(cleanup);
@@ -356,6 +359,42 @@ describe("SidebarServerPicker", () => {
     await openMenu();
     expect(await screen.findByText("Connect to new server…")).toBeInTheDocument();
     expect(screen.queryByTestId("sidebar-server-sign-out")).toBeNull();
+    // Shells that don't ask for them get neither Reload nor debug faults.
+    expect(screen.queryByTestId("sidebar-server-reload")).toBeNull();
+    expect(screen.queryByText("Debug authentication")).toBeNull();
+  });
+
+  it("reloads the page when the shell offers Reload", async () => {
+    const reload = vi.fn();
+    vi.stubGlobal("location", { ...window.location, reload });
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://omni.example",
+      recentServers: [],
+      offersReload: true,
+    });
+    renderPicker();
+    await openMenu();
+    fireEvent.click(await screen.findByTestId("sidebar-server-reload"));
+    expect(reload).toHaveBeenCalledOnce();
+    vi.unstubAllGlobals();
+  });
+
+  it("lists the shell's debug faults and runs the picked one", async () => {
+    getServerPicker.mockResolvedValue({
+      currentOrigin: "https://omni.example",
+      recentServers: [],
+      canSignOut: true,
+      debugActions: [
+        { id: 20_101, label: "Clear Session Cookie" },
+        { id: 20_102, label: "Clear Refresh Token" },
+      ],
+    });
+    renderPicker();
+    await openMenu();
+    expect(await screen.findByText("Debug authentication")).toBeInTheDocument();
+    expect(screen.getByText("Clear Session Cookie")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Clear Refresh Token"));
+    expect(runAuthDebugAction).toHaveBeenCalledExactlyOnceWith(20_102);
   });
 
   it("doesn't offer the workspace host it moved to as another server", async () => {
