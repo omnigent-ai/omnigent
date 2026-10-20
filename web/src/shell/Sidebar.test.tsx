@@ -3039,10 +3039,14 @@ describe("Sidebar project sections", () => {
     fireEvent.pointerCancel(menuButton, { pointerType: "touch" });
     fireEvent.click(menuButton);
     expect(menuButton).toHaveAttribute("aria-expanded", "false");
+    // A touch press with no click or cancel (a long press) must not arm a keyboard or AT click.
+    fireEvent.pointerDown(menuButton, { button: 0, ctrlKey: false, pointerType: "touch" });
+    fireEvent.click(menuButton, { detail: 0 });
+    expect(menuButton).toHaveAttribute("aria-expanded", "false");
     // A touch press alone (the start of a scroll) leaves the menu closed.
     fireEvent.pointerDown(menuButton, { button: 0, ctrlKey: false, pointerType: "touch" });
     expect(menuButton).toHaveAttribute("aria-expanded", "false");
-    fireEvent.click(menuButton);
+    fireEvent.click(menuButton, { detail: 1 });
     const menuItem = await screen.findByTestId("project-new-session-menu");
     expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
     expect(header).toHaveAttribute("aria-expanded", "false");

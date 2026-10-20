@@ -7292,7 +7292,8 @@ function ProjectFolderMenu({
           }}
           onClick={(e) => {
             e.stopPropagation();
-            if (touchPressRef.current) setOpen((wasOpen) => !wasOpen);
+            // Keyboard and assistive-tech clicks report detail 0 and stay with Radix.
+            if (touchPressRef.current && e.detail > 0) setOpen((wasOpen) => !wasOpen);
             touchPressRef.current = false;
           }}
         >
