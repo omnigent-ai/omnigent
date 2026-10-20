@@ -1481,8 +1481,8 @@ def create_runner_app(
     app.state.has_active_work = _has_active_work
 
     def _has_turn_in_flight() -> bool:
-        # Narrower than _has_active_work: timers and pending approvals can
-        # wait for hours and must not pin a laptop awake.
+        # Narrower than _has_active_work: timers and approvals pending outside
+        # a turn can wait for hours and must not pin a laptop awake.
         if _active_turns or _claude_prompt_waiters:
             return True
         session_ids = set(_session_start_cache) | set(_session_agent_ids)

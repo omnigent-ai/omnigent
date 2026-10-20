@@ -66,17 +66,20 @@ class _Caffeinate:
         )
 
     async def stop(self) -> None:
-        proc, self._proc = self._proc, None
-        if proc is None or proc.returncode is not None:
+        proc = self._proc
+        if proc is None:
             return
-        with contextlib.suppress(ProcessLookupError):
-            proc.terminate()
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=_STOP_TIMEOUT_S)
-        except TimeoutError:
+        if proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-            await proc.wait()
+                proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=_STOP_TIMEOUT_S)
+            except TimeoutError:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                await proc.wait()
+        # Drop the handle only once reaped, so a stop cancelled mid-wait can retry.
+        self._proc = None
 
 
 async def run_keep_awake_monitor(

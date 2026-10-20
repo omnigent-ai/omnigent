@@ -3394,3 +3394,51 @@ async def test_runner_selection_changes_without_rewriting_cached_bundle(tmp_path
     ]
     assert len({result.workdir for result in results}) == 1
     assert "registry" not in (results[0].workdir / "config.yaml").read_text()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_tunnel_runs_keep_awake_monitor_only_when_enabled(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    """The keep-awake monitor runs beside the tunnel and is cancelled on shutdown."""
+    import fastapi
+
+    import omnigent.runner._entry as entry_mod
+
+    monitor_started = asyncio.Event()
+    monitor_cancelled = asyncio.Event()
+
+    async def _fake_monitor(turn_in_flight: Any, *, runner_id: str) -> None:
+        assert turn_in_flight() is False
+        monitor_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            monitor_cancelled.set()
+            raise
+
+    async def _fake_serve_tunnel(*_args: Any, **_kwargs: Any) -> None:
+        if enabled:
+            await monitor_started.wait()
+        await asyncio.sleep(0.05)
+
+    monkeypatch.setattr(entry_mod, "_server_url_from_env", lambda: "http://runner.test")
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(entry_mod, "_runner_tunnel_binding_token_from_env", lambda: None)
+    monkeypatch.setattr(entry_mod, "_runner_parent_pid_from_env", lambda: None)
+    monkeypatch.setattr(entry_mod, "_load_runner_idle_timeout_s_from_config", lambda: 0)
+    monkeypatch.setattr(entry_mod, "_install_signal_handlers", lambda *_a, **_kw: None)
+    monkeypatch.setattr(entry_mod.gc, "freeze", lambda: None)
+    monkeypatch.setattr("omnigent.runner.identity.get_stable_runner_id", lambda: "runner-test-id")
+    monkeypatch.setattr(entry_mod, "create_app", lambda **_kw: fastapi.FastAPI())
+    monkeypatch.setattr(
+        "omnigent.runner.transports.ws_tunnel.serve.serve_tunnel", _fake_serve_tunnel
+    )
+    monkeypatch.setattr(entry_mod, "keep_awake_enabled", lambda: enabled)
+    monkeypatch.setattr(entry_mod, "run_keep_awake_monitor", _fake_monitor)
+
+    await asyncio.wait_for(entry_mod._run_tunnel_from_env(), timeout=10)
+
+    assert monitor_started.is_set() is enabled
+    assert monitor_cancelled.is_set() is enabled

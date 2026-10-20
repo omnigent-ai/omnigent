@@ -102,3 +102,32 @@ async def test_missing_binary_returns_without_polling(monkeypatch: pytest.Monkey
 
     await asyncio.wait_for(run_keep_awake_monitor(_busy, runner_id="runner_t"), timeout=1)
     assert calls == 0
+
+
+async def test_cancel_during_release_still_reaps_caffeinate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Shutdown cancelling a release mid-wait still kills and reaps the child."""
+    log = tmp_path / "calls.log"
+    script = tmp_path / "caffeinate"
+    # Ignores SIGTERM, so every release waits out the stop timeout before kill.
+    script.write_text(f"#!/bin/sh\ntrap '' TERM\necho \"$$\" >> {log}\nexec sleep 60\n")
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setattr(keep_awake, "_STOP_TIMEOUT_S", 0.3)
+    busy = True
+    task = asyncio.create_task(
+        run_keep_awake_monitor(
+            lambda: busy, runner_id="runner_t", poll_interval_s=0.01, caffeinate_binary=str(script)
+        )
+    )
+    await _wait_for(log.exists)
+    await asyncio.sleep(0.05)
+    pid = int(log.read_text().split()[0])
+
+    busy = False
+    await asyncio.sleep(0.1)
+    assert _pid_alive(pid)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not _pid_alive(pid)
