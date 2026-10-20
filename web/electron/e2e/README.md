@@ -124,6 +124,19 @@ into the nearby floating editor, and confirm the field remains `W41`. Escape
 should close only the editor. Reopen it and use Send or Enter to submit an
 instruction to chat. No instruction bar should appear below the browser URL.
 
+## Agent browser actions on dropdowns
+
+`desktop_browser_dropdowns.e2e.js` sends typed `snapshot` and `click` actions to
+a real desktop browser view. Its React fixture has a combobox that opens on
+mousedown, a native select and a Radix Select. Each must open and choose an
+option by ref, and the snapshot must list native options with the selected one
+marked. A click whose press navigates the page must still return. Build the SPA,
+then run from `web/electron`:
+
+```sh
+OMNIGENT_PW_NO_SANDBOX=1 xvfb-run -a node --test e2e/desktop_browser_dropdowns.e2e.js
+```
+
 ## Authoring a desktop reproduction
 
 For macOS titlebar clearance, build the SPA and run

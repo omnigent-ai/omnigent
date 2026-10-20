@@ -1,6 +1,6 @@
 "use strict";
 
-const { buildBrowserActionScript } = require("./browserActionScript.mjs");
+const { buildLegacyBrowserActionScript } = require("./browserActionScript.mjs");
 
 // v0.18's relay embeds JSON literals in fixed templates. Remove this adapter in v0.21.
 const JSON_STRING = String.raw`"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[\da-fA-F]{4}))*"`;
@@ -13,7 +13,7 @@ const placeholders = {
 
 function legacyPattern(action, args) {
   const seen = new Set();
-  const parts = buildBrowserActionScript(action, args).split(
+  const parts = buildLegacyBrowserActionScript(action, args).split(
     /("__legacy_selector__"|"__legacy_snapshot_id__"|"__legacy_text__"|9007199254740991)/,
   );
   const pattern = parts.map((part) => {
@@ -38,7 +38,7 @@ const patterns = ["click", "type"].flatMap((action) =>
 
 function decodeLegacyBrowserAction(script) {
   if (typeof script === "string" && script.length <= 2_000_000) {
-    if (script === buildBrowserActionScript("snapshot")) {
+    if (script === buildLegacyBrowserActionScript("snapshot")) {
       return { action: "snapshot", params: {} };
     }
     for (const { action, pattern } of patterns) {
@@ -48,7 +48,7 @@ function decodeLegacyBrowserAction(script) {
         Object.entries(match.groups).map(([key, value]) => [key, JSON.parse(value)]),
       );
       // Validate data limits and require the complete canonical template; never evaluate input.
-      if (buildBrowserActionScript(action, params) === script) return { action, params };
+      if (buildLegacyBrowserActionScript(action, params) === script) return { action, params };
     }
   }
   throw new Error("Unsupported legacy browser action; update the server UI");

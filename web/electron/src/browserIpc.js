@@ -246,6 +246,21 @@ function makeDesignModeInputHandler(gestureState) {
   };
 }
 
+// The server stops waiting after 30s; settle first so a page that never resolves
+// an async action's promise cannot leave the handler pending.
+const BROWSER_ACTION_DEADLINE_MS = 20_000;
+
+function settleBy(promise, ms) {
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`Browser action did not finish within ${ms / 1000}s`)),
+      ms,
+    );
+  });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
+
 /**
  * Register every `omnigent:browser-*` IPC handler. Idempotent per process is
  * NOT guaranteed — call exactly once from main.js's registerIpc.
@@ -446,7 +461,10 @@ function registerBrowserIpc({
     try {
       const { action, params } = legacy ? decodeLegacyBrowserAction(args?.js) : (args ?? {});
       const js = buildBrowserActionScript(action, params);
-      const result = await entry.view.webContents.executeJavaScript(js, false);
+      const result = await settleBy(
+        entry.view.webContents.executeJavaScript(js, false),
+        BROWSER_ACTION_DEADLINE_MS,
+      );
       return { ok: true, result: typeof result === "string" ? result : JSON.stringify(result) };
     } catch (e) {
       return { ok: false, error: e && e.message ? e.message : String(e) };

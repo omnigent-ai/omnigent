@@ -10,6 +10,35 @@ function jsNumber(n) {
   return JSON.stringify(n);
 }
 
+const SELECT_ROLE_JS = `    if (tag === 'select' && (el.multiple || el.size > 1)) return 'listbox';
+`;
+
+// A nested select names nothing: its option text would otherwise flood the name.
+const SELECT_NAME_JS = `    if (tag === 'select') {
+      const label = depth === 0 && el.labels && el.labels[0];
+      return label ? getName(label, 1) : '';
+    }
+`;
+
+const SELECT_OPTIONS_JS = `    if (el instanceof HTMLSelectElement) {
+      for (const option of el.options) {
+        if (window.getComputedStyle(option).display === 'none') continue;
+        const group = option.parentElement;
+        if (group instanceof HTMLOptGroupElement && window.getComputedStyle(group).display === 'none') continue;
+        const ref = ++nextRef;
+        window.__omni_refs__.set(ref, new WeakRef(option));
+        const name = option.label.trim().slice(0, 80);
+        let line = '  '.repeat(childDepth) + '- option';
+        if (name) line += ' ' + JSON.stringify(name);
+        line += ' [ref=' + ref + ']';
+        if (option.selected) line += ' [selected]';
+        if (option.matches(':disabled')) line += ' [disabled]';
+        lines.push(line);
+      }
+      return;
+    }
+`;
+
 /** In-page JS producing an a11y-style tree with stable `[ref=N]` ids. Refs live
  *  in `window.__omni_refs__` (resolved by click/type) under a per-snapshot
  *  `__omni_snapshot_id__`, so a stale ref is rejected with a precise error.
@@ -17,8 +46,10 @@ function jsNumber(n) {
  *  accessible name = aria-label > alt > placeholder > title > text, ≤80 chars.
  *  Snapshot REPLACES the ref map — two agents on one page collide (known limit,
  *  but the snapshot_id check turns a mis-click into a clean error).
+ *  A native select is named by its label and lists its options as refs, since
+ *  its closed popup has no layout to walk.
  *  Returns JSON: `{ snapshot_id, url, title, tree }`. */
-const SNAPSHOT_JS = `(() => {
+const snapshotScript = (listSelectOptions) => `(() => {
   const snapshotId = (crypto && crypto.randomUUID) ? crypto.randomUUID() : ('snap-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10));
   window.__omni_refs__ = new Map();
   window.__omni_snapshot_id__ = snapshotId;
@@ -54,7 +85,7 @@ const SNAPSHOT_JS = `(() => {
       return 'textbox';
     }
     if (isHeading(tag)) return 'heading';
-    if (TAG_ROLE[tag]) return TAG_ROLE[tag];
+${listSelectOptions ? SELECT_ROLE_JS : ""}    if (TAG_ROLE[tag]) return TAG_ROLE[tag];
     if (el.hasAttribute && (el.hasAttribute('tabindex') || el.hasAttribute('onclick'))) return 'generic';
     return null;
   }
@@ -72,7 +103,7 @@ const SNAPSHOT_JS = `(() => {
       if (ttl) return ttl;
     }
     const tag = el.tagName && el.tagName.toLowerCase();
-    if (tag === 'input' && el.value && el.type !== 'password') return String(el.value).slice(0, 80);
+${listSelectOptions ? SELECT_NAME_JS : ""}    if (tag === 'input' && el.value && el.type !== 'password') return String(el.value).slice(0, 80);
     let text = '';
     for (const node of el.childNodes) {
       if (node.nodeType === 3) text += node.textContent;
@@ -112,7 +143,7 @@ const SNAPSHOT_JS = `(() => {
       lines.push(line);
       childDepth = depth + 1;
     }
-    for (const child of el.children) {
+${listSelectOptions ? SELECT_OPTIONS_JS : ""}    for (const child of el.children) {
       walk(child, childDepth);
     }
   }
@@ -126,6 +157,8 @@ const SNAPSHOT_JS = `(() => {
     tree: lines.join('\\n'),
   });
 })()`;
+
+const SNAPSHOT_JS = snapshotScript(true);
 
 /** Build the "find element" preamble for an action that accepts EITHER ref OR
  *  selector. Sets `el` in the in-page scope; throws on miss.
@@ -158,7 +191,75 @@ function findElJs(args) {
   );
 }
 
-export function buildBrowserActionScript(action, args = {}) {
+/** Click body run after `findElJs`. A native option is set directly: its popup is
+ *  browser chrome that page events cannot open. Other elements get a press and
+ *  release first, so widgets that open on pointerdown or mousedown respond. */
+const CLICK_JS = `
+  const select = el instanceof HTMLOptionElement ? el.closest('select') : null;
+  (select || el).scrollIntoView({ block: 'center', inline: 'center' });
+  if (select) {
+    if (el.matches(':disabled') || select.matches(':disabled')) throw new Error('Element is disabled');
+    select.focus({ preventScroll: true });
+    const selected = select.multiple ? !el.selected : true;
+    if (el.selected !== selected) {
+      el.selected = selected;
+      select.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    return 'ok';
+  }
+  if (el.matches(':disabled') || el.closest('button, select, textarea')?.matches(':disabled')) {
+    throw new Error('Element is disabled');
+  }
+  const rect = el.getBoundingClientRect();
+  const mouse = {
+    bubbles: true, cancelable: true, composed: true, view: window, button: 0, detail: 1,
+    clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2,
+  };
+  const pointer = { ...mouse, detail: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+  const ancestors = [];
+  for (let node = el; node; node = node.parentElement ?? node.parentNode?.host) ancestors.push(node);
+  const pressed = el.dispatchEvent(new PointerEvent('pointerdown', { ...pointer, buttons: 1 }));
+  const pressTarget = ancestors.find((node) => node.isConnected) ?? document.documentElement;
+  if (pressed && pressTarget.dispatchEvent(new MouseEvent('mousedown', { ...mouse, buttons: 1 }))) {
+    const focusable = pressTarget.closest(
+      'a[href], button, input, select, textarea, summary, iframe, [tabindex], ' +
+      '[contenteditable]:not([contenteditable="false"])');
+    if (focusable) focusable.focus({ preventScroll: true });
+    else document.activeElement?.blur();
+  }
+  // Let the page commit the press, e.g. render a menu, before the release. A message task is
+  // not throttled in a hidden view; the timer covers a broken channel. A press that navigates
+  // ends the click, since a promise pending across page teardown never settles executeJavaScript.
+  const left = await new Promise((resolve) => {
+    const channel = new MessageChannel();
+    const done = (navigated) => {
+      clearTimeout(timer);
+      channel.port1.close();
+      window.removeEventListener('pagehide', leave);
+      resolve(navigated);
+    };
+    const leave = () => done(true);
+    const timer = setTimeout(done, 1000, false);
+    window.addEventListener('pagehide', leave);
+    channel.port1.onmessage = () => done(false);
+    channel.port2.postMessage(null);
+  });
+  if (left) return 'ok';
+  // Like a browser, release on what is now under the pointer and skip the click if the press removed el.
+  if (!el.isConnected) {
+    const release = document.elementFromPoint(mouse.clientX, mouse.clientY) ?? document.documentElement;
+    release.dispatchEvent(new PointerEvent('pointerup', pointer));
+    if (pressed) release.dispatchEvent(new MouseEvent('mouseup', mouse));
+    return 'ok';
+  }
+  el.dispatchEvent(new PointerEvent('pointerup', pointer));
+  if (pressed) el.dispatchEvent(new MouseEvent('mouseup', mouse));
+  if (el.click) el.click(); else el.dispatchEvent(new MouseEvent('click', mouse));
+  return 'ok';
+`;
+
+function validateBrowserAction(action, args) {
   if (!args || typeof args !== "object" || Array.isArray(args)) {
     throw new Error("Browser action arguments must be an object");
   }
@@ -170,7 +271,7 @@ export function buildBrowserActionScript(action, args = {}) {
   if (Object.keys(args).some((key) => !allowed.includes(key))) {
     throw new Error("Unsupported browser action argument");
   }
-  if (action === "snapshot") return SNAPSHOT_JS;
+  if (action === "snapshot") return;
   if (args.ref !== undefined && (!Number.isSafeInteger(args.ref) || args.ref <= 0)) {
     throw new Error("ref must be a positive integer");
   }
@@ -192,13 +293,9 @@ export function buildBrowserActionScript(action, args = {}) {
   if (action === "type" && (typeof args.text !== "string" || args.text.length > 100000)) {
     throw new Error("text must be a string of at most 100000 characters");
   }
-  if (action === "click") {
-    return (
-      `(() => { ${findElJs(args)} ` +
-      `el.scrollIntoView({ block: 'center', inline: 'center' }); ` +
-      `el.click(); return 'ok'; })()`
-    );
-  }
+}
+
+function typeScript(args) {
   const text = args.text;
   return (
     `(() => { ${findElJs(args)} ` +
@@ -209,4 +306,26 @@ export function buildBrowserActionScript(action, args = {}) {
     `el.dispatchEvent(new Event('change', { bubbles: true })); ` +
     `return 'ok'; })()`
   );
+}
+
+export function buildBrowserActionScript(action, args = {}) {
+  validateBrowserAction(action, args);
+  if (action === "snapshot") return SNAPSHOT_JS;
+  if (action === "click") return `(async () => { ${findElJs(args)}${CLICK_JS}})()`;
+  return typeScript(args);
+}
+
+/** The fixed v0.18 action templates exchanged with pre-typed desktops and UIs.
+ *  @deprecated Remove in v0.21 with the desktop/UI transition adapters. */
+export function buildLegacyBrowserActionScript(action, args = {}) {
+  validateBrowserAction(action, args);
+  if (action === "snapshot") return snapshotScript(false);
+  if (action === "click") {
+    return (
+      `(() => { ${findElJs(args)} ` +
+      `el.scrollIntoView({ block: 'center', inline: 'center' }); ` +
+      `el.click(); return 'ok'; })()`
+    );
+  }
+  return typeScript(args);
 }

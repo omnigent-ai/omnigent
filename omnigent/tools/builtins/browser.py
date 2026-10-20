@@ -150,7 +150,8 @@ class BrowserClickTool(Tool):
             "error instead of a generic stale-ref message. CSS "
             "`selector` is accepted as a fallback when you already know "
             "a stable selector. Exactly one of `ref` or `selector` "
-            "must be provided."
+            "must be provided. Clicking an `option` ref listed under a "
+            "native select chooses it; in a multi-select it toggles."
         )
 
     def get_schema(self) -> dict[str, Any]:

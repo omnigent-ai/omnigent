@@ -17,7 +17,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
-const { buildBrowserActionScript } = require("../src/browserActionScript.mjs");
+const { buildLegacyBrowserActionScript } = require("../src/browserActionScript.mjs");
 
 const {
   desktopDepsAvailable,
@@ -164,7 +164,7 @@ describe(
                   )
                 : window.evaluate(
                     ({ cid, script }) => window.omnigentDesktop.browserExecute(cid, script),
-                    { cid: conversationId, script: buildBrowserActionScript(action, params) },
+                    { cid: conversationId, script: buildLegacyBrowserActionScript(action, params) },
                   );
             const snapshot = await perform("snapshot");
             assert.equal(snapshot.ok, true, snapshot.error);

@@ -9,7 +9,7 @@
  *  desktop build that predates the `browser*` bridge is treated as unsupported,
  *  so the relay never claims an action it couldn't fulfill. */
 import { useEffect } from "react";
-import { buildBrowserActionScript } from "../../electron/src/browserActionScript.mjs";
+import { buildLegacyBrowserActionScript } from "../../electron/src/browserActionScript.mjs";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import { supportsBrowser } from "@/lib/nativeBridge";
@@ -92,7 +92,7 @@ async function performAction(
   }
   // Pre-typed desktops retain their existing executor until the v0.21 transition.
   if (desktop.browserExecute) {
-    return desktop.browserExecute(conversationId, buildBrowserActionScript(action, args));
+    return desktop.browserExecute(conversationId, buildLegacyBrowserActionScript(action, args));
   }
   return { ok: false, error: "this desktop shell does not support the browser pane" };
 }
