@@ -636,6 +636,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # runner on the default launch. Safe to propagate: not a secret, just a
         # plugin name.
         "OMNIGENT_CLAUDE_LAUNCHER",
+        # claude-sdk executor reads this and forwards it as CLAUDE_CODE_ENTRYPOINT;
+        # the daemon→runner strip would otherwise drop it. Not a secret.
+        "OMNIGENT_CLAUDE_CODE_ENTRYPOINT",
         # Testing knob: override the context window size for compaction
         # trigger threshold. Not a secret — a plain integer.
         "AP_CONTEXT_WINDOW_OVERRIDE",

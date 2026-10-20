@@ -1799,6 +1799,12 @@ class ClaudeSDKExecutor(Executor):
         if entrypoint := os.environ.get("OMNIGENT_CLAUDE_CODE_ENTRYPOINT"):
             self._extra_env["CLAUDE_CODE_ENTRYPOINT"] = entrypoint
 
+        # Bedrock mode: the gateway endpoint lives only in the user settings
+        # file, which the hermetic skills_filter="none" title spawns don't load
+        # (setting_sources=[]). Carry it via _extra_env so it reaches the CLI.
+        if bedrock_base_url := os.environ.get("ANTHROPIC_BEDROCK_BASE_URL"):
+            self._extra_env.setdefault("ANTHROPIC_BEDROCK_BASE_URL", bedrock_base_url)
+
         # Retry policy → Anthropic SDK env vars passed to the Claude
         # CLI subprocess. ``ANTHROPIC_MAX_RETRIES`` and
         # ``ANTHROPIC_REQUEST_TIMEOUT_SECONDS`` are speculative — the
