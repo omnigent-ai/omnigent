@@ -7,6 +7,7 @@
 
 import { describe, expect, it } from "vitest";
 import type { AnyBlock, BlockContext, MessageContentBlock, ToolExecution } from "./blocks";
+import { LIVE_ITEM_PREFIX } from "./blocks";
 import { BlockStream } from "./blockStream";
 import type { ConversationItem } from "./conversationItems";
 import type { StreamEvent } from "./events";
@@ -24,6 +25,8 @@ import {
   createBubbleCache,
   lastRenderableAssistantIndex,
   liveCandidateAssistantIndex,
+  opensWithEarlyReplyPreviews,
+  sessionOpensWithEarlyReplyPreviews,
 } from "./renderItems";
 import type { ActiveResponse } from "@/store/types";
 
@@ -4272,5 +4275,88 @@ describe("buildBubbles — lastActivityAtS", () => {
     );
     const asst = bubbles[0] as Extract<Bubble, { kind: "assistant" }>;
     expect(asst.lastActivityAtS).toBeUndefined();
+  });
+});
+
+describe("opensWithEarlyReplyPreviews", () => {
+  const preview = (messageId: string): AnyBlock => ({
+    type: "text_done",
+    ctx: ctx({
+      itemId: `${LIVE_ITEM_PREFIX}${messageId}`,
+      responseId: `${LIVE_ITEM_PREFIX}${messageId}`,
+    }),
+    fullText: "Start",
+    hasCodeBlocks: false,
+  });
+  const chip = (scope: "session" | "native_subagent"): AnyBlock =>
+    routingDecisionBlock(ctx({ itemId: `rd_${scope}`, responseId: `routing_${scope}` }), {
+      routing: { scope },
+    });
+  const greeting: AnyBlock = {
+    type: "text_done",
+    ctx: ctx({ itemId: "a0", responseId: "resp_0" }),
+    fullText: "Hi!",
+    hasCodeBlocks: false,
+  };
+  const prompt: AnyBlock = {
+    type: "user_message",
+    ctx: ctx({ itemId: "u0", responseId: "u0" }),
+    content: [{ type: "input_text", text: "hi" }],
+  };
+  const command: AnyBlock = {
+    type: "slash_command",
+    ctx: ctx({ itemId: "sc_0", responseId: "resp_sc" }),
+    kind: "command",
+    name: "effort",
+    arguments: "high",
+    output: null,
+  };
+  const shellInput: AnyBlock = {
+    type: "terminal_command",
+    ctx: ctx({ itemId: "sh_0", responseId: "sh_0" }),
+    kind: "input",
+    input: "ls",
+    stdout: null,
+    stderr: null,
+  };
+
+  it.each([
+    { timeline: "reply previews only", blocks: [preview("m1"), preview("m2")], opens: true },
+    {
+      timeline: "a create-time routing chip, then a preview",
+      blocks: [chip("session"), preview("m1")],
+      opens: true,
+    },
+    { timeline: "no preview", blocks: [chip("session")], opens: false },
+    {
+      timeline: "an agent greeting, then a preview",
+      blocks: [greeting, preview("m1")],
+      opens: false,
+    },
+    { timeline: "a prompt, then a preview", blocks: [prompt, preview("m1")], opens: false },
+    {
+      timeline: "a slash command, then a preview",
+      blocks: [command, preview("m1")],
+      opens: false,
+    },
+    {
+      timeline: "a shell input, then a preview",
+      blocks: [shellInput, preview("m1")],
+      opens: false,
+    },
+    {
+      timeline: "a sub-agent routing chip, then a preview",
+      blocks: [chip("native_subagent"), preview("m1")],
+      opens: false,
+    },
+  ])("is $opens for $timeline", ({ blocks, opens }) => {
+    expect(opensWithEarlyReplyPreviews(buildBubbles(blocks, null), false)).toBe(opens);
+    expect(sessionOpensWithEarlyReplyPreviews(blocks, null, false)).toBe(opens);
+  });
+
+  it("is false while older history is unloaded", () => {
+    // A paged window may hide the prompt those previews answer.
+    expect(opensWithEarlyReplyPreviews(buildBubbles([preview("m1")], null), true)).toBe(false);
+    expect(sessionOpensWithEarlyReplyPreviews([preview("m1")], null, true)).toBe(false);
   });
 });

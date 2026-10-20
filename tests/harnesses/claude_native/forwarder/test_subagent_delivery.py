@@ -29,46 +29,52 @@ from tests.harnesses.claude_native.forwarder._support import (
 )
 
 
+@pytest.mark.parametrize(
+    "reply_flushed_above_prompt", [False, True], ids=["file_order", "reply_flushed_above_prompt"]
+)
 async def test_subagent_watcher_forwards_transcript_items_to_child_session(
-    tmp_path: Path,
+    tmp_path: Path, reply_flushed_above_prompt: bool
 ) -> None:
     """
     After registering a sub-agent, the forwarder tails its
     ``.jsonl`` and POSTs an array of ``external_conversation_item`` events to
-    the Omnigent child session id (not the parent's).
+    the Omnigent child session id (not the parent's), prompt first.
     """
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
     transcript_path.write_text("", encoding="utf-8")
+    # Real sub-agent transcripts carry ``isSidechain: true`` on every record
+    # (that's how Claude marks them as belonging to a child instead of the
+    # main thread). The parser's default behavior strips sidechain records,
+    # so without this flag the watcher silently posts zero items — pin the
+    # real shape here so a regression to that behavior fails this test.
+    transcript_records: list[dict[str, Any]] = [
+        {
+            "isSidechain": True,
+            "type": "user",
+            "uuid": "sa-user-1",
+            "message": {"role": "user", "content": "go"},
+        },
+        {
+            "isSidechain": True,
+            "type": "assistant",
+            "uuid": "sa-assistant-1",
+            "parentUuid": "sa-user-1",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "looking now"}],
+            },
+        },
+    ]
+    if reply_flushed_above_prompt:
+        transcript_records.reverse()
     _seed_subagent_on_disk(
         transcript_path=transcript_path,
         subagent_id="b6d8fff",
         agent_type="Explore",
         description="Trace data flow",
         tool_use_id="toolu_abc",
-        # Real sub-agent transcripts carry ``isSidechain: true`` on
-        # every record (that's how Claude marks them as belonging to
-        # a child instead of the main thread). The parser's default
-        # behavior strips sidechain records, so without this flag
-        # the watcher silently posts zero items — pin the real shape
-        # here so a regression to that behavior fails this test.
-        transcript_records=[
-            {
-                "isSidechain": True,
-                "type": "user",
-                "uuid": "sa-user-1",
-                "message": {"role": "user", "content": "go"},
-            },
-            {
-                "isSidechain": True,
-                "type": "assistant",
-                "uuid": "sa-assistant-1",
-                "message": {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": "looking now"}],
-                },
-            },
-        ],
+        transcript_records=transcript_records,
     )
     record_hook_event(
         bridge_dir,
@@ -117,6 +123,7 @@ async def test_subagent_watcher_forwards_transcript_items_to_child_session(
         assert batch is not None
         assert len(batch) == 2
         assert all(event["type"] == "external_conversation_item" for event in batch)
+        assert [event["data"]["item_data"]["role"] for event in batch] == ["user", "assistant"]
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):

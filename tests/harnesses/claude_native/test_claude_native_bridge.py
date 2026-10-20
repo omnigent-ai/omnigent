@@ -1968,6 +1968,83 @@ def test_read_transcript_items_from_offset_preserves_partial_trailing_line(
     ]
 
 
+@pytest.mark.parametrize("line_cursor_reader", [False, True], ids=["byte_offset", "line_cursor"])
+def test_read_transcript_items_parses_prompt_before_reply_flushed_above_it(
+    tmp_path: Path, line_cursor_reader: bool
+) -> None:
+    """A reply written above the prompt it descends from still follows it."""
+    # Record layout Claude Code 2.1 flushed on a session's first turn.
+    entries: list[dict[str, Any]] = [
+        {"type": "mode", "mode": "default"},
+        {
+            "type": "assistant",
+            "uuid": "reply",
+            "parentUuid": "prompt-snapshot",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "Answer"}]},
+        },
+        {"type": "attachment", "uuid": "reply-snapshot", "parentUuid": "reply", "attachment": {}},
+        {"type": "attachment", "uuid": "hook", "parentUuid": None, "attachment": {}},
+        {"type": "file-history-snapshot", "messageId": "snapshot"},
+        {
+            "type": "user",
+            "uuid": "prompt",
+            "parentUuid": "hook",
+            "message": {"role": "user", "content": "Question"},
+        },
+        {
+            "type": "attachment",
+            "uuid": "prompt-snapshot",
+            "parentUuid": "prompt",
+            "attachment": {},
+        },
+    ]
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("".join(_transcript_line(entry) for entry in entries))
+
+    result = (
+        claude_native_bridge.read_transcript_items_since_with_position(
+            transcript_path, 0, agent_name="claude-native-ui"
+        )
+        if line_cursor_reader
+        else read_transcript_items_from_offset(
+            transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+        )
+    )
+
+    assert [item.data["role"] for item in result.items] == ["user", "assistant"]
+    assert result.byte_offset == transcript_path.stat().st_size
+    assert [item for record in result.record_items for item in record.items] == result.items
+    checkpoints = [record.next_byte_offset for record in result.record_items]
+    assert checkpoints == sorted(checkpoints)
+    assert checkpoints[-1] == result.byte_offset
+    prompt_checkpoint = next(
+        record.next_byte_offset
+        for record in result.record_items
+        if any(item.data["role"] == "user" for item in record.items)
+    )
+    assert prompt_checkpoint == len(_transcript_line(entries[0]).encode())
+
+
+@pytest.mark.parametrize(
+    ("links", "expected"),
+    [
+        # A child of a waiting record waits too; undecodable records keep their slot.
+        ([("a", "c"), ("b", "a"), None, ("c", None), ("d", "d")], [2, 3, 0, 1, 4]),
+        ([("x", "y"), ("y", "x"), ("z", None)], [2, 0, 1]),
+        # A repeated parent uuid already emitted earlier does not delay its child.
+        ([("p", None), ("c", "p"), ("p", None)], [0, 1, 2]),
+    ],
+    ids=["chained_wait", "parent_cycle", "repeated_parent_uuid"],
+)
+def test_parent_first_order_emits_each_record_once_after_its_batch_parent(
+    links: list[tuple[str, str | None] | None], expected: list[int]
+) -> None:
+    entries = [
+        None if link is None else {"uuid": link[0], "parentUuid": link[1]} for link in links
+    ]
+    assert claude_native_bridge._parent_first_order(entries) == expected
+
+
 def _transcript_line(entry: dict[str, Any]) -> str:
     """
     Serialize one transcript entry as a JSONL line.

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import type { RoutingScope } from "@/lib/routingDecision";
-import type { ToolExecution } from "@/lib/blocks";
+import { LIVE_ITEM_PREFIX, type ToolExecution } from "@/lib/blocks";
 import type { ServerInfo } from "@/lib/capabilities";
 import type { Session } from "@/lib/types";
 import {
@@ -556,6 +556,14 @@ const routingChipBubble = (id: string, scope: RoutingScope): Bubble => ({
   rationale: "trivial task -> cheapest arm",
   routing: { scope },
 });
+const livePreviewBubble = (messageId: string): Bubble => ({
+  kind: "assistant",
+  responseId: `${LIVE_ITEM_PREFIX}${messageId}`,
+  stableId: `${LIVE_ITEM_PREFIX}${messageId}`,
+  lifecycle: "completed",
+  error: null,
+  items: [{ kind: "text", itemId: `${LIVE_ITEM_PREFIX}${messageId}`, text: "Start", final: false }],
+});
 const bubbleIds = (bubbles: Bubble[]): string[] =>
   bubbles.map((b) => (b.kind === "assistant" ? b.stableId : b.itemId));
 
@@ -635,6 +643,35 @@ describe("mergePendingBubbles", () => {
     const committed = [routingChipBubble("rd_spawn", "native_subagent")];
     const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
     expect(bubbleIds(merged)).toEqual(["rd_spawn", "pend_1"]);
+  });
+
+  it("lifts the oldest send above a reply preview that streamed before any prompt", () => {
+    const preview = livePreviewBubble("m1");
+    const merged = mergePendingBubbles(
+      [routingChipBubble("rd_create", "session"), preview],
+      [userBubble("pend_1"), userBubble("pend_2")],
+    );
+    expect(bubbleIds(merged)).toEqual(["pend_1", "rd_create", "live:m1", "pend_2"]);
+  });
+
+  it("follows the caller's session-wide decision over the visible bubbles", () => {
+    // A side chat hides inherited turns, so its visible bubbles alone can look like an opening.
+    const merged = mergePendingBubbles([livePreviewBubble("m1")], [userBubble("pend_1")], false);
+    expect(bubbleIds(merged)).toEqual(["live:m1", "pend_1"]);
+  });
+
+  it("does NOT lift a send above a preview once a prompt is on the timeline", () => {
+    // A follow-up preview may answer a message the agent already read, so
+    // it keeps arrival order; the forwarder posts the prompt first.
+    const committed = [userBubble("u1"), assistantText("a1"), livePreviewBubble("m2")];
+    const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["u1", "a1", "live:m2", "pend_1"]);
+  });
+
+  it("does NOT lift a send above a preview that continues committed assistant text", () => {
+    const committed = [assistantText("a0"), livePreviewBubble("m1")];
+    const merged = mergePendingBubbles(committed, [userBubble("pend_1")]);
+    expect(bubbleIds(merged)).toEqual(["a0", "live:m1", "pend_1"]);
   });
 
   it("does NOT reorder for a tool_call-phase elicitation (message already committed)", () => {

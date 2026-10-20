@@ -7,7 +7,8 @@ import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as sessionsApi from "@/lib/sessionsApi";
 import type * as ChatStoreModule from "@/store/chatStore";
-import { useChatStore, type ChatState } from "@/store/chatStore";
+import type { AnyBlock } from "@/lib/blocks";
+import { handleSessionEvent, useChatStore, type ChatState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { SideChatPane } from "./SideChatPane";
@@ -847,5 +848,76 @@ describe("side-chat slash commands", () => {
     );
     typeSlash("/");
     expect(screen.queryByTestId("slash-menu-item-review")).toBeNull();
+  });
+});
+
+describe("side-chat first send against an early reply preview", () => {
+  const blockContext = (itemId: string) => ({
+    agent: null,
+    depth: 0,
+    turn: 0,
+    timestamp: 0,
+    responseId: itemId,
+    itemId,
+  });
+  const parentTurn: AnyBlock[] = [
+    {
+      type: "user_message",
+      ctx: blockContext("u0"),
+      content: [{ type: "input_text", text: "parent question" }],
+    },
+    {
+      type: "text_done",
+      ctx: blockContext("a0"),
+      fullText: "Parent answer.",
+      hasCodeBlocks: false,
+    },
+  ];
+  const earlyPreview: AnyBlock = {
+    type: "text_done",
+    ctx: blockContext("live:m1"),
+    fullText: "Early reply.",
+    hasCodeBlocks: false,
+  };
+  const shownOrder = () => {
+    const prompt = screen.getByText("child question");
+    const reply = screen.getByText("Early reply.");
+    const replyFollows = prompt.compareDocumentPosition(reply) & Node.DOCUMENT_POSITION_FOLLOWING;
+    return replyFollows ? ["prompt", "reply"] : ["reply", "prompt"];
+  };
+
+  // Hidden inherited prompts still count: the store's ack sees them, so both phases agree.
+  it.each([
+    { parent: "a parent turn", inherited: parentTurn, order: ["reply", "prompt"] },
+    { parent: "an empty parent", inherited: [], order: ["prompt", "reply"] },
+  ])("keeps the send in place through its ack after $parent", ({ inherited, order }) => {
+    const inheritedIds = inherited.map((block) => block.ctx.itemId);
+    localStorage.setItem(`omnigent.sideChatInherited:${childId}`, JSON.stringify(inheritedIds));
+    const content = [{ type: "input_text" as const, text: "child question" }];
+    conversationRegistry.acquire(childId).setState({
+      sessionHarness: "claude-native",
+      blocks: [...inherited, earlyPreview],
+      pendingUserMessages: [
+        { tempId: "pend_child", pendingId: "pending_child", posted: true, content },
+      ],
+    });
+    renderPane(<SideChatPane childId={childId} />);
+    expect(screen.queryByText("parent question")).toBeNull();
+    expect(shownOrder()).toEqual(order);
+
+    act(() =>
+      handleSessionEvent(
+        {
+          type: "session_input_consumed",
+          itemId: "u1",
+          itemType: "message",
+          clearedPendingId: "pending_child",
+          data: { role: "user", content },
+        },
+        childId,
+      ),
+    );
+    expect(conversationRegistry.acquire(childId).getState().pendingUserMessages).toEqual([]);
+    expect(shownOrder()).toEqual(order);
   });
 });

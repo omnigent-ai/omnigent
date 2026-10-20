@@ -931,8 +931,9 @@ class TranscriptReadResult:
         scanned. Claude's own auto-generated ``aiTitle`` is deliberately
         not surfaced here; Omnigent titles unnamed sessions itself.
     :param record_items: Parsed items grouped by their complete source JSONL
-        record, with the byte offset immediately after each record. Native
-        child-transcript batching uses these boundaries for partial checkpoints.
+        record, in the same order as ``items``, with the byte offset through
+        which every record is parsed. Native child-transcript batching uses
+        these boundaries for partial checkpoints.
     """
 
     line_cursor: int
@@ -3282,6 +3283,101 @@ def read_transcript_items_since(
     return result.line_cursor, result.current_response_id, result.items
 
 
+def _decoded_transcript_record(record: _JsonlRecord) -> _JsonObject | None:
+    """
+    Decode one complete transcript record.
+
+    :param record: Complete JSONL record from the transcript reader.
+    :returns: The record's JSON object, or ``None`` when it is not
+        valid UTF-8, not valid JSON, or not an object.
+    """
+    if record.text is None:
+        return None
+    try:
+        entry = json.loads(record.text)
+    except json.JSONDecodeError:
+        return None
+    return entry if isinstance(entry, dict) else None
+
+
+def _parent_first_order(entries: Sequence[_JsonObject | None]) -> list[int]:
+    """
+    Order one read batch so no record precedes its ``parentUuid`` record.
+
+    Claude can flush a turn's first reply above the prompt it answers.
+    Records keep file order unless they wait for a parent in the batch.
+
+    :param entries: Decoded records in file order; ``None`` for
+        records that could not be decoded.
+    :returns: Every index of ``entries`` exactly once.
+    """
+    positions: dict[str, int] = {}
+    for index, entry in enumerate(entries):
+        if entry is not None and isinstance(record_uuid := entry.get("uuid"), str):
+            positions.setdefault(record_uuid, index)
+    order: list[int] = []
+    emitted: set[int] = set()
+    waiting: dict[int, list[int]] = {}
+    for index, entry in enumerate(entries):
+        parent_uuid = entry.get("parentUuid") if entry is not None else None
+        parent_index = positions.get(parent_uuid) if isinstance(parent_uuid, str) else None
+        if parent_index is not None and parent_index != index and parent_index not in emitted:
+            waiting.setdefault(parent_index, []).append(index)
+            continue
+        ready = [index]
+        while ready:
+            current = ready.pop()
+            order.append(current)
+            emitted.add(current)
+            ready.extend(reversed(waiting.pop(current, [])))
+    # A parent cycle never emits; keep those records in file order.
+    order.extend(index for index in range(len(entries)) if index not in emitted)
+    return order
+
+
+def _record_items_in_parse_order(
+    records: Sequence[_JsonlRecord],
+    parse_order: Sequence[int],
+    parsed_by_record: Sequence[tuple[ClaudeTranscriptItem, ...]],
+    *,
+    retained_source_ids: set[str],
+) -> list[TranscriptRecordItems]:
+    """
+    Group retained items by source record, in parse order.
+
+    A record parsed ahead of an earlier one checkpoints only through the
+    file prefix parsed so far, so resuming from it never skips a record.
+
+    :param records: Complete records in file order.
+    :param parse_order: Record indexes from :func:`_parent_first_order`.
+    :param parsed_by_record: Items parsed from each record, by file index.
+    :param retained_source_ids: Source ids kept after deduplication.
+    :returns: One entry per record, in parse order.
+    """
+    parsed: set[int] = set()
+    parsed_prefix = 0
+    grouped: list[TranscriptRecordItems] = []
+    for index in parse_order:
+        parsed.add(index)
+        while parsed_prefix in parsed:
+            parsed_prefix += 1
+        grouped.append(
+            TranscriptRecordItems(
+                next_byte_offset=(
+                    records[parsed_prefix - 1].next_byte_offset
+                    if parsed_prefix
+                    else records[0].byte_offset
+                ),
+                items=tuple(
+                    item
+                    for item in parsed_by_record[index]
+                    if item.source_id in retained_source_ids
+                ),
+            )
+        )
+    return grouped
+
+
 def read_transcript_items_since_with_position(
     transcript_path: Path,
     start_line: int,
@@ -3323,26 +3419,14 @@ def read_transcript_items_since_with_position(
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     latest_custom_title: str | None = None
-    record_items: list[TranscriptRecordItems] = []
-    for record in read_result.records:
-        parsed: list[ClaudeTranscriptItem] = []
-        if record.text is None:
-            record_items.append(
-                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
-            )
+    entries = [_decoded_transcript_record(record) for record in read_result.records]
+    parsed_by_record: list[tuple[ClaudeTranscriptItem, ...]] = [()] * len(entries)
+    parse_order = _parent_first_order(entries)
+    for index in parse_order:
+        entry = entries[index]
+        if entry is None:
             continue
-        try:
-            entry = json.loads(record.text)
-        except json.JSONDecodeError:
-            record_items.append(
-                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
-            )
-            continue
-        if not isinstance(entry, dict):
-            record_items.append(
-                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
-            )
-            continue
+        record = read_result.records[index]
         active_response_id, parsed = _transcript_items_from_entry(
             entry,
             line_number=record.line_number,
@@ -3366,21 +3450,14 @@ def read_transcript_items_since_with_position(
         custom_title = _custom_title_from_transcript_entry(entry)
         if custom_title is not None:
             latest_custom_title = custom_title
-        record_items.append(
-            TranscriptRecordItems(
-                next_byte_offset=record.next_byte_offset,
-                items=tuple(parsed),
-            )
-        )
+        parsed_by_record[index] = tuple(parsed)
     items = _dedupe_compact_noop_echo(items)
-    retained_source_ids = {item.source_id for item in items}
-    record_items = [
-        TranscriptRecordItems(
-            next_byte_offset=record.next_byte_offset,
-            items=tuple(item for item in record.items if item.source_id in retained_source_ids),
-        )
-        for record in record_items
-    ]
+    record_items = _record_items_in_parse_order(
+        read_result.records,
+        parse_order,
+        parsed_by_record,
+        retained_source_ids={item.source_id for item in items},
+    )
     return TranscriptReadResult(
         line_cursor=read_result.line_cursor,
         byte_offset=read_result.byte_offset,
@@ -3446,26 +3523,14 @@ def read_transcript_items_from_offset(
     latest_usage: dict[str, int] | None = None
     latest_model: str | None = None
     latest_custom_title: str | None = None
-    record_items: list[TranscriptRecordItems] = []
-    for record in read_result.records:
-        parsed: list[ClaudeTranscriptItem] = []
-        if record.text is None:
-            record_items.append(
-                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
-            )
+    entries = [_decoded_transcript_record(record) for record in read_result.records]
+    parsed_by_record: list[tuple[ClaudeTranscriptItem, ...]] = [()] * len(entries)
+    parse_order = _parent_first_order(entries)
+    for index in parse_order:
+        entry = entries[index]
+        if entry is None:
             continue
-        try:
-            entry = json.loads(record.text)
-        except json.JSONDecodeError:
-            record_items.append(
-                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
-            )
-            continue
-        if not isinstance(entry, dict):
-            record_items.append(
-                TranscriptRecordItems(next_byte_offset=record.next_byte_offset, items=())
-            )
-            continue
+        record = read_result.records[index]
         previous_response_id = active_response_id
         active_response_id, parsed = _transcript_items_from_entry(
             entry,
@@ -3493,21 +3558,14 @@ def read_transcript_items_from_offset(
         custom_title = _custom_title_from_transcript_entry(entry)
         if custom_title is not None:
             latest_custom_title = custom_title
-        record_items.append(
-            TranscriptRecordItems(
-                next_byte_offset=record.next_byte_offset,
-                items=tuple(parsed),
-            )
-        )
+        parsed_by_record[index] = tuple(parsed)
     items = _dedupe_compact_noop_echo(items)
-    retained_source_ids = {item.source_id for item in items}
-    record_items = [
-        TranscriptRecordItems(
-            next_byte_offset=record.next_byte_offset,
-            items=tuple(item for item in record.items if item.source_id in retained_source_ids),
-        )
-        for record in record_items
-    ]
+    record_items = _record_items_in_parse_order(
+        read_result.records,
+        parse_order,
+        parsed_by_record,
+        retained_source_ids={item.source_id for item in items},
+    )
     return TranscriptReadResult(
         line_cursor=read_result.line_cursor,
         byte_offset=read_result.byte_offset,

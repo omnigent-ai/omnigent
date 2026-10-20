@@ -10,6 +10,7 @@ import {
   buildBubbles,
   createBubbleCache,
   liveCandidateAssistantIndex,
+  sessionOpensWithEarlyReplyPreviews,
 } from "@/lib/renderItems";
 import {
   BubbleView,
@@ -159,6 +160,7 @@ export function SideChatPane({
     subagentRoutingOverride,
     sessionStatus,
     sessionHarness,
+    hasMoreHistory,
     boundAgentId,
     loadingConversation,
     conversationLoadError,
@@ -220,6 +222,7 @@ export function SideChatPane({
   );
 
   const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
+  const sessionBubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
   const bubbles = useMemo<Bubble[]>(() => {
     const committed = stripGatedSubagentRoutingChips(
       reorderCommittedRequestElicitations(
@@ -237,14 +240,23 @@ export function SideChatPane({
     return mergePendingBubbles(
       committed,
       buildPendingBubbles(pendingUserMessages, getCurrentAuthorId()),
+      // Judge the whole session, inherited turns included, as the store's ack does.
+      sessionOpensWithEarlyReplyPreviews(
+        blocks,
+        activeResponse,
+        hasMoreHistory,
+        sessionBubbleCacheRef.current,
+      ),
     );
   }, [
+    blocks,
     visibleBlocks,
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
     subagentRoutingOverride,
     sessionStatus,
+    hasMoreHistory,
   ]);
 
   const lastAssistantIndex = liveCandidateAssistantIndex(bubbles);

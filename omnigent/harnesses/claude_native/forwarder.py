@@ -29,6 +29,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeMessageDelta,
     ClaudeTranscriptItem,
     HookReadResult,
+    MessageDeltaReadResult,
     TranscriptReadResult,
     _display_text,
     _transcript_items_from_entry,
@@ -815,6 +816,63 @@ class DeltaForwardState:
     byte_offset: int = 0
 
 
+# Upper bound on holding a new reply's preview for its prompt. Claude can
+# append a fast reply's prompt a few hundred ms after the first chunk.
+_PROMPT_RECORD_WAIT_S = 1.0
+
+
+@dataclass
+class _PromptOrderGate:
+    """
+    Hold a new reply's preview until the prompt that started it is forwarded.
+
+    :param submitted_at: Hook ``recorded_at`` of the newest main-session
+        ``UserPromptSubmit`` whose prompt item has not been forwarded, or
+        ``None`` when no prompt is outstanding.
+    :param noticed_at: Monotonic time that submit was first read.
+    :param forwarded_at: Wall-clock time up to which submits are settled: a
+        prompt item was forwarded, or that submit's wait expired.
+    """
+
+    submitted_at: float | None = None
+    noticed_at: float = 0.0
+    forwarded_at: float = 0.0
+
+    def note_submit(self, recorded_at: float | None) -> None:
+        """Start waiting for a submitted prompt not yet forwarded."""
+        if recorded_at is None or recorded_at <= self.forwarded_at:
+            return
+        if self.submitted_at is not None and recorded_at <= self.submitted_at:
+            return
+        self.submitted_at = recorded_at
+        self.noticed_at = time.monotonic()
+
+    def note_prompt_forwarded(self) -> None:
+        """Release the wait once a prompt item reaches the session."""
+        self.submitted_at = None
+        self.forwarded_at = time.time()
+
+    def holds(
+        self, deltas: Sequence[ClaudeMessageDelta], seen_keys: Mapping[tuple[str, int], None]
+    ) -> bool:
+        """
+        Return whether ``deltas`` start a message that must wait for its prompt.
+
+        :param deltas: Unposted chunks in file order.
+        :param seen_keys: ``(message_id, index)`` keys already posted; a
+            message whose first chunk is among them is already streaming.
+        :returns: ``True`` while a submitted prompt is outstanding, within
+            :data:`_PROMPT_RECORD_WAIT_S`, and ``deltas`` start a new message.
+        """
+        if self.submitted_at is None:
+            return False
+        if time.monotonic() - self.noticed_at >= _PROMPT_RECORD_WAIT_S:
+            self.forwarded_at = max(self.forwarded_at, self.submitted_at)
+            self.submitted_at = None
+            return False
+        return any((delta.message_id, 0) not in seen_keys for delta in deltas)
+
+
 @dataclass
 class _ForwardDedupeState:
     """
@@ -1313,6 +1371,7 @@ async def forward_claude_transcript_to_session(
     # prevents re-reads on the normal path.
     delta_state = _read_delta_forward_state(bridge_dir)
     seen_delta_keys: dict[tuple[str, int], None] = {}
+    prompt_gate = _PromptOrderGate()
     item_retries = _PostRetryTracker()
     status_retries = _PostRetryTracker()
     compaction_retries = _PostRetryTracker()
@@ -1524,23 +1583,18 @@ async def forward_claude_transcript_to_session(
                             session_id=current_session_id,
                             start_at_offset=start_at_offset,
                         )
-                        # Read deltas first for the lowest-latency preview. The
-                        # runtime reconciler handles either delta/item order.
-                        delta_state = await _forward_available_deltas(
-                            client=client,
-                            session_id=current_session_id,
-                            bridge_dir=bridge_dir,
-                            state=delta_state,
-                            seen_keys=seen_delta_keys,
-                            batch_capability=delta_batch_capability,
-                        )
+                        # Snapshot deltas before the transcript read and post them after
+                        # its items, so a prompt precedes its reply's first chunk.
+                        delta_snapshot = await _read_available_deltas(bridge_dir, delta_state)
                         # Mint a pending token for any PreCompact that first
                         # became visible THIS poll, before the transcript items
                         # phase (which consumes the isCompactSummary completion
                         # record) runs — else a PreCompact + summary landing in
                         # the same poll would lose the boundary. Cursor-keyed, so
                         # the main hook phase below does not re-mint.
-                        await _prescan_precompact_edges(bridge_dir, hook_state)
+                        await _prescan_precompact_edges(
+                            bridge_dir, hook_state, prompt_gate=prompt_gate
+                        )
                         state = await _forward_available_items(
                             client=client,
                             session_id=current_session_id,
@@ -1551,7 +1605,19 @@ async def forward_claude_transcript_to_session(
                             compaction_retry_tracker=compaction_retries,
                             skip_user_messages=skip_user_messages,
                             dedupe=dedupe,
+                            prompt_gate=prompt_gate,
                         )
+                        # A held snapshot keeps its cursor and is re-read next poll.
+                        if not prompt_gate.holds(delta_snapshot.deltas, seen_delta_keys):
+                            delta_state = await _forward_available_deltas(
+                                client=client,
+                                session_id=current_session_id,
+                                bridge_dir=bridge_dir,
+                                state=delta_state,
+                                seen_keys=seen_delta_keys,
+                                batch_capability=delta_batch_capability,
+                                read_result=delta_snapshot,
+                            )
                         hook_state = await _forward_available_status_events(
                             client=client,
                             session_id=current_session_id,
@@ -4883,6 +4949,7 @@ async def _forward_available_items(
     dedupe: _ForwardDedupeState,
     compaction_retry_tracker: _PostRetryTracker | None = None,
     skip_user_messages: bool = False,
+    prompt_gate: _PromptOrderGate | None = None,
 ) -> TranscriptForwardState:
     """
     Forward currently available transcript items after ``state``.
@@ -4898,6 +4965,8 @@ async def _forward_available_items(
         compaction snapshot reads; ``retry_tracker`` when omitted.
     :param dedupe: Last usage / context-window / model values POSTed;
         mutated in place to suppress duplicate ``external_*`` events.
+    :param prompt_gate: Released when a user input item is forwarded or
+        skipped.
     :returns: The updated transcript cursor state. On post failure it
         is the last durable cursor so retries don't re-post successful
         items.
@@ -5048,9 +5117,12 @@ async def _forward_available_items(
             refused = _read_compaction_state(bridge_dir).pending
             if refused is not None:
                 dedupe.pending_compaction_dismiss_seq = refused.seq
-        if skip_user_messages and item.item_type == "message" and item.data.get("role") == "user":
+        is_user_message = item.item_type == "message" and item.data.get("role") == "user"
+        if skip_user_messages and is_user_message:
             seen_source_ids.append(item.source_id)
             seen.add(item.source_id)
+            if prompt_gate is not None:
+                prompt_gate.note_prompt_forwarded()
             continue
         retry_key = f"item:{item.source_id}"
         if retry_tracker.retry_delay_s(retry_key) is not None:
@@ -5145,6 +5217,10 @@ async def _forward_available_items(
             )
             return updated
         retry_tracker.clear(retry_key)
+        if prompt_gate is not None and (
+            is_user_message or item.item_type in ("slash_command", "terminal_command")
+        ):
+            prompt_gate.note_prompt_forwarded()
         await _maybe_sync_effort_from_slash_command(client, session_id=session_id, item=item)
         seen.add(item.source_id)
         seen_source_ids.append(item.source_id)
@@ -5305,6 +5381,8 @@ def _read_hook_events_for_state(
 async def _prescan_precompact_edges(
     bridge_dir: Path,
     hook_state: HookForwardState | None,
+    *,
+    prompt_gate: _PromptOrderGate | None = None,
 ) -> None:
     """
     Mint pending tokens for newly-visible ``PreCompact`` edges before items.
@@ -5316,9 +5394,10 @@ async def _prescan_precompact_edges(
     boundary: the summary is consumed with no token yet minted. This scan
     reads the same hook records WITHOUT advancing the hook cursor and notes
     each ``PreCompact`` via :func:`_note_precompact`, keyed by ``event_cursor``
-    so the main hook phase does not re-mint. Only ``PreCompact`` edges are
-    touched — message/status/task semantics are untouched and stay owned by
-    :func:`_forward_available_status_events`.
+    so the main hook phase does not re-mint. It also notes main-session
+    ``UserPromptSubmit`` records on the in-memory ``prompt_gate``. Only
+    ``PreCompact`` edges touch durable state — message/status/task semantics
+    stay owned by :func:`_forward_available_status_events`.
 
     Cost note: this deliberately re-reads the same unforwarded hook records
     that :func:`_forward_available_status_events` reads later in the poll —
@@ -5333,12 +5412,23 @@ async def _prescan_precompact_edges(
     :param bridge_dir: Native Claude bridge directory.
     :param hook_state: Current hook cursor, or ``None`` before it is seeded
         (nothing to prescan yet).
+    :param prompt_gate: Gate that holds a reply's preview until its prompt
+        item is forwarded.
     :returns: None.
     """
     if hook_state is None:
         return
     result = await asyncio.to_thread(_read_hook_events_for_state, bridge_dir, hook_state)
+    parent_claude_session_ids: Collection[str] | None = None
     for record in result.records:
+        if record.event_name == "UserPromptSubmit" and prompt_gate is not None:
+            if parent_claude_session_ids is None:
+                parent_claude_session_ids = read_seen_claude_session_ids(bridge_dir)
+            if not _is_subagent_hook_record(
+                record, parent_claude_session_ids=parent_claude_session_ids
+            ):
+                prompt_gate.note_submit(record.recorded_at)
+            continue
         if record.event_name != "PreCompact":
             continue
         await _note_precompact(
@@ -5745,6 +5835,23 @@ async def _post_delta_batch(
         batch_capability.supported = True
 
 
+async def _read_available_deltas(
+    bridge_dir: Path, state: DeltaForwardState
+) -> MessageDeltaReadResult:
+    """
+    Read complete assistant-text delta records appended after the cursor.
+
+    :param bridge_dir: Native Claude bridge directory.
+    :param state: Current delta cursor state.
+    :returns: The new records and the byte offset after them; empty, at
+        the current offset, before the deltas file exists.
+    """
+    # Skip the thread hop until the MessageDisplay hook creates the deltas file.
+    if not (bridge_dir / MESSAGE_DELTAS_FILE).exists():
+        return MessageDeltaReadResult(byte_offset=state.byte_offset, deltas=[])
+    return await asyncio.to_thread(read_message_deltas_from_offset, bridge_dir, state.byte_offset)
+
+
 async def _forward_available_deltas(
     *,
     client: httpx.AsyncClient,
@@ -5753,6 +5860,7 @@ async def _forward_available_deltas(
     state: DeltaForwardState,
     seen_keys: dict[tuple[str, int], None],
     batch_capability: _SessionEventBatchCapability | None = None,
+    read_result: MessageDeltaReadResult | None = None,
 ) -> DeltaForwardState:
     """
     Forward newly appended assistant-text deltas to the active session.
@@ -5773,18 +5881,13 @@ async def _forward_available_deltas(
     :param seen_keys: In-memory ``(message_id, index)`` dedupe ring,
         mutated in place. Guards the rare file-truncation rewind where
         the reader restarts from offset ``0``.
+    :param read_result: Records already read from ``state``'s offset, or
+        ``None`` to read them now.
     :returns: The updated delta cursor state (offset advanced past the
         records just read).
     """
-    # The deltas file only exists once the MessageDisplay hook has fired
-    # for this Claude process. Skip the worker-thread read until then so
-    # idle / non-streaming polls don't churn the thread pool (this loop
-    # polls every ~0.25s). A bare ``exists()`` is a cheap stat consistent
-    # with the other sync reads this loop already does each poll.
-    if not (bridge_dir / MESSAGE_DELTAS_FILE).exists():
-        return state
-    result = await asyncio.to_thread(
-        read_message_deltas_from_offset, bridge_dir, state.byte_offset
+    result = (
+        read_result if read_result is not None else await _read_available_deltas(bridge_dir, state)
     )
     if result.byte_offset == state.byte_offset and not result.deltas:
         return state

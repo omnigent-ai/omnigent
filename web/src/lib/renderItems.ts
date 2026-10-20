@@ -557,6 +557,49 @@ export function liveCandidateAssistantIndex(bubbles: readonly Bubble[]): number 
   return idx;
 }
 
+function isLiveReplyPreview(bubble: Bubble): boolean {
+  return (
+    bubble.kind === "assistant" &&
+    bubble.items.length > 0 &&
+    bubble.items.every((item) => item.itemId?.startsWith(LIVE_ITEM_PREFIX) ?? false)
+  );
+}
+
+/**
+ * Whether the whole timeline is create-time routing chips followed by reply
+ * previews, which can only answer the session's first (oldest pending) send.
+ * Unknown while older history is unloaded. Build `bubbles` from every session
+ * block, not a filtered view, so each surface and the store's ack agree.
+ */
+export function opensWithEarlyReplyPreviews(
+  bubbles: readonly Bubble[],
+  hasMoreHistory: boolean,
+): boolean {
+  if (hasMoreHistory) return false;
+  let start = bubbles.length;
+  while (start > 0 && isLiveReplyPreview(bubbles[start - 1]!)) start -= 1;
+  if (start === bubbles.length) return false;
+  return bubbles
+    .slice(0, start)
+    .every(
+      (bubble) =>
+        bubble.kind === "routing_decision" && isSessionScopedDecision(bubble.routing?.scope),
+    );
+}
+
+/** {@link opensWithEarlyReplyPreviews} for a session's blocks; builds bubbles only once a preview exists. */
+export function sessionOpensWithEarlyReplyPreviews(
+  blocks: AnyBlock[],
+  activeResponse: ActiveResponse | null,
+  hasMoreHistory: boolean,
+  cache?: BubbleCache,
+): boolean {
+  if (hasMoreHistory || !blocks.some((block) => block.ctx.itemId?.startsWith(LIVE_ITEM_PREFIX))) {
+    return false;
+  }
+  return opensWithEarlyReplyPreviews(buildBubbles(blocks, activeResponse, cache), false);
+}
+
 /**
  * Whether a block's response id doesn't identify a real turn: `""`
  * (emitted before the turn was named) or a `live:` preview id. Such

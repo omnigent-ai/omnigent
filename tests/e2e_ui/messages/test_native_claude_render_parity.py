@@ -77,6 +77,27 @@ _CLAUDE_MOCK_MODEL = "claude-sonnet-4-20250514"
 
 # Two composer turns (the IN direction) + one TUI turn (the OUT direction).
 _COMPOSER_TURNS = 2
+# Logs each distinct bubble order, so a reply that briefly renders above its
+# prompt is caught even between Playwright polls.
+_BUBBLE_ORDER_LOG = """
+(() => {
+  const log = (window.__bubbleOrders = []);
+  let last = "";
+  const snapshot = () => {
+    const order = Array.from(document.querySelectorAll('[data-testid="message-bubble"]'),
+      (bubble) => [bubble.getAttribute("data-role"), bubble.innerText || ""]);
+    const key = JSON.stringify(order);
+    if (key !== last) {
+      last = key;
+      log.push(order);
+    }
+  };
+  const observe = () => new MutationObserver(snapshot).observe(document.documentElement,
+    { subtree: true, childList: true, characterData: true });
+  if (document.documentElement) observe();
+  else document.addEventListener("DOMContentLoaded", observe);
+})();
+"""
 
 
 def _open_terminal_view(page: Page) -> None:
@@ -99,6 +120,33 @@ def _wait_terminal_connected(page: Page) -> None:
     expect(terminal).to_have_attribute(
         "data-state", "connected", timeout=_TERMINAL_READY_TIMEOUT_MS
     )
+
+
+def _replies_above_their_prompts(
+    order: list[tuple[str, str]], user_markers: list[str], assistant_tokens: list[str]
+) -> list[str]:
+    """
+    Describe each reply placed above the prompt it answers.
+
+    :param order: ``(role, text)`` pairs in display or transcript order.
+    :param user_markers: Per-turn unique user markers, oldest first.
+    :param assistant_tokens: Per-turn unique assistant tokens, oldest first.
+    :returns: The reply token and role order for each inverted turn.
+    """
+    roles = [role for role, _ in order]
+    inverted: list[str] = []
+    for marker, token in zip(user_markers, assistant_tokens, strict=True):
+        user_at = next(
+            (at for at, (role, text) in enumerate(order) if role == "user" and marker in text),
+            None,
+        )
+        reply_at = next(
+            (at for at, (role, text) in enumerate(order) if role == "assistant" and token in text),
+            None,
+        )
+        if user_at is not None and reply_at is not None and reply_at < user_at:
+            inverted.append(f"{token} in {roles}")
+    return inverted
 
 
 def _type_into_tui(page: Page, text: str) -> None:
@@ -125,6 +173,7 @@ def test_native_claude_message_render_parity(
     base_url, session_id = native_claude_mock_session
     _log.info("native-claude mock session ready: base_url=%s session_id=%s", base_url, session_id)
 
+    page.add_init_script(_BUBBLE_ORDER_LOG)
     page.goto(f"{base_url}/c/{session_id}")
     _open_terminal_view(page)
     _wait_terminal_connected(page)
@@ -186,6 +235,29 @@ def test_native_claude_message_render_parity(
     # --- Assert all three properties over every turn. ---
     _assert_no_duplicate_render(page, user_markers, assistant_tokens)
     _assert_transcript_parity(base_url, session_id, user_markers, assistant_tokens)
+    stored = [
+        (str(item["role"]), _item_text(item))
+        for item in _ordered_message_items(base_url, session_id)
+    ]
+    assert _replies_above_their_prompts(stored, user_markers, assistant_tokens) == []
+    orders = page.evaluate("window.__bubbleOrders")
+    assert any(
+        all(
+            any(role == "user" and marker in text for role, text in order)
+            for marker in user_markers
+        )
+        and all(
+            any(role == "assistant" and token in text for role, text in order)
+            for token in assistant_tokens
+        )
+        for order in orders
+    ), "the bubble-order log never captured every turn"
+    displayed = [
+        inverted
+        for order in orders
+        for inverted in _replies_above_their_prompts(order, user_markers, assistant_tokens)
+    ]
+    assert displayed == [], f"a reply rendered above its prompt: {displayed}"
 
     # A live model can echo these reply tokens too; prove our prompts reached the mock.
     user_texts: list[str] = []

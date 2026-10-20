@@ -63,7 +63,12 @@ import {
   isTextBlock,
   keyedAttachments,
 } from "@/lib/blocks";
-import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
+import {
+  type Bubble,
+  type RenderItem,
+  bubblesEqual,
+  opensWithEarlyReplyPreviews,
+} from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
@@ -273,8 +278,16 @@ function liftAboveCreateRoutingChips(committed: Bubble[], end: number): number {
 
 // Place optimistic pending user bubbles into the committed timeline, keeping
 // the prompt above a trailing REQUEST-phase card or create-time routing chip.
-export function mergePendingBubbles(committed: Bubble[], pending: Bubble[]): Bubble[] {
+// `liftOldest` lifts the oldest send above earlier previews; the default assumes a full session.
+export function mergePendingBubbles(
+  committed: Bubble[],
+  pending: Bubble[],
+  liftOldest = opensWithEarlyReplyPreviews(committed, false),
+): Bubble[] {
   if (pending.length === 0) return committed;
+  if (liftOldest) {
+    return [pending[0]!, ...committed, ...pending.slice(1)];
+  }
   let insertAt = committed.length;
   while (insertAt > 0 && isStandaloneElicitationBubble(committed[insertAt - 1]!)) {
     insertAt -= 1;

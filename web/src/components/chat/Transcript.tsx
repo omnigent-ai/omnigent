@@ -21,6 +21,7 @@ import {
   buildBubbles,
   createBubbleCache,
   liveCandidateAssistantIndex,
+  opensWithEarlyReplyPreviews,
 } from "@/lib/renderItems";
 import { useChatStore } from "@/store/chatStore";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
@@ -138,22 +139,22 @@ function TranscriptImpl({
   // acked) render as trailing user bubbles so the input is visible immediately.
   const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
   const bubbles = useMemo<Bubble[]>(() => {
+    const built = buildBubbles(
+      blocks,
+      activeResponse,
+      bubbleCacheRef.current,
+      interruptedResponseIds,
+      computeIsWorking(sessionStatus),
+    );
     const committed = stripGatedSubagentRoutingChips(
-      reorderCommittedRequestElicitations(
-        buildBubbles(
-          blocks,
-          activeResponse,
-          bubbleCacheRef.current,
-          interruptedResponseIds,
-          computeIsWorking(sessionStatus),
-        ),
-      ),
+      reorderCommittedRequestElicitations(built),
       subagentRoutingOverride,
     );
     if (pendingUserMessages.length === 0) return committed;
     return mergePendingBubbles(
       committed,
       buildPendingBubbles(pendingUserMessages, getCurrentAuthorId()),
+      opensWithEarlyReplyPreviews(built, hasMoreHistory),
     );
   }, [
     blocks,
@@ -162,6 +163,7 @@ function TranscriptImpl({
     pendingUserMessages,
     subagentRoutingOverride,
     sessionStatus,
+    hasMoreHistory,
   ]);
 
   const pendingElicitations = useMemo(() => collectPendingElicitations(bubbles), [bubbles]);
