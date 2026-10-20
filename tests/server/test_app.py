@@ -2512,6 +2512,63 @@ async def test_on_runner_connect_defers_idle_tree_initialization_until_demand(
 
 
 @pytest.mark.asyncio
+async def test_on_runner_connect_reannounces_idle_status_for_deferred_sessions(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deferred idle session gets an idle edge so a tab latched on a dead turn settles."""
+    from omnigent.entities import Conversation
+    from omnigent.runner.routing import RoutedRunner
+    from omnigent.server.routes import sessions as sessions_routes
+    from omnigent.server.routes._sessions import common as sessions_common
+
+    app, captured = _build_minimal_app(db_uri, tmp_path, monkeypatch)
+    runner_id = "runner_idle_reannounce_test"
+    idle_id, archived_id, active_id = _bind_sessions(db_uri, runner_id, count=3)
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_session_live_status(idle_id, "idle")
+    store.set_session_live_status(archived_id, "idle")
+    store.update_conversation(archived_id, archived=True)
+    store.set_session_live_status(active_id, "running")
+    connection = _attach_live_connection(app, monkeypatch, runner_id)
+    monkeypatch.setattr(
+        app.state.tunnel_registry, "get", lambda rid: connection if rid == runner_id else None
+    )
+    routed = RoutedRunner(runner_id=runner_id, client=object())  # type: ignore[arg-type]
+    app.state.runner_router.client_for_session_resources = lambda *_a, **_k: routed  # type: ignore[assignment]
+    initialized: list[str] = []
+
+    async def _initialize(conv: Conversation, *_a: object, **_k: object) -> httpx.Response:
+        initialized.append(conv.id)
+        return httpx.Response(
+            201,
+            json={"session_init_protocol_version": 2, "terminal_ready": True},
+            request=httpx.Request("POST", "http://runner/v1/sessions"),
+        )
+
+    async def _noop_async(*_a: object, **_k: object) -> None:
+        return None
+
+    published: list[tuple[str, dict[str, object]]] = []
+    monkeypatch.setattr(app.state.runner_session_initializer, "initialize", _initialize)
+    monkeypatch.setattr(sessions_routes, "_ensure_runner_relay_ready", _noop_async)
+    monkeypatch.setattr(
+        sessions_common.session_stream,
+        "publish",
+        lambda session_id, event: published.append((session_id, event)),
+    )
+
+    await captured["callback"](runner_id, connection)  # type: ignore[operator]
+
+    assert initialized == [active_id]
+    statuses = [
+        (sid, e.get("status")) for sid, e in published if e.get("type") == "session.status"
+    ]
+    assert statuses == [(idle_id, "idle")]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failed_read", ["list_child_conversation_ids_page", "get_conversations"])
 async def test_on_runner_connect_attaches_sessions_when_child_scan_fails(
     db_uri: str,
