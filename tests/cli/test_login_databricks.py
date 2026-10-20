@@ -442,11 +442,12 @@ def test_login_apps_fails_loud_without_databricks_cli(
     result = CliRunner().invoke(cli_group, ["login", _APPS_URL])
 
     assert result.exit_code != 0
-    assert "Databricks CLI executable `databricks` was not found on PATH" in result.output
+    assert "Databricks CLI not found on PATH" in result.output
+    assert "Install it, then retry this command." in result.output
     assert "https://docs.databricks.com/dev-tools/cli/install.html" in result.output
-    assert "omnigent[databricks] Python extra does not install this executable" in result.output
-    assert "Run `databricks --version` in this terminal" in result.output
-    assert "retry your original command" in result.output
+    error_lines = result.output[result.output.index("Error:") :].splitlines()
+    assert len(error_lines) == 2
+    assert all(len(line) <= 80 for line in error_lines)
     assert login_calls == []
     assert load_databricks_workspace_host(_APPS_URL) is None
 

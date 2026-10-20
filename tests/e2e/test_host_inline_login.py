@@ -78,15 +78,14 @@ def test_first_host_login_registers_and_reuses_credentials(tmp_path: Path) -> No
                         cwd=str(home),
                         encoding="utf-8",
                         timeout=60,
-                        dimensions=(40, 140),
+                        dimensions=(40, 80),
                     )
                     child.logfile_read = transcript
                     try:
                         if attempt == "missing-cli":
-                            child.expect("was not found on PATH")
+                            child.expect("Databricks CLI not found on PATH")
+                            child.expect("Install it, then retry this command.")
                             child.expect("https://docs.databricks.com/dev-tools/cli/install")
-                            child.expect("databricks --version")
-                            child.expect("retry your original command")
                             child.expect(pexpect.EOF)
                             assert child.wait() != 0
                             transcript.flush()

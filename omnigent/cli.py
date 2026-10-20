@@ -13027,10 +13027,8 @@ def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None
         from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
 
         exc = click.ClickException(
-            "Databricks CLI executable `databricks` was not found on PATH. "
-            "Install it: https://docs.databricks.com/dev-tools/cli/install.html\n"
-            "The omnigent[databricks] Python extra does not install this executable. "
-            "Run `databricks --version` in this terminal, then retry your original command."
+            "Databricks CLI not found on PATH. Install it, then retry this command.\n"
+            "https://docs.databricks.com/dev-tools/cli/install.html"
         )
         setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
         raise exc

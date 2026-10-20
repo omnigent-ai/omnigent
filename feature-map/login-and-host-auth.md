@@ -143,11 +143,12 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   `uv run --no-sync pytest tests/e2e/test_host_inline_login.py --reruns 0 -q`.
   It starts an isolated real server and a local HTTPS mock workspace, then
   drives the real Omnigent and Databricks CLIs through a PTY. First, with the
-  Databricks CLI absent from PATH, the command must exit with an install link,
-  `databricks --version` check, and retry guidance, without the unrelated
-  `omnigent stop` hint, opening a browser, or registering a host. Restore the CLI and retry
-  the same command and home: Chromium completes the OAuth callback, the command
-  continues to `Connected as`, and `GET /v1/hosts` confirms this user's host is
+  Databricks CLI absent from PATH, the command must exit with a two-line error
+  naming the missing CLI and giving an install link and retry guidance, without
+  the unrelated `omnigent stop` hint, opening a browser, or registering a host.
+  Restore the CLI and retry the same command and home: Chromium completes the
+  OAuth callback, the command continues to `Connected as`, and `GET /v1/hosts`
+  confirms this user's host is
   online. Restart with the same home to confirm its host ID and login are reused
   without a second browser authorization. Transcripts and host API snapshots
   remain in pytest's temporary directory; use `--basetemp=/tmp/host-onboarding`
