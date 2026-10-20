@@ -877,6 +877,11 @@ class _ManagedMintTokenFactory:
     :attr:`proxy_auth_failed` instead: the credential presented to the proxy
     died (the seeded host bearer, or the minted JWT once a session outlives
     it), so callers should re-resolve SDK/OIDC rather than send bare requests.
+    That is only meaningful when a proxy bearer was ever presented, though —
+    a 401/403 with no ``proxy_bearer`` and no cached token latches
+    :attr:`declined` instead, the same as a definitive 400/404 (e.g. a bare
+    local runner whose binding token has no managed-launch owner and will
+    never mint here, regardless of retries).
     """
 
     def __init__(
@@ -911,9 +916,12 @@ class _ManagedMintTokenFactory:
         # than a genuine server refusal — that latch is recoverable via
         # :meth:`reset_decline`, so the factory stays installed.
         self.declined_by_server_error = False
-        # Set when mint fails with 401/403 on the proxy bearer (not a server
-        # refusal). Unlike ``declined``, this means the caller should try
-        # another credential path (SDK/OIDC) rather than sending bare requests.
+        # Set when mint fails with 401/403 on a proxy bearer or cached token
+        # that was actually presented (not a server refusal). Unlike
+        # ``declined``, this means the caller should try another credential
+        # path (SDK/OIDC) rather than sending bare requests. A 401/403 with
+        # neither ever presented sets ``declined`` instead — a credential
+        # that was never sent cannot have expired.
         self.proxy_auth_failed = False
 
     def __call__(self) -> str | None:
@@ -921,9 +929,12 @@ class _ManagedMintTokenFactory:
 
         :returns: The cached or freshly-minted JWT; ``None`` after a
             definitive server decline or a 5xx with no prior successful
-            mint (sets :attr:`declined`), after a mint 401/403 with no
-            still-valid cached token (sets :attr:`proxy_auth_failed`), or
-            on a transient mint failure with no still-valid cached token.
+            mint (sets :attr:`declined`), after a mint 401/403 with a proxy
+            bearer or cached token presented but no longer valid (sets
+            :attr:`proxy_auth_failed`), after a mint 401/403 with neither
+            ever presented (also sets :attr:`declined` — a bearer that was
+            never sent cannot have expired), or on a transient mint failure
+            with no still-valid cached token.
         """
         with self._lock:
             return self._call_locked()
@@ -968,6 +979,22 @@ class _ManagedMintTokenFactory:
                     return None
                 return self._still_valid_cached_token(now)
             if response.status_code in (401, 403):
+                if self._proxy_bearer is None and self._cached_token is None:
+                    # No proxy bearer was ever presented, so this can't mean
+                    # "the credential expired" — it is the same definitive
+                    # refusal as a 400/404. The binding token has no
+                    # managed-launch owner and will never mint here (e.g. a
+                    # bare local runner that was not a managed-sandbox
+                    # launch). Decline cleanly so callbacks go out bare
+                    # instead of failing closed forever.
+                    self.declined = True
+                    _logger.debug(
+                        "managed mint declined: %s returned %s with no proxy "
+                        "bearer or cached token ever presented",
+                        self._mint_url,
+                        response.status_code,
+                    )
+                    return None
                 # The proxy bearer is expired or invalid — the seeded host
                 # bearer, or the minted JWT once a session outlives it. With
                 # no still-valid cache left the mint loop cannot renew itself:

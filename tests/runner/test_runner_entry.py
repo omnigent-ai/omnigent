@@ -887,6 +887,55 @@ def test_managed_mint_factory_declines_at_request_time_and_auth_sends_bare(
     assert len(calls) == 2  # probe blip + the single definitive 400
 
 
+def test_managed_mint_factory_no_proxy_bearer_401_declines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 401 with no proxy bearer ever presented declines, not proxy_auth_failed.
+
+    A runner that holds only a tunnel binding token — no host bearer was ever
+    presented — 401s on its first mint because the server has no
+    managed-launch owner record for it. That refusal is definitive, not an
+    expired credential, so it must classify the same way a 400/404 does:
+    latch ``declined`` and send callbacks bare, instead of latching
+    ``proxy_auth_failed`` and failing closed on every callback.
+
+    :param monkeypatch: Pytest environment patch fixture.
+    :returns: None.
+    """
+
+    def _no_managed_launch_owner(
+        mint_url: str, server_url: str, binding_token: str, **_kw: object
+    ) -> tuple[str, float]:
+        """Reject the mint the way a server without an owner record does."""
+        request = httpx.Request("POST", mint_url)
+        raise httpx.HTTPStatusError(
+            "401", request=request, response=httpx.Response(401, request=request)
+        )
+
+    monkeypatch.setattr(
+        "omnigent.runner._entry._mint_managed_owner_token", _no_managed_launch_owner
+    )
+
+    # No proxy_bearer: nothing was ever presented to the proxy.
+    factory = _ManagedMintTokenFactory(
+        "https://s.example.com/v1/runners/r/token",
+        "https://s.example.com",
+        "btok",
+    )
+    assert factory() is None
+    assert factory.declined is True
+    assert factory.proxy_auth_failed is False
+
+    # Callbacks must go out bare rather than fail closed.
+    auth = _RunnerDatabricksAuth(factory)
+    request = httpx.Request("GET", "http://server/v1/sessions/conv_1/agent/contents")
+    sent = next(auth.auth_flow(request))
+    assert "Authorization" not in sent.headers
+
+    # The construction probe declines too, so no factory is installed.
+    assert _make_managed_mint_factory("https://s.example.com", "btok") is None
+
+
 @pytest.mark.parametrize("status_code", [500, 502, 503, 504])
 def test_managed_mint_factory_latches_declined_on_5xx_with_no_cache(
     monkeypatch: pytest.MonkeyPatch,
