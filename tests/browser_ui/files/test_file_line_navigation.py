@@ -6,6 +6,7 @@ import json
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from playwright.sync_api import Locator, Page, Route, expect
@@ -521,7 +522,16 @@ def test_content_search_opens_line_and_preserves_results(
     rail.get_by_role("tab", name="Content search", exact=True).click()
     search = rail.get_by_role("searchbox", name="Search file contents")
     search.fill("changed")
-    search.press("Enter")
+    expect(rail.get_by_label("Include", exact=True)).not_to_be_visible()
+    rail.get_by_role("button", name="Filter files", exact=True).click()
+    rail.get_by_label("Include", exact=True).fill("src/**, *.{py,txt}")
+    rail.get_by_label("Exclude", exact=True).fill("**/tests/**, *.min.js")
+    rail.get_by_role("button", name="Filter files", exact=True).click()
+    with page.expect_request(lambda request: "/content-search?" in request.url) as submitted:
+        search.press("Enter")
+    params = parse_qs(urlparse(submitted.value.url).query)
+    assert params["include"] == ["src/**, *.{py,txt}"]
+    assert params["exclude"] == ["**/tests/**, *.min.js"]
     result = rail.get_by_role("button", name=f"Open {_FILE_PATH} at line 351")
     result.click()
     page.wait_for_function(_CENTERED_LINE, arg={"text": _AFTER_LINES[350], "diff": False})
@@ -548,6 +558,9 @@ def test_content_search_opens_line_and_preserves_results(
     rail.get_by_role("button", name="Select panel", exact=True).click()
     page.get_by_role("menuitem", name="Content search", exact=True).click()
     expect(search).to_have_value("changed")
+    rail.get_by_role("button", name="Filter files", exact=True).click()
+    expect(rail.get_by_label("Include", exact=True)).to_have_value("src/**, *.{py,txt}")
+    expect(rail.get_by_label("Exclude", exact=True)).to_have_value("**/tests/**, *.min.js")
     expect(result).to_be_visible()
     result.click()
     page.wait_for_function(_CENTERED_LINE, arg={"text": _AFTER_LINES[350], "diff": False})

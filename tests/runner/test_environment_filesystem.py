@@ -1858,6 +1858,14 @@ async def test_search_matches(
         ("--help", {}, [4]),
         ("  spaced  ", {}, [5]),
         ("$(touch injected)", {}, [6]),
+        ("needle", {"include": "src/"}, [2, 3]),
+        ("needle", {"include": "missing/**"}, []),
+        ("needle", {"exclude": "src/"}, []),
+        ("needle", {"include": "src/**", "exclude": "*.txt"}, []),
+        ("needle", {"include": "*.{py,txt}, .git/**", "exclude": "ignored.txt"}, [2, 3]),
+        ("needle", {"include": "missing/**, src/**", "exclude": "*.py, ignored.txt"}, [2, 3]),
+        ("needle", {"include": " , ", "exclude": " , "}, [2, 3]),
+        ("needle", {"include": "$(touch injected)"}, []),
     ],
 )
 async def test_content_search_live_workspace(
@@ -1916,6 +1924,12 @@ async def test_content_search_limits_errors_and_hidden_files(
     for params in ({"q": " "}, {"q": "a" * 4097}, {"q": "a", "limit": 501}):
         response = await client.get(endpoint, params=params)
         assert response.status_code == 422
+    for field in ("include", "exclude"):
+        response = await client.get(endpoint, params={"q": "needle", field: "a" * 4097})
+        assert response.status_code == 422
+        for invalid in ("!*.txt", "src/\n", "src/\r", "src/\x00", "["):
+            response = await client.get(endpoint, params={"q": "needle", field: invalid})
+            assert response.json().get("error"), response.text
     (workspace / ".hidden.txt").write_text("é" * 1000 + "😀 needle tail\n")
     response = await client.get(endpoint, params={"q": "needle"})
     match = response.json()["matches"][0]
@@ -1940,7 +1954,9 @@ def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
         )
         executable.write_text(f"#!{sys.executable}\n{body}")
         executable.chmod(0o755)
-    parameters = "query = 'needle'\ncase_sensitive = False\nregex = False\nlimit = 2\n"
+    parameters = (
+        "query = 'needle'\ncase_sensitive = False\nregex = False\nlimit = 2\nglob_args = []\n"
+    )
     timer = (
         "import threading\noriginal_timer = threading.Timer\n"
         "threading.Timer = lambda seconds, callback: original_timer(0.2, callback)\n"

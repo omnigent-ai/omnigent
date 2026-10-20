@@ -1484,6 +1484,23 @@ def register_hooks_routes(
         if not isinstance(policy_name, str) or not policy_name:
             policy_name = "native_permission"
         extras: dict[str, Any] = {}
+        native_delivery = payload.get("native_delivery")
+        if native_delivery is not None:
+            if (
+                policy_name != "kiro_native_permission"
+                or not isinstance(native_delivery, dict)
+                or native_delivery.get("state") not in ("ready", "unconfirmed")
+                or not isinstance(native_delivery.get("attempt"), str)
+                or not native_delivery["attempt"]
+                or (
+                    native_delivery["state"] == "unconfirmed"
+                    and native_delivery.get("action") not in ("accept", "decline", "cancel")
+                )
+            ):
+                raise OmnigentError(
+                    "Invalid native delivery attempt.", code=ErrorCode.INVALID_INPUT
+                )
+            extras["native_delivery"] = native_delivery
         ask_user_question = payload.get("ask_user_question")
         if isinstance(ask_user_question, dict) and isinstance(
             ask_user_question.get("questions"), list
@@ -1512,7 +1529,7 @@ def register_hooks_routes(
         )
         if result is None:
             return Response(status_code=status.HTTP_200_OK)
-        if result.action == "decline":
+        if result.action == "decline" and native_delivery is None:
             # Explicit user decline: interrupt the native harness before
             # returning the decline so the abort signal arrives first.
             await _forward_session_change_to_runner(
@@ -1520,8 +1537,11 @@ def register_hooks_routes(
                 get_server_runner_router(),
                 {"type": "interrupt"},
             )
+        result_payload = result.model_dump(exclude_none=True)
+        if native_delivery is not None:
+            result_payload["native_delivery_attempt"] = native_delivery["attempt"]
         return Response(
-            content=json.dumps(result.model_dump(exclude_none=True)),
+            content=json.dumps(result_payload),
             media_type="application/json",
         )
 

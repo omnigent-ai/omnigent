@@ -1,6 +1,8 @@
 import { AlertTriangleIcon, XIcon } from "lucide-react";
+import { useEffect, useState } from "react";
 
 import { useHostDbcert } from "@/hooks/useHostDbcert";
+import { getDesktopFeatures, hasDbcertRefreshBridge } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 
 /**
@@ -9,13 +11,34 @@ import { cn } from "@/lib/utils";
  * `StreamBudgetBanner` and stacked with it in a `FloatingBannerStack`.
  * Dismissable per expired certificate.
  */
-export function DbcertBanner({
-  conversationId,
-  hostId,
-}: {
+interface DbcertBannerProps {
   conversationId: string | null | undefined;
   hostId: string | null | undefined;
-}) {
+}
+
+export function DbcertBanner({ conversationId, hostId }: DbcertBannerProps) {
+  const [supported, setSupported] = useState(false);
+
+  useEffect(() => {
+    if (!hasDbcertRefreshBridge()) return;
+    let active = true;
+    void getDesktopFeatures().then((features) => {
+      if (active) {
+        setSupported(
+          features?.databricksInternalFeatures === true && features.canRefreshDbcert === true,
+        );
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  if (!supported) return null;
+  return <SupportedDbcertBanner conversationId={conversationId} hostId={hostId} />;
+}
+
+function SupportedDbcertBanner({ conversationId, hostId }: DbcertBannerProps) {
   const dbcert = useHostDbcert(conversationId, hostId);
   if (!dbcert.show) return null;
   const running = dbcert.phase === "running";

@@ -44,8 +44,12 @@ vi.mock("./FileViewer", () => ({
 vi.mock("./FilesPanel", () => ({
   // Echo the fixed scope so tests can prove the Files tab renders the tree
   // (flatView=false) and the Changes tab the changed-only list (flatView=true).
-  FilesPanel: ({ flatView }: { flatView: boolean }) => (
-    <div data-testid="files-panel-stub" data-flat-view={String(flatView)} />
+  FilesPanel: ({ flatView, conversationId }: { flatView: boolean; conversationId: string }) => (
+    <div
+      data-testid="files-panel-stub"
+      data-session={conversationId}
+      data-flat-view={String(flatView)}
+    />
   ),
 }));
 vi.mock("./SubagentsPanel", () => ({
@@ -124,6 +128,7 @@ afterEach(() => {
 function renderWorkspace(
   initialOverrides: {
     conversationId?: string;
+    contained?: boolean;
     rightRailTab?: RightRailTab | null;
     openPanels?: DefaultWorkspaceTab[];
     selectedFilePath?: string | null;
@@ -159,6 +164,7 @@ function renderWorkspace(
     <TooltipProvider delayDuration={0}>
       <WorkspacePanel
         conversationId={overrides.conversationId ?? "conv_ws"}
+        contained={overrides.contained}
         width={360}
         open={overrides.open}
         animateVisibility={overrides.animateVisibility}
@@ -1445,4 +1451,15 @@ describe("WorkspacePanel panel picker", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: "Side chat 1" }));
     expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat");
   });
+});
+
+it("keeps a contained workspace inline on narrow viewports and scopes its file browser", () => {
+  isMobileMock.mockReturnValue(true);
+  renderWorkspace({ contained: true, maximized: true });
+  expect(screen.getByRole("complementary", { name: "Workspace" })).toHaveClass(
+    "absolute",
+    "inset-0",
+    "flex",
+  );
+  expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-session", "conv_ws");
 });

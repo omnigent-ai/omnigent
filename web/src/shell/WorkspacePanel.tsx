@@ -662,6 +662,11 @@ function RailTerminalView({
  * shell keeps single-source-of-truth over file/terminal/panel state.
  */
 interface WorkspacePanelProps {
+  /** Keep the panel and its viewers inside an independently scoped grid workspace. */
+  contained?: boolean;
+  sessionHarness?: ReturnType<typeof useChatStore.getState>["sessionHarness"];
+  agentId?: string | null;
+
   /** Active session id — panels read the workspace against it. */
   conversationId: string;
   /** Show inert panel chrome while the server session id is still pending. */
@@ -799,6 +804,9 @@ interface WorkspacePanelProps {
  */
 function WorkspacePanelImpl({
   conversationId,
+  contained = false,
+  sessionHarness,
+  agentId,
   pending = false,
   width,
   handleProps,
@@ -870,11 +878,12 @@ function WorkspacePanelImpl({
     onRightRailTabChange("browser");
     onReveal?.();
   };
-  useNewBrowserHotkey(addBrowser, showBrowserTab && !pending);
+  useNewBrowserHotkey(addBrowser, showBrowserTab && !pending && !contained);
 
   // ── Side chats: rail tabs backed by forked child conversations. ──────────
   const sideChats = useSideChats(conversationId);
-  const sideChatHarness = useChatStore((s) => s.sessionHarness);
+  const activeHarness = useChatStore((s) => s.sessionHarness);
+  const sideChatHarness = sessionHarness === undefined ? activeHarness : sessionHarness;
   const sideChatToOpen = useChatStore((s) => s.sideChatToOpen);
   const clearSideChatToOpen = useChatStore((s) => s.clearSideChatToOpen);
   const activeSideChatRef = useRef<HTMLDivElement | null>(null);
@@ -925,7 +934,8 @@ function WorkspacePanelImpl({
   // "New side chat" opens an EMPTY tab; the fork isn't created until the first
   // message is sent in it (startPendingSideChat below). Offered on every harness
   // that supports side chat.
-  const parentAgentId = useChatStore((s) => s.boundAgentId);
+  const activeAgentId = useChatStore((s) => s.boundAgentId);
+  const parentAgentId = agentId === undefined ? activeAgentId : agentId;
   const onNewSideChat = supportsSideChat(sideChatHarness)
     ? () => {
         sideChats.openPending();
@@ -989,7 +999,8 @@ function WorkspacePanelImpl({
   };
   // The selected side chat's pane, shown in the rail or the mobile drawer. A
   // `pending:` tab has no child yet; its first send creates the fork.
-  const isMobile = useIsMobileViewport();
+  const mobileViewport = useIsMobileViewport();
+  const isMobile = mobileViewport && !contained;
   useEffect(() => {
     if (!showContentSearch || !showFilesPanel || pending || isMobile) return;
     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
@@ -1364,6 +1375,9 @@ function WorkspacePanelImpl({
       className={cn(
         "workspace-panel-motion @container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-l md:border-border md:bg-card",
         maximized ? "md:absolute md:inset-0" : "md:shrink-0",
+        contained &&
+          "flex min-h-0 flex-col overflow-hidden border-l border-border bg-card shrink-0",
+        contained && maximized && "absolute inset-0",
       )}
       // Width is fixed by the resize handle normally; maximized ignores it and
       // stretches to the absolute inset instead. The width doubles as the
@@ -1733,6 +1747,8 @@ function WorkspacePanelImpl({
           ) : selectedFilePath !== null ? (
             <ResponsiveViewerSlot mobile={isMobile} mobileTarget={mobileFileTarget}>
               <FileViewer
+                syncUrl={!contained}
+                agentId={agentId}
                 mobileOverlay={isMobile}
                 frameless
                 open
@@ -1775,6 +1791,7 @@ function WorkspacePanelImpl({
           ) : rightRailTab === "content-search" && showContentSearch ? null : (
             showFilesPanel && (
               <FilesPanel
+                conversationId={contained ? conversationId : undefined}
                 frameless
                 onFileSelect={openFileViewer}
                 flatView={rightRailTab === "changes"}

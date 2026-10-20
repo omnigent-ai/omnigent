@@ -2188,7 +2188,6 @@ def _chat_local(
                 resume_latest=resume_latest,
                 resume_picker=resume_picker,
             )
-            bundle_bytes = _bundle_agent(spec_path)
             _chat_with_server(
                 base_url,
                 tool_handler,
@@ -2199,7 +2198,6 @@ def _chat_local(
                 fork_session_id=fork_session_id,
                 log=log,
                 agent_yaml=spec_path,
-                session_bundle=bundle_bytes,
                 ephemeral=ephemeral,
                 debug_events=debug_events,
                 server_log_path=server.log_path,
@@ -2257,7 +2255,6 @@ def _run_local_headless_prompt(
                 tool_handler,
                 prompt=prompt,
                 runner_id=server.runner_id,
-                session_bundle=_bundle_agent(spec_path),
             )
         finally:
             _stop_local_server(server)

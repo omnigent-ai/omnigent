@@ -76,6 +76,10 @@ def test_delivery_diagnostics(
             getattr(record, "event_name", "").startswith("claude_native_")
             for record in caplog.records
         )
+        if args[-1] == "Space":
+            pane = "──────\n❯ \n──────\n"
+        elif args[0] == "send-keys" and "-l" in args:
+            pane = "❯ "
         if args[0] == "paste-buffer":
             if scenario == "transport_error":
                 raise RuntimeError(secret)

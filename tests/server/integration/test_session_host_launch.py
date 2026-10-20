@@ -2530,6 +2530,55 @@ async def test_host_session_message_relaunches_offline_runner(
         "relaunch must mint a NEW runner_id (replace_runner_id); a stale id "
         "would keep routing messages to the dead runner"
     )
+    assert launch_frame.superseded_runner_ids == (original_runner_id,), (
+        "the relaunch must name the binding it replaced so the host stops it"
+    )
+
+
+async def test_unbound_host_session_relaunch_names_no_superseded_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relaunch after /clear moved the runner away supersedes nothing.
+
+    /clear unbinds the old session and hands its runner to the successor; if
+    the launch frame named no runners explicitly, the host would stop every
+    runner it launched for this session, including the successor's.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    SqlAlchemyConversationStore(db_uri).clear_runner_id(session_id)
+
+    set_runner_client(None)
+    post_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+            },
+        )
+    )
+    try:
+        launch_frame = await _wait_for_launch(comm, budget_s=budget(5.0))
+    finally:
+        post_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await post_task
+
+    assert launch_frame is not None, "a message to an unbound host session must relaunch"
+    assert launch_frame.superseded_runner_ids == ()
 
 
 async def test_first_message_during_host_spawn_does_not_launch_replacement(

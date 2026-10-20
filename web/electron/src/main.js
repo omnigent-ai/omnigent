@@ -2795,13 +2795,15 @@ function openFindBar(target) {
   });
   bar.on("closed", () => {
     findBars.delete(target);
-    if (!target.isDestroyed()) {
-      target.removeListener("resize", reposition);
-      target.removeListener("move", reposition);
-      target.webContents.removeListener("found-in-page", onFound);
-      target.webContents.stopFindInPage("clearSelection");
-      target.focus();
-    }
+    if (target.isDestroyed()) return;
+    target.removeListener("resize", reposition);
+    target.removeListener("move", reposition);
+    target.webContents.removeListener("found-in-page", onFound);
+    // Closing the parent (Cmd+W) destroys its webContents before this child's
+    // "closed" fires, while the parent window itself is not yet destroyed.
+    if (target.webContents.isDestroyed()) return;
+    target.webContents.stopFindInPage("clearSelection");
+    target.focus();
   });
 }
 

@@ -1353,7 +1353,7 @@ export interface ChatActions {
    * No-ops when `hasMoreHistory` is false, `loadingMoreHistory` is true,
    * or there is no active conversation / oldest-item cursor yet.
    */
-  loadMoreHistory: () => Promise<void>;
+  loadMoreHistory: (sessionId?: string) => Promise<void>;
   /** Flash a bubble briefly; rapid calls reschedule so the latest target wins. */
   flashUserMessage: (itemId: string) => void;
   /** Queue an "@"-mention chip into the active composer from outside it. */
@@ -3268,6 +3268,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (!sessionId) return;
     const scopedState = conversationId ? (setterForState(conversationId) ?? get()) : get();
     const write = setterFor(sessionId);
+    const originalBlock = scopedState.blocks.find(
+      (b): b is ElicitationBlock => b.type === "elicitation" && b.elicitationId === elicitationId,
+    );
+    if (
+      originalBlock?.nativeDelivery &&
+      (originalBlock.status !== "pending" || originalBlock.nativeDelivery.state === "sending")
+    )
+      return;
     const targetSessionId =
       scopedState.blocks.find(
         (b): b is ElicitationBlock => b.type === "elicitation" && b.elicitationId === elicitationId,
@@ -3289,7 +3297,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     write((s) => ({
       blocks: s.blocks.map((b) =>
         b.type === "elicitation" && b.elicitationId === elicitationId
-          ? { ...b, status: "responded", response: responseValue }
+          ? b.nativeDelivery
+            ? {
+                ...b,
+                nativeDelivery: { ...b.nativeDelivery, state: "sending", action },
+                response: responseValue,
+              }
+            : { ...b, status: "responded", response: responseValue }
           : b,
       ),
     }));
@@ -3318,8 +3332,15 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // answered.
       write((s) => ({
         blocks: s.blocks.map((b) =>
-          b.type === "elicitation" && b.elicitationId === elicitationId
-            ? { ...b, status: "pending", response: null }
+          b.type === "elicitation" &&
+          b.elicitationId === elicitationId &&
+          (!b.nativeDelivery || (b.status === "pending" && b.response === responseValue))
+            ? {
+                ...b,
+                status: "pending",
+                response: null,
+                ...(b.nativeDelivery ? { nativeDelivery: originalBlock?.nativeDelivery } : {}),
+              }
             : b,
         ),
       }));
@@ -3605,9 +3626,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  loadMoreHistory: async () => {
-    const { conversationId, oldestItemId, loadingMoreHistory, hasMoreHistory, historyGeneration } =
-      get();
+  loadMoreHistory: async (sessionId) => {
+    const conversationId = sessionId ?? get().conversationId;
+    const conversation = sessionId ? conversationRegistry.peek(sessionId)?.getState() : get();
+    if (!conversation) return;
+    const { oldestItemId, loadingMoreHistory, hasMoreHistory, historyGeneration } = conversation;
     if (!conversationId || !oldestItemId || loadingMoreHistory || !hasMoreHistory) return;
     // Pin the originating conversation: this page belongs to it, and it may be
     // backgrounded before the fetch lands. Resolving the target afterwards would
@@ -5284,6 +5307,7 @@ function reconcileElicitationBlocks(
   snapshotPending: AnyBlock[],
   preGapPendingIds: Set<string>,
   preGapAutoResolvedIds: Set<string>,
+  preGapCards: Map<string, ElicitationBlock>,
 ): AnyBlock[] | null {
   const pendingNow = new Set(
     snapshotPending
@@ -5295,6 +5319,19 @@ function reconcileElicitationBlocks(
   const patched = blocks.map((b) => {
     if (b.type !== "elicitation") return b;
     renderedIds.add(b.elicitationId);
+    const currentDelivery = snapshotPending.find(
+      (candidate): candidate is ElicitationBlock =>
+        candidate.type === "elicitation" && candidate.elicitationId === b.elicitationId,
+    );
+    if (b.nativeDelivery && preGapCards.get(b.elicitationId) !== b) return b;
+    if (
+      currentDelivery?.nativeDelivery &&
+      !b.nativeDeliveryResolved &&
+      (b.status === "pending" || b.response?.action === "auto_resolved")
+    ) {
+      changed = true;
+      return { ...currentDelivery, ctx: b.ctx };
+    }
     if (
       b.status === "pending" &&
       preGapPendingIds.has(b.elicitationId) &&
@@ -5311,6 +5348,7 @@ function reconcileElicitationBlocks(
     if (
       b.status === "responded" &&
       b.response?.action === "auto_resolved" &&
+      !b.nativeDelivery &&
       preGapAutoResolvedIds.has(b.elicitationId) &&
       pendingNow.has(b.elicitationId)
     ) {
@@ -5374,15 +5412,18 @@ function withoutRebuiltUserInputCards(
 function captureElicitationIdsByStatus(blocks: AnyBlock[]): {
   pending: Set<string>;
   autoResolved: Set<string>;
+  cards: Map<string, ElicitationBlock>;
 } {
+  const cards = new Map<string, ElicitationBlock>();
   const pending = new Set<string>();
   const autoResolved = new Set<string>();
   for (const b of blocks) {
     if (b.type !== "elicitation") continue;
+    cards.set(b.elicitationId, b);
     if (b.status === "pending") pending.add(b.elicitationId);
     else if (b.response?.action === "auto_resolved") autoResolved.add(b.elicitationId);
   }
-  return { pending, autoResolved };
+  return { pending, autoResolved, cards };
 }
 
 function blockWallClockS(block: AnyBlock): number | undefined {
@@ -5439,7 +5480,7 @@ async function rehydrateWindowOnReconnect(
   id: string,
   session: Session,
   preGapIds: Set<string>,
-  preGapElicitations: { pending: Set<string>; autoResolved: Set<string> },
+  preGapElicitations: ReturnType<typeof captureElicitationIdsByStatus>,
   set: Setter,
   get: Getter,
   ignoredNativeMessageIds: Set<string>,
@@ -5483,6 +5524,7 @@ async function rehydrateWindowOnReconnect(
         snapshotPending,
         preGapElicitations.pending,
         preGapElicitations.autoResolved,
+        preGapElicitations.cards,
       ) ?? merged;
     return {
       ...statusPatch,
@@ -5675,6 +5717,7 @@ async function reconcileOnReconnect(
       snapshotPending,
       preGapElicitations.pending,
       preGapElicitations.autoResolved,
+      preGapElicitations.cards,
     );
     if (reconciled !== null) nextBlocks = reconciled;
     nextBlocks =
@@ -6524,13 +6567,23 @@ export function isStaleCompletedResponse(s: { activeResponse: ActiveResponse | n
  * already in flight, and `submitApproval` owns rolling that back if
  * its POST fails.
  */
-function revivePendingElicitationBlock(set: Setter, elicitationId: string): void {
+function revivePendingElicitationBlock(
+  set: Setter,
+  elicitationId: string,
+  incoming?: ElicitationBlock,
+): void {
   set((s) => {
     const idx = s.blocks.findIndex(
       (b) => b.type === "elicitation" && b.elicitationId === elicitationId,
     );
     if (idx === -1) return {};
     const target = s.blocks[idx] as ElicitationBlock;
+    if (target.nativeDeliveryResolved) return {};
+    if (incoming?.nativeDelivery) {
+      if (target.status === "responded" && target.response?.action !== "auto_resolved") return {};
+      const updated = { ...incoming, ctx: target.ctx };
+      return { blocks: [...s.blocks.slice(0, idx), updated, ...s.blocks.slice(idx + 1)] };
+    }
     if (target.status !== "responded" || target.response?.action !== "auto_resolved") return {};
     const updated: ElicitationBlock = { ...target, status: "pending", response: null };
     return { blocks: [...s.blocks.slice(0, idx), updated, ...s.blocks.slice(idx + 1)] };
@@ -6754,9 +6807,15 @@ export async function pumpStreamEvents(
       // to answerable in place.
       if (block.type === "elicitation") {
         const eid = block.elicitationId;
-        if (buffer.some((b) => b.type === "elicitation" && b.elicitationId === eid)) continue;
+        const buffered = buffer.findIndex(
+          (b) => b.type === "elicitation" && b.elicitationId === eid,
+        );
+        if (buffered !== -1) {
+          if (block.nativeDelivery) buffer[buffered] = { ...block, ctx: buffer[buffered].ctx };
+          continue;
+        }
         if (get().blocks.some((b) => b.type === "elicitation" && b.elicitationId === eid)) {
-          revivePendingElicitationBlock(set, eid);
+          revivePendingElicitationBlock(set, eid, block);
           continue;
         }
       }
@@ -6997,7 +7056,7 @@ export function committedItemProvesDelivery(
  * @param replyDraft - Outgoing reply metadata.
  * @returns `true` when nothing differs, or when no draft is tracked for the id.
  */
-function restoredSendDraftUnchanged(
+export function restoredSendDraftUnchanged(
   restored: ConversationState["restoredSendDraft"],
   stableId: string,
   text: string,
@@ -7012,6 +7071,30 @@ function restoredSendDraftUnchanged(
     outgoing.every((file) => restored.files.includes(file)) &&
     JSON.stringify(restored.replyDraft ?? null) === JSON.stringify(replyDraft ?? null)
   );
+}
+
+/** Consume a session's failed send once, retaining retry identity only when restored. */
+export function takeFailedSendDraft(conversationId: string, hasDraft: boolean) {
+  const state = setterForState(conversationId);
+  const failed = state?.failedSendDraft;
+  if (!state || !failed || failed.conversationId !== conversationId) return null;
+  const delivered = committedItemProvesDelivery(state.blocks, failed);
+  const restore = !hasDraft && !delivered;
+  const patch: Partial<ConversationState> = { failedSendDraft: null };
+  if (!delivered) patch.pendingRetryStableId = restore ? (failed.stableId ?? null) : null;
+  // A discarded failure must not untrack an earlier draft still in the composer.
+  if (restore && failed.stableId)
+    patch.restoredSendDraft = {
+      conversationId,
+      stableId: failed.stableId,
+      text: failed.text,
+      files: failed.files,
+      replyDraft: failed.replyDraft,
+      serverRefused: failed.serverRefused,
+      delivered: false,
+    };
+  setterFor(conversationId)(patch);
+  return restore ? failed : null;
 }
 
 /**
@@ -8426,13 +8509,17 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           (b) =>
             b.type === "elicitation" &&
             b.elicitationId === event.elicitationId &&
-            b.status === "pending",
+            !b.nativeDeliveryResolved &&
+            (b.status === "pending" || Boolean(b.nativeDelivery)),
         );
         if (matchIdx === -1) return {};
         const target = s.blocks[matchIdx] as ElicitationBlock;
         const updated: ElicitationBlock = {
           ...target,
           status: "responded",
+          ...(target.nativeDelivery
+            ? { nativeDeliveryResolved: event.reason !== "unanswered" }
+            : {}),
           // Carry the verdict when the event delivers one so an approval
           // answered on another surface reads "Approved"/"Rejected";
           // fall back to the neutral pill only when it is truly unknown.

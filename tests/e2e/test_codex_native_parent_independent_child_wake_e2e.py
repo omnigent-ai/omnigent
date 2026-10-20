@@ -159,7 +159,7 @@ def test_codex_native_parent_woken_by_independent_child(
         },
         "os_env": {
             "type": "caller_process",
-            "cwd": str(_workspace),
+            "cwd": ".",
             "sandbox": {"type": "none"},
         },
     }
