@@ -408,9 +408,11 @@ def test_composer_pr_link_opens_github_tab(
             )
         ).to_be_visible()
         if pr_count > 1:
-            expect(panel.get_by_role("combobox", name="Session pull request")).to_have_text(
-                f"example.com/acme/app #{_PR_NUMBER}"
-            )
+            expect(
+                panel.get_by_role("list", name="Session pull requests").locator(
+                    'button[aria-current="true"]'
+                )
+            ).to_have_accessible_name(f"example.com/acme/app #{_PR_NUMBER} — Add the GitHub tab")
     finally:
         page.screenshot(path=tmp_path / "composer-pr-link-after-click.png", animations="disabled")
 

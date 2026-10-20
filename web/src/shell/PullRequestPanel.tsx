@@ -61,6 +61,14 @@ import { parsePatchFiles, type FileDiffMetadata } from "@pierre/diffs";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -74,7 +82,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
-import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { RunnerOfflineError, useWorkspaceAsleep } from "@/hooks/useWorkspaceChangedFiles";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
@@ -89,7 +96,6 @@ import {
   useSetPullRequestPreference,
   useUpdateSessionPr,
   type NormalizedPullRequestInfo,
-  type PullRequestAssociation,
   type PullRequestChangedFile,
   type PullRequestCheckRun,
   type PullRequestChecks,
@@ -97,6 +103,7 @@ import {
   type PullRequestInfo,
   type PullRequestReviewer,
 } from "@/hooks/usePullRequests";
+import { PullRequestList, pullRequestIdentity } from "./PullRequestList";
 
 // Shiki bundled themes matching the app's editor look; the concrete side is
 // chosen by `themeType` from the app's resolved light/dark mode.
@@ -140,7 +147,7 @@ function PullRequestEmptyState({
 }
 
 /** The provider icon with the panel title, or icon-only (provider named for screen
- *  readers) where the PR picker needs the room. */
+ *  readers) beside the PR count. */
 function PanelTitle({ copy, showTitle = false }: { copy: GitProviderCopy; showTitle?: boolean }) {
   const Icon = copy.Icon;
   return (
@@ -1027,23 +1034,10 @@ function SidebarNode({
 }
 
 /** A PR's picker label, in its own provider's copy (else the session's). */
-function pullRequestLabel(pr: PullRequestAssociation, sessionProvider?: string | null): string {
-  const copy = gitProviderCopy(pr.provider ?? sessionProvider, undefined, pr.provider_display);
-  const host = pr.host === copy.defaultHost ? "" : `${pr.host}/`;
-  const inferred = pr.relationship === "inferred" ? " (from branch)" : "";
-  const identity = `${host}${pr.repository} ${copy.prNumberPrefix}${pr.number}${inferred}`;
-  const title = pr.title?.trim();
-  return title ? `${identity} — ${title}` : identity;
-}
-
 export function PullRequestPanel({ conversationId }: { conversationId: string }) {
-  const isMobileViewport = useIsMobileViewport();
   const [selection, setSelection] = useState<{ sessionId: string; url?: string }>();
-  const [prPickerOpen, setPrPickerOpen] = useState(false);
-  const [prPickerTooltipOpen, setPrPickerTooltipOpen] = useState(false);
-  // Select focuses rows on both pointer hover and keyboard navigation.
-  const [focusedPrUrl, setFocusedPrUrl] = useState<string>();
   const [linking, setLinking] = useState(false);
+  const [confirmingUnlink, setConfirmingUnlink] = useState(false);
   const [url, setUrl] = useState("");
   const selected = selection?.sessionId === conversationId ? selection.url : undefined;
   const info = usePullRequestInfo(conversationId, { poll: true, prUrl: selected });
@@ -1108,6 +1102,12 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
   const prs = associations?.prs ?? [];
   const selectedPr = prs.find((pr) => pr.url === (selected ?? associations?.selected_pr_url));
   const linkInEmptyState = prs.length === 0 && panelState.kind === "no-pr";
+  // An unlink failure is reported in its confirmation dialog, not beside the link form.
+  const unlinkFailed = update.isError && update.variables?.action === "remove";
+  const unlinkTitle =
+    (info.data?.selected_pr_url === selectedPr?.url ? info.data?.pr?.title : undefined)?.trim() ||
+    selectedPr?.title?.trim();
+  const unlinkIdentity = selectedPr ? pullRequestIdentity(selectedPr, associations?.provider) : "";
   const linkControls = (
     <>
       {linking && (
@@ -1151,7 +1151,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
           </Button>
         </form>
       )}
-      {update.isError && (
+      {update.isError && !unlinkFailed && (
         <p role="alert" className="mt-1 text-ui text-destructive">
           {update.error.message}
         </p>
@@ -1185,71 +1185,9 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
           <PanelTitle copy={copy} showTitle={prs.length === 0} />
           <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
             {prs.length > 0 && (
-              <TooltipProvider>
-                <Select
-                  open={prPickerOpen}
-                  onOpenChange={(open) => {
-                    setPrPickerOpen(open);
-                    setPrPickerTooltipOpen(false);
-                    setFocusedPrUrl(undefined);
-                  }}
-                  value={selected ?? associations.selected_pr_url ?? ""}
-                  onValueChange={changeSelection}
-                >
-                  <Tooltip
-                    open={prPickerTooltipOpen && !prPickerOpen}
-                    onOpenChange={(open) => setPrPickerTooltipOpen(open && !prPickerOpen)}
-                  >
-                    <TooltipTrigger asChild>
-                      <SelectTrigger
-                        aria-label="Session pull request"
-                        className="min-w-0 flex-1 *:data-[slot=select-value]:block *:data-[slot=select-value]:truncate"
-                      >
-                        <SelectValue />
-                      </SelectTrigger>
-                    </TooltipTrigger>
-                    {selectedPr && (
-                      <TooltipContent className="wrap-anywhere">
-                        {pullRequestLabel(selectedPr, associations.provider)}
-                      </TooltipContent>
-                    )}
-                  </Tooltip>
-                  <SelectContent
-                    position="popper"
-                    align="start"
-                    className="w-(--radix-select-trigger-width)"
-                    onKeyDown={(event) => {
-                      if (event.key === "Escape") setPrPickerOpen(false);
-                    }}
-                  >
-                    {prs.map((pr) => (
-                      <Tooltip key={pr.url} open={prPickerOpen && focusedPrUrl === pr.url}>
-                        <TooltipTrigger asChild>
-                          <SelectItem
-                            value={pr.url}
-                            onFocus={() => setFocusedPrUrl(pr.url)}
-                            onBlur={() =>
-                              setFocusedPrUrl((current) =>
-                                current === pr.url ? undefined : current,
-                              )
-                            }
-                            className="*:[span]:last:block *:[span]:last:min-w-0 *:[span]:last:truncate"
-                          >
-                            {pullRequestLabel(pr, associations.provider)}
-                          </SelectItem>
-                        </TooltipTrigger>
-                        <TooltipContent
-                          side={isMobileViewport ? "bottom" : "left"}
-                          className="wrap-anywhere"
-                          style={isMobileViewport ? { pointerEvents: "none" } : undefined}
-                        >
-                          {pullRequestLabel(pr, associations.provider)}
-                        </TooltipContent>
-                      </Tooltip>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </TooltipProvider>
+              <span className="truncate text-xs text-muted-foreground">
+                {prs.length === 1 ? "1 pull request" : `${prs.length} pull requests`}
+              </span>
             )}
             <div className="ml-auto flex shrink-0 items-center gap-1">
               {refreshButton}
@@ -1261,14 +1199,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
                   <IconButton
                     label="Unlink PR"
                     disabled={update.isPending}
-                    onClick={() =>
-                      update.mutate(
-                        { url: selected, action: "remove" },
-                        {
-                          onSuccess: (data) => changeSelection(data.selected_pr_url),
-                        },
-                      )
-                    }
+                    onClick={() => setConfirmingUnlink(true)}
                   >
                     <Trash2Icon className="size-3.5" aria-hidden="true" />
                   </IconButton>
@@ -1283,8 +1214,18 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
           {refreshButton}
         </div>
       ) : null}
-      {showTrackingControls && (linking || update.isError) && (
+      {showTrackingControls && (linking || (update.isError && !unlinkFailed)) && (
         <div className="shrink-0 border-b border-border p-2">{linkControls}</div>
+      )}
+      {showTrackingControls && prs.length > 0 && (
+        <PullRequestList
+          key={conversationId}
+          conversationId={conversationId}
+          associations={prs}
+          sessionProvider={associations?.provider}
+          selectedUrl={selected ?? associations?.selected_pr_url}
+          onSelect={changeSelection}
+        />
       )}
       {info.data?.warnings?.length || info.data?.discovery_warnings?.length ? (
         <p
@@ -1294,6 +1235,69 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
           {[...(info.data?.warnings ?? []), ...(info.data?.discovery_warnings ?? [])].join(" ")}
         </p>
       ) : null}
+      <Dialog
+        open={confirmingUnlink && !!selectedPr}
+        onOpenChange={(open) => {
+          if (!update.isPending) setConfirmingUnlink(open);
+        }}
+      >
+        <DialogContent showCloseButton={!update.isPending}>
+          <DialogHeader>
+            <DialogTitle>Unlink this {fallbackCopy.requestName}?</DialogTitle>
+            <DialogDescription>
+              This session stops tracking it, even if the agent works on it again. The{" "}
+              {fallbackCopy.requestName} itself is not changed on {fallbackCopy.label}, and you can
+              link it again at any time.
+            </DialogDescription>
+          </DialogHeader>
+          {selectedPr && (
+            <div className="min-w-0 rounded-md border border-border px-3 py-2">
+              {unlinkTitle && <p className="text-ui font-medium wrap-anywhere">{unlinkTitle}</p>}
+              <a
+                href={selectedPr.url}
+                target="_blank"
+                rel="noreferrer"
+                className="text-xs text-muted-foreground wrap-anywhere hover:underline"
+              >
+                {unlinkIdentity}
+              </a>
+            </div>
+          )}
+          {unlinkFailed && (
+            <p role="alert" className="text-ui text-destructive">
+              {update.error.message}
+            </p>
+          )}
+          <DialogFooter>
+            <Button
+              variant="ghost"
+              disabled={update.isPending}
+              onClick={() => setConfirmingUnlink(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              loading={update.isPending}
+              disabled={update.isPending || !selected}
+              onClick={() =>
+                selected &&
+                update.mutate(
+                  { url: selected, action: "remove" },
+                  {
+                    onSuccess: (data) => {
+                      setConfirmingUnlink(false);
+                      changeSelection(data.selected_pr_url);
+                    },
+                  },
+                )
+              }
+            >
+              Unlink
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
       <div className="min-h-0 flex-1">
         <PullRequestPanelDetails
           key={`${conversationId}:${selected ?? ""}`}
