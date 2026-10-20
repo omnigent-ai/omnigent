@@ -6,7 +6,7 @@ import type { Comment } from "@/hooks/useComments";
 import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
 import { FileViewerContext } from "./FileViewerContext";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
-import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
+import { HTML_PREVIEW_SANDBOX, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
 import { highlightCode } from "@/components/ai-elements/code-block";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
@@ -27,7 +27,9 @@ vi.mock("./MarkdownRichTextViewer", () => ({ MarkdownRichTextViewer: () => null 
 // Stub the lazy Monaco editor so the heavy monaco-editor bundle isn't loaded in
 // jsdom; its presence in the DOM is the signal that a file was routed to Monaco.
 vi.mock("./MonacoCodeEditor", () => ({
-  MonacoCodeEditor: () => <div data-testid="monaco-editor-stub" />,
+  MonacoCodeEditor: ({ largeMarkdown }: { largeMarkdown?: boolean }) => (
+    <div data-testid="monaco-editor-stub" data-large-markdown={String(!!largeMarkdown)} />
+  ),
 }));
 // Stub the lazy PdfViewer so react-pdf / the pdf.js worker (no PDF engine in
 // jsdom) never load; its testid presence is the signal that a file was routed
@@ -1183,3 +1185,14 @@ it.each([true, false])(
     }
   },
 );
+
+describe("large Markdown source fallback", () => {
+  it.each(["editor", "preview", "source"] as const)("uses Monaco in %s mode", async (viewMode) => {
+    vi.mocked(highlightCode).mockClear();
+    renderViewer("a".repeat(MAX_RICH_MARKDOWN_BYTES + 1), true, "large.md", { viewMode });
+    expect(await screen.findByTestId("monaco-editor-stub")).toBeVisible();
+    expect(screen.getByTestId("monaco-editor-stub")).toHaveAttribute("data-large-markdown", "true");
+    expect(highlightCode).not.toHaveBeenCalled();
+    expect(screen.queryByText(/too large to load fully/)).not.toBeInTheDocument();
+  });
+});

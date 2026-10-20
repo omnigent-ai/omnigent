@@ -914,3 +914,42 @@ def test_markdown_diff_url_stays_stable_across_responsive_layouts(
         )
         transitions.append("1" if enabled else None)
         assert page.evaluate("window.diffUrlTransitions") == transitions
+
+
+def test_large_markdown_citation_and_unsaved_resize(
+    page: Page, seeded_session: BrowserSession
+) -> None:
+    """Large Markdown uses source for citations and preserves drafts on mobile."""
+    path = "src/large.md"
+    destination = "src/small.md"
+    content = "# Large file\n" + "A paragraph for source viewing.\n" * 35_000
+    content += "Final large Markdown line."
+    _mock_markdown_files(page, seeded_session, {path: content, destination: "# Small"})
+    _post_message(seeded_session, f"[End of document]({path}:{len(content.splitlines())})")
+    viewer = _open_viewer(
+        page, seeded_session, path, {"diffActive": False, "previewableViewMode": "preview"}
+    )
+    editor = viewer.locator(".monaco-editor")
+    expect(editor).to_be_visible(timeout=30_000)
+    expect(viewer.get_by_text("Large Markdown file opened as source", exact=False)).to_be_visible()
+    page.get_by_role("button", name="End of document", exact=True).click()
+    page.wait_for_function(
+        _CENTERED_LINE, arg={"text": "Final large Markdown line.", "diff": False}
+    )
+    viewer.locator(".view-lines").click()
+    page.keyboard.press("ControlOrMeta+Home")
+    page.keyboard.type("Unsaved large Markdown draft\n")
+    # The mock rejects writes, so resizing must preserve the unsaved editor.
+    expect(viewer.get_by_text("Save failed", exact=True)).to_be_visible(timeout=15_000)
+    editor.evaluate("el => window.largeMarkdownEditor = el")
+    for width in (390, 1600):
+        page.set_viewport_size({"width": width, "height": 1000})
+        expect(editor).to_be_visible()
+        expect(viewer.locator(".view-lines")).to_contain_text("Unsaved large Markdown draft")
+        assert editor.evaluate("el => el === window.largeMarkdownEditor")
+        if width == 390:
+            viewer.get_by_role("button", name="Close file viewer", exact=True).click()
+            dialog = page.get_by_role("dialog", name="Unsaved changes")
+            expect(dialog).to_be_visible()
+            dialog.get_by_role("button", name="Keep editing", exact=True).click()
+    expect(viewer.locator(".tiptap")).to_have_count(0)

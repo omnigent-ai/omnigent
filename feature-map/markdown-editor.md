@@ -15,6 +15,8 @@ and the recording protocol for comparing revisions.
 - `responsive`: desktop and mobile show the file and retain edits and drafts.
 - `load`: fixed mixed-content documents expose parsing and rendering costs.
 - `offline`: unsaved edits remain guarded when the workspace cannot save.
+- `large-files`: files above 1 MiB open as editable source; truncated files
+  remain read-only, with full-file download available.
 
 ## How to get to it (user POV)
 
@@ -111,6 +113,15 @@ This does not cover every Markdown shape or establish a safe 1 MiB limit.
   `tests/e2e_ui/files/test_right_panel.py::test_file_viewer_download_saves_the_complete_file`
   includes a single-line Markdown file beyond the server read cap. Its loaded
   prefix must render read-only, and downloading must preserve the entire file.
+- `direct-link`, `large-files`, `edit-save`:
+  `tests/e2e_ui/files/test_file_autosave.py::test_large_markdown_source_autosaves`
+  edits a complete file above 1 MiB in source, verifies every saved byte through
+  the real server, finds its final line, and shrinks it below the limit. Source
+  stays mounted until reload, which then restores the rich editor.
+- `chat-link`, `large-files`, `mobile`:
+  `tests/browser_ui/files/test_file_line_navigation.py::test_large_markdown_citation_and_unsaved_resize`
+  follows a final-line citation, rejects saves, and preserves the unsaved source
+  editor through phone/desktop resizing and the mobile close guard.
 - `direct-link`, `edit-save`:
   `tests/e2e_ui/files/test_file_autosave.py::test_markdown_edit_autosaves`
   confirms the edit, undo, and redo through fresh filesystem API reads from
@@ -142,6 +153,11 @@ instead of treating one comparison clip as complete feature verification.
 
 ## Gotchas
 
+- The automatic source fallback uses UTF-8 bytes, not JavaScript string length.
+  It applies above 1 MiB regardless of the saved view preference. The choice
+  stays fixed for that file visit so an autosave cannot replace an editor with
+  newer unsaved edits. Reopen another file and return, or reload, to reassess.
+  This is an initial-load guard, not a live cap on edits or external updates.
 - File editing uses TipTap. Chat Markdown, read-only Preview, and Source use
   different rendering paths; speeding up one does not validate the others.
 - Task-list tokenization and table-start detection bound the source passed to

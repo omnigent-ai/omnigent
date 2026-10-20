@@ -71,6 +71,7 @@ import {
   indexToLine,
   isBinaryPath,
   isImageFile,
+  isMarkdownTooLargeForRichView,
   isModelFile,
   isNotebookPath,
   isPdfFile,
@@ -90,9 +91,7 @@ import { MarkdownTableOfContents } from "./MarkdownTableOfContents";
 import { VideoPlayer } from "@/components/VideoPlayer";
 import { isVideoFile } from "@/lib/video";
 
-// Monaco is heavy (~MBs + worker); load it only when a non-markdown file is
-// actually viewed, so the initial bundle and markdown/preview paths don't pay
-// for it.
+// Lazy-load Monaco so small Markdown and preview surfaces avoid its bundle.
 const MonacoCodeEditor = lazy(() =>
   import("./MonacoCodeEditor").then((m) => ({ default: m.MonacoCodeEditor })),
 );
@@ -505,6 +504,8 @@ export interface CodeViewerProps {
   searchFocusNonce?: number;
   searchInputRef: RefObject<HTMLInputElement | null>;
   viewMode: "editor" | "preview" | "source" | "diff";
+  /** FileViewer keeps this choice stable across autosaves for the current file. */
+  markdownSourceFallback?: boolean;
   onDirtyChange?: (isDirty: boolean) => void;
   /**
    * Forwarded to the Monaco editor only — it reports its auto-save lifecycle so
@@ -542,6 +543,7 @@ export function CodeViewer({
   searchFocusNonce,
   searchInputRef,
   viewMode,
+  markdownSourceFallback,
   onDirtyChange,
   onSaveStatusChange,
   pendingBodyRef,
@@ -597,14 +599,17 @@ export function CodeViewer({
   // must drop to read-only when this is set.
   const truncated = fileQuery.data?.truncated ?? false;
   const lang = detectLang(path);
-  // Non-markdown files render in Monaco (read-only or editable by permission);
-  // markdown keeps TipTap (editor) / Shiki (source) and HTML keeps its preview.
-  const showMonaco = lang !== "markdown" && viewMode !== "preview";
+  const markdownTooLarge = useMemo(
+    () => markdownSourceFallback ?? isMarkdownTooLargeForRichView(lang, content),
+    [markdownSourceFallback, lang, content],
+  );
+  // Large Markdown shares the virtualized code editor and its save/permission rules.
+  const showMonaco = markdownTooLarge || (lang !== "markdown" && viewMode !== "preview");
   // HTML, markdown, and notebook previews render through their own surfaces and
   // never read the Shiki tokens, so skipping them avoids a wasted full-file pass.
   const isHtmlPreview = viewMode === "preview" && lang === "html";
   const isMarkdownOrNotebookPreview =
-    viewMode === "preview" && (lang === "markdown" || isNotebookPath(path));
+    viewMode === "preview" && ((lang === "markdown" && !markdownTooLarge) || isNotebookPath(path));
   const isRenderedPreview = isHtmlPreview || isMarkdownOrNotebookPreview;
   // Only the Shiki DOM path needs the per-line split; skip it for Monaco and
   // rendered previews, which never render these lines.
@@ -688,7 +693,7 @@ export function CodeViewer({
     matchLineRefs.current.get(idx)?.scrollIntoView({ block: "center", behavior: "smooth" });
   }, [searchQuery, currentMatchIdx]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const isMarkdownEditor = viewMode === "editor" && lang === "markdown";
+  const isMarkdownEditor = viewMode === "editor" && lang === "markdown" && !markdownTooLarge;
 
   // Markdown editor mode has its own find bar (MarkdownSearchBar), driven by the
   // shared `searchOpen` toggle. Cmd+F opens it and Escape closes it; the bar
@@ -932,7 +937,7 @@ export function CodeViewer({
     );
   }
 
-  if (viewMode === "editor" && lang === "markdown") {
+  if (isMarkdownEditor) {
     return (
       <MarkdownRichTextViewer
         content={content}
@@ -1008,6 +1013,7 @@ export function CodeViewer({
           path={path}
           isSettled={fileQuery.isSuccess}
           truncated={truncated}
+          largeMarkdown={markdownTooLarge}
           onDirtyChange={onDirtyChange}
           onSaveStatusChange={onSaveStatusChange}
           searchOpen={searchOpen}
