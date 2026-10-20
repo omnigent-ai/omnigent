@@ -112,8 +112,10 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_COLLABORATION_MODES,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
     _DEVIN_NATIVE_WRAPPER_LABEL_VALUE,
+    _MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S,
     _logger,
     _managed_launch_tasks,
+    _unbound_managed_launch_tasks,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -626,9 +628,28 @@ def register_core_routes(
         )
         startup = getattr(request.app.state, "startup_inputs", None)
 
+        async def record_unbound_launch_failure() -> None:
+            # Shutdown gave up on the launch. Bound, the host's replica finishes
+            # it; unbound, no replica can, so fail the saved inputs rather than
+            # leave them pending with nothing to deliver them.
+            assert startup is not None
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is not None and conv.host_id is None:
+                await startup.record_launch_failure(
+                    session_id, "the server shut down before the sandbox finished launching"
+                )
+
         async def launch_and_record_failure() -> None:
             try:
                 await launch
+            except asyncio.CancelledError:
+                if startup is not None:
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(
+                            record_unbound_launch_failure(),
+                            timeout=_MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S,
+                        )
+                raise
             except Exception as exc:
                 if startup is not None:
                     await startup.record_launch_failure(
@@ -641,7 +662,9 @@ def register_core_routes(
 
         launch_task = asyncio.create_task(launch_and_record_failure())
         _managed_launch_tasks.add(launch_task)
+        _unbound_managed_launch_tasks.add(launch_task)
         launch_task.add_done_callback(_managed_launch_tasks.discard)
+        launch_task.add_done_callback(_unbound_managed_launch_tasks.discard)
 
     async def _check_requested_host_id(
         request: Request, requested_host_id: str, user_id: str | None

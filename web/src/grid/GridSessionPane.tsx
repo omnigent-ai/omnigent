@@ -12,11 +12,8 @@ import { useCanEdit } from "@/hooks/usePermissions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useSession, useRootSessionId } from "@/hooks/useSession";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
-import { terminalTabKey, useTerminals, useDeleteTerminal } from "@/hooks/useTerminals";
-import {
-  useWorkspaceChangedFiles,
-  useWorkspaceEnvironment,
-} from "@/hooks/useWorkspaceChangedFiles";
+import { terminalTabKey, useDeleteTerminal } from "@/hooks/useTerminals";
+import { useWorkspaceResources } from "@/shell/useWorkspaceResources";
 import { supportsBrowser } from "@/lib/nativeBridge";
 import { Link } from "@/lib/routing";
 import {
@@ -67,7 +64,6 @@ export function GridSessionPane({
   const state = useConversationEntryState(sessionId);
   const canEdit = useCanEdit(sessionId);
   const permissionLevel = session?.permissionLevel ?? (canEdit ? null : 1);
-  const canBrowse = canEdit || session?.shareWorkspaceFiles === true;
   const grids = useGridSessions()!;
   const title = session?.title || "Session";
   const {
@@ -95,10 +91,20 @@ export function GridSessionPane({
   const liveness = useSessionLiveness(sessionId, livenessRowFromSession(session));
   const rootSessionId = useRootSessionId(sessionId, session?.parentSessionId);
   const { children: childSessions } = useChildSessions(rootSessionId);
-  const environment = useWorkspaceEnvironment(sessionId, { enabled: canBrowse });
-  const changedFiles = useWorkspaceChangedFiles(sessionId, { enabled: canBrowse });
-  const showFiles = canBrowse && environment.data?.available !== false;
-  const { terminals } = useTerminals(sessionId);
+  const {
+    canBrowseWorkspace: canBrowse,
+    environmentQuery: environment,
+    showFilesPanel: showFiles,
+    changedCount,
+    isChangedPath,
+    terminals,
+    openTerminals,
+  } = useWorkspaceResources({
+    sessionId,
+    permissionLevel,
+    shareWorkspaceFiles: session?.shareWorkspaceFiles,
+    terminalPending: state.terminalPending,
+  });
   const deleteTerminal = useDeleteTerminal(sessionId);
   const closingTerminal = terminals.find((terminal) => terminal.id === deleteTerminal.variables);
   const [pendingClose, setPendingClose] = useState<string | null>(null);
@@ -203,8 +209,7 @@ export function GridSessionPane({
       workspaceRoot: environment.data?.root ?? null,
       workspaceHome: environment.data?.home ?? null,
       sessionHostId: session?.hostId,
-      isChangedPath: (path: string) =>
-        changedFiles.data?.data.some((file) => file.path === path) ?? false,
+      isChangedPath,
     }),
     [
       openFile,
@@ -214,7 +219,7 @@ export function GridSessionPane({
       sessionId,
       environment.data,
       session?.hostId,
-      changedFiles.data,
+      isChangedPath,
     ],
   );
   const rightRailTab =
@@ -331,7 +336,7 @@ export function GridSessionPane({
               showGithubTab={showFiles}
               showBrowserTab={supportsBrowser()}
               onReveal={onOpenWorkspace}
-              changedCount={changedFiles.data?.data.length ?? 0}
+              changedCount={changedCount}
               subagentsWorking={childSessions.filter((child) => child.busy).length}
               agentCount={childSessions.length + 1}
               rootSessionId={rootSessionId}
@@ -343,7 +348,7 @@ export function GridSessionPane({
               onShowScopeView={() => selectTab(rightRailTab)}
               onCommentsOpenChange={() => {}}
               openTerminalTab={openTerminal}
-              openTerminals={terminals.map(terminalTabKey)}
+              openTerminals={openTerminals}
               selectedTerminalKey={workspace.selectedTerminalKey ?? null}
               closingTerminalKey={
                 deleteTerminal.isPending && closingTerminal ? terminalTabKey(closingTerminal) : null

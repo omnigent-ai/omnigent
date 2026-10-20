@@ -152,6 +152,9 @@ fills the grid area. Drag a cell titlebar onto another cell to swap positions,
 or focus the title and press Space, choose a cell with the arrow keys, and
 press Space again. Escape cancels. The sidebar's Delete grid menu action forgets
 only the grid, leaving sessions untouched. Unknown local grids show a recovery link.
+Grids wait for account identity; if it is unavailable, use Reload to retry.
+Failed sends restore text and supported attachments unless the cell has a newer draft.
+Quoted replies recover as serialized text.
 
 **Import:** open Settings → Import sessions, or choose **Import your recent
 sessions** on the empty landing. Choose a machine, harness, and recent count
@@ -334,12 +337,12 @@ plain `uv run pytest`, which starts a private server for the test.
 
 - **`session-grid` (browser contract):**
   `tests/browser_ui/chat/test_session_grid.py` drives sidebar drops, previews,
-  the four-pane limit, independent sends and live updates, reloads, pane closure,
+  the four-pane limit, independent sends, rejected-send recovery and live updates, reloads, pane closure,
   keyboard menu creation, inline rename/cancel/persistence, active-cell selection,
   shared workspace contents and width persistence, grid-wide maximize, rejected
   drops without navigation, sidebar
   reopening/deletion, titlebar rearrangement and cancellation, narrow-view
-  workspaces, and missing/disabled grid routes. With the flag absent or false,
+  workspaces, identity recovery, and missing/disabled grid routes. With the flag absent or false,
   ordinary session routes retain native link dragging and expose no grid menus,
   drop targets, or saved-grid sidebar entries. Run with `--browser-ui-skip-build --video=on` after building.
   Layout combinations and malformed local storage have unit coverage in

@@ -4,11 +4,20 @@ import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { toast } from "sonner";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { GridWorkspace } from "./GridWorkspace";
+import type { ReactNode } from "react";
 import { gridSessionIds, splitGrid } from "./gridLayout";
 import { GridSessionsProvider, useGridSessions } from "./GridSessionsContext";
 
-const identity = vi.hoisted(() => ({ viewer: "alice", server: "one" }));
-vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => identity.viewer }));
+const identity = vi.hoisted(() => ({
+  viewer: "alice" as string | null,
+  server: "one",
+  ready: true,
+}));
+vi.mock("@/hooks/useViewerId", () => ({
+  useViewerId: () => identity.viewer,
+  useIdentityReady: () => identity.ready,
+}));
 vi.mock("@/lib/host", () => ({ getOmnigentServerIdentity: () => identity.server }));
 
 function Probe() {
@@ -44,12 +53,8 @@ function Probe() {
   );
 }
 
-function tree(path: string, enabled = true) {
-  const element = (
-    <GridSessionsProvider>
-      <Probe />
-    </GridSessionsProvider>
-  );
+function tree(path: string, enabled = true, children: ReactNode = <Probe />) {
+  const element = <GridSessionsProvider>{children}</GridSessionsProvider>;
   return (
     <CapabilitiesProvider
       info={{ ...FALLBACK_SERVER_INFO, features: { grid_sessions_display_ui: enabled } }}
@@ -66,6 +71,7 @@ function tree(path: string, enabled = true) {
 
 beforeEach(() => {
   identity.viewer = "alice";
+  identity.ready = true;
   identity.server = "one";
   localStorage.clear();
 });
@@ -176,4 +182,70 @@ it("keeps a trimmed custom name through layout changes and reloads", () => {
   render(tree(path));
   expect(screen.getByTestId("name")).toHaveTextContent("My work");
   expect(screen.getByTestId("order")).toHaveTextContent("second,first");
+});
+
+vi.mock("@/canvas/CanvasWorkspace", () => ({
+  CanvasWorkspace: ({ children }: { children: ReactNode }) => children,
+}));
+vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => ({}) }));
+
+it("never accesses anonymous grids and preserves the session subtree through identity recovery", () => {
+  const key = "omnigent:session-grids:one:anonymous";
+  localStorage.setItem(
+    key,
+    JSON.stringify([{ id: "old", layout: splitGrid("first", "first", "second", "right") }]),
+  );
+  const read = vi.spyOn(Storage.prototype, "getItem");
+  const write = vi.spyOn(Storage.prototype, "setItem");
+  identity.viewer = null;
+  const view = render(tree("/c/first"));
+  fireEvent.click(screen.getByText("Split"));
+  expect(screen.getByTestId("path")).toHaveTextContent("/c/first");
+  expect(screen.getByTestId("count")).toHaveTextContent("0");
+  expect(read).not.toHaveBeenCalledWith(key);
+  expect(write).not.toHaveBeenCalled();
+  identity.viewer = "alice";
+  view.rerender(tree("/c/first"));
+  fireEvent.click(screen.getByText("Split"));
+  expect(screen.getByTestId("count")).toHaveTextContent("1");
+  identity.viewer = null;
+  view.rerender(tree("/c/first"));
+  expect(screen.getByTestId("count")).toHaveTextContent("0");
+  identity.viewer = "bob";
+  view.rerender(tree("/c/first"));
+  expect(screen.getByTestId("count")).toHaveTextContent("0");
+  view.unmount();
+
+  const session = () =>
+    tree(
+      "/c/first",
+      true,
+      <GridWorkspace active={false}>
+        <input aria-label="Draft" />
+      </GridWorkspace>,
+    );
+  identity.viewer = null;
+  const ordinary = render(session());
+  const input = screen.getByRole("textbox");
+  fireEvent.change(input, { target: { value: "Do not remount" } });
+  identity.viewer = "alice";
+  ordinary.rerender(session());
+  expect(screen.getByRole("textbox")).toBe(input);
+  expect(input).toHaveValue("Do not remount");
+});
+
+it("distinguishes loading identity, unavailable identity and a missing saved grid", () => {
+  const grid = () =>
+    tree("/grid/missing", true, <GridWorkspace active={false}>{null}</GridWorkspace>);
+  identity.viewer = null;
+  identity.ready = false;
+  const view = render(grid());
+  expect(screen.getByRole("heading")).toHaveTextContent("Loading grid");
+  identity.ready = true;
+  view.rerender(grid());
+  expect(screen.getByRole("button", { name: "Reload" })).toBeVisible();
+  identity.viewer = "alice";
+  view.rerender(grid());
+  expect(screen.getByText(/isn’t saved on this device/)).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Reload" })).toBeNull();
 });
