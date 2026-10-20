@@ -96,10 +96,12 @@ def test_dictation_streams_transcript_into_composer(
             timeout=_TRANSCRIPT_TIMEOUT_MS,
         )
 
+        # A second click finishes the take and sends it once. The composer
+        # clears and the dictated sentence is the user message.
         mic.click()
         expect(mic).to_have_attribute("aria-pressed", "false")
-        # Stopping must not clobber the finalized text.
-        expect(composer).to_have_value(re.compile(re.escape(_FAKE_SCRIPT)))
+        expect(composer).to_have_value("")
+        expect(page.get_by_text(_FAKE_SCRIPT).first).to_be_visible()
     finally:
         context.close()
 
@@ -130,20 +132,27 @@ def test_hotkey_toggles_dictation(
         # audio flows.
         page.keyboard.press("Control+Alt+KeyV")
         expect(mic).to_have_attribute("aria-pressed", "true", timeout=_TRANSCRIPT_TIMEOUT_MS)
+        composer = page.get_by_placeholder("Send a message…")
+        expect(composer).to_have_value(
+            re.compile(re.escape(_FAKE_SCRIPT)),
+            timeout=_TRANSCRIPT_TIMEOUT_MS,
+        )
 
-        # Stop via the hotkey.
+        # The chord ends the take and keeps the text. It does not send;
+        # the mic button and Enter do that.
         page.keyboard.press("Control+Alt+KeyV")
         expect(mic).to_have_attribute("aria-pressed", "false")
+        expect(composer).to_have_value(re.compile(re.escape(_FAKE_SCRIPT)))
     finally:
         context.close()
 
 
-def test_enter_while_listening_commits_text(
+def test_enter_while_listening_sends_text(
     browser: Browser,
     browser_context_args: dict[str, Any],
     seeded_session: tuple[str, str],
 ) -> None:
-    """Enter ends dictation but keeps the dictated text in the composer."""
+    """Enter ends dictation, sends the dictated text once, and clears the composer."""
     base_url, session_id = seeded_session
     context, page = _open_server_dictation_page(
         browser, browser_context_args, base_url, session_id
@@ -162,12 +171,12 @@ def test_enter_while_listening_commits_text(
             timeout=_TRANSCRIPT_TIMEOUT_MS,
         )
 
-        # Enter commits: dictation ends and the text stays. The capture-phase
-        # handler also preempts the composer's Enter-to-send, so the draft is
-        # not submitted — asserting the text is still present proves both.
+        # Enter flushes the take and sends once. The capture-phase handler
+        # owns the key, so the composer does not also submit it.
         page.keyboard.press("Enter")
         expect(mic).to_have_attribute("aria-pressed", "false")
-        expect(composer).to_have_value(re.compile(re.escape(_FAKE_SCRIPT)))
+        expect(composer).to_have_value("")
+        expect(page.get_by_text(_FAKE_SCRIPT).first).to_be_visible()
     finally:
         context.close()
 
@@ -206,27 +215,30 @@ def test_transcript_lands_at_the_caret(
             timeout=_TRANSCRIPT_TIMEOUT_MS,
         )
 
-        mic.click()
-        expect(mic).to_have_attribute("aria-pressed", "false")
-        # The dictated words lead and the pasted block still trails them.
+        # While the take is live the dictated words lead the pasted block.
+        # A second click would send; Escape discards back to the snapshot,
+        # which is what this test needs in order to dictate again.
         expect(composer).to_have_value(f"{_FAKE_SCRIPT} PASTED CONTEXT")
+        page.keyboard.press("Escape")
+        expect(mic).to_have_attribute("aria-pressed", "false")
+        expect(composer).to_have_value("PASTED CONTEXT")
 
         # Second take with the caret moved back to the top: the caret must be
-        # honoured again rather than the text chaining onto the first take.
-        # (The related empty-interim-clear regression can't be reached here —
-        # the fake engine always finalizes a non-empty tail, so the mic takes
-        # the onTranscript branch instead of onInterim(""). That path is
-        # covered in web/src/hooks/useDictationInsert.test.tsx.)
+        # honoured again. (The related empty-interim-clear regression can't be
+        # reached here — the fake engine always finalizes a non-empty tail, so
+        # the mic takes the onTranscript branch instead of onInterim(""). That
+        # path is covered in web/src/hooks/useDictationInsert.test.tsx.)
         composer.click()
         page.keyboard.press("Control+Home")
         mic.click()
         expect(mic).to_have_attribute("aria-pressed", "true")
         expect(composer).to_have_value(
-            f"{_FAKE_SCRIPT} {_FAKE_SCRIPT} PASTED CONTEXT",
+            f"{_FAKE_SCRIPT} PASTED CONTEXT",
             timeout=_TRANSCRIPT_TIMEOUT_MS,
         )
-        mic.click()
+        page.keyboard.press("Escape")
         expect(mic).to_have_attribute("aria-pressed", "false")
+        expect(composer).to_have_value("PASTED CONTEXT")
     finally:
         context.close()
 

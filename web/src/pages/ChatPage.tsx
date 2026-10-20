@@ -134,6 +134,7 @@ import {
   serializeReplyDraft,
   snapshotReplyDraft,
   type ComposerDraft,
+  type ReplyDraft,
   type StoredReplyDraft,
 } from "@/lib/replyDraft";
 // Re-exported so existing tests importing these from "./ChatPage" keep working
@@ -3217,10 +3218,17 @@ function ComposerImpl(
 
   const submit = ({
     resetNativeInputSession = false,
-  }: { resetNativeInputSession?: boolean } = {}) => {
+    voiceDraft,
+  }: { resetNativeInputSession?: boolean; voiceDraft?: ReplyDraft } = {}) => {
+    // A voice finish calls this in the same turn it inserts the tail. React
+    // has not re-rendered, so the closed-over draft would miss those words.
+    const sourceDraft = voiceDraft ?? draft;
+    const sourceText = voiceDraft === undefined ? fullText : serializeReplyDraft(voiceDraft);
+    const sourceStored =
+      voiceDraft === undefined ? storedReplyDraft : snapshotReplyDraft(voiceDraft);
     // The /btw overlay locks the composer — never send while it's open.
     if (composerLockedByBtw) return;
-    const trimmed = fullText.trim();
+    const trimmed = sourceText.trim();
     // Allow send if there's text, attached files, OR "@"-tagged paths.
     if (
       (!trimmed && files.length === 0 && mentionedItems.length === 0) ||
@@ -3265,7 +3273,7 @@ function ComposerImpl(
       ? matchSlashCommandInvocation(trimmed, slashCommandNames)
       : null;
     if (
-      draft.quotes.length === 0 &&
+      sourceDraft.quotes.length === 0 &&
       (skill !== null || isSlashCommandText(trimmed)) &&
       files.length === 0 &&
       mentionedItems.length === 0
@@ -3346,19 +3354,19 @@ function ComposerImpl(
     // server queues the message and delivers it to the running task
     // (or starts a fresh one once the current drains). Escape still
     // interrupts.
-    if (trimmed) appendEntry(fullText, storedReplyDraft);
+    if (trimmed) appendEntry(sourceText, sourceStored);
     const sendFiles = files.length > 0 ? files : undefined;
-    if (draft.quotes.length > 0) {
+    if (sourceDraft.quotes.length > 0) {
       // Preserve authored whitespace and quote provenance, including mention markers.
       const outgoing = {
-        ...draft,
-        quotes: draft.quotes.map((quote, index) =>
+        ...sourceDraft,
+        quotes: sourceDraft.quotes.map((quote, index) =>
           index === 0 ? { ...quote, before: mentionPreamble + quote.before } : quote,
         ),
       };
       onSend(serializeReplyDraft(outgoing), sendFiles, snapshotReplyDraft(outgoing));
     } else {
-      const message = isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd();
+      const message = isSlashCommandText(trimmed) ? trimmed : sourceText.trimEnd();
       onSend(mentionPreamble + message, sendFiles);
     }
     dirtyRef.current = true;
@@ -3935,6 +3943,22 @@ function ComposerImpl(
                   dictation.replaceInterim(text);
                   dirtyRef.current = true;
                   resetCursor();
+                }}
+                onVoiceSend={() => {
+                  const spoken = dictation.readDraft();
+                  const voiceDraft: ReplyDraft =
+                    activeTextId === null
+                      ? { ...draft, text: spoken }
+                      : {
+                          ...draft,
+                          quotes: draft.quotes.map((quote) =>
+                            quote.id === activeTextId ? { ...quote, before: spoken } : quote,
+                          ),
+                        };
+                  // submit(), not the form handler: while a turn is running the
+                  // form's submit button is Interrupt, and ending dictation
+                  // must not abort that turn.
+                  submit({ voiceDraft, resetNativeInputSession: true });
                 }}
               />
               <TooltipProvider>

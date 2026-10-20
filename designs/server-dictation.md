@@ -239,11 +239,20 @@ Chrome never permanently downgrades the page. With no constructor at all
 
 New optional prop `onInterim?: (text: string) => void`. In server mode the
 button emits `onInterim` for partial frames and the existing
-`onTranscript` for finals. Both composers (`ChatPage`, `NewChatDialog`)
-share a small hook, `useDictationInsert(setValue)`, that appends finals and
-maintains a replaceable trailing interim region in the textarea value, so
-text forms live while speaking. When `onInterim` is absent (Web Speech
-mode), behavior is exactly today's.
+`onTranscript` for finals. The composers (`ChatPage`, `NewChatDialog`,
+`SideChatPane`) share a small hook, `useDictationInsert`, that appends
+finals and maintains a replaceable interim region in the textarea value, so
+text forms live while speaking. `readDraft()` returns that text in the same
+turn, before React re-renders, so a send can include the tail.
+
+While a take is live, clicking the mic or pressing Enter (including
+Cmd/Ctrl+Enter) flushes the tail once, calls optional `onVoiceSend`, and
+turns the mic off. The parent sends that draft once and does not use the
+agent Interrupt control. A recognizer sentence that arrives after the send
+is dropped. Escape still discards back to the pre-take snapshot and does
+not send or interrupt a running turn. Shift+Enter and Alt+Enter stay
+newlines. The ⌘⌥V hotkey still only toggles the take: stopping with the
+chord keeps the text so it can be edited.
 
 ## Testing
 

@@ -656,8 +656,11 @@ function SideChatComposer({
       .finally(() => setInterrupting(false));
   };
 
-  const submit = () => {
-    const trimmed = isSlashCommandText(text) ? text.trim() : text.trimEnd();
+  const submit = (overrideText?: string) => {
+    // A voice finish passes the draft the hook just wrote. ``text`` is still
+    // the previous render until React flushes that update.
+    const raw = overrideText ?? text;
+    const trimmed = isSlashCommandText(raw) ? raw.trim() : raw.trimEnd();
     if (pending) {
       if (trimmed.length === 0 || starting || !onStart) return;
       // Keep the text so a failed fork can be retried without re-typing.
@@ -821,6 +824,11 @@ function SideChatComposer({
                 onVoiceDiscard={() => setText(voiceSnapshotRef.current)}
                 onTranscript={(spoken) => dictation.appendFinal(spoken)}
                 onInterim={(spoken) => dictation.replaceInterim(spoken)}
+                onVoiceSend={() => {
+                  // submit(), never interruptSideChat: ending dictation must
+                  // not abort the side chat's running turn.
+                  submit(dictation.readDraft());
+                }}
               />
               <ComposerSendButton
                 type="button"
@@ -838,7 +846,7 @@ function SideChatComposer({
                 disabled={
                   showInterrupt ? interrupting || !interruptReady : !canSend || !ready || busy
                 }
-                onClick={showInterrupt ? interruptSideChat : submit}
+                onClick={showInterrupt ? interruptSideChat : () => submit()}
                 data-testid={showInterrupt ? "side-chat-interrupt" : "side-chat-send"}
               />
             </>
