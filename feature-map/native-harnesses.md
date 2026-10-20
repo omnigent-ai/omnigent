@@ -260,6 +260,13 @@ Cross-harness journeys:
   `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_codex_picker_offers_the_clis_catalog_and_default`
   (real host API and Codex CLI, with custom/bundled catalogs and a hidden default; desktop and mobile);
   see also [composer](./composer.md) for effort.
+- **`model-and-effort`, Codex configured profiles (own environment):**
+  `tests/e2e_ui/start_session/test_unpinned_codex_default_model.py`
+  records real terminal launches with no source model, a root configured model,
+  a selected file-profile model, and hidden configured models. The terminal must
+  preserve the selected configuration; an unlisted model is not evidence that it
+  is invalid. These checks send no inference. Profile and catalog cache edits run
+  in `tests/harnesses/codex_native/app_server/test_profile_catalog.py`.
 - **`model-and-effort`, managed sandbox before a host exists:**
   `tests/e2e_ui/start_session/test_sandbox_gateway_models_without_binding.py::test_sandbox_codex_picker_offers_gateway_models_before_a_host_exists`,
   `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_optional_gateway_preview_without_a_host`.

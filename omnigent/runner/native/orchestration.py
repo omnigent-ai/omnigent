@@ -4948,7 +4948,12 @@ async def _auto_create_codex_terminal(
         CodexAppServerClient,
         CodexAppServerResponseError,
         apply_codex_thread_effort,
+        bind_codex_catalog_backend,
         build_codex_native_server,
+        capture_codex_catalog_source,
+        codex_catalog_identity,
+        codex_catalog_launch_route,
+        codex_config_profile,
         codex_remote_resume_omits_permission_args,
         codex_session_meta_model_provider,
         fresh_codex_launch_catalog,
@@ -5025,16 +5030,21 @@ async def _auto_create_codex_terminal(
     # machine-level config, parity with the in-process harness (#2744).
     _launch_spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
     _codex_terminal_args = launch_config.terminal_launch_args or ()
-    _codex_launch = resolve_native_codex_launch(
-        model=default_model, spec=_launch_spec, terminal_launch_args=_codex_terminal_args
-    )
-    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
-
-    codex_binding = binding_for_harness(load_runtime_inference_config(), "codex-native")
     from omnigent.inner.codex_executor import _find_codex_cli
 
     _codex_cli_path = _find_codex_cli()
+    _catalog_source = capture_codex_catalog_source(
+        codex_path=_codex_cli_path, config_profile=codex_config_profile(_codex_terminal_args)
+    )
+    _codex_launch = resolve_native_codex_launch(
+        model=default_model, spec=_launch_spec, terminal_launch_args=_codex_terminal_args
+    )
+    _catalog_route = codex_catalog_launch_route(_codex_launch)
+    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+
+    codex_binding = binding_for_harness(load_runtime_inference_config(), "codex-native")
     _catalog_launch = None
+    _catalog_identity = None
     _fresh_codex_catalog: list[_JsonObject] | None = None
     try:
         _catalog_launch = await asyncio.to_thread(
@@ -5042,6 +5052,9 @@ async def _auto_create_codex_terminal(
             model=None,
             spec=_launch_spec,
             terminal_launch_args=_codex_terminal_args,
+        )
+        _catalog_identity = codex_catalog_identity(
+            _catalog_launch, _catalog_source, actual_route=_catalog_route
         )
         _fresh_codex_catalog = fresh_codex_launch_catalog(
             codex_path=_codex_cli_path,
@@ -5082,6 +5095,9 @@ async def _auto_create_codex_terminal(
                     model=None,
                     spec=_launch_spec,
                     terminal_launch_args=_codex_terminal_args,
+                )
+                _catalog_identity = codex_catalog_identity(
+                    _catalog_launch, _catalog_source, actual_route=_catalog_route
                 )
             # Read staleness before the fetch can start a background probe.
             # The fingerprint and probe must use this session's provider.
@@ -5165,6 +5181,8 @@ async def _auto_create_codex_terminal(
                     _codex_launch = dataclasses.replace(_codex_launch, model=_default_id)
         if _codex_catalog and not _codex_catalog_was_stale:
             _fresh_codex_catalog = _codex_catalog
+    if codex_catalog_launch_route(_codex_launch) != _catalog_route:
+        _catalog_identity = None
     _session_meta_provider = codex_session_meta_model_provider(_codex_launch)
     # Cancel any surviving forwarder first so its teardown closes the OLD app-server,
     # not the one registered below — and so it can't mirror alongside the new one.
@@ -5538,6 +5556,7 @@ async def _auto_create_codex_terminal(
     )
     app_server.listen_url = codex_ws_url
     await app_server.start()
+    app_server.catalog_identity = bind_codex_catalog_backend(_catalog_identity, codex_home)
     _AUTO_CODEX_APP_SERVERS[session_id] = app_server
     _AUTO_CODEX_BRIDGE_DIRS[session_id] = bridge_dir
 

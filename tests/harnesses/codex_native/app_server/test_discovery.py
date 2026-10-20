@@ -6,6 +6,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -844,3 +845,100 @@ async def test_codex_config_read_preserves_unrelated_errors() -> None:
     with pytest.raises(CodexAppServerResponseError):
         await app_server._read_codex_probe_default(client)
     client.request.assert_awaited_once()
+
+
+@pytest.mark.parametrize("configured_model", ["gpt-6.1-sol", "hidden-custom-model"])
+async def test_probe_codex_model_options_lists_the_selected_profiles_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    configured_model: str,
+) -> None:
+    """A ``--profile`` with its own model catalog is probed the way start-up runs it.
+
+    The root config names one catalog and the ``work`` profile another; the
+    probe home must list the profile's catalog and retain its configured pin.
+    Editing the profile's catalog must change the catalog fingerprint.
+    """
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    source = tmp_path / "source"
+    source.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source))
+    root_catalog = tmp_path / "root.json"
+    work_catalog = tmp_path / "work.json"
+    root_catalog.write_text(json.dumps({"models": [{"slug": "gpt-5.6-sol"}]}))
+    work_catalog.write_text(json.dumps({"models": [{"slug": "gpt-6.1-sol"}]}))
+    (source / "config.toml").write_text(
+        f'model = "gpt-5.6-sol"\nmodel_catalog_json = {json.dumps(str(root_catalog))}\n'
+        '[profiles.unselected.mcp_servers.user]\ncommand = "must-not-run"\n'
+    )
+    profile = source / "work.config.toml"
+    profile.write_text(
+        f"model = {json.dumps(configured_model)}\n"
+        f"model_catalog_json = {json.dumps(str(work_catalog))}\n"
+        '[mcp_servers.user]\ncommand = "must-not-run"\n'
+        "[hooks]\n[plugins]\n"
+    )
+    homes: list[Path] = []
+
+    async def _fake_start(**kwargs: Any) -> object:
+        homes.append(Path(kwargs["env"]["CODEX_HOME"]))
+        return object()
+
+    async def _catalog_rows(client: object) -> list[dict[str, object]]:
+        """Answer with the catalog the probe home's config selects, as Codex would."""
+        del client
+        config = tomllib.loads((homes[-1] / "config.toml").read_text())
+        catalog = json.loads(Path(config["model_catalog_json"]).read_text())
+        return [{"id": row["slug"], "isDefault": True} for row in catalog["models"]]
+
+    async def _version(codex_path: str) -> tuple[int, int, int]:
+        del codex_path
+        return (0, 145, 0)
+
+    monkeypatch.setattr(codex_native_app_server, "_codex_cli_version", _version)
+    monkeypatch.setattr(
+        codex_native_app_server, "_start_codex_model_discovery_process", _fake_start
+    )
+    monkeypatch.setattr(codex_native_app_server, "_wait_for_discovery_listener", AsyncMock())
+    monkeypatch.setattr(
+        codex_native_app_server, "_stop_codex_model_discovery_process", AsyncMock()
+    )
+
+    def _client(**_kwargs: Any) -> AsyncMock:
+        client = AsyncMock()
+
+        async def _request(method: str, params: object) -> dict[str, object]:
+            assert method == "config/read"
+            config = tomllib.loads((homes[-1] / "config.toml").read_text())
+            return {"result": {"config": {"model": config["model"]}}}
+
+        client.request.side_effect = _request
+        return client
+
+    monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", _client)
+    monkeypatch.setattr(codex_native_app_server, "list_codex_model_options", _catalog_rows)
+    work = NativeCodexLaunch([], None, None, config_profile="work")
+    root = NativeCodexLaunch([], None, None)
+
+    rows = await codex_native_app_server.probe_codex_model_options(
+        codex_path="/test/codex", launch=work
+    )
+    root_rows = await codex_native_app_server.probe_codex_model_options(
+        codex_path="/test/codex", launch=root
+    )
+
+    expected_row: dict[str, object] = {"id": "gpt-6.1-sol"}
+    if configured_model == "gpt-6.1-sol":
+        expected_row["isDefault"] = True
+    assert rows == [expected_row]
+    assert root_rows == [{"id": "gpt-5.6-sol", "isDefault": True}]
+    assert homes[0] != homes[1], "profile probes must not share a probe home"
+    profile_config = tomllib.loads((homes[0] / "config.toml").read_text())
+    assert not {"mcp_servers", "hooks", "plugins"} & profile_config.keys()
+    assert "mcp_servers" not in profile_config["profiles"]["unselected"]
+    before = codex_native_app_server.codex_catalog_fingerprint(work, codex_path="/test/codex")
+    profile.write_text(profile.read_text().replace(str(work_catalog), str(root_catalog)))
+    after = codex_native_app_server.codex_catalog_fingerprint(work, codex_path="/test/codex")
+    assert before != after
