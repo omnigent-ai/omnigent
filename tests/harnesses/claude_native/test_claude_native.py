@@ -8881,6 +8881,9 @@ def test_resolve_native_claude_config_managed_gateway_defers_to_ambient_key(
         spec=_no_auth_claude_spec(), refresh_models=False
     )
 
+    assert preview is not None
+    assert session is not None
+    assert preview.env["ANTHROPIC_BASE_URL"] == "https://api.anthropic.com"
     assert claude_native.claude_catalog_fingerprint(preview) == (
         claude_native.claude_catalog_fingerprint(session)
     )
