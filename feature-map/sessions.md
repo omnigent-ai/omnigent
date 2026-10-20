@@ -138,7 +138,11 @@ session, and drag another sidebar row over it. Hover **Split left/right/top/bott
 to preview, then drop. Split a remaining full-width or full-height pane again
 to reach three or four panes. Alternatively, use a row's menu or right-click
 menu → **Open in grid** and choose the pane and direction. Each pane has its own
-transcript and composer; one shared Workspace panel follows the active cell. Open the session full screen
+transcript and composer; terminal-capable sessions have a Chat/Terminal switch in
+each cell header, including on narrow screens. The shortcut ⌘/Ctrl+Alt+\ switches
+only the active cell. Choices survive reloads and follow the session into full
+screen; drafts and terminal connections survive view changes. Shared-session
+terminals are read-only for non-owners. One shared Workspace panel follows the active cell. Open the session full screen
 for additional controls; close a pane to expand its neighbor. Closing down to
 one pane returns to `/c/<id>`. Reopen saved grids in **Grids**, above Projects and Pinned, or use
 their `/grid/<id>` URL on the same browser. Double-click a grid title or use
@@ -338,6 +342,7 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`session-grid` (browser contract):**
   `tests/browser_ui/chat/test_session_grid.py` drives sidebar drops, previews,
   the four-pane limit, independent sends, rejected-send recovery and live updates, reloads, pane closure,
+  per-cell terminal input, switching without reattaching, active-cell shortcuts and mobile switches,
   keyboard menu creation, inline rename/cancel/persistence, active-cell selection,
   shared workspace contents and width persistence, grid-wide maximize, rejected
   drops without navigation, sidebar
