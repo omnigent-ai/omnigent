@@ -67,7 +67,7 @@ def test_prompt_wait_repaints_an_overdrawn_composer(
     monkeypatch.setattr(
         bridge, "_capture_pane", lambda *_: _READY_PANE if repainted_at else _OVERDRAWN_PANE
     )
-    monkeypatch.setattr(bridge, "_request_claude_repaint", repaint, raising=False)
+    monkeypatch.setattr(bridge, "_request_claude_repaint", repaint)
 
     bridge._wait_for_claude_prompt_ready("/tmp/test.sock", "main", timeout_s=30.0)
 
@@ -175,13 +175,13 @@ signal.signal(signal.SIGCONT, resume)
 while True:
     if pending:
         pending = False
+        with marker.open("a") as draws:
+            draws.write("drawn\n")
         sys.stdout.write(
             "\x1b[H\x1b[2Jtranscript\r\n" + rule + "\r\n❯ \r\n" + rule + "\r\n"
             "  status line\r\n"
         )
         sys.stdout.flush()
-        with marker.open("a") as draws:
-            draws.write("drawn\n")
     time.sleep(0.02)
 """
 
@@ -261,7 +261,7 @@ def test_real_overdrawn_composer_is_repainted_before_the_wait_gives_up(
     overdrawn_terminal: tuple[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     socket_path, marker = overdrawn_terminal
-    monkeypatch.setattr(bridge, "_CLAUDE_REPAINT_AFTER_S", 0.3, raising=False)
+    monkeypatch.setattr(bridge, "_CLAUDE_REPAINT_AFTER_S", 0.3)
     monkeypatch.setattr(bridge, "_TMUX_READY_SLOW_BOOT_TIMEOUT_S", 8.0)
 
     bridge._wait_for_claude_prompt_ready(socket_path, "main", timeout_s=1.0)
