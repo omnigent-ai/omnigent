@@ -41,13 +41,7 @@ function DropZone({
       style={style}
       className="pointer-events-auto absolute flex items-center justify-center"
       data-grid-drop-edge={edge}
-    >
-      {/* <span
-        className={`rounded-md border bg-background/95 px-3 py-2 text-sm shadow-sm ${isOver ? "border-primary text-primary" : "border-border text-muted-foreground"}`}
-      > */}
-      {/* Split {edge} */}
-      {/* </span> */}
-    </div>
+    />
   );
 }
 
