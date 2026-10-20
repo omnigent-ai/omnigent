@@ -1028,6 +1028,8 @@ def register_resource_routes(
         q: str = Query(min_length=1, max_length=4096, pattern=r".*\S.*"),
         case_sensitive: bool = False,
         regex: bool = False,
+        include: str = Query(default="", max_length=4096),
+        exclude: str = Query(default="", max_length=4096),
         limit: int = Query(default=500, ge=1, le=500),
     ) -> JSONResponse:
         """Search live file contents inside the session's environment."""
@@ -1037,7 +1039,13 @@ def register_resource_routes(
         await _ensure_session_registered(session_id)
         env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
         result = await search_content(
-            env, q, case_sensitive=case_sensitive, regex=regex, limit=limit
+            env,
+            q,
+            case_sensitive=case_sensitive,
+            regex=regex,
+            include=include,
+            exclude=exclude,
+            limit=limit,
         )
         return JSONResponse(result)
 

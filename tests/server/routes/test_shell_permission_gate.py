@@ -847,7 +847,14 @@ async def test_content_search_forwards_options(
     client: httpx.AsyncClient, runner_client: _RecordingRunnerClient
 ) -> None:
     path = "/v1/sessions/conv_share/resources/environments/default/content-search"
-    params = {"q": "  Needle.* & more  ", "case_sensitive": "true", "regex": "true", "limit": "7"}
+    params = {
+        "q": "  Needle.* & more  ",
+        "case_sensitive": "true",
+        "regex": "true",
+        "include": "src/**, *.{py,txt}",
+        "exclude": "**/tests/**, a & b/**",
+        "limit": "7",
+    }
     response = await client.get(
         path, params=params, headers={"X-Forwarded-Email": "owner@example.com"}
     )

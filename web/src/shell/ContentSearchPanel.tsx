@@ -26,6 +26,8 @@ interface ContentSearchInput {
   query: string;
   caseSensitive: boolean;
   regex: boolean;
+  include: string;
+  exclude: string;
 }
 
 export function ContentSearchPanel({
@@ -40,12 +42,12 @@ export function ContentSearchPanel({
   const queryClient = useQueryClient();
   const cachedInput = useQuery<ContentSearchInput>({
     queryKey: ["content-search-input", conversationId],
-    initialData: { query: "", caseSensitive: false, regex: false },
+    initialData: { query: "", caseSensitive: false, regex: false, include: "", exclude: "" },
     enabled: false,
     gcTime: Infinity,
   });
   const [input, setInput] = useState(cachedInput.data);
-  const { query, caseSensitive, regex } = input;
+  const { query, caseSensitive, regex, include, exclude } = input;
   useEffect(() => {
     queryClient.setQueryData(["content-search-input", conversationId], input);
   }, [conversationId, input, queryClient]);
@@ -60,6 +62,8 @@ export function ContentSearchPanel({
         q: query,
         case_sensitive: String(caseSensitive),
         regex: String(regex),
+        include,
+        exclude,
       });
       const response = await authenticatedFetch(
         `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/default/content-search?${params}`,
@@ -124,9 +128,37 @@ export function ContentSearchPanel({
             Regular expression
           </label>
         </div>
+        <details className="text-xs">
+          <summary className="cursor-pointer rounded text-muted-foreground focus-visible:outline focus-visible:outline-ring">
+            Files to search{include.trim() || exclude.trim() ? " (filtered)" : ""}
+          </summary>
+          <div className="mt-2 space-y-2">
+            <label className="block space-y-1">
+              <span>Include</span>
+              <Input
+                placeholder="e.g. src/**, *.{ts,tsx}"
+                maxLength={4096}
+                value={include}
+                onChange={(event) => setInput({ ...input, include: event.target.value })}
+              />
+            </label>
+            <label className="block space-y-1">
+              <span>Exclude</span>
+              <Input
+                placeholder="e.g. **/tests/**, *.min.js"
+                maxLength={4096}
+                value={exclude}
+                onChange={(event) => setInput({ ...input, exclude: event.target.value })}
+              />
+            </label>
+            <p className="text-muted-foreground">
+              Comma-separated globs. Exclude takes precedence.
+            </p>
+          </div>
+        </details>
         <p className="text-xs text-muted-foreground">
-          Searches workspace contents on disk. Respects readable ignore files; skips binary files
-          and .git.
+          Searches workspace contents on disk. Respects readable ignore files unless explicitly
+          included; skips binary files and .git.
         </p>
       </form>
       <div className="min-h-0 flex-1 overflow-auto p-2" aria-busy={search.isFetching}>
