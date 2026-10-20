@@ -11844,7 +11844,9 @@ def agent_add(source: str, yes: bool, list_only: bool, server: str | None) -> No
             _clone_github_source(clone_url, ref, checkout)
         except click.ClickException as exc:
             if not source.startswith(("github:", "https://")):
-                exc.message += f"\n(If {source!r} is a local path, it doesn't exist.)"
+                raise _agent_cli_error(
+                    f"{exc.message}\n(If {source!r} is a local path, it doesn't exist.)"
+                ) from None
             raise
         # The parser rejects `..`, so only a symlinked component can leave the subpath.
         root = checkout / subpath
@@ -13022,10 +13024,14 @@ def _run_databricks_browser_login(workspace_host: str, org_id: str | None = None
     """
     databricks_bin = shutil.which("databricks")
     if databricks_bin is None:
-        raise click.ClickException(
-            "The Databricks CLI is required to log in to a workspace. "
-            "Install it first: https://docs.databricks.com/dev-tools/cli/install.html"
+        from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+
+        exc = click.ClickException(
+            "Databricks CLI not found on PATH. Install it, then retry this command.\n"
+            "https://docs.databricks.com/dev-tools/cli/install.html"
         )
+        setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
+        raise exc
     login_host = _host_with_org(workspace_host, org_id)
     # Pin the grant to a profile named for the workspace's first DNS label so
     # distinct workspaces don't clobber each other under the CLI's ``DEFAULT``.

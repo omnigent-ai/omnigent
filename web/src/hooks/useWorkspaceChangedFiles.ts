@@ -751,6 +751,8 @@ export function resolveChatFilePath(
   // any stripping so a "trusted" absolute path doesn't carry these markers
   // past the existence-check heuristic and trigger a fetch that can't match.
   if (text.includes("://") || text.includes("?") || text.includes("#")) return null;
+  // Windows paths (`C:\x`, `\\host\x`) would otherwise pass as one relative segment.
+  if (/^[A-Za-z]:/.test(text) || text.includes("\\")) return null;
   let p = text;
   if (home && (p === "~" || p.startsWith("~/"))) {
     // Strip a trailing slash off home so "/" home (root user) doesn't

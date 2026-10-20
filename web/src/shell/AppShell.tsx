@@ -946,6 +946,8 @@ export function AppShell() {
     () =>
       ({
         files: showFilesPanel,
+        "content-search":
+          showFilesPanel && isFeatureEnabled(serverInfo, "workspace_content_search"),
         // Changes tab shares the Files gate — same on-disk workspace, just the
         // changed-files scope.
         changes: showFilesPanel,
@@ -963,7 +965,7 @@ export function AppShell() {
         // rail's tab strip (see WorkspacePanel's TerminalTabsStrip / "+"
         // menu). Mobile keeps a shells drawer (see ``showShellsTab`` below).
       }) as const,
-    [showFilesPanel],
+    [showFilesPanel, serverInfo],
   );
   // Whether the rail has anything at all to show. When false the workspace
   // card doesn't mount and the header hides its collapse toggle — a
@@ -1320,10 +1322,11 @@ export function AppShell() {
       // gated nav tab — always valid, and never a fallback target.
       if (tab === null) return fallbackTab;
       if (tab === "sidechat") return tab;
+      if (tab === "content-search" && serverInfo === "loading") return tab;
       if (railTabsAvailable[tab]) return tab;
       return fallbackTab;
     });
-  }, [railTabsAvailable, rightRailTab, openPanels, fallbackWorkspaceTab]);
+  }, [railTabsAvailable, rightRailTab, openPanels, fallbackWorkspaceTab, serverInfo]);
 
   // Closing a file must not reveal an unpinned scope that was never opened.
   useEffect(() => {
@@ -1771,7 +1774,7 @@ export function AppShell() {
       setCommandPaletteOpen((prev) => !sessionSearch || !prev);
     },
   );
-  useNewSessionHotkey(!isEmbedded);
+  useNewSessionHotkey();
   useSettingsHotkey();
 
   // Mobile back button: close the open file and return to the files/changes
@@ -2634,8 +2637,9 @@ export function AppShell() {
                     onClosePanel={closeWorkspacePanel}
                     showFilesPanel={showFilesPanel}
                     showGithubTab={railTabsAvailable.github}
+                    showContentSearch={railTabsAvailable["content-search"]}
                     showBrowserTab={railTabsAvailable.browser}
-                    onBrowserTabOpened={revealRightPanel}
+                    onReveal={revealRightPanel}
                     changedCount={changedCount}
                     subagentsWorking={subagentsWorking}
                     agentCount={agentCount}

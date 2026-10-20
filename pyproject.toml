@@ -354,11 +354,11 @@ test = [
     # `[tool.coverage.run]` below for the relative-files setting that makes
     # cross-runner combine work.
     "pytest-cov>=5",
-    "pytest-playwright>=0.7",
+    # Isolated pytest subprocesses use the plugin's built-in base-URL support.
+    "pytest-playwright>=0.10",
     # Visual-regression snapshot plugin for the e2e_ui suite. Provides the
     # `assert_snapshot` fixture + `--update-snapshots` flag the UI diff gate
     # uses (see tests/e2e_ui/visual/ and .github/workflows/ui-snapshot.yml).
-    # Requires pytest-playwright>=0.7 (hence the floor bump above).
     "pytest-playwright-visual-snapshot>=0.5.1",
     # Hash-partition the test suite across N shards for the nightly
     # matrix. Pinned to a known-stable older release. Used by e2e.yml;

@@ -961,6 +961,9 @@ describe("resolveChatFilePath", () => {
     ["/home/u/ws/foo.md?x=1", ROOT, HOME, null, "absolute with ?query → unresolvable"],
     ["/etc/hosts#L1", ROOT, HOME, null, "outside path with #fragment → unresolvable"],
     ["https://example.com/x", ROOT, HOME, null, "URL → unresolvable"],
+    ["C:\\Users\\u\\ws\\a.ts", ROOT, HOME, null, "Windows drive path → unresolvable"],
+    ["C:/Users/u/ws/a.ts", ROOT, HOME, null, "Windows drive path, forward slashes"],
+    ["\\\\host\\share\\a.ts", ROOT, HOME, null, "Windows UNC path → unresolvable"],
   ])("%o (root=%o, home=%o) → %o (%s)", (text, root, home, expected, _why) => {
     expect(
       resolveChatFilePath(text as string, root as string | null, home as string | null),

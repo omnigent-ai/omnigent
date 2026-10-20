@@ -341,18 +341,20 @@ def test_ensure_local_omnigent_server_respawn_injects_persisted_base_path(
     assert env["OMNIGENT_WEB_BASE_PATH"] == "/proxy/6767"
 
 
+@pytest.mark.parametrize("features", ["usage_page", "-claude_osc_status"])
 def test_server_config_signature_changes_with_features(
     monkeypatch: pytest.MonkeyPatch,
+    features: str,
 ) -> None:
     """Changing the startup feature set forces a managed-server respawn."""
     monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
-    sig_off = local_server.server_config_signature()
+    default_signature = local_server.server_config_signature()
 
-    monkeypatch.setenv("OMNIGENT_FEATURES", "usage_page")
-    sig_on = local_server.server_config_signature()
+    monkeypatch.setenv("OMNIGENT_FEATURES", features)
+    overridden_signature = local_server.server_config_signature()
 
-    assert sig_off != sig_on
-    assert sig_on == local_server.server_config_signature()
+    assert default_signature != overridden_signature
+    assert overridden_signature == local_server.server_config_signature()
 
 
 def test_server_config_signature_changes_with_session_title_instructions(

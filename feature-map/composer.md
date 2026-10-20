@@ -54,6 +54,11 @@ and steers messages while the agent is busy.
   working-directory selection follows the project's defaults, not the old session.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
   be removed. State: unsupported file type rejected without losing the message.
+- `dictation`: the microphone button beside the message box dictates speech
+  into the composer at the caret; ⌘/Ctrl+Alt+V toggles it unless focus is in a
+  terminal or code editor. While listening, Enter keeps the dictated text and
+  Escape discards it. The button is absent when neither the browser nor the
+  server can transcribe.
 - `send-shortcut`: Enter or Mod+Enter, chosen in settings; only one gesture sends.
   Shift+Enter and Alt/Option+Enter insert a newline in both composers.
 - `list-formatting`: typing `-`, `*`, `1.` or `1)` then Space at the start of a
@@ -61,7 +66,9 @@ and steers messages while the agent is busy.
   (numbers increment) and ends it after an empty item.
 - `focus-hotkey`: Ctrl+Shift+L focuses the in-session message box from anywhere
   in the session view (not on mobile).
-- `new-session-hotkey`: ⌘/Ctrl+Alt+N opens and focuses the new-session composer.
+- `new-session-hotkey`: ⌘+Shift+O on macOS or Ctrl+Shift+O on Windows/Linux
+  opens and focuses the new-session composer in browsers. Native shells retain
+  ⌘/Ctrl+Alt+N. Embedded apps require focus inside the app.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
   can be steered into the running turn.
 - `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
@@ -108,6 +115,8 @@ and steers messages while the agent is busy.
   dropping them on the transcript.
 - For Codex plugin skills, type `$<skill-name>` in Chat and select the
   namespaced suggestion. The vendor terminal owns its own completion menu.
+- Click the microphone button, or press ⌘/Ctrl+Alt+V, to dictate into the
+  message box; press Enter to keep the text or Escape to discard it.
 - Send while the agent is working to queue a message, then steer it.
 - Type `/n`, press Tab to complete `/new`, then Enter to open the new-session
   page in the same project. Selecting **/new** in Commands also opens it.
@@ -125,7 +134,8 @@ and steers messages while the agent is busy.
 - Open the host chip, expand **Offline hosts (N)**, then **Show more**. Check the
   same menu on mobile and with a managed sandbox available. Offline rows remain
   disabled; a remembered offline selection still requires an explicit switch.
-- From any page, press ⌘/Ctrl+Alt+N to open and focus a clean new-session
+- With the browser app focused, press ⌘+Shift+O (macOS) or
+  Ctrl+Shift+O (Windows/Linux) to open and focus a clean new-session
   composer.
 - Hover the model/effort pill to see the tooltip.
 - Hover the host chip to see the selected host or sandbox and its connection.
@@ -164,6 +174,7 @@ and steers messages while the agent is busy.
   to select it; for Databricks, first enter the workspace URL and choose
   **Connect workspace**. Bearer-token services require **Manage MCP accounts**
   before selection. Use **Reconnect** if a selected service loses its connection.
+- Dictate with the microphone button or ⌘/Ctrl+Alt+V before the first send.
 - Open the agent picker's custom agents, then Create custom agent → Import
   bundle: pick a `.tar.gz` agent bundle. It installs, closes the dialog, and
   selects the agent, which stays listed after a reload. A rejected bundle (for
@@ -324,6 +335,14 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/browser_ui/chat/test_composer_attachments.py::test_attach_supported_files_and_remove`,
   `tests/browser_ui/chat/test_composer_attachments.py::test_file_dropped_on_the_transcript_attaches`,
   `tests/browser_ui/chat/test_composer_attachments.py::test_landing_rejects_unsupported_type_and_keeps_message`
+- **`dictation`, in-session composer (own environment):**
+  `tests/e2e_ui/chat/test_dictation.py` streams a fake microphone through the
+  server's fake transcription engine, which only the test's own server enables;
+  run it with plain `uv run pytest`. It covers the button, the hotkey, Enter
+  keeping the text, Escape discarding it, and insertion at the caret.
+- **`dictation`, new-session composer:** no browser-level coverage. Manually:
+  on the landing page, click the microphone (or press ⌘/Ctrl+Alt+V), speak,
+  and expect the text in the message box; Escape restores the previous draft.
 - **`send-shortcut`:**
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_submit_with_mod_enter_persists_and_is_the_only_send_gesture`,
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_alt_enter_inserts_newline_in_both_composers`
@@ -424,3 +443,8 @@ Other connection providers alone do not enable the managed MCP picker.
   connections. Bearer-token accounts must be connected in settings first.
 - Managed MCP browser tests stub launch and authentication. They prove composer
   wiring; the HTTP integration test proves the real provider boundary.
+- Dictation normally uses browser speech recognition, with server fallback
+  when unavailable or a network error occurs. The desktop app prefers the
+  server when available. A verification instance without a transcription engine
+  depends on browser support; a missing microphone there does not prove that
+  dictation is unavailable on a configured server.
