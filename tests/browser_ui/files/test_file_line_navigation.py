@@ -921,10 +921,9 @@ def test_large_markdown_citation_and_unsaved_resize(
 ) -> None:
     """Large Markdown uses source for citations and preserves drafts on mobile."""
     path = "src/large.md"
-    destination = "src/small.md"
     content = "# Large file\n" + "A paragraph for source viewing.\n" * 35_000
     content += "Final large Markdown line."
-    _mock_markdown_files(page, seeded_session, {path: content, destination: "# Small"})
+    _mock_markdown_files(page, seeded_session, {path: content})
     _post_message(seeded_session, f"[End of document]({path}:{len(content.splitlines())})")
     viewer = _open_viewer(
         page, seeded_session, path, {"diffActive": False, "previewableViewMode": "preview"}
