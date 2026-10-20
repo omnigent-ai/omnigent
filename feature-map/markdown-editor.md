@@ -25,6 +25,8 @@ and the recording protocol for comparing revisions.
 - `direct-link`: open a session URL with a selected Markdown file.
 - `chat-link`: follow a Markdown file link in a message; a line citation opens
   Source at that line, rather than the rich editor.
+- `tool-row`: click the path on an agent's Read, Write, or Edit row for a
+  Markdown file, including one the agent just created; absolute paths open too.
 - `document-link`: follow a relative file link inside the editor's link popup.
 - `mobile`: use the session Files surface or a file link at a phone width.
 

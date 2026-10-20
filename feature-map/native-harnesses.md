@@ -23,6 +23,11 @@ implements them separately, so a fix for one harness does not reach the others.
   `--resume` picker that lists only this host's sessions) or by reopening it.
 - `steer`: sending while the harness is mid-turn steers the active turn.
 - `chat-render`: the harness's output renders in chat like other harnesses.
+  A single-file tool row (Read, Write, Edit) shows its path as a dotted link;
+  clicking it opens that file in the workspace viewer without expanding the
+  row. Absolute paths open workspace-relative under the session root and
+  host-absolute outside it; they stay plain text until the root is known.
+  Shell commands and multi-file patches have no file link.
 - `working-status`: quiet work stays working; waiting for input is explained;
   completion, interruption and process exit settle the indicator. A following
   turn and reconnect must not leave a stale idle or working state.
