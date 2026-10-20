@@ -42,7 +42,7 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
@@ -50,6 +50,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from tests._helpers.native_session import create_native_session
+from tests._helpers.polling import poll_until
 from tests.e2e_ui.conftest import (
     _REPO_ROOT,
     _TEST_AGENT_YAML,
@@ -305,17 +306,6 @@ def main():
 if __name__ == "__main__":
     main()
 '''
-
-
-def _wait_for(
-    predicate: Callable[[], bool], *, timeout_s: float = 30.0, interval_s: float = 0.5
-) -> None:
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(interval_s)
-    raise AssertionError("condition not met within timeout")
 
 
 def _pending_elicitations(base_url: str, session_id: str) -> list[dict]:
@@ -594,7 +584,7 @@ def test_concurrent_kiro_permissions_surface_serially(
     _send(page, "Run the three setup commands that each need shell approval.")
 
     # Kiro raised three concurrent permission requests in one recorder batch…
-    _wait_for(
+    poll_until(
         lambda: set(_REQUEST_IDS) <= _recorder_request_ids(record_file),
         timeout_s=120.0,
     )
@@ -615,8 +605,8 @@ def test_concurrent_kiro_permissions_surface_serially(
     expect(page.locator(f'{_APPROVAL_CARD}[data-state="responded"]').first).to_be_visible(
         timeout=30_000
     )
-    _wait_for(lambda: _REQUEST_IDS[0] in _recorder_response_ids(record_file), timeout_s=60.0)
-    _wait_for(
+    poll_until(lambda: _REQUEST_IDS[0] in _recorder_response_ids(record_file), timeout_s=60.0)
+    poll_until(
         lambda: (
             "requires approval" in _kiro_pane_text(bridge_dir)
             and "setup-step-beta" in _kiro_pane_text(bridge_dir)

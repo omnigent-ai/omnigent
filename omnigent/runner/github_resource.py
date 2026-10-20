@@ -1045,13 +1045,15 @@ def _pr_changed_files(root: str, reference: PullRequestRef | None) -> dict[str, 
         token=token,
     )
     if rc != 0:
-        return empty
+        raise ValueError("GitHub could not load the PR's changed files. Refresh to retry.")
     try:
         entries = json.loads(out)
     except ValueError:
-        return empty
+        raise ValueError(
+            "GitHub returned an invalid changed-file list. Refresh to retry."
+        ) from None
     if not isinstance(entries, list):
-        return empty
+        raise ValueError("GitHub returned an invalid changed-file list. Refresh to retry.")
 
     if reference:
         entries = [
@@ -1179,7 +1181,9 @@ def _pr_patch(root: str, reference: PullRequestRef | None) -> dict[str, Any]:
         _host_args(root, reference)
     repo_args = ["-R", _repo_argument(reference)] if reference else []
     rc, out, _ = _gh(["pr", "diff", str(number), *repo_args], cwd=root, token=token)
-    return {"object": "session.github.pr_diff", "patch": out if rc == 0 else ""}
+    if rc != 0:
+        raise ValueError("GitHub could not load the PR diff. Refresh or open the PR on GitHub.")
+    return {"object": "session.github.pr_diff", "patch": out}
 
 
 def _host_args(root: str, reference: PullRequestRef) -> list[str]:

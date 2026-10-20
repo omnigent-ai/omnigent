@@ -28,12 +28,13 @@ from __future__ import annotations
 import contextlib
 import secrets
 import threading
-import time
 from functools import partial
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests._helpers.polling import poll_until
 
 _APPROVAL_CARD = '[data-testid="approval-card"]'
 _INBOX_ITEM = '[data-testid="inbox-item"]'
@@ -86,16 +87,6 @@ def _is_parked(base_url: str, session_id: str, elicitation_id: str) -> bool:
     )
 
 
-def _wait_for(predicate, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> None:
-    """Poll *predicate* until truthy or the deadline passes."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(interval_s)
-    raise AssertionError("condition not met within timeout")
-
-
 def _park_permission_hook(
     base_url: str,
     session_id: str,
@@ -139,7 +130,7 @@ def _park_in_thread(base_url: str, session_id: str, elicitation_id: str) -> dict
     )
     sink["thread"] = worker
     worker.start()
-    _wait_for(partial(_is_parked, base_url, session_id, elicitation_id))
+    poll_until(partial(_is_parked, base_url, session_id, elicitation_id))
     return sink
 
 
@@ -266,7 +257,7 @@ def test_inbox_permission_card_offers_approve_and_switch_to_auto(
         # Honoring it from the inbox routes the verdict to the owning session:
         # the prompt drains and the hook gets the setMode(auto) decision.
         auto_button.click()
-        _wait_for(lambda: not _pending_elicitations(base_url, session_id))
+        poll_until(lambda: not _pending_elicitations(base_url, session_id))
         _assert_auto_mode_decision(sink)
     finally:
         _drain_pending(base_url, session_id)

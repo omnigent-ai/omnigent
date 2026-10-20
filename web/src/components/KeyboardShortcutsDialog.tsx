@@ -20,6 +20,7 @@ import {
   ENTER_KEY,
   Kbd,
   MOD_KEY,
+  newSessionShortcutKeys,
   SHIFT_KEY,
   VIEW_MODE_TOGGLE_KEYS,
 } from "@/components/KeyboardShortcut";
@@ -33,6 +34,8 @@ import {
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { hasCommandModifier } from "@/lib/hotkeys";
 import { isElectronShell, isNativeShell, supportsBrowser } from "@/lib/nativeBridge";
 
@@ -75,7 +78,6 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
   {
     title: "General",
     items: [
-      { label: "Start a new session", keys: [MOD_KEY, ALT_KEY, "N"] },
       { label: "Open command palette", keys: [MOD_KEY, "K"] },
       { label: "Find a session by name", keys: [MOD_KEY, ALT_KEY, "S"] },
       { label: "Open Settings", keys: [MOD_KEY, ALT_KEY, ","] },
@@ -107,6 +109,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Toggle Chat / Terminal view", keys: [...VIEW_MODE_TOGGLE_KEYS] },
       { label: "Toggle conversations sidebar", keys: [MOD_KEY, ALT_KEY, "["] },
       { label: "Focus or close workspace sidebar", keys: [MOD_KEY, ALT_KEY, "]"] },
+      { label: "Search workspace contents", keys: [MOD_KEY, SHIFT_KEY, "F"] },
       {
         label: "Select a workspace tab",
         keys: [MOD_KEY, ALT_KEY, "]", "1…4"],
@@ -145,8 +148,18 @@ function shortcutGroupsFor(
   browser: boolean,
   submitWithModEnter: boolean,
   preventsKeyboardSubmit: boolean,
+  contentSearch: boolean,
 ): ShortcutGroup[] {
   return SHORTCUT_GROUPS.map((group) => {
+    if (group.title === "General") {
+      return {
+        ...group,
+        items: [
+          { label: "Start a new session", keys: newSessionShortcutKeys(native) },
+          ...group.items,
+        ],
+      };
+    }
     if (group.title === "In chats" && !preventsKeyboardSubmit) {
       return {
         ...group,
@@ -176,10 +189,20 @@ function shortcutGroupsFor(
         ],
       };
     }
-    if (group.title === "View" && !browser) {
+    if (group.title === "View") {
       return {
         ...group,
-        items: group.items.filter((item) => item.label !== "Open a new browser tab"),
+        items: group.items
+          .filter(
+            (item) =>
+              (browser || item.label !== "Open a new browser tab") &&
+              (contentSearch || item.label !== "Search workspace contents"),
+          )
+          .map((item) =>
+            contentSearch && item.label === "Select a workspace tab"
+              ? { ...item, keys: [MOD_KEY, ALT_KEY, "]", "1…5"] }
+              : item,
+          ),
       };
     }
     return group;
@@ -200,12 +223,14 @@ export function KeyboardShortcutsList({
   const isMobileViewport = useIsMobileViewport();
   const isCoarsePointer = useIsCoarsePointer();
   const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
+  const serverInfo = useServerInfo();
   const groups = shortcutGroupsFor(
     isNativeShell(),
     isElectronShell(),
     supportsBrowser(),
     readSubmitWithModEnter(),
     preventsKeyboardSubmit,
+    !isMobileViewport && isFeatureEnabled(serverInfo, "workspace_content_search"),
   );
   const settings = variant === "settings";
   return (

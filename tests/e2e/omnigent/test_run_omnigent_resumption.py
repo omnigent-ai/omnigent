@@ -44,8 +44,12 @@ from __future__ import annotations
 import re
 import subprocess
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 
+import pytest
+
+from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 from tests.e2e.omnigent.conftest import configure_mock_llm
 
 # ``openai-agents`` is picked because it honors
@@ -59,6 +63,18 @@ _HARNESS = "openai-agents"
 # 180s matches the existing run_omnigent tests' headroom for DBOS
 # sqlite migrations + cold imports + one openai-agents turn.
 _RUN_TIMEOUT_SEC = 180
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_runtime(tmp_path: Path) -> Iterator[None]:
+    """Keep persistent daemons within the resumption test that owns their state."""
+    try:
+        yield
+    finally:
+        # A leaked host can reconnect when another test reuses its server's port
+        # and replace that test's host registration under the shared hostname.
+        _, survivors = reap_leaked_omnigent_processes(tmp_path / "home" / ".omnigent")
+        assert not survivors, f"Test runtime processes survived cleanup: {survivors}"
 
 
 def _make_nonce() -> str:

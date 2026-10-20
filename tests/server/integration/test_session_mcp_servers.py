@@ -357,3 +357,53 @@ def _single_yaml_bundle(yaml_text: str) -> bytes:
         info.size = len(data)
         tf.addfile(info, io.BytesIO(data))
     return buf.getvalue()
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "DELETE"])
+async def test_mcp_mutation_rejects_legacy_source_tool_bundle(
+    client: httpx.AsyncClient,
+    method: str,
+) -> None:
+    from omnigent.runtime import get_agent_store, get_artifact_store
+    from tests.server.test_bundles import _MIN_CONFIG, _make_bundle_bytes
+
+    session = await create_test_session(client, name="legacy-source-agent")
+    agent = get_agent_store().get(session["agent_id"])
+    assert agent is not None
+    artifacts = get_artifact_store()
+    assert artifacts is not None
+    legacy_bundle = _make_bundle_bytes(
+        {
+            "config.yaml": _MIN_CONFIG.format(name="legacy-source-agent"),
+            "tools/python/echo.py": "def echo(text: str) -> str:\n    return text\n",
+            "tools/mcp/docs.yaml": "name: docs\ntransport: http\nurl: https://example.com/mcp\n",
+        }
+    )
+    # Seed the old stored representation directly; current HTTP uploads reject it.
+    artifacts.put(agent.bundle_location, legacy_bundle)
+    path = f"/v1/sessions/{session['id']}/agent/mcp-servers"
+    if method != "POST":
+        path += "/docs"
+    payload = {"name": "updated", "transport": "http", "url": "https://example.com/mcp"}
+    response = await client.request(method, path, json=payload if method != "DELETE" else None)
+    assert response.status_code == 400, response.text
+    assert "may not ship a server-side Python/TS tool file" in response.text
+    persisted = get_agent_store().get(agent.id)
+    assert persisted is not None
+    assert persisted.bundle_location == agent.bundle_location
+    assert artifacts.get(agent.bundle_location) == legacy_bundle
+
+    # Replace the bundle to remove the obsolete source tool before editing MCP settings.
+    migrated = _make_bundle_bytes(
+        {
+            "config.yaml": _MIN_CONFIG.format(name="legacy-source-agent"),
+            "tools/mcp/docs.yaml": "name: docs\ntransport: http\nurl: https://example.com/mcp\n",
+        }
+    )
+    replaced = await client.put(
+        f"/v1/sessions/{session['id']}/agent",
+        files={"bundle": ("agent.tar.gz", migrated, "application/gzip")},
+    )
+    assert replaced.status_code == 200, replaced.text
+    response = await client.request(method, path, json=payload if method != "DELETE" else None)
+    assert response.status_code == (204 if method == "DELETE" else 200), response.text

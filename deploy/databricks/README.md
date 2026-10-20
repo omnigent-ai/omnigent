@@ -152,9 +152,9 @@ Volume wheel paths because `uv lock` validates path sources locally.
 
 Re-running is safe — every step is idempotent.
 
-Release features are off by default. Enable one or more for the whole app by
-adding the comma-separated deploy argument, then reload the web app after the
-redeploy:
+Override release-feature defaults using the comma-separated deploy argument:
+names enable, `-name` disables, and empty uses defaults. Reload the web app
+after the redeploy:
 
 ```bash
 --features usage_page,harness_install
@@ -164,7 +164,9 @@ The Canvas page is off by default; include `canvas` in `--features` for the
 apps that should show it.
 
 See [`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md) for the current
-inventory and rollback procedure.
+inventory and rollback procedure. Runner overrides such as `-claude_osc_status`
+also need to be set on separately running hosts; restart their host/runners
+and launch fresh terminals.
 
 > [!TIP]
 > The generated app lock defaults to public PyPI. To use a private index or

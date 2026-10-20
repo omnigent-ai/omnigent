@@ -98,8 +98,9 @@ TLS is affected).
 
 ## Release features
 
-Release features are deployment-wide and off by default. Set the
-comma-separated `OMNIGENT_FEATURES` value in `base/configmap.yaml`, apply your
+Override feature defaults with comma-separated names in `OMNIGENT_FEATURES`:
+a name enables, `-name` disables, and empty uses defaults. Set the value in
+`base/configmap.yaml`, apply your
 Kustomize target, and restart the Deployment so every pod receives one fresh
 startup snapshot:
 
@@ -109,7 +110,9 @@ kubectl rollout restart deployment/omnigent
 kubectl rollout status deployment/omnigent
 ```
 
-Use the same restart after removing a feature for rollback. See
+Use the same restart after adding `-feature_name` for rollback. Runner
+overrides such as `-claude_osc_status` also need to be set on separately
+running hosts; restart their host/runners and launch fresh terminals. See
 [`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md) for known keys.
 
 ## Deploy with an external database

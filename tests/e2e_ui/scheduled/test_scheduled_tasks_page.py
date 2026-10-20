@@ -40,15 +40,24 @@ def _builtin_agent_id(base_url: str, name: str) -> str:
     :param name: Built-in agent name, e.g. ``"hello_world"``.
     :returns: The agent id.
     """
-    resp = httpx.get(f"{base_url}/v1/agents", timeout=10.0)
-    resp.raise_for_status()
-    agents = resp.json()["data"]
-    matches = [a["id"] for a in agents if a["name"] == name]
-    assert matches, (
+    names: list[str] = []
+    after: str | None = None
+    with httpx.Client(base_url=base_url, timeout=10.0) as client:
+        while True:
+            resp = client.get("/v1/agents", params={"after": after} if after else {})
+            resp.raise_for_status()
+            result = resp.json()
+            for agent in result["data"]:
+                if agent["name"] == name:
+                    return agent["id"]
+                names.append(agent["name"])
+            if not result["has_more"]:
+                break
+            after = result["last_id"]
+    pytest.fail(
         f"built-in agent {name!r} not listed in /v1/agents "
-        f"(got {[a['name'] for a in agents]}) — nothing to seed a task against."
+        f"(got {names}) — nothing to seed a task against."
     )
-    return matches[0]
 
 
 def _create_task(
