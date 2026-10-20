@@ -3731,6 +3731,8 @@ function SectionHeader({
           ? cn(
               SIDEBAR_ROW,
               "group flex w-full items-center border-0 text-left text-foreground transition-colors",
+              // The row grows to fit 44px touch actions so neighbors never overlap.
+              showProjectHeaderActionsOnTouch && "no-fine-hover:min-h-11",
               SIDEBAR_HOVER_HIGHLIGHT,
               contextMenu && SIDEBAR_OPEN_MENU_HIGHLIGHT,
               active && SIDEBAR_ACTIVE_HIGHLIGHT,
@@ -4367,11 +4369,8 @@ function ConversationSection({
                     "flex items-center rounded transition-opacity",
                     // Hidden touch actions stay in the accessibility tree and tab
                     // order without a hit area; keyboard focus reveals them.
-                    showProjectHeaderActionsOnTouch === undefined
-                      ? undefined
-                      : showProjectHeaderActionsOnTouch
-                        ? "no-fine-hover:opacity-100"
-                        : "no-fine-hover:sr-only no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:not-sr-only",
+                    showProjectHeaderActionsOnTouch === false &&
+                      "no-fine-hover:sr-only no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:not-sr-only",
                     "fine-hover:md:opacity-0 fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100 fine-hover:md:group-hover/header:opacity-100 fine-hover:md:group-has-[[data-state=open]]/header:opacity-100 fine-hover:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 fine-hover:md:has-[[aria-expanded=true]]:opacity-100",
                   )}
                 >
@@ -7271,8 +7270,10 @@ function ProjectFolderMenu({
   actions: ProjectFolderMenuActions;
   showOnTouch: boolean;
 }) {
+  const [open, setOpen] = useState(false);
+  const mouseToggledRef = useRef(false);
   return (
-    <DropdownMenu>
+    <DropdownMenu open={open} onOpenChange={setOpen}>
       <DropdownMenuTrigger asChild>
         <Button
           type="button"
@@ -7281,7 +7282,16 @@ function ProjectFolderMenu({
           aria-label={`Project actions for ${projectName}`}
           data-testid="project-actions"
           className={cn("text-muted-foreground", showOnTouch && "no-fine-hover:size-11")}
-          onClick={(e) => e.stopPropagation()}
+          onPointerDown={(e) => {
+            // Touch and pen open on click so a scroll starting here never opens the menu.
+            mouseToggledRef.current = e.pointerType === "mouse";
+            if (!mouseToggledRef.current) e.preventDefault();
+          }}
+          onClick={(e) => {
+            e.stopPropagation();
+            if (!mouseToggledRef.current) setOpen((wasOpen) => !wasOpen);
+            mouseToggledRef.current = false;
+          }}
         >
           <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />
         </Button>

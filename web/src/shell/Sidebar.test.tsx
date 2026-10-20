@@ -2762,7 +2762,11 @@ describe("Sidebar project sections", () => {
       </QueryClientProvider>,
     );
 
-    fireEvent.pointerDown(screen.getByTestId("project-actions"), { button: 0, ctrlKey: false });
+    fireEvent.pointerDown(screen.getByTestId("project-actions"), {
+      button: 0,
+      ctrlKey: false,
+      pointerType: "mouse",
+    });
     fireEvent.click(await screen.findByTestId("project-new-session-menu"));
     expect(onClose).toHaveBeenCalled();
   });
@@ -2996,6 +3000,7 @@ describe("Sidebar project sections", () => {
     fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Customer X" }), {
       button: 0,
       ctrlKey: false,
+      pointerType: "mouse",
     });
     fireEvent.click(await screen.findByTestId("delete-project"));
 
@@ -3009,46 +3014,30 @@ describe("Sidebar project sections", () => {
     );
   });
 
-  it("keeps touch actions keyboard reachable when off and paints them when enabled", async () => {
+  it("applies the touch actions preference live and opens the touch menu on click", async () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
     ]);
     renderSidebar();
 
-    const shortcut = screen.getByRole("link", { name: "New session in Customer X" });
-    expect(shortcut).toHaveAttribute("href", "/?project=Customer%20X");
     const menuButton = screen.getByTestId("project-actions");
-    const cluster = menuButton.parentElement!;
-    expect(cluster).toContainElement(shortcut);
-    expect(cluster).toHaveClass("flex", "items-center");
     const revealWrapper = menuButton.closest("div[class*=transition-opacity]")!;
-    expect(revealWrapper).toHaveClass(
-      "no-fine-hover:sr-only",
-      "no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:not-sr-only",
-    );
     const header = document.querySelector<HTMLElement>('[data-project-order-name="Customer X"]')!;
-    expect(header).not.toHaveClass("pr-8");
-    expect(header).toHaveClass("fine-hover:pr-14", "fine-hover:md:pr-2");
-    expect(header.className).toContain(
-      "no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:pr-24",
-    );
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Customer X" }), {
-      button: 0,
-      ctrlKey: false,
-    });
-    const menuItem = await screen.findByTestId("project-new-session-menu");
-    expect(menuItem).not.toHaveClass("hidden");
-    expect(menuItem).toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:hidden");
-    expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
+    expect(revealWrapper).toHaveClass("no-fine-hover:sr-only");
+    expect(header).not.toHaveClass("no-fine-hover:min-h-11");
 
-    stubViewportWidth(390, true, true, false);
     act(() => writeShowProjectHeaderActionsOnTouch(true));
-    expect(revealWrapper).toHaveClass("no-fine-hover:opacity-100");
     expect(revealWrapper).not.toHaveClass("no-fine-hover:sr-only");
-    expect(header.className).toContain("no-fine-hover:pr-24");
-    expect(shortcut).toHaveClass("no-fine-hover:size-11");
-    expect(menuButton).toHaveClass("no-fine-hover:size-11");
+    expect(header).toHaveClass("no-fine-hover:min-h-11");
+
+    // A touch press alone (the start of a scroll) leaves the menu closed.
+    fireEvent.pointerDown(menuButton, { button: 0, ctrlKey: false, pointerType: "touch" });
+    expect(menuButton).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(menuButton);
+    const menuItem = await screen.findByTestId("project-new-session-menu");
+    expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
+    expect(header).toHaveAttribute("aria-expanded", "false");
   });
 
   it("reveals project actions on hover only on wide fine-pointer layouts", () => {
@@ -3657,7 +3646,7 @@ describe("Sidebar collapsed project marker", () => {
 
     const header = screen.getByRole("button", { name: /^Customer X/ });
     const trigger = screen.getByRole("button", { name: "Project actions for Customer X" });
-    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false, pointerType: "mouse" });
     await screen.findByTestId("rename-project");
 
     fireEvent.pointerLeave(header.closest("section")!);
