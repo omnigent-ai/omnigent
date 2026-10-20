@@ -1,5 +1,7 @@
 import {
+  useCallback,
   useEffect,
+  useRef,
   useState,
   type ComponentProps,
   type DragEvent,
@@ -17,7 +19,14 @@ import {
   useSensors,
 } from "@dnd-kit/core";
 import { sortableKeyboardCoordinates } from "@dnd-kit/sortable";
-import { Grid2X2Icon, MoreHorizontalIcon, PencilIcon, Trash2Icon } from "lucide-react";
+import {
+  Grid2X2Icon,
+  MoreHorizontalIcon,
+  PanelRightCloseIcon,
+  PanelRightOpenIcon,
+  PencilIcon,
+  Trash2Icon,
+} from "lucide-react";
 import { CanvasWorkspace } from "@/canvas/CanvasWorkspace";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { Link, useParams } from "@/lib/routing";
@@ -26,6 +35,8 @@ import { Button } from "@/components/ui/button";
 import { useChatStore } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { cn } from "@/lib/utils";
+import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { readDefaultWorkspacePanelOpen } from "@/lib/workspacePanelPreferences";
 import { SidebarEditRow } from "@/shell/SidebarEditRow";
 import {
   SIDEBAR_ROW,
@@ -44,17 +55,22 @@ import {
   ContextMenuContent,
   ContextMenuItem,
 } from "@/components/ui/context-menu";
-import { gridPanes, gridSessionIds, type SessionGrid, type GridLayout } from "./gridLayout";
-import { GridSessionPane } from "./GridSessionPane";
+import { gridPanes, gridSessionIds, type SessionGrid } from "./gridLayout";
+import { GridSessionPane, type GridWorkspacePanelProps } from "./GridSessionPane";
 import { gridTitle, useGridSessions } from "./GridSessionsContext";
 
 export function GridSidebar({ onNavigate }: { onNavigate?: MouseEventHandler<HTMLAnchorElement> }) {
   const grids = useGridSessions();
+  if (!grids?.enabled || grids.grids.length === 0) return null;
+  return <SavedGridSidebar onNavigate={onNavigate} />;
+}
+
+function SavedGridSidebar({ onNavigate }: { onNavigate?: MouseEventHandler<HTMLAnchorElement> }) {
+  const grids = useGridSessions()!;
   const { data } = useLoadedConversations();
   const titles = new Map(
     data?.pages.flatMap((page) => page.data.map((session) => [session.id, session.title] as const)),
   );
-  if (!grids?.enabled || grids.grids.length === 0) return null;
   return (
     <section aria-label="Grids" className="mb-6">
       <div className="px-2 pb-2 text-xs font-medium text-muted-foreground">Grids</div>
@@ -164,7 +180,77 @@ function GridSidebarRow({
   );
 }
 
-function RearrangeableGrid({ layout }: { layout: GridLayout }) {
+export function RearrangeableGrid({
+  grid,
+  onOpenSidebar,
+}: {
+  grid: SessionGrid;
+  onOpenSidebar?: () => void;
+}) {
+  const { layout } = grid;
+  const sessionIds = gridSessionIds(layout);
+  const [selectedSessionId, setSelectedSessionId] = useState(sessionIds[0]);
+  const activeSessionId = sessionIds.includes(selectedSessionId)
+    ? selectedSessionId
+    : sessionIds[0];
+  const workspaceKey = `grid:${grid.id}`;
+  const [workspace, setWorkspace] = useState(() => {
+    const saved = readSessionWorkspaceState(workspaceKey);
+    return { open: saved.open ?? readDefaultWorkspacePanelOpen(), widthPx: saved.widthPx };
+  });
+  useEffect(() => writeSessionWorkspaceState(workspaceKey, workspace), [workspaceKey, workspace]);
+  const [maximized, setMaximized] = useState(false);
+  const [workspaceTarget, setWorkspaceTarget] = useState<HTMLDivElement | null>(null);
+  const openWorkspace = useCallback((sessionId: string) => {
+    setSelectedSessionId(sessionId);
+    setWorkspace((previous) => ({ ...previous, open: true }));
+  }, []);
+  const container = useRef<HTMLDivElement>(null);
+  const [containerWidth, setContainerWidth] = useState(0);
+  useEffect(() => {
+    const node = container.current;
+    if (!node) return;
+    const observer = new ResizeObserver(() => setContainerWidth(node.clientWidth));
+    observer.observe(node);
+    setContainerWidth(node.clientWidth);
+    return () => observer.disconnect();
+  }, []);
+  const maximumWidth = Math.max(0, containerWidth - 280);
+  const width = Math.min(workspace.widthPx ?? Math.min(600, containerWidth * 0.4), maximumWidth);
+  const resize = (next: number) =>
+    setWorkspace((previous) => ({
+      ...previous,
+      widthPx: Math.max(Math.min(240, maximumWidth), Math.min(maximumWidth, next)),
+    }));
+  const workspacePanel: GridWorkspacePanelProps = {
+    open: workspace.open,
+    width,
+    maximized,
+    onToggleMaximized: () => setMaximized((previous) => !previous),
+    handleProps: {
+      tabIndex: 0,
+      role: "separator",
+      "aria-label": "Resize grid workspace",
+      "aria-orientation": "vertical",
+      "aria-valuenow": Math.round(width),
+      "aria-valuemin": 0,
+      "aria-valuemax": maximumWidth,
+      onPointerDown: (event) => {
+        event.preventDefault();
+        event.currentTarget.setPointerCapture(event.pointerId);
+      },
+      onPointerMove: (event) => {
+        if (event.currentTarget.hasPointerCapture(event.pointerId) && container.current)
+          resize(container.current.getBoundingClientRect().right - event.clientX);
+      },
+      onPointerUp: (event) => event.currentTarget.releasePointerCapture(event.pointerId),
+      onKeyDown: (event) => {
+        if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+        event.preventDefault();
+        resize(width + (event.key === "ArrowLeft" ? 24 : -24));
+      },
+    },
+  };
   const grids = useGridSessions()!;
   const [draggedTitle, setDraggedTitle] = useState<string | null>(null);
   const sensors = useSensors(
@@ -192,13 +278,56 @@ function RearrangeableGrid({ layout }: { layout: GridLayout }) {
         if (over) grids.swapPanes(String(active.id), String(over.id));
       }}
     >
+      <header className="flex h-9 shrink-0 items-center gap-2 px-2">
+        {onOpenSidebar && (
+          <SidebarOpenButton
+            size="icon-sm"
+            onOpenSidebar={onOpenSidebar}
+            componentId="grid.open_sidebar"
+          />
+        )}
+        <Grid2X2Icon className="size-4 shrink-0" />
+        <h1 className="truncate text-ui font-medium">{gridTitle(grid)}</h1>
+        <span className="flex-1" />
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          aria-label={`${workspace.open ? "Collapse" : "Expand"} grid workspace`}
+          aria-expanded={workspace.open}
+          onClick={() => {
+            setMaximized(false);
+            setWorkspace((previous) => ({ ...previous, open: !previous.open }));
+          }}
+        >
+          {workspace.open ? <PanelRightCloseIcon /> : <PanelRightOpenIcon />}
+        </Button>
+      </header>
       <div
-        className="grid min-h-0 flex-1 grid-cols-2 grid-rows-2 gap-2 overflow-auto p-2 pt-0"
-        data-testid="session-grid"
+        ref={container}
+        className="relative flex min-h-0 min-w-0 flex-1"
+        data-testid="grid-workspace"
       >
-        {gridPanes(layout).map(({ sessionId, area }) => (
-          <GridSessionPane key={sessionId} sessionId={sessionId} area={area} />
-        ))}
+        <div
+          ref={(node) => {
+            node?.toggleAttribute("inert", maximized);
+          }}
+          className="grid min-h-0 min-w-0 flex-1 grid-cols-2 grid-rows-2 gap-2 overflow-auto p-2 pt-0"
+          data-testid="session-grid"
+        >
+          {gridPanes(layout).map(({ sessionId, area }) => (
+            <GridSessionPane
+              key={sessionId}
+              sessionId={sessionId}
+              area={area}
+              selected={sessionId === activeSessionId}
+              onActivate={() => setSelectedSessionId(sessionId)}
+              workspaceTarget={workspaceTarget}
+              workspacePanel={workspacePanel}
+              onOpenWorkspace={() => openWorkspace(sessionId)}
+            />
+          ))}
+        </div>
+        <div ref={setWorkspaceTarget} className="contents" data-testid="grid-workspace-panel" />
       </div>
       <DragOverlay dropAnimation={null}>
         {draggedTitle && (
@@ -257,24 +386,18 @@ export function GridWorkspace({
       onDragOver={preventLinkDrop}
       onDropCapture={preventLinkDrop}
     >
-      <header className="flex h-9 shrink-0 items-center gap-2 px-2">
-        {onOpenSidebar && (
-          <SidebarOpenButton
-            size="icon-sm"
-            onOpenSidebar={onOpenSidebar}
-            componentId="grid.open_sidebar"
-          />
-        )}
-        <Grid2X2Icon className="size-4" />
-        <h1 className="text-ui font-medium">
-          {grids.activeGrid ? gridTitle(grids.activeGrid) : "Grid unavailable"}
-        </h1>
-        <span className="ml-auto text-xs text-muted-foreground">Saved on this device</span>
-      </header>
-      {layout ? (
-        <RearrangeableGrid key={gridId} layout={layout} />
+      {grids.activeGrid ? (
+        <RearrangeableGrid key={gridId} grid={grids.activeGrid} onOpenSidebar={onOpenSidebar} />
       ) : (
         <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6 text-center">
+          {onOpenSidebar && (
+            <SidebarOpenButton
+              size="icon-sm"
+              onOpenSidebar={onOpenSidebar}
+              componentId="grid.open_sidebar"
+            />
+          )}
+          <h1>Grid unavailable</h1>
           <p>
             This grid isn’t saved on this device. Open a session and drag another session into it to
             create a grid.

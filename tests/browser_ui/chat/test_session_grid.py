@@ -6,6 +6,7 @@ import re
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
+import pytest
 from playwright.sync_api import Page, expect
 
 from tests.browser_ui.chat.session_contract import chat_session_handle, list_payload, message_item
@@ -128,31 +129,46 @@ def test_session_grid_drag_persist_live_updates_and_close(
         rename.fill("Research monitor")
         page.get_by_role("heading", name="Research grid", exact=True).click()
         expect(grid_nav.get_by_role("link", name="Research monitor")).to_be_visible()
-        # Every file browser and viewer stays scoped to its own session and cell.
+        # One grid-wide workspace follows clicks in any cell, keeping its width and tabs.
+        page.get_by_role("button", name="Expand grid workspace").click()
+        workspace = page.get_by_role("complementary", name="Workspace", exact=True)
         for index in range(2):
             cell = page.locator(f'[data-grid-session="grid-{index}"]')
-            toggle = cell.get_by_role("button", name=re.compile("workspace for"))
-            if toggle.get_attribute("aria-expanded") == "false":
-                toggle.click()
-            workspace = cell.get_by_role("complementary", name="Workspace", exact=True)
-            expect(workspace).to_be_visible()
+            cell.get_by_text(f"Transcript {index}", exact=True).click()
+            expect(cell).to_have_attribute("data-active", "true")
+            expect(workspace).to_have_count(1)
+            expect(cell.get_by_role("complementary")).to_have_count(0)
             workspace.get_by_text(f"notes-{index}.md", exact=True).click()
-            expect(cell.get_by_test_id("file-viewer")).to_contain_text(f"Workspace {index}")
+            expect(workspace.get_by_test_id("file-viewer")).to_contain_text(f"Workspace {index}")
             expect(page).to_have_url(grid_url)
-        page.screenshot(path=str(artifacts / "independent-workspaces.png"))
+        page.screenshot(path=str(artifacts / "shared-workspace.png"))
         first_cell = page.locator('[data-grid-session="grid-0"]')
-        first_workspace = first_cell.get_by_role("complementary", name="Workspace", exact=True)
+        first_cell.get_by_text("Transcript 0", exact=True).click()
+        first_workspace = workspace
+        expect(workspace.get_by_test_id("file-viewer")).to_contain_text("Workspace 0")
         original_area = first_cell.evaluate("node => node.style.gridArea")
         other_cell = page.locator('[data-grid-session="grid-1"]')
+        editor = workspace.get_by_test_id("file-viewer").locator('[contenteditable="true"]')
+        editor.fill("Unsaved grid file edit")
+        other_cell.get_by_text("Transcript 1", exact=True).click()
+        expect(workspace.get_by_test_id("file-viewer")).to_contain_text("Workspace 1")
+        first_cell.get_by_text("Transcript 0", exact=True).click()
+        expect(editor).to_have_text("Unsaved grid file edit")
+        workspace.get_by_role("tab", name="Files", exact=True).click()
+        page.get_by_role("dialog", name="Unsaved changes").get_by_role(
+            "button", name="Discard changes", exact=True
+        ).click()
+        workspace.get_by_text("notes-0.md", exact=True).first.click()
+        expect(workspace.get_by_test_id("file-viewer")).to_contain_text("Workspace 0")
         other_area = other_cell.evaluate("node => node.style.gridArea")
         first_cell.evaluate("node => node.dataset.instance = 'preserved'")
         assert first_cell.locator("header").bounding_box()["height"] == 32
-        expect(first_cell.locator('header [data-size="icon-sm"]')).to_have_count(3)
+        expect(first_cell.locator('header [data-size="icon-xs"]')).to_have_count(2)
         _move_cell(page, "grid-0", "grid-1")
         assert first_cell.evaluate("node => node.style.gridArea") == other_area
         assert other_cell.evaluate("node => node.style.gridArea") == original_area
         expect(first_cell).to_have_attribute("data-instance", "preserved")
-        expect(first_cell.get_by_test_id("file-viewer")).to_contain_text("Workspace 0")
+        expect(workspace.get_by_test_id("file-viewer")).to_contain_text("Workspace 0")
         page.screenshot(path=str(artifacts / "workspaces-rearranged.png"), animations="disabled")
         _move_cell(page, "grid-0", "grid-1", cancel=True)
         assert first_cell.evaluate("node => node.style.gridArea") == other_area
@@ -166,34 +182,47 @@ def test_session_grid_drag_persist_live_updates_and_close(
         assert first_cell.evaluate("node => node.style.gridArea") == original_area
         first_workspace.get_by_role("button", name="Full screen", exact=True).click()
         expect(first_workspace).to_have_attribute("data-maximized", "true")
-        cell_box, panel_box = first_cell.bounding_box(), first_workspace.bounding_box()
-        assert cell_box and panel_box
-        assert panel_box["width"] <= cell_box["width"]
-        assert panel_box["height"] <= cell_box["height"]
-        expect(
-            page.locator('[data-grid-session="grid-1"]').get_by_test_id("file-viewer")
-        ).to_contain_text("Workspace 1")
-        page.screenshot(path=str(artifacts / "workspace-maximized-in-cell.png"))
+        grid_box = page.get_by_test_id("grid-workspace").bounding_box()
+        panel_box = workspace.bounding_box()
+        assert grid_box and panel_box
+        assert abs(panel_box["width"] - grid_box["width"]) < 2
+        assert abs(panel_box["height"] - grid_box["height"]) < 2
+        page.screenshot(path=str(artifacts / "workspace-maximized-in-grid.png"))
         first_workspace.get_by_role("button", name="Exit full screen", exact=True).click()
-        first_cell.get_by_role("separator").focus()
-        before_width = first_workspace.bounding_box()["width"]
+        workspace.get_by_role("separator").focus()
+        before_width = workspace.bounding_box()["width"]
         page.keyboard.press("ArrowLeft")
-        assert first_workspace.bounding_box()["width"] > before_width
-        for index in range(2):
-            page.get_by_role("button", name=f"Collapse workspace for Grid session {index}").click()
+        saved_width = workspace.bounding_box()["width"]
+        assert saved_width > before_width
+        # Pointer resizing and a click in the composer also retain the grid's width.
+        handle_box = workspace.get_by_role("separator").bounding_box()
+        assert handle_box
+        page.mouse.move(handle_box["x"] + 2, handle_box["y"] + 100)
+        page.mouse.down()
+        page.mouse.move(handle_box["x"] - 30, handle_box["y"] + 100, steps=5)
+        page.mouse.up()
+        saved_width = workspace.bounding_box()["width"]
+        assert saved_width > before_width + 24
+        other_cell.get_by_role("textbox").click()
+        expect(other_cell).to_have_attribute("data-active", "true")
+        expect(workspace.get_by_test_id("file-viewer")).to_contain_text("Workspace 1")
+        assert workspace.bounding_box()["width"] == saved_width
+        first_cell.get_by_text("Transcript 0", exact=True).click()
+        expect(workspace.get_by_test_id("file-viewer")).to_contain_text("Workspace 0")
+        assert workspace.bounding_box()["width"] == saved_width
+        page.get_by_role("button", name="Collapse grid workspace").click()
         _drag_session(page, "grid-2", "grid-0", "bottom")
         _drag_session(page, "grid-3", "grid-1", "bottom")
         expect(page.locator("[data-grid-session]")).to_have_count(4)
         expect(page.locator('[data-grid-session="grid-3"]').get_by_role("textbox")).to_have_count(
             0
         )
-        page.get_by_role("button", name="Expand workspace for Grid session 3").click()
-        read_only_workspace = page.locator('[data-grid-session="grid-3"]').get_by_role(
-            "complementary", name="Workspace", exact=True
-        )
+        page.get_by_text("Transcript 3", exact=True).click()
+        page.get_by_role("button", name="Expand grid workspace").click()
+        read_only_workspace = workspace
         expect(read_only_workspace).to_be_visible()
         expect(read_only_workspace.get_by_role("tab", name="Files", exact=True)).to_have_count(0)
-        page.get_by_role("button", name="Collapse workspace for Grid session 3").click()
+        page.get_by_role("button", name="Collapse grid workspace").click()
         for index in range(4):
             expect(page.get_by_text(f"Transcript {index}", exact=True)).to_be_visible()
             sessions[index].wait_for_stream()
@@ -253,10 +282,19 @@ def test_session_grid_drag_persist_live_updates_and_close(
         expect(grid_nav.get_by_role("link", name="Research monitor")).to_be_visible()
         expect(page.locator("[data-grid-session]")).to_have_count(4)
         assert first.evaluate("node => node.style.gridArea") == last_area
+        page.get_by_role("button", name="Expand grid workspace").click()
+        assert workspace.bounding_box()["width"] == saved_width
+        page.get_by_text("Transcript 3", exact=True).click()
+        expect(page.locator('[data-grid-session="grid-3"]')).to_have_attribute(
+            "data-active", "true"
+        )
         for index in range(4):
             expect(page.get_by_text(f"Transcript {index}", exact=True)).to_be_visible()
         for index in (3, 2, 1):
             page.get_by_role("button", name=f"Remove Grid session {index} from grid").click()
+            if index != 1:
+                expect(page.locator('[data-grid-session][data-active="true"]')).to_have_count(1)
+                expect(workspace).to_have_count(1)
         expect(page).to_have_url(sessions[0].url)
         expect(page.get_by_role("region", name="Grids")).to_have_count(0)
         # The row context menu is the keyboard/touch alternative to dragging.
@@ -276,12 +314,11 @@ def test_session_grid_drag_persist_live_updates_and_close(
         expect(page.get_by_role("button", name="Open sidebar", exact=True)).to_have_attribute(
             "data-size", "icon-sm"
         )
-        page.get_by_role("button", name="Expand workspace for Grid session 0").click()
-        narrow_cell = page.locator('[data-grid-session="grid-0"]')
-        narrow_workspace = narrow_cell.get_by_role("complementary", name="Workspace", exact=True)
+        page.get_by_role("button", name="Expand grid workspace").click()
+        narrow_workspace = workspace
         expect(narrow_workspace).to_be_visible()
         narrow_workspace.get_by_role("button", name="Full screen", exact=True).click()
-        assert narrow_workspace.bounding_box()["width"] <= narrow_cell.bounding_box()["width"]
+        assert narrow_workspace.bounding_box()["width"] <= 700
         page.screenshot(path=str(artifacts / "narrow-grid-workspace.png"))
         page.set_viewport_size({"width": 2000, "height": 1000})
         page.get_by_role("button", name="Open sidebar", exact=True).click()
@@ -291,10 +328,41 @@ def test_session_grid_drag_persist_live_updates_and_close(
         expect(page.locator('aside [data-sidebar-session-id="grid-1"]')).to_be_visible()
 
 
+@pytest.mark.parametrize("features", [{}, {"grid_sessions_display_ui": False}])
 def test_grid_flag_off_and_unknown_local_grid(
-    page: Page, browser_contract: BrowserContract
+    page: Page, browser_contract: BrowserContract, features: dict[str, bool]
 ) -> None:
     with contextmanager(chat_session_handle)(page, browser_contract) as session:
+        browser_contract.json("/v1/info", {"single_user": True, "features": features})
+        page.goto(session.url)
+        row = page.locator(f'aside [data-sidebar-session-id="{session.session_id}"]')
+        expect(row).to_be_visible()
+        # A grid saved by an earlier flag-on visit must stay hidden and untouched.
+        page.evaluate("""() => localStorage.setItem(
+            `omnigent:session-grids:${location.origin}:local`,
+            JSON.stringify([{id: 'saved', layout: {
+                axis: 'columns', children: ['first', 'second']}}]))""")
+        page.reload()
+        expect(row).to_be_visible()
+        expect(page.get_by_role("region", name="Grids")).to_have_count(0)
+        expect(page.locator("[data-grid-session]")).to_have_count(0)
+        expect(page.get_by_role("button", name="Expand grid workspace")).to_have_count(0)
+        row.click(button="right")
+        expect(page.get_by_role("menuitem", name="Open in grid", exact=True)).to_have_count(0)
+        page.keyboard.press("Escape")
+        assert row.locator("a").evaluate("""node => node.draggable &&
+            node.dispatchEvent(new DragEvent('dragstart', {bubbles: true, cancelable: true}))""")
+        row.hover()
+        page.mouse.down()
+        page.mouse.move(800, 300, steps=10)
+        expect(page.get_by_test_id("grid-drop-targets")).to_have_count(0)
+        page.mouse.up()
+        expect(page).to_have_url(session.url)
+        assert page.evaluate(
+            "localStorage.getItem(`omnigent:session-grids:${location.origin}:local`)"
+        )
+        page.goto(f"{session.base_url}/grid/saved")
+        expect(page.get_by_text("Page not found", exact=True)).to_be_visible()
         page.goto(f"{session.base_url}/grid/missing")
         expect(page.get_by_text("Page not found", exact=True)).to_be_visible()
         browser_contract.json(

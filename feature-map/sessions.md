@@ -138,14 +138,17 @@ session, and drag another sidebar row over it. Hover **Split left/right/top/bott
 to preview, then drop. Split a remaining full-width or full-height pane again
 to reach three or four panes. Alternatively, use a row's menu or right-click
 menu → **Open in grid** and choose the pane and direction. Each pane has its own
-transcript, composer, and expandable workspace. Open the session full screen
+transcript and composer; one shared Workspace panel follows the active cell. Open the session full screen
 for additional controls; close a pane to expand its neighbor. Closing down to
 one pane returns to `/c/<id>`. Reopen saved grids in **Grids**, above Projects and Pinned, or use
 their `/grid/<id>` URL on the same browser. Double-click a grid title or use
 its Rename menu action to edit it inline.
-Enter or blur saves; Escape cancels. Grid names persist locally. Each cell has
-its own expandable Workspace panel; its resize and full-screen controls stay
-inside that cell. Drag a cell titlebar onto another cell to swap positions,
+Enter or blur saves; Escape cancels. Grid names persist locally. Click anywhere
+in a cell (or focus its controls) to activate it: its outline and inverted header
+identify the session shown in Workspace. The grid header toggles the shared
+panel; its width is saved per grid and stays fixed when switching sessions.
+Files, tabs, and unsaved edits remain session-specific. Maximizing Workspace
+fills the grid area. Drag a cell titlebar onto another cell to swap positions,
 or focus the title and press Space, choose a cell with the arrow keys, and
 press Space again. Escape cancels. The sidebar's Delete grid menu action forgets
 only the grid, leaving sessions untouched. Unknown local grids show a recovery link.
@@ -332,10 +335,13 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`session-grid` (browser contract):**
   `tests/browser_ui/chat/test_session_grid.py` drives sidebar drops, previews,
   the four-pane limit, independent sends and live updates, reloads, pane closure,
-  keyboard menu creation, inline rename/cancel/persistence, independent file
-  workspaces and cell-local maximize, rejected drops without navigation, sidebar
+  keyboard menu creation, inline rename/cancel/persistence, active-cell selection,
+  shared workspace contents and width persistence, grid-wide maximize, rejected
+  drops without navigation, sidebar
   reopening/deletion, titlebar rearrangement and cancellation, narrow-view
-  workspaces, and missing/disabled grid routes. Run with `--browser-ui-skip-build --video=on` after building.
+  workspaces, and missing/disabled grid routes. With the flag absent or false,
+  ordinary session routes retain native link dragging and expose no grid menus,
+  drop targets, or saved-grid sidebar entries. Run with `--browser-ui-skip-build --video=on` after building.
   Layout combinations and malformed local storage have unit coverage in
   `web/src/grid/gridLayout.test.ts`. For a real-server drive, enable
   `grid_sessions_display_ui` on the isolated server. Also check a collapsed

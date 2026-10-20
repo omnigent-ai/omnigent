@@ -5,6 +5,7 @@ import {
   getConnectionProtocol,
   maxLiveConversations,
 } from "./conversationRegistry";
+import * as capabilities from "@/lib/capabilities";
 import type { PendingUserMessage } from "./chatStore";
 
 /** An unsettled optimistic bubble — the shape that pins an entry. */
@@ -18,13 +19,18 @@ function postedBubble(tempId = "pend_1"): PendingUserMessage {
 }
 
 describe("maxLiveConversations", () => {
-  it("allows 30 when multiplexed and four grid panes when serial", () => {
-    // Not a product number: HTTP/2 multiplexes over one connection, while
-    // HTTP/1.1 caps ~6 per origin and an SSE stream holds one for its whole
-    // life — 30 there deadlocks every other fetch.
-    expect(maxLiveConversations("multiplexed")).toBe(30);
-    expect(maxLiveConversations("serial")).toBe(4);
-  });
+  it.each([undefined, false, true])(
+    "keeps the serial limit at three unless grids are enabled (%s)",
+    (enabled) => {
+      const cached = vi.spyOn(capabilities, "getCachedServerInfo").mockReturnValue({
+        ...capabilities.FALLBACK_SERVER_INFO,
+        features: enabled === undefined ? {} : { grid_sessions_display_ui: enabled },
+      });
+      expect(maxLiveConversations("multiplexed")).toBe(30);
+      expect(maxLiveConversations("serial")).toBe(enabled ? 4 : 3);
+      cached.mockRestore();
+    },
+  );
 });
 
 describe("getConnectionProtocol", () => {

@@ -662,7 +662,7 @@ function RailTerminalView({
  * shell keeps single-source-of-truth over file/terminal/panel state.
  */
 interface WorkspacePanelProps {
-  /** Keep the panel and its viewers inside an independently scoped grid cell. */
+  /** Keep the panel and its viewers inside an independently scoped grid workspace. */
   contained?: boolean;
   sessionHarness?: ReturnType<typeof useChatStore.getState>["sessionHarness"];
   agentId?: string | null;
@@ -1791,7 +1791,7 @@ function WorkspacePanelImpl({
           ) : rightRailTab === "content-search" && showContentSearch ? null : (
             showFilesPanel && (
               <FilesPanel
-                conversationId={conversationId}
+                conversationId={contained ? conversationId : undefined}
                 frameless
                 onFileSelect={openFileViewer}
                 flatView={rightRailTab === "changes"}

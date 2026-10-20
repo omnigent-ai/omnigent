@@ -497,6 +497,7 @@ function useActiveNavItem(): {
     gridId: string;
   }>();
   const location = useLocation();
+  const serverInfo = useServerInfo();
   const rebasePath = useRebasePath();
   const extensions = useExtensions();
   const leaf = location.pathname.split("/").filter(Boolean).at(-1);
@@ -510,7 +511,7 @@ function useActiveNavItem(): {
     resolveExtensionPageFromPath(extensions, location.pathname)?.page.id ?? null;
   const isNewSessionRoute =
     activeConversationId == null &&
-    gridId == null &&
+    (gridId == null || !isFeatureEnabled(serverInfo, "grid_sessions_display_ui")) &&
     !isInboxPage &&
     !isCanvasPage &&
     !isTasksPage &&
@@ -5016,8 +5017,12 @@ function ConversationRowImpl({
     <Link
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       componentId="sidebar.conversation_switcher"
-      draggable={false}
-      onDragStart={(event) => event.preventDefault()}
+      draggable={isFeatureEnabled(serverInfo, "grid_sessions_display_ui") ? false : undefined}
+      onDragStart={
+        isFeatureEnabled(serverInfo, "grid_sessions_display_ui")
+          ? (event) => event.preventDefault()
+          : undefined
+      }
       className={cn(
         SIDEBAR_ROW,
         "relative flex flex-col justify-center text-left text-foreground transition-colors",

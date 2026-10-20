@@ -8,6 +8,7 @@
 // on revisit is a transcript cache in a different shape, which is what keeping
 // streams open replaces. Live-or-gone is the simplification.
 
+import { getCachedServerInfo, isFeatureEnabled } from "@/lib/capabilities";
 import type { ConversationState } from "./chatStore";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
 
@@ -75,7 +76,11 @@ export function maxLiveConversations(
   protocol: ConnectionProtocol = getConnectionProtocol(),
 ): number {
   // Four grid panes leave two HTTP/1.1 connections available for ordinary requests.
-  return protocol === "multiplexed" ? 30 : 4;
+  return protocol === "multiplexed"
+    ? 30
+    : isFeatureEnabled(getCachedServerInfo() ?? "loading", "grid_sessions_display_ui")
+      ? 4
+      : 3;
 }
 
 /** Writes a patch into a conversation's state. Mirrors zustand's `setState`. */

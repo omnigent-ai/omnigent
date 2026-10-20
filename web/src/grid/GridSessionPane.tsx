@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
+import { createPortal } from "react-dom";
 import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { cn } from "@/lib/utils";
-import { Maximize2Icon, PanelRightCloseIcon, PanelRightOpenIcon, XIcon } from "lucide-react";
+import { Maximize2Icon, XIcon } from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { Button } from "@/components/ui/button";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
@@ -23,7 +24,11 @@ import {
   writeSessionWorkspaceState,
   type SessionWorkspaceState,
 } from "@/lib/sessionWorkspaceState";
-import { readDefaultWorkspaceTab } from "@/lib/workspaceTabPreferences";
+import {
+  readInitialWorkspaceTab,
+  readPinnedWorkspaceTabs,
+  isDefaultWorkspaceTab,
+} from "@/lib/workspaceTabPreferences";
 import { CloseShellDialog } from "@/shell/CloseShellDialog";
 import {
   FileViewerContext,
@@ -31,11 +36,33 @@ import {
   type FilePosition,
   type OpenFileOptions,
 } from "@/shell/FileViewerContext";
+import type { RightRailTab } from "@/shell/railTabs";
 import type { ChangedSort } from "@/shell/FlatFileList";
 import { WorkspacePanel } from "@/shell/WorkspacePanel";
 import { useGridSessions } from "./GridSessionsContext";
 
-export function GridSessionPane({ sessionId, area }: { sessionId: string; area?: string }) {
+export type GridWorkspacePanelProps = Pick<
+  ComponentProps<typeof WorkspacePanel>,
+  "open" | "width" | "handleProps" | "maximized" | "onToggleMaximized"
+>;
+
+export function GridSessionPane({
+  sessionId,
+  area,
+  selected,
+  onActivate,
+  workspaceTarget,
+  workspacePanel,
+  onOpenWorkspace,
+}: {
+  sessionId: string;
+  area?: string;
+  selected: boolean;
+  onActivate: () => void;
+  workspaceTarget: HTMLDivElement | null;
+  workspacePanel: GridWorkspacePanelProps;
+  onOpenWorkspace: () => void;
+}) {
   const { session } = useSession(sessionId);
   const state = useConversationEntryState(sessionId);
   const canEdit = useCanEdit(sessionId);
@@ -79,9 +106,8 @@ export function GridSessionPane({ sessionId, area }: { sessionId: string; area?:
   const [workspace, setWorkspace] = useState<SessionWorkspaceState>(() => {
     const saved = readSessionWorkspaceState(sessionId);
     return {
-      open: saved.open ?? false,
-      widthPx: saved.widthPx,
-      rightRailTab: saved.rightRailTab ?? readDefaultWorkspaceTab(),
+      rightRailTab: saved.rightRailTab ?? readInitialWorkspaceTab(),
+      openPanels: saved.openPanels ?? [],
       openFiles: saved.openFiles ?? [],
       selectedFilePath: saved.selectedFilePath ?? null,
       selectedTerminalKey: saved.selectedTerminalKey ?? null,
@@ -91,7 +117,6 @@ export function GridSessionPane({ sessionId, area }: { sessionId: string; area?:
   const updateWorkspace = useCallback((patch: SessionWorkspaceState) => {
     setWorkspace((previous) => ({ ...previous, ...patch }));
   }, []);
-  const [maximized, setMaximized] = useState(false);
   const [sort, setSort] = useState<ChangedSort>("recent");
   const [showHidden, setShowHidden] = useState(false);
   const [position, setPosition] = useState<FilePosition>();
@@ -112,12 +137,12 @@ export function GridSessionPane({ sessionId, area }: { sessionId: string; area?:
   const openFile = useCallback(
     (path: string, options?: OpenFileOptions) => {
       navigateWorkspace(path, options, () => {
+        onOpenWorkspace();
         setPosition(
           options?.line === undefined ? undefined : { line: options.line, column: options.column },
         );
         setWorkspace((previous) => ({
           ...previous,
-          open: true,
           selectedFilePath: path,
           selectedTerminalKey: null,
           openFiles: previous.openFiles?.includes(path)
@@ -126,15 +151,24 @@ export function GridSessionPane({ sessionId, area }: { sessionId: string; area?:
         }));
       });
     },
-    [navigateWorkspace],
+    [navigateWorkspace, onOpenWorkspace],
   );
   const selectTab = useCallback(
-    (rightRailTab: NonNullable<SessionWorkspaceState["rightRailTab"]>) => {
+    (rightRailTab: RightRailTab | null) => {
       navigateWorkspace("", undefined, () =>
-        updateWorkspace({ rightRailTab, selectedFilePath: null, selectedTerminalKey: null }),
+        setWorkspace((previous) => ({
+          ...previous,
+          rightRailTab,
+          selectedFilePath: null,
+          selectedTerminalKey: null,
+          openPanels:
+            isDefaultWorkspaceTab(rightRailTab) && !readPinnedWorkspaceTabs().includes(rightRailTab)
+              ? [...new Set([...(previous.openPanels ?? []), rightRailTab])]
+              : previous.openPanels,
+        })),
       );
     },
-    [navigateWorkspace, updateWorkspace],
+    [navigateWorkspace],
   );
   const closeFile = useCallback(
     (path: string) => {
@@ -150,11 +184,12 @@ export function GridSessionPane({ sessionId, area }: { sessionId: string; area?:
   );
   const openTerminal = useCallback(
     (key: string) => {
-      navigateWorkspace("", undefined, () =>
-        updateWorkspace({ open: true, selectedFilePath: null, selectedTerminalKey: key }),
-      );
+      navigateWorkspace("", undefined, () => {
+        onOpenWorkspace();
+        updateWorkspace({ selectedFilePath: null, selectedTerminalKey: key });
+      });
     },
-    [navigateWorkspace, updateWorkspace],
+    [navigateWorkspace, updateWorkspace, onOpenWorkspace],
   );
   const fileContext = useMemo(
     () => ({
@@ -162,7 +197,7 @@ export function GridSessionPane({ sessionId, area }: { sessionId: string; area?:
       registerNavigationGuard,
       openGithubTab: () => {
         selectTab("github");
-        updateWorkspace({ open: true });
+        onOpenWorkspace();
       },
       conversationId: sessionId,
       workspaceRoot: environment.data?.root ?? null,
@@ -175,45 +210,39 @@ export function GridSessionPane({ sessionId, area }: { sessionId: string; area?:
       openFile,
       registerNavigationGuard,
       selectTab,
-      updateWorkspace,
+      onOpenWorkspace,
       sessionId,
       environment.data,
       session?.hostId,
       changedFiles.data,
     ],
   );
-  const container = useRef<HTMLDivElement>(null);
-  const [cellWidth, setCellWidth] = useState(0);
-  useEffect(() => {
-    const node = container.current;
-    if (!node) return;
-    const observer = new ResizeObserver(() => setCellWidth(node.clientWidth));
-    observer.observe(node);
-    setCellWidth(node.clientWidth);
-    return () => observer.disconnect();
-  }, []);
-  const maximumWidth = Math.max(0, cellWidth - 140);
-  const width = Math.min(workspace.widthPx ?? cellWidth * 0.45, maximumWidth);
-  const resize = (next: number) =>
-    updateWorkspace({
-      widthPx: Math.max(Math.min(160, maximumWidth), Math.min(maximumWidth, next)),
-    });
   const rightRailTab =
     !showFiles && ["files", "changes", "github"].includes(workspace.rightRailTab ?? "")
       ? "subagents"
-      : (workspace.rightRailTab ?? "files");
+      : (workspace.rightRailTab ?? null);
   return (
     <FileViewerContext.Provider value={fileContext}>
       <section
         ref={setPaneRef}
         style={{ gridArea: area }}
         data-grid-session={sessionId}
+        data-active={selected}
+        aria-label={`${title}${selected ? " (active)" : ""}`}
+        onClickCapture={onActivate}
+        onFocusCapture={onActivate}
         className={cn(
           "relative flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border bg-background",
+          selected && "border-brand-accent/50 ring-1 ring-brand-accent/50",
           isDragging && "opacity-50",
         )}
       >
-        <header className="flex h-8 shrink-0 items-center border-b px-1">
+        <header
+          className={cn(
+            "flex h-8 shrink-0 items-center border-b px-1",
+            selected && "bg-brand-accent/50",
+          )}
+        >
           <button
             type="button"
             ref={setActivatorNodeRef}
@@ -225,22 +254,6 @@ export function GridSessionPane({ sessionId, area }: { sessionId: string; area?:
           >
             {title}
           </button>
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            aria-label={`${workspace.open ? "Collapse" : "Expand"} workspace for ${title}`}
-            aria-expanded={workspace.open}
-            onClick={() => {
-              setMaximized(false);
-              updateWorkspace({ open: !workspace.open });
-            }}
-          >
-            {workspace.open ? (
-              <PanelRightCloseIcon className="size-4" />
-            ) : (
-              <PanelRightOpenIcon className="size-4" />
-            )}
-          </Button>
           <Button asChild variant="ghost" size="icon-xs">
             <Link draggable={false} to={`/c/${sessionId}`} aria-label={`Open ${title} full screen`}>
               <Maximize2Icon className="size-3.5" />
@@ -255,74 +268,8 @@ export function GridSessionPane({ sessionId, area }: { sessionId: string; area?:
             <XIcon className="size-4" />
           </Button>
         </header>
-        <div ref={container} className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden">
-          <div className="min-h-0 min-w-0 flex-1 overflow-hidden" inert={maximized}>
-            <SideChatPane childId={sessionId} fullSession readOnly={!canEdit} />
-          </div>
-          <WorkspacePanel
-            contained
-            conversationId={sessionId}
-            sessionHarness={state.sessionHarness}
-            agentId={state.boundAgentId ?? session?.agentId ?? null}
-            open={workspace.open}
-            inert={!workspace.open}
-            width={width}
-            handleProps={{
-              tabIndex: 0,
-              role: "separator",
-              "aria-label": `Resize workspace for ${title}`,
-              "aria-orientation": "vertical",
-              "aria-valuenow": Math.round(width),
-              "aria-valuemin": 0,
-              "aria-valuemax": maximumWidth,
-              onPointerDown: (event) => {
-                event.preventDefault();
-                event.currentTarget.setPointerCapture(event.pointerId);
-              },
-              onPointerMove: (event) => {
-                if (event.currentTarget.hasPointerCapture(event.pointerId) && container.current)
-                  resize(container.current.getBoundingClientRect().right - event.clientX);
-              },
-              onPointerUp: (event) => event.currentTarget.releasePointerCapture(event.pointerId),
-              onKeyDown: (event) => {
-                if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
-                event.preventDefault();
-                resize(width + (event.key === "ArrowLeft" ? 24 : -24));
-              },
-            }}
-            rightRailTab={rightRailTab}
-            onRightRailTabChange={selectTab}
-            showFilesPanel={showFiles}
-            showGithubTab={showFiles}
-            showBrowserTab={supportsBrowser()}
-            onBrowserTabOpened={() => updateWorkspace({ open: true })}
-            changedCount={changedFiles.data?.data.length ?? 0}
-            subagentsWorking={childSessions.filter((child) => child.busy).length}
-            agentCount={childSessions.length + 1}
-            rootSessionId={rootSessionId}
-            selectedFilePath={canBrowse ? (workspace.selectedFilePath ?? null) : null}
-            filePosition={position}
-            openFiles={canBrowse ? (workspace.openFiles ?? []) : []}
-            openFileViewer={openFile}
-            onCloseFile={closeFile}
-            onShowScopeView={() => selectTab(rightRailTab)}
-            onCommentsOpenChange={() => {}}
-            openTerminalTab={openTerminal}
-            openTerminals={terminals.map(terminalTabKey)}
-            selectedTerminalKey={workspace.selectedTerminalKey ?? null}
-            closingTerminalKey={
-              deleteTerminal.isPending && closingTerminal ? terminalTabKey(closingTerminal) : null
-            }
-            onCloseTerminal={setPendingClose}
-            maximized={maximized}
-            onToggleMaximized={() => setMaximized((previous) => !previous)}
-            permissionLevel={permissionLevel}
-            filesPanelSort={sort}
-            onSortChange={setSort}
-            filesPanelShowHidden={showHidden}
-            onShowHiddenChange={setShowHidden}
-            liveness={liveness}
-          />
+        <div className="min-h-0 min-w-0 flex-1 overflow-hidden">
+          <SideChatPane childId={sessionId} fullSession readOnly={!canEdit} />
         </div>
         {isOver && active?.id !== sessionId && (
           <div
@@ -350,6 +297,69 @@ export function GridSessionPane({ sessionId, area }: { sessionId: string; area?:
           }}
         />
       </section>
+      {/* Keep inactive views mounted so switching cells preserves unsaved edits. */}
+      {workspaceTarget &&
+        createPortal(
+          <div className={selected && workspacePanel.open ? "contents" : "hidden"}>
+            <WorkspacePanel
+              contained
+              conversationId={sessionId}
+              sessionHarness={state.sessionHarness}
+              agentId={state.boundAgentId ?? session?.agentId ?? null}
+              {...workspacePanel}
+              open={selected && workspacePanel.open}
+              inert={!selected || !workspacePanel.open}
+              rightRailTab={rightRailTab}
+              onRightRailTabChange={selectTab}
+              openPanels={workspace.openPanels ?? []}
+              onClosePanel={(tab) => {
+                navigateWorkspace("", undefined, () =>
+                  setWorkspace((previous) => {
+                    const remaining = previous.openPanels?.filter((panel) => panel !== tab) ?? [];
+                    return {
+                      ...previous,
+                      openPanels: remaining,
+                      rightRailTab:
+                        previous.rightRailTab === tab
+                          ? (remaining.at(-1) ?? readInitialWorkspaceTab())
+                          : previous.rightRailTab,
+                    };
+                  }),
+                );
+              }}
+              showFilesPanel={showFiles}
+              showGithubTab={showFiles}
+              showBrowserTab={supportsBrowser()}
+              onBrowserTabOpened={onOpenWorkspace}
+              changedCount={changedFiles.data?.data.length ?? 0}
+              subagentsWorking={childSessions.filter((child) => child.busy).length}
+              agentCount={childSessions.length + 1}
+              rootSessionId={rootSessionId}
+              selectedFilePath={canBrowse ? (workspace.selectedFilePath ?? null) : null}
+              filePosition={position}
+              openFiles={canBrowse ? (workspace.openFiles ?? []) : []}
+              openFileViewer={openFile}
+              onCloseFile={closeFile}
+              onShowScopeView={() => selectTab(rightRailTab)}
+              onCommentsOpenChange={() => {}}
+              openTerminalTab={openTerminal}
+              openTerminals={terminals.map(terminalTabKey)}
+              selectedTerminalKey={workspace.selectedTerminalKey ?? null}
+              closingTerminalKey={
+                deleteTerminal.isPending && closingTerminal ? terminalTabKey(closingTerminal) : null
+              }
+              onCloseTerminal={setPendingClose}
+              maximized={selected && workspacePanel.maximized}
+              permissionLevel={permissionLevel}
+              filesPanelSort={sort}
+              onSortChange={setSort}
+              filesPanelShowHidden={showHidden}
+              onShowHiddenChange={setShowHidden}
+              liveness={liveness}
+            />
+          </div>,
+          workspaceTarget,
+        )}
     </FileViewerContext.Provider>
   );
 }

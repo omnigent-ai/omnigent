@@ -40,6 +40,8 @@ import {
   useWorkspaceFileSearch,
 } from "./useWorkspaceChangedFiles";
 
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { conversationRegistry } from "@/store/conversationRegistry";
 
 const onlineMock = vi.mocked(useSessionRunnerOnline);
@@ -1748,13 +1750,21 @@ describe("browse-location wire form (survives a slash-merging proxy)", () => {
   });
 });
 
-it("tracks activity in a grid session outside the active chat projection", () => {
+it.each([false, true])("gates background workspace activity on grid flag %s", (enabled) => {
   stubChatStore(null, "idle");
   const entry = conversationRegistry.acquire("grid-session");
-  const view = renderHook(() => useSessionActive("grid-session"));
+  const view = renderHook(() => useSessionActive("grid-session"), {
+    wrapper: ({ children }) => (
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: { grid_sessions_display_ui: enabled } }}
+      >
+        {children}
+      </CapabilitiesProvider>
+    ),
+  });
   expect(view.result.current).toBe(false);
   act(() => entry.setState({ sessionStatus: "running" }));
-  expect(view.result.current).toBe(true);
+  expect(view.result.current).toBe(enabled);
   act(() => entry.setState({ sessionStatus: "idle" }));
   expect(view.result.current).toBe(false);
   view.unmount();

@@ -12,32 +12,32 @@ vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => identity.viewer }));
 vi.mock("@/lib/host", () => ({ getOmnigentServerIdentity: () => identity.server }));
 
 function Probe() {
-  const grids = useGridSessions()!;
+  const grids = useGridSessions();
   const location = useLocation();
   return (
     <>
       <output data-testid="path">{location.pathname}</output>
       <output data-testid="order">
-        {grids.activeGrid && gridSessionIds(grids.activeGrid.layout).join(",")}
+        {grids?.activeGrid && gridSessionIds(grids?.activeGrid.layout).join(",")}
       </output>
-      <button type="button" onClick={() => grids.swapPanes("first", "second")}>
+      <button type="button" onClick={() => grids?.swapPanes("first", "second")}>
         Swap
       </button>
-      <output data-testid="name">{grids.activeGrid?.name}</output>
-      <button type="button" onClick={() => grids.renameGrid(grids.activeGrid!.id, "  My work  ")}>
+      <output data-testid="name">{grids?.activeGrid?.name}</output>
+      <button type="button" onClick={() => grids?.renameGrid(grids?.activeGrid!.id, "  My work  ")}>
         Rename
       </button>
-      <button type="button" onClick={() => grids.split("first", "third", "bottom")}>
+      <button type="button" onClick={() => grids?.split("first", "third", "bottom")}>
         Add third
       </button>
-      <button type="button" onClick={() => grids.closePane("third")}>
+      <button type="button" onClick={() => grids?.closePane("third")}>
         Close third
       </button>
-      <output data-testid="count">{grids.grids.length}</output>
-      <button type="button" onClick={() => grids.split("first", "second", "right")}>
+      <output data-testid="count">{grids?.grids.length ?? 0}</output>
+      <button type="button" onClick={() => grids?.split("first", "second", "right")}>
         Split
       </button>
-      <button type="button" onClick={() => grids.closePane("second")}>
+      <button type="button" onClick={() => grids?.closePane("second")}>
         Close
       </button>
     </>
@@ -98,7 +98,9 @@ it("persists across reloads, scopes grids to server and user, and collapses the 
 });
 
 it("gates creation and keeps an unsaved grid usable when storage is full", () => {
+  const read = vi.spyOn(Storage.prototype, "getItem");
   const view = render(tree("/c/first", false));
+  expect(read).not.toHaveBeenCalledWith("omnigent:session-grids:one:alice");
   fireEvent.click(screen.getByText("Split"));
   expect(screen.getByTestId("path")).toHaveTextContent("/c/first");
   expect(localStorage.length).toBe(0);

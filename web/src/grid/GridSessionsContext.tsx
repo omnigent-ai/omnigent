@@ -34,8 +34,12 @@ const EMPTY_GRIDS: SessionGrid[] = [];
 export const useGridSessions = () => useContext(GridSessionsContext);
 
 export function GridSessionsProvider({ children }: { children: ReactNode }) {
-  const viewerId = useViewerId();
   const enabled = isFeatureEnabled(useServerInfo(), "grid_sessions_display_ui");
+  return enabled ? <EnabledGridSessionsProvider>{children}</EnabledGridSessionsProvider> : children;
+}
+
+function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
+  const viewerId = useViewerId();
   const { conversationId: routeConversationId, gridId } = useParams<{
     conversationId: string;
     gridId: string;
@@ -53,7 +57,7 @@ export function GridSessionsProvider({ children }: { children: ReactNode }) {
   const [saved, setSaved] = useState(() => ({ key: storageKey, grids: read() }));
   if (saved.key !== storageKey) setSaved({ key: storageKey, grids: read() });
   const grids = saved.key === storageKey ? saved.grids : EMPTY_GRIDS;
-  const activeGrid = enabled ? grids.find((grid) => grid.id === gridId) : undefined;
+  const activeGrid = grids.find((grid) => grid.id === gridId);
   const value = useMemo<GridSessionsContextValue>(() => {
     const save = (next: SessionGrid[]) => {
       setSaved({ key: storageKey, grids: next });
@@ -68,12 +72,12 @@ export function GridSessionsProvider({ children }: { children: ReactNode }) {
       if (id === gridId) navigate("/");
     };
     return {
-      enabled,
+      enabled: true,
       grids,
       activeGrid,
       conversationId,
       split: (targetId, sessionId, edge) => {
-        if (!enabled || isTempConvId(sessionId)) return;
+        if (isTempConvId(sessionId)) return;
         const layout = activeGrid?.layout ?? conversationId;
         if (!layout) return;
         const next = splitGrid(layout, targetId, sessionId, edge);
@@ -105,11 +109,11 @@ export function GridSessionsProvider({ children }: { children: ReactNode }) {
       },
       renameGrid: (id, name) => {
         const trimmed = name.trim().slice(0, USER_SESSION_TITLE_MAX_CHARS);
-        if (enabled && trimmed)
+        if (trimmed)
           save(grids.map((grid) => (grid.id === id ? { ...grid, name: trimmed } : grid)));
       },
     };
-  }, [enabled, grids, activeGrid, conversationId, gridId, navigate, storageKey]);
+  }, [grids, activeGrid, conversationId, gridId, navigate, storageKey]);
   return <GridSessionsContext.Provider value={value}>{children}</GridSessionsContext.Provider>;
 }
 
