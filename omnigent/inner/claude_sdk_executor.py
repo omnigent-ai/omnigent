@@ -41,10 +41,12 @@ from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, NamedTuple, Protocol, TypeAlias, cast
+from urllib.parse import urlsplit
 
 from omnigent._platform import resolve_cli_binary, stable_user_id
 from omnigent.cli_invocation import cli_invocation
 from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
+from omnigent.diagnostics import redact_url
 from omnigent.inner import _proc
 from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
 from omnigent.inner.hook_scripts import subagent_router
@@ -59,6 +61,7 @@ from omnigent.models.claude_model_vocabulary import (
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import RetryPolicy
+from omnigent.util.env_credentials import getenv_nonempty_with_omnigent_prefix
 from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, validate_effort
@@ -1159,7 +1162,9 @@ def _resolve_gateway_env(
     used verbatim. When only a Databricks profile is supplied (no override
     values), the Databricks-specific fallback derives both from the profile's
     workspace **host** (see
-    :func:`~omnigent.inner.databricks_executor._databricks_gateway_host`).
+    :func:`~omnigent.inner.databricks_executor._databricks_gateway_host`);
+    an exported ``ANTHROPIC_BASE_URL`` on that host's origin replaces the
+    derived base URL.
     Only the host is needed: the bearer token is minted at request time by
     the generated auth command, so OAuth U2M profiles (``auth_type =
     databricks-cli``, no static ``token`` field) resolve too. Returns an
@@ -1219,9 +1224,23 @@ def _resolve_gateway_env(
         if not host:
             return {}
         host = host.rstrip("/")
-        base_url = (
-            base_url_override if base_url_override is not None else f"{host}/ai-gateway/anthropic"
-        )
+        # The bearer is minted for this host, so only a same-origin exported URL may replace it.
+        exported = getenv_nonempty_with_omnigent_prefix("ANTHROPIC_BASE_URL")
+        ambient_base_url = exported[1].strip() if exported else ""
+        if base_url_override is not None:
+            base_url = base_url_override
+        elif _on_workspace_origin(ambient_base_url, host):
+            base_url = ambient_base_url
+        else:
+            base_url = f"{host}/ai-gateway/anthropic"
+            if exported:
+                logger.info(
+                    "Ignoring %s (%s is not on %s); using %s",
+                    exported[0],
+                    _log_safe_url(ambient_base_url),
+                    _log_safe_url(host),
+                    _log_safe_url(base_url),
+                )
         auth_command = (
             auth_command_override
             if auth_command_override is not None
@@ -1263,6 +1282,43 @@ def _resolve_gateway_env(
     else:
         gateway_env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
     return gateway_env
+
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin(url: str) -> tuple[str, str, int | None] | None:
+    """Return ``(scheme, hostname, effective port)`` for *url*, or ``None`` when unusable.
+
+    Unparseable URLs and URLs carrying userinfo never yield an origin.
+    """
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return None
+    if not parts.scheme or not parts.hostname or parts.username is not None:
+        return None
+    if port is None:
+        port = _DEFAULT_PORTS.get(parts.scheme)
+    return parts.scheme, parts.hostname, port
+
+
+def _on_workspace_origin(url: str, workspace_host: str) -> bool:
+    """True when *url* shares *workspace_host*'s scheme, host and effective port."""
+    expected = _origin(workspace_host)
+    return expected is not None and _origin(url) == expected
+
+
+def _log_safe_url(url: str) -> str:
+    """Redact *url* for a single-line log entry; URLs without a usable origin become a placeholder.
+
+    Userinfo in a malformed URL can sit outside the authority, where redaction
+    would miss it, so only URLs that parse to an origin are echoed at all.
+    """
+    if _origin(url) is None:
+        return "<unparseable url>"
+    return (redact_url(url) or "").encode("unicode_escape").decode("ascii")
 
 
 def _databricks_claude_auth_command(host: str, profile: str | None = None) -> str:
