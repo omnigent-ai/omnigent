@@ -1435,6 +1435,12 @@ module.exports = function (pi) {
   // Response id shared across a turn's ``running`` → ``idle`` status pair.
   // Kept separate from activeResponseId, which turn_start overwrites.
   let turnStatusResponseId = null;
+  // Withheld Pi model error (errored turn's response_id + message), posted
+  // once the run settles so a transient retry never surfaces a red error.
+  let pendingModelError = null;
+  // Pi 0.80.4 shipped ``agent_settled`` and entry renderers together, so this
+  // method marks settled support; older builds flush errors at agent_end.
+  const piReportsSettled = typeof pi.registerEntryRenderer === "function";
   // Dedicated loop-state flag, set on agent_start / cleared on agent_end. Used
   // as the no-isIdle() fallback for requestInterrupt instead of
   // !activeResponseId: agent_start resets activeResponseId to null and only
@@ -1754,6 +1760,27 @@ module.exports = function (pi) {
     };
     if (usageModel) data.model = usageModel;
     await postEvent(config, { type: "external_session_usage", data });
+  }
+
+  // Post the withheld model error once, pinned to the errored turn's
+  // response_id (the next agent_start/agent_end resets activeResponseId).
+  async function flushPendingModelError() {
+    if (!pendingModelError) return;
+    const pending = pendingModelError;
+    pendingModelError = null;
+    await postConversationItem(
+      config,
+      {
+        response_id: pending.responseId,
+        item_type: "error",
+        item_data: {
+          source: "execution",
+          code: pending.code,
+          message: `Pi model error: ${pending.message}`,
+        },
+      },
+      pending.sourceId,
+    );
   }
 
   function rememberContext(ctx) {
@@ -2139,12 +2166,27 @@ module.exports = function (pi) {
     const endResponseId =
       turnStatusResponseId ?? `pi-${Date.now()}-${++sequence}`;
     turnStatusResponseId = null;
+    // Builds without agent_settled end the run here; flush a withheld error.
+    if (!piReportsSettled) await flushPendingModelError();
     // Manual compact aborts the turn first; its own completion publishes idle.
     if (compacting) return;
     await postEvent(config, {
       type: "external_session_status",
       data: { status: "idle", response_id: endResponseId },
     });
+  });
+
+  pi.on("agent_settled", async (_event, ctx) => {
+    rememberContext(ctx);
+    // The run is fully finished (no retry or compaction left), so a withheld
+    // model error is final. Only Pi >= 0.80.4 fires this.
+    await flushPendingModelError();
+  });
+
+  pi.on("session_shutdown", async (_event, ctx) => {
+    rememberContext(ctx);
+    // Last chance to surface a withheld error before the process exits.
+    await flushPendingModelError();
   });
 
   pi.on("turn_start", async (event, ctx) => {
@@ -2304,21 +2346,18 @@ module.exports = function (pi) {
         ? message.errorMessage
         : "";
     if (stopReason === "error" && errorMessage) {
-      await postConversationItem(
-        config,
-        {
-          response_id: responseId,
-          item_type: "error",
-          item_data: {
-            source: "execution",
-            code: authFailure ? authFailure.code : "RuntimeError",
-            message: `Pi model error: ${errorMessage}`,
-          },
-        },
-        assistantMessageSourceId(message, responseId, errorMessage),
-      );
+      // Pi >= 0.80.4 retries provider errors with backoff before the run
+      // settles; keep only the latest error until the outcome is known.
+      pendingModelError = {
+        responseId,
+        message: errorMessage,
+        code: authFailure ? authFailure.code : "RuntimeError",
+        sourceId: assistantMessageSourceId(message, responseId, errorMessage),
+      };
       return;
     }
+    // A completed assistant message means Pi recovered from a withheld error.
+    if (stopReason !== "error") pendingModelError = null;
     const text = textFromMessage(message);
     if (!text) return;
     const sourceId = assistantMessageSourceId(message, responseId, text);
