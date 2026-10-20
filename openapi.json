@@ -15482,6 +15482,28 @@
           },
           {
             "in": "query",
+            "name": "include",
+            "required": false,
+            "schema": {
+              "default": "",
+              "maxLength": 4096,
+              "title": "Include",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "exclude",
+            "required": false,
+            "schema": {
+              "default": "",
+              "maxLength": 4096,
+              "title": "Exclude",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
             "name": "limit",
             "required": false,
             "schema": {

@@ -317,7 +317,7 @@ _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit E
 # rather than as text when they arrive in one burst.
 _COMPOSER_KILL_TO_LINE_END = "\x1b[107;5u"
 _COMPOSER_KILL_TO_LINE_START = "\x1b[117;5u"
-# Re-clear rounds when the capture cannot show the whole box.
+# Retry rounds when the capture cannot show the whole box.
 _COMPOSER_CLEAR_MAX_ROUNDS = 3
 # How long to wait for the pasted draft to visibly land in Claude's
 # input box before sending the submit Enter. Claude Code coalesces
@@ -6148,12 +6148,14 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     up to :data:`_COMPOSER_CLEAR_MAX_ROUNDS` rounds. A box still in that
     state afterwards is refused rather than pasted into: an exhausted budget
     is no evidence the box is empty, and a paste beside leftover text would
-    submit the person's draft along with the injected input.
+    submit the person's draft along with the injected input. An unavailable
+    capture is likewise retried without sending clearing keys, then refused
+    if no readable box appears within the budget.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
-    :raises ClaudeComposerNotCleared: If the rounds ran out before a capture
-        showed the box whole and down to one row; nothing was pasted.
+    :raises ClaudeComposerNotCleared: If the rounds ran out before a readable
+        capture showed the box whole and down to one row; nothing was pasted.
     :raises RuntimeError: If a ``tmux`` invocation fails.
     """
     # Space returns focus from the footer to the input box. The clear also
@@ -6161,17 +6163,18 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
     for round_no in range(_COMPOSER_CLEAR_MAX_ROUNDS + 1):
         box = _composer_box(_capture_pane(socket_path, tmux_target))
-        settled = box is None or (box.framed and len(box.rows) <= 1)
+        settled = box is not None and box.framed and len(box.rows) <= 1
         if not settled and round_no == _COMPOSER_CLEAR_MAX_ROUNDS:
             raise ClaudeComposerNotCleared(
                 "A draft left in Claude Code's input box could not be cleared, so nothing "
                 "was sent. Open the terminal, clear the input box, then retry."
             )
-        presses = 2 * len(box.rows) if box is not None else 2
-        keys = _COMPOSER_KILL_TO_LINE_END * presses + _COMPOSER_KILL_TO_LINE_START * presses
-        _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, keys)
-        if settled:
-            return
+        if box is not None:
+            presses = 2 * len(box.rows)
+            keys = _COMPOSER_KILL_TO_LINE_END * presses + _COMPOSER_KILL_TO_LINE_START * presses
+            _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, keys)
+            if settled:
+                return
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 

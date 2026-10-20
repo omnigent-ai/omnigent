@@ -1183,37 +1183,36 @@ function modelReference(model) {
 }
 
 /**
- * Report Pi's live model catalog to Omnigent for the Web UI model picker.
- *
- * Sourced from Pi's model registry — the models Pi actually loaded for THIS
- * session, whatever their origin: an Omnigent-configured provider's generated
- * models.json, or Pi's own ``/login`` / ``~/.pi`` config. Posting the live
- * registry (rather than the server reading a launch-written file) means the
- * picker populates in every auth path, including ``/login`` where no Omnigent
- * models.json exists.
- *
- * Prefers ``getAvailable()`` — only models with configured auth — over
- * ``getAll()`` (Pi's entire built-in catalog spanning every vendor, most with
- * no credentials). This scopes the picker to models the user can actually
- * switch to, and naturally to whichever provider(s) they are logged into.
- * Falls back to ``getAll()`` only when ``getAvailable()`` is unavailable
- * (older Pi). Best-effort and fire-and-forget: an empty or unavailable
- * registry posts nothing, leaving the picker hidden.
+ * Publish Pi's scoped models plus the current model to the web picker.
+ * Without a scope, use authenticated models; older registries fall back to getAll.
+ * An empty or unavailable registry posts nothing.
  */
 async function postModelOptions(config, ctx) {
-  const registry = ctx ? ctx.modelRegistry : undefined;
-  if (!registry) return;
-  let models;
-  try {
-    if (typeof registry.getAvailable === "function") {
-      models = registry.getAvailable();
-    } else if (typeof registry.getAll === "function") {
-      models = registry.getAll();
-    } else {
+  let models = [];
+  const scoped = ctx && Array.isArray(ctx.scopedModels) ? ctx.scopedModels : [];
+  for (const entry of scoped) {
+    if (entry && entry.model) models.push(entry.model);
+  }
+  if (models.length > 0) {
+    const current = ctx ? ctx.model : undefined;
+    const currentId = modelReference(current);
+    if (currentId && !models.some((model) => modelReference(model) === currentId)) {
+      models = [current, ...models];
+    }
+  } else {
+    const registry = ctx ? ctx.modelRegistry : undefined;
+    if (!registry) return;
+    try {
+      if (typeof registry.getAvailable === "function") {
+        models = registry.getAvailable();
+      } else if (typeof registry.getAll === "function") {
+        models = registry.getAll();
+      } else {
+        return;
+      }
+    } catch (_err) {
       return;
     }
-  } catch (_err) {
-    return;
   }
   if (!Array.isArray(models) || models.length === 0) return;
   const options = [];

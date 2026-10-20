@@ -5955,9 +5955,7 @@ export function NewChatLandingScreen() {
     : "Describe a task to start a new session…";
 
   const isCloudHostEntry = (host: Host) =>
-    host.host_id === arcaHostId ||
-    !!host.sandbox_provider ||
-    host.name.toLowerCase().includes("cloud");
+    !!host.sandbox_provider || host.name.toLowerCase().includes("cloud");
   const isReconnectRow = (host: Host) =>
     host.status === "offline" && host.host_id === thisMachineHostId && canConnectThisMachine;
   // Keep the selected host and this machine's reconnect action above the fold.

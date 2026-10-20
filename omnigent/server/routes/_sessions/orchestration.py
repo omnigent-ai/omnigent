@@ -137,7 +137,6 @@ from omnigent.server._elicitation_registry import (
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_READ,
-    local_single_user_enabled,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -239,6 +238,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_sandbox_status_cache,
     _session_status_cache,
     _session_terminal_pending_cache,
+    _unbound_managed_launch_tasks,
     get_caps,
     get_server_host_registry,
     get_server_host_store,
@@ -618,13 +618,17 @@ async def _publish_and_wait_for_harness_elicitation(
             _harness_elicitation_owners.pop(elicitation_id, None)
         if _harness_parked_elicitations.get(elicitation_id) is parked:
             _harness_parked_elicitations.pop(elicitation_id, None)
-        if published_request and not settled:
-            # Severed without an answer — defer the clear (scheduled
-            # before any await so handler cancellation can't skip it).
+        delivery = getattr(params, "native_delivery", None)
+        if published_request and (
+            not settled or (delivery is not None and settled_action is not None)
+        ):
+            # Retain the card during reconnect or native delivery. Abandoned
+            # waits expire if no new hook arrives within the grace period.
             _schedule_deferred_elicitation_clear(
                 session_id,
                 elicitation_id,
                 conversation_store,
+                native_delivery_attempt=delivery["attempt"] if delivery is not None else None,
             )
         elif published_request:
             _publish_elicitation_resolved(session_id, elicitation_id, action=settled_action)
@@ -642,6 +646,8 @@ def _schedule_deferred_elicitation_clear(
     session_id: str,
     elicitation_id: str,
     conversation_store: ConversationStore | None,
+    *,
+    native_delivery_attempt: str | None = None,
 ) -> None:
     """
     Clear one elicitation's approval card after the re-park grace, unless
@@ -661,6 +667,8 @@ def _schedule_deferred_elicitation_clear(
         e.g. ``"elicit_claude_0f3a..."``.
     :param conversation_store: Store used to mirror the clear into
         ancestor streams, or ``None`` to keep it session-local.
+    :param native_delivery_attempt: Only expire this delivery attempt, never
+        a newer attempt or a card already confirmed by the recorder.
     """
 
     async def _clear_after_grace() -> None:
@@ -677,6 +685,14 @@ def _schedule_deferred_elicitation_clear(
         if elicitation_id in _harness_elicitation_registry:
             # Re-parked — the new wait owns the eventual clear.
             return
+        if native_delivery_attempt is not None:
+            entry = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+            if (
+                entry is None
+                or entry[1].get("params", {}).get("native_delivery", {}).get("attempt")
+                != native_delivery_attempt
+            ):
+                return  # A receipt or a newer delivery attempt superseded this wait.
         _publish_elicitation_resolved(session_id, elicitation_id, reason="unanswered")
         if conversation_store is not None:
             await asyncio.to_thread(
@@ -2237,6 +2253,75 @@ async def _persist_model_change_note(
     _publish_external_conversation_item(session_id, persisted_items[0])
 
 
+async def _resolve_native_delivery(
+    session_id: str,
+    elicitation_id: str,
+    data: dict[str, Any],
+    conversation_store: ConversationStore | None,
+) -> bool:
+    """Accept one delivery attempt while keeping its card pending for the native receipt."""
+    entry = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+    if entry is None:
+        return False
+    event = entry[1]
+    params = event.get("params", {})
+    delivery = params.get("native_delivery") if isinstance(params, dict) else None
+    if not isinstance(delivery, dict):
+        return False
+    if params.get("target_session_id") not in (None, session_id):
+        return True
+    if delivery.get("state") == "sending":
+        return True
+    if delivery.get("state") == "unconfirmed":
+        meta = data.get("_meta")
+        if not isinstance(meta, dict) or not meta.get("native_delivery_attempt"):
+            raise OmnigentError(
+                "This client cannot retry delivery. Update Omnigent or answer in the terminal.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if meta.get("native_delivery_attempt") != delivery.get("attempt") or data.get(
+            "action"
+        ) != delivery.get("action"):
+            raise OmnigentError(
+                "This delivery attempt changed. Refresh the approval before retrying.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+    try:
+        result = ElicitationResult.model_validate(
+            {k: v for k, v in data.items() if k != "elicitation_id"}
+        )
+    except ValidationError as err:
+        raise OmnigentError("Invalid approval payload.", code=ErrorCode.INVALID_INPUT) from err
+    future = _harness_elicitation_registry.get(elicitation_id)
+    if future is not None:
+        if _harness_elicitation_owners.get(elicitation_id) != session_id or future.done():
+            return True
+        future.set_result(result)
+    fingerprint = _harness_elicitation_request_fingerprint(
+        ElicitationRequestParams.model_validate(params)
+    )
+    _prune_pre_resolved_harness_elicitations()
+    _harness_pre_resolved_elicitations[elicitation_id] = _PreResolvedHarnessElicitation(
+        session_id=session_id,
+        created_at=time.time(),
+        result=result,
+        request_fingerprint=fingerprint,
+    )
+    waiting = {
+        **event,
+        "params": {
+            **params,
+            "native_delivery": {**delivery, "state": "sending", "action": result.action},
+        },
+    }
+    session_stream.publish(session_id, waiting)
+    if conversation_store is not None:
+        await asyncio.to_thread(
+            _publish_elicitation_request_to_ancestors, conversation_store, session_id, waiting
+        )
+    return True
+
+
 async def _resolve_elicitation(
     session_id: str,
     data: dict[str, Any],
@@ -2294,6 +2379,10 @@ async def _resolve_elicitation(
     # matches, no resolved event published) rather than 500-ing the
     # client — the runner forward still fires so the runner can reject.
     elicitation_id = data.get("elicitation_id", "")
+    if isinstance(elicitation_id, str) and await _resolve_native_delivery(
+        session_id, elicitation_id, data, conversation_store
+    ):
+        return
     harness_future = _harness_elicitation_registry.get(elicitation_id)
     if harness_future is not None and not harness_future.done():
         # Only the session that owns this elicitation
@@ -2351,8 +2440,8 @@ async def _resolve_elicitation(
             # tombstone with the question's params: a later, different
             # question that reuses this id must not inherit the verdict.
             gap_fingerprint: str | None = None
-            pending_entry = pending_elicitations.lookup(elicitation_id)
-            if pending_entry is not None and pending_entry[0] == session_id:
+            pending_entry = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+            if pending_entry is not None:
                 try:
                     gap_fingerprint = _harness_elicitation_request_fingerprint(
                         ElicitationRequestParams.model_validate(pending_entry[1].get("params"))
@@ -4373,13 +4462,23 @@ async def _bind_and_launch_managed_runner(
     """
     from omnigent.server.managed_hosts import terminate_managed_host
 
-    try:
-        conv = await asyncio.to_thread(
+    bind = asyncio.ensure_future(
+        asyncio.to_thread(
             conversation_store.set_host_id,
             session_id,
             managed.host_id,
             managed.workspace,
         )
+    )
+    try:
+        conv = await asyncio.shield(bind)
+    except asyncio.CancelledError:
+        # Shutdown cancelled the launch mid-write. Let the write land so the
+        # row, which the cancelled launch reads to decide whether it failed,
+        # says whether the session is bound.
+        with contextlib.suppress(Exception):
+            await bind
+        raise
     except ConversationNotFoundError:
         # The session was deleted while its sandbox provisioned. The
         # delete route couldn't see the host binding yet, so tear the
@@ -4400,6 +4499,9 @@ async def _bind_and_launch_managed_runner(
             session_id, "failed", "session was deleted while its sandbox was provisioning"
         )
         return
+    # From here a shutdown may cancel the launch: the host's replica finishes it.
+    if (launch_task := asyncio.current_task()) is not None:
+        _unbound_managed_launch_tasks.discard(launch_task)
     if relaunch_host is not None:
         await _note_workspace_reset_on_recreate(session_id, conversation_store)
     # Host bound; what remains is launching the runner and waiting
@@ -12166,14 +12268,10 @@ def _create_session_from_bundle(
         any non-integrity reason.
     """
     if spec is None:
-        # Enforce the policy-handler allowlist only on a shared /
-        # multi-user server. On a trusted single-user/local server,
-        # ``omnigent run`` uploads the operator's own bundle through this same
-        # path, so custom handlers must keep working (the operator already has
-        # code execution — the restriction would add no security there).
+        # Loopback requests can originate from agents as well as the operator.
         spec = validate_agent_bundle(
             bundle_bytes,
-            enforce_handler_allowlist=not local_single_user_enabled(),
+            enforce_handler_allowlist=True,
         )
     assert spec.name is not None
 

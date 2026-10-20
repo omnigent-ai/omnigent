@@ -1176,6 +1176,8 @@ def create_hosts_router(
                     if target.conv.inference_snapshot
                     else None
                 ),
+                # The session had no runner bound, so nothing is superseded.
+                superseded_runner_ids=(),
             )
         )
         try:

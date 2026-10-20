@@ -2045,16 +2045,23 @@ class HostProcess:
         # the exit as intentional); the SIGTERM/SIGKILL round itself is
         # detached so a stop that waits out its 5s grace cannot
         # head-of-line block other sessions' launches on this host.
-        if frame.session_id:
+        # A server that names the superseded runners is authoritative: after
+        # /clear or /switch the session's old runner serves another session.
+        if frame.superseded_runner_ids is not None:
+            named = set(frame.superseded_runner_ids)
+            superseded = [(rid, handle) for rid, handle in self._runners.items() if rid in named]
+        elif frame.session_id:
             superseded = [
                 (rid, handle)
                 for rid, handle in self._runners.items()
                 if handle.session_id == frame.session_id
             ]
-            for rid, handle in superseded:
-                self._runners.pop(rid, None)
-                handle.stop_requested = True
-                self._spawn_superseded_stop(rid, handle, frame.session_id)
+        else:
+            superseded = []
+        for rid, handle in superseded:
+            self._runners.pop(rid, None)
+            handle.stop_requested = True
+            self._spawn_superseded_stop(rid, handle, frame.session_id or "")
         self._runners[runner_id] = _RunnerHandle(
             proc=proc,
             log_path=log_path,
@@ -5037,7 +5044,10 @@ class HostProcess:
         elif isinstance(frame, HostStatFrame):
             await self._send_text(ws, encode_host_frame(self._handle_stat(frame)))
         elif isinstance(frame, HostListDirFrame):
-            await self._send_text(ws, encode_host_frame(self._handle_list_dir(frame)))
+            # Stat-ing every entry can be slow on large or network-backed
+            # directories; keep the tunnel's event loop free meanwhile.
+            list_result = await asyncio.to_thread(self._handle_list_dir, frame)
+            await self._send_text(ws, encode_host_frame(list_result))
         elif isinstance(frame, HostCreateDirFrame):
             await self._send_text(ws, encode_host_frame(self._handle_create_dir(frame)))
         elif isinstance(frame, HostInstallHarnessFrame):

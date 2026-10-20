@@ -449,7 +449,7 @@ def test_repl_single_approval_allows_llm_response(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_ASK_DEMO_DIR)],
+        ["run", str(_ASK_DEMO_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -545,7 +545,7 @@ def test_repl_refusal_shows_deny_sentinel(
     _configure_mock_text(mock_llm_server_url, ["should not appear"], match="deny-sentinel")
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_ASK_DEMO_DIR)],
+        ["run", str(_ASK_DEMO_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -609,7 +609,7 @@ def test_repl_two_turns_fires_one_approval_per_turn(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_ASK_DEMO_DIR)],
+        ["run", str(_ASK_DEMO_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -728,7 +728,7 @@ def test_repl_approve_always_caches_for_later_turns(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_ASK_DEMO_DIR)],
+        ["run", str(_ASK_DEMO_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -830,7 +830,7 @@ def test_repl_tool_call_approval_allows_tool_to_run(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_TOOL_GATE_DIR)],
+        ["run", str(_TOOL_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -906,7 +906,7 @@ def test_repl_tool_call_refusal_blocks_tool(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_TOOL_GATE_DIR)],
+        ["run", str(_TOOL_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -1035,7 +1035,7 @@ def test_repl_subagent_ask_does_not_tunnel_banner_to_root(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_SUBAGENT_GATE_DIR)],
+        ["run", str(_SUBAGENT_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -1127,7 +1127,7 @@ def test_repl_label_driven_ask_approves(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_LABEL_ASK_GATE_DIR)],
+        ["run", str(_LABEL_ASK_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -1211,7 +1211,7 @@ def test_repl_label_driven_ask_refuse_shows_sentinel(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_LABEL_ASK_GATE_DIR)],
+        ["run", str(_LABEL_ASK_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -1285,7 +1285,7 @@ def test_repl_output_ask_does_not_prompt_in_repl(
     _configure_mock_text(mock_llm_server_url, [reply], match="output-noprompt")
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_OUTPUT_GATE_DIR)],
+        ["run", str(_OUTPUT_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -1348,7 +1348,7 @@ def test_repl_output_ask_passes_reply_through_no_sentinel(
     _configure_mock_text(mock_llm_server_url, [reply], match="output-passthru")
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_OUTPUT_GATE_DIR)],
+        ["run", str(_OUTPUT_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -1443,7 +1443,7 @@ def test_repl_tool_result_ask_does_not_prompt_in_repl(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_TOOL_RESULT_GATE_DIR)],
+        ["run", str(_TOOL_RESULT_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -1531,7 +1531,7 @@ def test_repl_tool_result_ask_passes_output_through(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_TOOL_RESULT_GATE_DIR)],
+        ["run", str(_TOOL_RESULT_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",
@@ -1681,7 +1681,7 @@ def test_repl_subagent_tool_call_ask_does_not_tunnel_banner_to_root(
     )
     child = pexpect.spawn(
         ap_cli,
-        ["run", str(_SUBAGENT_TOOL_GATE_DIR)],
+        ["run", str(_SUBAGENT_TOOL_GATE_DIR), "--no-session"],
         env=repl_env,
         encoding="utf-8",
         codec_errors="replace",

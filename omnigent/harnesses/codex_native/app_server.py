@@ -1006,12 +1006,45 @@ _CODEX_THREAD_STORE_ERROR = "thread-store internal error"
 _CODEX_PAGINATED_LINEAGE_ERROR = "source rollout is not paginated"
 
 
+#: Substring in codex's ``-32600`` message when ``thread/resume`` finds no
+#: rollout for the thread id.
+_CODEX_NO_ROLLOUT_ERROR = "no rollout found for thread id"
+
+
+def is_missing_rollout_error(exc: BaseException) -> bool:
+    """
+    Whether a ``thread/resume`` failure says codex found no rollout for the thread.
+
+    The runner writes the rollout before resuming, so this is either codex not
+    having indexed the file yet or codex skipping a file it cannot read.
+
+    :param exc: The exception raised by the resume request.
+    :returns: ``True`` for codex's ``-32600 no rollout found`` refusal.
+    """
+    return (
+        isinstance(exc, CodexAppServerResponseError)
+        and exc.code == _CODEX_INVALID_REQUEST_CODE
+        and exc.message is not None
+        and _CODEX_NO_ROLLOUT_ERROR in exc.message
+    )
+
+
 def is_server_draining_error(error: CodexAppServerResponseError) -> bool:
     """Whether Codex explicitly refused this RPC before submitting its input."""
     return (
         error.code == _CODEX_INVALID_REQUEST_CODE
         and error.message == "Server is draining; retry after reconnecting"
     )
+
+
+def is_compaction_steer_refusal(error: CodexAppServerResponseError) -> bool:
+    """Whether Codex refused input because its active task is compaction."""
+    if error.code != _CODEX_INVALID_REQUEST_CODE or error.message != "cannot steer a compact turn":
+        return False
+    data = error.error.get("data") if isinstance(error.error, dict) else None
+    info = data.get("codexErrorInfo") if isinstance(data, dict) else None
+    refusal = info.get("activeTurnNotSteerable") if isinstance(info, dict) else None
+    return isinstance(refusal, dict) and refusal.get("turnKind") == "compact"
 
 
 def is_unreadable_thread_error(exc: BaseException) -> bool:
