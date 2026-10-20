@@ -507,9 +507,11 @@ def register_resources_routes(
                     "GET",
                     runner_path,
                     timeout=_download_timeout,
-                    headers={"Range": request.headers["range"]}
-                    if "range" in request.headers
-                    else {},
+                    headers={
+                        name: request.headers[name]
+                        for name in ("Range", "If-Range")
+                        if name in request.headers
+                    },
                 ),
                 stream=True,
             )

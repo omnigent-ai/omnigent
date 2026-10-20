@@ -4431,17 +4431,19 @@ _DOWNLOAD_URL = (
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("range_header", "status", "content_range", "body"),
+    ("range_header", "if_range", "status", "content_range", "body"),
     [
-        ("bytes=2-5", 206, "bytes 2-5/10", b"2345"),
-        ("bytes=10-", 416, "bytes */10", b""),
-        ("bytes=2-5", 200, None, b"0123456789"),
-        (None, 200, None, b"0123456789"),
+        ("bytes=2-5", None, 206, "bytes 2-5/10", b"2345"),
+        ("bytes=10-", None, 416, "bytes */10", b""),
+        ("bytes=2-5", None, 200, None, b"0123456789"),
+        (None, None, 200, None, b"0123456789"),
+        ("bytes=2-5", '"stale-etag"', 200, None, b"0123456789"),
     ],
 )
 async def test_filesystem_download_proxy_ranges(
     client: httpx.AsyncClient,
     range_header: str | None,
+    if_range: str | None,
     status: int,
     content_range: str | None,
     body: bytes,
@@ -4449,11 +4451,11 @@ async def test_filesystem_download_proxy_ranges(
     from fastapi import Response
 
     runner = FastAPI()
-    seen: list[str | None] = []
+    seen: list[tuple[str | None, str | None]] = []
 
     @runner.get(_FS_ROUTE)
     async def serve(request: Request) -> Response:
-        seen.append(request.headers.get("range"))
+        seen.append((request.headers.get("range"), request.headers.get("if-range")))
         headers = {
             "Content-Disposition": 'attachment; filename="big.bin"',
             "Accept-Ranges": "bytes",
@@ -4467,11 +4469,14 @@ async def test_filesystem_download_proxy_ranges(
             del headers["Content-Disposition"]
         return Response(body, status_code=status, headers=headers)
 
+    request_headers = {}
+    if range_header is not None:
+        request_headers["Range"] = range_header
+    if if_range is not None:
+        request_headers["If-Range"] = if_range
     async with _runner_app_client(runner):
-        response = await client.get(
-            _DOWNLOAD_URL, headers={"Range": range_header} if range_header is not None else {}
-        )
-    assert seen == [range_header]
+        response = await client.get(_DOWNLOAD_URL, headers=request_headers)
+    assert seen == [(range_header, if_range)]
     assert response.status_code == status
     assert response.content == body
     assert response.headers.get("content-range") == content_range

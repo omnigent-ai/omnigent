@@ -26,6 +26,7 @@ import {
 } from "@/hooks/useFileContent";
 import { showToast } from "@/components/ui/toast";
 import { withBasePath } from "@/lib/basePath";
+import { isHostRoutingEnabled } from "@/lib/host";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 import { cn } from "@/lib/utils";
 import { formatVideoTime } from "@/lib/video";
@@ -58,7 +59,7 @@ function VideoPlayerContent(props: VideoPlayerProps) {
     const hostedUrl = workspaceFileMediaUrl(conversationId, path);
     if (hostedUrl) return hostedUrl;
     // Standalone browsers stream the download URL; routed hosts keep the authenticated fetch.
-    return usesDirectFileDownload()
+    return usesDirectFileDownload() && !isHostRoutingEnabled()
       ? withBasePath(workspaceFileDownloadUrl(conversationId, path))
       : null;
   }, [requested, conversationId, path]);

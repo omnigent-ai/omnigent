@@ -66,6 +66,7 @@ afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   delete window.__OMNIGENT_BASE_PATH__;
 });
 
@@ -109,6 +110,21 @@ describe("VideoPlayer", () => {
     expect(authenticatedFetch).not.toHaveBeenCalled();
     expect(createUrl).not.toHaveBeenCalled();
     expect(revokeUrl).not.toHaveBeenCalled();
+  });
+
+  it("fetches a playback blob when OSS host routing requires request headers", async () => {
+    vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
+    vi.mocked(usesDirectFileDownload).mockReturnValue(true);
+    const { container, unmount } = render(<VideoPlayer {...props} />);
+    expect(fetchBlob).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Play video: Feature demo" }));
+    await waitFor(() =>
+      expect(container.querySelector("video")).toHaveAttribute("src", "blob:recording"),
+    );
+    expect(fetchBlob).toHaveBeenCalledWith("sess_1", "demo.webm", expect.any(AbortSignal));
+    unmount();
+    expect(revokeUrl).toHaveBeenCalledWith("blob:recording");
   });
 
   it("keeps direct downloads available after playback errors and waits for Play after Retry", () => {
