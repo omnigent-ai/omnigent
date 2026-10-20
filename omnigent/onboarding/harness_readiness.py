@@ -548,6 +548,24 @@ def _claude_managed_gateway_configured() -> bool:
         return False
 
 
+def _managed_connect_pi_provider_configured() -> bool:
+    """Whether a Pi launch with no ``providers:`` entry routes through the owner's
+    managed-connect broker (the fallback ``resolve_pi_native_provider`` takes), so a
+    connected sandbox reads ready rather than "needs-auth". Local reads; never raises."""
+    try:
+        from omnigent.host.databricks_credential import (
+            api_key_auth_precludes_broker,
+            managed_connect_workspace_host,
+        )
+
+        if api_key_auth_precludes_broker(None):
+            return False
+        return managed_connect_workspace_host() is not None
+    except Exception as exc:  # the message can quote .databrickscfg lines
+        _logger.debug("readiness: managed-connect check failed (%s)", type(exc).__name__)
+        return False
+
+
 def _ambient_family_env_key_configured(family: str) -> bool:
     """Whether an ambient env API key serving *family* is set.
 
@@ -980,6 +998,9 @@ def _harness_availability(canonical: str) -> HarnessAvailability:
                 and provider.kind == SUBSCRIPTION_KIND
                 and provider.cli == "pi"
             ):
+                return True
+            # No entry at all: launch falls back to the managed-connect broker.
+            if provider is None and _managed_connect_pi_provider_configured():
                 return True
         except Exception:
             pass

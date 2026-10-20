@@ -5390,6 +5390,13 @@ def _serve_host_until_exit(
     configure_host_databricks(server_url, identity.host_id)
     _generate_ucode_configs()
 
+    # On a managed sandbox (arclet), install a missing Pi CLI in the background so
+    # a fresh host offers Pi without manual setup; the readiness loop publishes the
+    # flip. No-op on laptops (``IS_SANDBOX`` unset) and when Pi is already present.
+    from omnigent.host.harness_preparation import prepare_host_harnesses
+
+    prepare_host_harnesses()
+
     if lifecycle_lock is None and daemon_target is not None:
         lifecycle_lock = DaemonLifecycleLock.for_target(daemon_target)
     host = HostProcess(

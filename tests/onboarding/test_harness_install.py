@@ -1695,3 +1695,67 @@ def test_missing_harness_cli_flags_outdated_version(
     spec = hi.missing_harness_cli("opencode-native")
     assert spec is not None
     assert spec.binary == "opencode"
+
+
+@pytest.mark.parametrize("compatible", [True, False])
+def test_concurrent_installs_of_one_package_are_serialized(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, compatible: bool
+) -> None:
+    """Host boot preparation and a UI install request never run two installers of
+    the same package at once. The caller that waited skips a now-compatible
+    install but still upgrades a binary whose version is too low."""
+    import threading
+
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/local/bin/{name}")
+    binary = tmp_path / "pi"
+    binary.write_text("")
+    monkeypatch.setattr(hi, "resolve_cli_binary", lambda _name: str(binary))
+    monkeypatch.setattr(hi, "_harness_cli_version_satisfies", lambda *_a, **_k: compatible)
+    package_lock = threading.Lock()
+    other_caller_waiting = threading.Event()
+
+    class _ObservedLock:
+        """The real per-package lock, signalling once a caller blocks on it."""
+
+        def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+            if blocking:
+                other_caller_waiting.set()
+            return package_lock.acquire(blocking, timeout)
+
+        def release(self) -> None:
+            package_lock.release()
+
+    monkeypatch.setattr(hi, "_install_lock", lambda _spec: _ObservedLock())
+    active = 0
+    peak = 0
+    runs = 0
+    guard = threading.Lock()
+
+    def _run_until_the_other_caller_waits(cmd, **_kwargs):
+        nonlocal active, peak, runs
+        with guard:
+            active += 1
+            runs += 1
+            peak = max(peak, active)
+        # Hold the installer until the other caller is blocked on the lock, so the
+        # overlap is guaranteed rather than timing-dependent.
+        assert other_caller_waiting.wait(timeout=10)
+        with guard:
+            active -= 1
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(hi.subprocess, "run", _run_until_the_other_caller_waits)
+    results: list[hi.HarnessInstallResult] = []
+    threads = [
+        threading.Thread(target=lambda: results.append(hi.try_install_harness_cli(hi.PI_KEY)))
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive(), "install thread deadlocked on the install lock"
+    assert [result.installed for result in results] == [True, True]
+    assert peak == 1
+    assert runs == (1 if compatible else 2)
