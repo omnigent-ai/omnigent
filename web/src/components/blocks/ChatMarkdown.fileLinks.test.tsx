@@ -28,7 +28,11 @@ beforeEach(() => {
   vi.stubGlobal("fetch", fetchMock);
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 
 function jsonResponse(body: unknown, status = 200): Response {
   return {
@@ -102,6 +106,45 @@ function renderMarkdown(
 }
 
 describe("markdown links to workspace files", () => {
+  it("plays an existing root-level recording outside the changed-file list", async () => {
+    fetchMock.mockResolvedValue(dirListing(["demo.webm"]));
+    renderMarkdown("[Screen recording](demo.webm)", [], FILE_VIEWER_WITH_SESSION);
+
+    expect(
+      await screen.findByRole("button", { name: "Play video: Screen recording" }),
+    ).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Screen recording" }));
+    expect(openFile).toHaveBeenCalledWith("demo.webm");
+  });
+
+  it("renders a workspace recording inline and keeps its file-viewer link", () => {
+    renderMarkdown("[Screen recording](demo.webm)", ["demo.webm"], FILE_VIEWER_WITH_SESSION);
+    expect(screen.getByRole("button", { name: "Play video: Screen recording" })).toBeVisible();
+    expect(screen.getAllByText("Screen recording")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Screen recording" }));
+    expect(openFile).toHaveBeenCalledWith("demo.webm");
+  });
+
+  it("renders direct remote video links but leaves ordinary links alone", () => {
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    renderMarkdown(
+      "[Demo](https://example.com/demo.mp4?signature=abc) and [docs](https://example.com/page)",
+    );
+    expect(document.querySelectorAll("video")).toHaveLength(0);
+    const docs = screen.getByRole("link", { name: "docs" });
+    expect(docs).toHaveAttribute("href", "https://example.com/page");
+    expect(docs).toHaveAttribute("target", "_blank");
+    fireEvent.click(screen.getByRole("button", { name: "Play video: Demo" }));
+    expect(document.querySelectorAll("video")).toHaveLength(1);
+    expect(document.querySelector("video")).toHaveAttribute(
+      "src",
+      "https://example.com/demo.mp4?signature=abc",
+    );
+    expect(screen.getByRole("link", { name: "docs" })).toBe(docs);
+    expect(openFile).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("opens the FileViewer for an absolute path instead of navigating", () => {
     renderMarkdown(`[proposal.md](${WORKSPACE}/docs/proposal.md)`, ["docs/proposal.md"]);
 

@@ -1,16 +1,17 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { MarkdownManager } from "@tiptap/markdown";
 import { StarterKit } from "@tiptap/starter-kit";
-import { scanSetextHeading } from "./markdownSetextHeading";
+import { installIterativeSetextHeadings, scanSetextHeading } from "./markdownSetextHeading";
 import { installMarkdownParserPatch } from "./tiptapMarkdownPatches";
 
 const manager = new MarkdownManager({ extensions: [StarterKit] });
-const rules = manager.instance.Lexer.rules.block;
 
 describe("iterative setext headings", () => {
-  it.each([true, false])("preserves upstream heading boundaries with GFM=%s", (gfm) => {
+  it.each([true, false])("preserves upstream heading fields with GFM=%s", (gfm) => {
     const lines = [
       "Title",
+      "  Title  ",
+      "Title \t",
       "",
       " ",
       "\t",
@@ -19,8 +20,11 @@ describe("iterative setext headings", () => {
       "# heading",
       "#word",
       "- item",
+      " - item",
       "-\titem",
       "1. item",
+      "  1. item",
+      "   1) item",
       "> quote",
       "```",
       "~~~",
@@ -39,14 +43,16 @@ describe("iterative setext headings", () => {
       for (const second of lines) {
         for (const ending of ["", "\n===\n\nAfter", "\n---\nAfter"]) {
           const source = `${first}\n${second}${ending}`;
-          const cap = (gfm ? rules.gfm : rules.normal).lheading.exec(source);
+          const tokenizer = new manager.instance.Tokenizer({ gfm });
+          tokenizer.lexer = new manager.instance.Lexer({ gfm, tokenizer });
+          const token = tokenizer.lheading(source);
           expect(scanSetextHeading(source, gfm), source).toEqual(
-            cap
+            token
               ? {
-                  type: "heading",
-                  raw: cap[0],
-                  depth: cap[2][0] === "=" ? 1 : 2,
-                  text: cap[1].trim(),
+                  type: token.type,
+                  raw: token.raw,
+                  depth: token.depth,
+                  text: token.text,
                 }
               : undefined,
           );
@@ -55,12 +61,23 @@ describe("iterative setext headings", () => {
     }
   });
 
-  it("keeps token content and the pedantic grammar when installed repeatedly", () => {
+  it("registers once when managers share a marked instance", () => {
+    const first = new MarkdownManager({ extensions: [StarterKit] });
+    const second = new MarkdownManager({ extensions: [StarterKit] });
+    expect(first.instance).toBe(second.instance);
+    const use = vi.spyOn(first.instance, "use");
+    installIterativeSetextHeadings(first.instance);
+    installIterativeSetextHeadings(first.instance);
+    installIterativeSetextHeadings(second.instance);
+    expect(use).toHaveBeenCalledTimes(1);
+    use.mockRestore();
+  });
+
+  it("keeps inline token content and delegates the pedantic grammar", () => {
     const sources = ["Title\n===\n\nAfter", "one\ntwo\n---\n", "#word\n===\n"];
     const expected = sources.map((source) =>
       new manager.instance.Lexer({ pedantic: true }).lex(source),
     );
-    installMarkdownParserPatch();
     installMarkdownParserPatch();
     manager.parse("Title\n===\n");
     const lex = (source: string, pedantic = false) =>

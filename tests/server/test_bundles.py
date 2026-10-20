@@ -144,11 +144,8 @@ def test_validate_bundle_accepts_clean_agent() -> None:
 def test_validate_bundle_allows_custom_handler_when_not_enforced() -> None:
     """``enforce_handler_allowlist=False`` accepts a custom handler.
 
-    This is the trusted single-user / local-server path: ``omnigent
-    run`` uploads the operator's own bundle through this same function,
-    so an unregistered custom handler must still load. The routes pass
-    ``enforce_handler_allowlist=not local_single_user_enabled()``, so
-    this mode is what a local server uses.
+    Direct trusted callers retain an explicit opt-out. HTTP routes never
+    select it, including on local single-user servers.
     """
     spec = validate_agent_bundle(
         _single_file_yaml_bundle(
@@ -337,8 +334,8 @@ def test_validate_agent_bundle_allows_contained_relative_cwd(ok_cwd: str) -> Non
     assert spec.name == "uploaded-agent"
 
 
-def test_validate_agent_bundle_allows_absolute_cwd_for_trusted_local_server() -> None:
-    """The trusted single-user/local path keeps the documented absolute-cwd
+def test_validate_agent_bundle_allows_absolute_cwd_for_direct_trusted_caller() -> None:
+    """Direct trusted in-process validation keeps the absolute-cwd
     behavior.
 
     With ``enforce_handler_allowlist=False`` the operator uploads their OWN
@@ -390,7 +387,7 @@ def test_validate_bundle_rejects_server_callable_tool() -> None:
 def test_validate_bundle_allows_server_callable_tool_when_not_enforced() -> None:
     """``enforce_handler_allowlist=False`` accepts a server ``callable:`` tool.
 
-    The trusted single-user / local-server path uploads the operator's own
+    A direct trusted in-process caller loads the operator's own
     bundle through this same function; Python callable tools are the intended
     operator feature there (the operator already has code execution), so the
     guard must not block them — mirroring the handler-allowlist exemption.

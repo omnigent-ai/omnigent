@@ -49,6 +49,7 @@ from omnigent.models.model_metadata import (
     ModelWireAPI,
 )
 from omnigent.models.model_resolver import ModelResolutionError, ModelResolutionSource
+from omnigent.onboarding.ambient import DetectedProvider
 from omnigent.onboarding.providers import ModelInfo
 from omnigent.runtime.credentials.databricks import WorkspaceCreds
 from omnigent.spec.types import AgentSpec, ApiKeyAuth, DatabricksAuth, ExecutorSpec, ProviderAuth
@@ -193,6 +194,62 @@ def test_managed_claude_gateway_preserves_explicit_provider(
     )
     unusable = _worker_spec(harness, auth=ProviderAuth(name="explicit"))
     assert resolve_model_provider(unusable, harness).kind == "none"
+
+
+def test_managed_claude_gateway_beats_global_auth_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spec pinning no route is labelled with the managed gateway, not global ``auth:``."""
+    _isolate_config(monkeypatch, tmp_path, "auth:\n  type: databricks\n  profile: oss\n")
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(
+        json.dumps(
+            {
+                "env": {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
+                "apiKeyHelper": "echo test-token",
+            }
+        )
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,)
+    )
+
+    provider = resolve_model_provider(_worker_spec("claude-native"), "claude-native")
+    assert provider.kind == "cli-config"
+    assert provider.base_url == "https://gateway.example/anthropic"
+    pinned = _worker_spec("claude-native", auth=DatabricksAuth(profile="explicit"))
+    assert resolve_model_provider(pinned, "claude-native").profile == "explicit"
+
+
+def test_managed_claude_gateway_keeps_ambient_key_label(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Managed settings only displace a global ``auth:``, not an ambient key route."""
+    _isolate_config(monkeypatch, tmp_path, "{}")
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(
+        json.dumps(
+            {
+                "env": {"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
+                "apiKeyHelper": "echo test-token",
+            }
+        )
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,)
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
+    monkeypatch.setattr(
+        "omnigent.onboarding.detected.detect_providers",
+        lambda: [
+            DetectedProvider(
+                name="anthropic", kind="key", family="anthropic", source="$ANTHROPIC_API_KEY"
+            )
+        ],
+    )
+
+    provider = resolve_model_provider(_worker_spec("claude-native"), "claude-native")
+    assert provider.kind == "key"
 
 
 @pytest.mark.parametrize(

@@ -56,26 +56,24 @@ const TIERS: { id: SharingMode; label: string; description: string }[] = [
   },
 ];
 
-/** Which new sessions start public, most-private first. */
-const DEFAULT_PUBLIC_OPTIONS: { id: DefaultPublicSessions; label: string; description: string }[] =
-  [
-    {
-      id: "off",
-      label: "Private",
-      description: "New sessions start private. Owners share them explicitly.",
-    },
-    {
-      id: "sandbox",
-      label: "Cloud sandbox sessions public",
-      description:
-        "Sessions running in a server-managed cloud sandbox start with public read access. Sessions on a user's own machine stay private.",
-    },
-    {
-      id: "all",
-      label: "All sessions public",
-      description: "Every new session starts with public read access.",
-    },
-  ];
+/** Scope of automatic sharing, most-private first. */
+const DEFAULT_PUBLIC_OPTIONS: {
+  id: Exclude<DefaultPublicSessions, "off">;
+  label: string;
+  description: string;
+}[] = [
+  {
+    id: "sandbox",
+    label: "Managed hosts only",
+    description:
+      "Share sessions on server-managed sandboxes. Sessions on local hosts start private.",
+  },
+  {
+    id: "all",
+    label: "All sessions",
+    description: "Share sessions on both managed and local hosts.",
+  },
+];
 
 /**
  * Greys out a control another setting overrides and explains why on hover.
@@ -311,53 +309,76 @@ export function SharingPage() {
 
                 <div className="mt-4 border-t border-border pt-4">
                   <BlockedBy reason={defaultPublicBlockedReason}>
-                    <SettingsLabel
-                      label="Default visibility for new sessions"
-                      description={
-                        <>
-                          Whether new sessions start with public read access. Owners can still
-                          revoke it from the Share dialog. Existing sessions are unchanged.
-                          {!defaultPublicEditable && (
-                            <span className="mt-1 block">
-                              Managed by this deployment and can&apos;t be changed here.
-                            </span>
-                          )}
-                        </>
-                      }
-                    />
-                    <fieldset
-                      className="mt-4 divide-y divide-border border-t border-border"
-                      disabled={defaultPublicDisabled}
-                      aria-label="Default visibility for new sessions"
-                    >
-                      {DEFAULT_PUBLIC_OPTIONS.map((option) => {
-                        const selected = option.id === effectiveDefaultPublic;
-                        return (
-                          <label
-                            key={option.id}
-                            className={cn(
-                              "flex cursor-pointer items-start gap-3 py-4 last:pb-0",
-                              defaultPublicDisabled && "cursor-not-allowed opacity-70",
+                    <div className="flex items-center justify-between gap-4">
+                      <SettingsLabel
+                        label="Share new sessions by default"
+                        labelId="default-public-label"
+                        descriptionId="default-public-description"
+                        descriptionClassName="max-md:block"
+                        className="flex-1"
+                        description={
+                          <>
+                            New sessions start with public read access for anyone with the link who
+                            can sign in. Owners can revoke it in Share. Existing sessions are
+                            unchanged.
+                            {!defaultPublicEditable && (
+                              <span className="mt-1 block">
+                                Managed by this deployment and can&apos;t be changed here.
+                              </span>
                             )}
-                          >
-                            <input
-                              type="radio"
-                              name="default-public-sessions"
-                              value={option.id}
-                              checked={selected}
-                              onChange={() => chooseDefaultPublic(option.id)}
-                              disabled={defaultPublicDisabled}
-                              className="mt-1 size-4 accent-primary"
-                            />
-                            <SettingsLabel
-                              label={option.label}
-                              description={option.description}
-                              className="flex-1"
-                            />
-                          </label>
-                        );
-                      })}
-                    </fieldset>
+                          </>
+                        }
+                      />
+                      <Switch
+                        checked={effectiveDefaultPublic !== "off"}
+                        onCheckedChange={(enabled) =>
+                          chooseDefaultPublic(enabled ? "sandbox" : "off")
+                        }
+                        disabled={defaultPublicDisabled}
+                        aria-labelledby="default-public-label"
+                        aria-describedby="default-public-description"
+                        componentId="settings.sharing.default_public"
+                      />
+                    </div>
+                    {effectiveDefaultPublic !== "off" && (
+                      <fieldset
+                        className="mt-4 ml-1 border-l-2 border-border pl-4"
+                        disabled={defaultPublicDisabled}
+                      >
+                        <legend className="mb-3 text-ui font-medium">Automatically share</legend>
+                        <div className="flex flex-col gap-4">
+                          {DEFAULT_PUBLIC_OPTIONS.map((option) => (
+                            <label
+                              key={option.id}
+                              className={cn(
+                                "flex cursor-pointer items-start gap-3",
+                                defaultPublicDisabled && "cursor-not-allowed opacity-70",
+                              )}
+                            >
+                              <input
+                                type="radio"
+                                name="default-public-sessions"
+                                value={option.id}
+                                checked={option.id === defaultPublic}
+                                onChange={() => chooseDefaultPublic(option.id)}
+                                disabled={defaultPublicDisabled}
+                                aria-labelledby={`default-public-${option.id}-label`}
+                                aria-describedby={`default-public-${option.id}-description`}
+                                className="mt-1 size-4 accent-primary"
+                              />
+                              <SettingsLabel
+                                label={option.label}
+                                labelId={`default-public-${option.id}-label`}
+                                description={option.description}
+                                descriptionId={`default-public-${option.id}-description`}
+                                descriptionClassName="max-md:block"
+                                className="flex-1"
+                              />
+                            </label>
+                          ))}
+                        </div>
+                      </fieldset>
+                    )}
                   </BlockedBy>
                 </div>
               </SettingsGroup>

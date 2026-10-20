@@ -1368,6 +1368,36 @@ describe("PullRequestPanel", () => {
     expect(screen.queryByTestId("diff")).toBeNull();
   });
 
+  it("reports a failed file list without claiming there are no changes", async () => {
+    state.changes!.data = undefined;
+    state.changes!.error = new Error("Could not load changed files.");
+    renderChanges();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not load changed files.");
+    expect(screen.queryByText("No changes vs base.")).toBeNull();
+  });
+
+  it("reports a malformed patch", async () => {
+    vi.mocked(parsePatchFiles).mockImplementationOnce(() => {
+      throw new Error("bad patch");
+    });
+    renderChanges();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Couldn’t read the PR diff.");
+    expect(screen.queryByText("No text diff available for this file.")).toBeNull();
+  });
+
+  it("refreshes info, files and diff even from an error state", async () => {
+    state.info!.error = new Error("Request timed out.");
+    const invalidate = vi.spyOn(QueryClient.prototype, "invalidateQueries").mockResolvedValue();
+    onTestFinished(() => invalidate.mockRestore());
+    renderPanel();
+    await userEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(invalidate.mock.calls.map(([filters]) => filters?.queryKey?.[0])).toEqual([
+      "github-info",
+      "github-changed-files",
+      "github-pr-diff",
+    ]);
+  });
+
   it("marks an incomplete changed-file list while retaining loaded file diffs", async () => {
     state.changes!.data!.has_more = true;
     renderChanges();
@@ -1534,6 +1564,13 @@ describe("derivePullRequestPanelState", () => {
       "runner-offline",
     );
     expect(derivePullRequestPanelState(q({ error: new Error("boom") })).kind).toBe("error");
+  });
+
+  it("reads an offline sandbox as sandbox-offline unless info was cached before it stopped", () => {
+    const asleep = (over: Parameters<typeof q>[0]) => ({ ...q(over), sandboxAsleep: true });
+    expect(derivePullRequestPanelState(asleep({ isLoading: true })).kind).toBe("sandbox-offline");
+    expect(derivePullRequestPanelState(asleep({})).kind).toBe("sandbox-offline");
+    expect(derivePullRequestPanelState(asleep({ data: ready })).kind).toBe("ready");
   });
 
   it("maps each unavailable reason to its own state", () => {

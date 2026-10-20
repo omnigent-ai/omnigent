@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -1844,6 +1845,211 @@ async def test_search_matches(
     assert expected_path in paths, (
         f"Expected {expected_path!r} in search results for q={q!r}, got: {paths}. {failure_hint}"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query,options,lines",
+    [
+        ("needle", {}, [2, 3]),
+        ("needle", {"case_sensitive": "true"}, [3]),
+        (r"n.edle", {"regex": "true"}, [2, 3]),
+        ("n.edle", {}, []),
+        ("--help", {}, [4]),
+        ("  spaced  ", {}, [5]),
+        ("$(touch injected)", {}, [6]),
+        ("needle", {"include": "src/"}, [2, 3]),
+        ("needle", {"include": "missing/**"}, []),
+        ("needle", {"exclude": "src/"}, []),
+        ("needle", {"include": "src/**", "exclude": "*.txt"}, []),
+        ("needle", {"include": "*.{py,txt}, .git/**", "exclude": "ignored.txt"}, [2, 3]),
+        ("needle", {"include": "missing/**, src/**", "exclude": "*.py, ignored.txt"}, [2, 3]),
+        ("needle", {"include": " , ", "exclude": " , "}, [2, 3]),
+        ("needle", {"include": "$(touch injected)"}, []),
+    ],
+)
+async def test_content_search_live_workspace(
+    client: httpx.AsyncClient,
+    workspace: Path,
+    query: str,
+    options: dict[str, str],
+    lines: list[int],
+) -> None:
+    subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+    (workspace / "src" / "content.txt").write_text(
+        "first\n😀 Needle\nneedle\n--help\n  spaced  \n$(touch injected)\n"
+    )
+    (workspace / ".gitignore").write_text("ignored.txt\n")
+    (workspace / "ignored.txt").write_text("needle\n")
+    (workspace / ".git" / "hidden-match").write_text("needle\n")
+    (workspace / "binary").write_bytes(b"\x00needle\n")
+    outside = workspace.parent / "outside.txt"
+    outside.write_text("needle\n")
+    (workspace / "link.txt").symlink_to(outside)
+    response = await client.get(
+        "/v1/sessions/conv_test/resources/environments/default/content-search",
+        params={"q": query, **options},
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert "error" not in result, result
+    assert [(match["path"], match["line"]) for match in result["matches"]] == [
+        ("src/content.txt", line) for line in lines
+    ]
+    if lines and lines[0] == 2:
+        match = result["matches"][0]
+        assert match["column"] == 4  # Monaco columns count UTF-16 code units.
+        assert (match["match_start"], match["match_end"]) == (3, 9)
+    assert result["truncated"] is False
+    assert not (workspace / "injected").exists()
+
+
+@pytest.mark.asyncio
+async def test_content_search_limits_errors_and_hidden_files(
+    client: httpx.AsyncClient, workspace: Path
+) -> None:
+    (workspace / ".hidden.txt").write_text("prefix needle\n" * 4)
+    endpoint = "/v1/sessions/conv_test/resources/environments/default/content-search"
+    response = await client.get(endpoint, params={"q": "needle", "limit": 2})
+    result = response.json()
+    assert len(result["matches"]) == 2, result
+    assert result["matches"][0]["path"] == ".hidden.txt"
+    assert result["truncated"] is True
+    response = await client.get(endpoint, params={"q": "needle", "limit": 4})
+    assert response.json()["truncated"] is False
+    response = await client.get(endpoint, params={"q": "[", "regex": "true"})
+    assert "regex parse error" in response.json()["error"]
+    response = await client.get(endpoint, params={"q": "needle\nsecond"})
+    assert "single-line" in response.json()["error"]
+    for params in ({"q": " "}, {"q": "a" * 4097}, {"q": "a", "limit": 501}):
+        response = await client.get(endpoint, params=params)
+        assert response.status_code == 422
+    for field in ("include", "exclude"):
+        response = await client.get(endpoint, params={"q": "needle", field: "a" * 4097})
+        assert response.status_code == 422
+        for invalid in ("!*.txt", "src/\n", "src/\r", "src/\x00", "["):
+            response = await client.get(endpoint, params={"q": "needle", field: invalid})
+            assert response.json().get("error"), response.text
+    (workspace / ".hidden.txt").write_text("é" * 1000 + "😀 needle tail\n")
+    response = await client.get(endpoint, params={"q": "needle"})
+    match = response.json()["matches"][0]
+    assert match["column"] == 1004
+    assert "needle" in match["text"]
+    assert len(match["text"]) <= 402
+
+
+@pytest.mark.parametrize("mode", ["missing", "timeout", "long-line"])
+def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
+    """Exercise the sandbox script with controlled executables and a short deadline."""
+    from omnigent.runner.content_search import _SEARCH_SCRIPT
+
+    if mode != "missing":
+        executable = tmp_path / "rg"
+        body = (
+            "import os, time\n"
+            f"open({str(tmp_path / 'pid')!r}, 'w').write(str(os.getpid()))\n"
+            "time.sleep(60)\n"
+            if mode == "timeout"
+            else "print('x' * (2 * 1024 * 1024))\n"
+        )
+        executable.write_text(f"#!{sys.executable}\n{body}")
+        executable.chmod(0o755)
+    parameters = (
+        "query = 'needle'\ncase_sensitive = False\nregex = False\nlimit = 2\nglob_args = []\n"
+    )
+    timer = (
+        "import threading\noriginal_timer = threading.Timer\n"
+        "threading.Timer = lambda seconds, callback: original_timer(0.2, callback)\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", parameters + timer + _SEARCH_SCRIPT],
+        env={**os.environ, "PATH": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=True,
+    )
+    result = json.loads(completed.stdout)
+    if mode == "missing":
+        assert "Install ripgrep" in result["error"]
+    elif mode == "timeout":
+        assert result["truncated"] is True
+        assert "15 seconds" in result["warning"]
+        with pytest.raises(ProcessLookupError):
+            os.kill(int((tmp_path / "pid").read_text()), 0)
+    else:
+        assert result["matches"] == []
+        assert "very long" in result["warning"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stdout", ["", '{"matches": []}\n[stdout truncated]'])
+async def test_content_search_rejects_invalid_helper_output(
+    registry: SessionResourceRegistry, monkeypatch: pytest.MonkeyPatch, stdout: str
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.runner.content_search import search_content
+
+    environment = registry._primary_envs["conv_test"]
+    monkeypatch.setattr(environment, "shell", AsyncMock(return_value={"stdout": stdout}))
+    assert await search_content(environment, "needle") == {
+        "error": "Content search could not run in this workspace. Try again."
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(_IS_ROOT, reason="root bypasses permission checks")
+@pytest.mark.parametrize("unreadable", [".env", ".ignore"])
+async def test_content_search_read_errors_keep_partial_results(
+    client: httpx.AsyncClient, workspace: Path, unreadable: str
+) -> None:
+    (workspace / "readable.txt").write_text("needle\n")
+    denied = workspace / unreadable
+    denied.write_text("readable.txt\n")
+    denied.chmod(0)
+    try:
+        response = await client.get(
+            "/v1/sessions/conv_test/resources/environments/default/content-search",
+            params={"q": "needle"},
+        )
+        result = response.json()
+        assert [match["path"] for match in result["matches"]] == ["readable.txt"], result
+        assert result["truncated"] is True
+        assert "ignore rules could not be read" in result["warning"]
+        assert "include normally ignored files" in result["warning"]
+    finally:
+        denied.chmod(0o600)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sandbox_type", _SANDBOX_BACKENDS)
+async def test_content_search_under_real_sandbox_keeps_readable_matches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sandbox_type: str
+) -> None:
+    from omnigent.runner.content_search import search_content
+
+    (tmp_path / ".env").write_text("needle secret\n")
+    (tmp_path / ".ignore").write_text("readable.txt\n")
+    (tmp_path / "readable.txt").write_text("needle\n")
+    monkeypatch.setenv("PYTHONPATH", f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            sandbox=OSEnvSandboxSpec(type=sandbox_type, read_paths=[str(_REPO_ROOT)]),
+        )
+    )
+    assert os_env is not None
+    try:
+        result = await search_content(os_env, "needle")
+        assert [match["path"] for match in result["matches"]] == ["readable.txt"], result
+        assert "secret" not in json.dumps(result)
+        if sandbox_type == "darwin_seatbelt":
+            assert result["truncated"] is True
+            assert "could not be read" in result["warning"]
+    finally:
+        os_env.close()
 
 
 @pytest.mark.asyncio

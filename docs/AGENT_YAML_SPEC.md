@@ -615,25 +615,41 @@ a private broker for renewable credentials instead.
 
 Tools are declared under `tools` by name.
 
-### Uploaded-agent compatibility in 0.18.0
+### Uploaded-agent compatibility
 
-On multi-user servers, uploaded agent bundles cannot declare server-side Python
-or TypeScript source-file tools. This includes tools in nested agents. Existing
-uploaded agents using these tools also fail bundle validation when adding,
-updating, or deleting MCP-server settings.
+HTTP-uploaded agent bundles cannot declare server-side Python or TypeScript
+source-file tools, server-side callable tools, unregistered policy handlers, or
+absolute/escaping working directories. This includes terminals and nested
+agents. These restrictions apply on multi-user servers and, starting in 0.19.0,
+on local single-user servers too, including bundles uploaded by `omnigent run`.
+Loopback requests can originate from agents as well as the operator.
+
+Invalid uploads return HTTP 400 before tools or policy handlers are imported.
+Existing uploaded agents using these features also fail bundle validation when
+adding, updating, or deleting MCP-server settings; rejected edits leave the
+stored bundle unchanged. The agent configuration read/patch endpoints enforce
+the same validation on legacy bundles.
 
 To migrate an existing uploaded agent:
 
 1. Expose its custom tools through an MCP server and replace the source-file
    tool entries with `type: mcp` entries, as shown below. Update nested agents too.
-2. Upload the corrected bundle and start a new session with it. Re-uploading
-   creates a new agent version; it does not rewrite existing sessions.
-3. Make subsequent MCP configuration changes on the migrated agent. Removing an
+2. [Register custom policy handlers on the server](POLICIES.md#setting-up-server-wide-policies)
+   and change working directories to relative paths contained in the workspace.
+3. Replace the session's bundle through `PUT /v1/sessions/{id}/agent`, or upload
+   the corrected bundle and start a new session. Installing an agent version
+   alone does not rewrite existing sessions.
+4. Make subsequent MCP configuration changes on the migrated agent. Removing an
    MCP server from an old agent does not bypass bundle validation.
 
-Operator-authored bundles on trusted single-user/local servers retain their
-Python and TypeScript tool support. Changing a tool's declared runtime alone is
-not a migration: client tools require a client-provided implementation.
+Use operator-registered agents (`omnigent server --agent ./my-agent`) for trusted
+in-process tools, or MCP/client tools for uploaded agents.
+`omnigent run ./my-agent --no-session` starts a dedicated local server with
+trusted startup registration and creates its session from that registration. Direct trusted
+in-process callers retain the explicit
+`validate_agent_bundle(..., enforce_handler_allowlist=False)` opt-out; HTTP
+requests cannot select it. Changing a tool's declared runtime alone is not a
+migration: client tools require a client-provided implementation.
 
 ### MCP server
 

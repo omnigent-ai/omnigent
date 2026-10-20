@@ -63,6 +63,12 @@ interface MainTerminalViewProps {
   /** Relaunch or reconnect the session without replaying user input. */
   onResume?: () => void | Promise<void>;
   /**
+   * The session's managed sandbox is offline (stopped while idle, say), so
+   * resuming starts the sandbox, not just the harness: the stopped state and
+   * its action name the sandbox.
+   */
+  sandboxOffline?: boolean;
+  /**
    * Exposes the outer terminal surface so the iOS native shell can show its
    * server switcher only while this surface is actually frontmost.
    */
@@ -76,6 +82,7 @@ export function MainTerminalView({
   readOnly = false,
   runnerOnline,
   onResume,
+  sandboxOffline = false,
   onSurfaceElement,
 }: MainTerminalViewProps) {
   const { terminals } = useTerminals(conversationId);
@@ -94,6 +101,7 @@ export function MainTerminalView({
   const [resumePending, setResumePending] = useState(false);
   const [resumeError, setResumeError] = useState<string | null>(null);
   const runnerOffline = runnerOnline === false;
+  const resumeTarget = sandboxOffline ? "sandbox" : "session";
   // A session whose terminal is coming up (fresh cold boot, relaunch, or
   // server-side PTY creation) must never read as stopped — the health poll
   // can report the runner down before the boot registers.
@@ -110,12 +118,12 @@ export function MainTerminalView({
     try {
       await onResume();
     } catch (error) {
-      setResumeError(resumeErrorText(error));
+      setResumeError(resumeErrorText(error, resumeTarget));
       throw error;
     } finally {
       setResumePending(false);
     }
-  }, [onResume]);
+  }, [onResume, resumeTarget]);
   // No manual keyboard padding here: this view is flow content inside the
   // app-shell, which useIOSViewportLock sizes to the visual viewport, so the
   // terminal already sits above the keyboard. (Fixed overlays like the mobile
@@ -213,9 +221,13 @@ export function MainTerminalView({
           ) : resumeAvailable ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center">
               <div className="space-y-1">
-                <p className="font-medium text-foreground text-ui">The harness is not running.</p>
+                <p className="font-medium text-foreground text-ui">
+                  {sandboxOffline ? "The sandbox is offline." : "The harness is not running."}
+                </p>
                 <p className="text-muted-foreground text-sm">
-                  Resume the session to reconnect the terminal.
+                  {sandboxOffline
+                    ? "Resume it to reconnect the terminal."
+                    : "Resume the session to reconnect the terminal."}
                 </p>
               </div>
               <Button
@@ -227,7 +239,7 @@ export function MainTerminalView({
                 componentId="diagnostics.main-terminal.resume"
               >
                 {resumePending && <Loader2Icon className="size-3.5 animate-spin" aria-hidden />}
-                {resumePending ? "Resuming…" : "Resume session"}
+                {resumePending ? "Resuming…" : `Resume ${resumeTarget}`}
               </Button>
               {resumeError && <p className="text-destructive text-sm">{resumeError}</p>}
             </div>
@@ -277,6 +289,7 @@ export function MainTerminalView({
                       active={visible}
                       directAttachUrl={activeTerminal.directAttachUrl}
                       onResume={runnerOffline && onResume ? handleResume : undefined}
+                      resumeTarget={resumeTarget}
                       resumePending={resumePending}
                       onStateChange={(state) => {
                         setTerminalConnectionState(activeTerminal.id, state);
@@ -294,7 +307,7 @@ export function MainTerminalView({
   );
 }
 
-function resumeErrorText(error: unknown): string {
-  if (error instanceof Error && error.message) return `Couldn't resume session: ${error.message}`;
-  return "Couldn't resume session.";
+function resumeErrorText(error: unknown, target: string): string {
+  if (error instanceof Error && error.message) return `Couldn't resume ${target}: ${error.message}`;
+  return `Couldn't resume ${target}.`;
 }
