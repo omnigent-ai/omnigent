@@ -150,7 +150,7 @@ class _FakeGateway(openshell_pb2_grpc.OpenShellServicer):
             cwd=self._localize(request.workdir) if request.workdir else self.sandbox_root,
             env=env,
             capture_output=True,
-            timeout=request.timeout_seconds or None,
+            timeout=request.execution_timeout.seconds or None,
             check=False,
         )
 
@@ -248,6 +248,11 @@ def test_sandbox_create_ships_wheel_bundle_within_gateway_message_cap(
         f"the wheels were built. CLI output:\n{output}"
     )
     assert exit_status == 0, f"`sandbox create` exited {exit_status}. CLI output:\n{output}"
+    # Every exec addresses the created sandbox by name within its workspace.
+    (sandbox_name,) = gateway._sandboxes
+    assert {(r.sandbox, r.workspace_scope.workspace) for r in gateway.exec_requests} == {
+        (sandbox_name, _WORKSPACE)
+    }
 
     uploaded = gateway.sandbox_root / _REMOTE_WHEELS_TGZ.lstrip("/")
     assert uploaded.is_file(), f"wheel bundle never landed at {uploaded}. CLI output:\n{output}"

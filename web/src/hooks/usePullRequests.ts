@@ -24,7 +24,7 @@ import {
   isRunnerUnavailable503,
   RunnerOfflineError,
   runnerOfflineRetryDelay,
-  shouldRetryRunnerOffline,
+  useRunnerOfflineRetry,
   useSessionActive,
   useTrailingInvalidate,
   useWorkspaceServeable,
@@ -414,6 +414,9 @@ export function usePullRequestInfo(
   // A `temp:*` id (navigate-first new-chat window) has no server session.
   const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
   const serveable = useWorkspaceServeable(conversationId);
+  // Gate on the health poll rather than the session snapshot: the sidebar
+  // tooltip reuses this hook, and must not load every hovered session.
+  const retry = useRunnerOfflineRetry(serveable !== false);
   // Turn-end backstop: refetch when the focused session goes active→idle, so a
   // just-opened PR appears without opening the tab. Keys off the turn lifecycle,
   // so it works for every harness (no per-harness tool detection).
@@ -422,7 +425,7 @@ export function usePullRequestInfo(
     queryKey: ["github-info", conversationId, ...(options?.prUrl ? [options.prUrl] : [])],
     queryFn: () => fetchPullRequestInfo(conversationId!, options?.prUrl),
     enabled: !!conversationId && serveable !== false,
-    retry: shouldRetryRunnerOffline,
+    retry,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
     refetchInterval: options?.poll
@@ -509,13 +512,14 @@ export function usePullRequestChangedFiles(
   revision?: string,
 ) {
   const serveable = useWorkspaceServeable(conversationId);
+  const retry = useRunnerOfflineRetry(serveable !== false);
   return useQuery({
     queryKey: ["github-changed-files", conversationId, ...(prUrl ? [prUrl, revision] : [])],
     queryFn: () => fetchPullRequestChangedFiles(conversationId!, prUrl),
     // Only a PR has files to show — skip the call in every no-PR / unavailable
     // / unauthenticated state (the panel shows an empty state instead).
     enabled: !!conversationId && hasPr && serveable !== false,
-    retry: shouldRetryRunnerOffline,
+    retry,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
   });
@@ -588,11 +592,12 @@ export function usePullRequestDiff(
   revision?: string,
 ) {
   const serveable = useWorkspaceServeable(conversationId);
+  const retry = useRunnerOfflineRetry(serveable !== false);
   return useQuery({
     queryKey: ["github-pr-diff", conversationId, ...(prUrl ? [prUrl, revision] : [])],
     queryFn: () => fetchPullRequestDiff(conversationId!, prUrl),
     enabled: !!conversationId && hasPr && serveable !== false,
-    retry: shouldRetryRunnerOffline,
+    retry,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,
   });

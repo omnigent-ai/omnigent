@@ -380,6 +380,9 @@ class HostConnection:
         ``host.install_harness_result``. Values carry the result fields
         (``status``, ``configured_harnesses``, ``gateway_inference``,
         ``error``). Same ``Any`` typing rationale as ``pending_stats``.
+    :param pending_harness_refreshes: Per-``request_id`` futures for forced
+        harness readiness probes. Values carry ``status``,
+        ``configured_harnesses``, ``gateway_inference``, and ``error``.
     :param inflight_installs: Install tasks used to coalesce concurrent
         install requests for the same harness family (a double-click, or
         two spellings of one npm package) onto one in-flight install, so
@@ -459,6 +462,9 @@ class HostConnection:
         default_factory=dict,
     )
     pending_installs: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_harness_refreshes: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
     inflight_installs: dict[str, asyncio.Task[dict[str, Any]]] = field(

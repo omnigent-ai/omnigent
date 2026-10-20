@@ -119,6 +119,7 @@ def register_resource_routes(
     _pi_terminal_ensure_locks: dict[str, asyncio.Lock],
     _publish_event: Callable[[str, Mapping[str, object]], None],
     _qwen_terminal_ensure_locks: dict[str, asyncio.Lock],
+    _rebind_claude_bridge: Callable[[str, str], Coroutine[Any, Any, None]],
     _record_session_claude_launch_config: Callable[[str, ClaudeNativeUcodeConfig | None], None],
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock],
     _repop_pending_cost_popup_on_attach: Callable[[str, str, str], Coroutine[Any, Any, None]],
@@ -396,6 +397,7 @@ def register_resource_routes(
                 server_client=server_client,
                 event_dispatcher=getattr(app.state, "runner_event_dispatcher", None),
                 ensure_comment_relay=_ensure_comment_relay_started,
+                rebind_bridge=_rebind_claude_bridge,
             )
             _ensure_build: (
                 Callable[[NativeLaunchContext], Awaitable[NativeLaunchContext]] | None
