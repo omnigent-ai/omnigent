@@ -108,6 +108,7 @@ def _row(row_id: str, *, parent: str | None, host_id: str | None = None) -> Simp
         root_conversation_id="root" if parent is not None else None,
         runner_id="runner_shared",
         host_id=host_id,
+        live_status="running",
     )
 
 
