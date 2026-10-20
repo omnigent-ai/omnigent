@@ -11595,7 +11595,7 @@ def test_a_slash_command_submits_with_a_rebound_submit_key(
 
     claude_native_bridge.inject_slash_command(bridge_dir, command=command)
 
-    assert tails == ["C-u", typed, ctrl_s]
+    assert tails == ["Space", "C-u", typed, ctrl_s]
 
 
 def test_a_slash_command_stuck_in_the_composer_fails_loud(
