@@ -761,6 +761,28 @@ def test_github_pr_diff_no_pr(monkeypatch: pytest.MonkeyPatch) -> None:
     assert github_pr_diff("/root") == {"object": "session.github.pr_diff", "patch": ""}
 
 
+@pytest.mark.parametrize(
+    ("command", "response", "load", "message"),
+    [
+        (("pr", "diff"), (1, "", "timeout"), github_pr_diff, "could not load the PR diff"),
+        (
+            ("api",),
+            (1, "", "denied"),
+            github_changed_files,
+            "could not load the PR's changed files",
+        ),
+        (("api",), (0, "invalid", ""), github_changed_files, "invalid changed-file list"),
+        (("api",), (0, "{}", ""), github_changed_files, "invalid changed-file list"),
+    ],
+)
+def test_github_diff_failures_are_not_empty_successes(
+    monkeypatch: pytest.MonkeyPatch, command, response, load, message: str
+) -> None:
+    _stub_gh(monkeypatch, {("pr", "view"): (0, '{"number":7}', ""), command: response})
+    with pytest.raises(ValueError, match=message):
+        load("/root")
+
+
 def test_github_pr_diff_resolves_number_then_diffs(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

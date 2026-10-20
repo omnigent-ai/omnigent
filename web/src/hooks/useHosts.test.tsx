@@ -4,6 +4,7 @@ import { startTransition, Suspense, useState, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  installHarnessOnHost,
   useDetectedCredentials,
   useHostModelOptions,
   useHosts,
@@ -11,6 +12,7 @@ import {
   useInstallingHarnesses,
   useStoreCredential,
 } from "./useHosts";
+import { ApiError } from "@/lib/sessionsApi";
 
 const fetchMock = vi.fn();
 
@@ -298,8 +300,28 @@ describe("useInstallHarness + useInstallingHarnesses (concurrent installs)", () 
   }
 
   const HOST = "host_1";
-  const installResult = (harness: string, readiness: Record<string, boolean | string>) =>
-    mockResponse({ object: "harness_install", harness, configured_harnesses: readiness });
+  const installResult = (
+    harness: string,
+    readiness: Record<string, boolean | string>,
+    gateway: Record<string, boolean>,
+  ) =>
+    mockResponse({
+      object: "harness_install",
+      harness,
+      configured_harnesses: readiness,
+      gateway_inference: gateway,
+      version: null,
+    });
+
+  it("throws ApiError for a failed install request", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ error: { code: "install_failed", message: "npm failed" } }, 502),
+    );
+
+    const error = await installHarnessOnHost(HOST, "codex-native").catch((reason) => reason);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({ code: "install_failed", status: 502 });
+  });
 
   it("keeps the first install's in-flight state and cache patch when a second starts", async () => {
     // Both hooks share ONE QueryClient — exactly the dialog's single instance.
@@ -341,30 +363,49 @@ describe("useInstallHarness + useInstallingHarnesses (concurrent installs)", () 
     // the /install route), so Codex's response already reflects Pi still
     // installing (binary-missing).
     codex.resolve(
-      installResult("codex-native", {
-        "codex-native": "needs-auth",
-        "pi-native": "binary-missing",
-      }),
+      installResult(
+        "codex-native",
+        {
+          "codex-native": "needs-auth",
+          "pi-native": "binary-missing",
+        },
+        { "codex-native": false },
+      ),
     );
     await waitFor(() => expect(result.current.installing.has("codex-native")).toBe(false));
     expect(result.current.installing.has("pi-native")).toBe(true); // Pi still going
-    const hosts = client.getQueryData<{ configured_harnesses?: Record<string, unknown> }[]>([
-      "hosts",
-      { includeSandbox: false },
-    ]);
+    const hosts = client.getQueryData<
+      {
+        configured_harnesses?: Record<string, unknown>;
+        gateway_inference?: Record<string, boolean> | null;
+      }[]
+    >(["hosts", { includeSandbox: false }]);
     expect(hosts?.[0].configured_harnesses?.["codex-native"]).toBe("needs-auth");
+    expect(hosts?.[0].gateway_inference).toEqual({ "codex-native": false });
 
     // Resolve Pi: it clears too and its response (again the full map) reflects
     // both harnesses' final readiness.
-    pi.resolve(installResult("pi-native", { "codex-native": "needs-auth", "pi-native": true }));
+    pi.resolve(
+      installResult(
+        "pi-native",
+        { "codex-native": "needs-auth", "pi-native": true },
+        { "codex-native": false, "pi-native": true },
+      ),
+    );
     await waitFor(() => expect(result.current.installing.has("pi-native")).toBe(false));
-    const hosts2 = client.getQueryData<{ configured_harnesses?: Record<string, unknown> }[]>([
-      "hosts",
-      { includeSandbox: false },
-    ]);
+    const hosts2 = client.getQueryData<
+      {
+        configured_harnesses?: Record<string, unknown>;
+        gateway_inference?: Record<string, boolean> | null;
+      }[]
+    >(["hosts", { includeSandbox: false }]);
     expect(hosts2?.[0].configured_harnesses?.["pi-native"]).toBe(true);
     // Codex's readiness is still present (the server's full map carries it).
     expect(hosts2?.[0].configured_harnesses?.["codex-native"]).toBe("needs-auth");
+    expect(hosts2?.[0].gateway_inference).toEqual({
+      "codex-native": false,
+      "pi-native": true,
+    });
   });
 });
 

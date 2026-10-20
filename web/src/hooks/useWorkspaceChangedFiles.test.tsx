@@ -961,6 +961,9 @@ describe("resolveChatFilePath", () => {
     ["/home/u/ws/foo.md?x=1", ROOT, HOME, null, "absolute with ?query → unresolvable"],
     ["/etc/hosts#L1", ROOT, HOME, null, "outside path with #fragment → unresolvable"],
     ["https://example.com/x", ROOT, HOME, null, "URL → unresolvable"],
+    ["C:\\Users\\u\\ws\\a.ts", ROOT, HOME, null, "Windows drive path → unresolvable"],
+    ["C:/Users/u/ws/a.ts", ROOT, HOME, null, "Windows drive path, forward slashes"],
+    ["\\\\host\\share\\a.ts", ROOT, HOME, null, "Windows UNC path → unresolvable"],
   ])("%o (root=%o, home=%o) → %o (%s)", (text, root, home, expected, _why) => {
     expect(
       resolveChatFilePath(text as string, root as string | null, home as string | null),
@@ -1553,6 +1556,44 @@ describe("runner-offline retry liveness gate", () => {
     await vi.advanceTimersByTimeAsync(1_200);
 
     expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("stops retrying once the loaded snapshot shows the sandbox asleep", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-23T00:00:00Z"));
+    // Page load: the first 503 lands while the snapshot is still loading.
+    onlineMock.mockReturnValue(undefined);
+    sessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
+    fetchMock.mockResolvedValue(jsonResponse({ error: { code: "runner_unavailable" } }, 503));
+    const qc = new QueryClient({ defaultOptions: { queries: { staleTime: 0 } } });
+    const tree = () => (
+      <QueryClientProvider client={qc}>
+        <EnvironmentProbe id="conv_asleep" />
+      </QueryClientProvider>
+    );
+
+    const view = render(tree());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // The snapshot lands: an idle-stopped managed sandbox with both tunnels down.
+    sessionMock.mockReturnValue({
+      session: {
+        hostId: "host_1",
+        hostResumable: true,
+        permissionLevel: null,
+        createdAt: Math.floor(Date.now() / 1000) - 3600,
+      } as Session,
+      isLoading: false,
+      error: null,
+    });
+    onlineMock.mockReturnValue(false);
+    hostOnlineMock.mockReturnValue(false);
+    view.rerender(tree());
+    await vi.advanceTimersByTimeAsync(130_000);
+
+    // The retry already scheduled at the first failure still runs; none after it.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
 

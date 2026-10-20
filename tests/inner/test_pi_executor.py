@@ -6027,22 +6027,28 @@ def test_build_models_json_catalog_reasoning_models_get_reasoning_flag() -> None
     assert "reasoning" not in by_id["system.ai.llama-4-maverick"]
 
 
-@pytest.mark.parametrize("wire_api", ["chat", "responses"])
-def test_generic_reasoning_uses_pi_compat_detection_without_changing_databricks(wire_api):
-    generic = _build_models_json(
+@pytest.mark.parametrize(
+    ("base_urls", "wire_api"),
+    [
+        ({"openai": "https://gateway.example/v1"}, "chat"),
+        ({"openai": "https://gateway.example/v1"}, "responses"),
+        (None, None),
+    ],
+    ids=["generic-chat", "generic-responses", "databricks"],
+)
+def test_generic_and_databricks_reasoning_use_pi_compat_detection(base_urls, wire_api):
+    config = _build_models_json(
         "https://gateway.example",
         "synthetic",
-        {"openai": "https://gateway.example/v1"},
+        base_urls,
         model="deepseek-test",
         openai_wire_api=wire_api,
     )
-    selected = next(p for p in generic["providers"].values() if p["models"])
-    assert "supportsReasoningEffort" not in selected["compat"]
+    selected = next(p for p in config["providers"].values() if p["models"])
     assert selected["models"][0]["reasoning"] is True
-    databricks = _build_models_json("https://workspace.example", "synthetic")
-    for provider in databricks["providers"].values():
+    for provider in config["providers"].values():
         if provider["api"].startswith("openai"):
-            assert provider["compat"]["supportsReasoningEffort"] is False
+            assert "supportsReasoningEffort" not in provider["compat"]
 
 
 @pytest.mark.parametrize("destination", ["generic", "mixed-databricks", "catalog"])

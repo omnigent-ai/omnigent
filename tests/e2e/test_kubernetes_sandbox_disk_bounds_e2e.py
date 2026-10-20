@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import json
 import os
-import socket
 import subprocess
 import sys
 import time
@@ -36,6 +35,7 @@ import httpx
 import pytest
 import yaml
 
+from tests._helpers.live_server import find_free_port
 from tests.e2e._k8s_stub_sdk import CAPTURE_ENV_VAR as _CAPTURE_ENV_VAR
 from tests.e2e._k8s_stub_sdk import STUB_FILES as _STUB_FILES
 
@@ -44,13 +44,6 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _HEALTH_TIMEOUT_S = 180.0
 _MANIFEST_TIMEOUT_S = 120.0
 _POLL_INTERVAL_S = 0.5
-
-
-def _find_free_port() -> int:
-    """Bind port 0 and return the assigned free port."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _write_stub_sdk(tmp_path: Path) -> Path:
@@ -200,7 +193,7 @@ def test_home_emptydir_carries_size_limit(tmp_path: Path) -> None:
     Without one, the HOME volume is charged to the node's root filesystem
     with no per-pod bound, and nodefs pressure evicts unrelated pods.
     """
-    port = _find_free_port()
+    port = find_free_port()
     config_path = _write_server_config(
         tmp_path,
         port,
@@ -235,7 +228,7 @@ def test_ephemeral_storage_resources_accepted_and_forwarded(tmp_path: Path) -> N
     — so sandboxes carried request 0 for ephemeral-storage and the scheduler
     could not spread them by disk.
     """
-    port = _find_free_port()
+    port = find_free_port()
     config_path = _write_server_config(
         tmp_path,
         port,

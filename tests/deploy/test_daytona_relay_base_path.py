@@ -32,6 +32,8 @@ from urllib.parse import urlsplit
 import httpx
 import pytest
 
+from tests._helpers.live_server import find_free_port
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKER_PATH = REPO_ROOT / "deploy" / "daytona" / "src" / "index.js"
 
@@ -77,12 +79,6 @@ const server = http.createServer(async (req, res) => {
 });
 server.listen(port, "127.0.0.1", () => console.log("relay listening"));
 """
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _wait_port(port: int, timeout_s: float = 30.0) -> None:
@@ -144,7 +140,7 @@ def relay_with_prefixed_upstream(tmp_path: Path) -> Iterator[tuple[str, _PrefixM
     if shutil.which("node") is None:
         pytest.skip("node is required to run the Daytona relay Worker")
     upstream = _PrefixMountedUpstream()
-    relay_port = _free_port()
+    relay_port = find_free_port()
     host_js = tmp_path / "relay_host.mjs"
     host_js.write_text(_NODE_HOST)
     proc = subprocess.Popen(
@@ -249,7 +245,7 @@ def _running_relay(tmp_path: Path, upstream_base: str) -> Iterator[tuple[str, _R
     if shutil.which("node") is None:
         pytest.skip("node is required to run the Daytona relay Worker")
     upstream = _RecordingUpstream()
-    relay_port = _free_port()
+    relay_port = find_free_port()
     host_js = tmp_path / "relay_host.mjs"
     host_js.write_text(_NODE_HOST)
     proc = subprocess.Popen(

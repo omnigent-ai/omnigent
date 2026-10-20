@@ -228,6 +228,7 @@ async def _probe_worker(payload: str) -> McpProbeResult:
         env["PYTHONPATH"] = os.environ["PYTHONPATH"]
     process = await asyncio.create_subprocess_exec(
         sys.executable,
+        "-P",
         "-m",
         "omnigent.host.mcp_tools",
         stdin=asyncio.subprocess.PIPE,

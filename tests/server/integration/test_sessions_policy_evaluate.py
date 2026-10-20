@@ -1057,7 +1057,7 @@ async def test_concurrent_cost_asks_serialize_and_collapse_sibling(
         elif entries == 2:
             second_in_gate.set()
         if result.state_updates:
-            engine.apply_state_updates(result.state_updates)
+            engine.apply_state_updates(result.state_updates, approved=True)
         return True
 
     monkeypatch.setattr(sessions_routes, "_hold_native_ask_gate", _controllable_gate)

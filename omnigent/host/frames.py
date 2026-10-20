@@ -62,6 +62,7 @@ CAP_HARNESS_STARTUP = "harness_startup"
 CAP_PLUGINS = "plugins"
 CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
+CAP_REFRESH_HARNESSES = "refresh_harnesses"
 CAP_MCP_REGISTRY = "mcp_registry"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
@@ -74,6 +75,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_MCP_REGISTRY,
     CAP_MCP_INVENTORY,
     CAP_HARNESS_STARTUP,
+    CAP_REFRESH_HARNESSES,
 ]
 
 
@@ -148,6 +150,8 @@ class HostFrameKind(str, Enum):
     CREATE_DIR_RESULT = "host.create_dir_result"
     INSTALL_HARNESS = "host.install_harness"
     INSTALL_HARNESS_RESULT = "host.install_harness_result"
+    REFRESH_HARNESSES = "host.refresh_harnesses"
+    REFRESH_HARNESSES_RESULT = "host.refresh_harnesses_result"
     STORE_SECRET = "host.store_secret"
     STORE_SECRET_RESULT = "host.store_secret_result"
     DETECT_CREDENTIALS = "host.detect_credentials"
@@ -789,6 +793,9 @@ class HostInstallHarnessResultFrame:
         after the install attempt, e.g. ``{"claude-native": True,
         "codex-native": "needs-auth"}``. ``None`` when the install could
         not run (the server keeps its prior readiness view).
+    :param version: Installed CLI version after the operation, e.g.
+        ``"1.18.4"``. ``None`` when an older host does not report it or the
+        version could not be determined.
     :param gateway_inference: Per-harness flag for whether that family's
         launch on this host resolves AI-Gateway-backed inference, e.g.
         ``{"claude-native": True, "codex": False}`` (see
@@ -798,6 +805,25 @@ class HostInstallHarnessResultFrame:
     :param error: Why the install failed, e.g. ``"npm not found"`` or
         ``"install timed out"``. ``None`` on success.
     """
+
+    request_id: str
+    status: str
+    configured_harnesses: dict[str, HarnessAvailability] | None = None
+    version: str | None = None
+    gateway_inference: dict[str, bool] | None = None
+    error: str | None = None
+
+
+@dataclass
+class HostRefreshHarnessesFrame:
+    """Server → host: immediately re-probe all harness readiness."""
+
+    request_id: str
+
+
+@dataclass
+class HostRefreshHarnessesResultFrame:
+    """Host → server: result of a forced harness readiness re-probe."""
 
     request_id: str
     status: str
@@ -1292,6 +1318,8 @@ HostFrame = (
     | HostCreateDirResultFrame
     | HostInstallHarnessFrame
     | HostInstallHarnessResultFrame
+    | HostRefreshHarnessesFrame
+    | HostRefreshHarnessesResultFrame
     | HostStoreSecretFrame
     | HostStoreSecretResultFrame
     | HostDetectCredentialsFrame
@@ -1598,6 +1626,25 @@ def encode_host_frame(frame: HostFrame) -> str:
         return _encode_payload(
             {
                 "kind": HostFrameKind.INSTALL_HARNESS_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "configured_harnesses": frame.configured_harnesses,
+                "version": frame.version,
+                "gateway_inference": frame.gateway_inference,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostRefreshHarnessesFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.REFRESH_HARNESSES.value,
+                "request_id": frame.request_id,
+            }
+        )
+    if isinstance(frame, HostRefreshHarnessesResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.REFRESH_HARNESSES_RESULT.value,
                 "request_id": frame.request_id,
                 "status": frame.status,
                 "configured_harnesses": frame.configured_harnesses,
@@ -2145,6 +2192,10 @@ def _decode_known_host_frame(
             return _decode_install_harness(msg)
         case HostFrameKind.INSTALL_HARNESS_RESULT:
             return _decode_install_harness_result(msg)
+        case HostFrameKind.REFRESH_HARNESSES:
+            return HostRefreshHarnessesFrame(request_id=_required_str(msg, "request_id"))
+        case HostFrameKind.REFRESH_HARNESSES_RESULT:
+            return _decode_refresh_harnesses_result(msg)
         case HostFrameKind.STORE_SECRET:
             return _decode_store_secret(msg)
         case HostFrameKind.STORE_SECRET_RESULT:
@@ -2627,6 +2678,18 @@ def _decode_install_harness_result(msg: _JsonObject) -> HostInstallHarnessResult
     :returns: Typed host.install_harness_result frame.
     """
     return HostInstallHarnessResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+        version=_optional_nullable_str(msg, "version"),
+        gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_refresh_harnesses_result(msg: _JsonObject) -> HostRefreshHarnessesResultFrame:
+    """Decode a host.refresh_harnesses_result frame."""
+    return HostRefreshHarnessesResultFrame(
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),

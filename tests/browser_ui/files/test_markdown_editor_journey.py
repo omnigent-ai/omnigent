@@ -61,8 +61,9 @@ def test_markdown_editor_review_journey(page: Page, seeded_session: BrowserSessi
     expect(editor.locator("pre")).to_have_text('print("original example")')
     expect(editor.locator("ol li")).to_have_count(2)
 
-    editor.get_by_text("Journey end.", exact=True).click()
-    page.keyboard.press("End")
+    editor.get_by_text("Journey end.", exact=True).click(click_count=3)
+    page.wait_for_function("window.getSelection()?.toString().trim() === 'Journey end.'")
+    page.keyboard.press("ArrowRight")
     page.keyboard.press("Enter")
     page.keyboard.type("```python")
     page.keyboard.press("Enter")
@@ -75,13 +76,27 @@ def test_markdown_editor_review_journey(page: Page, seeded_session: BrowserSessi
     assert editor.locator("pre").last.evaluate(
         "el => el.contains(document.getSelection().anchorNode)"
     )
+    # Exercise the native menu from both pointer and keyboard focus before
+    # verifying that the fence language survives autosave and reload.
+    pickers = editor.get_by_role("combobox", name="Code block language")
+    pickers.first.hover()
+    pickers.first.select_option("typescript")
+    picker = pickers.last
+    picker.focus()
+    picker.press("End")
+    picker.press("Enter")
+    expect(picker).to_have_value("yaml")
     expect(viewer.get_by_role("button", name="All changes saved")).to_be_visible(timeout=15_000)
     assert writes and "# caret stays in the code block" in writes[-1]
+    assert "```yaml" in writes[-1]
+    assert "```typescript" in writes[-1]
 
     page.reload()
     expect(editor.locator("pre").last).to_contain_text("journey edit")
+    expect(pickers.first).to_have_value("typescript")
+    expect(pickers.last).to_have_value("yaml")
     editor.locator("pre").last.click()
-    page.keyboard.press("Control+f")
+    page.keyboard.press("ControlOrMeta+f")
     search = viewer.get_by_placeholder(re.compile(r"^Find"))
     expect(search).to_be_focused()
     search.fill("journey edit")
@@ -137,17 +152,28 @@ def test_markdown_editor_load_journey(
             return getSelection(...args);
         };
     """)
-    viewer = _open_viewer(
+    _open_viewer(
         page, seeded_session, _PATH, {"diffActive": False, "previewableViewMode": "editor"}
     )
-    expect(viewer.locator(".tiptap")).to_contain_text("Load journey complete.", timeout=180_000)
+    # Locator assertions collect an accessibility snapshot of the whole editor.
+    # Wait on the terminal marker directly so that work cannot inflate timings.
+    page.wait_for_function(
+        """() => {
+            const editor = document.querySelector('.tiptap');
+            return editor?.lastElementChild?.textContent === 'Load journey complete.'
+                && editor.checkVisibility();
+        }""",
+        timeout=180_000,
+    )
     metrics = page.evaluate("""async () => {
         await new Promise(requestAnimationFrame);
         await new Promise(requestAnimationFrame);
         return {...window.markdownProbe, navigationToReadyMs: performance.now(),
             editors: document.querySelectorAll('.tiptap').length};
     }""")
+    assert metrics["editors"] == 1
     metrics.update(
+        readiness_probe="terminal-marker",
         fixture_sha256=hashlib.sha256(content.encode()).hexdigest(),
         bytes=len(content.encode()),
         browser=page.context.browser.version,

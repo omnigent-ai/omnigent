@@ -76,7 +76,6 @@ from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 from omnigent.util.reasoning_effort import (
     EFFORT_CLEAR_VALUES,
     PI_EFFORTS,
-    PI_THINKING_OFF,
     to_pi_thinking_level,
     validate_effort,
 )
@@ -454,12 +453,10 @@ def _read_json_object(path: Path) -> dict[str, object]:
 
 
 def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str, object]]:
-    """Enumerate the models Pi's own login can use (the unmanaged fallback).
+    """List Pi's logged-in and keyed custom models for the prelaunch picker.
 
-    When no omnigent-managed provider is configured, the launched Pi runs on
-    its own credentials, so the pre-launch picker must offer the models that
-    login can actually drive: Pi's ``models-store.json`` catalog filtered to
-    providers with an ``auth.json`` entry.
+    Declared models.json entries override cached names. Reserved Omnigent
+    provider IDs are excluded because own-login launch strips their prefixes.
 
     :param agent_dir: Pi agent dir override (tests); defaults to the host's
         own Pi agent dir.
@@ -469,11 +466,24 @@ def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str, 
     """
     root = agent_dir if agent_dir is not None else _global_pi_agent_dir()
     logged_in = set(_read_json_object(root / "auth.json"))
-    if not logged_in:
-        return []
+    catalogs: list[tuple[str, object]] = [
+        (provider_id, payload)
+        for provider_id, payload in _read_json_object(root / "models-store.json").items()
+        if provider_id in logged_in
+    ]
+    declared = _read_json_object(root / "models.json").get("providers")
+    for provider_id, payload in declared.items() if _is_str_object_dict(declared) else ():
+        api_key = payload.get("apiKey") if _is_str_object_dict(payload) else None
+        if provider_id in logged_in or (isinstance(api_key, str) and api_key):
+            # Appended after the models-store rows so declared models.json names win.
+            catalogs.append((provider_id, payload))
     options: dict[str, dict[str, object]] = {}
-    for provider_id, payload in _read_json_object(root / "models-store.json").items():
-        if provider_id not in logged_in or not _is_str_object_dict(payload):
+    for provider_id, payload in catalogs:
+        if not _is_str_object_dict(payload):
+            continue
+        if provider_id in _PI_MANAGED_PROVIDER_IDS:
+            # pi_own_login_model_arg() strips these ids as a stale managed pick,
+            # so the launch could not address such a row.
             continue
         models = payload.get("models")
         for model in models if isinstance(models, list) else []:
@@ -802,7 +812,6 @@ def _databricks_openai_provider(
             "supportsDeveloperRole": False,
             "supportsStore": False,
             "supportsStrictMode": False,
-            "supportsReasoningEffort": False,
             # stream_options is OpenAI-specific; Gemini and other non-OpenAI
             # models reject it with 400.
             "supportsUsageInStreaming": False,
@@ -1875,9 +1884,8 @@ def pi_native_provider_launch(
     :param agent_dir: The managed Pi config dir for this session.
     :param provider: The resolved provider config.
     :param reasoning_effort: Canonical omnigent effort for the session, e.g.
-        ``"high"``. Passed as ``--thinking`` on the primary provider; ignored
-        (with a warning) on a gateway-routed model, whose thinking must stay
-        off for text to surface.
+        ``"high"``. Passed as ``--thinking`` on the selected provider; Pi
+        applies the model's reasoning capabilities.
     :param selection: Optional picker value naming a generated provider and
         model. When that provider no longer serves the model, the provider that
         does is used instead.
@@ -1914,14 +1922,8 @@ def pi_native_provider_launch(
     else:
         model_provider_id = _default_model_provider_id(provider, rendered)
     write_pi_models_config(agent_dir, provider, rendered)
-    # Copy the user's global Pi settings but suppress defaultThinkingLevel.
-    # In TUI mode Pi applies the setting from ~/.pi/agent/settings.json; for
-    # non-Claude models via openai-completions, any thinking level causes the
-    # Databricks gateway to return 400 (reasoning_effort is sent even when
-    # supportsReasoningEffort is false in the compat block, because TUI mode
-    # applies the session-level thinking before the compat check fires).
-    # Passing None in the overlay makes _deep_merge_settings write null for the
-    # key; Pi's getDefaultThinkingLevel() returns null (falsy) → no thinking.
+    # Session effort or Pi's default selects thinking; don't inherit a global
+    # thinking preference that may belong to a different provider.
     from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir
 
     overlay: dict[str, object] = {"defaultThinkingLevel": None}
@@ -1958,20 +1960,6 @@ def pi_native_provider_launch(
             _LOGGER.warning("pi-native: %s", exc)
         if effort is not None:
             thinking = to_pi_thinking_level(effort)
-    # For non-Claude models on openai-completions/responses, disable thinking.
-    # Gemini and other Databricks models return reasoning_tokens in their
-    # responses; Pi's TUI mode applies thinking even with defaultThinkingLevel:null
-    # in settings, causing the agent loop to complete without surfacing the text
-    # content to the extension. Explicitly passing --thinking off ensures the
-    # completions handler doesn't activate the thinking path.
-    if model_provider_id != provider.provider_id:
-        args.extend(["--thinking", PI_THINKING_OFF])
-        if thinking is not None and thinking != PI_THINKING_OFF:
-            effort_warning = (
-                f"effort ignored for gateway-routed model {provider.model}: "
-                "thinking disabled to keep text surfacing"
-            )
-            _LOGGER.warning("pi-native: %s", effort_warning)
-    elif thinking is not None:
+    if thinking is not None:
         args.extend(["--thinking", thinking])
     return PiNativeLaunch(env=env, args=args, effort_warning=effort_warning)
