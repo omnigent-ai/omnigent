@@ -628,15 +628,77 @@ def test_inline_databricks_gateway_unlisted_override_is_routed_like_databricks_k
     assert [m["id"] for m in rendered[expected_provider]["models"]] == [override]
 
 
-def test_inline_dedicated_gateway_host_stays_single_family(
-    monkeypatch: pytest.MonkeyPatch,
+def _refuse_host_metadata_probe(host: str) -> None:
+    raise ConnectionError(f"offline test stub: refusing to probe {host}")
+
+
+def _use_databricks_config_file(
+    monkeypatch: pytest.MonkeyPatch, config_file: Path, contents: str | None
 ) -> None:
-    """A dedicated ``ai-gateway`` host names no workspace, so nothing is enumerated."""
+    """Resolve the Databricks workspace only from *config_file* (absent when ``None``)."""
+    # Newer SDKs probe the host during Config() and retry an unreachable one for minutes.
+    monkeypatch.setattr(
+        "databricks.sdk.config.get_host_metadata", _refuse_host_metadata_probe, raising=False
+    )
+    for name in (
+        "DATABRICKS_HOST",
+        "DATABRICKS_TOKEN",
+        "DATABRICKS_CONFIG_PROFILE",
+        "DATABRICKS_CLIENT_ID",
+        "DATABRICKS_CLIENT_SECRET",
+        "DATABRICKS_AUTH_TYPE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    if contents is not None:
+        config_file.write_text(contents)
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(config_file))
 
-    def _unexpected(host: str, token: str):
-        raise AssertionError("a dedicated gateway host must not trigger enumeration")
 
-    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _unexpected)
+_WORKSPACE_PROFILE = "[DEFAULT]\nhost = https://wkspc.cloud.databricks.com\ntoken = dapi-profile\n"
+
+
+@pytest.mark.parametrize(
+    ("databricks_config", "listing", "expected_listing_calls"),
+    [
+        pytest.param(None, ([], [], [], []), [], id="no-profile"),
+        pytest.param(
+            _WORKSPACE_PROFILE + "workspace_id = 999\n",
+            ([], [], [], []),
+            [],
+            id="profile-records-another-workspace",
+        ),
+        pytest.param(
+            _WORKSPACE_PROFILE + "workspace_id = 123\n",
+            ([], [], [], []),
+            [("https://wkspc.cloud.databricks.com", "gw-token")],
+            id="empty-listing",
+        ),
+        pytest.param(
+            _WORKSPACE_PROFILE,
+            None,
+            [("https://wkspc.cloud.databricks.com", "gw-token")],
+            id="listing-error",
+        ),
+    ],
+)
+def test_inline_dedicated_gateway_falls_back_to_single_family(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    databricks_config: str | None,
+    listing: tuple[list, list, list, list] | None,
+    expected_listing_calls: list[tuple[str, str]],
+) -> None:
+    """A dedicated host stays on its configured model unless its workspace lists more."""
+    _use_databricks_config_file(monkeypatch, tmp_path / "databrickscfg", databricks_config)
+    listing_calls: list[tuple[str, str]] = []
+
+    def _listing(host: str, token: str):
+        listing_calls.append((host, token))
+        if listing is None:
+            raise httpx.ConnectError("workspace unreachable")
+        return listing
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _listing)
     config = {
         "providers": {
             "anthropic-gateway": {
@@ -658,6 +720,116 @@ def test_inline_dedicated_gateway_host_stays_single_family(
     assert provider.base_url == "https://123.ai-gateway.cloud.databricks.com/anthropic"
     assert provider.model == "system.ai.claude-opus-5"
     assert not provider.additional_providers
+    assert listing_calls == expected_listing_calls
+
+
+@pytest.mark.parametrize(
+    ("family", "surface_path", "default_model", "default_provider"),
+    [
+        ("anthropic", "/anthropic", "system.ai.claude-opus-5", "omnigent"),
+        ("openai", "/codex/v1", "system.ai.gpt-5", "omnigent-openai"),
+    ],
+)
+def test_inline_dedicated_gateway_with_profile_routes_each_family_to_its_surface(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    family: str,
+    surface_path: str,
+    default_model: str,
+    default_provider: str,
+) -> None:
+    """Listed families launch on the dedicated host; Gemini uses the profile's workspace."""
+    _use_databricks_config_file(
+        monkeypatch,
+        tmp_path / "databrickscfg",
+        "[DEFAULT]\nhost = https://wkspc.cloud.databricks.com\ntoken = dapi-profile\n",
+    )
+    listing_calls: list[tuple[str, str]] = []
+
+    def _listing(host: str, token: str):
+        listing_calls.append((host, token))
+        return (
+            [{"id": "system.ai.claude-opus-5"}],
+            [{"id": "system.ai.gpt-5"}],
+            [],
+            [{"id": "system.ai.gemini-3-flash"}],
+        )
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _listing)
+    family_config = {"api_key": "gw-token", "models": {"default": default_model}}
+    if family == "openai":
+        family_config["wire_api"] = "responses"
+    config = {
+        "providers": {
+            "gateway": {
+                "kind": "gateway",
+                "default": True,
+                family: {
+                    "base_url": f"https://123.ai-gateway.cloud.databricks.com{surface_path}",
+                    **family_config,
+                },
+            }
+        }
+    }
+
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+
+    assert listing_calls == [("https://wkspc.cloud.databricks.com", "gw-token")]
+    assert provider is not None
+    assert provider.model == default_model
+    rendered = provider.to_models_config()["providers"]
+    assert {pid: payload["baseUrl"] for pid, payload in rendered.items()} == {
+        "omnigent": "https://123.ai-gateway.cloud.databricks.com/anthropic",
+        "omnigent-openai": "https://123.ai-gateway.cloud.databricks.com/codex/v1",
+        "omnigent-mlflow": "https://wkspc.cloud.databricks.com/ai-gateway/mlflow/v1",
+    }
+    assert default_model in [m["id"] for m in rendered[default_provider]["models"]]
+
+
+def test_inline_dedicated_gateway_with_workspace_profile_offers_every_family(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A dedicated gateway host offers every family once a profile names its workspace."""
+    _use_databricks_config_file(
+        monkeypatch,
+        tmp_path / "databrickscfg",
+        "[DEFAULT]\nhost = https://wkspc.cloud.databricks.com\ntoken = dapi-test\n",
+    )
+    monkeypatch.setattr(
+        creds,
+        "_fetch_pi_model_lists",
+        lambda host, token: (
+            [{"id": "system.ai.claude-opus-5"}],
+            [{"id": "system.ai.gpt-5"}],
+            [],
+            [{"id": "system.ai.gemini-3-flash"}],
+        ),
+    )
+    config = {
+        "providers": {
+            "gateway": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "https://123.ai-gateway.cloud.databricks.com/codex/v1",
+                    "api_key": "gw-token",
+                    "wire_api": "responses",
+                    "models": {"default": "system.ai.gpt-5"},
+                },
+            }
+        }
+    }
+
+    options = creds.pi_native_model_options(
+        config_loader=lambda: config,
+        transport=httpx.MockTransport(lambda request: httpx.Response(404)),
+    )
+
+    assert {o["model"] for o in options} == {
+        "omnigent/system.ai.claude-opus-5",
+        "omnigent-openai/system.ai.gpt-5",
+        "omnigent-mlflow/system.ai.gemini-3-flash",
+    }
 
 
 def test_databricks_gateway_builder_derives_codex_surface_from_anthropic_url(
@@ -1923,14 +2095,108 @@ def test_is_databricks_ai_gateway_url_rejects_lookalikes(gateway_url: str) -> No
     assert creds._is_databricks_ai_gateway_url(gateway_url) is False
 
 
-def test_workspace_url_for_dedicated_gateway_uses_profile(
+_WORKSPACE_HOST = "host = https://workspace.cloud.databricks.com\n"
+
+
+@pytest.mark.parametrize(
+    ("profile", "config_profile_env", "databricks_config", "expected"),
+    [
+        pytest.param(
+            "prod", None, None, "https://workspace.cloud.databricks.com", id="unrecorded"
+        ),
+        pytest.param(
+            "prod",
+            None,
+            f"[prod]\n{_WORKSPACE_HOST}workspace_id = 123\n",
+            "https://workspace.cloud.databricks.com",
+            id="recorded-match",
+        ),
+        pytest.param(
+            "prod",
+            None,
+            f"[prod]\n{_WORKSPACE_HOST}workspace_id = 999\n",
+            None,
+            id="recorded-mismatch",
+        ),
+        pytest.param(
+            None,
+            None,
+            f"[DEFAULT]\n{_WORKSPACE_HOST}workspace_id = 999\n",
+            None,
+            id="default-profile-mismatch",
+        ),
+        pytest.param(
+            None,
+            None,
+            f"[DEFAULT]\n{_WORKSPACE_HOST}[other]\n{_WORKSPACE_HOST}workspace_id = 999\n",
+            None,
+            id="unselected-profile-on-same-host-mismatch",
+        ),
+        pytest.param(
+            "prod",
+            None,
+            f"[prod]\n{_WORKSPACE_HOST}workspace_id = 123\n"
+            f"[other]\n{_WORKSPACE_HOST}workspace_id = 999\n",
+            None,
+            id="profiles-on-same-host-disagree",
+        ),
+        pytest.param(
+            None,
+            None,
+            "[__settings__]\ndefault_profile = prod\n"
+            f"[prod]\n{_WORKSPACE_HOST}workspace_id = 999\n",
+            None,
+            id="settings-default-profile-mismatch",
+        ),
+        pytest.param(
+            None,
+            "env",
+            f"[DEFAULT]\n{_WORKSPACE_HOST}workspace_id = 123\n"
+            f"[env]\n{_WORKSPACE_HOST}workspace_id = 999\n",
+            None,
+            id="env-profile-mismatch",
+        ),
+        pytest.param(
+            None,
+            None,
+            "[DEFAULT]\nhost = https://other.cloud.databricks.com\nworkspace_id = 999\n",
+            "https://workspace.cloud.databricks.com",
+            id="default-profile-for-another-host-ignored",
+        ),
+        pytest.param(
+            "prod",
+            None,
+            "[DEFAULT]\nhost = https://other.cloud.databricks.com\nworkspace_id = 999\n"
+            f"[prod]\n{_WORKSPACE_HOST}",
+            "https://workspace.cloud.databricks.com",
+            id="named-profile-does-not-inherit-default-id",
+        ),
+        pytest.param(
+            "prod",
+            None,
+            f"[prod]\n{_WORKSPACE_HOST}workspace_id = 12%3\n",
+            None,
+            id="malformed-recorded-id",
+        ),
+    ],
+)
+def test_workspace_url_for_dedicated_gateway_uses_matching_profile(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    profile: str | None,
+    config_profile_env: str | None,
+    databricks_config: str | None,
+    expected: str | None,
 ) -> None:
-    """A dedicated Unity Gateway origin is not itself a workspace API host."""
+    """A dedicated gateway's workspace is unused if a profile on it records another workspace."""
     from omnigent.runtime.credentials import databricks as db_creds_mod
 
-    def resolve(profile: str | None) -> db_creds_mod.WorkspaceCreds:
-        assert profile == "prod"
+    _use_databricks_config_file(monkeypatch, tmp_path / "databrickscfg", databricks_config)
+    if config_profile_env:
+        monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", config_profile_env)
+
+    def resolve(requested_profile: str | None) -> db_creds_mod.WorkspaceCreds:
+        assert requested_profile == profile
         return db_creds_mod.WorkspaceCreds(
             host="https://workspace.cloud.databricks.com",
             token="unused",
@@ -1941,10 +2207,57 @@ def test_workspace_url_for_dedicated_gateway_uses_profile(
     assert (
         creds._databricks_workspace_url_for_gateway(
             "https://123.ai-gateway.cloud.databricks.com/anthropic",
-            profile="prod",
+            profile=profile,
         )
-        == "https://workspace.cloud.databricks.com"
+        == expected
     )
+
+
+@pytest.mark.parametrize(
+    ("gateway_url", "resolved_host", "expected"),
+    [
+        pytest.param(
+            "https://123.ai-gateway.cloud.databricks.com/anthropic",
+            "https://attacker.example",
+            None,
+            id="non-databricks-host",
+        ),
+        pytest.param(
+            "https://123.ai-gateway.cloud.databricks.com/anthropic",
+            "http://workspace.cloud.databricks.com",
+            None,
+            id="plain-http",
+        ),
+        pytest.param(
+            "https://wkspc.ai-gateway.cloud.databricks.com/anthropic",
+            "https://workspace.cloud.databricks.com",
+            "https://workspace.cloud.databricks.com",
+            id="non-numeric-gateway-label-skips-id-check",
+        ),
+    ],
+)
+def test_workspace_url_for_dedicated_gateway_checks_resolved_host(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    gateway_url: str,
+    resolved_host: str,
+    expected: str | None,
+) -> None:
+    """The gateway token is only sent to an https workspace on a Databricks domain."""
+    from omnigent.runtime.credentials import databricks as db_creds_mod
+
+    _use_databricks_config_file(
+        monkeypatch,
+        tmp_path / "databrickscfg",
+        f"[DEFAULT]\n{_WORKSPACE_HOST}workspace_id = 123\n",
+    )
+    monkeypatch.setattr(
+        creds,
+        "resolve_databricks_workspace",
+        lambda _profile: db_creds_mod.WorkspaceCreds(host=resolved_host, token="unused"),
+    )
+
+    assert creds._databricks_workspace_url_for_gateway(gateway_url) == expected
 
 
 def test_workspace_url_for_generic_provider_is_none() -> None:
@@ -3562,6 +3875,47 @@ def test_cli_config_pi_provider_discovery_failure_falls_back_to_catalog_default(
     assert provider.model == "catalog-databricks-claude-default", (
         f"discovery failure must fall back to catalog default; got {provider.model!r}"
     )
+
+
+@pytest.mark.parametrize(
+    ("recorded_workspace_id", "expected_listing_calls"),
+    [
+        pytest.param(
+            "1965859176160743", [("https://wkspc.cloud.databricks.com", "live-token")], id="match"
+        ),
+        pytest.param("999", [], id="profile-records-another-workspace"),
+    ],
+)
+def test_cli_config_dedicated_gateway_lists_only_the_matching_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    recorded_workspace_id: str,
+    expected_listing_calls: list[tuple[str, str]],
+) -> None:
+    """The cli-config path skips discovery when the profile records another workspace."""
+    listing_calls: list[tuple[str, str]] = []
+
+    def fetch(host: str, token: str) -> tuple[list, list, list, list]:
+        listing_calls.append((host, token))
+        return [], [], [], []
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", fetch)
+    monkeypatch.setattr(creds, "_run_auth_command", lambda _cmd: "live-token")
+    _use_databricks_config_file(
+        monkeypatch,
+        tmp_path / "databrickscfg",
+        f"{_WORKSPACE_PROFILE}workspace_id = {recorded_workspace_id}\n",
+    )
+    _write_codex_config(tmp_path, _DATABRICKS_CODEX_CONFIG)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    provider = creds.resolve_pi_native_provider(config_loader=_cli_config_databricks_config)
+
+    assert provider is not None
+    assert provider.base_url == (
+        "https://1965859176160743.ai-gateway.cloud.databricks.com/anthropic"
+    )
+    assert listing_calls == expected_listing_calls
 
 
 _PI_CUSTOM_PROVIDERS = {

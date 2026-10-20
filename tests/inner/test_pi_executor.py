@@ -3960,8 +3960,28 @@ def test_gateway_catalog_keeps_live_models_when_mlflow_enrichment_fails() -> Non
     assert executor._gateway_model_entries == entries
 
 
-def test_dedicated_gateway_fetches_wire_catalog_from_workspace_host() -> None:
+@pytest.mark.parametrize(
+    ("recorded_workspace_id", "expected_fetches"),
+    [
+        pytest.param(
+            "123", [("https://workspace.cloud.databricks.com", "gateway-token")], id="match"
+        ),
+        pytest.param("999", [], id="profile-records-another-workspace"),
+    ],
+)
+def test_dedicated_gateway_fetches_wire_catalog_from_workspace_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recorded_workspace_id: str,
+    expected_fetches: list[tuple[str, str]],
+) -> None:
     """Dedicated gateway hosts resolve their workspace before UC discovery."""
+    config_file = tmp_path / "databrickscfg"
+    config_file.write_text(
+        "[DEFAULT]\nhost = https://workspace.cloud.databricks.com\n"
+        f"workspace_id = {recorded_workspace_id}\n"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(config_file))
     with (
         patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
         patch(
@@ -3986,10 +4006,7 @@ def test_dedicated_gateway_fetches_wire_catalog_from_workspace_host() -> None:
         )
         _run(executor._load_gateway_model_wire_apis())
 
-    fetch.assert_called_once_with(
-        "https://workspace.cloud.databricks.com",
-        "gateway-token",
-    )
+    assert [call.args for call in fetch.call_args_list] == expected_fetches
 
 
 def test_generic_anthropic_gateway_skips_databricks_wire_catalog() -> None:

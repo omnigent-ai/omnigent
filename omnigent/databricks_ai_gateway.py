@@ -50,6 +50,12 @@ def _under_trusted_domain(hostname: str) -> bool:
     return False
 
 
+def is_databricks_workspace_url(url: str) -> bool:
+    """Whether *url* is https on a host under a trusted Databricks domain."""
+    parsed = urlparse(url)
+    return parsed.scheme == "https" and _under_trusted_domain((parsed.hostname or "").lower())
+
+
 def is_databricks_ai_gateway_url(base_url: str) -> bool:
     """Return ``True`` only for a genuine Databricks Unity Gateway base URL.
 

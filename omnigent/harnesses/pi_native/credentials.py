@@ -37,6 +37,7 @@ from omnigent.databricks_ai_gateway import (
     DATABRICKS_AI_GATEWAY_LABEL,
     DATABRICKS_TRUSTED_HOST_SUFFIXES,
     is_databricks_ai_gateway_url,
+    is_databricks_workspace_url,
 )
 from omnigent.harnesses.pi_native.auth_command import (
     AUTH_DIR_ENV,
@@ -200,7 +201,10 @@ def _databricks_workspace_url_for_gateway(
 
     Workspace-hosted gateways already expose the workspace hostname. Dedicated
     ``ai-gateway`` subdomains require the configured Databricks profile because
-    the gateway hostname itself does not serve workspace APIs.
+    the gateway hostname itself does not serve workspace APIs. The resolved
+    workspace must be an https host on a trusted Databricks domain. For a
+    ``<workspace-id>.ai-gateway`` host, it is not used when any profile naming
+    that workspace records a different (or unreadable) ``workspace_id``.
 
     :param base_url: Gateway protocol URL or origin.
     :param profile: Optional Databricks profile for dedicated gateway hosts.
@@ -215,9 +219,23 @@ def _databricks_workspace_url_for_gateway(
     if _DATABRICKS_AI_GATEWAY_LABEL not in hostname.lower().split("."):
         return f"https://{hostname}"
     try:
-        return resolve_databricks_workspace(profile).host
+        workspace_url = resolve_databricks_workspace(profile).host
     except Exception:  # noqa: BLE001 — absent profile disables optional discovery
         return None
+    if not is_databricks_workspace_url(workspace_url):
+        return None
+    gateway_workspace_id = hostname.split(".", 1)[0]
+    if not gateway_workspace_id.isdecimal():
+        return workspace_url
+    from omnigent.inner.databricks_executor import databrickscfg_own_workspace_ids_for_host
+
+    try:
+        recorded_workspace_ids = databrickscfg_own_workspace_ids_for_host(workspace_url)
+    except Exception:  # noqa: BLE001 — an unreadable workspace_id cannot confirm the match
+        return None
+    if recorded_workspace_ids - {gateway_workspace_id}:
+        return None
+    return workspace_url
 
 
 @dataclass(frozen=True)
@@ -1365,15 +1383,20 @@ _WORKSPACE_GATEWAY_SURFACE_PATHS: dict[str, DatabricksPiSurface] = {
     "/ai-gateway/codex/v1": DatabricksPiSurface.RESPONSES,
     "/ai-gateway/mlflow/v1": DatabricksPiSurface.MLFLOW,
 }
+_DEDICATED_GATEWAY_SURFACE_PATHS: dict[str, DatabricksPiSurface] = {
+    _DATABRICKS_GATEWAY_ANTHROPIC_SUFFIX: DatabricksPiSurface.ANTHROPIC,
+    _DATABRICKS_GATEWAY_CODEX_SUFFIX: DatabricksPiSurface.RESPONSES,
+}
 
 
-def _databricks_workspace_gateway_surface(base_url: str) -> DatabricksPiSurface | None:
-    """Return the surface a workspace-hosted Databricks Unity Gateway URL names.
+def _databricks_gateway_surface(base_url: str) -> DatabricksPiSurface | None:
+    """Return the surface a Databricks Unity Gateway URL names.
 
-    Only a workspace-hosted URL is classified: its hostname is the workspace, so
-    the inventory behind it can be listed with the same credential. A dedicated
-    ``ai-gateway`` host names no workspace, and an unknown path is not a surface
-    Pi can be pointed at.
+    A workspace-hosted gateway serves its surfaces under ``/ai-gateway``. A
+    dedicated ``ai-gateway`` host serves the Anthropic and Responses surfaces at
+    its root and names no workspace, so listing its inventory needs a Databricks
+    profile (see :func:`_databricks_workspace_url_for_gateway`). An unknown path
+    is not a surface Pi can be pointed at.
 
     :param base_url: A provider family's ``base_url``.
     :returns: The surface, or ``None`` when *base_url* is not such a URL.
@@ -1381,9 +1404,10 @@ def _databricks_workspace_gateway_surface(base_url: str) -> DatabricksPiSurface 
     if not _is_databricks_ai_gateway_url(base_url):
         return None
     parsed = urlparse(base_url)
+    path = parsed.path.rstrip("/")
     if _DATABRICKS_AI_GATEWAY_LABEL in (parsed.hostname or "").lower().split("."):
-        return None
-    return _WORKSPACE_GATEWAY_SURFACE_PATHS.get(parsed.path.rstrip("/"))
+        return _DEDICATED_GATEWAY_SURFACE_PATHS.get(path)
+    return _WORKSPACE_GATEWAY_SURFACE_PATHS.get(path)
 
 
 def _family_tier_ids(family: FamilyConfig) -> list[str]:
@@ -1518,10 +1542,10 @@ def _inline_family_pi_provider(
     family happens to be configured first. Falls back to the other family, which
     keeps protocol-translating proxies working: a LiteLLM ``/anthropic``
     passthrough is the only configured family and still serves any model. When
-    the selected family's ``base_url`` is a workspace-hosted Databricks AI
-    Gateway, the whole workspace is enumerated instead (Claude, GPT and Gemini
-    surfaces) with the configured default kept as the launch model; see
-    :func:`_databricks_gateway_pi_provider`.
+    the selected family's ``base_url`` is a Databricks AI Gateway whose
+    workspace can be resolved, the whole workspace is enumerated instead
+    (Claude, GPT and Gemini surfaces) with the configured default kept as the
+    launch model; see :func:`_databricks_gateway_pi_provider`.
 
     :param entry: The resolved default provider entry.
     :param model: Session model override, or ``None`` to use the family default.
@@ -1576,11 +1600,10 @@ def _inline_family_pi_provider(
         tier_ids = _family_tier_ids(family)
         # A session override must not turn a default-only setup into a shortlist.
         curated_models = len(tier_ids) > 1
-        # A workspace-hosted Databricks Unity Gateway fronts Claude, GPT and Gemini
-        # together; list the workspace so Pi offers every family, not just this
-        # one. Inference bindings pin exact ids and a multi-model tier map is a
-        # deliberate shortlist, so both keep the single-family config below.
-        declared_surface = _databricks_workspace_gateway_surface(family.base_url)
+        # A Databricks Unity Gateway fronts Claude, GPT and Gemini, so list them all.
+        # Inference bindings pin exact ids and a multi-model tier map is a deliberate
+        # shortlist; both keep the single-family config below.
+        declared_surface = _databricks_gateway_surface(family.base_url)
         if declared_surface is not None and not preserve_model_ids and not curated_models:
             # The configured default keeps its declared surface and limits when
             # it is picked explicitly too (the picker offers it by that surface).
@@ -1600,8 +1623,8 @@ def _inline_family_pi_provider(
                 configured_context_window=family.context_window,
                 configured_max_output_tokens=family.max_output_tokens,
             )
-            # An empty listing (unreachable workspace, a token without Unity
-            # Catalog access) keeps the configured model on its own surface.
+            # An empty listing (no resolvable or reachable workspace, a token without
+            # Unity Catalog access) keeps the configured model on its own surface.
             if enumerated.extra_models or enumerated.additional_providers:
                 return enumerated
         model_entry = pi_generic_model_json_entry(

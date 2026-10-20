@@ -6,7 +6,10 @@ from typing import Any
 import pytest
 
 from omnigent import gateway_inference
-from omnigent.databricks_ai_gateway import is_databricks_ai_gateway_url
+from omnigent.databricks_ai_gateway import (
+    is_databricks_ai_gateway_url,
+    is_databricks_workspace_url,
+)
 from omnigent.gateway_inference import (
     CLAUDE_GATEWAY_HARNESSES,
     CODEX_GATEWAY_HARNESSES,
@@ -574,3 +577,19 @@ def test_gateway_url_accepts_databricks_owned_hosts(gateway_url: str) -> None:
 )
 def test_gateway_url_rejects_lookalike_hosts(gateway_url: str) -> None:
     assert is_databricks_ai_gateway_url(gateway_url) is False
+
+
+@pytest.mark.parametrize(
+    ("workspace_url", "expected"),
+    [
+        ("https://wkspc.cloud.databricks.com", True),
+        ("https://adb-1.2.azuredatabricks.net/", True),
+        ("http://wkspc.cloud.databricks.com", False),
+        ("https://cloud.databricks.com", False),
+        ("https://wkspc.cloud.databricks.com.evil.test", False),
+        ("wkspc.cloud.databricks.com", False),
+        ("", False),
+    ],
+)
+def test_workspace_url_requires_https_databricks_host(workspace_url: str, expected: bool) -> None:
+    assert is_databricks_workspace_url(workspace_url) is expected
