@@ -386,6 +386,9 @@ def test_project_actions_follow_the_input_type(
     project = f"Project with a long name to check action overlap {uuid.uuid4().hex[:6]}"
     page.goto(f"{base_url}/c/{session_id}")
     _move_to_new_project(page, _row(page, session_id), project)
+    neighbour = f"Neighbour project {uuid.uuid4().hex[:6]}"
+    if has_touch:
+        _create_project(page, neighbour)
     _folder_header(page, project).hover()
     expect(page.get_by_role("link", name=f"New session in {project}", exact=True)).to_be_visible()
 
@@ -437,10 +440,18 @@ def test_project_actions_follow_the_input_type(
             shortcut = touch.get_by_role("link", name=f"New session in {project}", exact=True)
             kebab = touch.get_by_role("button", name=f"Project actions for {project}")
             _assert_touch_folder_actions_are_visible(touch, header, shortcut, kebab)
+            for name in [project, neighbour]:
+                _assert_touch_actions_stay_in_their_row(touch, name)
 
             before = header.get_attribute("aria-expanded")
+            # The menu modal hides the trigger from the accessibility tree.
+            trigger = touch.get_by_role(
+                "button", name=f"Project actions for {project}", include_hidden=True
+            )
+            _touch_drag_from(touch, kebab)
+            expect(trigger).to_have_attribute("aria-expanded", "false")
             kebab.tap()
-            expect(touch.get_by_role("menu")).to_be_visible()
+            expect(trigger).to_have_attribute("aria-expanded", "true")
             touch.wait_for_timeout(750)
             expect(_folder_header(touch, project, include_hidden=True)).to_have_attribute(
                 "aria-expanded", before
@@ -584,6 +595,43 @@ def _assert_visually_hidden(control: Locator) -> None:
     expect(control).to_have_accessible_name(re.compile(r"\S"))
     box = control.locator("xpath=../..").bounding_box()
     assert box is not None and box["width"] <= 1 and box["height"] <= 1
+
+
+def _assert_touch_actions_stay_in_their_row(page: Page, project: str) -> None:
+    """Enlarged touch controls fit their own header, so edge taps never reach a neighbor."""
+    header = _folder_header(page, project)
+    for control in [
+        page.get_by_role("link", name=f"New session in {project}", exact=True),
+        page.get_by_role("button", name=f"Project actions for {project}"),
+    ]:
+        assert control.evaluate(
+            """(element, row) => {
+                const box = element.getBoundingClientRect();
+                const rowBox = row.getBoundingClientRect();
+                const hit = document.elementFromPoint(box.x + box.width / 2, box.bottom - 2);
+                const inRow = box.top >= rowBox.top && box.bottom <= rowBox.bottom;
+                return inRow && element.contains(hit);
+            }""",
+            header.element_handle(),
+        )
+
+
+def _touch_drag_from(page: Page, control: Locator) -> None:
+    """Press *control* and drag the finger down as if starting a scroll."""
+    box = control.bounding_box()
+    assert box is not None, "control has no touch target bounds"
+    x, y = round(box["x"] + box["width"] / 2), round(box["y"] + box["height"] / 2)
+    cdp = page.context.new_cdp_session(page)
+    try:
+        cdp.send(
+            "Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [{"x": x, "y": y}]}
+        )
+        for step in range(1, 9):
+            point = {"x": x, "y": y + step * 12}
+            cdp.send("Input.dispatchTouchEvent", {"type": "touchMove", "touchPoints": [point]})
+        cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+    finally:
+        cdp.detach()
 
 
 def _assert_touch_folder_actions_are_visible(
