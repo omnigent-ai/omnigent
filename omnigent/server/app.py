@@ -1837,12 +1837,14 @@ def create_app(
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task
             # Stop in-flight background managed-sandbox launches so a
-            # slow provision doesn't outlive the ASGI shutdown (the
-            # sandbox itself, if already provisioned, is reaped by the
-            # provider lifetime cap — see the hook's docstring).
+            # slow provision doesn't outlive the ASGI shutdown, after giving
+            # unbound ones the deployment's drain to bind their host (see the
+            # hook's docstring).
             from omnigent.server.routes.sessions import cancel_managed_launch_tasks
 
-            await cancel_managed_launch_tasks()
+            await cancel_managed_launch_tasks(
+                drain_s=sandbox_config.shutdown_drain_s if sandbox_config is not None else 0.0
+            )
             if startup_inputs is not None:
                 await startup_inputs.shutdown()
             await background_title_coordinator.shutdown()

@@ -349,6 +349,48 @@ Cross-harness journeys:
   (`tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_late_settings_ack_still_reaches_an_older_server`).
 - **`approvals`:**
   `tests/e2e_ui/approvals/test_native_edit_tools_approval_card.py::test_native_file_edit_tools_require_approval_card`
+- **`approvals`, Kiro delivery and manual retry:**
+  `tests/e2e_ui/messages/test_kiro_permission_retry.py::test_kiro_manual_retry`
+  (own environment, real browser/server/runner/tmux, fake Kiro) drops the first
+  Enter and checks the five-second wait, refresh recovery, and one explicit retry
+  from chat, Inbox, and the standalone approval page. The chat journey switches
+  to a mobile viewport to check and click Retry. Inbox and standalone journeys
+  hold the initial POST response open through Retry, then fail that old response;
+  the newer attempt must remain authoritative. It also checks rejection and answering through the existing terminal view toggle. Two
+  identical commands have distinct request IDs; only the first may be answered.
+  Write variants use Kiro's full-path heading and diff preview, covering approval
+  and rejection with a second same-basename file left pending.
+  `tests/e2e_ui/messages/test_kiro_permission_retry.py::test_kiro_retry_recovers_after_reporting_outage`
+  pauses the owned runner after a lost Enter, waits through the real 30-second
+  cleanup, then resumes it. Already-open Chat, standalone approval, and Inbox
+  restore Retry without reloading; no second Enter occurs until the user retries.
+  `tests/e2e_ui/messages/test_kiro_permission_retry.py::test_kiro_late_confirmation_removes_retry`
+  delays input consumption with real elapsed time and checks that late
+  confirmation removes Retry without sending another Enter, including when the
+  browser disconnects before confirmation and then reconnects.
+  `tests/e2e_ui/messages/test_kiro_permission_retry.py::test_kiro_two_tabs_cannot_repeat_an_old_retry`
+  checks simultaneous retries from chat and a standalone tab, rejection of a
+  stale retry after another attempt, and recovery after refreshing the stale tab.
+  `tests/e2e_ui/messages/test_kiro_permission_retry.py::test_kiro_legacy_server_does_not_repeat_enter`
+  runs the current runner with an older server checkout named by
+  `OMNIGENT_E2E_KIRO_LEGACY_SERVER_CHECKOUT`. With a nine-second input delay,
+  one approval must send just one Enter; the next identical request stays
+  unanswered. The fixture uses the current built SPA and logs the server's
+  import path. Without the older checkout, this mixed-version case is skipped.
+  After building the current SPA, reproduce with the pre-retry server `511135bc4`:
+
+  ```sh
+  git worktree add --detach ../omnigent-kiro-legacy-511135bc4 511135bc4
+  OMNIGENT_E2E_KIRO_LEGACY_SERVER_CHECKOUT="$(cd ../omnigent-kiro-legacy-511135bc4 && pwd)" \
+    uv run --no-sync pytest \
+    tests/e2e_ui/messages/test_kiro_permission_retry.py::test_kiro_legacy_server_does_not_repeat_enter \
+    --headed --ui-skip-build
+  ```
+
+  Child-session routing uses the shared approval card; server ownership and
+  receipt races, abandoned-hook cleanup, and legacy verdict replay are covered by
+  `tests/server/integration/test_kiro_permission_delivery.py`.
+  These tests do not verify a signed-in vendor Kiro CLI.
 - **`resume`, bare picker scoped to this host:**
   `tests/e2e/test_native_resume_picker_cross_host_e2e.py::test_bare_resume_picker_excludes_other_hosts_sessions`
 - **`resume`, Claude and Pi provider selection after a runner restart:**

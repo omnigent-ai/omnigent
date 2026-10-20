@@ -2462,6 +2462,8 @@ def register_resources_routes(
         q: str = Query(min_length=1, max_length=4096, pattern=r".*\S.*"),
         case_sensitive: bool = False,
         regex: bool = False,
+        include: str = Query(default="", max_length=4096),
+        exclude: str = Query(default="", max_length=4096),
         limit: int = Query(default=500, ge=1, le=500),
     ) -> Any:
         """Search the session workspace with the same access gate as file reads."""
@@ -2477,6 +2479,8 @@ def register_resources_routes(
                 "q": q,
                 "case_sensitive": str(case_sensitive).lower(),
                 "regex": str(regex).lower(),
+                "include": include,
+                "exclude": exclude,
                 "limit": str(limit),
             },
             timeout=25.0,

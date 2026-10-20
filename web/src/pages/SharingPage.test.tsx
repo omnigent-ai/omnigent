@@ -1,9 +1,6 @@
 // Tests for the admin SharingPage (server-wide sharing-settings picker).
 //
-// Browser e2e is impractical (admin-gated), so the surface is pinned here by
-// mocking the mode-agnostic identity probe (resolveIdentity / getCurrentIsAdmin
-// gate admin) and the react-query sharing hooks, so no QueryClient or
-// network is needed.
+// Mock identity and sharing hooks to cover admin gating and disabled controls.
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -250,26 +247,43 @@ describe("SharingPage", () => {
     });
   });
 
-  describe("default visibility for new sessions", () => {
-    const GROUP = "Default visibility for new sessions";
+  describe("default sharing for new sessions", () => {
+    const TOGGLE = "Share new sessions by default";
+    const GROUP = "Automatically share";
 
-    it("shows the three options with the current one selected", async () => {
+    it("shows only the scope options when automatic sharing is enabled", async () => {
       setSharingState(state({ default_public_sessions: "sandbox" }));
 
       renderPage();
-      await waitFor(() => expect(screen.getByText("On")).toBeInTheDocument());
+      expect(await screen.findByRole("switch", { name: TOGGLE })).toBeChecked();
 
       const radios = radiosIn(GROUP);
-      expect(radios.map((r) => r.value)).toEqual(["off", "sandbox", "all"]);
+      expect(radios.map((r) => r.value)).toEqual(["sandbox", "all"]);
       expect(radios.find((r) => r.value === "sandbox")!.checked).toBe(true);
-      expect(screen.queryByText(/has no effect/i)).not.toBeInTheDocument();
+      expect(screen.getByRole("radio", { name: "Managed hosts only" })).toBeChecked();
+      expect(screen.getByText(/Sessions on local hosts start private/)).toBeInTheDocument();
     });
 
-    it("calls the mutation with the chosen default", async () => {
+    it("hides scope while off and enables managed hosts only by default", async () => {
       setSharingState(state());
 
       renderPage();
-      await waitFor(() => expect(screen.getByText("On")).toBeInTheDocument());
+      const toggle = await screen.findByRole("switch", { name: TOGGLE });
+      expect(toggle).not.toBeChecked();
+      expect(screen.queryByRole("group", { name: GROUP })).not.toBeInTheDocument();
+      fireEvent.click(toggle);
+
+      expect(setModeMutate).toHaveBeenCalledWith(
+        { default_public_sessions: "sandbox" },
+        expect.anything(),
+      );
+    });
+
+    it("calls the mutation with the chosen scope", async () => {
+      setSharingState(state({ default_public_sessions: "sandbox" }));
+
+      renderPage();
+      await screen.findByRole("switch", { name: TOGGLE });
 
       fireEvent.click(radiosIn(GROUP).find((r) => r.value === "all")!);
 
@@ -279,42 +293,84 @@ describe("SharingPage", () => {
       );
     });
 
-    it("is disabled when deployment-managed", async () => {
-      setSharingState(state({ default_public_sessions_editable: false }));
+    it("turns automatic sharing off with the parent switch", async () => {
+      setSharingState(state({ default_public_sessions: "all" }));
 
       renderPage();
-      await waitFor(() => expect(screen.getByText("On")).toBeInTheDocument());
+      fireEvent.click(await screen.findByRole("switch", { name: TOGGLE }));
+
+      expect(setModeMutate).toHaveBeenCalledWith(
+        { default_public_sessions: "off" },
+        expect.anything(),
+      );
+    });
+
+    it("is disabled when deployment-managed", async () => {
+      setSharingState(
+        state({ default_public_sessions: "sandbox", default_public_sessions_editable: false }),
+      );
+
+      renderPage();
+      const toggle = await screen.findByRole("switch", { name: TOGGLE });
+      expect(toggle).toBeDisabled();
 
       const radios = radiosIn(GROUP);
       expect(radios.every((r) => r.disabled)).toBe(true);
+      fireEvent.click(toggle);
       fireEvent.click(radios.find((r) => r.value === "all")!);
       expect(setModeMutate).not.toHaveBeenCalled();
     });
 
-    it("is greyed out and shows Private while public access is off", async () => {
-      setSharingState(state({ public_sharing_enabled: false, default_public_sessions: "all" }));
+    it("disables both controls while a save is pending", async () => {
+      setSharingState(state({ default_public_sessions: "sandbox" }));
+      vi.mocked(sharingHook.useSetSharing).mockReturnValue({
+        mutate: setModeMutate,
+        isPending: true,
+      } as unknown as ReturnType<typeof sharingHook.useSetSharing>);
 
       renderPage();
-      await waitFor(() => expect(screen.getByText("On")).toBeInTheDocument());
+      expect(await screen.findByRole("switch", { name: TOGGLE })).toBeDisabled();
+      expect(radiosIn(GROUP).every((r) => r.disabled)).toBe(true);
+    });
 
-      const radios = radiosIn(GROUP);
-      expect(radios.every((r) => r.disabled)).toBe(true);
-      // Effective value, not the saved "all", which returns once public access is on.
-      expect(radios.find((r) => r.value === "off")!.checked).toBe(true);
+    it("keeps the saved scope and shows an error when saving fails", async () => {
+      setSharingState(state({ default_public_sessions: "sandbox" }));
+      setModeMutate.mockImplementation((_update, { onError }) => onError(new Error("Save failed")));
+
+      renderPage();
+      await screen.findByRole("switch", { name: TOGGLE });
+      fireEvent.click(screen.getByRole("radio", { name: "All sessions" }));
+
+      expect(screen.getByText("Save failed")).toBeInTheDocument();
+      expect(screen.getByRole("radio", { name: "Managed hosts only" })).toBeChecked();
+    });
+
+    it("is off and hides scope while public access is off", async () => {
+      setSharingState(state({ public_sharing_enabled: false, default_public_sessions: "all" }));
+
+      const view = renderPage();
+      const toggle = await screen.findByRole("switch", { name: TOGGLE });
+
+      expect(toggle).toBeDisabled();
+      expect(toggle).not.toBeChecked();
+      expect(screen.queryByRole("group", { name: GROUP })).not.toBeInTheDocument();
       expect(
         screen.getByText("Turn on public access to change the default visibility."),
       ).toBeInTheDocument();
-      fireEvent.click(radios.find((r) => r.value === "sandbox")!);
+      fireEvent.click(toggle);
       expect(setModeMutate).not.toHaveBeenCalled();
-    });
 
-    it("shows the saved choice again once public access is on", async () => {
       setSharingState(state({ public_sharing_enabled: true, default_public_sessions: "all" }));
-
-      renderPage();
-      await waitFor(() => expect(screen.getByText("On")).toBeInTheDocument());
+      view.rerender(
+        <TooltipProvider>
+          <SharingPage />
+        </TooltipProvider>,
+      );
 
       const radios = radiosIn(GROUP);
+      const restoredToggle = screen.getByRole("switch", { name: TOGGLE });
+      expect(restoredToggle).toBeEnabled();
+      expect(restoredToggle).toBeChecked();
       expect(radios.every((r) => !r.disabled)).toBe(true);
       expect(radios.find((r) => r.value === "all")!.checked).toBe(true);
       expect(screen.queryByText(/to change the default visibility/)).not.toBeInTheDocument();
@@ -338,10 +394,12 @@ describe("SharingPage", () => {
       expect(toggle).toBeDisabled();
       expect(toggle).not.toBeChecked();
       expect(screen.getByText("Turn sharing on to use public access.")).toBeInTheDocument();
-      const radios = radiosIn("Default visibility for new sessions");
-      expect(radios.every((r) => r.disabled)).toBe(true);
-      expect(radios.find((r) => r.value === "off")!.checked).toBe(true);
+      const defaultToggle = screen.getByRole("switch", { name: "Share new sessions by default" });
+      expect(defaultToggle).toBeDisabled();
+      expect(defaultToggle).not.toBeChecked();
+      expect(screen.queryByRole("group", { name: "Automatically share" })).not.toBeInTheDocument();
       fireEvent.click(toggle);
+      fireEvent.click(defaultToggle);
       expect(setModeMutate).not.toHaveBeenCalled();
     });
   });

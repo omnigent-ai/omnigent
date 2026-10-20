@@ -765,6 +765,24 @@ def test_launch_runner_frame_round_trip() -> None:
     assert decoded.session_id == "conv_abc123"
 
 
+def test_launch_runner_superseded_runner_ids_round_trip() -> None:
+    """Named, empty, and absent supersession lists stay distinct on the wire."""
+    for ids in (("runner_old",), ()):
+        frame = HostLaunchRunnerFrame(
+            request_id="req_s",
+            binding_token="tok",
+            workspace="/w",
+            session_id="conv_s",
+            superseded_runner_ids=ids,
+        )
+        assert decode_host_frame(encode_host_frame(frame)) == frame
+    legacy = HostLaunchRunnerFrame(request_id="req_l", binding_token="tok", workspace="/w")
+    assert "superseded_runner_ids" not in encode_host_frame(legacy)
+    decoded = decode_host_frame(encode_host_frame(legacy))
+    assert isinstance(decoded, HostLaunchRunnerFrame)
+    assert decoded.superseded_runner_ids is None
+
+
 def test_launch_runner_preserves_the_full_saved_inference_profile() -> None:
     config = {
         "providers": {

@@ -57,7 +57,7 @@ import {
   Trash2Icon,
   WrapTextIcon,
 } from "lucide-react";
-import { useSearchParams } from "@/lib/routing";
+import { useSearchParams, useRebasePath } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -301,6 +301,8 @@ function useToolbarOverflow(actionsKey: string): {
 // ---------------------------------------------------------------------------
 
 interface FileViewerProps {
+  syncUrl?: boolean;
+  agentId?: string | null;
   position?: FilePosition;
   open: boolean;
   /** Media visibility is independent of the mounted editor and its navigation guard. */
@@ -352,13 +354,17 @@ export function FileViewer(props: FileViewerProps) {
   // `omnigent run --server`.
   const agentId = useChatStore((s) => s.boundAgentId);
   return (
-    <CommentSenderProvider sessionId={props.conversationId} agentId={agentId}>
+    <CommentSenderProvider
+      sessionId={props.conversationId}
+      agentId={props.agentId === undefined ? agentId : props.agentId}
+    >
       <FileViewerBody {...props} />
     </CommentSenderProvider>
   );
 }
 
 function FileViewerBody({
+  syncUrl = true,
   position,
   open,
   mediaActive = true,
@@ -378,13 +384,14 @@ function FileViewerBody({
   // LEVEL_EDIT = 2; levels below 2 are read-only.
   const canEdit = permissionLevel == null || permissionLevel >= 2;
   const [searchParams, setSearchParams] = useSearchParams();
+  const rebasePath = useRebasePath();
   const isMobile = useIsMobileViewport();
   const isActiveViewport = viewport === undefined || (viewport === "mobile") === isMobile;
   // Capture URL params once on open — we don't want re-renders caused by our own
   // param writes to re-run the initialization logic.
-  const initialDiffRef = useRef(searchParams.get("diff") === "1");
+  const initialDiffRef = useRef(syncUrl && searchParams.get("diff") === "1");
   const linkedFileRef = useRef(initialDiffRef.current ? { conversationId, path } : null);
-  const initialCommentIdRef = useRef(searchParams.get("comment"));
+  const initialCommentIdRef = useRef(syncUrl ? searchParams.get("comment") : null);
   // Seeded from the parent's persisted state on remount (e.g. returning to a
   // tab); defaults closed on a fresh open. The linked-comment / fresh-open
   // effects below only force it open, never closed, so a restored-open value
@@ -559,6 +566,11 @@ function FileViewerBody({
   const copyFileLink = useCallback(() => {
     if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) return;
     const url = new URL(window.location.href);
+    if (!syncUrl) {
+      url.pathname = rebasePath(`/c/${conversationId}`);
+      url.search = "";
+      url.searchParams.set("file", path);
+    }
     if (!activeSelection) url.searchParams.delete("comment");
     navigator.clipboard.writeText(url.toString()).then(
       () => {
@@ -568,16 +580,24 @@ function FileViewerBody({
       },
       (err) => console.warn("Failed to copy file link", err),
     );
-  }, [activeSelection]);
+  }, [activeSelection, syncUrl, rebasePath, conversationId, path]);
 
-  const copyCommentLink = useCallback((commentId: string) => {
-    if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) return;
-    const url = new URL(window.location.href);
-    url.searchParams.set("comment", commentId);
-    navigator.clipboard
-      .writeText(url.toString())
-      .then(undefined, (err) => console.warn("Failed to copy comment link", err));
-  }, []);
+  const copyCommentLink = useCallback(
+    (commentId: string) => {
+      if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) return;
+      const url = new URL(window.location.href);
+      if (!syncUrl) {
+        url.pathname = rebasePath(`/c/${conversationId}`);
+        url.search = "";
+        url.searchParams.set("file", path);
+      }
+      url.searchParams.set("comment", commentId);
+      navigator.clipboard
+        .writeText(url.toString())
+        .then(undefined, (err) => console.warn("Failed to copy comment link", err));
+    },
+    [syncUrl, rebasePath, conversationId, path],
+  );
 
   const sender = useOptionalCommentSender();
 
@@ -643,6 +663,7 @@ function FileViewerBody({
   useEffect(() => {
     if (!open || !onNavigateTo || currentNavIdx === -1) return;
     const handler = (e: KeyboardEvent) => {
+      if (!syncUrl && !viewerIsActiveSurfaceRef.current) return;
       if (!e.altKey) return;
       if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
       // Don't hijack word-navigation when the user is typing in an input.
@@ -663,12 +684,13 @@ function FileViewerBody({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [open, onNavigateTo, currentNavIdx, prevPath, nextPath, guardDirty]);
+  }, [syncUrl, open, onNavigateTo, currentNavIdx, prevPath, nextPath, guardDirty]);
 
   // Escape closes the active file tab (when search is not open).
   useEffect(() => {
     if (!open || !onCloseTab) return;
     const handler = (e: KeyboardEvent) => {
+      if (!syncUrl && !viewerIsActiveSurfaceRef.current) return;
       if (e.key !== "Escape" || e.defaultPrevented) return;
       if (searchOpen) return;
       const target = e.target;
@@ -683,7 +705,7 @@ function FileViewerBody({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [open, onCloseTab, searchOpen, guardDirty]);
+  }, [syncUrl, open, onCloseTab, searchOpen, guardDirty]);
 
   // View mode toggle — markdown defaults to the rich-text editor, HTML and
   // notebooks to their rendered preview, and everything else to source.
@@ -1009,7 +1031,7 @@ function FileViewerBody({
   // that AppShell writes (React Router v7 BrowserRouter defers via startTransition,
   // so stale searchParams seen here could emit a navigate("?") that strips it).
   useEffect(() => {
-    if (!open || !isActiveViewport) return;
+    if (!syncUrl || !open || !isActiveViewport) return;
     const wantDiff = diffActive && isDiffAvailable;
     const hasDiff = searchParams.has("diff");
     if (wantDiff === hasDiff) return; // already in sync — no navigate needed
@@ -1025,7 +1047,7 @@ function FileViewerBody({
       },
       { replace: true },
     );
-  }, [diffActive, isDiffAvailable, open, isActiveViewport, searchParams, setSearchParams]);
+  }, [syncUrl, diffActive, isDiffAvailable, open, isActiveViewport, searchParams, setSearchParams]);
 
   // Toolbar actions, declared once and rendered two ways: inline icon buttons
   // when there's room, or rows in an overflow ("⋯") menu when there isn't.
@@ -1771,15 +1793,16 @@ function FileViewerBody({
               });
               // Sync the selected comment into the URL so the address bar is
               // always shareable. AppShell clears this param when the viewer closes.
-              setSearchParams(
-                (prev) => {
-                  const next = new URLSearchParams(prev);
-                  if (comment.status === "draft") next.set("comment", comment.id);
-                  else next.delete("comment");
-                  return next;
-                },
-                { replace: true },
-              );
+              if (syncUrl)
+                setSearchParams(
+                  (prev) => {
+                    const next = new URLSearchParams(prev);
+                    if (comment.status === "draft") next.set("comment", comment.id);
+                    else next.delete("comment");
+                    return next;
+                  },
+                  { replace: true },
+                );
             }}
             onEditComment={(id, body) => updateComment.mutate({ commentId: id, body })}
             onDeleteComment={(id) => {
