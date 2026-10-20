@@ -767,8 +767,14 @@ aside[aria-label="Workspace"][data-maximized] {
 html[data-electron-mac] {
   --mac-titlebar-height: calc(48px / var(--omnigent-electron-zoom, 1));
   --mac-traffic-light-width: calc(88px / var(--omnigent-electron-zoom, 1));
+  /* Width of the title-bar action cluster beside the lights: three 1.5rem icons and gaps. */
+  --mac-title-cluster-width: 5rem;
 }
 @media (min-width: 48rem) {
+  /* Back/Forward add two more icons and gaps wherever they render (not when embedded). */
+  html[data-electron-mac]:has(.electron-sidebar-header-actions .history-navigation-buttons) {
+    --mac-title-cluster-width: 8.5rem;
+  }
   /* Reserve the board's shared sidebar toggle only while navigation is closed. */
   .app-shell:not([data-sidebar-open]) .canvas-page-heading {
     padding-left: 4rem;
@@ -780,8 +786,8 @@ html[data-electron-mac] {
    *
    * The sidebar starts at the window's top edge rather than below the lights, so
    * no band of empty canvas sits above it. The title-bar row itself is NOT the
-   * sidebar's header row: the window furniture (lights + the Search/Settings/
-   * toggle cluster) is owned by AppShell and positioned over this top strip, so
+   * sidebar's header row: the window furniture (lights + the header action
+   * cluster) is owned by AppShell and positioned over this top strip, so
    * it stays put when the sidebar collapses or peeks. What remains here is to
    * strip the sidebar's now-redundant header chrome — its wordmark and its own
    * copy of the cluster — and reclaim the empty row. */
@@ -862,8 +868,8 @@ html[data-electron-mac] .electron-sidebar-header-actions {
   display: flex;
   align-items: center;
 
-  /* Read Collapse · Search · Settings outward from the window controls: pull
-   * the cluster's last button (the toggle) to the front. */
+  /* Read Collapse · Back · Forward · Search · Settings outward from the window
+   * controls: pull the cluster's last button (the toggle) to the front. */
   & > * > *:last-child {
     order: -1;
   }
@@ -871,7 +877,7 @@ html[data-electron-mac] .electron-sidebar-header-actions {
 /* Clear the fixed native-control area plus the font-relative action cluster
  * when the collapsed sidebar exposes the chat header at the window edge. */
 html[data-electron-mac] .traffic-light-clearance {
-  padding-left: calc(var(--mac-traffic-light-width) + 5rem);
+  padding-left: calc(var(--mac-traffic-light-width) + var(--mac-title-cluster-width));
 }
 /* A maximized rail reaches the same window corner while the sidebar is closed.
  * Once the sidebar opens, the rail starts to its right and needs no clearance. */
@@ -879,7 +885,7 @@ html[data-electron-mac]
   .app-shell:not([data-sidebar-open])
   aside[aria-label="Workspace"][data-maximized]
   .workspace-tab-strip {
-  padding-left: calc(var(--mac-traffic-light-width) + 5rem);
+  padding-left: calc(var(--mac-traffic-light-width) + var(--mac-title-cluster-width));
 }
 /* Drag regions ignore z-order, so controls and overlays need counter-regions.
  * Scoped from <html> to cover portals outside AppShell on macOS only. */

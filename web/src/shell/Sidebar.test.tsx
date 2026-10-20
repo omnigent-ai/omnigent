@@ -951,6 +951,26 @@ describe("Sidebar session list", () => {
     );
   });
 
+  it("shows Back/Forward in the header but not in the settings nav", () => {
+    vi.stubGlobal("navigation", new EventTarget());
+    try {
+      mockConversations(THREE_TYPE_CONVERSATIONS);
+      const home = renderSidebar();
+      const headerActions = screen.getByTestId("sidebar-header-actions");
+      expect(within(headerActions).getByRole("button", { name: "Back" })).toBeInTheDocument();
+      expect(within(headerActions).getByRole("button", { name: "Forward" })).toBeInTheDocument();
+      home.unmount();
+
+      // Settings keeps its own Back link as the way out, so the pair stays away.
+      renderSidebar(true, "/settings");
+      expect(screen.getByRole("link", { name: "Back" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Back" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Forward" })).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("renders Search, Settings, and Collapse as compact header actions", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();

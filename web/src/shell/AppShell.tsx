@@ -2431,14 +2431,9 @@ function AppShellImpl() {
           canvas for the traffic lights, and the strip is the window's one
           drag surface — content below and right stays fully clickable. */}
             {isMacElectronShell() && <div className="electron-drag-strip" aria-hidden="true" />}
-            {/* The Search/Settings/toggle cluster lives HERE on the macOS shell,
-          not in the sidebar, so the three icons hold one fixed position beside
-          the traffic lights no matter what the sidebar does. Inside the sidebar
-          they would be clipped and inert once it collapses (md:w-0 +
-          overflow-hidden + inert), and while peeking the floating card's
-          inset-2 would drag them off the lights' centre line. The sidebar's own
-          copy is hidden on mac by CSS; this one is positioned by
-          .electron-sidebar-header-actions in index.css. */}
+            {/* On the macOS shell the header cluster lives here, beside the traffic lights, so it
+          holds still while the sidebar collapses or peeks (see SidebarHeaderActions). CSS hides
+          the sidebar's own copy and positions this one (.electron-sidebar-header-actions). */}
             {/* Hidden on /settings: the settings nav replaces the session list
           INSIDE the sidebar, and its "Back" row is the only way out. Leaving a
           collapse toggle up here would let the user hide the one exit and strand
