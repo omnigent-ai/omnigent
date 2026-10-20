@@ -23,6 +23,7 @@ import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -33,6 +34,7 @@ import org.robolectric.annotation.Config
 import org.robolectric.shadow.api.Shadow
 import org.robolectric.shadows.ShadowPopupMenu
 import org.robolectric.shadows.ShadowRestrictionsManager
+import org.robolectric.shadows.ShadowToast
 import java.time.Duration
 import java.util.concurrent.Executor
 
@@ -273,6 +275,54 @@ class MainActivityTest {
         assertTrue(script.contains("currentOrigin") && script.contains("example.com"))
         // Only a server whose sign-in the shell owns offers "Sign out of <server>".
         assertTrue(script.contains("\"canSignOut\":false"))
+        assertTrue(script.contains("\"offersReload\":true"))
+        assertTrue(script.contains("\"debugActions\":[]"))
+    }
+
+    @Test
+    fun `a shell-owned OIDC sign-in keeps the pill hidden and puts its faults in the picker`() {
+        val activity = launch()
+        val webView = activity.webView()
+        activity.connectOidc("https://example.com")
+
+        webView.webViewClient.onPageStarted(webView, "https://example.com/app", null)
+        activity.invoke("onServerPickerRequested")
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(7))
+
+        assertEquals(View.GONE, activity.switchButton().visibility)
+        val script = shadowOf(webView).lastEvaluatedJavascript.orEmpty()
+        assertTrue(script.contains("\"canSignOut\":true"))
+        for (action in OidcAuthDebugMenu.ACTIONS) {
+            assertTrue(script.contains("{\"id\":${action.id},\"label\":\"${action.label}\"}"))
+        }
+    }
+
+    @Test
+    fun `picker debug faults this connection didn't offer are ignored`() {
+        val activity = launch()
+        val fault = 20_102 // OIDC "Clear Refresh Token" in debug builds.
+
+        activity.invoke("onAuthDebugActionRequested", arrayOf(Int::class.java), fault)
+
+        assertNull(ShadowToast.getLatestToast())
+    }
+
+    @Test
+    fun `picker debug faults run for a connection that offers them`() {
+        assumeTrue(OidcAuthDebugMenu.ACTIONS.isNotEmpty()) // Debug builds only.
+        val activity = launch()
+        activity.connectOidc("https://example.com")
+
+        activity.invoke(
+            "onAuthDebugActionRequested",
+            arrayOf(Int::class.java),
+            OidcAuthDebugMenu.ACTIONS.single { it.label == "Clear Refresh Token" }.id,
+        )
+
+        assertEquals(
+            "No saved refresh token for this server. Sign in first.",
+            ShadowToast.getTextOfLatestToast(),
+        )
     }
 
     @Test
@@ -553,6 +603,21 @@ class MainActivityTest {
             .getDeclaredField(name)
             .apply { isAccessible = true }
             .get(this) as T
+
+    /** Install a native OIDC connection, as a completed sign-in would. */
+    private fun MainActivity.connectOidc(serverUrl: String) {
+        val controller =
+            MainActivity::class
+                .java
+                .getDeclaredMethod("oidcController")
+                .apply { isAccessible = true }
+                .invoke(this)
+        OidcSessionController::class
+            .java
+            .getDeclaredField("connection")
+            .apply { isAccessible = true }
+            .set(controller, OidcConnection(serverUrl, "omnigent_session"))
+    }
 
     private fun MainActivity.switchButton(): View =
         MainActivity::class
