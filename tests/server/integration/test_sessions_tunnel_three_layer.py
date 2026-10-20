@@ -1825,6 +1825,53 @@ async def test_runner_idle_shutdown_settles_stale_running_session(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("_isolated_session_status_cache")
+@pytest.mark.parametrize("idle_shutdown", [True, False])
+async def test_runner_idle_shutdown_marks_relay_bound_sessions_before_the_grace(
+    tunnel_three_layer_stack: _TunnelStack,
+    monkeypatch: pytest.MonkeyPatch,
+    idle_shutdown: bool,
+) -> None:
+    """A relay decides at the same deadline as the grace timer, so it is marked at disconnect."""
+    from types import SimpleNamespace
+
+    from omnigent.runner.transports.ws_tunnel.frames import RUNNER_IDLE_SHUTDOWN_CLOSE_REASON
+    from omnigent.server.routes import sessions as sessions_module
+
+    ap_app = tunnel_three_layer_stack.ap_app
+    # Long enough that only the disconnect hook, not the grace sweep, can mark.
+    monkeypatch.setattr(sessions_module, "RUNNER_DISCONNECT_GRACE_S", 60.0)
+    _stub_connect_hook_for_pumpless_ws(ap_app, monkeypatch)
+    runner_id = "runner-idle-shutdown-relay"
+    session_id = "relay-bound-idle-shutdown"
+    communicator = await _connect_runner_tunnel(ap_app, runner_id)
+    await _send_hello_and_wait(communicator, ap_app, runner_id, harnesses=[_TEST_HARNESS_NAME])
+    sessions_module._runner_relay_tasks[session_id] = SimpleNamespace(  # type: ignore[assignment]
+        runner_id=runner_id
+    )
+    sessions_module._session_status_cache[session_id] = "running"
+    try:
+        await communicator.send_input(
+            {
+                "type": "websocket.disconnect",
+                "code": 1000,
+                "reason": RUNNER_IDLE_SHUTDOWN_CLOSE_REASON if idle_shutdown else "",
+            }
+        )
+        await communicator.wait(timeout=budget(2.0))
+
+        marked = sessions_module._intentional_stop_sessions.get(session_id)
+        assert marked == (runner_id if idle_shutdown else None)
+    finally:
+        for task in asyncio.all_tasks():
+            if task.get_name() == f"runner-disconnect-grace-{runner_id}":
+                task.cancel()
+        sessions_module._runner_relay_tasks.pop(session_id, None)
+        sessions_module._session_status_cache.pop(session_id, None)
+        sessions_module._intentional_stop_sessions.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_isolated_session_status_cache")
 @pytest.mark.parametrize("foreign_write", [True, False])
 async def test_runner_disconnect_grace_spares_runner_live_on_another_replica(
     tunnel_three_layer_stack: _TunnelStack,

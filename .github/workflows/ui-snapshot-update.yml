@@ -83,7 +83,7 @@ jobs:
       # The pinned Playwright image doesn't ship Node, so install Node before
       # the pnpm action (pnpm/action-setup's self-installer needs a Node binary).
       - name: Set up Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
 
@@ -99,7 +99,7 @@ jobs:
           enable-cache: true
 
       - name: Cache virtualenv
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .venv
           # Namespaced + container-scoped to match ui-snapshot.yml (built with

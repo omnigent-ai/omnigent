@@ -256,10 +256,10 @@ def _resolve_base_ref(root: Path = _REPO_ROOT) -> str:
     _die(f"could not resolve a base ref (origin/main, main, HEAD) in {_REPO_ROOT}")
 
 
-def _unique_branch(slug: str, root: Path = _REPO_ROOT) -> str:
-    """Return ``fix/<slug>`` (or ``fix/<slug>-2``, …) not yet used locally."""
+def _unique_branch(slug: str, root: Path = _REPO_ROOT, prefix: str = "fix") -> str:
+    """Return ``<prefix>/<slug>`` (or ``<prefix>/<slug>-2``, …) not yet used locally."""
     existing = set(_git("branch", "--format=%(refname:short)", cwd=root).split())
-    base = f"fix/{slug}"
+    base = f"{prefix}/{slug}"
     if base not in existing:
         return base
     n = 2

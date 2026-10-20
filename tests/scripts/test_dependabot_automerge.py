@@ -62,6 +62,10 @@ def api():
     }
     routes = {
         f"{PREFIX}/pulls/123": pull,
+        f"{PREFIX}/compare/{BASE}...{HEAD}": {"merge_base_commit": {"sha": BASE}},
+        f"{PREFIX}/commits/{HEAD}/statuses?per_page=100&page=1": [
+            {"id": 1, "context": "Merge Ready", "state": "success"}
+        ],
         f"{PREFIX}/pulls/123/files?per_page=100&page=1": [
             {"filename": "uv.lock", "status": "modified"}
         ],
@@ -83,6 +87,7 @@ def api():
         }
     for name in (
         "Security Scan",
+        "Maintainer Approval",
         "Trivy CVE Scan (repository)",
         "Trivy CVE Scan (dev-tools)",
         "Pre-commit checks",
@@ -104,6 +109,9 @@ def api():
                 }
             ],
         }
+    workflow_jobs = json.loads((ROOT / ".github/dependabot-automerge.json").read_text())[
+        "workflow_test_jobs"
+    ]
     for run_id, workflow in enumerate(
         (
             "trivy.yml",
@@ -117,6 +125,12 @@ def api():
         ),
         start=11,
     ):
+        routes[f"{PREFIX}/actions/runs/{run_id}/jobs?per_page=100&page=1"] = {
+            "jobs": [
+                {"name": name.replace("*", "1/1"), "conclusion": "success"}
+                for name in workflow_jobs[workflow]
+            ]
+        }
         routes[
             f"{PREFIX}/actions/workflows/{workflow}/runs?head_sha={HEAD}&event=pull_request&per_page=100"
         ] = {
@@ -192,6 +206,9 @@ elif args[:2] == ['pr', 'merge']:
     assert args == ['pr', 'merge', '123', '--repo', 'example/project',
                     '--squash', '--match-head-commit', 'a' * 40]
     sys.exit(data.get('merge_exit', 0))
+elif args[:3] == ['api', '--method', 'POST']:
+    assert os.environ['GH_TOKEN'] == 'test-merge-token'
+    assert args[3].endswith(('/rerun-failed-jobs', '/rerun'))
 elif args[0] == 'api':
     assert os.environ['GH_TOKEN'] == 'test-only'
     endpoint = args[1]
@@ -302,24 +319,17 @@ def test_merge_uses_exact_head_after_completed_reports(tmp_path, api):
     assert "Merged after policy" in process.stdout
 
 
-@pytest.mark.parametrize("candidate", ["eligible", "held", "not_evaluated"])
-def test_security_workflow_step_emits_the_policy_decision(tmp_path, api, candidate):
-    eligible = ""
-    if candidate != "not_evaluated":
-        if candidate == "held":
-            api["routes"][f"{PREFIX}/pulls/123"]["labels"] = [{"name": "hold-automerge"}]
-        process, calls = run_cli(tmp_path, api, mode="merge", scan=True)
-        assert process.returncode == 0, process.stdout + process.stderr
-        eligible = "true" if candidate == "eligible" else "false"
-        assert (tmp_path / "outputs").read_text() == f"eligible={eligible}\n"
-        assert not any(call[:2] == ["pr", "merge"] for call in calls)
-
+@pytest.mark.parametrize("dependabot", ["true", "false", ""])
+def test_security_audit_does_not_gate_dependabot_ci_on_baseline(tmp_path, dependabot):
     workflow = yaml.safe_load((ROOT / ".github/workflows/security-scan.yml").read_text())
     audit = next(
         s for s in workflow["jobs"]["scan"]["steps"] if s["name"] == "OSV advisory scan (uv.lock)"
     )
     assert audit["if"] == "${{ steps.gate.outputs.scan == 'true' }}"
-    assert audit["env"]["DEPENDABOT_ELIGIBLE"] == "${{ steps.dependabot.outputs.eligible }}"
+    identity = audit["env"]["DEPENDABOT_PR"]
+    assert "user.login == 'dependabot[bot]'" in identity
+    assert "user.type == 'Bot'" in identity
+    assert "head.repo.full_name == github.repository" in identity
     (tmp_path / "changed.txt").write_text("uv.lock\n")
     for name, command in (
         ("uv", "printf 'ruff==0.15.2\\n'"),
@@ -337,7 +347,7 @@ def test_security_workflow_step_emits_the_policy_decision(tmp_path, api, candida
             os.environ,
             PATH=f"{tmp_path}{os.pathsep}{os.environ['PATH']}",
             GITHUB_WORKSPACE=str(tmp_path),
-            DEPENDABOT_ELIGIBLE=eligible,
+            DEPENDABOT_PR=dependabot,
         ),
         text=True,
         capture_output=True,
@@ -345,9 +355,9 @@ def test_security_workflow_step_emits_the_policy_decision(tmp_path, api, candida
     )
     assert process.returncode == 0, process.stdout + process.stderr
     audit_calls = tmp_path / "audit-calls"
-    if candidate == "eligible":
+    if dependabot == "true":
         assert not audit_calls.exists()
-        assert "Trivy policy is enforced by the merge worker" in process.stdout
+        assert "Trivy findings are checked by the merge worker or a maintainer" in process.stdout
     else:
         assert audit_calls.read_text().splitlines() == [
             f"pip-audit --requirement {tmp_path}/uv-req.txt --no-deps",
@@ -796,7 +806,7 @@ def test_expanded_updates_use_production_entry_points(tmp_path, expanded_update,
         assert "policy satisfied" in process.stdout
     else:
         output = (tmp_path / "outputs").read_text()
-        assert "eligible=true" in output
+        assert "eligible=" not in output
         assert ("workflow_pins=true" in output) == (ecosystem == "github-actions")
         if ecosystem == "github-actions":
             changed = tmp_path / "changed.txt"
@@ -1030,4 +1040,222 @@ def test_action_and_hook_advisories_block_unattended_merge(tmp_path, expanded_up
     process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
     assert process.returncode == 0, process.stderr
     assert "GHSA-test" in process.stdout
+    assert not any(call[:2] == ["pr", "merge"] for call in calls)
+
+
+def test_policy_reads_merge_base_while_preserving_tip_race_check(tmp_path, api):
+    tip = "c" * 40
+    api["routes"][f"{PREFIX}/pulls/123"]["base"]["sha"] = tip
+    api["routes"][f"{PREFIX}/compare/{tip}...{HEAD}"] = {"merge_base_commit": {"sha": BASE}}
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert calls[-1][:2] == ["pr", "merge"], process.stdout
+    assert ["api", f"{PREFIX}/git/trees/{tip}"] not in calls
+    assert ["api", f"{PREFIX}/git/trees/{BASE}"] in calls
+
+
+@pytest.mark.parametrize("expanded_update", ["npm"], indirect=True)
+@pytest.mark.parametrize("consumer", ["none", "workspace", "transitive", "alias", "optional"])
+def test_npm_prunes_only_unreachable_entries(tmp_path, expanded_update, consumer):
+    _ecosystem, api = expanded_update
+    files = api["files"]
+    locks = [yaml.safe_load(text) for text in files["pnpm-lock.yaml"]]
+    locks[0]["packages"]["marked@18.0.6"] = {"resolution": {"integrity": "sha512-unused"}}
+    locks[0]["snapshots"]["marked@18.0.6"] = {}
+    if consumer in {"workspace", "alias"}:
+        for lock in locks:
+            name, pin = (
+                ("old-marked", "marked@18.0.6") if consumer == "alias" else ("marked", "18.0.6")
+            )
+            lock["importers"]["another-workspace"] = {
+                "dependencies": {name: {"specifier": "^18.0.6", "version": pin}}
+            }
+    elif consumer in {"transitive", "optional"}:
+        for lock, pin in zip(locks, ["2.1.0", "2.1.1"], strict=True):
+            section = "optionalDependencies" if consumer == "optional" else "dependencies"
+            lock["snapshots"][f"clsx@{pin}"] = {section: {"marked": "18.0.6"}}
+    files["pnpm-lock.yaml"] = tuple(yaml.safe_dump(lock) for lock in locks)
+    set_changed_files(api, files)
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert any(call[:2] == ["pr", "merge"] for call in calls) == (consumer == "none"), (
+        process.stdout
+    )
+
+
+@pytest.mark.parametrize("expanded_update", ["github-actions"], indirect=True)
+@pytest.mark.parametrize("fault", [None, "major", "young", "untested", "command", "fork"])
+def test_scan_pin_exception_is_separate_from_merge_authorization(tmp_path, expanded_update, fault):
+    _ecosystem, api = expanded_update
+    files = api["files"]
+    old, new = files[".github/workflows/ci.yml"]
+    if fault == "major":
+        new = new.replace("v4.2.0", "v5.0.0")
+        api["routes"]["repos/actions/checkout/tags?per_page=100&page=1"][1]["name"] = "v5.0.0"
+        api["routes"]["repos/actions/checkout/releases/tags/v5.0.0"] = api["routes"][
+            "repos/actions/checkout/releases/tags/v4.2.0"
+        ]
+    elif fault == "young":
+        api["routes"]["repos/actions/checkout/releases/tags/v4.2.0"]["published_at"] = (
+            datetime.now(UTC).isoformat()
+        )
+    elif fault == "command":
+        new += "      - run: echo unexpected\n"
+    path = ".github/workflows/release.yml" if fault == "untested" else ".github/workflows/ci.yml"
+    set_changed_files(api, {path: (old, new)})
+    if fault == "fork":
+        api["routes"][f"{PREFIX}/pulls/123"]["head"]["repo"]["full_name"] = "fork/project"
+    scan_dir, merge_dir = tmp_path / "scan", tmp_path / "merge"
+    scan_dir.mkdir()
+    merge_dir.mkdir()
+    process, _ = run_cli(scan_dir, api, mode="report", scan=True)
+    assert process.returncode == 0, process.stderr
+    permitted = fault not in {"command", "fork"}
+    assert (scan_dir / "outputs").read_text() == f"workflow_pins={str(permitted).lower()}\n"
+    process, calls = run_cli(merge_dir, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert any(call[:2] == ["pr", "merge"] for call in calls) == (fault is None), process.stdout
+
+
+@pytest.mark.parametrize("expanded_update", ["github-actions"], indirect=True)
+@pytest.mark.parametrize("action", ["e2e-run", "integration-run", "setup-uv"])
+def test_local_action_updates_require_executed_consumer_jobs(tmp_path, expanded_update, action):
+    _ecosystem, api = expanded_update
+    old, new = api["files"][".github/workflows/ci.yml"]
+    set_changed_files(api, {f".github/actions/{action}/action.yml": (old, new)})
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert calls[-1][:2] == ["pr", "merge"], process.stdout
+    policy = json.loads((ROOT / ".github/dependabot-automerge.json").read_text())
+    workflow = policy["action_test_paths"][f".github/actions/{action}/action.yml"]
+    run = api["routes"][
+        f"{PREFIX}/actions/workflows/{workflow}/runs?head_sha={HEAD}&event=pull_request&per_page=100"
+    ]["workflow_runs"][0]
+    for job in api["routes"][f"{PREFIX}/actions/runs/{run['id']}/jobs?per_page=100&page=1"][
+        "jobs"
+    ]:
+        job["conclusion"] = "skipped"
+    blocked = tmp_path / "skipped"
+    blocked.mkdir()
+    process, calls = run_cli(blocked, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert not any(call[:2] == ["pr", "merge"] for call in calls), process.stdout
+
+
+@pytest.mark.parametrize("newest", ["label", "failure", "pending", "missing_jobs"])
+def test_skipped_label_run_does_not_hide_real_e2e_result(tmp_path, api, newest):
+    runs = api["routes"][
+        f"{PREFIX}/actions/workflows/e2e.yml/runs?head_sha={HEAD}&event=pull_request&per_page=100"
+    ]["workflow_runs"]
+    runs.append(dict(runs[0], id=80))
+    jobs = [{"name": "gate / Security Gate", "conclusion": "skipped"}]
+    if newest == "failure":
+        runs[-1].update(conclusion="failure", run_attempt=1)
+        jobs = [{"name": "E2E Tests (shard 1/1)", "conclusion": "failure"}]
+    elif newest == "pending":
+        runs[-1].update(status="in_progress", conclusion=None)
+    elif newest == "missing_jobs":
+        jobs = []
+    api["routes"][f"{PREFIX}/actions/runs/80/jobs?per_page=100&page=1"] = {"jobs": jobs}
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert any(call[:2] == ["pr", "merge"] for call in calls) == (newest == "label"), (
+        process.stdout
+    )
+
+
+@pytest.mark.parametrize(
+    "condition", ["eligible", "report", "held", "pending", "limit", "wrong_workflow"]
+)
+def test_worker_refreshes_stale_approval_without_merging(tmp_path, api, condition):
+    check = api["routes"]["Maintainer Approval"]["check_runs"][0]
+    check.update(
+        conclusion="failure", details_url=f"https://github.com/{REPO}/actions/runs/90/job/91"
+    )
+    run = {
+        "path": ".github/workflows/maintainer-approval.yml",
+        "event": "pull_request_target",
+        "status": "completed",
+        "conclusion": "failure",
+        "run_attempt": 1,
+    }
+    api["routes"][f"{PREFIX}/actions/runs/90"] = run
+    if condition == "held":
+        api["routes"][f"{PREFIX}/pulls/123"]["labels"] = [{"name": "hold-automerge"}]
+    elif condition == "pending":
+        check.update(status="in_progress", conclusion=None)
+    elif condition == "limit":
+        run["run_attempt"] = 3
+    elif condition == "wrong_workflow":
+        run["path"] = ".github/workflows/release.yml"
+    process, calls = run_cli(
+        tmp_path, api, mode="report" if condition == "report" else "merge", sweep=True
+    )
+    assert process.returncode == 0, process.stderr
+    posts = [call for call in calls if call[:3] == ["api", "--method", "POST"]]
+    assert posts == (
+        [["api", "--method", "POST", f"{PREFIX}/actions/runs/90/rerun-failed-jobs"]]
+        if condition == "eligible"
+        else []
+    ), process.stdout
+    assert not any(call[:2] == ["pr", "merge"] for call in calls)
+    if condition == "eligible":
+        check["conclusion"] = "success"
+        followup = tmp_path / "next-sweep"
+        followup.mkdir()
+        process, calls = run_cli(followup, api, mode="merge", sweep=True)
+        assert calls[-1][:2] == ["pr", "merge"], process.stdout
+
+
+@pytest.mark.parametrize("condition", ["gate", "test", "scan_red", "report", "limit"])
+def test_worker_only_recovers_ci_blocked_by_a_now_green_scan(tmp_path, api, condition):
+    run = api["routes"][
+        f"{PREFIX}/actions/workflows/ci.yml/runs?head_sha={HEAD}&event=pull_request&per_page=100"
+    ]["workflow_runs"][0]
+    run.update(conclusion="failure", run_attempt=3 if condition == "limit" else 1)
+    jobs = api["routes"][f"{PREFIX}/actions/runs/{run['id']}/jobs?per_page=100&page=1"]["jobs"]
+    jobs[0]["conclusion"] = "failure" if condition == "test" else "skipped"
+    jobs.append({"name": "gate / Security Gate", "conclusion": "failure"})
+    if condition == "scan_red":
+        api["routes"]["Security Scan"]["check_runs"][0]["conclusion"] = "failure"
+    process, calls = run_cli(
+        tmp_path, api, mode="report" if condition == "report" else "merge", sweep=True
+    )
+    assert process.returncode == 0, process.stderr
+    posts = [call for call in calls if call[:3] == ["api", "--method", "POST"]]
+    assert posts == (
+        [["api", "--method", "POST", f"{PREFIX}/actions/runs/{run['id']}/rerun"]]
+        if condition == "gate"
+        else []
+    ), process.stdout
+    assert not any(call[:2] == ["pr", "merge"] for call in calls)
+
+
+@pytest.mark.parametrize("state", ["missing", "pending", "failure"])
+def test_merge_ready_is_a_commit_status_not_a_job_check(tmp_path, api, state):
+    statuses = api["routes"][f"{PREFIX}/commits/{HEAD}/statuses?per_page=100&page=1"]
+    if state == "missing":
+        statuses.clear()
+    else:
+        statuses.append({"id": 2, "context": "Merge Ready", "state": state})
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert "Waiting for successful Merge Ready status" in process.stdout
+    assert not any(call[:2] == ["pr", "merge"] for call in calls)
+
+
+def test_report_mode_checks_advisories_without_automatic_approval(tmp_path, api):
+    del api["routes"]["Maintainer Approval"]
+    api["report"]["Results"][0]["Vulnerabilities"].append(
+        {
+            "PkgName": "ruff",
+            "InstalledVersion": "0.15.2",
+            "Severity": "HIGH",
+            "VulnerabilityID": "CVE-changed-version",
+        }
+    )
+    process, calls = run_cli(tmp_path, api, mode="report", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert "CVE-changed-version requires human review" in process.stdout
+    assert not any(call[:3] == ["api", "--method", "POST"] for call in calls)
     assert not any(call[:2] == ["pr", "merge"] for call in calls)

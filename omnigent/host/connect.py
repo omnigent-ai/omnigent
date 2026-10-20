@@ -45,6 +45,7 @@ from omnigent.debug_logging import (
     PRIMARY_SESSION_ID_ENV_VAR,
     USER_ID_ENV_VAR,
     debug_event,
+    publish_origin_identity,
     runner_log_scope,
 )
 from omnigent.errors import (
@@ -62,6 +63,7 @@ from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_CAPABILITIES,
+    RUNNER_LOG_TAIL_HEADING,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -393,7 +395,7 @@ def _runner_exit_error(exit_code: int | None, log_path: Path) -> str:
     tail = _read_log_tail(log_path)
     if tail.strip():
         lines = tail.strip().splitlines()[-_LOG_TAIL_MAX_LINES:]
-        message += "\n--- runner log tail ---\n" + _redact_log_tail("\n".join(lines))
+        message += f"\n{RUNNER_LOG_TAIL_HEADING}\n" + _redact_log_tail("\n".join(lines))
     return message
 
 
@@ -778,6 +780,7 @@ _BASE_HARNESS_CREDENTIAL_ENV_VARS: frozenset[str] = frozenset(
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "GEMINI_API_KEY",
+        "GOOGLE_GEMINI_BASE_URL",
         "GIT_TOKEN",
         "GIT_USERNAME",
     }
@@ -1209,20 +1212,11 @@ class HostProcess:
         # to OMNIGENT_USER_ID so host/runner debug-log rows carry it. None until
         # resolved, or on a single-user server / managed host where it is absent.
         self._owner_user_id: str | None = None
-        # The fronting Databricks workspace id for this server, resolved once from
-        # the server URL (its ?o= selector or the stored login record) — the same
-        # resolution the display URL uses, no extra network. Published to
+        # The fronting Databricks workspace id for this server, published to
         # DATABRICKS_WORKSPACE_ID for the host's own debug-log rows and injected
         # into every runner this host spawns; None on a non-Databricks server.
-        self._origin_workspace_id: str | None = None
-        try:
-            from omnigent.util.server_url import ServerUrl
-
-            self._origin_workspace_id = ServerUrl.from_api_base(self._server_url).org_id
-        except Exception:  # noqa: BLE001 — attribution is best-effort
-            self._origin_workspace_id = None
-        if self._origin_workspace_id:
-            os.environ[ORIGIN_WORKSPACE_ID_ENV_VAR] = self._origin_workspace_id
+        # run_host_process already resolved it, so this is a cache hit there.
+        self._origin_workspace_id: str | None = publish_origin_identity(self._server_url)
         # Set on the first accepted WS upgrade. Distinguishes a host that
         # never authenticated (login redirects / 401 / 403 turn fatal) from a
         # live host hit by a transient failure — a server restart or a dropped
@@ -5097,6 +5091,8 @@ def _generate_ucode_configs() -> None:
     the runner never has to fall back to a synchronous on-demand ``ucode
     configure`` when opencode first launches — the slow path for opencode startup.
     """
+    import configparser
+
     from omnigent.host.databricks_credential import (
         HOST_DATABRICKS_PROFILE,
         broker_token_command,
@@ -5106,7 +5102,14 @@ def _generate_ucode_configs() -> None:
     from omnigent.onboarding.provider_config import load_config
     from omnigent.onboarding.ucode_setup import configure_ucode_for_sandbox
 
-    workspace = _read_databrickscfg_host(HOST_DATABRICKS_PROFILE)
+    try:
+        workspace = _read_databrickscfg_host(HOST_DATABRICKS_PROFILE)
+    except (configparser.Error, OSError, UnicodeError):
+        _logger.warning(
+            "Skipping managed gateway configuration: repair the Databricks profile file, "
+            "then run omni setup."
+        )
+        return
     if not workspace:
         return
     bearer_command = broker_token_command(workspace)
@@ -5182,6 +5185,8 @@ def run_host_process(
         loopback server that is gone). The actionable cause is printed
         to stderr first.
     """
+    # Before any startup work logs, so its earliest debug-log rows are attributed.
+    publish_origin_identity(server_url)
     host_log_path = configure_process_logging(
         "host",
         log_to_stderr=should_log_to_stderr() or sys.stderr.isatty(),

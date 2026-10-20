@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fnmatch
 import io
 import json
 import os
+import re
 import subprocess
 import zipfile
 import zlib
@@ -17,13 +19,18 @@ from urllib.parse import urlencode
 
 from dependabot_policy import (
     NeedsReview,
+    action_changes,
     evaluate_changes,
     require,
 )
 from maintainer_approval import gh_json, latest_decisive_reviews, paginated
 
 POLICY = Path(__file__).resolve().parents[1] / "dependabot-automerge.json"
-REPORT_CHECKS = ("Security Scan", "Trivy CVE Scan (repository)", "Trivy CVE Scan (dev-tools)")
+REPORT_CHECKS = (
+    "Security Scan",
+    "Trivy CVE Scan (repository)",
+    "Trivy CVE Scan (dev-tools)",
+)
 
 
 @cache
@@ -49,7 +56,9 @@ def read_file(repository: str, sha: str, path: str) -> str:
     return base64.b64decode(blob["content"]).decode()
 
 
-def evaluate(repository: str, number: int, expected_head: str | None = None) -> dict:
+def evaluate(
+    repository: str, number: int, expected_head: str | None = None, *, for_scan: bool = False
+) -> dict:
     pull = gh_json(["api", f"repos/{repository}/pulls/{number}"])
     require(pull["state"] == "open" and not pull["draft"], "PR is closed or draft")
     require(
@@ -57,12 +66,12 @@ def evaluate(repository: str, number: int, expected_head: str | None = None) -> 
         "Not a Dependabot PR",
     )
     require(pull["head"]["repo"]["full_name"] == repository, "Fork PR requires review")
-    require(pull["base"]["ref"] == "main", "Only main is covered by the pilot")
+    require(pull["base"]["ref"] == "main", "Only main is covered by auto-merge")
     head, base = pull["head"]["sha"], pull["base"]["sha"]
     require(expected_head is None or head == expected_head, "PR head changed during evaluation")
     labels = {label["name"] for label in pull["labels"]}
     require(
-        not labels & {"hold-automerge", "skip-security-scan"},
+        for_scan or not labels & {"hold-automerge", "skip-security-scan"},
         "A hold or scan-waiver label is present",
     )
     files = paginated(f"repos/{repository}/pulls/{number}/files")
@@ -75,16 +84,26 @@ def evaluate(repository: str, number: int, expected_head: str | None = None) -> 
     )
     reviews = paginated(f"repos/{repository}/pulls/{number}/reviews")
     require(
-        all(r["state"] != "CHANGES_REQUESTED" for r in latest_decisive_reviews(reviews).values()),
+        for_scan
+        or all(
+            r["state"] != "CHANGES_REQUESTED" for r in latest_decisive_reviews(reviews).values()
+        ),
         "A reviewer has requested changes",
     )
     policy = json.loads(POLICY.read_text())
+    comparison = gh_json(["api", f"repos/{repository}/compare/{base}...{head}"])
+    merge_base = comparison["merge_base_commit"]["sha"]
 
     @cache
     def read(path):
-        return read_file(repository, base, path), read_file(repository, head, path)
+        return read_file(repository, merge_base, path), read_file(repository, head, path)
 
-    decision = evaluate_changes(read, {f["filename"] for f in files}, policy)
+    paths = {f["filename"] for f in files}
+    decision = (
+        action_changes(read, paths, policy, for_scan=True)
+        if for_scan
+        else evaluate_changes(read, paths, policy)
+    )
     return dict(decision, head=head, base=base)
 
 
@@ -108,16 +127,66 @@ def require_advisory_policy(
     require(set(packages) <= inventory, "Trivy did not inventory every changed package")
 
 
+def latest_check(repository: str, head: str, name: str) -> dict:
+    # Filter server-side; large CI matrices fill the first page.
+    query = urlencode({"check_name": name, "per_page": 100})
+    response = gh_json(["api", f"repos/{repository}/commits/{head}/check-runs?{query}"])
+    require(response["total_count"] <= 100, f"Too many {name} checks to evaluate")
+    runs = [run for run in response["check_runs"] if run["app"]["slug"] == "github-actions"]
+    require(bool(runs), f"Waiting for {name}")
+    return max(runs, key=lambda run: run["id"])
+
+
+def require_approval(repository: str, candidate: dict, mode: str) -> None:
+    if mode != "merge":
+        return
+    check = latest_check(repository, candidate["head"], "Maintainer Approval")
+    require(check["status"] == "completed", "Waiting for Maintainer Approval")
+    if check["conclusion"] == "success":
+        return
+    require(check["conclusion"] == "failure", "Maintainer Approval needs human intervention")
+    match = re.fullmatch(
+        rf"https://github.com/{re.escape(repository)}/actions/runs/(\d+)/job/\d+",
+        check.get("details_url", ""),
+    )
+    require(match is not None, "Cannot identify Maintainer Approval workflow run")
+    run_id = match[1]
+    run = gh_json(["api", f"repos/{repository}/actions/runs/{run_id}"])
+    require(
+        run["path"] == ".github/workflows/maintainer-approval.yml"
+        and run["event"] == "pull_request_target"
+        and run["status"] == "completed"
+        and run["conclusion"] == "failure",
+        "Approval workflow cannot be refreshed",
+    )
+    require(run["run_attempt"] < 3, "Approval refresh retry limit reached; inspect the run")
+    # Cooldown expiry and mode changes do not generate a new PR event.
+    subprocess.run(
+        [
+            "gh",
+            "api",
+            "--method",
+            "POST",
+            f"repos/{repository}/actions/runs/{run_id}/rerun-failed-jobs",
+        ],
+        check=True,
+        env=dict(os.environ, GH_TOKEN=os.environ["DEPENDABOT_MERGE_TOKEN"]),
+    )
+    raise NeedsReview("Refreshed Maintainer Approval; waiting for the next sweep")
+
+
 def require_reports(repository: str, candidate: dict) -> None:
     head = candidate["head"]
+    # Merge Ready is a commit status, unlike the workflow job check runs.
+    statuses = paginated(f"repos/{repository}/commits/{head}/statuses")
+    merge_ready = [status for status in statuses if status["context"] == "Merge Ready"]
+    require(
+        bool(merge_ready)
+        and max(merge_ready, key=lambda status: status["id"])["state"] == "success",
+        "Waiting for successful Merge Ready status",
+    )
     for name in (*REPORT_CHECKS, *candidate["checks"]):
-        # Filter server-side before pagination; large CI matrices fill the first page.
-        query = urlencode({"check_name": name, "per_page": 100})
-        response = gh_json(["api", f"repos/{repository}/commits/{head}/check-runs?{query}"])
-        require(response["total_count"] <= 100, f"Too many {name} checks to evaluate")
-        runs = [run for run in response["check_runs"] if run["app"]["slug"] == "github-actions"]
-        require(bool(runs), f"Waiting for {name}")
-        latest = max(runs, key=lambda run: run["id"])
+        latest = latest_check(repository, head, name)
         require(
             latest["status"] == "completed" and latest["conclusion"] == "success",
             f"Waiting for successful {name}",
@@ -126,19 +195,20 @@ def require_reports(repository: str, candidate: dict) -> None:
     # path-filtered check as skippable while its workflow is being created.
     completed_runs = {}
     for workflow in sorted(set(candidate["workflows"]) | {"ci.yml", "lint.yml", "trivy.yml"}):
-        query = urlencode({"head_sha": head, "event": "pull_request", "per_page": 100})
-        response = gh_json(
-            ["api", f"repos/{repository}/actions/workflows/{workflow}/runs?{query}"]
-        )
-        runs = response["workflow_runs"]
-        require(bool(runs), f"No {workflow} run for this head")
-        latest = max(runs, key=lambda run: run["id"])
+        latest, jobs = latest_workflow(repository, head, workflow)
         require(
             latest["head_sha"] == head
             and latest["status"] == "completed"
             and latest["conclusion"] == "success",
             f"Latest {workflow} run did not succeed",
         )
+        required_jobs = json.loads(POLICY.read_text())["workflow_test_jobs"][workflow]
+        for pattern in required_jobs:
+            matching = [job for job in jobs if fnmatch.fnmatchcase(job["name"], pattern)]
+            require(
+                bool(matching) and all(job["conclusion"] == "success" for job in matching),
+                f"{workflow}: waiting for successful {pattern} jobs",
+            )
         completed_runs[workflow] = latest
     if not candidate["target"]:
         ecosystem = "actions" if candidate["ecosystem"] == "github-actions" else "pip"
@@ -184,6 +254,63 @@ def require_reports(repository: str, candidate: dict) -> None:
         raise NeedsReview(f"Trivy repository report is unreadable: {exc}") from exc
 
 
+def latest_workflow(repository: str, head: str, workflow: str) -> tuple[dict, list[dict]]:
+    query = urlencode({"head_sha": head, "event": "pull_request", "per_page": 100})
+    response = gh_json(["api", f"repos/{repository}/actions/workflows/{workflow}/runs?{query}"])
+    for run in sorted(response["workflow_runs"], key=lambda run: run["id"], reverse=True):
+        require(run["head_sha"] == head, "Workflow head does not match the candidate")
+        jobs = paginated(
+            f"repos/{repository}/actions/runs/{run['id']}/jobs",
+            request=lambda args: gh_json(args)["jobs"],
+        )
+        if (
+            workflow == "e2e.yml"
+            and run["status"] == "completed"
+            and run["conclusion"] in {"success", "skipped"}
+            and jobs
+            and all(job["conclusion"] == "skipped" for job in jobs)
+        ):
+            continue  # Unrelated label events create an entirely skipped E2E run.
+        return run, jobs
+    raise NeedsReview(f"No executed {workflow} run for this head")
+
+
+def refresh_failed_gates(repository: str, candidate: dict, mode: str) -> None:
+    if mode != "merge":
+        return
+    scan = latest_check(repository, candidate["head"], "Security Scan")
+    require(
+        scan["status"] == "completed" and scan["conclusion"] == "success",
+        "Waiting for successful Security Scan",
+    )
+    refreshed = []
+    for workflow in sorted(set(candidate["workflows"]) | {"ci.yml", "lint.yml", "trivy.yml"}):
+        run, jobs = latest_workflow(repository, candidate["head"], workflow)
+        if run["status"] != "completed" or run["conclusion"] != "failure":
+            continue
+        failed = [job for job in jobs if job["conclusion"] not in {"success", "skipped"}]
+        if not failed or not all(
+            job["name"].endswith("Security Gate") and job["conclusion"] == "failure"
+            for job in failed
+        ):
+            continue
+        require(run["run_attempt"] < 3, f"{workflow}: gate refresh retry limit reached")
+        # Re-run all jobs: the test jobs behind the failed gate were skipped.
+        subprocess.run(
+            [
+                "gh",
+                "api",
+                "--method",
+                "POST",
+                f"repos/{repository}/actions/runs/{run['id']}/rerun",
+            ],
+            check=True,
+            env=dict(os.environ, GH_TOKEN=os.environ["DEPENDABOT_MERGE_TOKEN"]),
+        )
+        refreshed.append(workflow)
+    require(not refreshed, f"Refreshed blocked CI: {', '.join(refreshed)}; waiting for next sweep")
+
+
 def sweep(repository: str, mode: str) -> None:
     if mode == "merge":
         require(
@@ -214,6 +341,8 @@ def sweep(repository: str, mode: str) -> None:
             decision = evaluate(repository, number)
             packages = ", ".join(decision["packages"])
             rows.append(f"- #{number}: eligible ({packages})")
+            require_approval(repository, decision, mode)
+            refresh_failed_gates(repository, decision, mode)
             require_reports(repository, decision)
             if mode == "merge":
                 current = gh_json(["api", f"repos/{repository}/pulls/{number}"])
@@ -271,23 +400,32 @@ def main() -> int:
     parser.add_argument("--repository", required=True)
     parser.add_argument("--pr-number", type=int)
     parser.add_argument("--expected-head")
+    parser.add_argument("--check-action-pins", action="store_true")
     args = parser.parse_args()
     mode = os.environ.get("DEPENDABOT_AUTOMERGE_MODE", "report") or "report"
     require(mode in {"report", "merge"}, "Unknown Dependabot auto-merge mode")
+    if args.check_action_pins and args.pr_number is None:
+        parser.error("--check-action-pins requires --pr-number")
     if args.pr_number is None:
         sweep(args.repository, mode)
         return 0
     try:
-        decision = evaluate(args.repository, args.pr_number, args.expected_head)
+        decision = evaluate(
+            args.repository, args.pr_number, args.expected_head, for_scan=args.check_action_pins
+        )
         print(json.dumps(decision))
         eligible = "true"
     except (KeyError, TypeError, ValueError, OSError, subprocess.CalledProcessError) as exc:
-        print(f"Human review required: {exc}")
+        prefix = "No workflow-pin exception" if args.check_action_pins else "Human review required"
+        print(f"{prefix}: {exc}")
         eligible = "false"
     if path := os.environ.get("GITHUB_OUTPUT"):
         with open(path, "a") as output:
-            output.write(f"eligible={eligible}\n")
-            if eligible == "true" and decision["ecosystem"] == "github-actions":
+            if not args.check_action_pins:
+                output.write(f"eligible={eligible}\n")
+            if args.check_action_pins:
+                output.write(f"workflow_pins={eligible}\n")
+            elif eligible == "true" and decision["ecosystem"] == "github-actions":
                 output.write("workflow_pins=true\n")
     return 0
 

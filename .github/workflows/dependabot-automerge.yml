@@ -56,6 +56,8 @@ jobs:
           repositories: omnigent
           permission-contents: write
           permission-pull-requests: write
+          permission-workflows: write
+          permission-actions: write
 
       - name: Evaluate and optionally merge Dependabot upgrades
         env:

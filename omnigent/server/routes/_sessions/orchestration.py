@@ -7815,6 +7815,49 @@ def _owned_by_parent_runtime(conv: Conversation | _RelayStatusSnapshot | None) -
     return conv is not None and is_parent_owned_subagent(conv)
 
 
+def _note_runner_idle_shutdown(runner_id: str, convs: Sequence[Conversation] = ()) -> int:
+    """Mark an idle-shut-down runner's sessions as intentionally stopped.
+
+    The runner's idle watchdog exits only with no active work, so the
+    intentional-stop paths settle these sessions to idle instead of failing
+    them. Relay-bound sessions are found here; *convs* adds stored sessions
+    without a local relay. A session this replica still believes mid-turn is
+    logged: the runner and server disagreed about whether a turn was in flight.
+
+    :param runner_id: Runner that closed with ``RUNNER_IDLE_SHUTDOWN_CLOSE_REASON``.
+    :param convs: Stored sessions bound to the runner.
+    :returns: How many sessions were newly marked.
+    """
+    session_ids = {
+        session_id
+        for session_id, handle in _runner_relay_tasks.items()
+        if handle.runner_id == runner_id
+    }
+    session_ids.update(conv.id for conv in convs if conv.runner_id == runner_id)
+    marked = 0
+    for session_id in sorted(session_ids):
+        if _intentional_stop_sessions.get(session_id) is not None:
+            continue
+        cached = _session_status_cache.get(session_id)
+        if cached in _MID_TURN_STATUSES:
+            _logger.warning(
+                "Runner %s shut down idle while session=%s was %s here; settling it idle",
+                runner_id,
+                session_id,
+                cached,
+                extra=debug_event(
+                    "runner_idle_shutdown_status_mismatch",
+                    session_id=session_id,
+                    turn_id=_session_active_response_cache.get(session_id),
+                    runner_id=runner_id,
+                    cached_session_status=cached,
+                ),
+            )
+        _intentional_stop_sessions[session_id] = runner_id
+        marked += 1
+    return marked
+
+
 async def _runner_disconnect_requires_failure(
     session_id: str,
     conversation_store: ConversationStore,

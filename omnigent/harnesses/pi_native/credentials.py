@@ -1736,6 +1736,9 @@ def resolve_pi_native_provider(
         _LOGGER.warning("pi-native: failed to read provider configuration", exc_info=True)
         return None
     config = load_runtime_inference_config(base_config)
+    selection = _split_pi_native_model_selection(model)
+    if selection is not None:
+        _, model = selection
     binding = binding_for_harness(config, "pi-native")
     if binding is not None:
         entry = resolve_bound_provider(config, "pi-native", auth)
@@ -1780,10 +1783,7 @@ def resolve_pi_native_provider(
             )
         return replace(resolved, inference_bound=True)
 
-    selection = _split_pi_native_model_selection(model)
     unmanaged_prefix_warning: str | None = None
-    if selection is not None:
-        _, model = selection
     try:
         # Pi is multi-family; ``omnigent setup`` marks defaults per family, not
         # for ``pi``. Use the shared house-pattern selection so pi resolves its

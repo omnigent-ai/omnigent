@@ -391,7 +391,7 @@ describe("browserIpc — trust gate", () => {
       "omnigent:browser-cancel-recent-session-switch",
       "omnigent:browser-resize",
       "omnigent:browser-screenshot",
-      "omnigent:browser-execute",
+      "omnigent:browser-perform-action",
       "omnigent:browser-has-view",
       "omnigent:browser-close",
       "omnigent:browser-go-back",
@@ -407,20 +407,29 @@ describe("browserIpc — trust gate", () => {
   });
 
   it("rejects an unpinned sender on the new toolbar handlers", async () => {
-    const { ipcMain, event } = setup({ pinned: false });
+    const { ipcMain, event, wc } = setup({ pinned: false });
     const channels = [
       "omnigent:browser-go-back",
       "omnigent:browser-go-forward",
       "omnigent:browser-reload",
       "omnigent:open-browser-devtools",
+      "omnigent:browser-perform-action",
+      "omnigent:browser-execute",
     ];
     const results = await Promise.all(
-      channels.map((ch) => ipcMain.invoke(ch, event, { conversationId: "conv_1" })),
+      channels.map((ch) =>
+        ipcMain.invoke(ch, event, {
+          conversationId: "conv_1",
+          action: "snapshot",
+          js: require("../src/browserActionScript.mjs").buildBrowserActionScript("snapshot"),
+        }),
+      ),
     );
     results.forEach((r, i) => {
       assert.equal(r.ok, false, `${channels[i]} should be gated`);
       assert.match(r.error, /connected server's page/);
     });
+    assert.deepEqual(wc.scripts, []);
   });
 });
 
@@ -778,6 +787,63 @@ describe("browserIpc — navigation API helpers", () => {
     const cantWc = makeWebContents({ canBack: false, canForward: false });
     assert.equal(goBack(cantWc), false);
     assert.equal(goForward(cantWc), false);
+  });
+});
+
+describe("browserIpc — typed actions", () => {
+  it("accepts an older UI's action templates without executing arbitrary input", async () => {
+    const { ipcMain, event, wc } = setup();
+    for (const { script } of require("./fixtures/browserActions-v0.18.json").requests) {
+      // oxlint-disable-next-line no-await-in-loop -- Exercise each legacy request against the same view.
+      const result = await ipcMain.invoke("omnigent:browser-execute", event, {
+        conversationId: "conv_1",
+        js: script,
+      });
+      assert.equal(result.ok, true, result.error);
+      assert.equal(wc.scripts.at(-1), script);
+    }
+  });
+
+  it("rejects raw scripts and malformed action arguments before execution", async () => {
+    const wc = makeWebContents();
+    const { ipcMain, event } = setup({ webContents: wc });
+    const legacy = await ipcMain.invoke("omnigent:browser-execute", event, {
+      conversationId: "conv_1",
+      js: "1 + 1",
+    });
+    assert.equal(legacy.ok, false);
+    for (const input of [
+      { action: "evaluate", params: { js: "1 + 1" } },
+      { action: "click", params: { ref: "7" } },
+      { action: "snapshot", params: { js: "1 + 1" } },
+      { action: "type", params: { selector: "input", text: {} } },
+    ]) {
+      // oxlint-disable-next-line no-await-in-loop -- Assert each rejected request leaves the view untouched.
+      const result = await ipcMain.invoke("omnigent:browser-perform-action", event, {
+        conversationId: "conv_1",
+        ...input,
+      });
+      assert.equal(result.ok, false);
+    }
+    assert.equal(wc.scripts.length, 0);
+  });
+
+  it("executes a fixed action without synthetic user activation", async () => {
+    const wc = makeWebContents();
+    const calls = [];
+    wc.executeJavaScript = async (...args) => {
+      calls.push(args);
+      return "ok";
+    };
+    const { ipcMain, event } = setup({ webContents: wc });
+    const result = await ipcMain.invoke("omnigent:browser-perform-action", event, {
+      conversationId: "conv_1",
+      action: "click",
+      params: { selector: "button" },
+    });
+    assert.deepEqual(result, { ok: true, result: "ok" });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0][1], false);
   });
 });
 

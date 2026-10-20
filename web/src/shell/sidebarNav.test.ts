@@ -738,6 +738,14 @@ describe("groupConversations", () => {
       ["Done", ["b"]],
     ]);
   });
+
+  it("retains an empty Working group in status order", () => {
+    const done = conversation("done", "Done", new Date(2026, 0, 1));
+    expect(groupConversations([done], () => "Done", STATUS_BUCKETS, "Working")).toEqual([
+      { title: "Working", conversations: [] },
+      { title: "Done", conversations: [done] },
+    ]);
+  });
 });
 
 describe("sessionsListAcceptsDrop", () => {

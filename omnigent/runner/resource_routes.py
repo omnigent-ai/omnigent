@@ -1543,7 +1543,7 @@ def register_resource_routes(
         )
         fs = CallerProcessFilesystem(env)
         result = await fs.delete(relative_path, recursive=recursive)
-        if filesystem_registry is not None and result.type == "file":
+        if filesystem_registry is not None and result.type in ("file", "symlink"):
             filesystem_registry.record_change(relative_path, "deleted", session_id)
         return JSONResponse(
             status_code=200,

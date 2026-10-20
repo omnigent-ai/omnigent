@@ -1394,10 +1394,11 @@ def _exit_without_teardown(code: int) -> NoReturn:
 
     Claude Code blocks on the policy hook until its process exits, and tearing
     down the modules it imported costs tens of milliseconds on every tool call.
-    This joins non-daemon threads, then runs the ``threading`` and ``atexit``
-    exit callbacks, in the interpreter's own order (as CPython 3.13's forked
-    multiprocessing children do), so pending writes and exit work still finish.
-    Only object finalizers that run during module teardown are skipped.
+    This runs the ``threading`` exit callbacks and joins non-daemon threads,
+    then runs the ``atexit`` callbacks, in the interpreter's own order (as
+    CPython 3.13's forked multiprocessing children do), so pending writes and
+    exit work still finish. Only object finalizers that run during module
+    teardown are skipped.
 
     :param code: Process exit code, e.g. ``0``.
     """
