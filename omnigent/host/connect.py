@@ -5597,7 +5597,7 @@ def _interpreter_missing(executable: str) -> bool:
     except (FileNotFoundError, NotADirectoryError):
         return True
     except OSError:
-        return False
+        pass
     return False
 
 
