@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseErr
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_APP_SERVER_STOPPED,
     CodexNativeBridgeState,
+    read_bridge_startup_failure,
     read_bridge_state,
     read_codex_config_effort,
     read_codex_config_model,
@@ -2525,6 +2527,227 @@ async def test_cancel_during_connect_closes_the_half_open_client(
 
     assert _HangingClient.closes == 1
     assert _HangingClient.requests == []
+
+
+@contextlib.asynccontextmanager
+async def _silent_app_server(
+    tmp_path: Path,
+    silent_method: str,
+    *,
+    active_turn_id: str | None = None,
+    on_silent: Callable[[], None] | None = None,
+) -> AsyncIterator[list[str]]:
+    """
+    Serve a real app-server peer that stays connected but never answers one method.
+
+    :param tmp_path: Bridge directory, seeded to point at the peer.
+    :param silent_method: Method left unanswered, e.g. ``"initialize"``.
+    :param active_turn_id: Active turn id to seed, or ``None``.
+    :param on_silent: Called when the unanswered request arrives, or ``None``.
+    :returns: The request methods the peer received, in order.
+    """
+    methods: list[str] = []
+    results: dict[str, dict[str, Any]] = {
+        "model/list": {"data": [], "nextCursor": None},
+        "turn/start": {"turn": {"id": "turn_started"}},
+        "turn/steer": {"turnId": "turn_steered"},
+    }
+
+    async def handle(websocket: ServerConnection) -> None:
+        async for raw in websocket:
+            request = json.loads(raw)
+            if "id" not in request:
+                continue
+            methods.append(request["method"])
+            if request["method"] != silent_method:
+                result = results.get(request["method"], {})
+                await websocket.send(json.dumps({"id": request["id"], "result": result}))
+            elif on_silent is not None:
+                on_silent()
+
+    async with serve(handle, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+        state = read_bridge_state(tmp_path)
+        assert state is not None
+        write_bridge_state(tmp_path, replace(state, socket_path=f"ws://127.0.0.1:{port}"))
+        yield methods
+
+
+async def _run_turn_within_deadline(
+    executor: CodexNativeExecutor, content: str, config: ExecutorConfig | None = None
+) -> list[Any]:
+    """
+    Run one turn, failing the test if it outlives a deadline far above the RPC bound.
+
+    :param executor: Native Codex executor under test.
+    :param content: User message content, e.g. ``"synthetic input"``.
+    :param config: Optional per-turn config.
+    :returns: Events yielded by the turn.
+    """
+    async with asyncio.timeout(5.0):
+        return [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": content}], [], "", config
+            )
+        ]
+
+
+def _recorded_stop_code(bridge_dir: Path) -> str | None:
+    """:returns: The code of the bridge's recorded startup failure, if any."""
+    recorded = read_bridge_startup_failure(bridge_dir)
+    return recorded.code if recorded is not None else None
+
+
+@pytest.mark.parametrize("live_injection", [False, True], ids=["run-turn", "live-steer"])
+async def test_unanswered_initialize_fails_fast_and_keeps_input_undelivered(
+    live_injection: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    An app-server that accepts the connection but never answers ``initialize``
+    fails delivery within the RPC bound instead of hanging until the idle watchdog.
+
+    Nothing reached Codex, so the input is reported undelivered, and the
+    app-server's stop record is left in the bridge.
+    """
+    monkeypatch.setattr(codex_native_executor, "_APP_SERVER_RPC_TIMEOUT_SECONDS", 0.2)
+    caplog.set_level(logging.WARNING, logger=codex_native_executor.__name__)
+
+    async with _silent_app_server(
+        tmp_path, "initialize", active_turn_id="turn_existing" if live_injection else None
+    ) as methods:
+        executor = CodexNativeExecutor(bridge_dir=tmp_path)
+        if live_injection:
+            async with asyncio.timeout(5.0):
+                assert await executor.enqueue_session_message("main", "synthetic input") is False
+        else:
+            [failure] = await _run_turn_within_deadline(executor, "synthetic input")
+            assert isinstance(failure, ExecutorError)
+            assert failure.undelivered is True
+            assert failure.code == CODEX_APP_SERVER_STOPPED.code
+
+    assert methods == ["initialize"]
+    assert _recorded_stop_code(tmp_path) == CODEX_APP_SERVER_STOPPED.code
+    [warning] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "codex_app_server_unresponsive"
+    ]
+    assert warning.levelno == logging.WARNING
+    assert warning.attributes["stage"] == "initialize"
+
+
+@pytest.mark.parametrize(
+    ("method", "content", "config"),
+    [
+        ("thread/settings/update", "synthetic input", ExecutorConfig(model="gpt-5.3-codex")),
+        ("thread/goal/set", "/goal synthetic objective", None),
+    ],
+    ids=["settings-update", "goal-set"],
+)
+async def test_unanswered_pre_delivery_rpc_keeps_input_undelivered(
+    method: str,
+    content: str,
+    config: ExecutorConfig | None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A request ahead of ``turn/start`` that goes unanswered never sends the turn."""
+    monkeypatch.setattr(codex_native_executor, "_APP_SERVER_RPC_TIMEOUT_SECONDS", 0.2)
+    caplog.set_level(logging.WARNING, logger=codex_native_executor.__name__)
+
+    async with _silent_app_server(tmp_path, method) as methods:
+        [failure] = await _run_turn_within_deadline(
+            CodexNativeExecutor(bridge_dir=tmp_path), content, config
+        )
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is True
+    assert failure.code == CODEX_APP_SERVER_STOPPED.code
+    assert methods[-1] == method
+    assert "turn/start" not in methods
+    assert _recorded_stop_code(tmp_path) == CODEX_APP_SERVER_STOPPED.code
+    [warning] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "codex_app_server_unresponsive"
+    ]
+    assert warning.attributes["stage"] == method.replace("/", "_")
+
+
+@pytest.mark.parametrize(
+    ("active_turn_id", "method"),
+    [(None, "turn/start"), ("turn_existing", "turn/steer")],
+    ids=["start", "steer"],
+)
+async def test_unanswered_turn_rpc_fails_fast_but_stays_ambiguous(
+    active_turn_id: str | None,
+    method: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    An unanswered ``turn/start`` / ``turn/steer`` fails the turn within the bound,
+    but Codex may already have taken the input, so it is neither marked
+    undelivered nor sent again.
+    """
+    monkeypatch.setattr(codex_native_executor, "_APP_SERVER_RPC_TIMEOUT_SECONDS", 0.2)
+    caplog.set_level(logging.INFO, logger=codex_native_executor.__name__)
+
+    async with _silent_app_server(tmp_path, method, active_turn_id=active_turn_id) as methods:
+        with input_delivery_scope({"input_stable_id": "a" * 32}):
+            [failure] = await _run_turn_within_deadline(
+                CodexNativeExecutor(bridge_dir=tmp_path), "synthetic input"
+            )
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is False
+    assert failure.code is None
+    assert f"stopped responding: no reply to {method}" in failure.message
+    assert methods == ["initialize", method]
+    assert _recorded_stop_code(tmp_path) == CODEX_APP_SERVER_STOPPED.code
+    [finished] = [
+        record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "codex_native_delivery_finished"
+    ]
+    assert finished["outcome"] == "timeout"
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == active_turn_id
+
+
+@pytest.mark.parametrize("method", ["initialize", "turn/start"])
+async def test_unanswered_rpc_after_a_relaunch_does_not_mark_the_new_app_server(
+    method: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    The runner replaces an app-server recorded as stopped, so a request to an old
+    one that times out after a relaunch republished the bridge must not leave a
+    stop record that would make the runner replace the healthy new app-server.
+    """
+    monkeypatch.setattr(codex_native_executor, "_APP_SERVER_RPC_TIMEOUT_SECONDS", 0.2)
+
+    def relaunch() -> None:
+        state = read_bridge_state(tmp_path)
+        assert state is not None
+        write_bridge_state(tmp_path, replace(state, socket_path="ws://127.0.0.1:9"))
+
+    async with _silent_app_server(tmp_path, method, on_silent=relaunch) as methods:
+        [failure] = await _run_turn_within_deadline(
+            CodexNativeExecutor(bridge_dir=tmp_path), "synthetic input"
+        )
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is (method == "initialize")
+    assert methods[-1] == method
+    assert _recorded_stop_code(tmp_path) is None
 
 
 def test_bridge_state_wait_preserves_legacy_and_configured_command_contracts(

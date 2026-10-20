@@ -390,6 +390,22 @@ def codex_native_bridge_dir(session_id: str) -> Path:
     return _AUTO_CODEX_BRIDGE_DIRS.get(session_id) or bridge_dir_for_bridge_id(session_id)
 
 
+def _codex_app_server_recorded_stopped(bridge_dir: Path) -> bool:
+    """Whether the bridge records its app-server as stopped, e.g. alive but no longer answering.
+
+    :param bridge_dir: Bridge directory of the session's Codex launch.
+    :returns: ``True`` only for the ``codex_app_server_stopped`` record, not for
+        other startup causes such as a pending sign-in.
+    """
+    from omnigent.harnesses.codex_native.bridge import (
+        CODEX_APP_SERVER_STOPPED,
+        read_bridge_startup_failure,
+    )
+
+    failure = read_bridge_startup_failure(bridge_dir)
+    return failure is not None and failure.code == CODEX_APP_SERVER_STOPPED.code
+
+
 # Background OpenCode ``opencode serve`` instances for host-spawned
 # opencode-native runners, kept referenced so they aren't garbage-collected
 # mid-run (mirrors ``_AUTO_CODEX_APP_SERVERS``).
@@ -4979,8 +4995,11 @@ async def _auto_create_codex_terminal(
     forwarder = _AUTO_FORWARDER_TASKS.get(session_id)
     bridge_state = read_bridge_state(bridge_dir)
     process = getattr(app_server, "proc", None)
+    # A live app-server the executor found silent is torn down and replaced below.
+    app_server_stopped = app_server is not None and _codex_app_server_recorded_stopped(bridge_dir)
     if (
         app_server is not None
+        and not app_server_stopped
         and process is not None
         and process.returncode is None
         and forwarder is not None
@@ -5008,6 +5027,12 @@ async def _auto_create_codex_terminal(
             agent_spec=agent_spec,
         )
         return launched.view
+    if app_server_stopped:
+        _logger.warning(
+            "Replacing the Codex app-server recorded as stopped for session=%s",
+            session_id,
+            extra=debug_event("codex_app_server_replaced", session_id=session_id),
+        )
     # Route across all offerings: a configured provider (omnigent setup),
     # a Databricks ucode profile from provider config, or Codex's own
     # login — parity with the in-process codex harness and the CLI path.
@@ -7535,8 +7560,9 @@ def _is_runner_owned_codex_terminal(
     would fail fast on the saved startup error until the terminal is recreated.
     Reporting it as not owned makes the ensure close it and launch again,
     which also clears the saved error. A pane whose backend is alive (for
-    example one still waiting on a sign-in prompt) stays reusable. The saved
-    error is read from the bridge directory the session's last launch used.
+    example one still waiting on a sign-in prompt) stays reusable, unless the
+    executor recorded that live app-server as stopped because it stopped answering.
+    The saved error is read from the bridge directory the session's last launch used.
 
     :param resource_registry: Runner resource registry that owns private
         terminal role markers.
@@ -7551,9 +7577,10 @@ def _is_runner_owned_codex_terminal(
         != CODEX_NATIVE_TERMINAL_ROLE
     ):
         return False
+    bridge_dir = codex_native_bridge_dir(resource.session_id)
     if resource.session_id in _AUTO_CODEX_APP_SERVERS:
-        return True
-    return read_bridge_startup_error(codex_native_bridge_dir(resource.session_id)) is None
+        return not _codex_app_server_recorded_stopped(bridge_dir)
+    return read_bridge_startup_error(bridge_dir) is None
 
 
 def _is_runner_owned_antigravity_terminal(
