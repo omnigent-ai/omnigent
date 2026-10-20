@@ -345,6 +345,7 @@ from omnigent.server.routes._sessions.helpers import (
     _routing_decision_item_from_sse,
     _RunnerForwardResult,
     _seed_missing_title_from_user_message,
+    _session_prs_for_display,
     _session_status_from_cache,
     _session_status_with_child_rollup,
     _SessionEventDispatchResult,
@@ -1251,6 +1252,7 @@ def _build_session_list_item(
         workspace=conv.workspace,
         git_branch=conv.git_branch,
         archived=conv.archived,
+        pull_requests=_session_prs_for_display(conv.session_pull_requests),
         comments_count=comments_fingerprint.count if comments_fingerprint else 0,
         comments_updated_at=(
             comments_fingerprint.last_updated_at if comments_fingerprint else None
@@ -1512,6 +1514,8 @@ def _build_session_response(
         archived=conv.archived,
         # Replay the last native Plan after a Server restart.
         todos=conv.session_todos,
+        pull_requests=_session_prs_for_display(conv.session_pull_requests),
+        pull_requests_updated_at_ns=conv.session_pull_requests_updated_at_ns,
         model_options=[
             NativeModelOption.model_validate(option) for option in (model_options or [])
         ],

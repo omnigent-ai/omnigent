@@ -2,7 +2,7 @@
 // the session's runner (through the GitHub panel's query cache), so a bounded
 // queue keeps a large canvas from firing dozens of runner requests at once.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import type { GitProviderDisplay } from "@/lib/gitProviders";
 import type { Conversation } from "@/hooks/useConversations";
@@ -91,7 +91,7 @@ function samePullRequest(
 }
 
 /**
- * The open pull request (if any) for each branch-bearing session in
+ * The associated pull request (if any) for each branch-bearing or tracked session in
  * ``sessions``, refreshed at most every five minutes per session (a failed
  * lookup retries after one minute). Pass a memoized list — the queue is
  * rebuilt whenever it changes, and re-checked on a timer in between.
@@ -122,7 +122,7 @@ export function usePullRequests(sessions: readonly Conversation[]): CanvasPullRe
     const now = Date.now();
     const due = sessions.filter(
       (session) =>
-        Boolean(session.git_branch?.trim()) &&
+        Boolean(session.git_branch?.trim() || session.pull_requests?.length) &&
         now - (checkedAtRef.current[session.id] ?? 0) >= PULL_REQUEST_REFRESH_MS,
     );
     queue.replace(
@@ -145,13 +145,13 @@ export function usePullRequests(sessions: readonly Conversation[]): CanvasPullRe
             throw error;
           }
           if (!aliveRef.current) return;
-          const pr = info.available ? info.pr : null;
+          const pr = (info.available ? info.pr : null) ?? info.prs?.[0];
           const next: CanvasPullRequest | null =
             pr && /^https:\/\//.test(pr.url)
               ? {
                   number: pr.number,
-                  title: pr.title,
-                  state: pr.state,
+                  title: pr.title ?? "",
+                  state: "state" in pr ? pr.state : "",
                   url: pr.url,
                   // The PR's own provider wins over the session's, as in the composer chip.
                   provider: info.prs?.[0]?.provider ?? info.provider,
@@ -169,5 +169,13 @@ export function usePullRequests(sessions: readonly Conversation[]): CanvasPullRe
     return () => queue.clear();
   }, [queryClient, sessions, tick]);
 
-  return pullRequests;
+  return useMemo(() => {
+    const current = { ...pullRequests };
+    for (const session of sessions) {
+      if (!session.git_branch?.trim() && session.pull_requests?.length === 0) {
+        current[session.id] = null;
+      }
+    }
+    return current;
+  }, [pullRequests, sessions]);
 }

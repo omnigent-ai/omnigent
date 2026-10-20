@@ -14,8 +14,8 @@
 // fetches a file's full content (/resources/github/diff/{path}) only when the
 // reader expands unchanged context.
 //
-// Data comes from the runner's read-only PR resource API (see
-// hooks/usePullRequests.ts), which shells out to the provider CLI + `git`.
+// The server reads live PR resources through the runner and retains snapshots
+// for offline viewing (see hooks/usePullRequests.ts).
 // `derivePullRequestPanelState` is the single switch that turns the info query
 // into what the panel shows: an outdated host, a non-git workspace, an
 // unsupported remote, a missing provider CLI, an unresolved upstream repo, or no
@@ -111,6 +111,24 @@ function PanelMessage({ children }: { children: React.ReactNode }) {
   );
 }
 
+function LastSynced({ timestamp }: { timestamp: number | null | undefined }) {
+  if (timestamp == null || !Number.isFinite(timestamp)) return null;
+  const timestampMs = timestamp * 1000;
+  return (
+    <>
+      {" · Last synced "}
+      <time dateTime={new Date(timestampMs).toISOString()}>{absoluteTime(timestampMs)}</time>
+    </>
+  );
+}
+
+function unavailableSnapshotMessage(resource: string, reason: string, message?: string) {
+  if (message) return message;
+  return reason === "too_large"
+    ? `The snapshot for ${resource} was too large to save. Open the PR on its provider.`
+    : `No saved snapshot is available for ${resource}. Open the PR on its provider.`;
+}
+
 /** Full-panel empty state: an icon, a title, optional hint and note lines, and
  *  optional children below (the account/remote selectors). Used for every "no PR
  *  content to show" reason so they read as one family. */
@@ -194,7 +212,7 @@ function GithubAccountSelector({
       <Select
         value={selectedAccount}
         onValueChange={(login) => setPref.mutate({ account: login, pr_url: info.selected_pr_url })}
-        disabled={setPref.isPending}
+        disabled={setPref.isPending || info.reason === "workspace_offline"}
       >
         <SelectTrigger
           aria-label={`${gitProviderCopy(info.provider, info.auth.hint, info.provider_display).label} account`}
@@ -226,6 +244,7 @@ export type PullRequestPanelState =
   | { kind: "loading" }
   | { kind: "runner-offline" }
   | { kind: "sandbox-offline" }
+  | { kind: "workspace-offline" }
   | { kind: "error"; message: string }
   | { kind: "host-outdated" }
   | { kind: "unavailable" }
@@ -258,7 +277,9 @@ export function derivePullRequestPanelState(info: {
     return { kind: "error", message: (info.error as Error).message };
   }
   const data = info.data;
+  if (data?.cached && data.pr) return { kind: "ready" };
   if (!data || !data.available) {
+    if (data?.reason === "workspace_offline") return { kind: "workspace-offline" };
     if (data?.reason === "not_a_git_repo") return { kind: "not-a-git-repo" };
     if (data?.reason === "host_outdated") return { kind: "host-outdated" };
     if (data?.reason === "unsupported_remote") {
@@ -759,12 +780,14 @@ function PullRequestSummaryTab({
   checksSupported,
   checksUnavailableHint,
   body,
+  bodyPartial,
 }: {
   reviewers: PullRequestReviewer[] | undefined;
   checks: PullRequestChecks;
   checksSupported: boolean;
   checksUnavailableHint?: string;
   body: string | null | undefined;
+  bodyPartial?: boolean;
 }) {
   return (
     // Extra bottom padding so the end of a long description can scroll clear
@@ -818,6 +841,11 @@ function PullRequestSummaryTab({
         <h3 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
           Description
         </h3>
+        {bodyPartial && (
+          <p role="status" className="text-ui text-muted-foreground">
+            The saved description is incomplete. Open the PR on its provider to read it in full.
+          </p>
+        )}
         {body ? (
           <div className="text-ui break-words">
             <MessageResponse>{body}</MessageResponse>
@@ -1049,11 +1077,55 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
   const info = usePullRequestInfo(conversationId, { poll: true, prUrl: selected });
   const queryClient = useQueryClient();
   const [refreshing, setRefreshing] = useState(false);
+  const [knownAssociations, setKnownAssociations] = useState<{
+    sessionId: string;
+    data: Pick<
+      PullRequestInfo,
+      | "prs"
+      | "tracking_available"
+      | "selected_pr_url"
+      | "provider"
+      | "provider_display"
+      | "reason"
+      | "cached"
+    >;
+  }>();
+  useEffect(() => {
+    if (info.data) {
+      const {
+        prs,
+        tracking_available,
+        selected_pr_url,
+        provider,
+        provider_display,
+        reason,
+        cached,
+      } = info.data;
+      setKnownAssociations({
+        sessionId: conversationId,
+        data: {
+          prs,
+          tracking_available,
+          selected_pr_url,
+          provider,
+          provider_display,
+          reason,
+          cached,
+        },
+      });
+    }
+  }, [conversationId, info.data]);
+  // Switching the metadata query must not unmount the session's PR controls.
+  const associations =
+    info.data ??
+    (knownAssociations?.sessionId === conversationId ? knownAssociations.data : undefined);
+  const panelState = derivePullRequestPanelState(info);
+  const workspaceOffline = associations?.reason === "workspace_offline";
   const refreshButton = (
     <Button
       size="sm"
       variant="ghost"
-      disabled={refreshing}
+      disabled={refreshing || workspaceOffline}
       onClick={async () => {
         setRefreshing(true);
         try {
@@ -1071,27 +1143,6 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
       Refresh
     </Button>
   );
-  const [knownAssociations, setKnownAssociations] = useState<{
-    sessionId: string;
-    data: Pick<
-      PullRequestInfo,
-      "prs" | "tracking_available" | "selected_pr_url" | "provider" | "provider_display"
-    >;
-  }>();
-  useEffect(() => {
-    if (info.data) {
-      const { prs, tracking_available, selected_pr_url, provider, provider_display } = info.data;
-      setKnownAssociations({
-        sessionId: conversationId,
-        data: { prs, tracking_available, selected_pr_url, provider, provider_display },
-      });
-    }
-  }, [conversationId, info.data]);
-  // Switching the metadata query must not unmount the session's PR controls.
-  const associations =
-    info.data ??
-    (knownAssociations?.sessionId === conversationId ? knownAssociations.data : undefined);
-  const panelState = derivePullRequestPanelState(info);
   // No provider is known without a payload, or in a non-git workspace (older hosts omit it).
   const copy = gitProviderCopy(
     associations && panelState.kind !== "not-a-git-repo" ? associations.provider : null,
@@ -1138,12 +1189,13 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
             aria-label="Pull request URL"
             type="url"
             required
+            disabled={workspaceOffline}
             value={url}
             onChange={(event) => setUrl(event.target.value)}
             placeholder={copy.prUrlPlaceholder}
             className="flex-1 focus-visible:ring-0"
           />
-          <Button type="submit" disabled={update.isPending}>
+          <Button type="submit" disabled={update.isPending || workspaceOffline}>
             Link
           </Button>
           <Button type="button" variant="outline" onClick={() => setLinking(false)}>
@@ -1254,13 +1306,17 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
             <div className="ml-auto flex shrink-0 items-center gap-1">
               {refreshButton}
               <TooltipProvider delayDuration={0}>
-                <IconButton label="Link a PR" onClick={() => setLinking(!linking)}>
+                <IconButton
+                  label="Link a PR"
+                  disabled={workspaceOffline}
+                  onClick={() => setLinking(!linking)}
+                >
                   <PlusIcon className="size-3.5" aria-hidden="true" />
                 </IconButton>
                 {selected && (
                   <IconButton
                     label="Unlink PR"
-                    disabled={update.isPending}
+                    disabled={update.isPending || workspaceOffline}
                     onClick={() =>
                       update.mutate(
                         { url: selected, action: "remove" },
@@ -1285,6 +1341,15 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
       ) : null}
       {showTrackingControls && (linking || update.isError) && (
         <div className="shrink-0 border-b border-border p-2">{linkControls}</div>
+      )}
+      {(workspaceOffline || associations?.cached) && (
+        <p
+          role="status"
+          className="shrink-0 border-b border-border p-2 text-ui text-muted-foreground"
+        >
+          {workspaceOffline ? "Workspace offline" : "Saved PR details"}
+          <LastSynced timestamp={info.data?.cached_at} />
+        </p>
       )}
       {info.data?.warnings?.length || info.data?.discovery_warnings?.length ? (
         <p
@@ -1334,10 +1399,15 @@ function PullRequestPanelDetails({
   const prUrl = info.data?.selected_pr_url;
   const headSha = info.data?.pr?.head_sha;
   const baseSha = info.data?.pr?.base_sha;
-  const revision = `${baseSha ?? ""}:${headSha ?? ""}`;
+  const revision = `${baseSha ?? ""}:${headSha ?? ""}${
+    info.data?.cached ? `:cached:${info.data.cached_at ?? "missing"}` : ""
+  }`;
   const hasPr = !!info.data?.pr;
+  const workspaceOffline = info.data?.reason === "workspace_offline";
   const changes = usePullRequestChangedFiles(conversationId, hasPr, prUrl, revision);
   const prDiff = usePullRequestDiff(conversationId, hasPr, prUrl, revision);
+  const canExpandContext =
+    !workspaceOffline && !info.data?.cached && !changes.data?.cached && !prDiff.data?.cached;
   const sandboxAsleep = useWorkspaceAsleep(conversationId);
 
   // Summary (checks + PR body), Comments, and Changes (the stacked diff).
@@ -1453,9 +1523,9 @@ function PullRequestPanelDetails({
       // unchanged lines aren't in the patch, so expansion (and the exact
       // trailing-region count) is served by loadDiffFiles on demand.
       expansionLineCount: 10,
-      loadDiffFiles,
+      loadDiffFiles: canExpandContext ? loadDiffFiles : undefined,
     }),
-    [themeType, diffStyle, loadDiffFiles],
+    [themeType, diffStyle, loadDiffFiles, canExpandContext],
   );
 
   // The stacked diff scrolls as one; the sidebar highlights the file at the top
@@ -1535,6 +1605,22 @@ function PullRequestPanelDetails({
       return (
         <PanelMessage>
           <p>The sandbox is offline. Send a message in the chat to start it again.</p>
+          {emptyStateAction}
+        </PanelMessage>
+      );
+    case "workspace-offline":
+      return (
+        <PanelMessage>
+          <p>The workspace is offline. Reconnect it to load current PR details.</p>
+          {info.data?.unavailable_reason && (
+            <p>
+              {unavailableSnapshotMessage(
+                "PR details",
+                info.data.unavailable_reason,
+                info.data.message,
+              )}
+            </p>
+          )}
           {emptyStateAction}
         </PanelMessage>
       );
@@ -1734,6 +1820,7 @@ function PullRequestPanelDetails({
             checksSupported={pr.checks_supported !== false}
             checksUnavailableHint={copy.checksUnavailableHint}
             body={pr.body}
+            bodyPartial={pr.body_partial}
           />
         </TabsContent>
 
@@ -1748,12 +1835,54 @@ function PullRequestPanelDetails({
         {/* Changes: a controls row, then the sidebar (jump-to-file) + one scroll
             of all files' diffs. */}
         <TabsContent value="changes" className="flex min-h-0 flex-1 flex-col">
-          {(changes.data?.has_more || changes.data?.warning) && (
+          {!canExpandContext && (
+            <div className="shrink-0 border-b border-border p-2 text-ui text-muted-foreground">
+              {changes.data?.cached_at != null && changes.data.cached_at !== data.cached_at && (
+                <p>
+                  Changed files
+                  <LastSynced timestamp={changes.data.cached_at} />
+                </p>
+              )}
+              {prDiff.data?.cached_at != null && prDiff.data.cached_at !== data.cached_at && (
+                <p>
+                  Diff
+                  <LastSynced timestamp={prDiff.data.cached_at} />
+                </p>
+              )}
+              <p>
+                {workspaceOffline
+                  ? "Reconnect the workspace to expand unchanged file context."
+                  : "Refresh PR details to expand unchanged file context."}
+              </p>
+            </div>
+          )}
+          {changes.data?.unavailable_reason && (
             <p
               role="status"
               className="shrink-0 border-b border-border p-2 text-ui text-muted-foreground"
             >
-              {changes.data.warning || "The changed-file list is incomplete."}
+              {unavailableSnapshotMessage(
+                "changed files",
+                changes.data.unavailable_reason,
+                changes.data.message ?? changes.data.warning,
+              )}
+            </p>
+          )}
+          {!changes.data?.unavailable_reason &&
+            (changes.data?.has_more || changes.data?.warning) && (
+              <p
+                role="status"
+                className="shrink-0 border-b border-border p-2 text-ui text-muted-foreground"
+              >
+                {changes.data.warning || "The changed-file list is incomplete."}
+              </p>
+            )}
+          {prDiff.data?.cached && prDiff.data.message && !prDiff.data.unavailable_reason && (
+            <p
+              role="status"
+              className="shrink-0 border-b border-border p-2 text-ui text-muted-foreground"
+            >
+              {prDiff.data.message}
             </p>
           )}
           {files.length > 0 && (
@@ -1853,10 +1982,17 @@ function PullRequestPanelDetails({
                 </PanelMessage>
               ) : prDiff.data?.unavailable_reason ? (
                 <PanelMessage>
-                  {prDiff.data.message ||
-                    (prDiff.data.unavailable_reason === "pr_outside_workspace"
-                      ? "Diff unavailable for a PR outside this workspace's repository"
-                      : "Diff unavailable. Refresh or open the request on its provider.")}
+                  {prDiff.data.unavailable_reason === "not_synced" ||
+                  prDiff.data.unavailable_reason === "too_large"
+                    ? unavailableSnapshotMessage(
+                        "the diff",
+                        prDiff.data.unavailable_reason,
+                        prDiff.data.message,
+                      )
+                    : prDiff.data.message ||
+                      (prDiff.data.unavailable_reason === "pr_outside_workspace"
+                        ? "Diff unavailable for a PR outside this workspace's repository"
+                        : "Diff unavailable. Refresh or open the request on its provider.")}
                 </PanelMessage>
               ) : files.length === 0 || prDiff.isLoading ? (
                 <PanelMessage>

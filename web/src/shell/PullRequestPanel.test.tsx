@@ -14,6 +14,7 @@ import type {
   PullRequestAssociation,
   PullRequestAuth,
   PullRequestChangedFile,
+  PullRequestChangedFilesResult,
   PullRequestComment,
   PullRequestDiffResponse,
   PullRequestInfo,
@@ -27,12 +28,7 @@ const state = vi.hoisted(() => ({
     isFetching: boolean;
   } | null,
   changes: null as {
-    data?: {
-      available: boolean;
-      data: PullRequestChangedFile[];
-      has_more?: boolean;
-      warning?: string;
-    };
+    data?: PullRequestChangedFilesResult;
     isLoading: boolean;
     error: unknown;
     isFetching: boolean;
@@ -82,8 +78,18 @@ vi.mock("@pierre/diffs", () => ({
   parsePatchFiles: vi.fn(() => [{ files: state.parsedFiles }]),
 }));
 vi.mock("@pierre/diffs/react", () => ({
-  FileDiff: ({ fileDiff }: { fileDiff: { name: string } }) => (
-    <div data-testid="diff" data-path={fileDiff.name} />
+  FileDiff: ({
+    fileDiff,
+    options,
+  }: {
+    fileDiff: { name: string };
+    options?: { loadDiffFiles?: unknown };
+  }) => (
+    <div
+      data-testid="diff"
+      data-path={fileDiff.name}
+      data-can-expand-context={!!options?.loadDiffFiles}
+    />
   ),
 }));
 // The resolved theme mode drives @pierre/diffs' themeType.
@@ -710,11 +716,16 @@ describe("PullRequestPanel", () => {
     expect(screen.queryByTestId("diff")).toBeNull();
   });
 
-  it.each([1, 2])("offers the stored PR in the empty state with %i GitHub accounts", (count) => {
+  it.each([
+    { count: 1, cached: false },
+    { count: 2, cached: false },
+    { count: 2, cached: true },
+  ])("offers the stored PR with $count accounts (cached: $cached)", ({ count, cached }) => {
     const url = "https://github.com/acme/app/pull/6000";
     const info = state.info!.data!;
     info.pr = null;
     info.repo = null;
+    info.cached = cached;
     info.tracking_available = true;
     info.selected_pr_url = url;
     info.prs = [
@@ -737,6 +748,7 @@ describe("PullRequestPanel", () => {
     const account = screen.queryByRole("combobox", { name: "GitHub account" });
     if (count > 1) {
       expect(emptyState).toContainElement(account);
+      expect(account).toBeEnabled();
       expect(
         account!.compareDocumentPosition(link) & Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy();
@@ -1350,6 +1362,7 @@ describe("PullRequestPanel", () => {
       object: "session.github.pr_diff",
       patch: "",
       unavailable_reason: "truncated",
+      cached: true,
       message,
     };
     renderChanges();
@@ -1667,6 +1680,233 @@ describe("derivePullRequestPanelState", () => {
 });
 
 describe("session PR selection", () => {
+  it("separates saved resource revisions while live polling keeps the same cache key", () => {
+    state.info!.data!.pr!.base_sha = "base";
+    state.info!.data!.pr!.head_sha = "head";
+    state.info!.data!.cached_at = 1_700_000_000;
+    const { rerender } = renderPanel();
+    const resourceRevision = () => vi.mocked(usePullRequestChangedFiles).mock.lastCall?.[3];
+    const liveRevision = resourceRevision();
+
+    state.info!.data!.cached_at! += 10;
+    rerender(<PullRequestPanel conversationId="conv_1" />);
+    expect(resourceRevision()).toBe(liveRevision);
+
+    state.info!.data!.cached = true;
+    state.info!.data!.available = false;
+    state.info!.data!.reason = "workspace_offline";
+    rerender(<PullRequestPanel conversationId="conv_1" />);
+    const savedRevision = resourceRevision();
+    expect(savedRevision).not.toBe(liveRevision);
+
+    state.info!.data!.cached_at! += 10;
+    rerender(<PullRequestPanel conversationId="conv_1" />);
+    expect(resourceRevision()).not.toBe(savedRevision);
+  });
+
+  it.each([
+    { available: false, reason: "workspace_offline", offline: true },
+    { available: true, reason: undefined, offline: false },
+    { available: false, reason: "provider_unavailable", offline: false },
+  ] as const)(
+    "reads saved resources with available=$available, reason=$reason",
+    ({ available, reason, offline }) => {
+      const pr = state.info!.data!.pr!;
+      const cachedAt = 1_700_000_000;
+      const diffWarning = "Could not refresh the diff. Showing the saved snapshot.";
+      state.info!.data = {
+        ...state.info!.data!,
+        cached: true,
+        cached_at: cachedAt,
+        available,
+        reason,
+        gh_available: false,
+        authenticated: false,
+        repo: null,
+        tracking_available: true,
+        selected_pr_url: pr.url,
+        prs: [
+          {
+            url: pr.url,
+            host: "example.com",
+            repository: "acme/app",
+            number: pr.number,
+            relationship: "created",
+          },
+        ],
+        pr: {
+          ...pr,
+          body: "Saved description",
+          body_partial: true,
+          comments: [
+            { author: "reviewer", body: "Saved review comment", created_at: null, url: null },
+          ],
+          comments_partial: true,
+        },
+      };
+      state.changes!.data = { ...state.changes!.data!, cached: true, cached_at: cachedAt - 10 };
+      state.diff = {
+        ...state.diff!,
+        cached: true,
+        cached_at: cachedAt - 20,
+        message: offline ? undefined : diffWarning,
+      };
+      renderPanel();
+
+      expect(screen.getByText("Saved description")).toBeVisible();
+      expect(screen.getByText(/The saved description is incomplete/)).toBeVisible();
+      const notice = screen.getByText(offline ? /Workspace offline/ : /Saved PR details/);
+      expect(notice).toHaveTextContent("Last synced");
+      expect(notice.querySelector("time")).toHaveAttribute("datetime", "2023-11-14T22:13:20.000Z");
+      if (!offline) expect(screen.queryByText(/Workspace offline/)).not.toBeInTheDocument();
+      expect(screen.getByRole("link", { name: /chore: dummy PR/ })).toHaveAttribute("href", pr.url);
+      for (const name of ["Refresh", "Link a PR", "Unlink PR"]) {
+        const button = screen.getByRole("button", { name });
+        if (offline) expect(button).toBeDisabled();
+        else expect(button).toBeEnabled();
+      }
+      if (!offline) {
+        fireEvent.click(screen.getByRole("button", { name: "Link a PR" }));
+        expect(screen.getByRole("textbox", { name: "Pull request URL" })).toBeEnabled();
+        expect(screen.getByRole("button", { name: "Link" })).toBeEnabled();
+        fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      }
+
+      fireEvent.mouseDown(screen.getByRole("tab", { name: /^Comments/ }));
+      expect(screen.getByText("Saved review comment")).toBeVisible();
+      expect(screen.getByText("Some comments are unavailable.")).toBeVisible();
+
+      fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
+      expect(screen.getAllByTestId("diff")).toHaveLength(2);
+      if (offline) expect(screen.queryByText(diffWarning)).not.toBeInTheDocument();
+      else expect(screen.getByText(diffWarning)).toBeVisible();
+      for (const diff of screen.getAllByTestId("diff")) {
+        expect(diff).toHaveAttribute("data-can-expand-context", "false");
+      }
+      expect(screen.getByText(/Changed files · Last synced/)).toBeVisible();
+      expect(screen.getByText(/Diff · Last synced/)).toBeVisible();
+      expect(
+        screen.getByText(
+          offline
+            ? "Reconnect the workspace to expand unchanged file context."
+            : "Refresh PR details to expand unchanged file context.",
+        ),
+      ).toBeVisible();
+      fireEvent.click(screen.getByRole("button", { name: "Collapse all diffs" }));
+      expect(screen.queryByTestId("diff")).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Expand all diffs" }));
+      expect(screen.getAllByTestId("diff")).toHaveLength(2);
+    },
+  );
+
+  it.each(["not_synced", "too_large"])(
+    "explains an unavailable saved info snapshot (%s)",
+    (reason) => {
+      state.info!.data = {
+        ...state.info!.data!,
+        available: false,
+        reason: "workspace_offline",
+        cached: true,
+        cached_at: null,
+        unavailable_reason: reason,
+        pr: null,
+      };
+      renderPanel();
+
+      expect(
+        screen.getByText(
+          reason === "too_large"
+            ? /PR details was too large to save/
+            : /No saved snapshot is available for PR details/,
+        ),
+      ).toBeVisible();
+      expect(screen.queryByText(/Last synced/)).not.toBeInTheDocument();
+      expect(screen.queryByRole("tab", { name: "Summary" })).not.toBeInTheDocument();
+    },
+  );
+
+  it.each(["not_synced", "too_large"])(
+    "explains unavailable saved changes and diff (%s)",
+    (reason) => {
+      state.info!.data = {
+        ...state.info!.data!,
+        available: false,
+        reason: "workspace_offline",
+        cached: true,
+      };
+      state.changes!.data = {
+        available: false,
+        data: [],
+        cached: true,
+        unavailable_reason: reason,
+      };
+      state.diff = {
+        object: "session.github.pr_diff",
+        patch: "",
+        cached: true,
+        unavailable_reason: reason,
+      };
+      renderChanges();
+
+      expect(
+        screen.getByText(
+          reason === "too_large"
+            ? /changed files was too large to save/
+            : /No saved snapshot is available for changed files/,
+        ),
+      ).toBeVisible();
+      expect(
+        screen.getByText(
+          reason === "too_large"
+            ? /the diff was too large to save/
+            : /No saved snapshot is available for the diff/,
+        ),
+      ).toBeVisible();
+      expect(screen.queryByText("No changes vs base.")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("diff")).not.toBeInTheDocument();
+    },
+  );
+
+  it("keeps saved PR selection and external links available while the workspace is offline", async () => {
+    const user = userEvent.setup();
+    const one = "https://github.com/acme/app/pull/42";
+    const two = "https://github.com/acme/app/pull/43";
+    state.info!.data = {
+      object: "session.github.info",
+      available: false,
+      reason: "workspace_offline",
+      tracking_available: true,
+      selected_pr_url: one,
+      prs: [one, two].map((url, index) => ({
+        url,
+        host: "github.com",
+        repository: "acme/app",
+        number: 42 + index,
+        relationship: "created",
+      })),
+    };
+    const { rerender } = renderPanel();
+
+    expect(screen.getByText(/The workspace is offline/)).toBeVisible();
+    expect(screen.getByRole("link", { name: "Open the PR on GitHub" })).toHaveAttribute(
+      "href",
+      one,
+    );
+    expect(screen.getByRole("button", { name: "Link a PR" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Unlink PR" })).toBeDisabled();
+    expect(usePullRequestChangedFiles).toHaveBeenLastCalledWith("conv_1", false, one, ":");
+    await user.click(screen.getByRole("combobox", { name: "Session pull request" }));
+    await user.click(screen.getByRole("option", { name: "acme/app #43" }));
+    expect(screen.getByRole("link", { name: "Open the PR on GitHub" })).toHaveAttribute(
+      "href",
+      two,
+    );
+    state.info = { isLoading: true, isFetching: true, error: null };
+    rerender(<PullRequestPanel conversationId="conv_1" />);
+    expect(screen.getByRole("button", { name: "Link a PR" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Unlink PR" })).toBeDisabled();
+  });
+
   it("keeps the selector and repository identity while PR details load or fail", async () => {
     const user = userEvent.setup();
     const one = "https://github.com/example/one/pull/42";

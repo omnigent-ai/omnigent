@@ -21,7 +21,7 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from dev.repro_env.runtime import isolated_env
-from tests._helpers.server_runner import server_runner
+from tests._helpers.server_runner import ServerRunner, server_runner
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.e2e_ui.conftest import configure_mock_llm, set_fallback_mock_llm
 
@@ -49,7 +49,12 @@ pr = {
     "title": "Show the session pull request", "state": "OPEN", "isDraft": True,
     "author": {"login": "contributor"}, "baseRefName": "main",
     "headRefName": "contributor/topic", "headRefOid": "a" * 40,
-    "baseRefOid": "b" * 40, "statusCheckRollup": [], "comments": [],
+    "baseRefOid": "b" * 40,
+    "statusCheckRollup": [{"name": "Unit tests", "status": "COMPLETED",
+                           "conclusion": "SUCCESS"}],
+    "comments": [{"author": {"login": "reviewer"}, "body": "Ready for review.",
+                  "createdAt": "2026-10-01T12:00:00Z",
+                  "url": "https://github.com/example/project/pull/42#issuecomment-1"}],
     "body": "Created from the active session checkout.",
 }
 if args[:2] == ["api", "graphql"]:
@@ -78,7 +83,12 @@ elif args == [
     "api", "--hostname", "github.com", "--paginate", "--slurp",
     "repos/example/project/pulls/42/files?per_page=100",
 ]:
-    print("[[]]")
+    print(json.dumps([[{"filename": "greeting.py", "status": "modified",
+                        "additions": 1, "deletions": 1}]]))
+elif args[:2] == ["pr", "diff"]:
+    print('diff --git a/greeting.py b/greeting.py\\n'
+          '--- a/greeting.py\\n+++ b/greeting.py\\n@@ -1 +1 @@\\n'
+          '-print("Hello")\\n+print("Hello from the saved PR")')
 elif args[0] == "api":
     unexpected_api()
 else:
@@ -91,7 +101,7 @@ def pr_session(
     built_spa: None,
     mock_llm_server_url: str,
     tmp_path: Path,
-) -> Iterator[tuple[str, str, str, Path]]:
+) -> Iterator[tuple[str, str, str, Path, ServerRunner]]:
     binary = tmp_path / "bin"
     binary.mkdir()
     impl = binary / "gh_impl.py"
@@ -159,7 +169,7 @@ os_env:
         response.raise_for_status()
         session_id = response.json()["session_id"]
         bind_session_runner(httpx.patch, base_url, session_id, stack.runner_id, timeout=30)
-        yield base_url, session_id, model, binary
+        yield base_url, session_id, model, binary, stack
 
 
 @pytest.mark.parametrize(
@@ -167,12 +177,12 @@ os_env:
 )
 def test_pr_appears_in_composer_and_workspace(
     page: Page,
-    pr_session: tuple[str, str, str, Path],
+    pr_session: tuple[str, str, str, Path, ServerRunner],
     mock_llm_server_url: str,
     tmp_path: Path,
     existing: bool,
 ) -> None:
-    base_url, session_id, model, binary = pr_session
+    base_url, session_id, model, binary, _stack = pr_session
     if existing:
         (binary / "discover").touch()
         (binary / "created").touch()

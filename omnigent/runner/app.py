@@ -2006,6 +2006,13 @@ def create_runner_app(
                 status_code = resp.status_code
                 if resp.status_code == 200:
                     body = resp.json()
+                    from omnigent.runner.session_pr_sync import restore_session_prs
+
+                    await restore_session_prs(
+                        session_id,
+                        body.get("pull_requests"),
+                        updated_at_ns=body.get("pull_requests_updated_at_ns"),
+                    )
                     raw_created = body.get("created_at")
                     if raw_created is not None:
                         created_at = float(raw_created)
@@ -2174,11 +2181,19 @@ def create_runner_app(
             body_sub_agent if isinstance(body_sub_agent, str) else None
         ):
             raise ValueError("session initialization envelope sub-agent mismatch")
-        return _load_envelope_session_init_context(
+        init_context = _load_envelope_session_init_context(
             envelope,
             session_id=session_id,
             agent_id=agent_id,
         )
+        from omnigent.runner.session_pr_sync import restore_session_prs
+
+        await restore_session_prs(
+            session_id,
+            envelope.snapshot.pull_requests,
+            updated_at_ns=envelope.snapshot.pull_requests_updated_at_ns,
+        )
+        return init_context
 
     async def _resolve_session_fs_registry(
         session_id: str,
@@ -3245,18 +3260,22 @@ def create_runner_app(
     @app.get("/v1/sessions/{session_id}/stream")
     async def stream_session(session_id: str) -> StreamingResponse:
         async def _event_generator() -> AsyncIterator[bytes]:
+            from omnigent.runner.session_pr_sync import sync_session_prs
+
             queue = _session_event_queues.get(session_id)
             if queue is None:
                 queue = asyncio.Queue()
                 _session_event_queues[session_id] = queue
             heartbeat_frame = b'data: {"type": "session.heartbeat"}\n\n'
             yield heartbeat_frame
+            await sync_session_prs(session_id, server_client)
             while True:
                 try:
                     event = await asyncio.wait_for(
                         queue.get(), timeout=_SESSION_STREAM_HEARTBEAT_S
                     )
                 except asyncio.TimeoutError:
+                    await sync_session_prs(session_id, server_client)
                     yield heartbeat_frame
                     continue
                 if event is None:
@@ -5959,6 +5978,12 @@ def create_runner_app(
                                                 }
                                             )
                                         elif _it == "function_call_output":
+                                            from omnigent.runner.session_pr_sync import (
+                                                sync_session_prs,
+                                            )
+
+                                            # SDK observers record before emitting output.
+                                            await sync_session_prs(conv_id, server_client)
                                             _session_histories.setdefault(conv_id, []).append(
                                                 {
                                                     "type": "function_call_output",

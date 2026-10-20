@@ -71,6 +71,7 @@ import { releaseConversation, useChatStore } from "@/store/chatStore";
 import type { Session } from "@/lib/types";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import { markConversationSeen } from "./useUnseenConversations";
+import type { PullRequestAssociation } from "./usePullRequests";
 
 export const CONNECTED_STREAM_REFETCH_INTERVAL_MS = 60_000;
 export const DISCONNECTED_STREAM_REFETCH_INTERVAL_MS = 45_000;
@@ -201,6 +202,8 @@ export interface Conversation {
    * "delete local branch" checkbox. See designs/SESSION_GIT_WORKTREE.md.
    */
   git_branch?: string | null;
+  /** Saved PR associations remain available after the execution host stops. */
+  pull_requests?: PullRequestAssociation[];
   /**
    * Whether the session is archived. Archived sessions are hidden from
    * the sidebar's default view and surface in the "Archived" section
@@ -502,6 +505,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     runner_online: wire.runner_online ?? undefined,
     host_online: wire.host_online ?? undefined,
     git_branch: wire.git_branch ?? null,
+    pull_requests: wire.pull_requests,
     archived: wire.archived ?? false,
   };
 }

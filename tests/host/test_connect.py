@@ -8865,6 +8865,72 @@ async def test_handle_import_local_legacy_server_skips_only_unsafe_session(
     ]
 
 
+@pytest.mark.parametrize("failure", [None, "invalid_metadata", "lock_timeout", "write_error"])
+async def test_github_info_restores_server_prs_before_branch_discovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: str | None,
+) -> None:
+    from filelock import Timeout
+
+    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry, SessionPullRequest
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    session_id = "restored-session"
+    urls = ["https://github.com/example/one/pull/42", "https://github.com/example/two/pull/99"]
+    saved_prs = [
+        SessionPullRequest(
+            **PullRequestRef.from_url(url).model_dump(),
+            relationship="created",
+            source="test",
+            first_seen_at=1,
+            last_seen_at=1,
+        ).model_dump()
+        for url in urls
+    ]
+    revision = time.time_ns() + 1_000_000_000
+    if failure == "invalid_metadata":
+        saved_prs[0] = {"url": "invalid"}
+    elif failure is not None:
+
+        def fail_restore(*_args, **_kwargs):
+            raise Timeout("session-prs.lock") if failure == "lock_timeout" else OSError("write")
+
+        monkeypatch.setattr(SessionPrRegistry, "restore", fail_restore)
+
+    def discover_branch_pr(actual_session_id: str, pr_url: str | None) -> dict[str, object]:
+        assert actual_session_id == session_id
+        assert pr_url == urls[1]
+        registry = SessionPrRegistry(session_id)
+        assert {entry.url for entry in registry.list()} == (
+            set(urls) if failure is None else set()
+        )
+        registry.record(
+            [PullRequestRef.from_url(urls[0])], relationship="inferred", source="branch"
+        )
+        snapshot = registry.snapshot()
+        assert snapshot is not None
+        if failure is None:
+            assert snapshot[0] > revision
+        return {"prs": [entry.url for entry in snapshot[1]]}
+
+    result = HostProcess._dispatch_fs_op(
+        SimpleNamespace(github_info=discover_branch_pr),
+        "github_info",
+        session_id,
+        {
+            "pr_url": urls[1],
+            "pull_requests": saved_prs,
+            "pull_requests_updated_at_ns": revision,
+        },
+    )
+    result_prs = result["prs"]
+    assert isinstance(result_prs, list)
+    assert set(result_prs) == (set(urls) if failure is None else {urls[0]})
+    assert ("Failed to restore session PRs" in caplog.text) == (failure is not None)
+
+
 async def test_dispatch_fs_write_op_routes_github_set_preference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

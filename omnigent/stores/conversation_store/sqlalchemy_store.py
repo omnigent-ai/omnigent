@@ -117,16 +117,23 @@ from omnigent.stores.conversation_store.overrides import (
 from omnigent.stores.conversation_store.overrides import (
     encode_session_overrides as _encode_session_overrides,
 )
+from omnigent.stores.conversation_store.session_prs import (
+    validate_session_pr_revision,
+    validate_session_prs,
+)
 
 _logger = logging.getLogger(__name__)
 
 _SESSION_TODOS_STATE_KEY = "_omnigent_native_plan_snapshot_v1"
+# ponytail: bounded PR metadata shares policy writes; split into dedicated rows
+# when write amplification warrants a schema migration. Panel content uses artifacts.
+_SESSION_PRS_STATE_KEY = "_omnigent_session_prs_v1"
 
 
 def _decode_session_state(
     value: str | None,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Split policy state from the reserved native Plan snapshot."""
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any] | None]:
+    """Split policy state from reserved session display snapshots."""
     state = json.loads(value) if value else {}
     if not isinstance(state, dict):
         raise TypeError("session_state must decode to an object")
@@ -135,18 +142,27 @@ def _decode_session_state(
     if raw_todos is not None:
         with suppress(TypeError, ValueError):
             todos = validate_session_todos(raw_todos)
-    return state, todos
+    raw_prs = state.pop(_SESSION_PRS_STATE_KEY, None)
+    prs = None
+    if isinstance(raw_prs, dict):
+        with suppress(TypeError, ValueError):
+            prs = {**raw_prs, "prs": validate_session_prs(raw_prs.get("prs"))}
+    return state, todos, prs
 
 
 def _encode_session_state(
     state: dict[str, Any],
     todos: list[dict[str, Any]] | None,
+    prs: dict[str, Any] | None,
 ) -> str:
-    """Serialize policy state while preserving an optional Plan snapshot."""
+    """Serialize policy state while preserving session display snapshots."""
     payload = dict(state)
     payload.pop(_SESSION_TODOS_STATE_KEY, None)
+    payload.pop(_SESSION_PRS_STATE_KEY, None)
     if todos:
         payload[_SESSION_TODOS_STATE_KEY] = todos
+    if prs is not None:
+        payload[_SESSION_PRS_STATE_KEY] = prs
     return json.dumps(payload, separators=(",", ":"))
 
 
@@ -208,7 +224,9 @@ def _to_conversation(
         callers pass the JOINed ``{key: value}`` map.
     :returns: A :class:`Conversation` dataclass instance.
     """
-    session_state, session_todos = _decode_session_state(meta.session_state if meta else None)
+    session_state, session_todos, session_prs = _decode_session_state(
+        meta.session_state if meta else None
+    )
     session_usage: dict[str, Any] = {}
     if meta and meta.session_usage:
         session_usage = json.loads(meta.session_usage)
@@ -232,6 +250,9 @@ def _to_conversation(
         session_state=session_state,
         session_usage=session_usage,
         session_todos=session_todos,
+        session_pull_requests=session_prs["prs"] if session_prs is not None else None,
+        session_pull_requests_updated_at_ns=(session_prs or {}).get("updated_at_ns"),
+        session_pr_snapshots=(session_prs or {}).get("snapshots", {}),
         reasoning_effort=overrides["reasoning_effort"],
         model_override=overrides["model_override"],
         inference_snapshot=(
@@ -1541,8 +1562,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 q = q.with_for_update()
             meta = session.scalars(q).first()
             if meta is not None:
-                _, todos = _decode_session_state(meta.session_state)
-                meta.session_state = _encode_session_state(state, todos)
+                _, todos, prs = _decode_session_state(meta.session_state)
+                meta.session_state = _encode_session_state(state, todos, prs)
 
         run_write_transaction(self._session_immediate, "set_session_state", write)
 
@@ -1601,11 +1622,163 @@ class SqlAlchemyConversationStore(ConversationStore):
             meta = session.scalars(q).first()
             if meta is None:
                 return False
-            state, _ = _decode_session_state(meta.session_state)
-            meta.session_state = _encode_session_state(state, validated)
+            state, _, prs = _decode_session_state(meta.session_state)
+            meta.session_state = _encode_session_state(state, validated, prs)
             return True
 
         return run_write_transaction(self._session_immediate, "set_session_todos", write)
+
+    def set_session_prs(
+        self,
+        conversation_id: str,
+        prs: list[dict[str, Any]],
+        *,
+        updated_at_ns: int | None = None,
+        user_update: bool = False,
+    ) -> bool:
+        """Persist newer PRs; explicit user updates also accept unversioned hosts."""
+        validated = validate_session_prs(prs)
+        if updated_at_ns is not None:
+            validate_session_pr_revision(updated_at_ns)
+
+        def write(session: Session) -> bool:
+            query = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == conversation_id,
+            )
+            if self._meta_supports_for_update:
+                query = query.with_for_update()
+            meta = session.scalars(query).first()
+            if meta is None:
+                return False
+            state, todos, previous = _decode_session_state(meta.session_state)
+            if previous is not None and (
+                (
+                    updated_at_ns is None
+                    and not user_update
+                    and (
+                        not previous.get("provisional", False)
+                        or (not validated and previous["prs"])
+                        or validated == previous["prs"]
+                    )
+                )
+                or (
+                    updated_at_ns is not None
+                    and (previous.get("updated_at_ns") or 0) >= updated_at_ns
+                )
+            ):
+                return False
+            snapshot = {
+                **(previous or {}),
+                "prs": validated,
+                "updated_at_ns": updated_at_ns
+                if updated_at_ns is not None
+                else (previous or {}).get("updated_at_ns"),
+                "provisional": updated_at_ns is None and not user_update,
+            }
+            meta.session_state = _encode_session_state(state, todos, snapshot)
+            return True
+
+        return run_write_transaction(self._session_immediate, "set_session_prs", write)
+
+    def set_session_pr_snapshot(
+        self,
+        conversation_id: str,
+        pr_url: str,
+        captured_at_ns: int,
+        resource_keys: dict[str, str],
+        *,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
+    ) -> tuple[bool, list[str]]:
+        """Publish newer resources without reviving removed associations."""
+        from omnigent.stores.session_pr_snapshots import PR_SNAPSHOT_KINDS
+
+        validate_session_pr_revision(captured_at_ns)
+        if not resource_keys or resource_keys.keys() - PR_SNAPSHOT_KINDS:
+            raise ValueError("Unknown PR snapshot resource")
+
+        def write(session: Session) -> tuple[bool, list[str]]:
+            query = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == conversation_id,
+            )
+            if self._meta_supports_for_update:
+                query = query.with_for_update()
+            meta = session.scalars(query).first()
+            if meta is None:
+                return False, list(resource_keys.values())
+            state, todos, prs = _decode_session_state(meta.session_state)
+            association = next(
+                (pr for pr in (prs or {}).get("prs", []) if pr["url"] == pr_url), None
+            )
+            if association is None or captured_at_ns < int(
+                association["last_seen_at"] * 1_000_000_000
+            ):
+                return False, list(resource_keys.values())
+            assert prs is not None
+            snapshots = prs.setdefault("snapshots", {})
+            resources = snapshots.setdefault(pr_url, {})
+            previous_info = resources.get("info")
+            if previous_info is not None and previous_info["captured_at_ns"] > captured_at_ns:
+                return False, list(resource_keys.values())
+            obsolete: list[str] = []
+            if (
+                "info" in resource_keys
+                and previous_info is not None
+                and captured_at_ns > previous_info["captured_at_ns"]
+                and (head_sha or base_sha)
+                and (previous_info.get("head_sha"), previous_info.get("base_sha"))
+                != (head_sha, base_sha)
+            ):
+                for kind in ("changes", "diff"):
+                    if kind in resources:
+                        obsolete.append(resources.pop(kind)["key"])
+            saved = False
+            for kind, key in resource_keys.items():
+                previous = resources.get(kind)
+                if previous is not None and previous["captured_at_ns"] >= captured_at_ns:
+                    obsolete.append(key)
+                    continue
+                if previous is not None:
+                    obsolete.append(previous["key"])
+                resources[kind] = {"key": key, "captured_at_ns": captured_at_ns}
+                if kind == "info":
+                    resources[kind].update(head_sha=head_sha, base_sha=base_sha)
+                saved = True
+            if saved:
+                meta.session_state = _encode_session_state(state, todos, prs)
+            return saved, obsolete
+
+        return run_write_transaction(self._session_immediate, "set_session_pr_snapshot", write)
+
+    def prune_session_pr_snapshots(self, conversation_id: str) -> list[str]:
+        def write(session: Session) -> list[str]:
+            query = select(SqlConversationMetadata).where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id == conversation_id,
+            )
+            if self._meta_supports_for_update:
+                query = query.with_for_update()
+            meta = session.scalars(query).first()
+            if meta is None:
+                return []
+            state, todos, prs = _decode_session_state(meta.session_state)
+            if prs is None:
+                return []
+            associated = {pr["url"] for pr in prs["prs"]}
+            snapshots = prs.get("snapshots", {})
+            obsolete = [
+                resource["key"]
+                for url in list(snapshots)
+                if url not in associated
+                for resource in snapshots.pop(url).values()
+            ]
+            if obsolete:
+                meta.session_state = _encode_session_state(state, todos, prs)
+            return obsolete
+
+        return run_write_transaction(self._session_immediate, "prune_session_pr_snapshots", write)
 
     def set_conversation_project(
         self,

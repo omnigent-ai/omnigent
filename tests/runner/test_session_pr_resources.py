@@ -453,6 +453,44 @@ def test_auth_failure_preserves_pr_list(tracked: str, monkeypatch: pytest.Monkey
     assert len(info["prs"]) == 2
 
 
+def test_pr_snapshot_revision_includes_removal_during_title_lookup(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = SessionPrRegistry("session")
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if args[-1] == "title":
+            registry.remove(A)
+        return 0, '{"title": "Current title"}', ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    info = github.github_info(tracked, session_id="session", pr_url=B)
+    assert [entry["url"] for entry in info["prs"]] == [B]
+    snapshot = registry.snapshot()
+    assert snapshot is not None
+    assert info["prs_updated_at_ns"] == snapshot[0]
+    assert [entry["title"] for entry in info["prs"]] == [snapshot[1][0].title]
+
+
+def test_pr_snapshot_preserves_newer_concurrent_title(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = SessionPrRegistry("session")
+    monkeypatch.setattr(github.time, "time", lambda: 1000)
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if args[-1] == "title":
+            registry.update_titles({B: "Newer title"}, timestamp=2000)
+        return 0, '{"title": "Older title"}', ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    info = github.github_info(tracked, session_id="session", pr_url=B)
+    assert {entry["url"]: entry["title"] for entry in info["prs"]}[B] == "Newer title"
+    snapshot = registry.snapshot()
+    assert snapshot is not None
+    assert info["prs_updated_at_ns"] == snapshot[0]
+
+
 def test_context_uses_fork_head_and_merge_base(
     tracked: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

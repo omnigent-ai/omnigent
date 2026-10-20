@@ -191,6 +191,8 @@ interface ChatHeaderProps {
   hasHeaderMenu: boolean;
   /** Whether the Files tab/right panel is available for this session. */
   showFilesPanel: boolean;
+  /** Whether live or saved pull requests are available for this session. */
+  showGithubPanel?: boolean;
   /**
    * Whether the right workspace rail has at least one available tab
    * (files, terminals, or sub-agents). Gates both the mobile rail entries and
@@ -345,6 +347,7 @@ export function ChatHeader({
   onAgentInfo,
   hasHeaderMenu,
   showFilesPanel,
+  showGithubPanel = showFilesPanel,
   hasRailContent,
   rightPanelOpen,
   onToggleRightPanel,
@@ -396,7 +399,7 @@ export function ChatHeader({
             )}
           </DropdownMenuItem>
         )}
-        {showFilesPanel && (
+        {showGithubPanel && (
           <DropdownMenuItem
             onSelect={mobileMenu.onOpenGithub}
             className="gap-2.5 px-2.5 py-2 text-ui"

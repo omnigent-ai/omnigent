@@ -685,7 +685,7 @@ interface WorkspacePanelProps {
   onClosePanel: (tab: DefaultWorkspaceTab) => void;
   /** Whether the Files/Changes tabs are available (agent spec exposes an os_env). */
   showFilesPanel: boolean;
-  /** Whether the Pull Requests tab is available (same on-disk-workspace gate as Files). */
+  /** Whether live or saved pull requests are available. */
   showGithubTab: boolean;
   /** Whether Browser soft tabs are available — hidden without a browser bridge. */
   showBrowserTab: boolean;

@@ -527,6 +527,24 @@ class ProxyMcpManager:
                 continue
 
             # ── Normal result (ALLOW or post-approval execution) ──────────
+            from omnigent.runner.session_pr_sync import sync_session_prs
+
+            # Direct runner MCP calls already record at the connection. Registry
+            # tools and elicitation retries bypass that observer.
+            if managed or (approval_retries and separator):
+                from omnigent.runner.pr_observer import observe_tool_completion
+
+                await asyncio.to_thread(
+                    observe_tool_completion,
+                    self._session_id,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    result=result,
+                    call_id=operation_id,
+                    source="mcp_proxy",
+                    successful=not result.get("isError", False),
+                )
+            await sync_session_prs(self._session_id, self._omnigent_client)
             content = result.get("content", [])
             is_error = result.get("isError", False)
             if isinstance(content, list):

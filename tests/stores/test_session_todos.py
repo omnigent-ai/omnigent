@@ -30,12 +30,12 @@ def test_sqlite_writers_preserve_policy_and_plan(tmp_path, monkeypatch):
     entered = [threading.Event(), threading.Event()]
     release, decode = threading.Event(), store_module._decode_session_state
 
-    def coordinated_decode(value: str | None) -> tuple[dict[str, object], list[dict[str, object]]]:
-        state, todos = decode(value)
+    def coordinated_decode(value: str | None):
+        decoded = decode(value)
         writer = int(threading.current_thread().name.rsplit("_", 1)[1])
         entered[writer].set()
         assert writer != 0 or release.wait(10)
-        return state, todos
+        return decoded
 
     monkeypatch.setattr(store_module, "_decode_session_state", coordinated_decode)
 

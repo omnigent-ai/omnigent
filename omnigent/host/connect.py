@@ -3695,6 +3695,21 @@ class HostProcess:
                 limit=_coerce_int(params.get("limit", 500)),
             )
         if op == "github_info":
+            from omnigent.runner.session_prs import SessionPrRegistry
+
+            saved_prs = params.get("pull_requests")
+            if isinstance(saved_prs, list):
+                revision = params.get("pull_requests_updated_at_ns")
+                try:
+                    SessionPrRegistry(session_id).restore(
+                        saved_prs, updated_at_ns=revision if isinstance(revision, int) else None
+                    )
+                except Exception:  # noqa: BLE001 — optional metadata must not block PR reads
+                    _logger.warning(
+                        "Failed to restore session PRs",
+                        extra={"session_id": session_id},
+                        exc_info=True,
+                    )
             return r.github_info(session_id, cast("str | None", params.get("pr_url")))
         if op == "github_changes":
             return r.github_changes(session_id, cast("str | None", params.get("pr_url")))

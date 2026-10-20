@@ -32,6 +32,8 @@ class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pyd
     parent_session_id: str | None = None
     root_session_id: str | None = None
     inference_config: dict[str, object] | None = None
+    pull_requests: list[dict[str, object]] | None = None
+    pull_requests_updated_at_ns: int | None = None
 
 
 class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pydantic uses Any
@@ -92,6 +94,8 @@ def build_runner_session_init_payload(
             parent_session_id=conversation.parent_conversation_id,
             root_session_id=conversation.root_conversation_id,
             inference_config=snapshot_runtime_config(conversation.inference_snapshot),
+            pull_requests=conversation.session_pull_requests,
+            pull_requests_updated_at_ns=conversation.session_pull_requests_updated_at_ns,
         ),
     )
     return {

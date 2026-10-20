@@ -6,6 +6,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import httpx
 import pytest
 from filelock import FileLock
 
@@ -1021,20 +1022,37 @@ async def test_runner_shell_dispatch_records_only_success(tmp_path, monkeypatch,
     from omnigent.runner import tool_dispatch
 
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "omnigent.runner.session_pr_snapshot_sync.schedule_session_pr_snapshots",
+        lambda *_args, **_kwargs: None,
+    )
     output = A + ("\n[exit code: 1]" if failed else "\n")
 
     async def shell(*_args, **_kwargs):
         return output
 
     monkeypatch.setattr(tool_dispatch, "_execute_os_env_tool", shell)
-    result = await tool_dispatch.execute_tool(
-        tool_name="sys_os_shell",
-        arguments=json.dumps({"command": "gh pr create"}),
-        conversation_id="conv_dispatch",
-        agent_spec=None,
-    )
+    snapshots = []
+
+    def receive(request: httpx.Request) -> httpx.Response:
+        snapshots.append(json.loads(request.content)["data"])
+        return httpx.Response(200)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(receive), base_url="http://server"
+    ) as client:
+        result = await tool_dispatch.execute_tool(
+            tool_name="sys_os_shell",
+            arguments=json.dumps({"command": "gh pr create"}),
+            conversation_id="conv_dispatch",
+            agent_spec=None,
+            server_client=client,
+        )
     assert result == output
     assert [pr.url for pr in SessionPrRegistry("conv_dispatch").list()] == ([] if failed else [A])
+    assert [pr["url"] for snapshot in snapshots for pr in snapshot["prs"]] == (
+        [] if failed else [A]
+    )
 
 
 @pytest.mark.parametrize(

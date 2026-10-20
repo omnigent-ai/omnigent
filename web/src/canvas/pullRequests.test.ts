@@ -208,6 +208,37 @@ describe("usePullRequests", () => {
     vi.useRealTimers();
   });
 
+  it("shows a saved association without a worktree branch and clears its final unlink", async () => {
+    const saved = association({
+      title: "Ship it",
+      provider: "example_forge",
+      provider_display: FORGE_DISPLAY,
+    });
+    vi.mocked(pullRequestHooks.fetchPullRequestInfo).mockResolvedValue(
+      info(null, { available: false, reason: "workspace_offline", prs: [saved] }),
+    );
+    const sessions = [
+      { ...session("s", null), pull_requests: [saved], runner_online: false, host_online: false },
+    ];
+    const { result, rerender } = renderHook(({ sessions: rows }) => usePullRequests(rows), {
+      wrapper,
+      initialProps: { sessions },
+    });
+
+    await waitFor(() =>
+      expect(result.current.s).toEqual({
+        number: 7,
+        title: "Ship it",
+        state: "",
+        url: FORGE_URL,
+        provider: "example_forge",
+        provider_display: FORGE_DISPLAY,
+      }),
+    );
+    rerender({ sessions: [{ ...sessions[0], pull_requests: [] }] });
+    expect(result.current.s).toBeNull();
+  });
+
   it("ignores pull requests without an https URL", async () => {
     vi.mocked(pullRequestHooks.fetchPullRequestInfo).mockResolvedValue(
       info({

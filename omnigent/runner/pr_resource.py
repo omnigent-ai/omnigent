@@ -330,13 +330,24 @@ def _session_prs_with_titles(
     if titles and may_cache:
         try:
             registry.update_titles(titles, timestamp=now, timed_out_urls=timed_out_urls)
+            titles = {}
         except (OSError, ValueError, FileLockTimeout):
             _logger.debug("Could not cache session PR titles", exc_info=True)
 
+    snapshot = registry.snapshot()
+    if snapshot is None:
+        return []
+    revision, entries = snapshot
+    if not titles:
+        info["prs_updated_at_ns"] = revision
     return [
         {
             **entry.model_dump(),
-            "title": titles.get(entry.url) or entry.title,
+            "title": (
+                entry.title
+                if entry.title_checked_at > now
+                else titles.get(entry.url) or entry.title
+            ),
             "provider_display": provider_display(entry.provider),
         }
         for entry in entries

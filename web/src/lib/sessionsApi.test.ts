@@ -180,6 +180,7 @@ describe("createSession", () => {
       activeResponseId: null,
       workspace: null,
       gitBranch: null,
+      pullRequests: null,
     });
   });
 
@@ -993,6 +994,15 @@ describe("runner binding", () => {
 
 describe("getSession", () => {
   it("GETs the sessions endpoint and parses the response", async () => {
+    const pullRequests = [
+      {
+        url: "https://github.com/acme/widget/pull/42",
+        host: "github.com",
+        repository: "acme/widget",
+        number: 42,
+        relationship: "created",
+      },
+    ];
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
         id: "conv_abc",
@@ -1000,6 +1010,7 @@ describe("getSession", () => {
         status: "running",
         created_at: 1704067200,
         items: [],
+        pull_requests: pullRequests,
       }),
     );
 
@@ -1009,6 +1020,7 @@ describe("getSession", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv_abc");
     expect(session.agentId).toBe("agent_xyz");
     expect(session.createdAt).toBe(1704067200);
+    expect(session.pullRequests).toEqual(pullRequests);
   });
 
   it("url-encodes the session id", async () => {

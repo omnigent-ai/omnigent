@@ -13,6 +13,7 @@
 import type { ConversationItem } from "./conversationItems";
 import type { McpServerStartup } from "./events";
 import type { MessageContentBlock } from "./blocks";
+import type { PullRequestAssociation } from "@/hooks/usePullRequests";
 
 /** Reference to a conversation, as returned on response objects. */
 export interface ConversationRef {
@@ -359,6 +360,8 @@ export interface Session {
    * selector for the clone.
    */
   gitBranch?: string | null;
+  /** Saved PR associations remain available without a workspace. */
+  pullRequests?: PullRequestAssociation[] | null;
   items: SessionItem[];
   queuedItems?: SessionEventInput[];
   /** Per-session reasoning-effort override, e.g. ``"high"``. */

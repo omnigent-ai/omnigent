@@ -1,7 +1,5 @@
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
-// The workspace rail's Pull Requests tab is shown whenever the workspace/Files gate is
-// open. Non-git workspaces (not_a_git_repo) show an empty state inside the panel
-// rather than hiding the tab entirely.
+// Pull Requests stays reachable with a workspace or saved session associations.
 
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
@@ -88,8 +86,29 @@ import { useOpenGithubTab } from "./FileViewerContext";
 import { isMobileViewport } from "./Sidebar";
 import { usePullRequestInfo } from "@/hooks/usePullRequests";
 import { useConversations } from "@/hooks/useConversations";
+import { useSession } from "@/hooks/useSession";
+import { useWorkspaceEnvironment } from "@/hooks/useWorkspaceChangedFiles";
+import type { Session } from "@/lib/types";
 
 const usePullRequestInfoMock = vi.mocked(usePullRequestInfo);
+const savedPullRequest = {
+  url: "https://github.com/acme/widget/pull/42",
+  host: "github.com",
+  repository: "acme/widget",
+  number: 42,
+  relationship: "created" as const,
+};
+const conversation = {
+  id: "conv_ws",
+  object: "conversation" as const,
+  title: null,
+  created_at: 0,
+  updated_at: 0,
+  labels: {},
+  permission_level: null,
+  host_id: null,
+  runner_id: null,
+};
 
 afterEach(cleanup);
 
@@ -100,6 +119,13 @@ beforeEach(() => {
   writeWorkspacePanelDefault("open");
   sessionStorage.clear();
   vi.mocked(isMobileViewport).mockReturnValue(false);
+  vi.mocked(useWorkspaceEnvironment).mockReset();
+  vi.mocked(useWorkspaceEnvironment).mockReturnValue({
+    data: { available: true, root: null },
+    isLoading: false,
+  } as ReturnType<typeof useWorkspaceEnvironment>);
+  vi.mocked(useSession).mockReset();
+  vi.mocked(useSession).mockReturnValue({ session: null, isLoading: false, error: null });
   usePullRequestInfoMock.mockReset();
   usePullRequestInfoMock.mockReturnValue({ data: undefined, isLoading: true } as ReturnType<
     typeof usePullRequestInfo
@@ -109,19 +135,7 @@ beforeEach(() => {
     data: {
       pages: [
         {
-          data: [
-            {
-              id: "conv_ws",
-              object: "conversation" as const,
-              title: null,
-              created_at: 0,
-              updated_at: 0,
-              labels: {},
-              permission_level: null,
-              host_id: null,
-              runner_id: null,
-            },
-          ],
+          data: [conversation],
           first_id: null,
           last_id: null,
           has_more: false,
@@ -217,6 +231,61 @@ describe("opening Pull Requests from the composer", () => {
   beforeEach(() => {
     writeSessionWorkspaceState("conv_ws", { open: false, rightRailTab: "files" });
   });
+
+  it.each([
+    { viewport: "desktop", noWorkspace: true },
+    { viewport: "mobile", noWorkspace: true },
+    { viewport: "desktop", noWorkspace: false },
+    { viewport: "mobile", noWorkspace: false },
+  ])(
+    "opens saved PRs on $viewport without file access (no workspace: $noWorkspace)",
+    ({ viewport, noWorkspace }) => {
+      vi.mocked(isMobileViewport).mockReturnValue(viewport === "mobile");
+      if (noWorkspace) {
+        vi.mocked(useWorkspaceEnvironment).mockReturnValue({
+          data: { available: false, root: null },
+          isLoading: false,
+        } as ReturnType<typeof useWorkspaceEnvironment>);
+        vi.mocked(useSession).mockImplementation((id) => ({
+          session: id === "conv_ws" ? ({ id, pullRequests: [savedPullRequest] } as Session) : null,
+          isLoading: false,
+          error: null,
+        }));
+      } else {
+        vi.mocked(useConversations).mockReturnValue({
+          data: {
+            pages: [
+              {
+                data: [
+                  {
+                    ...conversation,
+                    permission_level: "read",
+                    pull_requests: [savedPullRequest],
+                  },
+                ],
+                first_id: null,
+                last_id: null,
+                has_more: false,
+              },
+            ],
+            pageParams: [undefined],
+          },
+        } as never);
+      }
+
+      renderShell();
+      expect(screen.queryByRole("tab", { name: /^Files$/ })).not.toBeInTheDocument();
+      expect(screen.queryByRole("tab", { name: /^Changes$/ })).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: "Open PR" }));
+
+      const target =
+        viewport === "mobile"
+          ? screen.getByTestId("github-panel-drawer")
+          : screen.getByRole("complementary", { name: "Workspace" });
+      expect(within(target).getByTestId("github-panel")).toBeInTheDocument();
+    },
+  );
 
   it("opens and dismisses the mobile drawer without opening the hidden desktop rail", () => {
     vi.mocked(isMobileViewport).mockReturnValue(true);

@@ -85,6 +85,7 @@ function renderHeader(props: {
   hasRailContent?: boolean;
   rightPanelOpen?: boolean;
   showFilesPanel?: boolean;
+  showGithubPanel?: boolean;
   pending?: boolean;
   mobileMenu?: typeof mobileMenu;
   onOpenSidebar?: (peek?: boolean) => void;
@@ -123,6 +124,7 @@ function renderHeader(props: {
             onAgentInfo={() => {}}
             hasHeaderMenu={props.hasHeaderMenu ?? false}
             showFilesPanel={props.showFilesPanel ?? false}
+            showGithubPanel={props.showGithubPanel}
             hasRailContent={props.hasRailContent ?? true}
             rightPanelOpen={props.rightPanelOpen ?? false}
             onToggleRightPanel={() => {}}
@@ -936,6 +938,27 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     });
     fireEvent.click(screen.getByRole("menuitem", { name: "Files" }));
     expect(onOpenFiles).toHaveBeenCalled();
+  });
+
+  it("opens saved PRs from the mobile menu without workspace file access", () => {
+    const onOpenGithub = vi.fn();
+    isMobileMock.mockReturnValue(true);
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      actionConversation: conversation,
+      showFilesPanel: false,
+      showGithubPanel: true,
+      mobileMenu: { ...mobileMenu, onOpenGithub },
+    });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Conversation actions" }), {
+      button: 0,
+    });
+    expect(screen.queryByRole("menuitem", { name: "Files" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Changes" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Pull Requests" }));
+    expect(onOpenGithub).toHaveBeenCalledOnce();
   });
 
   it("opens the side-chats drawer from the kebab when the harness supports it", () => {

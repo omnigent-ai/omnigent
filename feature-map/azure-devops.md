@@ -13,6 +13,9 @@ CLI sign-in reads the request. The panel identifies Azure requests with `!`.
 - `partial`: retain loaded results and explain incomplete data or unavailable diffs.
 - `auth`: an authenticated PAT works without the Azure CLI; account switching is absent.
 - `tracking`: supported successful agent mutations associate their resulting request.
+- `offline`: saved request details, comments, checks, and diffs survive runner
+  shutdown and server restart, with a last-sync time. Refresh, link/unlink, and
+  expanded file context require the workspace.
 
 ## How to get to it (user POV)
 
@@ -49,6 +52,11 @@ not contact Azure DevOps or invoke the Azure CLI.
   test repository and the [observer instructions](../docs/AZURE_DEVOPS.md#observer-limits);
   after a successful supported creation or update, confirm the resulting request
   appears in the panel. Reads and comments must not add an association.
+- Offline shared UI (own environment):
+  `tests/e2e_ui/github/test_prs_survive_runner_shutdown.py::test_created_pr_survives_runner_and_server_shutdown`
+  records desktop/mobile Summary, Comments, and Changes, plus sidebar details and
+  Canvas after real runner shutdown and server restart. It uses a scripted GitHub
+  response; Azure labels have separate server/component coverage.
 
 ## Gotchas
 

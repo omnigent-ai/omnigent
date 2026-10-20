@@ -16,6 +16,9 @@ reads the MR; agent CLI and MCP writes associate it with the session.
   including alongside GitHub and Azure DevOps remotes.
 - `tracking`: successful mutations persist; reads, comments, failures, and replay
   do not create extra associations.
+- `offline`: saved MR details, comments, checks, and diffs survive runner shutdown
+  and server restart, with a last-sync time. Refresh, link/unlink, and expanded
+  file context require the workspace.
 
 ## How to get to it (user POV)
 
@@ -60,6 +63,11 @@ responses; they exercise the actual shared UI without contacting GitLab.
 - Live auth, fork context, and removal persistence: follow
   [the manual verification steps](../docs/GITLAB.md#limits-and-verification)
   using a permitted test GitLab project and execution-host credentials.
+- Offline shared UI (own environment):
+  `tests/e2e_ui/github/test_prs_survive_runner_shutdown.py::test_created_pr_survives_runner_and_server_shutdown`
+  records desktop/mobile Summary, Comments, and Changes, plus sidebar details and
+  Canvas after real runner shutdown and server restart. It uses a scripted GitHub
+  response; GitLab labels have separate server/component coverage.
 
 ## Gotchas
 

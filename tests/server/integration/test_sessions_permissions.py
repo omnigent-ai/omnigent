@@ -598,6 +598,92 @@ async def test_read_grant_allows_get_but_blocks_post_events(
         f"LEVEL_EDIT."
     )
 
+    refused_pr_update = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_session_prs", "data": {"prs": [], "updated_at_ns": 1}},
+        headers={"X-Forwarded-Email": "user-b"},
+    )
+    assert refused_pr_update.status_code == 403
+    refused_snapshot = await auth_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_session_pr_snapshot",
+            "data": {
+                "pr_url": "https://github.com/example/project/pull/42",
+                "captured_at_ns": 3_000_000_000,
+                "diff": {"patch": "blocked"},
+            },
+        },
+        headers={"X-Forwarded-Email": "user-b"},
+    )
+    assert refused_snapshot.status_code == 403
+    snapshot = await auth_client.get(
+        f"/v1/sessions/{session_id}",
+        headers={"X-Forwarded-Email": "user-b"},
+    )
+    assert snapshot.json()["pull_requests"] is None
+
+
+@pytest.mark.parametrize(
+    ("user", "token", "expected_status"),
+    [
+        ("user-a", None, 202),
+        ("user-b", None, 403),
+        ("user-b", "bound-runner", 202),
+        ("user-b", "other-runner", 403),
+    ],
+)
+async def test_pr_metadata_events_require_owner_or_bound_runner(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    user: str,
+    token: str | None,
+    expected_status: int,
+) -> None:
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+
+    agent = await create_test_agent(auth_client, user="bryan")
+    session = await _create_session_as(auth_client, agent["id"], "user-a")
+    session_id = session["id"]
+    response = await _grant_permission(
+        auth_client, session_id, granter="user-a", target_user="user-b", level=LEVEL_EDIT
+    )
+    assert response.status_code == 200
+    store = SqlAlchemyConversationStore(db_uri)
+    store.replace_runner_id(session_id, token_bound_runner_id("bound-runner"))
+    headers = {"X-Forwarded-Email": user}
+    if token is not None:
+        headers[RUNNER_TUNNEL_TOKEN_HEADER] = token
+    pr = {
+        "host": "github.com",
+        "repository": "example/project",
+        "number": 42,
+        "url": "https://github.com/example/project/pull/42",
+        "relationship": "created",
+        "source": "native_hook",
+        "first_seen_at": 1,
+        "last_seen_at": 2,
+    }
+    for event in (
+        {"type": "external_session_prs", "data": {"prs": [pr], "updated_at_ns": 1}},
+        {
+            "type": "external_session_pr_snapshot",
+            "data": {
+                "pr_url": pr["url"],
+                "captured_at_ns": 3_000_000_000,
+                "diff": {"patch": "saved patch"},
+            },
+        },
+    ):
+        response = await auth_client.post(
+            f"/v1/sessions/{session_id}/events", json=event, headers=headers
+        )
+        assert response.status_code == expected_status, response.text
+    saved = store.get_conversation(session_id)
+    assert saved is not None
+    assert bool(saved.session_pull_requests) == (expected_status == 202)
+    assert bool(saved.session_pr_snapshots) == (expected_status == 202)
+
 
 async def test_edit_grant_blocked_from_stop_session_requires_owner(
     auth_client: httpx.AsyncClient,

@@ -29,6 +29,10 @@ async def test_native_session_tracks_prs_across_repositories(
 ) -> None:
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr(
+        "omnigent.runner.session_pr_snapshot_sync.schedule_session_pr_snapshots",
+        lambda *_args, **_kwargs: None,
+    )
     monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
     binary = tmp_path / "bin"
@@ -65,12 +69,25 @@ async def test_native_session_tracks_prs_across_repositories(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     bridge_dir = bridge.prepare_bridge_dir("tracking", workspace=workspace)
+    snapshots: list[dict] = []
+
+    def receive_snapshot(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/conv_owned/events"
+        payload = json.loads(request.content)
+        assert payload["type"] == "external_session_prs"
+        snapshots.append(payload["data"])
+        return httpx.Response(200)
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(receive_snapshot), base_url="http://server"
+    )
     relay = bridge.start_tool_relay(
         bridge_dir=bridge_dir,
         tools=[],
         tool_executor=None,
         loop=asyncio.get_running_loop(),
         session_id="conv_owned",
+        policy_client=server_client,
     )
     hook = hook_settings(bridge_dir, sys.executable, f"omnigent.harnesses.{harness}.hook")
     command = shlex.split(str(hook["command"]))
@@ -223,6 +240,9 @@ async def test_native_session_tracks_prs_across_repositories(
                 )
                 assert completed.returncode == 0, completed.stderr
                 assert completed.stdout == ""
+                assert snapshots[-1]["prs"] == [
+                    entry.model_dump() for entry in SessionPrRegistry("conv_owned").list()
+                ]
         registry = SessionPrRegistry("conv_owned")
         entries = registry.list()
         assert len(entries) == 6
@@ -253,6 +273,7 @@ async def test_native_session_tracks_prs_across_repositories(
         assert denied.status_code == 401
     finally:
         relay.close()
+        await server_client.aclose()
     # Closing the relay and using a fresh reader models the parked-runner host path.
     entries = SessionPrRegistry("conv_owned").list()
     assert len(entries) == 5

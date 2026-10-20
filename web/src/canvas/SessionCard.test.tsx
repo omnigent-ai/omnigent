@@ -96,13 +96,13 @@ describe("SessionCard", () => {
     expect(card).toHaveAccessibleName(/^Bob\./);
   });
 
-  it("shows the worktree branch and links the open pull request", () => {
+  it.each(["OPEN", ""])("shows the worktree branch and links a PR with state %j", (state) => {
     renderCard({
       conversation: conversation({ git_branch: "feat/canvas" }),
       pullRequest: {
         number: 7,
         title: "Ship it",
-        state: "OPEN",
+        state,
         url: "https://github.com/acme/repo/pull/7",
       },
     });
@@ -112,6 +112,7 @@ describe("SessionCard", () => {
     expect(link).toHaveAttribute("target", "_blank");
     expect(link).toHaveAttribute("rel", "noopener noreferrer");
     expect(link).toHaveTextContent("#7 Ship it");
+    expect(link).toHaveAttribute("title", state ? "Ship it (open)" : "Ship it");
   });
 
   it.each([

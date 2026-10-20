@@ -7083,9 +7083,16 @@ def _tool_relay_handler_factory(
                 return
             if self.path == "/hook/observe-tool":
                 from omnigent.runner.pr_observer import observe_hook
+                from omnigent.runner.session_pr_sync import sync_session_prs
 
                 if session_id is not None:
                     observe_hook(session_id, payload)
+                    if policy_client is not None:
+                        sync_future = asyncio.run_coroutine_threadsafe(
+                            sync_session_prs(session_id, policy_client), loop
+                        )
+                        with contextlib.suppress(Exception):
+                            sync_future.result(timeout=_FILE_CHANGE_OBSERVER_TIMEOUT_S)
                     if file_change_observer is not None:
                         # Wait so the record lands before the hook returns and
                         # the panel's next fetch can see it; the observer owns

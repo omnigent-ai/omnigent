@@ -163,6 +163,7 @@ interface SessionResponseWire {
   terminal_launch_args?: string[] | null;
   /** Worktree branch; ``null`` when the session uses no worktree. */
   git_branch?: string | null;
+  pull_requests?: Session["pullRequests"];
   items?: SessionItem[];
   // `queued_items` is documented in `omnigent/server/API.md` but
   // is not on `SessionResponse` today (migration plan R5). Typed
@@ -339,6 +340,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     workspace: wire.workspace ?? null,
     terminalLaunchArgs: wire.terminal_launch_args ?? null,
     gitBranch: wire.git_branch ?? null,
+    pullRequests: wire.pull_requests ?? null,
     items: wire.items ?? [],
     queuedItems: wire.queued_items,
     reasoningEffort: wire.reasoning_effort,

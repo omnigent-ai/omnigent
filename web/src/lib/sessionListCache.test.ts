@@ -111,24 +111,36 @@ describe("mergeItemsIntoPages", () => {
     expect(found).toEqual(new Set(["a"]));
   });
 
-  it("detects label changes structurally despite fresh object identity", () => {
-    const before = data([conv("a", { labels: { x: "1" } })]);
-    // A freshly-parsed frame always has a new labels object reference;
-    // only a value difference should count as a change.
-    const sameLabels = new Map<string, SessionListWireItem>([
-      ["a", { id: "a", labels: { x: "1" } }],
-    ]);
-    const changedLabels = new Map<string, SessionListWireItem>([
-      ["a", { id: "a", labels: { x: "2" } }],
-    ]);
+  it.each([
+    { field: "labels" as const, initial: { x: "1" }, updated: { x: "2" } },
+    {
+      field: "pull_requests" as const,
+      initial: [],
+      updated: [
+        {
+          url: "https://github.com/acme/app/pull/42",
+          host: "github.com",
+          repository: "acme/app",
+          number: 42,
+          relationship: "created",
+        },
+      ],
+    },
+  ])(
+    "detects $field changes by value despite fresh object identity",
+    ({ field, initial, updated }) => {
+      const before = data([conv("a", { [field]: initial })]);
+      const identical = new Map<string, SessionListWireItem>([
+        ["a", { id: "a", [field]: structuredClone(initial) }],
+      ]);
+      const changed = new Map<string, SessionListWireItem>([["a", { id: "a", [field]: updated }]]);
 
-    // Equal labels by value → no change.
-    expect(mergeItemsIntoPages(before, sameLabels, DEFAULT_FILTERS, NO_ACTIVE).data).toBe(before);
-    // Different label value → row rewritten with the new labels.
-    const { data: after } = mergeItemsIntoPages(before, changedLabels, DEFAULT_FILTERS, NO_ACTIVE);
-    expect(after).not.toBe(before);
-    expect(after!.pages[0].data[0].labels).toEqual({ x: "2" });
-  });
+      expect(mergeItemsIntoPages(before, identical, DEFAULT_FILTERS, NO_ACTIVE).data).toBe(before);
+      const { data: after } = mergeItemsIntoPages(before, changed, DEFAULT_FILTERS, NO_ACTIVE);
+      expect(after).not.toBe(before);
+      expect(after!.pages[0].data[0][field]).toEqual(updated);
+    },
+  );
 
   it("does not report ids absent from any page (structural additions)", () => {
     const before = data([conv("a")]);

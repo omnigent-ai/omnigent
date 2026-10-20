@@ -939,6 +939,9 @@ export function AppShell() {
     enabled: canBrowseWorkspace,
   });
   const showFilesPanel = canBrowseWorkspace && environmentQuery.data?.available !== false;
+  const savedPullRequests =
+    activeConv?.pull_requests ?? (activeSessionMatchesRoute ? activeSession?.pullRequests : null);
+  const showGithubPanel = showFilesPanel || Boolean(savedPullRequests?.length);
   // Per-tab availability for the right workspace rail — the single source
   // of truth shared by the tab-fallback effect below, the rail's mount
   // gate, and the header's collapse toggle, so they can never disagree.
@@ -949,9 +952,8 @@ export function AppShell() {
         // Changes tab shares the Files gate — same on-disk workspace, just the
         // changed-files scope.
         changes: showFilesPanel,
-        // Pull Requests tab: shares the Files/workspace gate. Non-git workspaces and
-        // other unavailable reasons are shown as empty states in the panel.
-        github: showFilesPanel,
+        // Saved associations can be opened without access to workspace files.
+        github: showGithubPanel,
         // Browser soft tabs: available only when the shell hosts the embedded
         // WebContentsView. Plain web and older desktop builds hide the "+"
         // option entirely so they never surface a dead tab whose calls no-op.
@@ -963,7 +965,7 @@ export function AppShell() {
         // rail's tab strip (see WorkspacePanel's TerminalTabsStrip / "+"
         // menu). Mobile keeps a shells drawer (see ``showShellsTab`` below).
       }) as const,
-    [showFilesPanel],
+    [showFilesPanel, showGithubPanel],
   );
   // Whether the rail has anything at all to show. When false the workspace
   // card doesn't mount and the header hides its collapse toggle — a
@@ -2548,6 +2550,7 @@ export function AppShell() {
                     onAgentInfo={() => setAgentInfoOpen(true)}
                     hasHeaderMenu={hasHeaderMenu}
                     showFilesPanel={showFilesPanel}
+                    showGithubPanel={showGithubPanel}
                     hasRailContent={hasRailContent}
                     rightPanelOpen={rightPanelOpen}
                     onToggleRightPanel={toggleRightPanel}
@@ -2741,7 +2744,7 @@ export function AppShell() {
                   />
                 </MobilePanelDrawer>
               )}
-              {conversationId && showFilesPanel && (
+              {conversationId && showGithubPanel && (
                 <MobilePanelDrawer
                   open={githubPanelOpen}
                   title="Pull Requests"

@@ -101,49 +101,93 @@ class SessionPrRegistry:
             self._write(state)
         return state
 
-    def list(self) -> list[SessionPullRequest]:
-        """Read a locked snapshot with explicit activity before inferred PRs.
-
-        :raises ValueError: If the registry is corrupt or busy.
-        """
+    def snapshot(self) -> tuple[int, list[SessionPullRequest]] | None:
+        """Read associations and their revision together; absent files are not an empty update."""
         if not self.path.parent.exists():
-            return []
+            return None
         try:
             with FileLock(str(self.path) + ".lock", timeout=1):
-                return sorted(
+                paths = [path for path in (self.path, self._providers_path) if path.exists()]
+                if not paths:
+                    return None
+                entries = sorted(
                     self._read().prs,
                     key=lambda pr: (
                         pr.relationship == "inferred",
                         pr.first_seen_at if pr.relationship == "inferred" else -pr.last_seen_at,
                     ),
                 )
+                return max(path.stat().st_mtime_ns for path in paths), entries
         except FileLockTimeout as exc:
             raise ValueError("PR tracking is busy; try again.") from exc
 
-    def _write(self, state: _Registry, *, legacy_first: bool = False) -> None:
+    def list(self) -> list[SessionPullRequest]:
+        """Read a locked snapshot with explicit activity before inferred PRs.
+
+        :raises ValueError: If the registry is corrupt or busy.
+        """
+        snapshot = self.snapshot()
+        return snapshot[1] if snapshot is not None else []
+
+    def restore(
+        self,
+        entries: Sequence[dict[str, object]] | None,
+        *,
+        updated_at_ns: int | None = None,
+    ) -> None:
+        """Restore newer server metadata while keeping newer local observations replayable."""
+        if entries is None:
+            return
+        if updated_at_ns is not None:
+            from omnigent.stores.conversation_store.session_prs import validate_session_pr_revision
+
+            updated_at_ns = validate_session_pr_revision(updated_at_ns)
+        references = [SessionPullRequest.model_validate(entry) for entry in entries]
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with FileLock(str(self.path) + ".lock", timeout=1):
+            paths = [path for path in (self.path, self._providers_path) if path.exists()]
+            if paths and (
+                updated_at_ns is None
+                or updated_at_ns <= max(path.stat().st_mtime_ns for path in paths)
+            ):
+                return
+            state = self._read()
+            restored_urls = {entry.url for entry in references}
+            excluded = set(state.excluded) | {entry.url for entry in state.prs}
+            state.excluded = sorted(excluded - restored_urls)
+            state.prs = references
+            self._write(state, after_revision=updated_at_ns or 0)
+
+    def _write(
+        self, state: _Registry, *, legacy_first: bool = False, after_revision: int = 0
+    ) -> None:
         # Old hosts may rewrite this file; keep foreign associations out of it.
         legacy = state.model_copy(
             update={"prs": [pr for pr in state.prs if pr.provider == "github"]}
         )
         if legacy_first:
-            self._write_file(self.path, legacy)
+            self._write_file(self.path, legacy, after_revision=after_revision)
         foreign = [pr for pr in state.prs if pr.provider != "github"]
         if foreign or self._providers_path.exists():
             self._write_file(
                 self._providers_path,
                 _ProviderRegistry(prs=foreign, order=[pr.url for pr in state.prs]),
+                after_revision=after_revision,
             )
         if not legacy_first:
-            self._write_file(self.path, legacy)
+            self._write_file(self.path, legacy, after_revision=after_revision)
 
     @staticmethod
-    def _write_file(path: Path, state: _Associations) -> None:
+    def _write_file(path: Path, state: _Associations, *, after_revision: int = 0) -> None:
+        previous_modified_ns = path.stat().st_mtime_ns if path.exists() else 0
         fd, temporary = tempfile.mkstemp(prefix=".session-prs-", dir=path.parent)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
                 stream.write(state.model_dump_json() + "\n")
                 stream.flush()
                 os.fsync(stream.fileno())
+            modified_ns = max(time.time_ns(), previous_modified_ns + 1, after_revision + 1)
+            os.utime(temporary, ns=(modified_ns, modified_ns))
             os.replace(temporary, path)
         finally:
             Path(temporary).unlink(missing_ok=True)

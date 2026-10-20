@@ -2332,6 +2332,8 @@ class SessionResponse(BaseModel):
     :param todos: Current native Plan items reported by a harness. Each has
         ``content``, ``status``, and ``activeForm``. Persisted in conversation
         metadata; empty before the first report or after an explicit clear.
+    :param pull_requests: Saved PR associations available without the workspace.
+        None before the first report; an empty list records an explicit clear.
     :param model_options: Runner-owned model-picker options for native
         sessions. Claude supplies launch-time gateway aliases; Codex includes
         each model's supported reasoning efforts. Empty while unavailable.
@@ -2413,6 +2415,8 @@ class SessionResponse(BaseModel):
     git_branch: str | None = None
     archived: bool = False
     todos: list[dict[str, Any]] = Field(default_factory=list)
+    pull_requests: list[dict[str, Any]] | None = None
+    pull_requests_updated_at_ns: int | None = None
     model_options: list[NativeModelOption] = Field(default_factory=list)
     inference_configured: bool = False
     inference_error: str | None = None
@@ -3011,6 +3015,7 @@ class SessionListItem(BaseModel):
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False
+    pull_requests: list[dict[str, Any]] | None = None
     comments_count: int = 0
     comments_updated_at: int | None = None
     viewer_last_seen: int | None = None

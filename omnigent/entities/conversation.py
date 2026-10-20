@@ -106,6 +106,8 @@ class Conversation:
         dict when no LLM calls have been recorded yet.
     :param session_todos: Latest native Plan display snapshot, restored after
         Server restart without invoking the harness or replaying task work.
+    :param session_pull_requests: Saved PR associations; None before the first report,
+        empty after an explicit clear. Available without the workspace.
     :param reasoning_effort: Per-session reasoning-effort hint,
         e.g. ``"high"``. ``None`` means use the agent default.
         Set at session creation via ``POST /v1/sessions`` metadata
@@ -246,6 +248,9 @@ class Conversation:
     session_state: dict[str, Any] = field(default_factory=dict)
     session_usage: dict[str, Any] = field(default_factory=dict)
     session_todos: list[dict[str, Any]] = field(default_factory=list)
+    session_pull_requests: list[dict[str, Any]] | None = None
+    session_pull_requests_updated_at_ns: int | None = None
+    session_pr_snapshots: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
     reasoning_effort: str | None = None
     model_override: str | None = None
     inference_snapshot: dict[str, Any] | None = None

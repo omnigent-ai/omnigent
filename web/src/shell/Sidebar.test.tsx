@@ -3586,8 +3586,17 @@ describe("Sidebar view options", () => {
     expect(usePullRequestInfoMock).toHaveBeenCalledWith("conv_gh");
   });
 
-  it("shows the tracked PR number when gh can't resolve its state", async () => {
+  it.each([true, false])("shows a saved PR with workspace present: %s", async (hasWorkspace) => {
     // gh unauthenticated: `pr` is null, but the association carries the number.
+    const prs: PullRequestsModule.PullRequestAssociation[] = [
+      {
+        url: "https://github.com/omnigent-ai/omnigent/pull/7918",
+        host: "github.com",
+        repository: "omnigent-ai/omnigent",
+        number: 7918,
+        relationship: "created",
+      },
+    ];
     usePullRequestInfoMock.mockReturnValue({
       data: {
         object: "session.github.info",
@@ -3596,18 +3605,15 @@ describe("Sidebar view options", () => {
         repo: { name_with_owner: "omnigent-ai/omnigent" },
         pr: null,
         selected_pr_url: "https://github.com/omnigent-ai/omnigent/pull/7918",
-        prs: [
-          {
-            url: "https://github.com/omnigent-ai/omnigent/pull/7918",
-            host: "github.com",
-            repository: "omnigent-ai/omnigent",
-            number: 7918,
-            relationship: "created",
-          },
-        ],
+        prs,
       },
     });
-    mockConversations([conv("conv_assoc", "Codex", { workspace: "/Users/me/omnigent" })]);
+    mockConversations([
+      conv("conv_assoc", "Codex", {
+        workspace: hasWorkspace ? "/Users/me/omnigent" : null,
+        pull_requests: prs,
+      }),
+    ]);
     renderGroupingSidebar();
 
     fireEvent.pointerMove(screen.getByRole("link", { name: "conv_assoc" }), {
@@ -3617,6 +3623,7 @@ describe("Sidebar view options", () => {
       // Number only, no "· Open/Draft" suffix, since there's no resolved state.
       expect(screen.getByTestId("session-tooltip-pr")).toHaveTextContent(/^PR#7918$/);
     });
+    expect(usePullRequestInfoMock).toHaveBeenCalledWith("conv_assoc");
   });
 
   it("skips the GitHub lookup for a session without a workspace", async () => {

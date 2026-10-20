@@ -2973,6 +2973,15 @@ def _pin_claude_permission_launch_args(
     return [*stripped, "--permission-mode", mode]
 
 
+def _session_prs_for_display(prs: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    """Attach server-known provider labels without persisting host preferences."""
+    from omnigent.git_providers import provider_display
+
+    if prs is None:
+        return None
+    return [{**pr, "provider_display": provider_display(pr["provider"])} for pr in prs]
+
+
 async def _handle_external_session_todos(
     session_id: str,
     body: SessionEventInput,

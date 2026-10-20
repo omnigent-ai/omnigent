@@ -517,6 +517,27 @@ Fields:
     key in the existing compressed session-state metadata and updated by
     `external_session_todos` events. Empty before the first Plan update.
 
+  pull_requests (array or null, default `null`)
+    Saved PR associations (`provider`, `host`, `repository`, `number`, `url`,
+    `relationship`, `source`, first/last-seen timestamps, and optional `title`).
+    Available after the sandbox stops and across server restarts. `null` means
+    no snapshot has been reported; `[]` records an explicit clear. The GitHub
+    resource endpoint returns these links with `reason: "workspace_offline"`
+    when neither runner nor host can supply live details. If saved, the same
+    endpoint includes PR summary, comments, checks and reviewers; `/changes`
+    and `/diff` return saved file lists and patches. Each saved response includes
+    `cached: true` and `cached_at` (Unix seconds). Missing or oversized content
+    uses `unavailable_reason: "not_synced" | "too_large"`. Full-file context
+    expansion still requires the workspace. Snapshot bodies and artifact keys
+    are excluded from session detail/list responses.
+    Eligible provider failures return saved changes/diffs with a warning;
+    authorization failures and unassociated PR URLs remain errors.
+
+  pull_requests_updated_at_ns (integer or null, session detail only)
+    Last acknowledged registry revision. Replacement runners retain this floor
+    when restoring PR metadata so reports from a host with a slower clock remain
+    newer than the saved snapshot.
+
   terminal_pending (boolean, default `false`)
     `true` while the runner is auto-creating the terminal for a
     terminal-first session (claude-native / codex-native), so the Web UI
@@ -1101,6 +1122,43 @@ Request body matches `SessionEventInput`:
                                   activeForm: string}]}`.
                                   Malformed items are dropped; item/text/byte
                                   bounds fail the request with 400.
+      - "external_session_prs"
+                                — internal PR association snapshot. Payload:
+                                  `{prs: [...], updated_at_ns: integer}`.
+                                  Requires the session owner or bound runner.
+                                  Revisions are positive 64-bit nanosecond
+                                  timestamps, at most five minutes in the future.
+                                  Stores at most 100 entries / 128 KiB, validates
+                                  HTTPS identities. Session detail and list
+                                  responses expose the saved `pull_requests`.
+                                  Older revisions are ignored; empty clears.
+                                  Unversioned reports remain provisional until a
+                                  versioned report or explicit user update;
+                                  empty legacy reports do not erase saved links.
+                                  Rejected reports return saved associations
+                                  while preserving the live provider context.
+      - "external_session_pr_snapshot"
+                                — internal PR panel cache update. Payload:
+                                  `{pr_url, captured_at_ns, info?, changes?, diff?}`.
+                                  Requires the session owner or bound runner.
+                                  The PR must already belong to the session.
+                                  Capture time is a positive 64-bit nanosecond
+                                  timestamp, at most five minutes in the future.
+                                  Each resource keeps its latest
+                                  capture; newer head/base revisions invalidate
+                                  older file lists and patches. Returns
+                                  `{queued: false, saved: boolean}`.
+                                  Sanitized payloads use the artifact store;
+                                  only references live in existing session
+                                  metadata. Info and changes are capped at
+                                  512 KiB each; patches at 5 MiB. Oversized
+                                  comments are trimmed with `comments_partial`;
+                                  descriptions use `body_partial` when truncated.
+                                  Credentials and host account configuration
+                                  are excluded. Detached PRs and deleted
+                                  sessions release their saved artifacts.
+                                  Saved partial captures use the normal five-minute
+                                  refresh interval; PR activity refreshes sooner.
     The route validates `type` against the conversation entity's item
     discriminator map plus the documented control/internal event types.
     Unknown values fail loud with 400 — they are NOT silently enqueued.

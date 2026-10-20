@@ -7038,6 +7038,21 @@
             ],
             "title": "Project Id"
           },
+          "pull_requests": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pull Requests"
+          },
           "reasoning_effort": {
             "anyOf": [
               {
@@ -7975,6 +7990,34 @@
               }
             ],
             "title": "Project Id"
+          },
+          "pull_requests": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Saved PR associations available without the workspace. None before the first report; an empty list records an explicit clear.",
+            "title": "Pull Requests"
+          },
+          "pull_requests_updated_at_ns": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pull Requests Updated At Ns"
           },
           "reasoning_effort": {
             "anyOf": [
@@ -16497,7 +16540,7 @@
     },
     "/v1/sessions/{session_id}/resources/github": {
       "get": {
-        "description": "Return GitHub context (repo, branch, base ref, PR) for a session.\n\nProxies to the runner, which shells out to `gh`/`git` in the\nworkspace. Returns an `available: false` payload (200) when `gh` is\nmissing or the workspace is not a git repo.\n\n**Returns:** The `session.github.info` object.",
+        "description": "Return GitHub context (repo, branch, base ref, PR) for a session.\n\nReads live provider details through the runner or host. When both are\noffline, returns saved PR links without requiring the workspace.\n\n**Returns:** The `session.github.info` object.",
         "operationId": "get_session_github_v1_sessions__session_id__resources_github_get",
         "parameters": [
           {

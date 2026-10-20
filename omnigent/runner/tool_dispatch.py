@@ -6848,6 +6848,7 @@ async def execute_tool(
 
     if conversation_id and tool_name == "sys_os_shell":
         from omnigent.runner.pr_observer import observe_tool_completion
+        from omnigent.runner.session_pr_sync import sync_session_prs
 
         await asyncio.to_thread(
             observe_tool_completion,
@@ -6858,6 +6859,7 @@ async def execute_tool(
             successful=not output.startswith("Error:"),
             source="runner_shell",
         )
+        await sync_session_prs(conversation_id, server_client, workspace=runner_workspace)
     return output
 
 

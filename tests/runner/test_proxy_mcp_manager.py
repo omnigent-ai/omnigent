@@ -18,6 +18,7 @@ import asyncio
 import json
 from dataclasses import dataclass
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -31,7 +32,9 @@ from omnigent.runner.mcp_execution_registry import (
     McpExecutionResult,
 )
 from omnigent.runner.mcp_manager import McpSchemasResult
+from omnigent.runner.pr_observer import observe_tool_completion
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
+from omnigent.runner.session_prs import SessionPrRegistry
 from omnigent.spec.types import AgentSpec, MCPServerConfig
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -334,6 +337,83 @@ async def test_schemas_for_malformed_rpc_objects_return_failure(
 
 
 # ── call_tool ──────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("route", ["registry", "runner", "retry"])
+@pytest.mark.parametrize(
+    "name,failed,expected_count",
+    [
+        ("create_pull_request", False, 1),
+        ("get_pull_request", False, 0),
+        ("create_pull_request", True, 0),
+    ],
+)
+async def test_proxy_persists_created_prs_before_return(
+    tmp_path, monkeypatch, route, name, failed, expected_count
+) -> None:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "omnigent.runner.session_pr_snapshot_sync.schedule_session_pr_snapshots",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        pending_approvals,
+        "wait_for_user_verdict",
+        AsyncMock(return_value=pending_approvals.Verdict(approved=True)),
+    )
+    url = "https://github.com/example/repo/pull/42"
+    result = {
+        "content": [{"type": "text", "text": json.dumps({"html_url": url})}],
+        "isError": failed,
+    }
+    snapshots = []
+
+    def receive(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        if request.url.path.endswith("/events"):
+            assert payload["type"] == "external_session_prs"
+            snapshots.append(payload["data"])
+            return httpx.Response(200)
+        if route == "retry" and "inputResponses" not in payload["params"]:
+            return httpx.Response(
+                200,
+                json={
+                    "result": {
+                        "resultType": "input_required",
+                        "inputRequests": {"approval": {"params": {}}},
+                        "requestState": "retry-state",
+                    }
+                },
+            )
+        if route == "runner":
+            observe_tool_completion(
+                "session",
+                tool_name=f"github__{name}",
+                arguments={},
+                result=result,
+                source="managed_mcp",
+                successful=not failed,
+            )
+        return httpx.Response(200, json={"result": result})
+
+    config = (
+        MCPServerConfig(name="github", transport="registry")
+        if route == "registry"
+        else (_make_spec("github").mcp_servers[0])
+    )
+    spec = AgentSpec(spec_version=1, name="test", mcp_servers=[config])
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(receive), base_url="http://server"
+    ) as client:
+        manager = ProxyMcpManager("session", client)
+        output = await manager.call_tool(spec, f"github__{name}", {})
+        assert url in output
+    assert len(snapshots) == expected_count
+    assert len(SessionPrRegistry("session").list()) == expected_count
+    if expected_count:
+        assert snapshots[0]["prs"][0]["url"] == url
+        state = json.loads(SessionPrRegistry("session").path.read_text())
+        assert len(state["observations"]) == 1
 
 
 @pytest.mark.asyncio
