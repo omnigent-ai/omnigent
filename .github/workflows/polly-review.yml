@@ -226,7 +226,7 @@ jobs:
 
       - name: Set up Python
         if: steps.creds.outputs.available == 'true'
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
 
@@ -779,7 +779,7 @@ jobs:
       - name: Mint App token
         id: app-token
         if: steps.creds.outputs.available == 'true' && vars.OMNIGENT_BOT_APP_ID != ''
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
           private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
@@ -928,7 +928,7 @@ jobs:
 
       - name: Upload Polly completion receipt
         if: steps.publish.outcome == 'success'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: polly-completed-${{ steps.pr.outputs.pr_number }}-${{ steps.ctx.outputs.head_sha }}
           path: /tmp/polly-completed-sha.txt
@@ -975,7 +975,7 @@ jobs:
 
       - name: Upload Polly diagnostics
         if: always() && (failure() || (steps.polly.outcome != '' && steps.polly.outcome != 'skipped'))
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: polly-review-logs-${{ github.run_id }}
           path: /tmp/polly-diagnostics/

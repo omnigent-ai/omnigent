@@ -886,22 +886,36 @@ class _ReusedDatabricksTokenSource:
         self._server_url = server_url
         self._host = host
         self._auth: _DatabricksBearerAuth | None = None
+        self._failure_logged = False
 
     def _resolve(self) -> _DatabricksBearerAuth | None:
-        """Resolve fresh SDK auth, returning ``None`` on credential failure."""
+        """Resolve fresh SDK auth, returning ``None`` on credential failure.
+
+        Callers proceed unauthenticated on ``None``, so the failure is logged
+        here: it is otherwise the only record of why a request carried no
+        bearer. Only the first failure since the last successful resolution is
+        logged, since a failing source is re-resolved on every mint.
+        """
         try:
             if self._host is not None:
-                return _resolve_databricks_auth(host=self._host)[0]
-            from omnigent.cli_auth import load_databricks_workspace_host
+                auth = _resolve_databricks_auth(host=self._host)[0]
+            else:
+                from omnigent.cli_auth import load_databricks_workspace_host
 
-            workspace_host = (
-                load_databricks_workspace_host(self._server_url) if self._server_url else None
-            )
-            if workspace_host is not None:
-                return _resolve_databricks_auth(host=workspace_host)[0]
-            return _resolve_databricks_auth()[0]
-        except (DatabricksAuthError, ImportError, ValueError):
+                workspace_host = (
+                    load_databricks_workspace_host(self._server_url) if self._server_url else None
+                )
+                if workspace_host is not None:
+                    auth = _resolve_databricks_auth(host=workspace_host)[0]
+                else:
+                    auth = _resolve_databricks_auth()[0]
+        except (DatabricksAuthError, ImportError, ValueError) as exc:
+            if not self._failure_logged:
+                self._failure_logged = True
+                logger.info("Databricks SDK auth unavailable: %s: %s", type(exc).__name__, exc)
             return None
+        self._failure_logged = False
+        return auth
 
     def current_token(self) -> str | None:
         """Mint a token, resolving auth lazily and retrying once if it is stale."""

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "omnigent"
 # Keep in sync with omnigent/version.py's VERSION constant.
-version = "0.19.0.dev0"
+version = "0.20.0.dev0"
 description = "Omnigent: declarative agent authoring and runtime framework"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -26,8 +26,8 @@ dependencies = [
     # one version, so a published `omnigent==X` must resolve the SDK wheels
     # built alongside it (release-omnigent.yml verifies these pins match the
     # release tag). Local/editable installs still resolve via tool.uv.sources.
-    "omnigent-client==0.19.0.dev0",
-    "omnigent-ui-sdk==0.19.0.dev0",
+    "omnigent-client==0.20.0.dev0",
+    "omnigent-ui-sdk==0.20.0.dev0",
     # Merged from omnigent + omnigent.
     "pyyaml>=6.0,<7",
     # OpenClaw stores its wrapped acpx registry as JSON5.
@@ -36,7 +36,7 @@ dependencies = [
     # Keep this cap until the websockets<15 compatibility pin can be lifted.
     "openai>=1.0,<2.45",
     # >=14: the `e2b` extra's SDK (>=2.26) needs rich>=14 (was >=13,<14).
-    "rich>=14,<15",
+    "rich>=14,<16",
     "prompt_toolkit>=3.0,<4",
     "mcp>=1.0,<2",
     "starlette>=1.0.1,<2",
@@ -69,7 +69,7 @@ dependencies = [
     # omnigent deps (runtime, spec, server, persistent terminal, etc.).
     "alembic>=1.0,<2",
     "anyio>=4.0,<5",
-    "cachetools>=5.0,<7",
+    "cachetools>=5.0,<8",
     "filelock>=3.0",
     # _HostGroup (omnigent/cli.py) rewrites a leading positional server URL
     # into `--server` before Click parses it, so it no longer depends on
@@ -99,12 +99,12 @@ dependencies = [
     "claude-agent-sdk>=0.1.62",
     "openai-agents>=0.0.17",
     "PyJWT[crypto]>=2.8,<3",
-    "argon2-cffi>=23.1,<24",
+    "argon2-cffi>=23.1,<26",
     # PEP 440 version comparison for the update check / `omni upgrade`
     # (omnigent/update_check.py, omnigent/cli.py): compares the installed
     # version against the latest PyPI release. Previously only a
     # transitive dep; pinned here now that we import it directly.
-    "packaging>=23,<26",
+    "packaging>=23,<27",
     # CA root bundle for client TLS verification (omnigent/tls.py,
     # omnigent/inner/egress/ca.py). Required as a real fallback on uv /
     # python-build-standalone interpreters whose OpenSSL has no default cert
@@ -283,7 +283,7 @@ nimble = ["nimble-python>=1.2.0,<2"]
 # (`omnigent-client`, `omnigent-ui-sdk`) and the sub-package's own
 # `[project].version` in `integrations/slack/pyproject.toml`.
 slack = [
-    "omnigent-slack==0.19.0.dev0",
+    "omnigent-slack==0.20.0.dev0",
 ]
 # PostgreSQL storage backend. The server builds a psycopg engine whenever
 # the database URI is Postgres (``OMNIGENT_DATABASE_URI=postgresql+psycopg://…``
@@ -354,11 +354,11 @@ test = [
     # `[tool.coverage.run]` below for the relative-files setting that makes
     # cross-runner combine work.
     "pytest-cov>=5",
-    "pytest-playwright>=0.7",
+    # Isolated pytest subprocesses use the plugin's built-in base-URL support.
+    "pytest-playwright>=0.10",
     # Visual-regression snapshot plugin for the e2e_ui suite. Provides the
     # `assert_snapshot` fixture + `--update-snapshots` flag the UI diff gate
     # uses (see tests/e2e_ui/visual/ and .github/workflows/ui-snapshot.yml).
-    # Requires pytest-playwright>=0.7 (hence the floor bump above).
     "pytest-playwright-visual-snapshot>=0.5.1",
     # Hash-partition the test suite across N shards for the nightly
     # matrix. Pinned to a known-stable older release. Used by e2e.yml;

@@ -906,6 +906,11 @@ _SUBAGENT_FORWARD_RECONNECT_WAIT_S = 5.0
 
 # custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _managed_launch_tasks: set[asyncio.Task[None]] = set()
+# The subset not yet bound to their host. Shutdown waits for these: once a
+# session is bound, whichever replica its host tunnels to finishes the launch.
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
+_unbound_managed_launch_tasks: set[asyncio.Task[Any]] = set()
+_MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S = 5.0
 
 
 _RUNNER_SESSION_INIT_TIMEOUT_S = 10.0
@@ -1176,6 +1181,7 @@ __all__ = [
     "_LAST_TASK_ERROR_MESSAGE_LABEL_KEY",
     "_LAST_TASK_ERROR_REMEDIATION_LABEL_KEY",
     "_LAST_TASK_ERROR_TITLE_LABEL_KEY",
+    "_MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S",
     "_MANAGED_RESUMABLE_TUNNEL_STALE_S",
     "_MAX_TERMINAL_LAUNCH_ARGS",
     "_MAX_TERMINAL_LAUNCH_ARG_LEN",
@@ -1253,6 +1259,7 @@ __all__ = [
     "_session_sandbox_status_cache",
     "_session_status_cache",
     "_session_terminal_pending_cache",
+    "_unbound_managed_launch_tasks",
     "get_server_host_registry",
     "get_server_runner_router",
     "host_interactive_shells_for_request",

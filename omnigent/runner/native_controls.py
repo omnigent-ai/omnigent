@@ -1450,6 +1450,7 @@ def build_native_controls(
     ) -> Response:
         from omnigent.harnesses.claude_native.bridge import (
             SWITCH_MODEL_DIALOG_HINT,
+            ClaudeInjectionCancelled,
             ClaudePromptTimeout,
             ClaudeUserPromptPending,
             bridge_dir_for_bridge_id,
@@ -1621,6 +1622,10 @@ def build_native_controls(
         if wait_error is not None:
             return _model_failed(wait_error)
         baseline = await asyncio.to_thread(read_claude_status_model, bridge_dir)
+
+        def _switched(current: str | None) -> bool:
+            return bool(current and (current in expected or (baseline and current != baseline)))
+
         try:
             # A boot that used the prompt budget still leaves the injection a
             # short wait for a torn capture right after the prompt rendered.
@@ -1629,6 +1634,12 @@ def build_native_controls(
             )
         except ClaudeUserPromptPending:
             return _switch_once_answered()
+        except ClaudeInjectionCancelled as exc:
+            # The budget can lapse in the dialog watch after ``/model`` was submitted;
+            # a pane that already switched must not be rolled back. Read only, no keys.
+            if _switched(await asyncio.to_thread(read_claude_status_model, bridge_dir)):
+                return Response(status_code=204)
+            return _model_failed(exc)
         except (RuntimeError, ValueError, OSError) as exc:
             return _model_failed(exc)
         # Verify against the statusLine snapshot the forwarder already polls:
@@ -1644,7 +1655,7 @@ def build_native_controls(
         was_busy = _native_pane_status.get(conv_id) in ("running", "waiting")
         while True:
             current = await asyncio.to_thread(read_claude_status_model, bridge_dir)
-            if current and (current in expected or (baseline and current != baseline)):
+            if _switched(current):
                 # The pane switched. When it landed somewhere other than the
                 # expected spelling, the forwarder's verbatim report is the
                 # truth the UI will settle on — the command still took effect.

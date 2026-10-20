@@ -65,7 +65,7 @@ def _service_for_current_platform() -> HostService:
 def _service_command(server_url: str | None) -> list[str]:
     """Build the persistent service entry-point command."""
     mode = ["--server", server_url] if server_url else ["--local"]
-    return [sys.executable, "-m", "omnigent.host.service_entry", *mode]
+    return [sys.executable, "-P", "-m", "omnigent.host.service_entry", *mode]
 
 
 def _clean_environment(environment: Mapping[str, str]) -> dict[str, str]:

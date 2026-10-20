@@ -1754,7 +1754,11 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     def run_tmux(socket_path: str, *args: str) -> None:
         nonlocal pane, enters, prompt_pending
         del socket_path
-        if args[0] == "paste-buffer":
+        if args[-1] == "Space":
+            pane = "──────\n❯ \n──────\n"
+        elif args[0] == "send-keys" and "-l" in args:
+            pane = "❯ "
+        elif args[0] == "paste-buffer":
             pane = "❯ review this function"
             prompt_pending = not submitted
         elif args[-1] == "Enter":

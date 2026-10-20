@@ -1,3 +1,4 @@
+import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Mirrors sdks/python-client/omnigent_client/_events.py.
 //
 // Hand-ported. When _events.py changes, update this file and the
@@ -180,6 +181,7 @@ export interface PolicyDenied {
 }
 
 export interface ElicitationRequest {
+  nativeDelivery?: NativePermissionDelivery;
   type: "elicitation_request";
   elicitationId: string;
   /**
