@@ -256,10 +256,13 @@ def test_file_viewer_download_saves_the_complete_file(
     viewer = rail.get_by_test_id("file-viewer")
     expect(viewer).to_be_visible()
     if file_name.endswith(".md"):
-        editor = viewer.locator(".tiptap")
+        editor = viewer.locator(".monaco-editor")
         expect(editor).to_be_visible(timeout=30_000)
-        expect(editor).to_have_attribute("contenteditable", "false")
-        assert editor.evaluate("el => el.textContent.length") == _MAX_READ_BYTES
+        editor.locator(".view-lines").click()
+        page.keyboard.type("x")
+        expect(editor.get_by_text("Cannot edit in read-only editor")).to_be_visible()
+        page.keyboard.press("Escape")
+        expect(viewer.locator(".tiptap")).to_have_count(0)
         expect(viewer.get_by_text("too large to load fully", exact=False)).to_be_visible()
     rail.get_by_role("button", name="View settings").click()
     with page.expect_download() as download_info:

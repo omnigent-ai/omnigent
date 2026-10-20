@@ -24,6 +24,8 @@ import {
   useNavigate,
   useSearchParams,
 } from "react-router-dom";
+import { setEmbedRoot } from "@/lib/host";
+import { EmbeddedProvider } from "@/lib/embedded";
 import { RoutingProvider, reactRouterRouting, type RoutingApi } from "@/lib/routing";
 import { useFileViewer } from "./FileViewerContext";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -2712,6 +2714,75 @@ describe("Extension pages own the header", () => {
 });
 
 describe("Right workspace card visibility", () => {
+  it.each([true, false])(
+    "waits for capabilities before validating restored search (enabled=%s)",
+    async (enabled) => {
+      mockConversations([{ id: "conv_restore_search", permission_level: null }]);
+      writeSessionWorkspaceState("conv_restore_search", {
+        open: true,
+        rightRailTab: "content-search",
+      });
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const tree = (info: ServerInfo | "loading") => (
+        <CapabilitiesProvider info={info}>
+          {sessionShellTree(client, "/c/conv_restore_search")}
+        </CapabilitiesProvider>
+      );
+      const { rerender } = render(tree("loading"));
+      expect(readSessionWorkspaceState("conv_restore_search").rightRailTab).toBe("content-search");
+      rerender(tree(serverInfo({ features: { workspace_content_search: enabled } })));
+      await waitFor(() =>
+        expect(
+          screen.getByRole("tab", { name: enabled ? "Content search" : "Files" }),
+        ).toHaveAttribute("aria-selected", "true"),
+      );
+      expect(readSessionWorkspaceState("conv_restore_search").rightRailTab).toBe(
+        enabled ? "content-search" : "files",
+      );
+    },
+  );
+
+  it.each(["MacIntel", "Win32"])(
+    "opens content search, focuses its input and preserves the query on %s",
+    async (platform) => {
+      vi.spyOn(navigator, "platform", "get").mockReturnValue(platform);
+      writeWorkspacePanelDefault("collapsed");
+      mockConversations([{ id: "conv_search_hotkey", permission_level: null }]);
+      renderShell(
+        "/c/conv_search_hotkey",
+        serverInfo({ features: { workspace_content_search: true } }),
+      );
+      expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+      const chord = {
+        code: "KeyF",
+        shiftKey: true,
+        metaKey: platform === "MacIntel",
+        ctrlKey: platform !== "MacIntel",
+      };
+      fireEvent.keyDown(document, chord);
+      const input = await screen.findByRole("searchbox", { name: "Search file contents" });
+      await waitFor(() => expect(input).toHaveFocus());
+      expect(screen.getByRole("tab", { name: "Content search" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      fireEvent.change(input, { target: { value: "keep my query" } });
+      screen.getByRole("button", { name: "Search" }).focus();
+      fireEvent.keyDown(document.activeElement!, chord);
+      await waitFor(() => expect(input).toHaveFocus());
+      expect(input).toHaveValue("keep my query");
+
+      fireEvent.mouseDown(screen.getByRole("tab", { name: "Files" }), { button: 0 });
+      fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
+      expect(screen.getByTestId("file-viewer-inline")).toBeInTheDocument();
+      fireEvent.keyDown(document, chord);
+      await waitFor(() => expect(input).toHaveFocus());
+      expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+      expect(screen.getByTestId("url-params")).not.toHaveTextContent("file=");
+      expect(input).toHaveValue("keep my query");
+    },
+  );
+
   it("restores each Canvas card's saved Workspace choice", async () => {
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null, home: null },
@@ -5542,5 +5613,38 @@ describe("AppShell design-mode submission", () => {
       expect.stringContaining("A later instruction without a new screenshot"),
       undefined,
     );
+  });
+});
+
+describe("new-session browser shortcut", () => {
+  it.each([false, true])("works from the composer with embedded=%s", (embedded) => {
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const app = embedded ? (
+      <EmbeddedProvider>
+        <AppShell />
+      </EmbeddedProvider>
+    ) : (
+      <AppShell />
+    );
+    const view = render(
+      shellTree(
+        client,
+        "/c/conv_abc",
+        <>
+          <Route index element={<p>New session route</p>} />
+          <Route path="c/:conversationId" element={<textarea aria-label="Message" />} />
+        </>,
+        app,
+      ),
+    );
+    if (embedded) setEmbedRoot(view.container);
+    const composer = screen.getByRole("textbox", { name: "Message" });
+    composer.focus();
+    fireEvent.keyDown(composer, { code: "KeyN", ctrlKey: true, altKey: true });
+    expect(screen.queryByText("New session route")).toBeNull();
+    fireEvent.keyDown(composer, { key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
+    expect(screen.getByText("New session route")).toBeInTheDocument();
+    setEmbedRoot(null);
   });
 });

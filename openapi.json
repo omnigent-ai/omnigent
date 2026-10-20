@@ -15425,6 +15425,100 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/resources/environments/{environment_id}/content-search": {
+      "get": {
+        "description": "Search the session workspace with the same access gate as file reads.",
+        "operationId": "search_environment_content_v1_sessions__session_id__resources_environments__environment_id__content_search_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "title": "Environment Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "maxLength": 4096,
+              "minLength": 1,
+              "pattern": ".*\\S.*",
+              "title": "Q",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "case_sensitive",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Case Sensitive",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "regex",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Regex",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Search Environment Content",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/resources/environments/{environment_id}/filesystem": {
       "get": {
         "description": "List root directory of an environment.\n\n**Returns:** PaginatedList of filesystem entries.",

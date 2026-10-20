@@ -106,6 +106,7 @@ import {
   detectLang,
   isBinaryPath,
   isImageFile,
+  isMarkdownTooLargeForRichView,
   isModelFile,
   isNotebookPath,
   isPdfFile,
@@ -687,7 +688,26 @@ function FileViewerBody({
   // View mode toggle — markdown defaults to the rich-text editor, HTML and
   // notebooks to their rendered preview, and everything else to source.
   const lang = detectLang(path);
-  const isPreviewable = lang === "markdown" || lang === "html" || isNotebookPath(path);
+  const [markdownRouting, setMarkdownRouting] = useState<{
+    conversationId: string;
+    path: string;
+    source: boolean | undefined;
+  }>({ conversationId, path, source: undefined });
+  // Choose once per file visit so an autosave crossing the limit cannot
+  // replace the editor while it contains newer unsaved edits.
+  let markdownSourceFallback = markdownRouting.source;
+  if (
+    markdownRouting.conversationId !== conversationId ||
+    markdownRouting.path !== path ||
+    (markdownRouting.source === undefined && fileQuery.data !== undefined)
+  ) {
+    markdownSourceFallback = fileQuery.data
+      ? isMarkdownTooLargeForRichView(lang, fileContent)
+      : undefined;
+    setMarkdownRouting({ conversationId, path, source: markdownSourceFallback });
+  }
+  const isPreviewable =
+    (lang === "markdown" && !markdownSourceFallback) || lang === "html" || isNotebookPath(path);
   // Images and PDFs render through CodeViewer's own viewers regardless of view
   // mode; they have no source/diff representation, so diff is suppressed for
   // them (Monaco would otherwise render the base64 payload as garbage text).
@@ -885,7 +905,7 @@ function FileViewerBody({
   // would swallow the browser's find-in-page with no find widget to show.
   const isMonacoFindSurface =
     diffViewActive ||
-    (lang !== "markdown" &&
+    ((lang !== "markdown" || markdownSourceFallback) &&
       viewMode !== "preview" &&
       !isImage &&
       !isPdf &&
@@ -1052,7 +1072,7 @@ function FileViewerBody({
     menu?: ToolbarOption[];
   }
   const toolbarActions: ToolbarAction[] = [];
-  if (lang === "markdown" && viewMode !== "diff") {
+  if (lang === "markdown" && !markdownSourceFallback && viewMode !== "diff") {
     // Markdown is a segmented control over three reachable modes: the rich-text
     // Editor (default), the rendered Preview, and raw Source. Switching away
     // from the editor must guard unsaved edits; the read-only preview/source
@@ -1709,6 +1729,7 @@ function FileViewerBody({
               searchFocusNonce={searchFocusNonce}
               searchInputRef={searchInputRef}
               viewMode={viewMode}
+              markdownSourceFallback={markdownSourceFallback ?? false}
               tocOpen={tocOpen}
               onTocToggle={() => setTocOpen((prev) => !prev)}
               onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}

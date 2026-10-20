@@ -1066,7 +1066,7 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
         except click.ClickException as exc:
             # Provider errors echo the failed command, and this one carries the token.
             # Redact in place so subclasses such as SandboxGoneError keep their type.
-            exc.message = exc.message.replace(token, "[redacted]")
+            exc.message = exc.message.replace(token, "[redacted]")  # type: ignore[read-only]
             exc.args = (exc.message,)
             raise exc from None
         return workspace

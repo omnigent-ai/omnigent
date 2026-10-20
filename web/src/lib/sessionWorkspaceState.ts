@@ -15,7 +15,12 @@ const WORKSPACE_PANEL_TABS: readonly DefaultWorkspaceTab[] = [
   "github",
   "subagents",
 ];
-const RAIL_TABS: readonly RightRailTab[] = [...WORKSPACE_PANEL_TABS, "browser", "sidechat"];
+const RAIL_TABS: readonly RightRailTab[] = [
+  ...WORKSPACE_PANEL_TABS,
+  "browser",
+  "sidechat",
+  "content-search",
+];
 
 export interface SessionWorkspaceState {
   /** Whether the rail was left open in this session. */
