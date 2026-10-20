@@ -96,6 +96,7 @@ from omnigent.inner.codex_executor import (
     codex_router_hooks_settings,
     codex_router_session_id,
     codex_routing_hook_skip_reason,
+    drop_unparseable_model_catalog,
     materialize_codex_provider_config,
     read_codex_model_catalog,
     write_codex_hooks_file,
@@ -2111,7 +2112,7 @@ class CodexNativeAppServer:
             extend_model_catalog=codex_extended_catalog_requested(self.env),
             supported_efforts=CODEX_NATIVE_EFFORTS,
             minimal_config=minimal_config,
-            codex_path=self.codex_path,
+            validate_model_catalog=False,
         )
         compose_profile_instructions = _materialize_codex_profile_for_start(
             self.codex_home,
@@ -2154,6 +2155,10 @@ class CodexNativeAppServer:
         self.config_overrides = materialize_codex_provider_config(
             self.codex_home,
             self.config_overrides,
+        )
+        # Checked last: a selected profile file can bring its own catalog.
+        await asyncio.to_thread(
+            drop_unparseable_model_catalog, self.codex_home / "config.toml", self.codex_path
         )
         if codex_version is not None and not policy_hooks_supported:
             self._disable_policy_hook(

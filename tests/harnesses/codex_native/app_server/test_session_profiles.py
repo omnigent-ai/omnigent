@@ -305,3 +305,38 @@ def test_remote_codex_rejects_unmaterialized_provider_config() -> None:
             remote_url="ws://127.0.0.1:9876",
             config_overrides=(provider_override,),
         )
+
+
+async def test_the_catalog_check_reads_the_config_a_selected_profile_produced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A profile file can bring its own catalog, so startup checks the final config."""
+    from omnigent.harnesses.codex_native import app_server
+
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    (real_codex_home / "config.toml").write_text('model = "gpt-5.5"\n', encoding="utf-8")
+    (real_codex_home / "work.config.toml").write_text(
+        'model_catalog_json = "/profile/catalog.json"\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    _disable_codex_startup_rpc(monkeypatch)
+    _stub_model_catalog_probe(monkeypatch)
+    checked: list[str] = []
+
+    def _record(config_path: Path, codex_path: str | None) -> bool:
+        del codex_path
+        checked.append(config_path.read_text(encoding="utf-8"))
+        return False
+
+    monkeypatch.setattr(app_server, "drop_unparseable_model_catalog", _record)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
+    server.config_profile = "work"
+
+    await server.start()
+    await server.close()
+
+    [final_config] = checked
+    assert "/profile/catalog.json" in final_config

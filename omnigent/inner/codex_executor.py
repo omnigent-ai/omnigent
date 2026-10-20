@@ -1117,6 +1117,7 @@ def _populate_codex_home_config(
     include_credentials: bool = True,
     required_brokered_probe: tuple[str, Path, OSEnvSpec] | None = None,
     codex_path: str | None = None,
+    validate_model_catalog: bool = True,
 ) -> None:
     """
     Bridge user config files from the real ``CODEX_HOME`` into the temp one.
@@ -1169,6 +1170,9 @@ def _populate_codex_home_config(
         sandbox used to write a network-denied bundled catalog.
     :param codex_path: The codex binary the session launches, used to check a
         copied ``model_catalog_json``; ``None`` resolves it from ``PATH``.
+    :param validate_model_catalog: Drop a ``model_catalog_json`` Codex cannot
+        parse. A caller that rewrites the config afterwards passes ``False`` and
+        calls :func:`drop_unparseable_model_catalog` on the final file.
     """
     if required_brokered_probe is not None:
         codex_path, cwd, os_env = required_brokered_probe
@@ -1280,7 +1284,6 @@ def _populate_codex_home_config(
         shutil.copy2(source_file, dest_path)
         if filename == "config.toml":
             _normalize_copied_codex_effort(dest_path, supported_efforts=supported_efforts)
-            drop_unparseable_model_catalog(dest_path, codex_path or _find_codex_cli())
             if extend_model_catalog:
                 # Routed turns and spawns can land on an arm codex's bundled
                 # catalog has no entry for, which it then refuses client-side.
@@ -1289,6 +1292,9 @@ def _populate_codex_home_config(
                 )
                 if catalog_path is not None:
                     set_codex_model_catalog_path(dest_path, catalog_path)
+    if validate_model_catalog:
+        # A reused private home keeps its copy, so check it on every start.
+        drop_unparseable_model_catalog(target_dir / "config.toml", codex_path or _find_codex_cli())
 
 
 def materialize_codex_provider_config(
@@ -2048,7 +2054,7 @@ def drop_unparseable_model_catalog(
     """
     import tomlkit
 
-    if codex_path is None:
+    if codex_path is None or not config_path.is_file():
         return False
     try:
         document = tomlkit.parse(config_path.read_text(encoding="utf-8"))
@@ -2062,13 +2068,22 @@ def drop_unparseable_model_catalog(
     ]
     if not any("model_catalog_json" in table for table in tables):
         return False
+    # Only parsing is under test, so the probe gets no inherited credentials.
+    env = {
+        name: value
+        for name in ("PATH", "LANG", "LC_ALL", "TZ")
+        if (value := os.environ.get(name)) is not None
+    }
+    env.setdefault("PATH", os.defpath)
+    env["HOME"] = env["CODEX_HOME"] = str(config_path.parent)
     try:
         completed = subprocess.run(
             [codex_path, "debug", "models"],
             capture_output=True,
+            stdin=subprocess.DEVNULL,
             text=True,
             timeout=timeout,
-            env={**os.environ, "CODEX_HOME": str(config_path.parent)},
+            env=env,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):

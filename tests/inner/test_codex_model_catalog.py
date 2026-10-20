@@ -522,11 +522,16 @@ def test_required_brokered_catalog_write_failure_leaves_no_partial_file(
 
 
 def _fake_codex(tmp_path: Path, *, stderr: str, returncode: int) -> str:
-    """A codex binary whose ``debug models`` answers with *stderr* and *returncode*."""
+    """A codex binary whose ``debug models`` answers with *stderr* and *returncode*.
+
+    Each run appends its environment to ``probe-env.jsonl`` beside the script.
+    """
     script = tmp_path / "codex"
+    env_log = tmp_path / "probe-env.jsonl"
     script.write_text(
         f"#!{sys.executable}\n"
-        "import os, sys\n"
+        "import json, os, sys\n"
+        f"open({str(env_log)!r}, 'a').write(json.dumps(dict(os.environ)) + '\\n')\n"
         "home = os.environ['CODEX_HOME']\n"
         f"sys.stderr.write({stderr!r}.replace('{{home}}', home))\n"
         f"sys.exit({returncode})\n"
@@ -631,3 +636,67 @@ def test_a_config_without_a_catalog_never_runs_the_check(
     )
 
     assert tomllib.loads(private.read_text())["model"] == "m"
+
+
+def _unparseable(catalog: Path) -> str:
+    return f"Error: failed to parse model_catalog_json path `{catalog}` as JSON: x\n"
+
+
+def test_the_catalog_check_gets_no_inherited_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-denied")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-denied")
+    catalog = tmp_path / "old.json"
+    catalog.write_text("{}")
+    codex = _fake_codex(tmp_path, stderr=_unparseable(catalog), returncode=1)
+
+    private = _populate_with_user_catalog(
+        tmp_path, codex, f'model_catalog_json = "{catalog}"\n\n{_PROVIDER_TABLE}'
+    )
+
+    [probe_env] = [
+        json.loads(line) for line in (tmp_path / "probe-env.jsonl").read_text().splitlines()
+    ]
+    assert "OPENAI_API_KEY" not in probe_env
+    assert "DATABRICKS_TOKEN" not in probe_env
+    assert probe_env["CODEX_HOME"] == probe_env["HOME"] == str(private.parent)
+    assert "model_catalog_json" not in tomllib.loads(private.read_text())
+
+
+def test_a_reused_private_home_is_repaired(tmp_path: Path) -> None:
+    # A persisted home keeps its earlier copy, so the check cannot rely on a fresh copy.
+    catalog = tmp_path / "old.json"
+    catalog.write_text("{}")
+    codex = _fake_codex(tmp_path, stderr=_unparseable(catalog), returncode=1)
+    source = tmp_path / "user-codex"
+    source.mkdir()
+    (source / "config.toml").write_text(_PROVIDER_TABLE)
+    target = tmp_path / "private"
+    target.mkdir()
+    (target / "config.toml").write_text(f'model_catalog_json = "{catalog}"\n\n{_PROVIDER_TABLE}')
+
+    codex_executor._populate_codex_home_config(target, source, codex_path=codex)
+
+    document = tomllib.loads((target / "config.toml").read_text())
+    assert "model_catalog_json" not in document
+    assert document["model_providers"]["Databricks"]["name"] == "Databricks"
+
+
+def test_a_caller_that_rewrites_the_config_can_defer_the_check(tmp_path: Path) -> None:
+    catalog = tmp_path / "old.json"
+    catalog.write_text("{}")
+    codex = _fake_codex(tmp_path, stderr=_unparseable(catalog), returncode=1)
+    source = tmp_path / "user-codex"
+    source.mkdir()
+    (source / "config.toml").write_text(f'model_catalog_json = "{catalog}"\n')
+    target = tmp_path / "private"
+    target.mkdir()
+
+    codex_executor._populate_codex_home_config(
+        target, source, codex_path=codex, validate_model_catalog=False
+    )
+
+    assert not (tmp_path / "probe-env.jsonl").exists()
+    assert codex_executor.drop_unparseable_model_catalog(target / "config.toml", codex) is True
+    assert "model_catalog_json" not in tomllib.loads((target / "config.toml").read_text())
