@@ -11,7 +11,7 @@ openai-agents wrap; see the claude-sdk module for the config-flow rationale.
 Like that wrap, this is an in-process SDK harness (no CLI/sandbox subprocess),
 though the SDK itself launches a native ``localharness`` binary needing a
 recent glibc (see the executor note). Auth is Gemini-native (API key or
-Vertex AI), so there are no ``*_GATEWAY_*`` env vars.
+Vertex AI) or Databricks Unity Gateway's native Gemini route.
 
 Env vars read at startup:
 
@@ -27,6 +27,15 @@ Env vars read at startup:
   e.g. ``"my-gcp-project"``.
 - ``HARNESS_ANTIGRAVITY_LOCATION``: GCP region for the Vertex AI path,
   e.g. ``"us-central1"``.
+- ``HARNESS_ANTIGRAVITY_GATEWAY_BASE_URL``: Unity Gateway Gemini route, e.g.
+  ``"https://example.cloud.databricks.com/ai-gateway/gemini"``. Set when the
+  spec declares ``executor.auth: {type: databricks, …}``; every model call then
+  goes to the gateway instead of Google.
+- ``HARNESS_ANTIGRAVITY_DATABRICKS_PROFILE``: Databricks CLI profile the
+  gateway bearer token is minted from, e.g. ``"DEFAULT"``.
+- ``HARNESS_DATABRICKS_MODEL_PROVIDER_SERVICE``: optional Unity Gateway model
+  provider service sent on every gateway request, e.g.
+  ``"main.ai.gemini_prod"``.
 """
 
 from __future__ import annotations
@@ -49,6 +58,8 @@ _ENV_API_KEY = "HARNESS_ANTIGRAVITY_API_KEY"
 _ENV_VERTEX = "HARNESS_ANTIGRAVITY_VERTEX"
 _ENV_PROJECT = "HARNESS_ANTIGRAVITY_PROJECT"
 _ENV_LOCATION = "HARNESS_ANTIGRAVITY_LOCATION"
+_ENV_GATEWAY_BASE_URL = "HARNESS_ANTIGRAVITY_GATEWAY_BASE_URL"
+_ENV_DATABRICKS_PROFILE = "HARNESS_ANTIGRAVITY_DATABRICKS_PROFILE"
 
 # Truthy spellings accepted for the boolean Vertex flag.
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
@@ -69,6 +80,8 @@ def _build_antigravity_executor() -> Executor:
         vertex=os.environ.get(_ENV_VERTEX, "").strip().lower() in _TRUTHY,
         project=os.environ.get(_ENV_PROJECT) or None,
         location=os.environ.get(_ENV_LOCATION) or None,
+        gateway_base_url=os.environ.get(_ENV_GATEWAY_BASE_URL) or None,
+        databricks_profile=os.environ.get(_ENV_DATABRICKS_PROFILE) or None,
     )
 
 

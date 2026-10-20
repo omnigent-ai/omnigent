@@ -13,7 +13,6 @@ Unit test — no subprocess spawn, no real httpx.
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -161,18 +160,32 @@ def test_vertex_config_threads_project_and_location() -> None:
     assert env["HARNESS_ANTIGRAVITY_LOCATION"] == "us-central1"
 
 
-def test_databricks_auth_ignored_with_warning(caplog: pytest.LogCaptureFixture) -> None:
-    """``DatabricksAuth`` is unsupported: no env var emitted, and a warning logged."""
-    with caplog.at_level(logging.WARNING, logger=wf.__name__):
-        env = _build_antigravity_spawn_env(
-            _make_spec(model="gemini-3-pro", auth=DatabricksAuth(profile="dev"))
+def test_databricks_auth_routes_through_gemini_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``DatabricksAuth`` targets the profile workspace's native Gemini gateway route."""
+    monkeypatch.setattr(
+        wf,
+        "get_workspace_url_for_profile",
+        lambda profile: "https://example.cloud.databricks.com/",
+    )
+    env = _build_antigravity_spawn_env(
+        _make_spec(model="gemini-3.8-flash", auth=DatabricksAuth(profile="dev"))
+    )
+    assert env == {
+        "HARNESS_ANTIGRAVITY_MODEL": "gemini-3.8-flash",
+        "HARNESS_ANTIGRAVITY_GATEWAY_BASE_URL": (
+            "https://example.cloud.databricks.com/ai-gateway/gemini"
+        ),
+        "HARNESS_ANTIGRAVITY_DATABRICKS_PROFILE": "dev",
+    }
+
+
+def test_databricks_auth_unknown_profile_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A profile with no workspace host fails at spawn rather than calling Google."""
+    monkeypatch.setattr(wf, "get_workspace_url_for_profile", lambda profile: None)
+    with pytest.raises(OmnigentError, match="databricks auth login --profile nope"):
+        _build_antigravity_spawn_env(
+            _make_spec(model="gemini-3.8-flash", auth=DatabricksAuth(profile="nope"))
         )
-    # No Databricks profile var — antigravity has no Databricks/gateway path.
-    assert "HARNESS_ANTIGRAVITY_DATABRICKS_PROFILE" not in env
-    assert "HARNESS_ANTIGRAVITY_API_KEY" not in env
-    # The user is told their Databricks auth was ignored rather than silently
-    # dropped (which would look like the key "didn't take").
-    assert any("Databricks" in rec.message for rec in caplog.records)
 
 
 def test_legacy_profile_is_ignored() -> None:
@@ -277,6 +290,9 @@ def test_databricks_auth_does_not_adopt_stored_key(
     """
     monkeypatch.setenv("GEMINI_KEY_SRC", "AIza_stored_123")
     _write_antigravity_config(_isolate_global_config, "env:GEMINI_KEY_SRC")
+    monkeypatch.setattr(
+        wf, "get_workspace_url_for_profile", lambda profile: "https://example.cloud.databricks.com"
+    )
     env = _build_antigravity_spawn_env(
         _make_spec(model="gemini-3-pro", auth=DatabricksAuth(profile="oss"))
     )

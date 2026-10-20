@@ -10,7 +10,7 @@ Wraps a :class:`omnigent.inner.copilot_executor.CopilotExecutor`, which drives
 a persistent GitHub Copilot SDK (``github-copilot-sdk``) session. Mirrors the
 cursor / antigravity wraps' env-var config flow.
 
-Like cursor and antigravity, copilot has NO gateway / Databricks-profile env
+Like cursor, copilot has NO gateway / Databricks-profile env
 vars: the Copilot SDK talks only to GitHub's Copilot backend (authenticated by a
 GitHub token) and has no custom API base-URL override, so there is nothing for
 the workflow layer to route through the Databricks Unity Gateway.
