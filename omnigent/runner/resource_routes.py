@@ -1898,6 +1898,7 @@ def register_resource_routes(
                 environment_id,
                 relative_path,
                 range_header=request.headers.get("range"),
+                if_range_header=request.headers.get("if-range"),
                 follow_outward_links=follow_outward_links,
             )
         return await _fs_list_or_read(
@@ -2076,6 +2077,7 @@ def register_resource_routes(
         path: str,
         *,
         range_header: str | None = None,
+        if_range_header: str | None = None,
         follow_outward_links: bool = False,
     ) -> Response:
         """Serve a file's complete bytes as an attachment.
@@ -2089,6 +2091,7 @@ def register_resource_routes(
         :param environment_id: Environment resource id.
         :param path: Path within the environment, or an absolute path.
         :param range_header: Optional HTTP Range header value for partial content requests.
+        :param if_range_header: Optional validator required to serve partial content.
         :param follow_outward_links: Admit a workspace symlink whose target
             lies outside the workspace but within the environment's reach.
         :returns: The file streamed with ``Content-Disposition: attachment``.
@@ -2104,7 +2107,8 @@ def register_resource_routes(
         fs = CallerProcessFilesystem(env, follow_outward_links=follow_outward_links)
         fobj, resolved, size = await fs.open_download(path)
         try:
-            byte_range = _parse_byte_range(range_header, size)
+            # No ETag or Last-Modified is emitted, so If-Range cannot match.
+            byte_range = _parse_byte_range(range_header, size) if if_range_header is None else None
         except ValueError:
             fobj.close()
             return Response(

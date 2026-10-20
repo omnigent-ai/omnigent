@@ -1536,6 +1536,27 @@ function FileViewerBody({
     return action.disabled ? <span className="inline-flex">{button}</span> : button;
   };
 
+  const renderDownloadButton = (interactive: boolean) =>
+    canDownload && (
+      <TooltipProvider>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              aria-label="Download file"
+              tabIndex={interactive ? undefined : -1}
+              onClick={interactive ? downloadFile : undefined}
+            >
+              <DownloadIcon className="size-4" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>Download file</TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    );
+
   // The expanded inline row — rendered both offscreen (for measurement) and,
   // when it fits, as the visible toolbar. `interactive` is false for the
   // measurement clone so it stays out of the tab order / a11y tree.
@@ -1787,24 +1808,7 @@ function FileViewerBody({
           {/* Collapse overflowing actions into "⋯", keeping the Open in split
               button visible. The offscreen clone measures the full row. */}
           <div className="flex items-center justify-end gap-1">
-            {canDownload && (
-              <TooltipProvider>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label="Download file"
-                      onClick={downloadFile}
-                    >
-                      <DownloadIcon className="size-4" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>Download file</TooltipContent>
-                </Tooltip>
-              </TooltipProvider>
-            )}
+            {renderDownloadButton(true)}
             {toolbarCollapsed ? (
               <>
                 <DropdownMenu>
@@ -1914,6 +1918,7 @@ function FileViewerBody({
             aria-hidden
             className="pointer-events-none absolute left-[-9999px] top-0 flex flex-nowrap items-center gap-1"
           >
+            {renderDownloadButton(false)}
             {renderActionButtons(false)}
           </div>
           <span

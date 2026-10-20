@@ -1073,6 +1073,28 @@ async def test_download_byte_ranges(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "if_range", ['"stale-etag"', 'W/"weak-etag"', "Wed, 21 Oct 2015 07:28:00 GMT", ""]
+)
+@pytest.mark.parametrize("range_header", ["bytes=2-5", "bytes=10-"])
+async def test_download_if_range_without_validator_returns_full_file(
+    client: httpx.AsyncClient, workspace: Path, if_range: str, range_header: str
+) -> None:
+    (workspace / "range.bin").write_bytes(b"0123456789")
+    response = await client.get(
+        f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}"
+        "/filesystem/range.bin?download=true",
+        headers={"Range": range_header, "If-Range": if_range},
+    )
+    assert response.status_code == 200
+    assert response.content == b"0123456789"
+    assert response.headers["content-length"] == "10"
+    assert "content-range" not in response.headers
+    assert "etag" not in response.headers
+    assert "last-modified" not in response.headers
+
+
+@pytest.mark.asyncio
 async def test_download_range_on_empty_file(client: httpx.AsyncClient, workspace: Path) -> None:
     (workspace / "empty.bin").write_bytes(b"")
     response = await client.get(

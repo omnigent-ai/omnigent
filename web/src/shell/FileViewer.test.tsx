@@ -238,6 +238,24 @@ describe("FileViewer video and download toolbar", () => {
       expect(downloadWorkspaceFile).toHaveBeenCalledWith("conv_1", path);
     },
   );
+  it.each([
+    [180, true],
+    [220, false],
+  ])("includes Download when measuring toolbar overflow at %ipx", (width, collapsed) => {
+    installCollapsedToolbar();
+    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(width);
+    vi.spyOn(HTMLElement.prototype, "scrollWidth", "get").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      // Model 28px icon buttons with the toolbar's 4px gap.
+      const count = this.querySelectorAll("button").length;
+      return count * 28 + Math.max(0, count - 1) * 4;
+    });
+    renderViewer({ open: true, frameless: true, path: "clip.mp4" });
+    expect(!!screen.queryByRole("button", { name: "More actions" })).toBe(collapsed);
+    expect(screen.getByRole("button", { name: "Download file" })).toBeVisible();
+  });
+
   it("skips JSON and suppresses diff and edit for video", async () => {
     await vi.mocked(useWorkspaceChangedFiles).withImplementation(
       () =>
