@@ -3689,7 +3689,7 @@ function SectionHeader({
       ? undefined
       : showProjectHeaderActionsOnTouch
         ? "no-fine-hover:mr-24"
-        : "no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:mr-24";
+        : "no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:mr-24 no-fine-hover:group-has-[[data-header-controls]_[aria-expanded=true]]/header:mr-24";
   const markerFade =
     "fine-hover:md:group-hover/section:opacity-0 fine-hover:md:group-has-[[data-state=open]]/header:opacity-0";
   const actionFocusFade = actionFocusVisible
@@ -3744,7 +3744,7 @@ function SectionHeader({
                     ? undefined
                     : showProjectHeaderActionsOnTouch
                       ? "no-fine-hover:pr-24"
-                      : "no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:pr-24",
+                      : "no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:pr-24 no-fine-hover:group-has-[[data-header-controls]_[aria-expanded=true]]/header:pr-24",
                 ),
             )
           : cn(
@@ -4368,9 +4368,9 @@ function ConversationSection({
                   className={cn(
                     "flex items-center rounded transition-opacity",
                     // Hidden touch actions stay in the accessibility tree and tab
-                    // order without a hit area; keyboard focus reveals them.
+                    // order without a hit area; keyboard focus or their open menu reveals them.
                     showProjectHeaderActionsOnTouch === false &&
-                      "no-fine-hover:sr-only no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:not-sr-only",
+                      "no-fine-hover:sr-only no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:not-sr-only no-fine-hover:group-has-[[data-header-controls]_[aria-expanded=true]]/header:not-sr-only",
                     "fine-hover:md:opacity-0 fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100 fine-hover:md:group-hover/header:opacity-100 fine-hover:md:group-has-[[data-state=open]]/header:opacity-100 fine-hover:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 fine-hover:md:has-[[aria-expanded=true]]:opacity-100",
                   )}
                 >
@@ -7271,7 +7271,7 @@ function ProjectFolderMenu({
   showOnTouch: boolean;
 }) {
   const [open, setOpen] = useState(false);
-  const touchPressRef = useRef(false);
+  const pressPointerRef = useRef<"mouse" | "touch" | null>(null);
   return (
     <DropdownMenu open={open} onOpenChange={setOpen}>
       <DropdownMenuTrigger asChild>
@@ -7283,18 +7283,21 @@ function ProjectFolderMenu({
           data-testid="project-actions"
           className={cn("text-muted-foreground", showOnTouch && "no-fine-hover:size-11")}
           onPointerDown={(e) => {
-            // Touch and pen open on click so a scroll starting here never opens the menu.
-            touchPressRef.current = e.pointerType !== "mouse";
-            if (touchPressRef.current) e.preventDefault();
+            pressPointerRef.current = e.pointerType === "mouse" ? "mouse" : "touch";
+            // Touch and pen skip Radix's press toggle so a scroll start never opens the menu.
+            if (pressPointerRef.current === "touch") e.preventDefault();
           }}
           onPointerCancel={() => {
-            touchPressRef.current = false;
+            pressPointerRef.current = null;
           }}
           onClick={(e) => {
             e.stopPropagation();
-            // Keyboard and assistive-tech clicks report detail 0 and stay with Radix.
-            if (touchPressRef.current && e.detail > 0) setOpen((wasOpen) => !wasOpen);
-            touchPressRef.current = false;
+            // Mouse presses already toggled and touch taps toggle here; keyboard and
+            // assistive-tech clicks (detail 0) only open, so a Space click is a no-op.
+            const press = e.detail > 0 ? pressPointerRef.current : null;
+            pressPointerRef.current = null;
+            if (press === "touch") setOpen((wasOpen) => !wasOpen);
+            else if (press === null) setOpen(true);
           }}
         >
           <MoreHorizontalIcon className="size-3.5" data-icon-size="14" />

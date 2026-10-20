@@ -3031,21 +3031,54 @@ describe("Sidebar project sections", () => {
     expect(revealWrapper).not.toHaveClass("no-fine-hover:sr-only");
     expect(header).toHaveClass("no-fine-hover:min-h-11");
 
-    // A click without a pointer press (keyboard Space keyup) leaves Radix in charge.
-    fireEvent.click(menuButton);
-    expect(menuButton).toHaveAttribute("aria-expanded", "false");
-    // A touch press that turns into a scroll is cancelled and must not arm a later click.
-    fireEvent.pointerDown(menuButton, { button: 0, ctrlKey: false, pointerType: "touch" });
-    fireEvent.pointerCancel(menuButton, { pointerType: "touch" });
-    fireEvent.click(menuButton);
-    expect(menuButton).toHaveAttribute("aria-expanded", "false");
-    // A touch press with no click or cancel (a long press) must not arm a keyboard or AT click.
-    fireEvent.pointerDown(menuButton, { button: 0, ctrlKey: false, pointerType: "touch" });
+    const expectMenuOpen = (open: boolean) =>
+      expect(menuButton).toHaveAttribute("aria-expanded", String(open));
+    const pressTouch = () =>
+      fireEvent.pointerDown(menuButton, { button: 0, ctrlKey: false, pointerType: "touch" });
+    const closeMenu = () => {
+      fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+      expectMenuOpen(false);
+    };
+
+    // Assistive tech may activate with a bare click (detail 0, no press): it opens.
     fireEvent.click(menuButton, { detail: 0 });
-    expect(menuButton).toHaveAttribute("aria-expanded", "false");
-    // A touch press alone (the start of a scroll) leaves the menu closed.
-    fireEvent.pointerDown(menuButton, { button: 0, ctrlKey: false, pointerType: "touch" });
-    expect(menuButton).toHaveAttribute("aria-expanded", "false");
+    expectMenuOpen(true);
+    closeMenu();
+    // Enter and Space open on keydown; a following keyboard click keeps the menu open.
+    for (const key of ["Enter", " "]) {
+      fireEvent.keyDown(menuButton, { key });
+      fireEvent.click(menuButton, { detail: 0 });
+      expectMenuOpen(true);
+      closeMenu();
+    }
+    // A mouse press toggles once; its click does not toggle again.
+    fireEvent.pointerDown(menuButton, { button: 0, ctrlKey: false, pointerType: "mouse" });
+    fireEvent.click(menuButton, { detail: 1 });
+    expectMenuOpen(true);
+    closeMenu();
+    // A touch press that turns into a scroll is cancelled; a later bare click still opens.
+    pressTouch();
+    fireEvent.pointerCancel(menuButton, { pointerType: "touch" });
+    expectMenuOpen(false);
+    fireEvent.click(menuButton, { detail: 0 });
+    expectMenuOpen(true);
+    closeMenu();
+    // A stray touch press (a long press) does not turn a bare click into a toggle.
+    pressTouch();
+    fireEvent.click(menuButton, { detail: 0 });
+    expectMenuOpen(true);
+    fireEvent.click(menuButton, { detail: 0 });
+    expectMenuOpen(true);
+    closeMenu();
+    // A touch tap toggles on click, never on the press alone.
+    pressTouch();
+    expectMenuOpen(false);
+    fireEvent.click(menuButton, { detail: 1 });
+    expectMenuOpen(true);
+    pressTouch();
+    fireEvent.click(menuButton, { detail: 1 });
+    expectMenuOpen(false);
+    pressTouch();
     fireEvent.click(menuButton, { detail: 1 });
     const menuItem = await screen.findByTestId("project-new-session-menu");
     expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
