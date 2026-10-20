@@ -797,51 +797,42 @@ async def test_patch_rejects_client_supplied_archived_at_label(
     assert ARCHIVED_AT_LABEL_KEY not in conv.labels
 
 
-@pytest.mark.parametrize(
-    "key", ["omnigent.host_offline_hold_until", "omnigent.host_offline_deferred_stop"]
-)
 async def test_patch_rejects_client_supplied_host_offline_hold_label(
     client: httpx.AsyncClient,
     session_id: str,
     db_uri: str,
-    key: str,
 ) -> None:
-    """A host-offline hold's labels are server-owned.
+    """A host-offline hold's deadline label is server-owned.
 
-    Other replicas read the hold's deadline to leave a held turn running, and a
-    deferred Stop's runner id to stop that runner on reconnect. A client must not
-    seed either or overwrite the server's value, including on shared sessions it
-    can edit.
+    Other replicas read it to leave a held turn running, so a client must not
+    seed it (forging a long hold) or overwrite the server's value (cancelling
+    one), including on shared sessions it can edit.
     """
-    from omnigent.stores.conversation_store import (
-        HOST_OFFLINE_DEFERRED_STOP_LABEL_KEY,
-        HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY,
-    )
+    from omnigent.stores.conversation_store import HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY
 
-    assert key in (HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY, HOST_OFFLINE_DEFERRED_STOP_LABEL_KEY)
     conv_store = SqlAlchemyConversationStore(db_uri)
     for value in ("9999999999", ""):
         resp = await client.patch(
             f"/v1/sessions/{session_id}",
-            json={"labels": {key: value}},
+            json={"labels": {HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY: value}},
             headers={"Content-Type": "application/json"},
         )
         assert resp.status_code == 400
     conv = conv_store.get_conversation(session_id)
     assert conv is not None
-    assert key not in conv.labels
+    assert HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY not in conv.labels
 
-    # A value the server wrote survives a client write.
-    conv_store.set_labels(session_id, {key: "2000000000"})
+    # A hold the server started keeps its deadline through a client write.
+    conv_store.set_labels(session_id, {HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY: "2000000000"})
     resp = await client.patch(
         f"/v1/sessions/{session_id}",
-        json={"labels": {key: "1"}},
+        json={"labels": {HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY: "1"}},
         headers={"Content-Type": "application/json"},
     )
     assert resp.status_code == 400
     conv = conv_store.get_conversation(session_id)
     assert conv is not None
-    assert conv.labels[key] == "2000000000"
+    assert conv.labels[HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY] == "2000000000"
 
 
 async def test_list_sessions_pinned_filter(

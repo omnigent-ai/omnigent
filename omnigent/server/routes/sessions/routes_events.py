@@ -261,7 +261,6 @@ from omnigent.server.routes._sessions.orchestration import (
     _stop_host_runner_intentionally,
     _wait_for_host_bound_runner_client,
     _wait_for_host_reconnect,
-    defer_stop_until_runner_returns,
     ensure_runner_connected,
 )
 from omnigent.server.schemas import (
@@ -1724,23 +1723,10 @@ def register_events_routes(
                         else None
                     )
                     if runner_status not in {"dead", "unknown"}:
-                        from omnigent.server.routes import sessions as _facade
-
-                        # An offline host can't take the stop: settle the session
-                        # now and stop its runner when the runner reconnects.
-                        if (
-                            not stop_delivered
-                            and host_conn is None
-                            and await _facade._host_offline_state(stop_conv.host_id) is True
-                        ):
-                            await defer_stop_until_runner_returns(
-                                session_id, stop_conv.runner_id, conversation_store
-                            )
-                        else:
-                            raise OmnigentError(
-                                "Couldn't confirm the session's runner stopped. Please try again.",
-                                code=ErrorCode.RUNNER_UNAVAILABLE,
-                            )
+                        raise OmnigentError(
+                            "Couldn't confirm the session's runner stopped. Please try again.",
+                            code=ErrorCode.RUNNER_UNAVAILABLE,
+                        )
             if not stop_delivered:
                 # False-success backstop. The stop reached NO live runner
                 # (``_stop_session_via_runner`` returned False, so there was

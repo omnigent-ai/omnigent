@@ -404,7 +404,6 @@ from omnigent.spec.types import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
-    HOST_OFFLINE_DEFERRED_STOP_LABEL_KEY,
     HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY,
     PINNED_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
@@ -8112,76 +8111,27 @@ def host_offline_hold_active(labels: Mapping[str, str], now: float) -> bool:
     return now < deadline <= now + HOST_OFFLINE_HOLD_S + _HOST_OFFLINE_HOLD_SKEW_S
 
 
-async def defer_stop_until_runner_returns(
-    session_id: str, runner_id: str, conversation_store: ConversationStore
-) -> None:
+async def host_offline_hold_covers(
+    conv: Conversation, conversation_store: ConversationStore, now: float
+) -> bool:
     """
-    Stop a session whose offline host can't receive the stop yet.
+    Report whether another replica's host-offline hold still covers a session's turn.
 
-    The session settles as stopped now, and the runner id is recorded so the
-    server stops that runner when it reconnects, before its turn can resume.
-    A runner that never returns has nothing left to stop.
+    The label outlives the replica that wrote it, so it counts only while the
+    session's host is confirmed offline. Once the host is back, or its row can't
+    be read, orphan cleanup settles the turn as it would without a hold.
 
-    :param session_id: The session the person stopped.
-    :param runner_id: The unreachable runner still bound to it.
-    :param conversation_store: Store holding the session's labels and status.
-    :returns: None.
-    :raises OmnigentError: ``RUNNER_UNAVAILABLE`` if the stop couldn't be recorded.
+    :param conv: The session row, carrying its labels.
+    :param conversation_store: Store used to resolve a hostless session's host.
+    :param now: Epoch seconds to compare the hold's deadline against.
+    :returns: ``True`` while the deadline is ahead and the host is offline.
     """
-    try:
-        await asyncio.to_thread(
-            conversation_store.set_labels,
-            session_id,
-            {HOST_OFFLINE_DEFERRED_STOP_LABEL_KEY: runner_id},
-        )
-        # Ordered after earlier live-state writes; skips a rebound or failed row.
-        settled = await asyncio.wrap_future(
-            session_live_state.submit(
-                "settle_intentional_stop",
-                conversation_store.settle_intentionally_stopped_session,
-                session_id,
-                runner_id,
-            )
-        )
-    except Exception as exc:
-        raise OmnigentError(
-            "Couldn't stop the session while its host is offline. Please try again.",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
-        ) from exc
-    if settled is None:
-        raise OmnigentError(
-            "Couldn't stop the session while its host is offline. Please try again.",
-            code=ErrorCode.RUNNER_UNAVAILABLE,
-        )
-    if not settled:
-        # The settle skips a row whose binding moved; a row still bound here already failed.
-        current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-        if current is None or current.runner_id != runner_id:
-            with contextlib.suppress(Exception):
-                await asyncio.to_thread(
-                    conversation_store.delete_label,
-                    session_id,
-                    HOST_OFFLINE_DEFERRED_STOP_LABEL_KEY,
-                    if_value=runner_id,
-                )
-            raise OmnigentError(
-                "The session moved to another runner while stopping. Please stop it again.",
-                code=ErrorCode.CONFLICT,
-            )
-    if settled:
-        session_live_state.forget_live_status(session_id)
-        _publish_status(session_id, "idle", persist_live_status=False)
-    _logger.info(
-        "Stop deferred until runner %s returns for session=%s",
-        runner_id,
-        session_id,
-        extra=debug_event(
-            "host_offline_stop_deferred",
-            session_id=session_id,
-            runner_id=runner_id,
-            settled=bool(settled),
-        ),
-    )
+    from omnigent.server.routes import sessions as _facade
+
+    if not host_offline_hold_active(conv.labels, now):
+        return False
+    host_id = await _session_host_id(conv, conversation_store)
+    return await _facade._host_offline_state(host_id) is True
 
 
 # Reports whether this replica's disconnect task for a runner is still running;

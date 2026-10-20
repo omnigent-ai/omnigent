@@ -179,10 +179,6 @@ ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
 # orphan cleanup leaves a held turn running.
 HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY = "omnigent.host_offline_hold_until"
 
-# Runner id a Stop could not reach while its host was offline. Whichever server
-# replica the runner reconnects to stops it before re-attaching the session.
-HOST_OFFLINE_DEFERRED_STOP_LABEL_KEY = "omnigent.host_offline_deferred_stop"
-
 
 # Labels that must NOT cross into a new session context — deliberately
 # dropped both when forking (not copied to the clone) and on an in-place
@@ -215,7 +211,6 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
         "omnigent.startup",
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
         HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY,
-        HOST_OFFLINE_DEFERRED_STOP_LABEL_KEY,
     }
 )
 

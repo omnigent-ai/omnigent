@@ -5473,8 +5473,6 @@ def test_fork_conversation_drops_instance_scoped_labels(
             "omnigent.codex_native.bypass_sandbox": "1",
             # The source's host-offline hold deadline protects only its own turn.
             "omnigent.host_offline_hold_until": "4102444800",
-            # A deferred Stop names the source's own runner.
-            "omnigent.host_offline_deferred_stop": "runner-source",
             # An ordinary, non-instance label that SHOULD carry over.
             "omnigent.wrapper": "claude-code-native-ui",
         },

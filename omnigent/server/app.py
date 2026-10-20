@@ -159,10 +159,6 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 _RECONNECT_BINDING_BATCH_SIZE = 128
-# A runner back after a Stop its offline host never got: how often to retry the
-# stop before leaving it for the runner's next reconnect.
-_DEFERRED_STOP_ATTEMPTS = 6
-_DEFERRED_STOP_RETRY_S = 5.0
 
 
 class SmartRoutingSourcesInfo(BaseModel):
@@ -3571,7 +3567,6 @@ def create_app(
             _session_host_id,
         )
         from omnigent.server.routes.sessions import (
-            HOST_OFFLINE_DEFERRED_STOP_LABEL_KEY,
             HOST_OFFLINE_HOLD_S,
             RUNNER_DISCONNECT_GRACE_S,
             _host_offline_state,
@@ -3638,12 +3633,6 @@ def create_app(
                 runner_id,
             )
             return
-        # Stopped while its host was offline: already settled, and stopped on reconnect.
-        affected = [
-            conv
-            for conv in affected
-            if (conv.labels or {}).get(HOST_OFFLINE_DEFERRED_STOP_LABEL_KEY) != runner_id
-        ]
         if idle_shutdown:
             # The sweep's stop path settles these to idle instead of failing them.
             _note_runner_idle_shutdown(runner_id, affected)
@@ -3698,36 +3687,18 @@ def create_app(
 
     async def _held_still_bound(
         runner_id: str, held: "list[Conversation]"
-    ) -> "tuple[list[tuple[Conversation, int | None]], set[str]]":
-        """Return the held sessions still bound to *runner_id*, and the ones stopped.
+    ) -> "list[tuple[Conversation, int | None]]":
+        """Return the held sessions still bound to *runner_id*, with their liveness stamp.
 
-        Point reads per held session, so the cost tracks the interrupted turns
-        rather than every session the runner ever served. A session the person
-        stopped during the hold is no longer held: its runner gets the stop when
-        it reconnects, and nothing fails the turn.
-
-        :returns: The bound sessions with their liveness stamps, and the ids of
-            held sessions whose Stop waits for this runner.
+        One point read per held session, so the cost tracks the interrupted
+        turns rather than every session the runner ever served.
         """
-        from omnigent.server.routes.sessions import HOST_OFFLINE_DEFERRED_STOP_LABEL_KEY
-
-        current = await asyncio.to_thread(
-            conversation_store.get_conversations, [conv.id for conv in held]
-        )
         bound: list[tuple[Conversation, int | None]] = []
-        stopped: set[str] = set()
         for conv in held:
-            row = current.get(conv.id)
-            if (
-                row is not None
-                and (row.labels or {}).get(HOST_OFFLINE_DEFERRED_STOP_LABEL_KEY) == runner_id
-            ):
-                stopped.add(conv.id)
-                continue
             liveness = await asyncio.to_thread(conversation_store.get_runner_liveness, conv.id)
             if liveness is not None and liveness[0] == runner_id:
                 bound.append((conv, liveness[1]))
-        return bound, stopped
+        return bound
 
     async def _hold_while_host_offline(
         runner_id: str,
@@ -3753,8 +3724,8 @@ def create_app(
         :param reference_stamp: This replica's last liveness stamp for the runner.
         :param hold_value: Epoch-seconds deadline written as the hold's label.
         :returns: The outcome and the sessions to fail. Nothing fails after
-            ``"runner_reconnected"``, ``"live_elsewhere"``, ``"rebound"``,
-            ``"stopped"`` or ``"server_shutdown"``; ``"expired"`` and
+            ``"runner_reconnected"``, ``"live_elsewhere"``, ``"rebound"`` or
+            ``"server_shutdown"``; ``"expired"`` and
             ``"host_back_without_runner"`` fail those still bound to the runner.
         """
         from omnigent.server.routes._sessions.orchestration import (
@@ -3812,7 +3783,7 @@ def create_app(
                     label_write = asyncio.ensure_future(_mark_hold(unlabeled, hold_labels))
                     unlabeled = await asyncio.shield(label_write)
                 try:
-                    bound, stopped = await _held_still_bound(runner_id, held)
+                    bound = await _held_still_bound(runner_id, held)
                 except Exception:  # noqa: BLE001 — keep holding; the next check retries
                     _logger.warning(
                         "Runner %s: host-offline hold re-check failed; retrying",
@@ -3838,9 +3809,8 @@ def create_app(
                     outcome = "live_elsewhere"
                     break
                 if not bound:
-                    # Every held session was stopped or moved to another runner;
-                    # none is ours to fail.
-                    outcome = "stopped" if len(stopped) == len(held) else "rebound"
+                    # Every held session moved to another runner; none is ours to fail.
+                    outcome = "rebound"
                     break
                 if ended:
                     outcome = "expired" if host_back_at is None else "host_back_without_runner"
@@ -4088,87 +4058,6 @@ def create_app(
             fail_idle_top_level=not runner_ran,
         )
 
-    # Per session: the task stopping a runner that was stopped while offline.
-    _deferred_stop_tasks: dict[str, asyncio.Task[None]] = {}
-
-    async def _deliver_deferred_stop(conv: "Conversation", runner_id: str) -> None:
-        """Stop a reconnected runner whose session was stopped while its host was offline.
-
-        The turn was settled as stopped then; this ends it on the runner before
-        its output reaches the session again. The label stays until the runner
-        and its host both take the stop, so a later reconnect retries.
-        """
-        from omnigent.server.routes.sessions import (
-            HOST_OFFLINE_DEFERRED_STOP_LABEL_KEY,
-            _interrupt_fenced_sessions,
-            _stop_host_runner_intentionally,
-            _stop_session_via_runner,
-        )
-
-        _interrupt_fenced_sessions.add(conv.id)
-        for attempt in range(1, _DEFERRED_STOP_ATTEMPTS + 1):
-            if tunnel_registry.get(runner_id) is None:
-                break
-            try:
-                delivered = await _stop_session_via_runner(conv.id, runner_router)
-                # Stopping the process also ends turns that have no pane to kill.
-                host_stopped = conv.host_id is not None and await _stop_host_runner_intentionally(
-                    conv.id, conv.host_id, runner_id, host_registry, conversation_store
-                )
-            except Exception:  # noqa: BLE001 — retried; the label keeps the stop
-                _logger.warning(
-                    "Deferred stop for session %s failed on runner %s (attempt %d)",
-                    conv.id,
-                    runner_id,
-                    attempt,
-                    exc_info=True,
-                    extra={"session_id": conv.id},
-                )
-            else:
-                if delivered and host_stopped:
-                    await asyncio.to_thread(
-                        conversation_store.delete_label,
-                        conv.id,
-                        HOST_OFFLINE_DEFERRED_STOP_LABEL_KEY,
-                        if_value=runner_id,
-                    )
-                    _logger.info(
-                        "Deferred stop delivered to runner %s for session=%s",
-                        runner_id,
-                        conv.id,
-                        extra=debug_event(
-                            "host_offline_stop_delivered",
-                            session_id=conv.id,
-                            runner_id=runner_id,
-                            attempt=attempt,
-                        ),
-                    )
-                    return
-            await asyncio.sleep(_DEFERRED_STOP_RETRY_S)
-        _logger.warning(
-            "Deferred stop for session %s did not reach runner %s; keeping it for its next "
-            "reconnect",
-            conv.id,
-            runner_id,
-            extra={"session_id": conv.id},
-        )
-
-    def _start_deferred_stop(conv: "Conversation", runner_id: str) -> None:
-        """Run one deferred stop per session, off the reconnect path."""
-        running = _deferred_stop_tasks.get(conv.id)
-        if running is not None and not running.done():
-            return
-        task = asyncio.create_task(
-            _deliver_deferred_stop(conv, runner_id), name=f"deferred-stop-{conv.id}"
-        )
-        _deferred_stop_tasks[conv.id] = task
-
-        def _clear_slot(done: asyncio.Task[None]) -> None:
-            if _deferred_stop_tasks.get(conv.id) is done:
-                _deferred_stop_tasks.pop(conv.id, None)
-
-        task.add_done_callback(_clear_slot)
-
     async def _on_runner_connect(runner_id: str, connection: RunnerSession) -> None:
         """Attach bound streams, then recover independent session trees concurrently."""
         from omnigent.entities import Conversation
@@ -4186,7 +4075,6 @@ def create_app(
         )
         from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
         from omnigent.server.routes.sessions import (
-            HOST_OFFLINE_DEFERRED_STOP_LABEL_KEY,
             _ensure_runner_relay,
             _publish_runner_recovered_status,
             _publish_sandbox_status,
@@ -4283,12 +4171,6 @@ def create_app(
                         _logger.info(
                             "_on_runner_connect: matched %s (agent=%s)", conv.id, conv.agent_id
                         )
-                        stop_for = (conv.labels or {}).get(HOST_OFFLINE_DEFERRED_STOP_LABEL_KEY)
-                        if stop_for == runner_id:
-                            # Stopped while its host was offline: end the turn
-                            # instead of re-attaching it.
-                            _start_deferred_stop(conv, runner_id)
-                            continue
                         try:
                             routed = runner_router.client_for_session_resources(
                                 conv.id, conversation=conv
