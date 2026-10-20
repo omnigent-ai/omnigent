@@ -2960,6 +2960,7 @@ describe("Right workspace card visibility", () => {
   it.each(["MacIntel", "Win32"])(
     "opens content search, focuses its input and preserves the query on %s",
     async (platform) => {
+      stubMatchMedia({ width: 1280 });
       vi.spyOn(navigator, "platform", "get").mockReturnValue(platform);
       writeWorkspacePanelDefault("collapsed");
       mockConversations([{ id: "conv_search_hotkey", permission_level: null }]);
@@ -3660,6 +3661,7 @@ describe("Right workspace card visibility", () => {
   it.each([false, true])(
     "closes a linked file with all pages unpinned (existing page: %s)",
     (hasOpenPage) => {
+      stubMatchMedia({ width: 1280 });
       writePinnedWorkspaceTabs([]);
       if (hasOpenPage)
         writeSessionWorkspaceState("conv_file_link", {
