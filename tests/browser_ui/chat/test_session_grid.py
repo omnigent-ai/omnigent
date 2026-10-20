@@ -60,6 +60,9 @@ def test_session_grid_drag_persist_live_updates_and_close(
             )
             for index in range(5)
         ]
+        # Deleting the active grid opens New Chat, which lists the host's home directory.
+        host_filesystem_api = f"/v1/hosts/{sessions[0].host_id}/filesystem"
+        browser_contract.json(host_filesystem_api, list_payload([]))
         for index, session in enumerate(sessions):
             session.update_session(title=f"Grid session {index}")
             session.set_items(
@@ -335,7 +338,11 @@ def test_session_grid_drag_persist_live_updates_and_close(
         page.set_viewport_size({"width": 2000, "height": 1000})
         page.get_by_role("button", name="Open sidebar", exact=True).click()
         page.get_by_role("region", name="Grids").get_by_role("link").click(button="right")
-        page.get_by_role("menuitem", name="Delete grid", exact=True).click()
+        with page.expect_response(f"**{host_filesystem_api}?*") as home_listing:
+            page.get_by_role("menuitem", name="Delete grid", exact=True).click()
+        assert home_listing.value.ok
+        expect(page).to_have_url(f"{sessions[0].base_url}/")
+        expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible()
         expect(page.get_by_role("region", name="Grids")).to_have_count(0)
         expect(page.locator('aside [data-sidebar-session-id="grid-1"]')).to_be_visible()
 
