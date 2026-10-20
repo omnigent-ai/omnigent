@@ -4352,8 +4352,6 @@ function ConversationSection({
                 headerStatus
                   ? "ml-auto flex shrink-0 items-center gap-0.5 pr-1"
                   : "mobile-app:static mobile-app:translate-y-0 mobile-app:pr-1 mobile-app:pointer-events-auto -translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5",
-                showProjectHeaderActionsOnTouch === false &&
-                  "no-fine-hover:pointer-events-none no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto",
                 protectsCollapsedBadge &&
                   "fine-hover:md:pointer-events-none fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto fine-hover:md:group-hover/header:pointer-events-auto fine-hover:md:group-has-[[data-state=open]]/header:pointer-events-auto fine-hover:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:pointer-events-auto fine-hover:md:has-[[aria-expanded=true]]:pointer-events-auto",
               )}
@@ -4367,11 +4365,13 @@ function ConversationSection({
                 <div
                   className={cn(
                     "flex items-center rounded transition-opacity",
+                    // Hidden touch actions stay in the accessibility tree and tab
+                    // order without a hit area; keyboard focus reveals them.
                     showProjectHeaderActionsOnTouch === undefined
                       ? undefined
                       : showProjectHeaderActionsOnTouch
                         ? "no-fine-hover:opacity-100"
-                        : "no-fine-hover:opacity-0 no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:opacity-100",
+                        : "no-fine-hover:sr-only no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:not-sr-only",
                     "fine-hover:md:opacity-0 fine-hover:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100 fine-hover:md:group-hover/header:opacity-100 fine-hover:md:group-has-[[data-state=open]]/header:opacity-100 fine-hover:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 fine-hover:md:has-[[aria-expanded=true]]:opacity-100",
                   )}
                 >
