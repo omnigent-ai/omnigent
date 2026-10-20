@@ -8121,6 +8121,21 @@ async def defer_stop_until_runner_returns(
             "Couldn't stop the session while its host is offline. Please try again.",
             code=ErrorCode.RUNNER_UNAVAILABLE,
         )
+    if not settled:
+        # The settle skips a row whose binding moved; a row still bound here already failed.
+        current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if current is None or current.runner_id != runner_id:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(
+                    conversation_store.delete_label,
+                    session_id,
+                    HOST_OFFLINE_DEFERRED_STOP_LABEL_KEY,
+                    if_value=runner_id,
+                )
+            raise OmnigentError(
+                "The session moved to another runner while stopping. Please stop it again.",
+                code=ErrorCode.CONFLICT,
+            )
     if settled:
         session_live_state.forget_live_status(session_id)
         _publish_status(session_id, "idle", persist_live_status=False)

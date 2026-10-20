@@ -214,3 +214,60 @@ def test_host_offline_hold_active_reads_an_unexpired_deadline(
     """Only a deadline ahead, and no further out than one hold plus skew, marks a hold."""
     labels = {} if value is None else {orchestration.HOST_OFFLINE_HOLD_UNTIL_LABEL_KEY: value}
     assert orchestration.host_offline_hold_active(labels, now=1500.0) is expected
+
+
+class _DeferredStopStore:
+    """Labels plus a runner binding another request moves while the stop is recorded."""
+
+    def __init__(self, runner_id: str | None, *, bound_at_settle: str | None) -> None:
+        self.runner_id = runner_id
+        self.labels: dict[str, str] = {}
+        self._bound_at_settle = bound_at_settle
+
+    def set_labels(self, session_id: str, labels: dict[str, str]) -> None:
+        self.labels.update(labels)
+
+    def settle_intentionally_stopped_session(self, session_id: str, runner_id: str) -> bool:
+        # The conditional settle only matches a still-running row bound to *runner_id*.
+        self.runner_id = self._bound_at_settle
+        return False
+
+    def get_conversation(self, session_id: str) -> SimpleNamespace:
+        return SimpleNamespace(runner_id=self.runner_id)
+
+    def delete_label(self, session_id: str, key: str, *, if_value: str | None = None) -> None:
+        if if_value is None or self.labels.get(key) == if_value:
+            self.labels.pop(key, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bound_at_settle", ["runner-new", None])
+async def test_deferred_stop_fails_when_the_session_leaves_the_runner(
+    bound_at_settle: str | None,
+) -> None:
+    """A replacement runner keeps running, so Stop must not claim success or stay armed."""
+    store = _DeferredStopStore("runner-old", bound_at_settle=bound_at_settle)
+
+    with pytest.raises(orchestration.OmnigentError) as raised:
+        await orchestration.defer_stop_until_runner_returns(
+            "sess-moved",
+            "runner-old",
+            store,  # type: ignore[arg-type]
+        )
+
+    assert raised.value.code == orchestration.ErrorCode.CONFLICT
+    assert orchestration.HOST_OFFLINE_DEFERRED_STOP_LABEL_KEY not in store.labels
+
+
+@pytest.mark.asyncio
+async def test_deferred_stop_stays_armed_for_a_still_bound_failed_session() -> None:
+    """A row still bound to the runner only failed first; the runner is stopped on return."""
+    store = _DeferredStopStore("runner-old", bound_at_settle="runner-old")
+
+    await orchestration.defer_stop_until_runner_returns(
+        "sess-failed",
+        "runner-old",
+        store,  # type: ignore[arg-type]
+    )
+
+    assert store.labels[orchestration.HOST_OFFLINE_DEFERRED_STOP_LABEL_KEY] == "runner-old"
