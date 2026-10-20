@@ -1319,7 +1319,7 @@ class BenchEnvironment:
 
     async def cold_start_first_delta(
         self, agent_id: str, text: str, *, timeout: float = _TURN_TIMEOUT_S
-    ) -> None:
+    ) -> str:
         """Time the full UI cold path: create → attach SSE → send → first token.
 
         Reproduces exactly what the Web UI does for a brand-new host-bound
@@ -1334,6 +1334,7 @@ class BenchEnvironment:
         pipeline. No pre-warm and no ``GET /session`` status polling — the SSE
         first-delta signal is the same one the UI renders on.
 
+        :returns: The new session's id, so the caller can stop its runner.
         :raises RuntimeError: If not host-backed, or no delta / a terminal event
             arrives within *timeout*.
         """
@@ -1341,6 +1342,7 @@ class BenchEnvironment:
         await self._post_and_await_first_delta(
             session_id, text, wait_idle_first=False, timeout=timeout
         )
+        return session_id
 
     async def start_gated_turn(
         self, session_id: str, *, timeout: float = _TURN_TIMEOUT_S

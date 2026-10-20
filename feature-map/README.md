@@ -113,6 +113,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 ## Features
 
+- [Workspace content search](./workspace-content-search.md) covers runner-backed
+  text search, result navigation and its release flag.
+
 - [Harness acceptance](./harness-acceptance.md) standardizes the SDK/native
   checklist, connects existing bench probes to user journeys, and records
   per-harness coverage gaps separately from observed results.

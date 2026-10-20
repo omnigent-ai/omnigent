@@ -115,7 +115,7 @@ jobs:
           echo "prebuilt=$prebuilt" >> "$GITHUB_OUTPUT"
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5  # v4.1.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069  # v4.4.1
 
       # Single-arch (amd64) build, no push. load: true imports the result into
       # the runner's Docker so the smoke step below can run it. Shares the same
