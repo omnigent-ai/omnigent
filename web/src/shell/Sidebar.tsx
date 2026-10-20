@@ -280,11 +280,11 @@ import { type PullRequest, usePullRequestInfo } from "@/hooks/usePullRequests";
 import { matchWorktree } from "@/hooks/useHostWorktrees";
 import { useSessionWorktrees } from "@/hooks/useSessionWorktrees";
 import {
-  deriveRepoName,
   localMachineLabel,
   resolveThisMachineHostId,
   SANDBOX_REPO_LABEL_KEY,
 } from "./NewChatDialog";
+import { deriveRepoName } from "@/lib/repoName";
 import { useDesktopHostId } from "./RevealInFileManager";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";

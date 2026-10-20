@@ -7,6 +7,7 @@ afterEach(cleanup);
 
 const base = {
   workspacePath: "/home/alice/repo",
+  sandboxRepos: [] as string[],
   worktreePath: "/home/alice/repo",
   isWorktree: false,
   branch: "feature/login",
@@ -65,5 +66,74 @@ describe("ComposerWorkspaceStatus", () => {
       "title",
       "Branch unavailable. Created on branch feature/created.",
     );
+  });
+
+  it("names the sandbox repository while the launch has not bound a workspace", () => {
+    render(
+      <ComposerWorkspaceStatus
+        {...base}
+        workspacePath={null}
+        sandboxRepos={["https://github.com/org/fixture-repo.git"]}
+        showWorktree={false}
+      />,
+    );
+    const directory = screen.getByTestId("composer-workspace-dir");
+    expect(directory).toHaveTextContent("fixture-repo");
+    expect(directory).toHaveAccessibleName(
+      "Sandbox repository: https://github.com/org/fixture-repo.git",
+    );
+    expect(directory).toHaveAttribute(
+      "title",
+      "Sandbox repository: https://github.com/org/fixture-repo.git",
+    );
+  });
+
+  it("keeps the repository's branch in the label and counts several repositories", () => {
+    const { rerender } = render(
+      <ComposerWorkspaceStatus
+        {...base}
+        workspacePath={null}
+        sandboxRepos={["git@github.com:org/api.git#release"]}
+        showWorktree={false}
+      />,
+    );
+    expect(screen.getByTestId("composer-workspace-dir")).toHaveTextContent("api#release");
+
+    rerender(
+      <ComposerWorkspaceStatus
+        {...base}
+        workspacePath={null}
+        sandboxRepos={["https://github.com/org/api", "https://github.com/org/web#main"]}
+        showWorktree={false}
+      />,
+    );
+    const directory = screen.getByTestId("composer-workspace-dir");
+    expect(directory).toHaveTextContent("2 repositories");
+    expect(directory).toHaveAccessibleName(
+      "Sandbox repositories: https://github.com/org/api, https://github.com/org/web#main",
+    );
+  });
+
+  it("prefers the bound working directory over the sandbox repositories", () => {
+    render(
+      <ComposerWorkspaceStatus {...base} sandboxRepos={["https://github.com/org/other.git"]} />,
+    );
+    expect(screen.getByTestId("composer-workspace-dir")).toHaveAccessibleName(
+      "Working directory: /home/alice/repo",
+    );
+  });
+
+  it("reads 'No workspace' only when neither a directory nor a repository is known", () => {
+    render(
+      <ComposerWorkspaceStatus
+        {...base}
+        workspacePath={null}
+        sandboxRepos={[]}
+        showWorktree={false}
+      />,
+    );
+    const directory = screen.getByTestId("composer-workspace-dir");
+    expect(directory).toHaveTextContent("No workspace");
+    expect(directory).toHaveAccessibleName("Working directory: Not selected");
   });
 });
