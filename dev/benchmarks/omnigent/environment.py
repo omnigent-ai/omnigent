@@ -343,6 +343,7 @@ class BenchEnvironment:
         harness: str = _DEFAULT_HARNESS,
         model: str = _DEFAULT_MODEL,
         network_delay_ms: float = 0.0,
+        teardown_started: asyncio.Event | None = None,
     ) -> None:
         # with_host is additive over with_runner: the boot runner still serves
         # the warm journeys, and the host daemon additionally lets the cold-start
@@ -359,6 +360,8 @@ class BenchEnvironment:
         self.host_id = ""
         self.host_workspace = ""
         self.client: httpx.AsyncClient | None = None
+        # Set when __aexit__ begins, so a SIGTERM retry knows to stop cancelling.
+        self._teardown_started = teardown_started
 
         self._tmp = Path("/tmp") / f"omni-bench-{uuid.uuid4().hex[:8]}"
         # TMPDIR for bench subprocesses, so their terminal sockets can be swept.
@@ -424,6 +427,8 @@ class BenchEnvironment:
         return self
 
     async def __aexit__(self, *exc: object) -> None:
+        if self._teardown_started is not None:
+            self._teardown_started.set()
         if self.client is not None:
             await self.client.aclose()
         self._sampler_stop.set()
@@ -1314,7 +1319,7 @@ class BenchEnvironment:
 
     async def cold_start_first_delta(
         self, agent_id: str, text: str, *, timeout: float = _TURN_TIMEOUT_S
-    ) -> None:
+    ) -> str:
         """Time the full UI cold path: create → attach SSE → send → first token.
 
         Reproduces exactly what the Web UI does for a brand-new host-bound
@@ -1329,6 +1334,7 @@ class BenchEnvironment:
         pipeline. No pre-warm and no ``GET /session`` status polling — the SSE
         first-delta signal is the same one the UI renders on.
 
+        :returns: The new session's id, so the caller can stop its runner.
         :raises RuntimeError: If not host-backed, or no delta / a terminal event
             arrives within *timeout*.
         """
@@ -1336,6 +1342,7 @@ class BenchEnvironment:
         await self._post_and_await_first_delta(
             session_id, text, wait_idle_first=False, timeout=timeout
         )
+        return session_id
 
     async def start_gated_turn(
         self, session_id: str, *, timeout: float = _TURN_TIMEOUT_S

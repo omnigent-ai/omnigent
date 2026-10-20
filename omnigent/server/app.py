@@ -181,6 +181,7 @@ class ServerInfoResponse(BaseModel):
     needs_setup: bool
     databricks_features: bool
     managed_sandboxes_enabled: bool
+    durable_initial_input: bool = False
     sandbox_provider: str | None
     sandbox_providers: list[str]
     # UI-relevant capability flags per launchable provider, e.g.
@@ -1563,7 +1564,8 @@ def create_app(
     from omnigent.server.routes._host_launch import configure_host_sharding
 
     configure_host_sharding(host_sharded)
-    tunnel_registry = TunnelRegistry()
+    # A tunnel this replica retires on purpose is a handoff, not a lost runner.
+    tunnel_registry = TunnelRegistry(on_retire=shutdown_state.note_runner_tunnel_retired)
     host_registry = HostRegistry()
     runner_router = RunnerRouter(
         registry=tunnel_registry,
@@ -1835,12 +1837,16 @@ def create_app(
             with suppress(asyncio.CancelledError):
                 await metrics_publish_task
             # Stop in-flight background managed-sandbox launches so a
-            # slow provision doesn't outlive the ASGI shutdown (the
-            # sandbox itself, if already provisioned, is reaped by the
-            # provider lifetime cap — see the hook's docstring).
+            # slow provision doesn't outlive the ASGI shutdown, after giving
+            # unbound ones the deployment's drain to bind their host (see the
+            # hook's docstring).
             from omnigent.server.routes.sessions import cancel_managed_launch_tasks
 
-            await cancel_managed_launch_tasks()
+            await cancel_managed_launch_tasks(
+                drain_s=sandbox_config.shutdown_drain_s if sandbox_config is not None else 0.0
+            )
+            if startup_inputs is not None:
+                await startup_inputs.shutdown()
             await background_title_coordinator.shutdown()
             _uninstall_subagent_block_notifier()
             set_resource_registry(None)
@@ -1877,6 +1883,16 @@ def create_app(
     app.state.runner_session_initializer = runner_session_initializer
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
+    from omnigent.server.startup_inputs import ManagedStartupInputs
+
+    # Only managed creates accept a durable first input, and only managed hosts
+    # need their startup recovered on the replica holding the tunnel.
+    startup_inputs = (
+        ManagedStartupInputs(conversation_store, host_registry)
+        if sandbox_config is not None and sandbox_config.managed_launch_supported
+        else None
+    )
+    app.state.startup_inputs = startup_inputs
     app.state.host_store = host_store
     app.state.mcp_gateway_backend = mcp_gateway_backend
     app.state.mcp_registry = mcp_registry
@@ -3138,6 +3154,7 @@ def create_app(
                 "needs_setup": needs_setup,
                 "databricks_features": databricks_features,
                 "managed_sandboxes_enabled": managed_sandboxes_enabled,
+                "durable_initial_input": startup_inputs is not None,
                 "sandbox_provider": sandbox_provider,
                 "sandbox_providers": sandbox_providers,
                 "sandbox_provider_capabilities": sandbox_provider_capabilities,
@@ -3278,6 +3295,14 @@ def create_app(
             # files a session into a project (owner-private membership).
             project_store=project_store,
             background_title_coordinator=background_title_coordinator,
+            register_startup_dispatch=lambda handler: (
+                setattr(startup_inputs, "dispatch", handler)
+                if startup_inputs is not None
+                else None
+            ),
+            register_initial_file_upload=lambda handler: setattr(
+                app.state, "initial_file_upload", handler
+            ),
             register_runner_ingest=lambda handler: setattr(
                 app.state, "runner_event_ingest", handler
             ),
@@ -3547,6 +3572,16 @@ def create_app(
                 runner_id,
             )
             return
+        # The same holds for one runner this replica handed to another replica.
+        handoff_reason = shutdown_state.runner_handoff_reason(runner_id)
+        if handoff_reason is not None:
+            _logger.info(
+                "Runner %s dropped because this server handed it off (%s); "
+                "skipping offline-marking",
+                runner_id,
+                handoff_reason,
+            )
+            return
         if reconnected is not None:
             _logger.info(
                 "Runner %s reconnected within the liveness lease; skipping offline-marking",
@@ -3664,6 +3699,7 @@ def create_app(
                 runner_id=runner_id,
                 peer_close_reason=connection.peer_close_reason,
                 idle_shutdown=idle_shutdown,
+                **shutdown_state.disconnect_attributes(runner_id),
             ),
         )
         if idle_shutdown:
@@ -3675,9 +3711,12 @@ def create_app(
         # one we wrote ourselves (the clear itself never erases this record).
         reference_stamp = session_live_state.last_liveness_stamp(runner_id)
         # Graceful disconnect: clear the persisted liveness stamp so other replicas
-        # flip offline at once. Not on our own shutdown: the runner is alive and
-        # re-tunnels to the replacement, which must not settle its turns to idle.
-        if shutdown_state.server_shutting_down():
+        # flip offline at once. Not on our own shutdown or a handoff: the runner is
+        # alive and re-tunnels elsewhere, which must not settle its turns to idle.
+        if (
+            shutdown_state.server_shutting_down()
+            or shutdown_state.runner_handoff_reason(runner_id) is not None
+        ):
             session_live_state.touch_runner_liveness([runner_id])
         else:
             session_live_state.clear_runner_liveness(runner_id)
@@ -3784,6 +3823,8 @@ def create_app(
             "Runner connected",
             extra=debug_event("runner_connected", runner_id=runner_id),
         )
+        # A runner back on this replica is this replica's to reconcile again.
+        shutdown_state.clear_runner_handoff(runner_id)
         # Other replicas must see the runner online before the first liveness sweep.
         session_live_state.touch_runner_liveness([runner_id])
         # The by-runner lookup is read-after-write consistent and includes archived
@@ -4126,6 +4167,8 @@ def create_app(
 
         async def _on_hosts_changed(_host_id: str, owner: str | None) -> None:
             announce_hosts_changed(owner)
+            if startup_inputs is not None:
+                startup_inputs.host_changed(app, _host_id)
 
         app.include_router(
             create_host_tunnel_router(

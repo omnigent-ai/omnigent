@@ -1,5 +1,6 @@
 """Regression checks for the UI suite's fixture configuration."""
 
+import json
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,53 @@ def test_mock_config_respects_workflow_ownership(monkeypatch, tmp_path, harness,
             assert f"mock-{harness}:" in config.read_text()
             assert "http://model" in config.read_text()
     assert config.read_text() == "original config\n"
+
+
+def test_native_claude_mock_rejects_conflicting_managed_route(monkeypatch, tmp_path):
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    config = tmp_path / "config.yaml"
+    config.write_text("original config\n")
+    managed = tmp_path / "managed-settings.json"
+    managed.write_text(
+        json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://private.example/secret"}})
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed,)
+    )
+    with pytest.raises(RuntimeError, match="managed ANTHROPIC_BASE_URL overrides") as caught:
+        configuration.validate_native_claude_mock_routing("http://model")
+    assert config.read_text() == "original config\n"
+    assert not (tmp_path / "config.yaml.e2e-backup").exists()
+    assert "private.example" not in str(caught.value)
+    assert "secret" not in str(caught.value)
+
+    # The Anthropic config is also used by Pi; only real Claude launches need this check.
+    with configuration.temp_omnigent_mock_config("http://model", "claude"):
+        assert "mock-claude:" in config.read_text()
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        None,
+        "not json",
+        "[]",
+        "{}",
+        '{"apiKeyHelper": "credential-helper"}',
+        '{"env": {"ANTHROPIC_BASE_URL": "http://model/"}}',
+    ],
+    ids=["missing", "malformed", "non-object", "unrelated", "auth-only", "matching"],
+)
+def test_native_claude_mock_allows_settings_without_a_conflicting_route(
+    monkeypatch, tmp_path, settings
+):
+    managed = tmp_path / "managed-settings.json"
+    if settings is not None:
+        managed.write_text(settings)
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed,)
+    )
+    configuration.validate_native_claude_mock_routing("http://model")
 
 
 @pytest.mark.parametrize("missing", ["SERVER_URL", "MODEL_URL", "RUNNER_ID"])

@@ -1231,6 +1231,26 @@ describe("WorkspacePicker navigation status", () => {
     expect(screen.getByTestId("workspace-picker-new-folder")).toBeDisabled();
   });
 
+  it("keeps a cached listing on screen while it refetches in the background", () => {
+    useHostFilesystemMock.mockReturnValue(
+      result({
+        data: { entries: [dir("src", "/repo/src")], truncated: false },
+        isLoading: false,
+        isFetching: true,
+        isPlaceholderData: false,
+        error: null,
+      }),
+    );
+
+    render(<WorkspacePicker hostId="host_1" initialPath="/repo" onSelect={vi.fn()} />);
+
+    expect(screen.getByTestId("workspace-picker-listing")).not.toHaveAttribute("aria-busy");
+    expect(screen.queryByText("Loading folder…")).toBeNull();
+    expect(screen.getByTestId("workspace-picker-entry-src")).toBeInTheDocument();
+    expect(screen.getByTestId("workspace-picker-select")).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Refresh" })).toBeDisabled();
+  });
+
   it("announces directory listing errors", () => {
     useHostFilesystemMock.mockReturnValue(
       result({

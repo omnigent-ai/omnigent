@@ -606,7 +606,7 @@ def test_start_local_server_spawns_runner_as_sibling(
 
     # Server subprocess was spawned.
     assert len(server_popen_calls) == 1
-    assert server_popen_calls[0].args[2:6] == [
+    assert server_popen_calls[0].args[3:7] == [
         "omnigent.cli",
         "server",
         "--host",
@@ -1117,8 +1117,8 @@ def test_run_local_headless_prompt_uses_directory_bundle_for_root_config_yaml(
     """One-shot local prompt mode also preserves directory-agent siblings.
 
     This covers ``omnigent run bundle/config.yaml -p ...``. Without the
-    canonicalization in the headless helper, interactive runs would upload the
-    full bundle while one-shot runs would silently upload only ``config.yaml``.
+    canonicalization in the headless helper, startup registration would lose
+    the sibling directories. Session creation reuses the registered agent.
     """
     agent_dir = tmp_path / "orchestrator"
     agent_dir.mkdir()
@@ -1186,13 +1186,13 @@ def test_run_local_headless_prompt_uses_directory_bundle_for_root_config_yaml(
 
     assert captured["server_spec_path"] == agent_dir
     assert captured["server_ephemeral"] is True
-    assert captured["bundle_path"] == agent_dir
+    assert "bundle_path" not in captured
     headless = captured["headless"]
     assert isinstance(headless, dict)
     assert headless["agent_name"] == "orchestrator"
     assert headless["prompt"] == "say hi"
     assert headless["runner_id"] == "runner_headless"
-    assert headless["session_bundle"] == b"bundle-bytes"
+    assert headless["session_bundle"] is None
 
 
 def test_chat_local_uses_directory_bundle_for_root_config_yaml(
@@ -1203,8 +1203,8 @@ def test_chat_local_uses_directory_bundle_for_root_config_yaml(
 
     This covers the ``_chat_local`` path used by local non-daemon REPL runs.
     If the helper passes ``bundle/config.yaml`` through unchanged, the local
-    server and session bundle lose sibling directories such as ``agents/`` and
-    ``skills/``.
+    server registration loses sibling directories such as ``agents/`` and
+    ``skills/``. The REPL reuses that registration without an HTTP upload.
     """
     agent_dir = tmp_path / "orchestrator"
     (agent_dir / "skills" / "investigate").mkdir(parents=True)
@@ -1270,7 +1270,7 @@ def test_chat_local_uses_directory_bundle_for_root_config_yaml(
     assert captured["server_spec_path"] == agent_dir
     assert captured["server_port"] == 45678
     assert captured["server_ephemeral"] is True
-    assert captured["bundle_path"] == agent_dir
+    assert "bundle_path" not in captured
     chat_args = captured["chat_args"]
     assert isinstance(chat_args, tuple)
     assert chat_args[0] == "http://127.0.0.1:45678"
@@ -1281,7 +1281,7 @@ def test_chat_local_uses_directory_bundle_for_root_config_yaml(
     assert chat_kwargs["initial_message"] == "say hi"
     assert chat_kwargs["resume_conversation_id"] == "conv_resume"
     assert chat_kwargs["runner_id"] == "runner_local"
-    assert chat_kwargs["session_bundle"] == b"bundle-bytes"
+    assert chat_kwargs.get("session_bundle") is None
     skills = chat_kwargs["skills"]
     assert isinstance(skills, list)
     assert "investigate" in {skill.name for skill in skills}

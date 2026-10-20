@@ -1,7 +1,7 @@
 """E2E: file edits auto-save without an explicit Save action.
 
 The FileViewer has no Save button — both editor surfaces (TipTap for
-markdown, Monaco for everything else) debounce edits and write them back
+small Markdown, Monaco for large Markdown and code) debounce edits and write them back
 through ``PUT .../filesystem/{path}`` automatically (see
 ``useEditorAutoSave``). These tests drive a real edit in each surface and
 prove the change reaches the server:
@@ -143,6 +143,24 @@ def test_markdown_edit_autosaves(page: Page, seeded_markdown: tuple[str, str]) -
     persisted = _wait_for_persisted(base_url, session_id, _MARKDOWN_PATH, sentinel)
     assert sentinel in persisted
 
+    # Undo after saving must persist the older document, then redo must save
+    # the edit again against that new baseline.
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PUT"
+            and response.url.endswith(f"/filesystem/{_MARKDOWN_PATH}")
+        )
+    ) as undo_save:
+        page.keyboard.press("ControlOrMeta+z")
+        expect(editor).not_to_contain_text(sentinel)
+    assert undo_save.value.ok
+    assert _read_file(base_url, session_id, _MARKDOWN_PATH).strip() == _MARKDOWN_CONTENT.strip()
+    page.keyboard.press("ControlOrMeta+Shift+z")
+    expect(editor).to_contain_text(sentinel)
+    assert _wait_for_persisted(base_url, session_id, _MARKDOWN_PATH, sentinel) == persisted
+    page.reload()
+    expect(editor).to_contain_text(sentinel)
+
 
 def test_non_markdown_edit_autosaves(page: Page, seeded_python: tuple[str, str, str]) -> None:
     """The full file can be viewed and edited without losing its tail on save."""
@@ -179,3 +197,53 @@ def test_non_markdown_edit_autosaves(page: Page, seeded_python: tuple[str, str, 
 
     page.keyboard.press("Control+End")
     expect(file_viewer.locator(".view-lines")).to_contain_text("file_end_marker")
+
+
+def test_large_markdown_source_autosaves(page: Page, seeded_session: tuple[str, str]) -> None:
+    """Source fallback preserves the whole file and stays mounted across a smaller save."""
+    base_url, session_id = seeded_session
+    path = "large-autosave.md"
+    line = "A paragraph in a large Markdown document.\n\n"
+    original = "# Large document\n\n" + line * (1024 * 1024 // len(line) + 1)
+    original += "Large document end.\n"
+    _seed_file(base_url, session_id, path, original)
+    try:
+        page.goto(f"{base_url}/c/{session_id}?file={path}")
+        viewer = page.locator('[data-testid="file-viewer"]:visible')
+        expect(
+            viewer.get_by_text("Large Markdown file opened as source", exact=False)
+        ).to_be_visible()
+        editor = viewer.locator(".monaco-editor")
+        expect(editor).to_be_visible(timeout=30_000)
+        expect(viewer.locator(".tiptap")).to_have_count(0)
+        expect(viewer.get_by_role("button", name="View mode", exact=False)).to_have_count(0)
+        viewer.locator(".view-lines").click()
+        page.keyboard.press("ControlOrMeta+End")
+        expect(viewer.locator(".view-lines")).to_contain_text("Large document end.")
+        page.keyboard.press("ControlOrMeta+Home")
+        sentinel = "# Saved large Markdown\n"
+        page.keyboard.type(sentinel)
+        assert _wait_for_persisted(base_url, session_id, path, sentinel) == sentinel + original
+        page.reload()
+        expect(viewer.locator(".view-lines")).to_contain_text("Saved large Markdown")
+        viewer.locator(".view-lines").click()
+        page.keyboard.press("ControlOrMeta+f")
+        search = editor.get_by_role("textbox", name="Find", exact=True)
+        expect(search).to_be_focused()
+        search.fill("Large document end.")
+        expect(editor.locator(".view-lines")).to_contain_text("Large document end.")
+        page.keyboard.press("Escape")
+        page.keyboard.press("ControlOrMeta+a")
+        small = "# Smaller saved document\n"
+        page.keyboard.type(small)
+        assert _wait_for_persisted(base_url, session_id, path, small) == small
+        expect(editor).to_be_visible()
+        page.keyboard.type("Another edit after shrinking.")
+        assert (
+            _wait_for_persisted(base_url, session_id, path, "Another edit")
+            == small + "Another edit after shrinking."
+        )
+        page.reload()
+        expect(viewer.locator(".tiptap")).to_contain_text("Another edit after shrinking.")
+    finally:
+        _cleanup_session_workdir(session_id)
