@@ -21,12 +21,12 @@ adds native niceties:
   **Compatibility:** These controls require an updated macOS desktop app and
   connected server web bundle. Older server bundles retain their existing
   focused-conversation suppression. Existing notification preferences are preserved.
-- **A foreground attention cue.** Electron requests foreground presentation on
-  macOS, so a native banner can appear while Omnigent is frontmost. The shell
-  supplements notifications by **bouncing the macOS dock icon** (or flashing
-  the taskbar frame on Windows/Linux). On macOS it also **plays the chosen sound
-  itself** via `afplay`, keeping the alert audible whether Omnigent is in front
-  or backgrounded; the toast's own sound is muted so the cue never doubles.
+- **Native attention cues.** Electron requests foreground presentation on
+  macOS; whether a banner appears depends on macOS notification settings.
+  The macOS dock icon only bounces while the app is unfocused; the taskbar frame
+  on Windows/Linux only flashes for an unfocused window. When sound is enabled,
+  the shell plays the chosen macOS sound via `afplay` in foreground and background.
+  It explicitly silences the native toast to avoid duplicate audio.
 - **Multiple windows** (**Server → New Window**, `Cmd/Ctrl+N`). Each window is
   an independent view, opening on the current window's URL so you can then
   navigate it to a different conversation and watch two side by side. A

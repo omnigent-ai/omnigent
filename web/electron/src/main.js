@@ -3174,12 +3174,9 @@ async function confirmHostEnrollment(win) {
 }
 
 /**
- * Supplemental OS-level attention cue for a notification. On macOS we bounce
- * the dock icon (`informational` = a single gentle bounce); on Windows/Linux we
- * flash the window frame when it is not focused. Electron presents foreground
- * macOS notifications too, including for the active conversation in Always
- * mode, so this cue complements rather than replaces the banner. Wrapped in
- * try/catch: a cue must never break notifying.
+ * Background attention cue: macOS only bounces the dock icon while the app is
+ * unfocused; Windows/Linux only flash an unfocused window. Foreground banners
+ * are requested separately by Electron and remain subject to OS settings.
  */
 function signalForeground() {
   try {
@@ -3197,12 +3194,9 @@ function signalForeground() {
 }
 
 // ---------------------------------------------------------------------------
-// Notification sound (macOS). The frontmost app's own OS-notification sound is
-// suppressed by macOS, so to make the alert audible in BOTH the foreground and
-// the background we play a system sound ourselves with `afplay` and mute the
-// toast's built-in sound (see the notify handler). The chosen sound and the
-// on/off switch live in Settings → Notifications, persisted in settings
-// (`notification_sound_enabled`, `notification_sound_name`).
+// Play the selected macOS sound via `afplay` in foreground and background.
+// We explicitly silence the native toast to avoid duplicate sound. Preferences
+// live in Settings → Notifications and persist in settings.json.
 // ---------------------------------------------------------------------------
 
 const SYSTEM_SOUNDS_DIR = "/System/Library/Sounds";
@@ -4415,12 +4409,9 @@ function registerIpc() {
       // isPinnedOriginSender above guarantees a pinned, parseable origin.
       title = `[${serverDisplayName(origin)}] ${title}`;
     }
-    // On macOS we play the notification sound ourselves (afplay, after show())
-    // so the alert is audible in the foreground too — macOS suppresses the
-    // frontmost app's OWN notification sound, so we mute the toast there and
-    // play it explicitly, which also keeps the cue consistent when backgrounded
-    // (no double sound). Off macOS, let the OS play its default sound, gated on
-    // the same enable switch.
+    // On macOS, silence the toast and play the selected sound via afplay after
+    // show(), avoiding duplicate audio. Elsewhere, use the OS default sound
+    // gated on the same enable switch.
     const isMac = process.platform === "darwin";
     const soundOn = notificationSoundEnabled();
     const notification = new Notification({

@@ -202,6 +202,15 @@ function loadMainHarness({
         isAttached: () => false,
       }),
     },
+    // Avoid pulling Electron-only CLI dependencies into the web CI install.
+    "./arca_autoconnect": {
+      createArcaAutoConnect: () => ({
+        getStatus: () => null,
+        ensure: async () => null,
+        retry: async () => null,
+        inFlight: () => null,
+      }),
+    },
     "./omnigent_cli": {
       isExecutableFile: () => false,
       resolveCliPath: () => null,
