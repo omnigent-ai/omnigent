@@ -72,11 +72,6 @@ from omnigent.harnesses.claude_native import delivery_diagnostics
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
-from omnigent.harnesses.claude_native.submit_verification import (
-    SubmitBoundary,
-    capture_submit_boundary,
-    has_matching_hook_refusal,
-)
 from omnigent.harnesses.diagnostics import (
     detect_sign_in_prompt,
     sign_in_next_step,
@@ -224,6 +219,8 @@ _TOOL_RELAY_FILE = "tool_relay.json"
 # on every relay start, so hooks survive runner restarts (new port).
 _TOOL_RELAY_ENV_FILE = "tool_relay.env"
 _TMUX_FILE = "tmux.json"
+# Claude Code's user keybindings, under the config dir :func:`claude_config_dir` resolves.
+_CLAUDE_KEYBINDINGS_FILE = "keybindings.json"
 _PERMISSION_HOOK_FILE = "permission_hook.json"
 _CONTEXT_FILE = "context.json"
 _USER_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
@@ -313,12 +310,6 @@ _DIALOG_SCAN_TAIL_LINES = 15
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _CLAUDE_LIVENESS_POLL_INTERVAL_S = 1.0
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
-# Ctrl+K and Ctrl+U as CSI-u sequences, so Claude Code reads them as keys
-# rather than as text when they arrive in one burst.
-_COMPOSER_KILL_TO_LINE_END = "\x1b[107;5u"
-_COMPOSER_KILL_TO_LINE_START = "\x1b[117;5u"
-# Retry rounds when the capture cannot show the whole box.
-_COMPOSER_CLEAR_MAX_ROUNDS = 3
 # How long to wait for the pasted draft to visibly land in Claude's
 # input box before sending the submit Enter. Claude Code coalesces
 # rapid stdin bursts into a paste, so an Enter sent while the TUI is
@@ -422,14 +413,6 @@ _OVERLAY_SURFACE = "an overlay"
 # e.g. a launch wrapper's output before Claude Code has drawn its input box —
 # and an Escape cannot clear it.
 _ESCAPE_DISMISS_HINT = re.compile(r"\b(?:\w+/)*Esc(?:/\w+)* to \w", re.IGNORECASE)
-# Headlines of startup dialogs whose "Esc to cancel" quits Claude Code rather
-# than closing the dialog (2.1.299: the settings error exits 1, the folder-trust
-# question exits 0). Only the person may answer them.
-_ESCAPE_QUITS_DIALOG_HEADLINES = (
-    "Settings Error",
-    "Accessing workspace",
-    "Do you trust the files in this folder",
-)
 # Titles of the confirmation dialog Claude Code pops when a switch invalidates
 # the prompt cache — one component, titled for what is being switched. It only
 # appears on a session with history, and it took ~1.9s to render on a warm
@@ -648,29 +631,11 @@ class ClaudeInjectionCancelled(RuntimeError):
 
 
 class ClaudeUserPromptPending(RuntimeError):
-    """
-    A native question or permission prompt must be answered before injection.
-
-    :param message: Human-readable refusal.
-    :param nothing_typed: Whether the refusal came before any keystroke reached
-        the pane, so the same delivery can run again once the prompt is answered.
-    """
-
-    def __init__(self, message: str, *, nothing_typed: bool = False) -> None:
-        super().__init__(message)
-        self.nothing_typed = nothing_typed
+    """A native question or permission prompt must be answered before injection."""
 
 
 class ClaudeMessageNotAccepted(RuntimeError):
     """The submitted draft remained in Claude's input box until the deadline."""
-
-
-class ClaudeComposerNotCleared(ClaudeMessageNotAccepted):
-    """A draft left in Claude's input box could not be cleared, so nothing was sent."""
-
-
-class ClaudeSubmitBlockedUnconfirmed(RuntimeError):
-    """A fresh matching native refusal stops retries without proving web ownership."""
 
 
 @contextlib.contextmanager
@@ -687,6 +652,10 @@ def _check_injection_cancelled() -> None:
     cancel_event = _INJECTION_CANCEL_EVENT.get()
     if cancel_event is not None and cancel_event.is_set():
         raise ClaudeInjectionCancelled("Claude Code message delivery was cancelled")
+
+
+class ClaudeSubmitKeyUnsupported(ClaudeMessageNotAccepted):
+    """``keybindings.json`` moves ``chat:submit`` off Enter onto keys the bridge cannot type."""
 
 
 class TmuxSessionNotAdvertised(RuntimeError):
@@ -1893,6 +1862,49 @@ def _claude_joined_path(cwd: Path, directory: str, name: str) -> Path:
     """
     joined = os.path.normpath(os.path.join(directory, name))
     return Path(joined) if os.path.isabs(joined) else cwd / joined
+
+
+def claude_config_dir(cwd: Path | None = None, env: Mapping[str, str] | None = None) -> Path:
+    """
+    Return Claude's config directory for its launch env and working directory.
+
+    Claude keeps ``keybindings.json``, ``settings.json`` and ``sessions/`` under
+    ``$CLAUDE_CONFIG_DIR`` when that is non-empty, else ``~/.claude``; a
+    relative value is resolved against its working directory.
+
+    :param cwd: Claude's working directory, e.g. ``Path("/home/user/repo")``.
+        ``None`` uses this process's working directory.
+    :param env: Claude's launch environment, e.g. ``{"HOME": "/home/user"}``.
+        ``None`` uses this process's environment.
+    :returns: The config directory, e.g. ``Path("/home/user/.claude")``.
+    """
+    env = os.environ if env is None else env
+    base = cwd if cwd is not None else Path.cwd()
+    joined = os.path.normpath(_claude_config_directory(env))
+    return Path(joined) if os.path.isabs(joined) else base / joined
+
+
+def claude_config_dir_is_relative(env: Mapping[str, str] | None = None) -> bool:
+    """
+    Return whether Claude's config directory depends on its working directory.
+
+    :param env: Claude's launch environment, e.g. ``{"CLAUDE_CONFIG_DIR": "cfg"}``.
+        ``None`` uses this process's environment.
+    :returns: ``True`` for a relative ``CLAUDE_CONFIG_DIR`` or home, e.g. ``"cfg"``.
+    """
+    env = os.environ if env is None else env
+    return not os.path.isabs(os.path.normpath(_claude_config_directory(env)))
+
+
+def _claude_config_directory(env: Mapping[str, str]) -> str:
+    """
+    Return the directory value Claude resolves its config dir from.
+
+    :param env: Claude's launch environment.
+    :returns: ``$CLAUDE_CONFIG_DIR`` when non-empty, else ``<home>/.claude``.
+    """
+    configured = env.get("CLAUDE_CONFIG_DIR")
+    return configured or os.path.join(env.get("HOME") or str(_account_home_dir()), ".claude")
 
 
 def _account_home_dir() -> Path:
@@ -4135,6 +4147,7 @@ def write_tmux_target(
     socket_path: Path,
     tmux_target: str,
     pid: int | None = None,
+    config_dir: Path | None = None,
 ) -> None:
     """
     Advertise the tmux socket + target for the Claude terminal.
@@ -4149,6 +4162,9 @@ def write_tmux_target(
         socket, e.g. ``Path("/tmp/.../tmux.sock")``.
     :param tmux_target: tmux pane target string, e.g. ``"claude:0.0"``.
     :param pid: Optional Claude process pid, recorded for diagnostics.
+    :param config_dir: The Claude config directory this pane's process reads
+        (see :func:`claude_config_dir`), so injection can honor its
+        ``keybindings.json``. ``None`` keeps the Enter submit.
     :returns: None.
     """
     _ensure_secure_dir(bridge_dir)
@@ -4159,6 +4175,8 @@ def write_tmux_target(
     }
     if pid is not None:
         payload["pid"] = pid
+    if config_dir is not None:
+        payload["claude_config_dir"] = str(config_dir)
     _write_json_file(bridge_dir / _TMUX_FILE, payload)
 
 
@@ -4193,8 +4211,9 @@ def inject_user_message(
     (anthropics/claude-code#52126). A trailing newline inside the paste
     absorbs any trailing backslash — otherwise ``\`` + the submit
     ``Enter`` reads as a line-continuation and the message sits unsent.
-    ``Enter`` is a separate tmux call. The file-based buffer
-    path (not ``send-keys`` argv) matters: tmux caps a single
+    The submit key — Enter, or the chord ``keybindings.json`` binds to
+    ``chat:submit`` (see :func:`_rebound_submit_sequence`) — is a separate
+    tmux call. The file-based buffer path (not ``send-keys`` argv) matters: tmux caps a single
     client→server command at ~16KB, so a large message — e.g. a PR diff
     in a sub-agent dispatch — failed with "command too long".
 
@@ -4203,9 +4222,9 @@ def inject_user_message(
     while the TUI is still consuming the paste is folded in as a
     newline and the draft sits unsent. This helper first polls
     ``capture-pane`` until the draft is visible in the input box (the
-    paste was committed), sends Enter, then polls that the draft left
-    the box — re-sending Enter while it hasn't — and raises if the
-    message never submits.
+    paste was committed), sends the submit key, then polls that the
+    draft left the box — re-sending it while it hasn't — and raises if
+    the message never submits.
 
     A message leading with an *unknown* slash command passes through
     unescaped on the guess that it names a skill. When Claude Code
@@ -4234,6 +4253,8 @@ def inject_user_message(
     """
     delivery_diagnostics.set_stage("waiting_for_tmux")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    # An unsupported submit binding fails here, before any keystroke reaches the pane.
+    submit_sequence = _rebound_submit_sequence(_advertised_claude_config_dir(info))
     delivery_diagnostics.set_stage("restoring_input")
     # A surface left occupying the composer swallows everything typed
     # below — and hides the input box, wedging the readiness gate — so
@@ -4282,7 +4303,14 @@ def inject_user_message(
         rejection_baseline = _count_unknown_command_rejections(
             _capture_pane(socket_path, tmux_target), rejection_needle
         )
-    _paste_and_submit(bridge_dir, socket_path, tmux_target, text=injected_text, needle=needle)
+    _paste_and_submit(
+        bridge_dir,
+        socket_path,
+        tmux_target,
+        text=injected_text,
+        needle=needle,
+        submit_sequence=submit_sequence,
+    )
     if rejection_needle is None:
         return
     if not _unknown_command_rejection_appeared(
@@ -4307,7 +4335,121 @@ def inject_user_message(
         tmux_target,
         text=_escape_slash_command_text(content),
         needle=needle,
+        submit_sequence=submit_sequence,
     )
+
+
+# CSI-u key codes and modifier bits for Claude Code's keystroke names.
+_CSI_U_KEY_CODES = {"enter": 13, "return": 13, "tab": 9, "escape": 27, "esc": 27, "space": 32}
+_CSI_U_MODIFIER_BITS = {
+    "shift": 1,
+    "alt": 2,
+    "opt": 2,
+    "option": 2,
+    "meta": 2,
+    "ctrl": 4,
+    "control": 4,
+    "cmd": 8,
+    "command": 8,
+    "super": 8,
+    "win": 8,
+}
+
+
+def _keys_csi_u(keys: str) -> str | None:
+    """
+    Encode a Claude Code keystroke or chord as CSI-u sequences.
+
+    :param keys: A ``keybindings.json`` key, e.g. ``"ctrl+s"`` or ``"ctrl+x s"``.
+    :returns: The sequences, e.g. ``"\\x1b[115;5u"`` or ``"\\x1b[120;5us"``, or
+        ``None`` when a keystroke is one CSI-u does not carry, e.g. ``"up"``.
+    """
+    sequences = ""
+    for keystroke in keys.split():
+        *modifiers, key = keystroke.split("+")
+        code = _CSI_U_KEY_CODES.get(key, ord(key) if len(key) == 1 else None)
+        if code is None or any(modifier not in _CSI_U_MODIFIER_BITS for modifier in modifiers):
+            return None
+        bits = sum({_CSI_U_MODIFIER_BITS[modifier] for modifier in modifiers})
+        # An unmodified key goes as the character a terminal emits for it.
+        sequences += f"\x1b[{code};{bits + 1}u" if bits else chr(code)
+    return sequences or None
+
+
+def _rebound_submit_sequence(config_dir: Path | None) -> str | None:
+    """
+    Return the user's submit key when their keybindings moved it off Enter.
+
+    Claude Code reads ``keybindings.json`` from its config dir (see
+    :func:`claude_config_dir`); a ``Chat`` binding there can move
+    ``chat:submit`` to another key, and Enter then only adds a newline.
+
+    :param config_dir: The config dir this pane's Claude process reads, as the
+        launch advertised it in ``tmux.json``, or ``None`` when it did not. The
+        bridge then keeps Enter rather than guess from its own environment,
+        which is not Claude's.
+    :returns: The submit key as CSI-u, e.g. ``"\\x1b[13;2u"`` for
+        ``shift+enter``, or ``None`` when Enter still submits.
+    :raises ClaudeSubmitKeyUnsupported: If Enter no longer submits and
+        ``chat:submit`` is bound only to keys CSI-u cannot carry, e.g. ``up``.
+    """
+    if config_dir is None:
+        return None
+    path = config_dir / _CLAUDE_KEYBINDINGS_FILE
+    chat: dict[str, Any] = {}
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+        for block in config["bindings"]:
+            if block.get("context") == "Chat":
+                chat.update(block["bindings"])
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, LookupError, TypeError, AttributeError) as exc:
+        # Claude falls back to its defaults for a malformed file; leave a trace.
+        _logger.warning("claude-native: ignoring unreadable %s, pressing Enter: %s", path, exc)
+        return None
+    bindings = {" ".join(key.lower().split()): action for key, action in chat.items()}
+    if bindings.get("enter", bindings.get("return", "chat:submit")) == "chat:submit":
+        return None
+    submit_keys = [keys for keys, action in bindings.items() if action == "chat:submit"]
+    for keys in submit_keys:
+        sequence = _keys_csi_u(keys)
+        if sequence is not None:
+            return sequence
+    # Enter would only add newlines, so failing now beats the generic verify timeout.
+    raise ClaudeSubmitKeyUnsupported(
+        "Claude Code's keybindings.json moves chat:submit off Enter but binds it to "
+        f"{', '.join(submit_keys) or 'nothing'}, which Omnigent cannot type into the "
+        "terminal. Bind chat:submit to Enter or a Ctrl/Alt/Shift chord. The message was "
+        "not delivered."
+    )
+
+
+def _press_submit(socket_path: str, tmux_target: str, sequence: str | None) -> None:
+    """
+    Press the key that submits Claude's input box.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param sequence: The rebound submit key from
+        :func:`_rebound_submit_sequence`, or ``None`` to press Enter.
+    :returns: None.
+    """
+    if sequence is None:
+        _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    else:
+        _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, sequence)
+
+
+def _advertised_claude_config_dir(info: Mapping[str, str]) -> Path | None:
+    """
+    Return the Claude config dir ``tmux.json`` advertised for this pane.
+
+    :param info: The payload from :func:`_wait_for_tmux_info`.
+    :returns: The directory, or ``None`` when the launch did not record one.
+    """
+    config_dir = info.get("claude_config_dir")
+    return Path(config_dir) if config_dir else None
 
 
 def _paste_and_submit(
@@ -4317,15 +4459,16 @@ def _paste_and_submit(
     *,
     text: str,
     needle: str,
+    submit_sequence: str | None,
 ) -> None:
     r"""
-    Deliver *text* into Claude's input box as one paste plus a verified Enter.
+    Deliver *text* into Claude's input box as one paste plus a verified submit.
 
     The delivery core of :func:`inject_user_message` (see its docstring for
     the full hazard notes): clear any leftover draft, bracketed-paste the
     payload via ``load-buffer`` + ``paste-buffer -p``, wait for the draft to
     visibly commit, submit, and verify the draft left the box — re-sending
-    Enter while it verifiably hasn't.
+    the submit key while it verifiably hasn't.
 
     :param bridge_dir: Bridge directory path (hosts the paste temp file).
     :param socket_path: Absolute path to the tmux socket.
@@ -4333,11 +4476,11 @@ def _paste_and_submit(
     :param text: Exact text to paste (already escaped as needed).
     :param needle: Draft marker from :func:`_submit_needle`; empty skips
         draft-visibility verification (blind submit).
+    :param submit_sequence: The rebound submit key from
+        :func:`_rebound_submit_sequence`, or ``None`` for Enter.
     :returns: None.
     :raises ClaudeUserPromptPending: If a question or permission prompt is
         pending before the submit Enter; the message was not sent.
-    :raises ClaudeComposerNotCleared: If a draft left in the input box could
-        not be cleared first; the message was not sent.
     :raises RuntimeError: If a ``tmux`` invocation fails, if the draft
         never leaves the input box after repeated submit Enters, or if a
         prompt appears after the submit Enter.
@@ -4346,13 +4489,16 @@ def _paste_and_submit(
     delivery_diagnostics.set_stage("checking_pending_prompt")
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
-            "Answer the pending Claude question or permission request before sending a message.",
-            nothing_typed=True,
+            "Answer the pending Claude question or permission request before sending a message."
         )
     delivery_diagnostics.set_stage("pasting")
-    # Clear stale text first, or the paste lands inside the person's draft and
-    # Enter submits both together.
-    _clear_composer(socket_path, tmux_target)
+    # Space returns focus to the input box if the footer (shells item or agent
+    # list) holds it. Either way it types a space, which the clear removes.
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
+    # Clear stale text first: raw controls can otherwise become pasted text.
+    # CSI-u sends Ctrl+A/Ctrl+K literally so Claude handles them as keys.
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[97;5u")
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[107;5u")
     # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
     # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
     # client→server command at ~16KB, so per-byte hex argv blew up with
@@ -4421,14 +4567,7 @@ def _paste_and_submit(
             "Claude is waiting for an explicit answer; message not sent."
         )
     delivery_diagnostics.set_stage("submitting")
-    transcript_path = read_transcript_path(bridge_dir)
-    native_session_id = read_claude_session_id(bridge_dir)
-    submit_boundary = (
-        capture_submit_boundary(transcript_path, native_session_id)
-        if transcript_path is not None and native_session_id is not None
-        else None
-    )
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    _press_submit(socket_path, tmux_target, submit_sequence)
     delivery_diagnostics.record_details(submit_sent=True)
     if not draft_seen:
         delivery_diagnostics.record_details(verification="unverified")
@@ -4449,8 +4588,7 @@ def _paste_and_submit(
             needle=needle,
             what="submitted message",
             bridge_dir=bridge_dir,
-            submit_boundary=submit_boundary,
-            submitted_text=text,
+            submit_sequence=submit_sequence,
         )
     except ClaudeUserPromptPending as exc:
         # The Enter already went out, so the prompt may belong to this message's own turn.
@@ -4473,11 +4611,10 @@ def _verify_submit_accepted(
     needle: str,
     what: str,
     bridge_dir: Path | None = None,
-    submit_boundary: SubmitBoundary | None = None,
-    submitted_text: str | None = None,
+    submit_sequence: str | None = None,
 ) -> bool:
     """
-    Wait for a submitted draft to leave the input box, re-sending Enter.
+    Wait for a submitted draft to leave the input box, re-sending the submit key.
 
     A transiently unresponsive TUI (a CPU-starved host, a long paste
     burst) can take tens of seconds to process the submit while the
@@ -4494,12 +4631,10 @@ def _verify_submit_accepted(
     :param needle: Draft marker from :func:`_submit_needle`.
     :param what: Label for log lines, e.g. ``"submitted message"``.
     :param bridge_dir: Bridge whose pending questions protect submit retries.
-    :param submit_boundary: Native transcript boundary captured before Enter.
-    :param submitted_text: Full submitted text; a marker alone cannot identify a refusal.
+    :param submit_sequence: The rebound submit key re-sent while the draft
+        remains, or ``None`` for Enter.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
-    :raises ClaudeSubmitBlockedUnconfirmed: A fresh matching refusal appeared;
-        ownership of the web input remains unconfirmed.
     """
     start = time.monotonic()
     last_enter = start
@@ -4512,26 +4647,6 @@ def _verify_submit_accepted(
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
         pane = _capture_pane(socket_path, tmux_target)
         polls += 1
-        if (
-            bridge_dir is not None
-            and submit_boundary is not None
-            and submitted_text is not None
-            and _fresh_matching_hook_block(bridge_dir, submit_boundary, submitted_text)
-        ):
-            delivery_diagnostics.record_verification(
-                draft_still_present=_draft_in_input_box(pane, needle),
-                pane=pane,
-                needle=needle,
-                prompt_glyph=_CLAUDE_PROMPT_GLYPH,
-                start=start,
-                retries=retries,
-                polls=polls,
-            )
-            delivery_diagnostics.record_details(verification="hook_block_unowned")
-            raise ClaudeSubmitBlockedUnconfirmed(
-                "A hook blocked a matching prompt in Claude's terminal. Web message delivery "
-                "could not be confirmed; inspect the terminal before retrying."
-            )
         if not _draft_in_input_box(pane, needle):
             delivery_diagnostics.record_verification(
                 draft_still_present=False,
@@ -4561,7 +4676,7 @@ def _verify_submit_accepted(
             )
         if now - last_enter >= retry_interval:
             _raise_if_user_prompt_pending(bridge_dir, pane)
-            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+            _press_submit(socket_path, tmux_target, submit_sequence)
             retries += 1
             delivery_diagnostics.record_details(retries=retries)
             last_enter = now
@@ -4576,23 +4691,6 @@ def _verify_submit_accepted(
         polls=polls,
     )
     return False
-
-
-def _fresh_matching_hook_block(
-    bridge_dir: Path, boundary: SubmitBoundary, submitted_text: str
-) -> bool:
-    """A matching refusal prevents retries; it never establishes input ownership."""
-    if read_claude_session_id(bridge_dir) != boundary.native_session_id:
-        return False
-    path = read_transcript_path(bridge_dir)
-    try:
-        if path is None or path.resolve() != boundary.path:
-            return False
-    except (OSError, ValueError, RuntimeError):
-        return False
-    return has_matching_hook_refusal(
-        boundary, submitted_text, normalize_prompt=_unwrap_pasted_content_markers
-    )
 
 
 def _count_unknown_command_rejections(pane: str, needle: str) -> int:
@@ -4732,46 +4830,6 @@ def kill_session(
 
 
 @_serialize_bridge_injection
-def wait_for_input_ready(
-    bridge_dir: Path,
-    *,
-    ready_timeout_s: float,
-    timeout_s: float = _TMUX_READY_TIMEOUT_S,
-) -> None:
-    """
-    Block until Claude's input box can take keystrokes, within a hard budget.
-
-    For a caller that reads state off the booted pane before it types, such
-    as the statusLine model a switch is judged against: a snapshot taken
-    while the TUI is still booting is empty or left over from an earlier run.
-    It runs the same reclaim-then-wait step :func:`inject_slash_command`
-    does, so a surface the person left over the composer is dismissed rather
-    than waited out.
-
-    :param bridge_dir: Bridge directory path, e.g.
-        ``/tmp/omnigent/claude-native/<digest>``.
-    :param ready_timeout_s: Hard cap, in seconds, on the wait, e.g. ``9.0``.
-        There is no slow-boot extension, so a terminal that is still booting
-        when it lapses fails the wait.
-    :param timeout_s: Seconds to wait for ``tmux.json``, e.g. ``1.0``.
-    :returns: None.
-    :raises RuntimeError: If the tmux target is not advertised in time, if the
-        input box does not render within *ready_timeout_s*
-        (:class:`ClaudePromptTimeout`), or if a dialog, input mode (shell mode,
-        the prompt-history search), sign-in prompt or pending question holds
-        the terminal.
-    """
-    info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
-    _reclaim_and_wait_for_prompt(
-        bridge_dir,
-        info["socket_path"],
-        info["tmux_target"],
-        timeout_s=_TMUX_READY_TIMEOUT_S,
-        ready_timeout_s=ready_timeout_s,
-    )
-
-
-@_serialize_bridge_injection
 def inject_slash_command(
     bridge_dir: Path,
     *,
@@ -4779,22 +4837,23 @@ def inject_slash_command(
     timeout_s: float = _TMUX_READY_TIMEOUT_S,
     auto_confirm: bool = False,
     confirm_hint: str | None = None,
-    ready_timeout_s: float | None = None,
 ) -> None:
     """
     Type a Claude Code slash command into the tmux pane and submit it.
 
-    The input surface is reclaimed and the composer waited for before anything
-    is typed (see :func:`_reclaim_and_wait_for_prompt`): a booting TUI drops
-    keystrokes, and a surface left over the composer would swallow them.
+    Anything the person left occupying the composer from the embedded
+    terminal (ctrl+r history search, rewind dialog, ``!`` shell mode) is
+    dismissed first — see :func:`_restore_occupied_input` — so the
+    command cannot be typed into it. A surface that stays (a dialog with
+    no Escape dismissal, or one that outlived the retries) fails the call
+    instead: nothing would draft, so the submit Enter would answer the
+    dialog rather than run the command.
 
     :param bridge_dir: Bridge directory path, e.g.
         ``/tmp/omnigent/claude-native/<digest>``.
     :param command: Single-line slash command including the leading
         ``/``, e.g. ``"/effort high"``.
-    :param timeout_s: Seconds to wait for ``tmux.json``, e.g. ``30.0``. Also
-        the base budget for the input box to render when *ready_timeout_s* is
-        ``None``.
+    :param timeout_s: Seconds to wait for ``tmux.json``, e.g. ``30.0``.
     :param auto_confirm: If ``True``, accept the default option of the TUI
         confirmation dialog the command pops (e.g. ``/effort`` when
         switching invalidates the prompt cache). HACK — the chat UI has no
@@ -4807,22 +4866,14 @@ def inject_slash_command(
         dialog is polled for by its own title so a late render (~1.9s on a
         session with cached history) still gets its Enter, and so the Enter
         cannot answer a dialog that is not ours.
-    :param ready_timeout_s: Hard cap, in seconds, on waiting for the input box
-        to render, e.g. ``9.0``. For a caller answering a request with its own
-        deadline: a slow boot then fails the command in time instead of
-        outliving the request. ``None`` waits like :func:`inject_user_message`
-        — *timeout_s* as the base budget, extended while a live pane is still
-        booting.
     :raises ValueError: If *command* is empty, does not start with
         ``/``, contains a newline, or *auto_confirm* is set without a
         *confirm_hint*.
-    :raises ClaudeTerminalDialog: If shell mode, the prompt-history search or a
-        footer-less dialog still covers the input box after the restore, or
-        the readiness gate finds a dialog holding it; no keystroke was sent.
-        The person clears it from the embedded terminal and retries.
+    :raises ClaudeTerminalDialog: If a surface still covers the input box
+        after the restore; no keystroke was sent. The person clears it from
+        the embedded terminal and retries.
     :raises RuntimeError: If the tmux target is not advertised in
-        time, if the input box never renders (:class:`ClaudePromptTimeout`),
-        if a ``tmux send-keys`` invocation fails, if the typed
+        time, if a ``tmux send-keys`` invocation fails, or if the typed
         command verifiably never left the input box (submit swallowed).
     """
     if not command or not command.startswith("/"):
@@ -4837,27 +4888,33 @@ def inject_slash_command(
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
-    # Same reclaim-then-wait as inject_user_message: a surface left occupying
-    # the composer would swallow the clearing keys and command, and a TUI that
-    # has not mounted its input box yet would drop them.
-    _reclaim_and_wait_for_prompt(
-        bridge_dir,
-        socket_path,
-        tmux_target,
-        timeout_s=timeout_s,
-        ready_timeout_s=ready_timeout_s,
-    )
+    submit_sequence = _rebound_submit_sequence(_advertised_claude_config_dir(info))
+    # Same reclaim as inject_user_message: a surface left occupying the
+    # composer would swallow the C-u and the typed command.
+    surface = _restore_occupied_input(socket_path, tmux_target, bridge_dir=bridge_dir)
+    if surface is not None:
+        # No readiness gate follows; a blind Enter would answer the dialog.
+        raise ClaudeTerminalDialog(
+            f"Claude Code's input box is occupied by {surface}, so the command was "
+            "not sent. Open the terminal, dismiss it, then retry."
+        )
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before changing settings."
         )
-    # Clear any draft the user is mid-typing; otherwise the command below
-    # concatenates with their text and Enter submits
+    # ``C-u`` clears any draft the user is mid-typing; otherwise the
+    # paste below concatenates with their text and Enter submits
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
-    # not interrupt an in-flight generation.
-    _clear_composer(socket_path, tmux_target)
-    # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
-    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
+    # not interrupt an in-flight generation. Space first refocuses the input
+    # box from the footer, as in :func:`_paste_and_submit`; C-u clears its space.
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-u")
+    # ``-l`` pastes ``/`` and spaces literally; the submit key follows.
+    typed = command
+    if " " not in command and submit_sequence is not None:
+        # Claude's command menu takes only Enter; a trailing space closes it.
+        typed = f"{command} "
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, typed)
     # Same delivery hazards as inject_user_message: a coalesced or dropped
     # Enter leaves the command drafted while the persisted session value
     # claims it applied. Wait for the command to render, submit, verify it
@@ -4877,7 +4934,7 @@ def inject_slash_command(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; settings command not sent."
         )
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    _press_submit(socket_path, tmux_target, submit_sequence)
     if draft_seen:
         # Retry only while the command remains drafted and no user decision
         # is pending. A dialog replacing the composer counts as submission.
@@ -4887,6 +4944,7 @@ def inject_slash_command(
             needle=needle,
             what="slash command",
             bridge_dir=bridge_dir,
+            submit_sequence=submit_sequence,
         ):
             raise RuntimeError(
                 f"Claude Code did not accept the slash command within "
@@ -5762,23 +5820,16 @@ def _raise_if_user_prompt_pending(
     pane: str,
     *,
     message: str = "Claude is waiting for an explicit answer; input not sent.",
-    nothing_typed: bool = False,
 ) -> None:
-    """
-    Protect live hook waits even when a captured pane is torn or stale.
-
-    :param nothing_typed: Whether no keystroke has reached the pane yet (see
-        :class:`ClaudeUserPromptPending`).
-    """
+    """Protect live hook waits even when a captured pane is torn or stale."""
     if _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_CONSENT):
         raise ClaudeUserPromptPending(
             "Claude Code is waiting for your auto-mode classifier billing choice. "
             "The message was not delivered. Open the terminal, answer the prompt, "
-            "then resend your message.",
-            nothing_typed=nothing_typed,
+            "then resend your message."
         )
     if (bridge_dir is not None and _has_approval_wait(bridge_dir)) or _user_prompt_visible(pane):
-        raise ClaudeUserPromptPending(message, nothing_typed=nothing_typed)
+        raise ClaudeUserPromptPending(message)
 
 
 def has_pending_user_prompt(bridge_dir: Path) -> bool:
@@ -5890,11 +5941,7 @@ def acknowledge_auto_mode_billing_notice(
 
 
 def _restore_occupied_input(
-    socket_path: str,
-    tmux_target: str,
-    *,
-    bridge_dir: Path | None = None,
-    timeout_s: float | None = None,
+    socket_path: str, tmux_target: str, *, bridge_dir: Path | None = None
 ) -> str | None:
     """
     Dismiss a terminal-opened surface occupying Claude's input box.
@@ -5914,40 +5961,34 @@ def _restore_occupied_input(
     the web-UI message wins the pane.
 
     Questions and permission prompts are protected by their hook wait markers
-    and visible decision controls; they require an explicit answer. So are the
-    startup dialogs whose Escape quits Claude Code instead of closing them
-    (:func:`_escape_quits_claude`): they are left for the person to answer.
+    and visible decision controls; they require an explicit answer.
 
     Escape is only sent while the surface is verifiably on screen —
     never blind, because on the bare composer Escape interrupts an
     in-flight turn. A screen with no input box counts only when it
     advertises Escape as its dismissal; before Claude Code draws its input
     box the pane holds launcher output, which is handed back to the caller
-    untouched: :func:`inject_user_message` and :func:`inject_slash_command`
-    (through :func:`_reclaim_and_wait_for_prompt`) wait on the readiness
-    gate (:func:`_wait_for_claude_prompt_ready`) rather than type into it.
-    An empty (torn) capture means "unknown" and gets no Escape, and a
-    surface seen in a single frame is re-confirmed a poll later before an
-    Escape is spent on it — or before it is given up as unclearable — so a
-    repaint artifact cannot draw one.
+    untouched: :func:`inject_user_message` waits on its readiness gate
+    (:func:`_wait_for_claude_prompt_ready`), :func:`inject_slash_command`
+    fails loud rather than type into it. An empty (torn) capture means
+    "unknown" and gets no Escape, and a surface seen in a single frame is
+    re-confirmed a poll later before an Escape is spent on it — or before
+    it is given up as unclearable — so a repaint artifact cannot draw one.
     A swallowed Escape is re-sent while the surface remains, spaced by
     :data:`_OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S`. Best-effort: a
-    surface that outlives the dismissal window (*timeout_s*,
-    :data:`_OCCUPIED_INPUT_DISMISS_TIMEOUT_S` by default) is left on screen
-    and returned, so the caller's readiness gate or delivery verification
-    fails loud, exactly as it did before this restore existed.
+    surface that outlives :data:`_OCCUPIED_INPUT_DISMISS_TIMEOUT_S` is
+    left on screen and returned, so the caller's readiness gate or
+    delivery verification fails loud, exactly as it did before this
+    restore existed.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param bridge_dir: Bridge whose live permission hooks protect the native prompt.
-    :param timeout_s: Seconds to keep dismissing, e.g. ``1.5``. ``None`` uses
-        :data:`_OCCUPIED_INPUT_DISMISS_TIMEOUT_S`.
     :returns: ``None`` once the input box is free (or the capture is torn);
         otherwise the :func:`_occupying_surface` description of what is
         still on screen, for the caller to refuse to type into.
     """
-    dismiss_timeout_s = _OCCUPIED_INPUT_DISMISS_TIMEOUT_S if timeout_s is None else timeout_s
-    deadline = time.monotonic() + dismiss_timeout_s
+    deadline = time.monotonic() + _OCCUPIED_INPUT_DISMISS_TIMEOUT_S
     last_escape: float | None = None
     confirmed = False
     unclearable_seen = False
@@ -5960,7 +6001,6 @@ def _restore_occupied_input(
                 "Answer the pending Claude question or permission request "
                 "before sending a message."
             ),
-            nothing_typed=True,
         )
         if auto_mode_billing_notice_visible(pane):
             _acknowledge_auto_mode_billing_notice(socket_path, tmux_target)
@@ -5973,14 +6013,12 @@ def _restore_occupied_input(
             _logger.warning(
                 "claude-native: input box still occupied (%s) after %.1fs; proceeding",
                 surface,
-                dismiss_timeout_s,
+                _OCCUPIED_INPUT_DISMISS_TIMEOUT_S,
             )
             return surface
         # Nothing an Escape can clear: launcher output before the input box
-        # mounts, a dialog that offers no dismissal, or one Escape would quit.
-        unclearable = surface == _OVERLAY_SURFACE and (
-            not _ESCAPE_DISMISS_HINT.search(pane) or _escape_quits_claude(pane)
-        )
+        # mounts, or a dialog that offers no dismissal.
+        unclearable = surface == _OVERLAY_SURFACE and not _ESCAPE_DISMISS_HINT.search(pane)
         if not confirmed:
             # One sighting is not enough to spend an Escape on: on a bare
             # composer Escape interrupts the running turn, and a single frame
@@ -5999,18 +6037,6 @@ def _restore_occupied_input(
             last_escape = now
         unclearable_seen = unclearable
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-
-
-def _escape_quits_claude(pane: str) -> bool:
-    """
-    Return whether the dialog on screen quits Claude Code on Escape.
-
-    :param pane: Captured pane text from :func:`_capture_pane`.
-    :returns: ``True`` for a startup dialog named in
-        :data:`_ESCAPE_QUITS_DIALOG_HEADLINES`.
-    """
-    headline = _terminal_dialog_headline(pane)
-    return headline is not None and headline.startswith(_ESCAPE_QUITS_DIALOG_HEADLINES)
 
 
 def _occupying_surface(pane: str) -> str | None:
@@ -6089,93 +6115,6 @@ def _composer_row(pane: str) -> str | None:
         if row.strip()[:1] in _COMPOSER_MODE_GLYPHS:
             return row
     return None
-
-
-class _ComposerBox(NamedTuple):
-    """Claude Code's live input box as a pane capture showed it."""
-
-    #: The box's rows, e.g. ``["❯ fix the bug", "  in foo.py"]``. Blank rows
-    #: are kept, since a draft's empty lines are lines too.
-    rows: list[str]
-    #: Whether the closing rule was on screen, so ``rows`` is the whole box
-    #: rather than the part of it above the bottom of the pane.
-    framed: bool
-
-
-def _composer_box(pane: str) -> _ComposerBox | None:
-    """
-    Return every visible row of Claude Code's live input box, or ``None``.
-
-    The box is located as in :func:`_composer_row`: its first row sits
-    directly under the opening rule, led by a composer glyph. The rows run to
-    the closing rule, or to the bottom of the pane when there is none on
-    screen.
-
-    :param pane: Captured pane text from :func:`_capture_pane`.
-    :returns: The box's visible rows and whether its closing rule was on
-        screen, or ``None`` when no input box is on screen.
-    """
-    lines = pane.splitlines()
-    rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
-    if not rules:
-        return None
-    if len(rules) >= 2:
-        first = rules[-2] + 1
-        if first < rules[-1] and lines[first].strip()[:1] in _COMPOSER_MODE_GLYPHS:
-            return _ComposerBox(lines[first : rules[-1]], framed=True)
-    first = rules[-1] + 1
-    if first < len(lines) and lines[first].strip()[:1] in _COMPOSER_MODE_GLYPHS:
-        return _ComposerBox(lines[first:], framed=False)
-    return None
-
-
-def _clear_composer(socket_path: str, tmux_target: str) -> None:
-    """
-    Delete the whole draft in Claude Code's input box.
-
-    Ctrl+K deletes to the end of the line and, at the end of a line, the
-    line break after it; Ctrl+U does the same towards the start. Two of each
-    per row of the box therefore empty a draft from any cursor position,
-    while presses beyond the draft do nothing. Clearing only the cursor's
-    line would leave the rest of a multi-line draft to be submitted with the
-    next message.
-
-    One burst is known to have emptied the box only when the capture showed
-    the box whole (closing rule on screen) with a single row. A box with
-    more rows, or one cut off by the bottom of the pane (a draft taller than
-    the pane, or a sliver-height pane with no room for the closing rule),
-    may still hold lines the capture did not show, so it is cleared again,
-    up to :data:`_COMPOSER_CLEAR_MAX_ROUNDS` rounds. A box still in that
-    state afterwards is refused rather than pasted into: an exhausted budget
-    is no evidence the box is empty, and a paste beside leftover text would
-    submit the person's draft along with the injected input. An unavailable
-    capture is likewise retried without sending clearing keys, then refused
-    if no readable box appears within the budget.
-
-    :param socket_path: Absolute path to the tmux socket.
-    :param tmux_target: tmux pane target string, e.g. ``"main"``.
-    :raises ClaudeComposerNotCleared: If the rounds ran out before a readable
-        capture showed the box whole and down to one row; nothing was pasted.
-    :raises RuntimeError: If a ``tmux`` invocation fails.
-    """
-    # Space returns focus from the footer to the input box. The clear also
-    # removes the space when the input box already held focus.
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
-    for round_no in range(_COMPOSER_CLEAR_MAX_ROUNDS + 1):
-        box = _composer_box(_capture_pane(socket_path, tmux_target))
-        settled = box is not None and box.framed and len(box.rows) <= 1
-        if not settled and round_no == _COMPOSER_CLEAR_MAX_ROUNDS:
-            raise ClaudeComposerNotCleared(
-                "A draft left in Claude Code's input box could not be cleared, so nothing "
-                "was sent. Open the terminal, clear the input box, then retry."
-            )
-        if box is not None:
-            presses = 2 * len(box.rows)
-            keys = _COMPOSER_KILL_TO_LINE_END * presses + _COMPOSER_KILL_TO_LINE_START * presses
-            _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, keys)
-            if settled:
-                return
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
 def _claude_prompt_rendered(pane: str) -> bool:
@@ -6409,7 +6348,6 @@ def _wait_for_claude_prompt_ready(
     *,
     timeout_s: float,
     bridge_dir: Path | None = None,
-    extend_for_slow_boot: bool = True,
 ) -> None:
     """
     Block until Claude Code's TUI input box is ready for keystrokes.
@@ -6422,11 +6360,10 @@ def _wait_for_claude_prompt_ready(
     it returns immediately once mounted, so 2nd+ messages are
     unaffected.
 
-    Claude-native only — this is called from :func:`inject_user_message`
-    and :func:`inject_slash_command`, which exclusively serve the Claude
-    Code terminal. It must never be used for generic terminals, whose
-    programs never render :data:`_CLAUDE_PROMPT_GLYPH` and would always
-    time out.
+    Claude-native only — this is called from :func:`inject_user_message`,
+    which exclusively serves the Claude Code terminal. It must never be
+    used for generic terminals, whose programs never render
+    :data:`_CLAUDE_PROMPT_GLYPH` and would always time out.
 
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
@@ -6436,12 +6373,6 @@ def _wait_for_claude_prompt_ready(
         :data:`_TMUX_READY_SLOW_BOOT_TIMEOUT_S`. Liveness checks start within
         one second; a dead pane or rejected query ends the wait.
     :param bridge_dir: Protect live permission-hook waits when delivering a message.
-    :param extend_for_slow_boot: ``False`` makes *timeout_s* a hard cap with no
-        slow-boot extension, for a caller that must answer within its own
-        deadline (a settings change whose requester gives up after a fixed
-        time). A slow boot then fails the wait instead of outliving the request,
-        while a dead pane still ends it at the first liveness check, a
-        :data:`_CLAUDE_LIVENESS_POLL_INTERVAL_S` in, rather than at the cap.
     :returns: None.
     :raises ClaudeTerminalExited: If tmux affirms the pane's process has
         exited, carrying the pane's wait-status so a clean quit is
@@ -6468,9 +6399,7 @@ def _wait_for_claude_prompt_ready(
     """
     started = time.monotonic()
     next_liveness_probe = started + min(timeout_s, _CLAUDE_LIVENESS_POLL_INTERVAL_S)
-    hard_deadline = started + (
-        max(timeout_s, _TMUX_READY_SLOW_BOOT_TIMEOUT_S) if extend_for_slow_boot else timeout_s
-    )
+    hard_deadline = started + max(timeout_s, _TMUX_READY_SLOW_BOOT_TIMEOUT_S)
     polls = 0
     empty_polls = 0
     # Keep the last non-empty capture the loop actually saw, not a fresh
@@ -6494,7 +6423,6 @@ def _wait_for_claude_prompt_ready(
             bridge_dir,
             pane,
             message="Claude is waiting for an explicit answer; message not sent.",
-            nothing_typed=True,
         )
         polls += 1
         if pane.strip():
@@ -6585,125 +6513,6 @@ def _wait_for_claude_prompt_ready(
     )
 
 
-def _reclaim_and_wait_for_prompt(
-    bridge_dir: Path,
-    socket_path: str,
-    tmux_target: str,
-    *,
-    timeout_s: float,
-    ready_timeout_s: float | None,
-) -> None:
-    """
-    Clear anything occupying Claude's input box, then wait for its prompt.
-
-    The order :func:`inject_user_message` follows inline: a surface left over the
-    composer hides the input box from the readiness gate, so it is dismissed
-    first, and only then is the pane waited on until the prompt renders.
-
-    Shell mode or the prompt-history search left on screen is refused at once:
-    typing there would run the text as bash or filter history, and the wait
-    could only end in a readiness timeout. So is a boxed dialog without the
-    footer the readiness gate names (a ``/model`` or ``/effort`` confirmation,
-    a tool permission prompt): the gate would only wait out its budget on it.
-    Launcher output before the input box mounts goes to the readiness gate and
-    its own outcome stands. Nothing is typed until the prompt renders, so the
-    submit Enter cannot answer a dialog.
-
-    :param bridge_dir: Bridge directory path.
-    :param socket_path: Absolute path to the tmux socket.
-    :param tmux_target: tmux pane target string, e.g. ``"main"``.
-    :param timeout_s: Base readiness budget when *ready_timeout_s* is
-        ``None``, e.g. ``30.0``.
-    :param ready_timeout_s: Cap, in seconds, on the whole step, reclaim
-        included, e.g. ``9.0``. The reclaim keeps at least two polls to
-        confirm a surface, so a cap below that is exceeded by the difference;
-        the caller's cancellation flag is the strict deadline. ``None`` waits
-        like a message delivery: *timeout_s* as the base budget, extended
-        while a live pane is still booting.
-    :returns: None.
-    :raises ClaudeTerminalDialog: If shell mode, the prompt-history search or a
-        footer-less dialog still covers the input box after the restore; no
-        keystroke was sent.
-    :raises RuntimeError: As :func:`_wait_for_claude_prompt_ready` and
-        :func:`_restore_occupied_input` raise.
-    """
-    started = time.monotonic()
-    surface = _restore_occupied_input(
-        socket_path,
-        tmux_target,
-        bridge_dir=bridge_dir,
-        # At least two polls, so a surface is confirmed before it is refused.
-        timeout_s=(
-            None
-            if ready_timeout_s is None
-            else max(
-                2 * _CLAUDE_READY_POLL_INTERVAL_S,
-                min(_OCCUPIED_INPUT_DISMISS_TIMEOUT_S, ready_timeout_s),
-            )
-        ),
-    )
-    if surface is not None and surface != _OVERLAY_SURFACE:
-        # Typing into these would run bash or filter history, and the wait below
-        # could only poll out its whole budget on them.
-        raise ClaudeTerminalDialog(
-            f"Claude Code's input box is occupied by {surface}, so the command was "
-            "not sent. Open the terminal, dismiss it, then retry."
-        )
-    # Launcher output is waited out below, but a footer-less dialog would only be
-    # waited on until the budget lapses, then the pane reaped; the reclaim may
-    # also have read a torn frame as a free input box. A torn frame here is
-    # re-read once rather than taken for "no dialog".
-    pane = _capture_pane(socket_path, tmux_target)
-    if not pane.strip():
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-        pane = _capture_pane(socket_path, tmux_target)
-    if _composer_row(pane) is None:
-        dialog = _unnamed_dialog_hint(pane)
-        if dialog is not None:
-            raise ClaudeTerminalDialog(
-                f"Claude Code's input box is occupied by a dialog ({dialog.strip()!r}), so "
-                "the command was not sent. Open the terminal, answer it, then retry."
-            )
-    if ready_timeout_s is None:
-        _wait_for_claude_prompt_ready(
-            socket_path, tmux_target, timeout_s=timeout_s, bridge_dir=bridge_dir
-        )
-        return
-    _wait_for_claude_prompt_ready(
-        socket_path,
-        tmux_target,
-        timeout_s=max(0.0, ready_timeout_s - (time.monotonic() - started)),
-        bridge_dir=bridge_dir,
-        extend_for_slow_boot=False,
-    )
-
-
-def _unnamed_dialog_hint(pane: str) -> str | None:
-    """
-    Return the confirmation-dialog title boxed on *pane*, or ``None``.
-
-    These dialogs lack the footer :func:`_terminal_dialog_headline` names;
-    permission prompts are refused earlier by the pending-prompt guard. Only
-    the last ``╭ … ╰`` box is searched: the same words echoed in the
-    scrollback above launcher output are not a dialog.
-    """
-    lines = pane.splitlines()
-    top = max((i for i, line in enumerate(lines) if line.lstrip().startswith("╭")), default=None)
-    if top is None:
-        return None
-    bottom = next(
-        (i for i, line in enumerate(lines) if i > top and line.lstrip().startswith("╰")), None
-    )
-    if bottom is None:
-        # An unclosed box is a dialog only when clipped at the bottom of the
-        # screen; a stray corner higher up is scrollback.
-        if len(lines) - top > _DIALOG_SCAN_TAIL_LINES:
-            return None
-        bottom = len(lines) - 1
-    region = "\n".join(lines[top : bottom + 1])
-    return next((hint for hint in _CONFIRM_DIALOG_HINTS if hint in region), None)
-
-
 def _paste_payload_bytes(text: str) -> bytes:
     r"""
     Encode text as the paste-buffer byte payload for ``tmux load-buffer``.
@@ -6751,7 +6560,8 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
 
     :param bridge_dir: Bridge directory path.
     :param timeout_s: Seconds to wait, e.g. ``30.0``.
-    :returns: ``{"socket_path": ..., "tmux_target": ...}``.
+    :returns: ``{"socket_path": ..., "tmux_target": ...}``, plus
+        ``claude_config_dir`` when the launch advertised Claude's config dir.
     :raises TmuxSessionNotAdvertised: If the file never appears with valid
         ``socket_path`` and ``tmux_target`` fields.
     """
@@ -6763,7 +6573,11 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
         socket_path = payload.get("socket_path") if isinstance(payload, dict) else None
         tmux_target = payload.get("tmux_target") if isinstance(payload, dict) else None
         if isinstance(socket_path, str) and isinstance(tmux_target, str):
-            return {"socket_path": socket_path, "tmux_target": tmux_target}
+            info = {"socket_path": socket_path, "tmux_target": tmux_target}
+            config_dir = payload.get("claude_config_dir")
+            if isinstance(config_dir, str) and config_dir:
+                info["claude_config_dir"] = config_dir
+            return info
         time.sleep(0.05)
     raise TmuxSessionNotAdvertised(
         "Claude terminal tmux target is not advertised yet. Wait for the "
