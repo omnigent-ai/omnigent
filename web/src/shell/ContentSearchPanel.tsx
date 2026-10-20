@@ -1,11 +1,12 @@
-import { type RefObject, useEffect, useState } from "react";
+import { type RefObject, useEffect, useId, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { FileIcon, SearchIcon } from "lucide-react";
+import { FileIcon, FilterIcon, SearchIcon } from "lucide-react";
 import { authenticatedFetch } from "@/lib/identity";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import type { OpenFileOptions } from "./FileViewerContext";
+import { cn } from "@/lib/utils";
 
 interface ContentMatch {
   path: string;
@@ -47,6 +48,8 @@ export function ContentSearchPanel({
     gcTime: Infinity,
   });
   const [input, setInput] = useState(cachedInput.data);
+  const [showFilters, setShowFilters] = useState(false);
+  const filtersId = useId();
   const { query, caseSensitive, regex, include, exclude } = input;
   useEffect(() => {
     queryClient.setQueryData(["content-search-input", conversationId], input);
@@ -96,15 +99,31 @@ export function ContentSearchPanel({
         }}
       >
         <div className="flex gap-2">
-          <Input
-            ref={inputRef}
-            aria-label="Search file contents"
-            placeholder="Search file contents"
-            type="search"
-            maxLength={4096}
-            value={query}
-            onChange={(event) => setInput({ ...input, query: event.target.value })}
-          />
+          <div className="flex flex-1">
+            <Input
+              ref={inputRef}
+              aria-label="Search file contents"
+              placeholder="Search file contents"
+              type="search"
+              maxLength={4096}
+              value={query}
+              onChange={(event) => setInput({ ...input, query: event.target.value })}
+              className="rounded-r-none"
+            />
+            <Button
+              type="button"
+              variant={include.trim() || exclude.trim() ? "secondary" : "outline"}
+              size="icon"
+              aria-label="Filter files"
+              aria-expanded={showFilters}
+              aria-controls={filtersId}
+              title="Include / exclude files"
+              onClick={() => setShowFilters((visible) => !visible)}
+              className={cn("rounded-l-none border-l-0", showFilters && "bg-muted!")}
+            >
+              <FilterIcon className="size-4" />
+            </Button>
+          </div>
           <Button type="submit" disabled={!query.trim() || search.isFetching}>
             <SearchIcon className="size-4" />
             Search
@@ -128,34 +147,27 @@ export function ContentSearchPanel({
             Regular expression
           </label>
         </div>
-        <details className="text-xs">
-          <summary className="cursor-pointer rounded text-muted-foreground focus-visible:outline focus-visible:outline-ring">
-            Files to search{include.trim() || exclude.trim() ? " (filtered)" : ""}
-          </summary>
-          <div className="mt-2 space-y-2">
-            <label className="block space-y-1">
-              <span>Include</span>
-              <Input
-                placeholder="e.g. src/**, *.{ts,tsx}"
-                maxLength={4096}
-                value={include}
-                onChange={(event) => setInput({ ...input, include: event.target.value })}
-              />
-            </label>
-            <label className="block space-y-1">
-              <span>Exclude</span>
-              <Input
-                placeholder="e.g. **/tests/**, *.min.js"
-                maxLength={4096}
-                value={exclude}
-                onChange={(event) => setInput({ ...input, exclude: event.target.value })}
-              />
-            </label>
-            <p className="text-muted-foreground">
-              Comma-separated globs. Exclude takes precedence.
-            </p>
-          </div>
-        </details>
+        <div id={filtersId} hidden={!showFilters} className="space-y-2 text-xs">
+          <label className="block space-y-1">
+            <span>Include</span>
+            <Input
+              placeholder="e.g. src/**, *.{ts,tsx}"
+              maxLength={4096}
+              value={include}
+              onChange={(event) => setInput({ ...input, include: event.target.value })}
+            />
+          </label>
+          <label className="block space-y-1">
+            <span>Exclude</span>
+            <Input
+              placeholder="e.g. **/tests/**, *.min.js"
+              maxLength={4096}
+              value={exclude}
+              onChange={(event) => setInput({ ...input, exclude: event.target.value })}
+            />
+          </label>
+          <p className="text-muted-foreground">Comma-separated globs. Exclude takes precedence.</p>
+        </div>
         <p className="text-xs text-muted-foreground">
           Searches workspace contents on disk. Respects readable ignore files unless explicitly
           included; skips binary files and .git.

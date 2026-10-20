@@ -7,7 +7,9 @@ panel, then open a matching file at its line. Filename search remains in Files.
 
 - `search`: submit a literal query with Enter or Search, optionally matching case
   or using a ripgrep regular expression; results show paths, lines and previews.
-- `filter`: expand **Files to search** to set **Include** and **Exclude** globs.
+- `filter`: click **Filter files** (the funnel button between the query and
+  Search) to show or hide **Include** and **Exclude** globs. The button is
+  highlighted while filters are set, even when the fields are hidden.
   Comma-separated patterns and brace alternatives work (for example `src/**,
   *.{ts,tsx}`); excludes take precedence. Clear both fields to search all files again.
 - `navigate`: open a result at its line and return to the preserved search;
@@ -41,7 +43,7 @@ input receives focus. Collapse Workspace and press it again: Workspace should
 reopen with the input focused and the previous query and results intact.
 Switch sessions and confirm results from the previous session are absent, then
 switch back and confirm its query, options and results return without a new search.
-Expand Files to search, include `src/**` and exclude `**/tests/**`, then submit.
+Click Filter files, include `src/**` and exclude `**/tests/**`, then submit.
 Confirm results respect both filters, including after collapsing the filters or
 switching conversations. Clear both fields and submit to restore the full search.
 Restart the test server without the flag and reload: the tab, picker entry and
