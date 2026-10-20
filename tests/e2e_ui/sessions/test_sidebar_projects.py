@@ -580,9 +580,8 @@ def _assert_touch_folder_actions_are_keyboard_reachable(
     page.keyboard.press("Escape")
     expect(menu).to_be_hidden()
     expect(kebab).to_be_focused()
-    # Space activates on keyup; that click must not close the menu Radix just opened.
+    # Space opens the project menu as Enter does.
     page.keyboard.press(" ")
-    page.wait_for_timeout(300)
     expect(kebab).to_have_attribute("aria-expanded", "true")
     expect(menu.get_by_role("menuitem", name="Rename project")).to_be_visible()
     page.keyboard.press("Escape")
