@@ -69,8 +69,13 @@ def reconstruct_signed_request(
     headers: Sequence[tuple[str, str]],
     body: bytes,
     max_body_bytes: int = 10 * 1024 * 1024,
+    extra_headers: Sequence[tuple[str, str]] = (),
 ) -> SignedModelRequest:
-    """Authorize and rebuild one queryless JSON model request."""
+    """Authorize and rebuild one queryless JSON model request.
+
+    *extra_headers* come from the signer's own trusted config, never the
+    client, and are appended to the rebuilt request.
+    """
     _validate_secret_value(placeholder, label="placeholder")
     _validate_secret_value(bearer_token, label="bearer token")
     if placeholder in target:
@@ -126,6 +131,7 @@ def reconstruct_signed_request(
         raise SigningRejected("duplicate Accept is not allowed")
     if accept:
         rebuilt.append(("Accept", accept[0]))
+    rebuilt.extend(extra_headers)
 
     return SignedModelRequest(
         method=route.method,

@@ -449,6 +449,51 @@ def test_pinned_harness_launch_argv_is_unchanged(bridge_dir: Path) -> None:
     assert "--allowedTools" not in baseline
 
 
+@pytest.mark.parametrize(("skills_filter", "expect_override"), [("all", True), ("none", False)])
+def test_gateway_attribution_outranks_a_loaded_settings_header_block(
+    bridge_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    skills_filter: str,
+    expect_override: bool,
+) -> None:
+    """The invocation settings re-send a loaded settings file's header block with attribution."""
+    import json
+
+    from omnigent.harnesses.claude_native.bridge import augment_claude_args
+
+    config_dir = tmp_path / "claude-config"
+    config_dir.mkdir()
+    (config_dir / "settings.json").write_text(
+        json.dumps({"env": {"ANTHROPIC_CUSTOM_HEADERS": "X-User: kept"}})
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    args = augment_claude_args(
+        (),
+        bridge_dir=bridge_dir,
+        python_executable="/venv/bin/python",
+        workspace=workspace,
+        skills_filter=skills_filter,
+        claude_env={
+            "ANTHROPIC_CUSTOM_HEADERS": "Databricks-Custom-Coding-Agent: claude-code\n"
+            "Databricks-Custom-Client-Surfaces: omnigent"
+        },
+    )
+
+    settings = json.loads(Path(args[args.index("--settings") + 1]).read_text())
+    if not expect_override:
+        assert "env" not in settings
+        return
+    assert settings["env"]["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
+        "X-User: kept",
+        "Databricks-Custom-Coding-Agent: claude-code",
+        "Databricks-Custom-Client-Surfaces: omnigent",
+    ]
+
+
 def test_routed_spawn_launch_args_gate_is_off_without_auto_harness() -> None:
     assert _routed_spawn_launch_args(False) == (None, ())
     note, allowed = _routed_spawn_launch_args(True)

@@ -431,7 +431,7 @@ def test_ucode_config_for_profile_reads_allowlisted_claude_state(
             "ANTHROPIC_CUSTOM_HEADERS": (
                 "x-databricks-use-coding-agent-mode: true\n"
                 "Databricks-Custom-Coding-Agent: claude-code\n"
-                "Databricks-Custom-Client-Surfaces: omnigent, ucode"
+                "Databricks-Custom-Client-Surfaces: omnigent, ug"
             ),
             # No CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS: this path launches in
             # gateway mode (CLAUDE_CODE_USE_GATEWAY=1), where Claude Code
@@ -11697,7 +11697,7 @@ def test_connect_fallback_prefers_ucode_state(
     assert config.env["ANTHROPIC_CUSTOM_HEADERS"].splitlines() == [
         "User-Agent: ucode/0.1.0 claude/2.1.0",
         "Databricks-Custom-Coding-Agent: claude-code",
-        "Databricks-Custom-Client-Surfaces: omnigent, ucode",
+        "Databricks-Custom-Client-Surfaces: omnigent, ug",
     ]
     # But the bearer is still our own broker command, not ucode's.
     assert config.api_key_helper is not None

@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Protocol, TypeVar
 from urllib.parse import urlsplit
 
+from omnigent.databricks_ai_gateway import CODEX_AGENT, gateway_attribution_headers
+
 from .egress.ca import ensure_ca, ensure_ca_bundle
 from .egress.certs import HostCertCache
 from .egress.proxy import EgressProxy, _parse_http_headers
@@ -242,6 +244,7 @@ class _SignerRelay(EgressProxy):
         ca_key_path: Path,
         ca_bundle_path: Path,
         provider_port: int | None,
+        extra_headers: tuple[tuple[str, str], ...] = (),
     ) -> None:
         super().__init__(
             parse_rules([f"{route.method} {route.host}{route.path}"]),
@@ -252,6 +255,7 @@ class _SignerRelay(EgressProxy):
         )
         self._route = route
         self._placeholder = placeholder
+        self._extra_headers = extra_headers
         if (bearer_token is None) == (credential_source is None):
             raise ValueError("signer relay requires exactly one credential source")
         self._credential_source = credential_source or _StaticCredential(bearer_token or "")
@@ -352,6 +356,7 @@ class _SignerRelay(EgressProxy):
             target=path,
             headers=headers,
             body=body,
+            extra_headers=self._extra_headers,
         )
         if port != 443:
             await self._send_forbidden(client_writer, "")
@@ -982,6 +987,12 @@ async def _run(config_fd: int) -> int:
             ca_key_path=ca_key,
             ca_bundle_path=ca_bundle,
             provider_port=provider_port,
+            # The ucode binding is ug's Codex route; name it for gateway attribution.
+            extra_headers=(
+                tuple(gateway_attribution_headers(CODEX_AGENT, via_ucode=True).items())
+                if binding_id == _UCODE_BINDING
+                else ()
+            ),
         )
         socket_path = public_dir / "relay.sock"
         await relay.start_unix(socket_path)

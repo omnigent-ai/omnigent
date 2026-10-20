@@ -153,7 +153,7 @@ def test_write_provider_config_attributes_unity_gateway_models(tmp_path: Path) -
     assert providers["databricks"]["models"]["system.ai.glm-5"]["headers"] == {
         "User-Agent": "ucode/0.1.0 opencode/1.2.0",
         "Databricks-Custom-Coding-Agent": "opencode",
-        "Databricks-Custom-Client-Surfaces": "omnigent, ucode",
+        "Databricks-Custom-Client-Surfaces": "omnigent, ug",
     }
     assert providers["serving"]["models"]["databricks-x"] == {"name": "databricks-x"}
     # The caller's config is left as it was.

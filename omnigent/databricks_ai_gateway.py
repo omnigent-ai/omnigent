@@ -11,7 +11,10 @@ so each harness names the coding agent and client surfaces the same way.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import json
+import os
+from collections.abc import Collection, Mapping
+from pathlib import Path
 from typing import Final, TypeVar
 from urllib.parse import urlparse
 
@@ -107,9 +110,16 @@ PI_AGENT: Final[str] = "pi"
 OPENCODE_AGENT: Final[str] = "opencode"
 
 OMNIGENT_SURFACE: Final[str] = "omnigent"
-UCODE_SURFACE: Final[str] = "ucode"
+# The Unity Gateway names ucode-configured routes ``ug``.
+UG_SURFACE: Final[str] = "ug"
 # ucode stamps ``ucode/<version> <agent>/<version>`` on the providers it writes.
 _UCODE_USER_AGENT_PREFIX: Final[str] = "ucode/"
+# Set in a harness's env when its gateway route comes from ug's state, for
+# in-process harnesses whose provider config carries no ug User-Agent.
+UG_ROUTE_ENV: Final[str] = "OMNIGENT_GATEWAY_ROUTE_VIA_UG"
+
+_CLAUDE_CUSTOM_HEADERS_ENV: Final[str] = "ANTHROPIC_CUSTOM_HEADERS"
+_CLAUDE_BASE_URL_ENV: Final[str] = "ANTHROPIC_BASE_URL"
 
 _HeaderValue = TypeVar("_HeaderValue")
 
@@ -133,15 +143,15 @@ def gateway_attribution_headers(
 
     :param coding_agent: The harness making the request, e.g. ``"codex"``.
     :param via_ucode: Whether the route comes from ucode-generated config, which
-        nests ucode inside Omnigent (``"omnigent, ucode"``).
+        nests ``ug`` inside Omnigent (``"omnigent, ug"``).
     :param inner_surfaces: An already-present surfaces header value, e.g. one
         ucode wrote; its entries follow Omnigent's, duplicates dropped.
     :returns: Header name to value, e.g. ``{"Databricks-Custom-Coding-Agent":
-        "codex", "Databricks-Custom-Client-Surfaces": "omnigent, ucode"}``.
+        "codex", "Databricks-Custom-Client-Surfaces": "omnigent, ug"}``.
     """
     surfaces = [OMNIGENT_SURFACE]
     if via_ucode:
-        surfaces.append(UCODE_SURFACE)
+        surfaces.append(UG_SURFACE)
     surfaces.extend(part.strip() for part in (inner_surfaces or "").split(","))
     unique = [surface for surface in dict.fromkeys(surfaces) if surface]
     return {CODING_AGENT_HEADER: coding_agent, CLIENT_SURFACES_HEADER: ", ".join(unique)}
@@ -164,7 +174,10 @@ def _attribution_for(
 
 
 def with_gateway_attribution(
-    headers: Mapping[str, _HeaderValue] | None, coding_agent: str
+    headers: Mapping[str, _HeaderValue] | None,
+    coding_agent: str,
+    *,
+    via_ucode: bool = False,
 ) -> dict[str, _HeaderValue | str]:
     """Return *headers* with the Unity Gateway attribution headers merged in.
 
@@ -174,10 +187,11 @@ def with_gateway_attribution(
     :param headers: A provider's existing static request headers, e.g. a Codex
         ``http_headers`` table, or ``None``.
     :param coding_agent: The harness making the request, e.g. ``"codex"``.
+    :param via_ucode: Force the ``ug`` surface even without a ucode User-Agent.
     :returns: A new header mapping carrying both attribution headers.
     """
     existing = dict(headers or {})
-    attribution = _attribution_for(existing, coding_agent, via_ucode=False)
+    attribution = _attribution_for(existing, coding_agent, via_ucode=via_ucode)
     replaced = {name.casefold() for name in attribution}
     merged: dict[str, _HeaderValue | str] = {
         name: value for name, value in existing.items() if name.casefold() not in replaced
@@ -200,7 +214,7 @@ def with_gateway_attribution_lines(
     :param custom_headers: The existing block, e.g.
         ``"x-databricks-use-coding-agent-mode: true"``, or ``None``.
     :param coding_agent: The harness making the request, e.g. ``"claude-code"``.
-    :param via_ucode: Force the ucode surface even without a ucode User-Agent.
+    :param via_ucode: Force the ``ug`` surface even without a ucode User-Agent.
     :returns: The block with both attribution lines appended.
     """
     lines = [line for line in (custom_headers or "").splitlines() if line.strip()]
@@ -213,3 +227,81 @@ def with_gateway_attribution_lines(
     kept = [line for line in lines if line.partition(":")[0].strip().casefold() not in replaced]
     kept.extend(f"{name}: {value}" for name, value in attribution.items())
     return "\n".join(kept)
+
+
+def gateway_route_via_ug(env: Mapping[str, str] | None = None) -> bool:
+    """Whether *env* (default: the process env) marks the gateway route as ug's."""
+    return (os.environ if env is None else env).get(UG_ROUTE_ENV) == "1"
+
+
+def _claude_settings_file_env(
+    project_dir: Path, setting_sources: Collection[str] | None
+) -> dict[str, str]:
+    """The ``env`` Claude Code would take from its settings files, by file precedence.
+
+    :param project_dir: Claude Code's working directory.
+    :param setting_sources: Loaded sources (``"user"``, ``"project"``,
+        ``"local"``), or ``None`` for all of them.
+    :returns: Merged string-valued env, local over project over user.
+    """
+    config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    files = {
+        "user": config_dir / "settings.json",
+        "project": project_dir / ".claude" / "settings.json",
+        "local": project_dir / ".claude" / "settings.local.json",
+    }
+    merged: dict[str, str] = {}
+    for source, path in files.items():
+        if setting_sources is not None and source not in setting_sources:
+            continue
+        try:
+            settings = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        env = settings.get("env") if isinstance(settings, dict) else None
+        if isinstance(env, dict):
+            merged.update({key: value for key, value in env.items() if isinstance(value, str)})
+    return merged
+
+
+def claude_settings_attribution_env(
+    custom_headers: str | None,
+    *,
+    project_dir: Path,
+    setting_sources: Collection[str] | None = None,
+) -> dict[str, str]:
+    """Env for Claude's ``--settings`` that keeps attribution past a settings-file header block.
+
+    Claude Code ranks settings-file ``env`` above process env, so a header block
+    there silently replaces *custom_headers*. ``--settings`` ranks above those
+    files (only managed settings outrank it), so the file's block is re-sent
+    from there with the attribution lines merged in.
+
+    :param custom_headers: The ``ANTHROPIC_CUSTOM_HEADERS`` block Omnigent launches with.
+    :param project_dir: Claude Code's working directory.
+    :param setting_sources: Loaded setting sources, or ``None`` for all.
+    :returns: ``{"ANTHROPIC_CUSTOM_HEADERS": ...}``, or ``{}`` when no file
+        overrides the block, the block carries no attribution, or the file
+        routes Claude off the gateway.
+    """
+    parsed = {
+        name.strip().casefold(): value.strip()
+        for name, _, value in (line.partition(":") for line in (custom_headers or "").splitlines())
+    }
+    coding_agent = parsed.get(CODING_AGENT_HEADER.casefold())
+    if not coding_agent:
+        return {}
+    file_env = _claude_settings_file_env(project_dir, setting_sources)
+    file_headers = file_env.get(_CLAUDE_CUSTOM_HEADERS_ENV)
+    if file_headers is None:
+        return {}
+    base_url = file_env.get(_CLAUDE_BASE_URL_ENV)
+    if base_url is not None and not is_databricks_ai_gateway_url(base_url):
+        return {}
+    surfaces = parsed.get(CLIENT_SURFACES_HEADER.casefold(), "")
+    via_ug = UG_SURFACE in (part.strip() for part in surfaces.split(","))
+    return {
+        _CLAUDE_CUSTOM_HEADERS_ENV: with_gateway_attribution_lines(
+            file_headers, coding_agent, via_ucode=via_ug
+        )
+    }

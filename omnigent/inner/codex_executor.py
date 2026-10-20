@@ -41,7 +41,10 @@ from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import resolve_cli_binary
 from omnigent.databricks_ai_gateway import (
+    CLIENT_SURFACES_HEADER,
     CODEX_AGENT,
+    CODING_AGENT_HEADER,
+    gateway_route_via_ug,
     is_databricks_ai_gateway_url,
     with_gateway_attribution,
 )
@@ -1292,11 +1295,52 @@ def _populate_codex_home_config(
                     set_codex_model_catalog_path(dest_path, catalog_path)
 
 
+# Admin-managed Codex config; it outranks every user and session layer.
+_CODEX_MANAGED_CONFIG_PATH = Path("/etc/codex/managed_config.toml")
+
+
+def _managed_gateway_attribution() -> dict[str, dict[str, str]]:
+    """Attribution headers for the Unity Gateway providers the managed config defines.
+
+    :returns: Provider name to its two attribution headers, judged from the
+        managed provider's own headers (a ucode User-Agent marks it as ug's).
+    """
+    import tomlkit
+    from tomlkit.exceptions import TOMLKitError
+
+    try:
+        managed = tomlkit.parse(_CODEX_MANAGED_CONFIG_PATH.read_text(encoding="utf-8")).unwrap()
+    except (OSError, UnicodeDecodeError, TOMLKitError):
+        return {}
+    providers = managed.get("model_providers")
+    if not isinstance(providers, dict):
+        return {}
+
+    from omnigent.onboarding.codex_auth_readiness import CODEX_BUILTIN_PROVIDERS
+
+    attribution: dict[str, dict[str, str]] = {}
+    for provider_name, provider_config in providers.items():
+        if provider_name in CODEX_BUILTIN_PROVIDERS or not isinstance(provider_config, dict):
+            continue
+        base_url = provider_config.get("base_url")
+        if not isinstance(base_url, str) or not is_databricks_ai_gateway_url(base_url):
+            continue
+        headers = provider_config.get("http_headers")
+        merged = with_gateway_attribution(
+            headers if isinstance(headers, Mapping) else None, CODEX_AGENT
+        )
+        attribution[provider_name] = {
+            name: merged[name] for name in (CODING_AGENT_HEADER, CLIENT_SURFACES_HEADER)
+        }
+    return attribution
+
+
 def materialize_codex_provider_config(
     codex_home: Path,
     config_overrides: Iterable[str],
     *,
     retry_policy: RetryPolicy | None = None,
+    via_ucode: bool = False,
 ) -> list[str]:
     """Move generated provider definitions into a private Codex config.
 
@@ -1308,17 +1352,20 @@ def materialize_codex_provider_config(
     Built-in provider tables (e.g. ``[model_providers.amazon-bedrock]``) stay
     untouched: Codex rejects unsupported fields there by discarding the whole config.
     Custom providers on a Databricks Unity Gateway also get the gateway's
-    usage-attribution ``http_headers``.
+    usage-attribution ``http_headers``. Codex merges config layers per key, so
+    a header-only table here also stamps a provider the managed config defines.
 
     :param codex_home: Private session ``CODEX_HOME`` directory.
     :param config_overrides: Pending Codex config override strings.
     :param retry_policy: Omnigent retry policy to apply through Codex's native
         provider settings. ``None`` uses :class:`RetryPolicy` defaults.
+    :param via_ucode: Whether the session's gateway route comes from ug's state.
     :returns: Overrides safe to retain in subprocess arguments.
     """
     codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(codex_home, 0o700)
     config_path = codex_home / "config.toml"
+    managed_attribution = _managed_gateway_attribution()
 
     provider_overrides: list[str] = []
     argv_overrides: list[str] = []
@@ -1327,7 +1374,7 @@ def materialize_codex_provider_config(
             provider_overrides.append(override)
         else:
             argv_overrides.append(override)
-    if not provider_overrides and not config_path.is_file():
+    if not provider_overrides and not managed_attribution and not config_path.is_file():
         return argv_overrides
     if not provider_overrides and config_path.is_symlink():
         return argv_overrides
@@ -1337,7 +1384,7 @@ def materialize_codex_provider_config(
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     document = tomlkit.parse(existing) if existing else tomlkit.document()
     providers = document.get("model_providers")
-    if providers is None and not provider_overrides:
+    if providers is None and not provider_overrides and not managed_attribution:
         if config_path.is_file() and not config_path.is_symlink():
             os.chmod(config_path, 0o600)
         return argv_overrides
@@ -1363,6 +1410,9 @@ def materialize_codex_provider_config(
             continue
         if provider_name in CODEX_BUILTIN_PROVIDERS:
             continue
+        if provider_name in managed_attribution and "base_url" not in provider_config:
+            # A header-only table from an earlier launch; the provider is the managed one's.
+            continue
         if isinstance(provider_config, tomlkit.items.InlineTable):
             inline_provider = tomlkit.inline_table()
             for key, value in provider_config.items():
@@ -1377,8 +1427,20 @@ def materialize_codex_provider_config(
         if isinstance(base_url, str) and is_databricks_ai_gateway_url(base_url):
             headers = provider_config.get("http_headers")
             provider_config["http_headers"] = with_gateway_attribution(
-                headers if isinstance(headers, Mapping) else None, CODEX_AGENT
+                headers if isinstance(headers, Mapping) else None,
+                CODEX_AGENT,
+                via_ucode=via_ucode,
             )
+    for provider_name, attribution in managed_attribution.items():
+        provider_config = providers.get(provider_name)
+        if not isinstance(provider_config, MutableMapping):
+            provider_config = tomlkit.table()
+            providers[provider_name] = provider_config
+        headers = provider_config.get("http_headers")
+        provider_config["http_headers"] = {
+            **(dict(headers) if isinstance(headers, Mapping) else {}),
+            **attribution,
+        }
 
     fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))
     try:
@@ -2994,6 +3056,7 @@ class _CodexAppServerSession:
             self._codex_home_dir,
             self._codex_config_overrides,
             retry_policy=self._retry_policy,
+            via_ucode=gateway_route_via_ug(),
         )
         if self._signer is not None:
             self._codex_config_overrides.extend(

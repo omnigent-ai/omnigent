@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from omnigent.inner.datamodel import OSEnvSpec
 
 from omnigent.cli_invocation import cli_invocation
+from omnigent.databricks_ai_gateway import UG_ROUTE_ENV
 from omnigent.entities import (
     NON_CONTENT_ITEM_TYPES,
     CompactionData,
@@ -344,6 +345,7 @@ def configure_agent_harness_with_ucode(
         refresh_key=config.refresh_key,
         workspace_url=state.workspace_host,
     )
+    env[UG_ROUTE_ENV] = "1"
     # When ucode caches no model, resolve a Databricks endpoint so the CLI
     # cannot fall back to a direct-provider model the gateway rejects.
     if config.model_key not in env:

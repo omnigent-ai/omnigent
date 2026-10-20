@@ -3866,6 +3866,18 @@ def test_models_json_lists_only_live_gateway_models() -> None:
     ]
 
 
+def test_models_json_names_ug_for_a_ug_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A gateway route fed from ug's state nests ug inside Omnigent."""
+    from omnigent.databricks_ai_gateway import UG_ROUTE_ENV
+
+    monkeypatch.setenv(UG_ROUTE_ENV, "1")
+    providers = _build_models_json("https://dbc-1.cloud.databricks.com", "tok")["providers"]
+
+    assert providers["databricks-openai"]["headers"]["Databricks-Custom-Client-Surfaces"] == (
+        "omnigent, ug"
+    )
+
+
 def test_models_json_attributes_only_unity_gateway_providers() -> None:
     """Providers on ``/ai-gateway/`` paths name Pi and Omnigent; serving endpoints don't."""
     providers = _build_models_json("https://dbc-1.cloud.databricks.com", "tok")["providers"]

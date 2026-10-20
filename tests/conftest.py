@@ -437,6 +437,21 @@ def _isolate_claude_managed_settings(
     monkeypatch.setattr("omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
 
 
+@pytest.fixture(autouse=True)
+def _isolate_codex_managed_config(
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the host's ``/etc/codex/managed_config.toml`` out of Codex config materialization.
+
+    :param tmp_path_factory: Pytest's session-scoped temp factory.
+    :param monkeypatch: Pytest monkeypatch fixture; restores the path at teardown.
+    :returns: None.
+    """
+    missing = tmp_path_factory.mktemp("codex-managed") / "managed_config.toml"
+    monkeypatch.setattr("omnigent.inner.codex_executor._CODEX_MANAGED_CONFIG_PATH", missing)
+
+
 @pytest.fixture()
 def untracked_cache_start() -> None:
     """Opt back in to the real :meth:`GitFilesystemRegistry.start`.
