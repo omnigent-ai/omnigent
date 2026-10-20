@@ -8234,6 +8234,113 @@ async def test_handle_launch_leaves_other_sessions_runners_alone(
     _cleanup_host(host)
 
 
+def _sleeping_popen() -> Callable[..., subprocess.Popen[bytes]]:
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        return original_popen(
+            ["sleep", "30"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    return _fake_popen
+
+
+async def test_handle_launch_keeps_a_runner_the_server_did_not_name(
+    tmp_path: Path,
+) -> None:
+    """A relaunch after /clear leaves the moved runner alone.
+
+    /clear hands the session's runner to its successor and unbinds the old
+    session, so its relaunch names no superseded runner; stopping by session
+    id would kill the successor's runner and every sub-agent running on it.
+    """
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_sleeping_popen()):
+        moved = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_a",
+                binding_token="tok_moved",
+                workspace=str(workspace),
+                session_id="conv_cleared",
+                superseded_runner_ids=(),
+            )
+        )
+        relaunch = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_b",
+                binding_token="tok_relaunch",
+                workspace=str(workspace),
+                session_id="conv_cleared",
+                superseded_runner_ids=(),
+            )
+        )
+
+    assert moved.status == "launched" and relaunch.status == "launched"
+    assert moved.runner_id in host._runners
+    assert host._runners[moved.runner_id].proc.poll() is None
+    assert relaunch.runner_id in host._runners
+    _cleanup_host(host)
+
+
+async def test_handle_launch_stops_only_the_named_superseded_runner(
+    tmp_path: Path,
+) -> None:
+    """A named supersession stops that runner, whatever session launched it."""
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_sleeping_popen()):
+        # Launched for the pre-/clear session, now bound to its successor.
+        moved = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_a",
+                binding_token="tok_src",
+                workspace=str(workspace),
+                session_id="conv_source",
+            )
+        )
+        moved_handle = host._runners[moved.runner_id]
+        sibling = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_b",
+                binding_token="tok_sib",
+                workspace=str(workspace),
+                session_id="conv_successor",
+                superseded_runner_ids=(),
+            )
+        )
+        replacement = await host._handle_launch(
+            HostLaunchRunnerFrame(
+                request_id="req_c",
+                binding_token="tok_succ",
+                workspace=str(workspace),
+                session_id="conv_successor",
+                superseded_runner_ids=(moved.runner_id,),
+            )
+        )
+
+    assert replacement.status == "launched"
+    assert moved.runner_id not in host._runners
+    for _ in range(70):
+        if moved_handle.proc.poll() is not None:
+            break
+        await asyncio.sleep(0.1)
+    assert moved_handle.proc.poll() is not None, "the named runner must be stopped"
+    assert sibling.runner_id in host._runners, "an unnamed runner must stay tracked"
+    assert host._runners[sibling.runner_id].proc.poll() is None
+    _cleanup_host(host)
+
+
 async def test_handle_launch_spawn_failure_preserves_previous_runner(
     tmp_path: Path,
 ) -> None:

@@ -807,6 +807,8 @@ def register_core_routes(
                     if target.conv.inference_snapshot
                     else None
                 ),
+                # The session had no runner bound, so nothing is superseded.
+                superseded_runner_ids=(),
             )
         )
         launch_timeout_s = resolve_launch_timeout_s()
