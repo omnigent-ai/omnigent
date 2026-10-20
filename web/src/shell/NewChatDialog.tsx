@@ -158,7 +158,7 @@ import { useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
 import { isHostAbsolutePath, isNavigablePath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
-import { StaticSandboxPicker } from "./StaticSandboxPicker";
+import { StaticSandboxPicker, StaticSandboxState } from "./StaticSandboxPicker";
 import { StaticSandboxEdit, StaticSandboxName } from "./StaticSandboxName";
 import { RecentWorkspaceList } from "./RecentWorkspaceList";
 import {
@@ -5336,6 +5336,7 @@ export function NewChatLandingScreen() {
       }
       await queryClient.invalidateQueries({ queryKey: ["hosts"] });
       selectHost(hostId);
+      void queryClient.invalidateQueries({ queryKey: ["sandbox-discovery"] });
     } catch (error) {
       setCreateError(error instanceof Error ? error.message : "Could not wake sandbox");
     } finally {
@@ -6211,14 +6212,17 @@ export function NewChatLandingScreen() {
             wakeable
               ? wakingHostId === host.host_id
                 ? "Waking…"
-                : "Asleep · click to wake"
+                : "Offline · click to wake"
               : host.host_id === arcaHostId
                 ? "Arca instance"
                 : undefined
           }
           action={
             host.sandbox_attached ? (
-              <StaticSandboxEdit onEdit={() => editSandboxName(host)} />
+              <span className="ml-auto flex min-w-0 shrink-0 flex-col items-end">
+                <StaticSandboxEdit onEdit={() => editSandboxName(host)} />
+                <StaticSandboxState host={host} enabled={hostMenuOpen} />
+              </span>
             ) : reconnect ? (
               <span
                 className="inline-flex h-6 shrink-0 items-center rounded-md px-2 text-xs font-medium text-muted-foreground group-hover:text-foreground"

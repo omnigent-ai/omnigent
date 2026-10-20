@@ -858,6 +858,7 @@ def create_hosts_router(
                     "status": "online" if host_is_live(host, now=now) else "offline",
                     # Only sandboxes marked reusable appear in host pickers.
                     "sandbox_provider": host.sandbox_provider,
+                    "sandbox_id": host.sandbox_id,
                     "sandbox_attached": host.sandbox_attached,
                     "configured_harnesses": host.configured_harnesses,
                     # Held in memory from the host's connect handshake, not the
@@ -903,6 +904,7 @@ def create_hosts_router(
             "owner": host.user_id,
             "status": "online" if host_is_live(host) else "offline",
             "sandbox_provider": host.sandbox_provider,
+            "sandbox_id": host.sandbox_id,
             "sandbox_attached": host.sandbox_attached,
             "configured_harnesses": host.configured_harnesses,
             # Same semantics as list_hosts: reported on connect and held in

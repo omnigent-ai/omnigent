@@ -112,11 +112,22 @@ def list_for_user(self, *, owner: str):
 
 `SandboxInfo.name` is optional and falls back to the ID. `SandboxInfo.state`
 optionally supplies a controller-reported string such as `running` or `stopped`;
-omission means unknown. Discovery displays that state as information, never as
-a launch gate. It is not saved or polled in the background. Host `status` still
+omission means unknown. Discovery and saved sandbox rows display that state as
+information, never as a launch gate. It is not saved or polled in the background. Host `status` still
 means the existing heartbeat-based online/offline status; a running box need
 not have a connected host. Other metadata is not sent to the browser. The controller supplies the current inventory; Omnigent
 only saves a host registration after selection, not a copy of that inventory.
+
+Opening either host picker reads the same inventory endpoint for saved static
+boxes, matching by provider and sandbox ID. Requests share a per-user/provider
+cache for 30 seconds, time out after five seconds, and refresh on reopening
+after the cache expires. Wake and attachment invalidate the cache. Stale values
+are labeled **Last reported**; failed lookups show **State unavailable** without
+preventing host selection or reuse. Missing boxes or omitted state leave the
+existing connection indicator alone; neither means stopped or deleted.
+Controllers with no state information need no changes. The host list/detail
+responses include nullable `sandbox_id` for matching; older responses that omit
+it retain the existing picker behavior. A running box can have an offline host.
 
 The attachment authorization hook is optional and rejects requests by default:
 
@@ -195,6 +206,7 @@ and session launch APIs keep their existing purpose.
 | `POST /v1/hosts/{host_id}/wake` | Wake a saved reusable host before selecting a working directory. |
 | `PATCH /v1/hosts/{host_id}` | Set `{display_name: "My project"}` or clear with `{display_name: null}` for an owned reusable host. Return `{host_id, display_name}`. |
 | `DELETE /v1/hosts/{host_id}` | Remove a reusable registration and its credentials, without deleting the box. |
+| Existing host list/detail | Include nullable `sandbox_id` alongside provider, label and connection status, so pickers can match optional inventory state. |
 | Existing session creation | A provider choice creates a fresh box. A host choice reuses that host. |
 
 ```mermaid

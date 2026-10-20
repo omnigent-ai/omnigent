@@ -31,6 +31,7 @@ import {
 } from "@/hooks/useHostFilesystem";
 
 const navigateMock = vi.fn();
+vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "local" }));
 vi.mock("react-router-dom", async (importOriginal) => {
   const actual = await importOriginal<typeof ReactRouterDomModule>();
   return { ...actual, useNavigate: () => navigateMock };
@@ -1452,7 +1453,13 @@ describe("ForkSessionDialog", () => {
             });
             setHosts([
               host(),
-              host({ host_id: "host_existing", name: "Existing box", sandbox_attached: true }),
+              host({
+                host_id: "host_existing",
+                name: "Existing box",
+                sandbox_attached: true,
+                sandbox_provider: "static",
+                sandbox_id: "existing-box",
+              }),
               host({
                 host_id: "host_other",
                 name: "Other box",

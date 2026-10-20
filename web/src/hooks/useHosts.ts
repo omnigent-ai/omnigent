@@ -23,6 +23,8 @@ export interface Host {
    * omit the field entirely.
    */
   sandbox_provider?: string | null;
+  /** Provider identity for matching optional inventory state; older servers omit it. */
+  sandbox_id?: string | null;
   /** Reusable, externally owned sandbox, created by a provider or attached later. */
   sandbox_attached?: boolean;
   /**

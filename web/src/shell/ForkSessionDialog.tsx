@@ -89,7 +89,7 @@ import {
 import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferences";
 import { resolveWorkspacePath, useResolvedHostHome } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
-import { StaticSandboxPicker } from "./StaticSandboxPicker";
+import { StaticSandboxPicker, StaticSandboxState } from "./StaticSandboxPicker";
 import { StaticSandboxEdit, StaticSandboxName } from "./StaticSandboxName";
 import { WorkspacePathField } from "./WorkspacePathField";
 import {
@@ -1628,7 +1628,10 @@ function SupportedForkSessionForm({
                         }}
                         action={
                           host.sandbox_attached && (
-                            <StaticSandboxEdit onEdit={() => editSandboxName(host)} />
+                            <span className="ml-auto flex min-w-0 shrink-0 flex-col items-end">
+                              <StaticSandboxEdit onEdit={() => editSandboxName(host)} />
+                              <StaticSandboxState host={host} enabled={hostMenuOpen} />
+                            </span>
                           )
                         }
                       >

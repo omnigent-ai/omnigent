@@ -9,11 +9,54 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { authenticatedFetch } from "@/lib/identity";
+import type { Host } from "@/hooks/useHosts";
+import { useViewerId } from "@/hooks/useViewerId";
 
 interface Sandbox {
   sandbox_id: string;
   name: string;
   state?: string | null;
+}
+
+function useSandboxInventory(provider: string | null, enabled = true) {
+  const viewer = useViewerId();
+  return useQuery({
+    queryKey: ["sandbox-discovery", viewer, provider],
+    queryFn: async ({ signal }): Promise<Sandbox[]> => {
+      const response = await authenticatedFetch(
+        `/v1/hosts/sandboxes?provider=${encodeURIComponent(provider!)}`,
+        { signal: AbortSignal.any([signal, AbortSignal.timeout(5_000)]) },
+      );
+      if (!response.ok) throw new Error("Could not load static sandboxes. Try again.");
+      return (await response.json()).sandboxes;
+    },
+    enabled: enabled && provider !== null && viewer !== null,
+    staleTime: 30_000,
+    retry: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+  });
+}
+
+/** Optional controller information, never a gate on selecting or waking a host. */
+export function StaticSandboxState({ host, enabled }: { host: Host; enabled: boolean }) {
+  const provider =
+    host.sandbox_attached && host.sandbox_id ? (host.sandbox_provider ?? null) : null;
+  const inventory = useSandboxInventory(provider, enabled);
+  if (!enabled || provider === null) return null;
+  if (inventory.isError) {
+    return <span className="text-xs text-muted-foreground">State unavailable</span>;
+  }
+  const state = inventory.data?.find((box) => box.sandbox_id === host.sandbox_id)?.state;
+  if (!state) return null;
+  return (
+    <span
+      className="max-w-36 truncate text-xs text-muted-foreground"
+      title={`Controller state: ${state}. Checked ${new Date(inventory.dataUpdatedAt).toLocaleString()}. Separate from host connectivity.`}
+    >
+      {inventory.isStale ? "Last reported" : "Sandbox"}: {state}
+    </span>
+  );
 }
 
 /** Mounted only while choosing a box from one provider's current inventory. */
@@ -29,17 +72,7 @@ export function StaticSandboxPicker({
   const queryClient = useQueryClient();
   const [attaching, setAttaching] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const inventory = useQuery({
-    queryKey: ["sandbox-discovery", provider],
-    queryFn: async (): Promise<Sandbox[]> => {
-      const response = await authenticatedFetch(
-        `/v1/hosts/sandboxes?provider=${encodeURIComponent(provider)}`,
-      );
-      if (!response.ok) throw new Error("Could not load static sandboxes. Try again.");
-      return (await response.json()).sandboxes;
-    },
-    retry: false,
-  });
+  const inventory = useSandboxInventory(provider);
 
   async function attach(box: Sandbox) {
     setAttaching(box.sandbox_id);
@@ -57,6 +90,7 @@ export function StaticSandboxPicker({
       const body = await response.json();
       if (!response.ok) throw new Error(body.detail || "Could not connect to static sandbox");
       await queryClient.invalidateQueries({ queryKey: ["hosts"] });
+      void queryClient.invalidateQueries({ queryKey: ["sandbox-discovery"] });
       onSelect(body.host_id);
       onClose();
     } catch (cause) {
@@ -92,8 +126,11 @@ export function StaticSandboxPicker({
             >
               <span className="break-all">{box.name}</span>
               <span className="break-all text-xs text-muted-foreground">{box.sandbox_id}</span>
-              {box.state && (
-                <span className="text-xs text-muted-foreground">Controller state: {box.state}</span>
+              {box.state && !inventory.isError && (
+                <span className="text-xs text-muted-foreground">
+                  {inventory.isStale ? "Last reported controller state" : "Controller state"}:{" "}
+                  {box.state}
+                </span>
               )}
             </Button>
           ))}

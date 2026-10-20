@@ -209,6 +209,7 @@ async def test_list_hosts_returns_connected_host(
     # field must be present and None so clients can tell it apart from
     # server-managed hosts without a schema sniff.
     assert hosts[0]["sandbox_provider"] is None
+    assert hosts[0]["sandbox_id"] is None
 
 
 async def test_list_hosts_reports_sandbox_provider_for_managed_host(
@@ -251,6 +252,7 @@ async def test_list_hosts_reports_sandbox_provider_for_managed_host(
     # host process dials the tunnel.
     assert hosts[0]["status"] == "offline"
     assert hosts[0]["sandbox_provider"] == "modal"
+    assert hosts[0]["sandbox_id"] == "sb-12345"
 
 
 async def test_get_host_returns_details(
@@ -273,6 +275,7 @@ async def test_get_host_returns_details(
     # Detail endpoint mirrors list_hosts: a tunnel-connected host is
     # not sandbox-backed, so the field is present and None.
     assert data["sandbox_provider"] is None
+    assert data["sandbox_id"] is None
 
 
 async def test_hosts_api_surfaces_configured_harnesses(
@@ -1569,6 +1572,7 @@ async def test_attach_api_reuses_one_tunnel_for_two_session_launches(
         assert renamed.json() == {"host_id": host_id, "display_name": "My project"}
         assert store.get_host(host_id).updated_at == before.updated_at
         assert (await client.get(f"/v1/hosts/{host_id}")).json()["display_name"] == "My project"
+        assert (await client.get(f"/v1/hosts/{host_id}")).json()["sandbox_id"] == "devbox"
         retry = await client.post("/v1/hosts/attach", json=payload)
         assert retry.json() == attached.json()
         fake.attachments.clear()
@@ -1576,6 +1580,7 @@ async def test_attach_api_reuses_one_tunnel_for_two_session_launches(
         assert denied.status_code == 403  # Listing or prior attachment never grants access.
         hosts = (await client.get("/v1/hosts")).json()["hosts"]
         assert len(hosts) == 1 and hosts[0]["sandbox_attached"] is True
+        assert hosts[0]["sandbox_id"] == "devbox"
         assert hosts[0]["name"] == before.name and hosts[0]["display_name"] == "My project"
         cleared = await client.patch(f"/v1/hosts/{host_id}", json={"display_name": None})
         assert cleared.json()["display_name"] is None

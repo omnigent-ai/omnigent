@@ -3500,6 +3500,7 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
                 "status": "offline",
                 "sandbox_provider": "static",
                 "sandbox_attached": True,
+                "sandbox_id": "existing-box",
                 "configured_harnesses": {"claude-native": True},
             }
             hosts = [
@@ -3515,10 +3516,12 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
             discovery_calls = []
             attach_calls = []
             rename_calls = []
+            inventory_unavailable = False
+            controller_state = "running"
 
             async def discover(route):
                 discovery_calls.append(route.request.method)
-                if len(discovery_calls) == 1:
+                if len(discovery_calls) == 1 or inventory_unavailable:
                     await route.fulfill(status=502, json={"detail": "controller unavailable"})
                 else:
                     await route.fulfill(
@@ -3529,7 +3532,7 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
                                 {
                                     "sandbox_id": "existing-box",
                                     "name": "My devbox",
-                                    "state": "running",
+                                    "state": controller_state,
                                 },
                                 {"sandbox_id": "another-box", "name": "Another sandbox"},
                             ]
@@ -3622,7 +3625,8 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
                     await expect(create_static).to_have_count(0)
                 row = page.get_by_test_id("new-chat-landing-host-host_devbox")
                 await expect(row).to_be_visible()
-                await expect(row).to_contain_text("Asleep")
+                await expect(row).to_contain_text("Offline")
+                await expect(row).to_contain_text("Sandbox: running")
                 menu = page.get_by_test_id("new-chat-landing-host-menu")
                 await expect(menu.get_by_role("menuitem").nth(-2)).to_have_text(
                     "Existing Static Sandbox"
@@ -3645,11 +3649,13 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
                 assert not wake_calls and not rename_calls
                 await expect(page.locator("[data-sandbox-edit]")).to_have_count(0)
                 await chip.click()
+                controller_state = "starting"
                 await row.click()
                 await expect(chip).to_have_attribute("aria-label", "Host: My devbox, Online")
                 assert wake_calls == ["POST"]
                 await expect(page.locator("[data-sandbox-edit]")).to_have_count(0)
                 await chip.click()
+                await expect(row).to_contain_text("Sandbox: starting")
                 await row.hover()
                 await expect(row.get_by_text("Edit", exact=True)).to_be_visible()
                 await page.screenshot(
@@ -3667,6 +3673,14 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
                 await page.screenshot(
                     path=str(tmp_path / "named-static-sandbox.png"), animations="disabled"
                 )
+                inventory_unavailable = True
+                await chip.click()
+                await expect(row).to_contain_text("State unavailable")
+                await expect(row).not_to_contain_text("Sandbox: starting")
+                await page.screenshot(
+                    path=str(tmp_path / "state-unavailable.png"), animations="disabled"
+                )
+                await row.click()
                 for number in range(2):
                     if number:
                         await page.goto(f"{base_url}/")
@@ -3678,6 +3692,8 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
                     await expect(page).to_have_url(re.compile(rf"/c/{session_id}$"))
                 assert [body["host_id"] for body in creates] == ["host_devbox", "host_devbox"]
                 assert all(body.get("host_type") != "managed" for body in creates)
+                inventory_unavailable = False
+                controller_state = "running"
 
                 async def coding_snapshot(route):
                     response = await route.fetch()
@@ -3701,6 +3717,7 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
                 )
                 await clone.get_by_test_id("fork-session-host-select").tap()
                 clone_row = page.get_by_test_id("fork-session-host-option-host_devbox")
+                await expect(clone_row).to_contain_text("Sandbox: running")
                 await expect(clone_row.get_by_text("Edit", exact=True)).to_be_visible()
                 await page.screenshot(
                     path=str(tmp_path / "edit-in-clone-picker.png"), animations="disabled"
