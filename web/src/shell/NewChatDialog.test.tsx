@@ -7340,6 +7340,54 @@ describe("NewChatLandingScreen", () => {
     await waitFor(() => expect(screen.queryByTestId("new-chat-landing-error")).toBeNull());
   });
 
+  it.each([undefined, true])(
+    "includes managed first input only when the server accepts it durably (%s)",
+    async (durableInitialInput) => {
+      renderLanding({
+        managed_sandboxes_enabled: true,
+        durable_initial_input: durableInitialInput,
+      });
+      const { body } = await submitAndReadBody("finish after I close the tab");
+      expect(body.host_type).toBe("managed");
+      expect(body.initial_items).toBeUndefined();
+      expect(body.initial_input).toEqual(
+        durableInitialInput
+          ? {
+              type: "message",
+              data: {
+                role: "user",
+                content: [{ type: "input_text", text: "finish after I close the tab" }],
+              },
+            }
+          : undefined,
+      );
+    },
+  );
+
+  it("uploads managed first-message files in the create request", async () => {
+    renderLanding({ managed_sandboxes_enabled: true, durable_initial_input: true });
+    const file = new File(["saved context"], "context.txt", { type: "text/plain" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+      target: { files: [file] },
+    });
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "use the attachment" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() =>
+      expect(authenticatedFetchMock.mock.calls.some(([url]) => url === "/v1/sessions")).toBe(true),
+    );
+    const [, init] = authenticatedFetchMock.mock.calls.find(([url]) => url === "/v1/sessions")!;
+    const form = (init as RequestInit).body as FormData;
+    expect(form).toBeInstanceOf(FormData);
+    expect(form.getAll("initial_files")).toEqual([file]);
+    expect(JSON.parse(form.get("metadata") as string)).toMatchObject({
+      host_type: "managed",
+      initial_input: { type: "message", data: { role: "user" } },
+    });
+    expect(new Headers(init?.headers).has("Content-Type")).toBe(false);
+  });
+
   it("shows the default hero heading in the normal new-session flow (no project)", async () => {
     // Without a `?project=` param the session is unfiled — the hero keeps its
     // generic prompt, and there is no project chip in the tray.

@@ -1711,6 +1711,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           visible={isShown}
           runnerOnline={isActive ? runnerOnline : undefined}
           onResume={isActive ? handleTerminalResume : undefined}
+          sandboxOffline={isActive && liveness.kind === "host_asleep"}
           onSurfaceElement={isActive ? setTerminalSurfaceEl : undefined}
           readOnly={entry.readOnly}
         />
@@ -3895,7 +3896,14 @@ function ComposerImpl(
                     showClaudePermissionMode ? claudePermissionMode : codexApprovalMode
                   }
                   options={permissionOptions}
-                  disabled={isReadOnly || unreachable || configBusy}
+                  disabled={
+                    isReadOnly || unreachable || configBusy || !isOwnerLevel(permissionLevel)
+                  }
+                  disabledReason={
+                    isOwnerLevel(permissionLevel)
+                      ? undefined
+                      : "Only the session owner can change the permission mode"
+                  }
                   onSelect={(mode) => void changePermission(mode)}
                 />
               )}

@@ -18,6 +18,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -26,7 +27,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 from omnigent._platform import IS_WINDOWS
 from omnigent.cli_invocation import cli_invocation
@@ -36,6 +37,9 @@ from omnigent.native import owner_claim
 from omnigent.process_logging import redact_log_text
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.util.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
+
+if TYPE_CHECKING:
+    from omnigent.terminals.program_status import ProgramStatusReader
 
 from . import _proc
 from .agent_env import strip_desktop_session_env
@@ -1117,6 +1121,9 @@ class TerminalInstance:
     keep_alive_after_exit: bool = False
     running: bool = False
     launch_cwd: str | None = None
+    # Runtime-owned observation; never part of the portable terminal spec.
+    program_status_app: str | None = None
+    program_status: ProgramStatusReader | None = field(default=None, init=False, repr=False)
     # Owned per-launch egress proxy. ``None`` when the sandbox
     # carries no ``egress_rules`` or the backend doesn't need a
     # spawn-time wrap (the ``none`` backend does nothing here). Cleaned
@@ -1589,6 +1596,8 @@ class TerminalInstance:
             raise
 
     async def _launch_impl(self, *, cwd: Path | None = None) -> None:
+        from omnigent.terminals import program_status
+
         if self.running:
             return
         self._last_exit_snapshot = None
@@ -1649,6 +1658,20 @@ class TerminalInstance:
             inner_cmd = [launcher_path, *self.args]
         else:
             inner_cmd = [self.command, *self.args]
+        if self.program_status_app is not None:
+            status_path = self.private_dir / "program-status.json"
+            status_path.unlink(missing_ok=True)
+            self.program_status = program_status.ProgramStatusReader(status_path)
+            inner_cmd = [
+                sys.executable,
+                str(Path(program_status.__file__)),
+                "--state-file",
+                str(status_path),
+                "--app",
+                self.program_status_app,
+                "--",
+                *inner_cmd,
+            ]
         inner_str = shlex.join(inner_cmd)
         if self.tmux_start_on_attach:
             inner_str = f"tmux wait-for {_TMUX_START_ON_ATTACH_CHANNEL}; exec {inner_str}"

@@ -136,7 +136,6 @@ from omnigent.server._elicitation_registry import (
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_READ,
-    local_single_user_enabled,
 )
 from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
@@ -381,6 +380,12 @@ from omnigent.server.schemas import (
     SessionResponse,
     SessionStatusEvent,
     SessionUsageEvent,
+)
+from omnigent.server.startup_inputs import (
+    STARTUP_LABEL,
+    StartupInputContext,
+    restore_pending_inputs,
+    wake_startup_worker,
 )
 from omnigent.server.subagent_activity import (
     claude_subagent_completion_markers,
@@ -2587,7 +2592,7 @@ async def _hold_native_ask_gate_impl(
             engine.apply_label_writes(result.set_labels)
         if result.state_updates:
             with contextlib.suppress(ConversationNotFoundError):
-                engine.apply_state_updates(result.state_updates)
+                engine.apply_state_updates(result.state_updates, approved=True)
     return approved
 
 
@@ -2936,6 +2941,8 @@ async def _persist_external_conversation_item_unlocked(
         existing = await asyncio.to_thread(conversation_store.get_item, session_id, item.stable_id)
         if existing is not None:
             return existing.id
+    if _drains_pending_inputs(item) and STARTUP_LABEL in conv.labels:
+        await restore_pending_inputs(conversation_store, session_id)
     # A native user message round-tripping back from the transcript:
     # drain its optimistic pending-input entry and fold the entry's file
     # blocks (image / file) into the item BEFORE persisting. The transcript
@@ -3000,13 +3007,13 @@ async def _persist_external_conversation_item_unlocked(
         if drained is not None:
             cleared_pending_id = drained.pending_id
             item = _merge_pending_file_blocks(item, drained.content)
-            # Apply the original sender's identity recorded at POST time.
-            # The transcript forwarder is the single writer here and has no
-            # auth context, so the persisted item would otherwise have
-            # created_by=None, causing session.input.consumed to broadcast
-            # without an author — the label would flash in from the optimistic
-            # bubble then disappear once the committed item arrived.
-            if drained.created_by is not None and item.created_by is None:
+            # A text match preserves the sender recorded at POST time. FIFO
+            # settlement alone does not establish authorship of the mirror.
+            if (
+                drained.created_by is not None
+                and item.created_by is None
+                and match_method != "fifo_fallback"
+            ):
                 item = item.model_copy(update={"created_by": drained.created_by})
             # A web client that sends stable_id gets store-level idempotency:
             # use it directly as the item id so the append is a no-op on retry.
@@ -3040,6 +3047,8 @@ async def _persist_external_conversation_item_unlocked(
         drained = pending_inputs.resolve_shell_command(session_id, shell_command, hold=True)
         if drained is not None:
             cleared_pending_id = drained.pending_id
+    if drained is not None:
+        item = item.model_copy(update={"replaces_pending_id": drained.stable_id})
     # Build the batch: skipped entries first (their positions must precede
     # the matched item to match broadcast order), then the anchor. Each
     # skipped entry gets a pair of items (user message + error) with stable
@@ -3083,6 +3092,9 @@ async def _persist_external_conversation_item_unlocked(
     # go back into play.
     _release_drained_inputs(session_id, [*skipped_pending, *uncertain_pending, drained])
     _restore_drained_inputs(session_id, held_older, None)
+    if item.replaces_pending_id is not None and conv.host_id is not None:
+        # A saved startup input's receipt frees the next one queued behind it.
+        wake_startup_worker(conv.host_id)
     # Not a duplicate: publish side effects for each skipped pair. Items are
     # [user0, error0, user1, error1, ...]; 2 per skipped entry. The consumed
     # event names each skipped entry so clients settle those bubbles in order
@@ -3362,6 +3374,11 @@ async def _settle_undelivered_native_input(
         return
     pending_id = pending_inputs.pending_id_for_stable_id(session_id, input_stable_id)
     if pending_id is None:
+        # A saved startup input submitted before a server restart is matched
+        # only once restored.
+        await restore_pending_inputs(conversation_store, session_id)
+        pending_id = pending_inputs.pending_id_for_stable_id(session_id, input_stable_id)
+    if pending_id is None:
         return
     drained = pending_inputs.resolve(session_id, pending_id)
     if drained is None:
@@ -3372,6 +3389,7 @@ async def _settle_undelivered_native_input(
         data=MessageData(role="user", content=drained.content, user_authored=True),
         created_by=drained.created_by,
         stable_id=drained.stable_id,
+        replaces_pending_id=drained.stable_id,
     )
     try:
         persisted = await asyncio.to_thread(conversation_store.append, session_id, [item])
@@ -3487,6 +3505,7 @@ def _build_skipped_native_items(
                     uuid.NAMESPACE_URL,
                     f"omnigent-skipped-{harness_key}-user:{session_id}:{skipped.pending_id}",
                 ).hex,
+                replaces_pending_id=skipped.stable_id,
             )
         )
         items.append(
@@ -6710,6 +6729,7 @@ async def _forward_event_to_runner(
     created_by: str | None = None,
     host_store: HostStore | None = None,
     agent_revision: str | None = None,
+    startup_input_id: str | None = None,
 ) -> str:
     """
     Persist a user event and forward it to the runner.
@@ -6750,6 +6770,7 @@ async def _forward_event_to_runner(
     turn_id = f"turn_{uuid.uuid4().hex}"
     # A web send is persisted under its client stable id (see _web_send_stable_id).
     item = _build_new_item(body, turn_id, created_by=created_by, adopt_stable_id=True)
+    item = item.model_copy(update={"replaces_pending_id": startup_input_id})
     persisted_items = await asyncio.to_thread(
         conversation_store.append,
         session_id,
@@ -7596,6 +7617,7 @@ async def _dispatch_session_event_to_runner_impl(
     host_registry: HostRegistry | None = None,
     background_titles_enabled: bool = True,
     agent_revision: str | None = None,
+    startup_input: StartupInputContext | None = None,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -7701,6 +7723,8 @@ async def _dispatch_session_event_to_runner_impl(
             )
         )
         if ensure_outcome.error is not None:
+            if startup_input is not None:
+                raise OmnigentError(str(ensure_outcome.error), code=ErrorCode.RUNNER_UNAVAILABLE)
             item_id = await _persist_native_terminal_failure(
                 session_id,
                 conv,
@@ -7790,6 +7814,10 @@ async def _dispatch_session_event_to_runner_impl(
                     ),
                 )
                 return _SessionEventDispatchResult(item_id=None, pending_id=repeated_pending_id)
+        if startup_input is not None and not await startup_input.claim(
+            conversation_store, session_id
+        ):
+            return _SessionEventDispatchResult(item_id=None, pending_id=None)
         pending_id: str | None = (
             pending_inputs.record(
                 session_id,
@@ -8004,6 +8032,8 @@ async def _dispatch_session_event_to_runner_impl(
                     decision_id=_native_decision_id,
                 )
         return _SessionEventDispatchResult(item_id=None, pending_id=pending_id)
+    if startup_input is not None and not await startup_input.claim(conversation_store, session_id):
+        return _SessionEventDispatchResult(item_id=None, pending_id=None)
     item_id = await _forward_event_to_runner(
         session_id,
         conv,
@@ -8017,6 +8047,7 @@ async def _dispatch_session_event_to_runner_impl(
         created_by=created_by,
         host_store=host_store,
         agent_revision=agent_revision,
+        startup_input_id=startup_input.input_id if startup_input is not None else None,
     )
     return _SessionEventDispatchResult(item_id=item_id, pending_id=None)
 
@@ -11894,14 +11925,10 @@ def _create_session_from_bundle(
         any non-integrity reason.
     """
     if spec is None:
-        # Enforce the policy-handler allowlist only on a shared /
-        # multi-user server. On a trusted single-user/local server,
-        # ``omnigent run`` uploads the operator's own bundle through this same
-        # path, so custom handlers must keep working (the operator already has
-        # code execution — the restriction would add no security there).
+        # Loopback requests can originate from agents as well as the operator.
         spec = validate_agent_bundle(
             bundle_bytes,
-            enforce_handler_allowlist=not local_single_user_enabled(),
+            enforce_handler_allowlist=True,
         )
     assert spec.name is not None
 
@@ -12215,7 +12242,9 @@ async def _handle_mcp_tools_call(
                     await asyncio.to_thread(engine.apply_label_writes, _pending.set_labels)
                 if _pending.state_updates:
                     with contextlib.suppress(ConversationNotFoundError):
-                        await asyncio.to_thread(engine.apply_state_updates, _pending.state_updates)
+                        await asyncio.to_thread(
+                            engine.apply_state_updates, _pending.state_updates, approved=True
+                        )
         else:
             # The current policy controls arguments when approval is no longer required.
             if retry_result.data is not None:
@@ -13304,6 +13333,11 @@ async def _get_session_snapshot(
     response.inference_configured = inference_configured
     response.inference_error = inference_error
     response.usage_included = include_usage
+    startup = getattr(request.app.state, "startup_inputs", None) if request is not None else None
+    if startup is not None and STARTUP_LABEL in conv.labels:
+        queued = await startup.pending_snapshot(session_id)
+        known = {item["pending_id"] for item in response.pending_inputs}
+        response.pending_inputs.extend(item for item in queued if item["pending_id"] not in known)
     return response
 
 

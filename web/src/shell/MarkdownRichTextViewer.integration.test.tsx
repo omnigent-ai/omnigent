@@ -8,6 +8,7 @@
 // the write endpoint (useWriteFileContent) is mocked, to assert the PUT fires
 // with the edited content.
 
+import { Schema, type Node } from "@tiptap/pm/model";
 import { act, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -30,16 +31,21 @@ interface FakeEditor {
   off: (evt: string, h: UpdateHandler) => void;
   commands: { setContent: (c: string) => void };
   setEditable: () => void;
-  state: { selection: { empty: boolean; from: number; to: number } };
+  state: { doc: Node; selection: { empty: boolean; from: number; to: number } };
   emit: (evt: string, payload?: UpdatePayload) => void;
   setMarkdown: (m: string) => void;
   isFocused: boolean;
   wired: boolean;
 }
 
+const schema = new Schema({ nodes: { doc: { content: "text*" }, text: {} } });
+const documentFor = (text: string) =>
+  schema.node("doc", null, text ? schema.text(text) : undefined);
+
 function makeFakeEditor(initial: string): FakeEditor {
   const handlers: Record<string, Set<UpdateHandler>> = {};
   let markdown = initial;
+  const state = { doc: documentFor(initial), selection: { empty: true, from: 0, to: 0 } };
   return {
     isDestroyed: false,
     getMarkdown: () => markdown,
@@ -52,15 +58,17 @@ function makeFakeEditor(initial: string): FakeEditor {
     commands: {
       setContent: (c: string) => {
         markdown = c;
+        state.doc = documentFor(c);
       },
     },
     setEditable: () => {},
-    state: { selection: { empty: true, from: 0, to: 0 } },
+    state,
     emit: (evt, payload) => {
       handlers[evt]?.forEach((h) => h(payload));
     },
     setMarkdown: (m) => {
       markdown = m;
+      state.doc = documentFor(m);
     },
     // Default focused: these tests simulate USER edits, which only happen while
     // the editor has focus. The load-normalisation test flips this to false.
@@ -190,6 +198,111 @@ afterEach(() => {
 });
 
 describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
+  it("serializes once at save time, never for each keystroke or a clean blur", async () => {
+    render(makeViewer());
+    const serialize = vi.spyOn(fakeEditor!, "getMarkdown");
+    await act(async () => {
+      for (const suffix of ["a", "ab", "abc"]) {
+        fakeEditor!.setMarkdown(INITIAL + suffix);
+        fakeEditor!.emit("update");
+      }
+    });
+    expect(screen.getByText(/Unsaved changes/)).toBeInTheDocument();
+    expect(serialize).not.toHaveBeenCalled();
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+    });
+    expect(serialize).toHaveBeenCalledTimes(1);
+    expect(mutateAsync).toHaveBeenCalledExactlyOnceWith({ path: PATH, content: INITIAL + "abc" });
+    await act(async () => fakeEditor!.emit("blur"));
+    expect(serialize).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/Unsaved changes/)).toBeNull();
+  });
+
+  it("undo to an equivalent baseline document clears dirty without serializing or writing", async () => {
+    render(makeViewer());
+    const original = fakeEditor!.state.doc;
+    const serialize = vi.spyOn(fakeEditor!, "getMarkdown");
+    await act(async () => {
+      fakeEditor!.setMarkdown(EDITED);
+      fakeEditor!.emit("update");
+    });
+    expect(screen.getByText(/Unsaved changes/)).toBeInTheDocument();
+    await act(async () => {
+      fakeEditor!.setMarkdown(INITIAL);
+      fakeEditor!.emit("update");
+    });
+    expect(fakeEditor!.state.doc).not.toBe(original);
+    expect(screen.queryByText(/Unsaved changes/)).toBeNull();
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+      fakeEditor!.emit("blur");
+    });
+    expect(serialize).not.toHaveBeenCalled();
+    expect(mutateAsync).not.toHaveBeenCalled();
+  });
+
+  it("re-baselines a changed document that serializes to the same Markdown without writing", async () => {
+    render(makeViewer());
+    fakeEditor!.setMarkdown(EDITED);
+    const serialize = vi.spyOn(fakeEditor!, "getMarkdown").mockReturnValue(INITIAL);
+    await act(async () => fakeEditor!.emit("update"));
+    await act(async () => vi.advanceTimersByTime(1000));
+    expect(mutateAsync).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Unsaved changes/)).toBeNull();
+    await act(async () => fakeEditor!.emit("blur"));
+    expect(serialize).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves edits made during a pending write and baselines the saved snapshot", async () => {
+    let resolveWrite!: () => void;
+    mutateAsync.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveWrite = resolve;
+        }),
+    );
+    render(makeViewer());
+    const serialize = vi.spyOn(fakeEditor!, "getMarkdown");
+    await act(async () => {
+      fakeEditor!.setMarkdown(EDITED);
+      fakeEditor!.emit("update");
+      vi.advanceTimersByTime(1000);
+    });
+    await act(async () => {
+      fakeEditor!.setMarkdown(EDITED + "newer");
+      fakeEditor!.emit("update");
+      vi.advanceTimersByTime(1000);
+    });
+    expect(mutateAsync).toHaveBeenCalledTimes(1);
+    expect(serialize).toHaveBeenCalledTimes(1);
+    await act(async () => resolveWrite());
+    expect(mutateAsync).toHaveBeenNthCalledWith(2, { path: PATH, content: EDITED + "newer" });
+    expect(serialize).toHaveBeenCalledTimes(2);
+    await act(async () => fakeEditor!.emit("blur"));
+    expect(mutateAsync).toHaveBeenCalledTimes(2);
+    expect(serialize).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses an external replacement as the new undo baseline", async () => {
+    const { rerender } = render(makeViewer());
+    await act(async () => rerender(makeViewer(EDITED)));
+    expect(fakeEditor!.getMarkdown()).toBe(EDITED);
+    const serialize = vi.spyOn(fakeEditor!, "getMarkdown");
+    await act(async () => {
+      fakeEditor!.setMarkdown(EDITED + "newer");
+      fakeEditor!.emit("update");
+    });
+    await act(async () => {
+      fakeEditor!.setMarkdown(EDITED);
+      fakeEditor!.emit("update");
+      vi.advanceTimersByTime(1000);
+    });
+    expect(screen.queryByText(/Unsaved changes/)).toBeNull();
+    expect(serialize).not.toHaveBeenCalled();
+    expect(mutateAsync).not.toHaveBeenCalled();
+  });
+
   it("debounced save fires after an edit (update → schedule → write)", async () => {
     render(makeViewer());
     // Edit: content diverges from the onCreate baseline, then emit 'update'.
@@ -293,7 +406,7 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
       reset: vi.fn(),
       mutateAsync: vi.fn(async ({ content }: { content: string }) => {
         saved.push(content);
-        fakeEditor!.setMarkdown(content + "\n"); // round-trip drift, not a user edit
+        vi.spyOn(fakeEditor!, "getMarkdown").mockReturnValue(content + "\n");
       }),
     } as unknown as ReturnType<typeof writeHook.useWriteFileContent>);
 

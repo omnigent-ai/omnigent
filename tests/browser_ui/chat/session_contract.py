@@ -657,11 +657,15 @@ def _multipart_file_metadata(request: Mapping[str, Any]) -> tuple[str, int]:
 def chat_session_handle(
     page: Page,
     browser_contract: BrowserContract,
+    *,
+    session_id: str = DEFAULT_SESSION_ID,
 ) -> Iterator[ChatSessionContract]:
     """Create, install, and clean up a reusable chat contract handle."""
     stream = _ChatSseStream()
     try:
-        handle = ChatSessionContract(page=page, contract=browser_contract, stream=stream)
+        handle = ChatSessionContract(
+            page=page, contract=browser_contract, stream=stream, session_id=session_id
+        )
         install_chat_session_routes(handle)
         yield handle
     finally:

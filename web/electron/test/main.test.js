@@ -190,6 +190,7 @@ function loadNavigationHarness({
     arcaLoginCancels: 0,
   };
   const pickers = [];
+  const findBars = [];
   const ipc = new Map();
   const webRequest = {};
   const jar = new Map();
@@ -220,6 +221,12 @@ function loadNavigationHarness({
     },
   });
   const defaultSession = {
+    setPermissionRequestHandler(handler) {
+      this.request = handler;
+    },
+    setPermissionCheckHandler(handler) {
+      this.check = handler;
+    },
     cookies: network?.cookies ?? cookies,
     webRequest: {
       onBeforeRequest: (fn) => {
@@ -347,6 +354,20 @@ function loadNavigationHarness({
           });
           pickers.push(picker);
           return picker;
+        }
+        if (options?.webPreferences?.preload?.endsWith("find_preload.js")) {
+          let destroyed = false;
+          const bar = Object.assign(new EventEmitter(), {
+            webContents: { send: () => {} },
+            isDestroyed: () => destroyed,
+            close() {
+              destroyed = true;
+              this.emit("closed");
+            },
+            loadFile: async () => {},
+          });
+          findBars.push(bar);
+          return bar;
         }
         return win;
       },
@@ -622,7 +643,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, cancelReconnect };";
+    "\nmodule.exports.testApi = { buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -679,6 +700,7 @@ function loadNavigationHarness({
     webContents,
     settingsPath: path.join(userData, "settings.json"),
     pickers,
+    findBars,
     emit: (eventName, ...args) => webContents.emit(eventName, ...args),
     emitWindow: (eventName) => {
       for (const listener of winListeners.get(eventName) ?? []) listener();
@@ -2162,6 +2184,29 @@ describe("Databricks auth mode wiring", () => {
 });
 
 describe("browser permission wiring", () => {
+  it("grants fullscreen only to the pinned server's top-level page", (t) => {
+    const serverUrl = "https://server.example/omnigent";
+    const h = loadNavigationHarness({ serverUrl });
+    t.after(h.cleanup);
+    h.webContents.isDestroyed = () => false;
+    h.api.registerPermissions();
+    const ses = h.electron.session.defaultSession;
+    const request = (permission, requestingUrl) => {
+      let granted;
+      ses.request(h.webContents, permission, (value) => (granted = value), { requestingUrl });
+      return granted;
+    };
+    assert.equal(ses.check(h.webContents, "fullscreen", serverUrl), true);
+    assert.equal(request("fullscreen", `${serverUrl}/c/session`), true);
+    assert.equal(request("fullscreen", "https://foreign.example/video"), false);
+    assert.equal(ses.check(h.webContents, "fullscreen", "https://foreign.example"), false);
+    assert.equal(ses.check(null, "fullscreen", serverUrl), false);
+    assert.equal(request("clipboard-read", serverUrl), false);
+    h.setUrl("https://foreign.example");
+    assert.equal(request("fullscreen", serverUrl), false);
+    assert.equal(ses.check(h.webContents, "fullscreen", serverUrl), false);
+  });
+
   it("installs isolated consent handlers before construction and only prompts for the visible pane", async () => {
     const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
     try {
@@ -2175,6 +2220,7 @@ describe("browser permission wiring", () => {
           const ses = {
             setPermissionRequestHandler: (handler) => (ses.request = handler),
             setPermissionCheckHandler: (handler) => (ses.check = handler),
+            webRequest: { onBeforeRequest() {}, onBeforeSendHeaders() {}, onHeadersReceived() {} },
           };
           sessions.set(partition, ses);
         }
@@ -2222,6 +2268,130 @@ describe("browser permission wiring", () => {
       assert.equal(h.permissionPromptCalls.dismiss.length, dismissals + 2);
       assert.equal(h.electron.session.defaultSession.request, undefined);
       assert.equal(h.electron.session.defaultSession.check, undefined);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it("guards each agent partition's document requests through its own Chromium session", async () => {
+    const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
+    try {
+      const sessions = new Map();
+      const dns = { "lvh.me": "127.0.0.1", "example.com": "93.184.215.14" };
+      h.electron.session.fromPartition = (partition) => {
+        if (!sessions.has(partition)) {
+          const ses = {
+            installs: [],
+            lookups: [],
+            dns: { ...dns },
+            setPermissionRequestHandler() {},
+            setPermissionCheckHandler() {},
+            webRequest: {
+              onBeforeRequest: (filter, fn) => ses.installs.push(["request", filter, fn]),
+              onBeforeSendHeaders: (filter, fn) => ses.installs.push(["sendHeaders", filter, fn]),
+              onHeadersReceived: (filter, fn) => ses.installs.push(["headers", filter, fn]),
+            },
+            resolveHost: async (host) => {
+              ses.lookups.push(host);
+              return {
+                endpoints: ses.dns[host] ? [{ address: ses.dns[host], family: "ipv4" }] : [],
+              };
+            },
+            resolveProxy: async () => "DIRECT",
+          };
+          sessions.set(partition, ses);
+        }
+        return sessions.get(partition);
+      };
+      let nextId = 1;
+      const partitions = [];
+      h.electron.createWebContentsView = function (opts) {
+        partitions.push(opts.webPreferences.partition);
+        const wc = Object.assign(new EventEmitter(), {
+          id: nextId++,
+          setWindowOpenHandler() {},
+          loadURL() {},
+        });
+        return { webContents: wc, setVisible() {}, setBounds() {}, getBounds: () => ({}) };
+      };
+      const registry = h.api.createBrowserRegistryForWindow(h.win);
+      const agent = registry.openOrNavigate("conv", "https://example.com/", undefined, {
+        agent: true,
+      }).entry.view.webContents;
+      registry.openOrNavigate("browser-tab:conv:t1", "https://example.com/");
+      assert.equal(partitions[0], partitions[1], "a session's tabs share one partition");
+      const ses = sessions.get(partitions[0]);
+      assert.deepEqual(
+        // main.js runs in its own vm realm, so copy its arrays before deepEqual.
+        ses.installs.map(([kind, filter]) => [kind, [...filter.types]]),
+        [
+          ["request", ["mainFrame", "subFrame", "object"]],
+          ["sendHeaders", ["mainFrame", "subFrame", "object"]],
+          ["headers", ["mainFrame", "subFrame", "object"]],
+        ],
+        "installed once per partition, for document requests only",
+      );
+      // Round-trip through JSON so objects from main.js's vm realm compare.
+      const decide = (kind, details, session = ses, view = agent) =>
+        new Promise((resolve) => {
+          const [, , fn] = session.installs.find(([k]) => k === kind);
+          fn({ webContentsId: view.id, ...details }, (response) =>
+            resolve(JSON.parse(JSON.stringify(response))),
+          );
+        });
+      // Each listener forwards the registry's decision; the address and proxy
+      // matrices live in the policy and registry tests.
+      const next = "https://example.com/next";
+      assert.deepEqual(await decide("request", { url: next }), { cancel: false });
+      assert.deepEqual(await decide("request", { url: "http://lvh.me:8899/" }), { cancel: true });
+      assert.deepEqual(await decide("sendHeaders", { url: next, requestHeaders: {} }), {
+        requestHeaders: { "Cache-Control": "no-cache" },
+      });
+      assert.deepEqual(await decide("headers", { url: next, ip: "127.0.0.1" }), { cancel: true });
+      ses.resolveProxy = async () => {
+        throw new Error("proxy lookup failed");
+      };
+      assert.deepEqual(
+        await decide("headers", { url: next, ip: "10.0.0.2" }),
+        { cancel: true },
+        "a failed check cancels",
+      );
+      const firstHop = await registry.checkAgentNavigation("conv", "http://lvh.me:8899/", null);
+      assert.equal(firstHop.ok, false, "the IPC first hop resolves through the same session");
+      const otherAgent = registry.openOrNavigate("other-conv", "https://example.com/", undefined, {
+        agent: true,
+      }).entry.view.webContents;
+      assert.notEqual(partitions[2], partitions[0], "conversations use independent partitions");
+      const otherSession = sessions.get(partitions[2]);
+      assert.notEqual(otherSession, ses);
+      assert.deepEqual(
+        otherSession.installs.map(([kind, filter]) => [kind, [...filter.types]]),
+        ses.installs.map(([kind, filter]) => [kind, [...filter.types]]),
+        "each independent session receives all document hooks",
+      );
+      otherSession.dns["example.com"] = "127.0.0.1";
+      ses.lookups.length = 0;
+      otherSession.lookups.length = 0;
+      assert.deepEqual(await decide("request", { url: next }, otherSession, otherAgent), {
+        cancel: true,
+      });
+      assert.deepEqual(otherSession.lookups, ["example.com"]);
+      assert.deepEqual(ses.lookups, [], "the second session never resolves through the first");
+      assert.deepEqual(await decide("request", { url: next }), { cancel: false });
+      assert.deepEqual(ses.lookups, ["example.com"]);
+      assert.deepEqual(
+        otherSession.lookups,
+        ["example.com"],
+        "the first session stays independent",
+      );
+      assert.deepEqual(
+        await decide("sendHeaders", { url: next, requestHeaders: {} }, otherSession, otherAgent),
+        { requestHeaders: { "Cache-Control": "no-cache" } },
+      );
+      assert.deepEqual(
+        await decide("headers", { url: next, ip: "127.0.0.1" }, otherSession, otherAgent),
+        { cancel: true },
+      );
     } finally {
       h.cleanup();
     }
@@ -4689,6 +4859,37 @@ describe("OIDC system-browser sign-in wiring", () => {
       assert.equal(h.api.windows.get(h.win).authKind, null, url);
     }
     /* oxlint-enable no-await-in-loop */
+  });
+});
+
+describe("find bar teardown (src/main.js)", () => {
+  function openBar() {
+    const h = loadNavigationHarness();
+    const stops = [];
+    h.webContents.isDestroyed = () => false;
+    h.webContents.stopFindInPage = (action) => stops.push(action);
+    h.win.removeListener = () => {};
+    h.api.openFindBar(h.win);
+    return { h, stops, bar: h.findBars[0] };
+  }
+
+  it("clears the search and refocuses the parent when the bar closes", (t) => {
+    const { h, stops, bar } = openBar();
+    t.after(h.cleanup);
+    bar.close();
+    assert.deepEqual(stops, ["clearSelection"]);
+    assert.equal(h.calls.focused, 1);
+  });
+
+  it("skips the parent's webContents once Cmd+W has destroyed them", (t) => {
+    const { h, bar } = openBar();
+    t.after(h.cleanup);
+    h.webContents.isDestroyed = () => true;
+    h.webContents.stopFindInPage = () => {
+      throw new TypeError("Object has been destroyed");
+    };
+    assert.doesNotThrow(() => bar.close());
+    assert.equal(h.calls.focused, undefined);
   });
 });
 

@@ -181,6 +181,7 @@ class ServerInfoResponse(BaseModel):
     needs_setup: bool
     databricks_features: bool
     managed_sandboxes_enabled: bool
+    durable_initial_input: bool = False
     sandbox_provider: str | None
     sandbox_providers: list[str]
     # UI-relevant capability flags per launchable provider, e.g.
@@ -1842,6 +1843,8 @@ def create_app(
             from omnigent.server.routes.sessions import cancel_managed_launch_tasks
 
             await cancel_managed_launch_tasks()
+            if startup_inputs is not None:
+                await startup_inputs.shutdown()
             await background_title_coordinator.shutdown()
             _uninstall_subagent_block_notifier()
             set_resource_registry(None)
@@ -1878,6 +1881,16 @@ def create_app(
     app.state.runner_session_initializer = runner_session_initializer
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
+    from omnigent.server.startup_inputs import ManagedStartupInputs
+
+    # Only managed creates accept a durable first input, and only managed hosts
+    # need their startup recovered on the replica holding the tunnel.
+    startup_inputs = (
+        ManagedStartupInputs(conversation_store, host_registry)
+        if sandbox_config is not None and sandbox_config.managed_launch_supported
+        else None
+    )
+    app.state.startup_inputs = startup_inputs
     app.state.host_store = host_store
     app.state.mcp_gateway_backend = mcp_gateway_backend
     app.state.mcp_registry = mcp_registry
@@ -3139,6 +3152,7 @@ def create_app(
                 "needs_setup": needs_setup,
                 "databricks_features": databricks_features,
                 "managed_sandboxes_enabled": managed_sandboxes_enabled,
+                "durable_initial_input": startup_inputs is not None,
                 "sandbox_provider": sandbox_provider,
                 "sandbox_providers": sandbox_providers,
                 "sandbox_provider_capabilities": sandbox_provider_capabilities,
@@ -3279,6 +3293,14 @@ def create_app(
             # files a session into a project (owner-private membership).
             project_store=project_store,
             background_title_coordinator=background_title_coordinator,
+            register_startup_dispatch=lambda handler: (
+                setattr(startup_inputs, "dispatch", handler)
+                if startup_inputs is not None
+                else None
+            ),
+            register_initial_file_upload=lambda handler: setattr(
+                app.state, "initial_file_upload", handler
+            ),
             register_runner_ingest=lambda handler: setattr(
                 app.state, "runner_event_ingest", handler
             ),
@@ -4143,6 +4165,8 @@ def create_app(
 
         async def _on_hosts_changed(_host_id: str, owner: str | None) -> None:
             announce_hosts_changed(owner)
+            if startup_inputs is not None:
+                startup_inputs.host_changed(app, _host_id)
 
         app.include_router(
             create_host_tunnel_router(

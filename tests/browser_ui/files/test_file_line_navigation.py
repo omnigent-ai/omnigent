@@ -42,6 +42,7 @@ class BrowserSession:
     comments: list[dict[str, object]] = field(default_factory=list)
     runner_online: bool = True
     host_online: bool = True
+    features: dict[str, bool] = field(default_factory=dict)
 
     def __iter__(self) -> Iterator[str]:
         yield self.contract.base_url
@@ -84,7 +85,7 @@ def seeded_session(browser_contract: BrowserContract) -> BrowserSession:
             "server_version": "browser-contract",
             "smart_routing_enabled": False,
             "smart_routing_sources": {"external": False, "oss": False},
-            "features": {},
+            "features": session.features,
             "harness_install_enabled": False,
             "installable_harnesses": [],
             "dictation_available": False,
@@ -335,9 +336,8 @@ def test_markdown_code_block_creation_keeps_caret(
     _mock_markdown_files(page, seeded_session, {path: "```python\noriginal\n```\n\nTail\n"})
     viewer = _open_viewer(page, seeded_session, path, {"diffActive": False})
     editor = viewer.locator(".tiptap")
-    editor.locator("p").last.click()
-    page.keyboard.press("Home")
-    page.keyboard.press("Shift+End")
+    editor.get_by_text("Tail", exact=True).dblclick()
+    page.wait_for_function("window.getSelection()?.toString() === 'Tail'")
     page.keyboard.type("```python")
     page.keyboard.press("Enter")
     blocks = editor.locator(".tiptap-code-block")
@@ -491,6 +491,73 @@ def test_chat_line_link_expands_and_centers_diff_context(
         )
         expect(diff).to_be_visible()
         expect(page).to_have_url(re.compile(r"[?&]diff=1(?:&|$)"))
+
+
+def test_content_search_opens_line_and_preserves_results(
+    page: Page, seeded_session: BrowserSession
+) -> None:
+    """The tab, picker and hotkey preserve search and line navigation."""
+    seeded_session.features["workspace_content_search"] = True
+    _seed_citation_file(page, seeded_session)
+    seeded_session.contract.json(
+        f"/v1/sessions/{seeded_session.session_id}/resources/environments/default/content-search",
+        {
+            "matches": [
+                {
+                    "path": _FILE_PATH,
+                    "line": 351,
+                    "column": 3,
+                    "text": _AFTER_LINES[350],
+                    "match_start": 2,
+                    "match_end": 9,
+                }
+            ],
+            "truncated": False,
+            "warning": None,
+        },
+    )
+    _open_monaco(page, seeded_session)
+    rail = page.get_by_role("complementary", name="Workspace")
+    rail.get_by_role("tab", name="Content search", exact=True).click()
+    search = rail.get_by_role("searchbox", name="Search file contents")
+    search.fill("changed")
+    search.press("Enter")
+    result = rail.get_by_role("button", name=f"Open {_FILE_PATH} at line 351")
+    result.click()
+    page.wait_for_function(_CENTERED_LINE, arg={"text": _AFTER_LINES[350], "diff": False})
+
+    # The global chord must escape Monaco's key handlers and reopen a collapsed rail.
+    page.locator(".monaco-editor textarea").first.focus()
+    page.keyboard.press("ControlOrMeta+Shift+f")
+    expect(search).to_be_focused()
+    expect(search).to_have_value("changed")
+    expect(result).to_be_visible()
+    for _ in range(2):
+        page.get_by_role("button", name="Collapse right panel", exact=True).click()
+        expect(rail).not_to_be_visible()
+        page.keyboard.press("ControlOrMeta+Shift+f")
+        expect(rail).to_be_visible()
+        expect(search).to_be_focused()
+        expect(result).to_be_visible()
+
+    rail.get_by_role("tab", name="Files", exact=True).click()
+    file_search = rail.get_by_role("searchbox", name="Search all files")
+    expect(file_search).to_have_attribute("placeholder", "Find files by name")
+    expect(rail.get_by_role("group", name="Search mode")).to_have_count(0)
+    expect(rail.get_by_role("button", name="Contents", exact=True)).to_have_count(0)
+    rail.get_by_role("button", name="Select panel", exact=True).click()
+    page.get_by_role("menuitem", name="Content search", exact=True).click()
+    expect(search).to_have_value("changed")
+    expect(result).to_be_visible()
+    result.click()
+    page.wait_for_function(_CENTERED_LINE, arg={"text": _AFTER_LINES[350], "diff": False})
+    expect(page).to_have_url(re.compile(r"[?&]line=351(?:&|$)"))
+    rail.get_by_role("tab", name="Content search", exact=True).click()
+    page.reload()
+    expect(rail.get_by_role("tab", name="Content search", exact=True)).to_have_attribute(
+        "aria-selected", "true"
+    )
+    expect(search).to_have_value("")
 
 
 def test_source_citation_centers_last_loaded_line(
@@ -825,10 +892,10 @@ def test_markdown_comment_draft_survives_responsive_layouts(
     expect(viewer).to_have_count(1)
     editor = viewer.locator(".tiptap")
     expect(editor).to_be_visible()
-    editor.click()
-    page.keyboard.press("Control+Home")
-    page.keyboard.press("Control+Shift+ArrowRight")
+    editor.get_by_text("A paragraph to review.", exact=True).dblclick(position={"x": 20, "y": 5})
+    page.wait_for_function("window.getSelection()?.toString() === 'paragraph'")
     page.get_by_role("button", name="Add comment", exact=True).click()
+    expect(viewer.get_by_text("Selection: paragraph", exact=True)).to_be_visible()
     draft = viewer.get_by_placeholder("Add a comment", exact=False)
     draft.fill("Keep this unsubmitted review")
     draft.evaluate("el => el.setSelectionRange(5, 9, 'backward')")
@@ -915,3 +982,41 @@ def test_markdown_diff_url_stays_stable_across_responsive_layouts(
         )
         transitions.append("1" if enabled else None)
         assert page.evaluate("window.diffUrlTransitions") == transitions
+
+
+def test_large_markdown_citation_and_unsaved_resize(
+    page: Page, seeded_session: BrowserSession
+) -> None:
+    """Large Markdown uses source for citations and preserves drafts on mobile."""
+    path = "src/large.md"
+    content = "# Large file\n" + "A paragraph for source viewing.\n" * 35_000
+    content += "Final large Markdown line."
+    _mock_markdown_files(page, seeded_session, {path: content})
+    _post_message(seeded_session, f"[End of document]({path}:{len(content.splitlines())})")
+    viewer = _open_viewer(
+        page, seeded_session, path, {"diffActive": False, "previewableViewMode": "preview"}
+    )
+    editor = viewer.locator(".monaco-editor")
+    expect(editor).to_be_visible(timeout=30_000)
+    expect(viewer.get_by_text("Large Markdown file opened as source", exact=False)).to_be_visible()
+    page.get_by_role("button", name="End of document", exact=True).click()
+    page.wait_for_function(
+        _CENTERED_LINE, arg={"text": "Final large Markdown line.", "diff": False}
+    )
+    viewer.locator(".view-lines").click()
+    page.keyboard.press("ControlOrMeta+Home")
+    page.keyboard.type("Unsaved large Markdown draft\n")
+    # The mock rejects writes, so resizing must preserve the unsaved editor.
+    expect(viewer.get_by_text("Save failed", exact=True)).to_be_visible(timeout=15_000)
+    editor.evaluate("el => window.largeMarkdownEditor = el")
+    for width in (390, 1600):
+        page.set_viewport_size({"width": width, "height": 1000})
+        expect(editor).to_be_visible()
+        expect(viewer.locator(".view-lines")).to_contain_text("Unsaved large Markdown draft")
+        assert editor.evaluate("el => el === window.largeMarkdownEditor")
+        if width == 390:
+            viewer.get_by_role("button", name="Close file viewer", exact=True).click()
+            dialog = page.get_by_role("dialog", name="Unsaved changes")
+            expect(dialog).to_be_visible()
+            dialog.get_by_role("button", name="Keep editing", exact=True).click()
+    expect(viewer.locator(".tiptap")).to_have_count(0)

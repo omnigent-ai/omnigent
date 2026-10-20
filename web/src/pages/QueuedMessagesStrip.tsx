@@ -4,6 +4,7 @@ import {
   type CollisionDetection,
   type DragEndEvent,
   KeyboardSensor,
+  type Modifier,
   MouseSensor,
   pointerWithin,
   TouchSensor,
@@ -34,6 +35,26 @@ const ACTION_BUTTON_CLASS =
   "shrink-0 text-muted-foreground transition-colors hover:text-foreground focus-visible:text-foreground max-md:size-11";
 
 const ACTION_ICON_CLASS = "size-3.5 max-md:size-4";
+
+/**
+ * Keep the dragged row vertical and inside the scrolling list, which would
+ * otherwise clip it. A fixed-position overlay is avoided on purpose: Mobile
+ * Safari draws it offset from the finger once the page has shifted for the
+ * keyboard.
+ */
+export const restrictToQueuedList: Modifier = ({
+  transform,
+  draggingNodeRect,
+  scrollableAncestorRects,
+}) => {
+  const list = scrollableAncestorRects[0];
+  if (!draggingNodeRect || !list) return { ...transform, x: 0 };
+  const y = Math.min(
+    Math.max(transform.y, list.top - draggingNodeRect.top),
+    list.bottom - draggingNodeRect.bottom,
+  );
+  return { ...transform, x: 0, y };
+};
 
 export const queuedMessageCollisionDetection: CollisionDetection = (args) =>
   args.pointerCoordinates ? pointerWithin(args) : closestCenter(args);
@@ -78,20 +99,27 @@ function QueuedRow({
   onSteer?: (queueId: string) => void;
   reorderable: boolean;
 }) {
+  // The whole row drags (via its grip) and is the drop target, so the row
+  // follows the finger and dropping anywhere on another row reorders.
   const {
     attributes,
     listeners,
     setNodeRef: setDragRef,
+    setActivatorNodeRef,
+    transform,
     isDragging,
   } = useDraggable({
     id: message.queueId,
     disabled: !reorderable,
   });
-  // The whole row is the drop target so dropping anywhere on it reorders.
   const { setNodeRef: setDropRef, isOver } = useDroppable({
     id: message.queueId,
     disabled: !reorderable,
   });
+  const setRowRef = (node: HTMLDivElement | null) => {
+    setDragRef(node);
+    setDropRef(node);
+  };
   const hasText = message.text.trim().length > 0;
   const files = message.files ?? [];
   const attachmentNames = files.map(attachmentFilename);
@@ -101,19 +129,22 @@ function QueuedRow({
 
   return (
     <div
-      ref={setDropRef}
+      ref={setRowRef}
       role="listitem"
+      style={transform ? { transform: `translate3d(0, ${transform.y}px, 0)` } : undefined}
       className={cn(
-        "relative flex min-w-0 items-center gap-1 py-0.5 text-sm text-foreground",
-        isDragging && "opacity-40",
+        // WebKit's long-press text selection and callout cancel the touch
+        // gesture dnd-kit's TouchSensor relies on, so suppress them on the row.
+        "relative flex min-w-0 items-center gap-1 py-0.5 text-sm text-foreground select-none [-webkit-touch-callout:none]",
+        isDragging && "z-10 rounded-md bg-background shadow-md ring-1 ring-border ring-inset",
         isOver &&
           !isDragging &&
-          "after:absolute after:inset-x-0 after:-bottom-0.5 after:h-px after:bg-muted-foreground/50",
+          "after:absolute after:inset-x-0 after:-bottom-0.5 after:h-0.5 after:rounded-full after:bg-muted-foreground/60",
       )}
     >
       {reorderable ? (
         <Button
-          ref={setDragRef}
+          ref={setActivatorNodeRef}
           type="button"
           variant="ghost"
           size="icon-xs"
@@ -297,6 +328,7 @@ export function QueuedMessagesStrip({
           <DndContext
             sensors={sensors}
             collisionDetection={queuedMessageCollisionDetection}
+            modifiers={[restrictToQueuedList]}
             onDragEnd={handleDragEnd}
           >
             {rows}
