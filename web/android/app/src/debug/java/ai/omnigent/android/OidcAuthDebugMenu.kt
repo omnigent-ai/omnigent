@@ -8,17 +8,19 @@ internal object OidcAuthDebugMenu {
     const val CLEAR_SESSION_COOKIE = 20_101
     const val CLEAR_REFRESH_TOKEN = 20_102
 
-    /** Debug builds keep the server pill reachable so these faults stay one tap away. */
-    const val IS_AVAILABLE = true
+    /** The faults, in menu order; the sidebar server picker lists them too. */
+    val ACTIONS =
+        listOf(
+            AuthDebugAction(CLEAR_SESSION_COOKIE, "Clear Session Cookie"),
+            AuthDebugAction(CLEAR_REFRESH_TOKEN, "Clear Refresh Token"),
+        )
 
     fun addItems(menu: Menu) {
         val debug = menu.addSubMenu(3, MENU_ROOT, 0, "Debug Authentication")
-        debug.add(3, CLEAR_SESSION_COOKIE, 0, "Clear Session Cookie")
-        debug.add(3, CLEAR_REFRESH_TOKEN, 1, "Clear Refresh Token")
+        ACTIONS.forEachIndexed { order, action -> debug.add(3, action.id, order, action.label) }
     }
 
-    fun handles(itemId: Int): Boolean =
-        itemId == CLEAR_SESSION_COOKIE || itemId == CLEAR_REFRESH_TOKEN
+    fun handles(itemId: Int): Boolean = ACTIONS.any { it.id == itemId }
 
     /** Injects the fault and reports what to expect next. */
     fun run(
