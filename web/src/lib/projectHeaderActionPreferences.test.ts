@@ -59,13 +59,21 @@ describe("projectHeaderActionPreferences", () => {
 
   it("ignores storage events for unrelated keys", () => {
     const { result } = renderHook(() => useShowProjectHeaderActionsOnTouch());
-    const before = result.current;
+    expect(result.current).toBe(false);
+    localStorage.setItem(SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH_STORAGE_KEY, "true");
     localStorage.setItem("some:other:key", "true");
 
     act(() => {
       window.dispatchEvent(new StorageEvent("storage", { key: "some:other:key" }));
     });
 
-    expect(result.current).toBe(before);
+    expect(result.current).toBe(false);
+
+    act(() => {
+      window.dispatchEvent(
+        new StorageEvent("storage", { key: SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH_STORAGE_KEY }),
+      );
+    });
+    expect(result.current).toBe(true);
   });
 });
