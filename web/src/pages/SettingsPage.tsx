@@ -264,6 +264,11 @@ import {
   writeSwipeActions,
 } from "@/lib/swipeActionPreferences";
 import {
+  SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH_STORAGE_KEY,
+  useShowProjectHeaderActionsOnTouch,
+  writeShowProjectHeaderActionsOnTouch,
+} from "@/lib/projectHeaderActionPreferences";
+import {
   applyThemePalette,
   DEFAULT_PALETTE,
   isThemeSelection,
@@ -1112,6 +1117,35 @@ function SwipeActionsControl() {
   );
 }
 
+function ProjectHeaderActionsOnTouchControl() {
+  const enabled = useShowProjectHeaderActionsOnTouch();
+  const labelId = useId();
+  const descriptionId = useId();
+  const toggle = useCallback((next: boolean) => writeShowProjectHeaderActionsOnTouch(next), []);
+
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <SettingsLabel
+        label="Show action buttons on touch"
+        labelId={labelId}
+        descriptionId={descriptionId}
+        className="flex-1"
+        description="Show the project menu and New session buttons on project folders. When off, long-press a folder to open its menu."
+        descriptionClassName="text-ui"
+      />
+      <Switch
+        aria-labelledby={labelId}
+        aria-describedby={descriptionId}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="show-project-header-actions-on-touch-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.appearance.show_project_header_actions_on_touch"
+      />
+    </div>
+  );
+}
+
 function AppearanceSection() {
   const { setTheme } = useTheme();
   const [resetKey, setResetKey] = useState(0);
@@ -1142,6 +1176,7 @@ function AppearanceSection() {
     writeFoldAssistantNarration(DEFAULT_FOLD_ASSISTANT_NARRATION);
 
     writeSwipeActions(DEFAULT_SWIPE_ACTIONS);
+    writeShowProjectHeaderActionsOnTouch(false);
 
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
 
@@ -1172,6 +1207,7 @@ function AppearanceSection() {
           FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
           HIDDEN_PICKER_AGENTS_STORAGE_KEY,
           "omnigent:swipe-actions",
+          SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH_STORAGE_KEY,
         ]) {
           window.localStorage.removeItem(key);
         }
@@ -1272,7 +1308,10 @@ function AppearanceSection() {
           </SettingsGroup>
 
           <SettingsGroup title="Touch & mobile" testId="settings-group-touch">
-            <SwipeActionsControl />
+            <ProjectHeaderActionsOnTouchControl />
+            <div className="border-t border-border pt-4">
+              <SwipeActionsControl />
+            </div>
           </SettingsGroup>
         </div>
 

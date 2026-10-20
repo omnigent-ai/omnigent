@@ -581,10 +581,23 @@ describe("SettingsPage", () => {
     const follows = (a: Node, b: Node) =>
       Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
     expect(follows(codeWeight, touch)).toBe(true);
-    expect(follows(touch, swipe)).toBe(true);
+    expect(follows(touch, screen.getByText("Show action buttons on touch"))).toBe(true);
+    expect(follows(screen.getByText("Show action buttons on touch"), swipe)).toBe(true);
     expect(follows(swipe, exportButton)).toBe(true);
     // The Touch & mobile section comes after the workspace settings, not inside them.
     expect(follows(screen.getByTestId("hide-unconfigured-harnesses-toggle"), touch)).toBe(true);
+  });
+
+  it("toggles and persists project header actions for touch devices", () => {
+    renderPage("/settings/appearance");
+
+    const toggle = screen.getByTestId("show-project-header-actions-on-touch-toggle");
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    expect(localStorage.getItem("omnigent:show-project-header-actions-on-touch")).toBeNull();
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(localStorage.getItem("omnigent:show-project-header-actions-on-touch")).toBe("true");
   });
 
   it("shows Swipe right then Swipe left cards with the archive-right/delete-left defaults", () => {
@@ -1371,6 +1384,8 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Pin Changes" }));
     fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
     fireEvent.click(screen.getByTestId("fold-assistant-narration-toggle"));
+    fireEvent.click(screen.getByTestId("show-project-header-actions-on-touch-toggle"));
+    expect(localStorage.getItem("omnigent:show-project-header-actions-on-touch")).toBe("true");
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.change(screen.getByTestId("ui-font-family-input") as HTMLInputElement, {
@@ -1458,6 +1473,11 @@ describe("SettingsPage", () => {
     );
     expect(localStorage.getItem("omnigent:fold-assistant-narration")).toBeNull();
     expect(localStorage.getItem("omnigent:hidden-picker-agents")).toBeNull();
+    expect(screen.getByTestId("show-project-header-actions-on-touch-toggle")).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+    expect(localStorage.getItem("omnigent:show-project-header-actions-on-touch")).toBeNull();
     expect(screen.getByTestId("swipe-action-right")).toHaveAccessibleName("Swipe right: Archive");
     expect(screen.getByTestId("swipe-action-left")).toHaveAccessibleName("Swipe left: Delete");
     expect(localStorage.getItem("omnigent:swipe-actions")).toBeNull();
