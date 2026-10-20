@@ -369,7 +369,7 @@ def test_project_actions_follow_the_input_type(
     viewport: dict[str, int],
     has_touch: bool,
 ) -> None:
-    """Touch folders act through the long-press menu; a narrow mouse keeps the controls."""
+    """Touch preference changes project header actions without changing mouse behavior."""
     base_url, session_id = seeded_session
     project = f"Project with a long name to check action overlap {uuid.uuid4().hex[:6]}"
     page.goto(f"{base_url}/c/{session_id}")
@@ -380,6 +380,16 @@ def test_project_actions_follow_the_input_type(
     context = browser.new_context(viewport=viewport, has_touch=has_touch)
     touch = context.new_page()
     try:
+        if has_touch:
+            assert touch.evaluate("matchMedia('(hover: none)').matches")
+            assert touch.evaluate("matchMedia('(pointer: coarse)').matches")
+        else:
+            assert touch.evaluate("matchMedia('(hover: hover) and (pointer: fine)').matches")
+
+        touch.goto(f"{base_url}/settings/appearance")
+        toggle = touch.get_by_test_id("show-project-header-actions-on-touch-toggle")
+        expect(toggle).to_have_attribute("aria-checked", "false")
+
         touch.goto(f"{base_url}/c/{session_id}?sidebar=open")
         header = _folder_header(touch, project)
         expect(header).to_be_visible()
@@ -391,44 +401,76 @@ def test_project_actions_follow_the_input_type(
         )
         if has_touch:
             _assert_touch_folder_uses_long_press(touch, header, shortcut, kebab, project)
-            touch.get_by_test_id("project-new-session-menu").tap()
+            touch.goto(f"{base_url}/c/{session_id}?sidebar=open")
+            _assert_touch_folder_actions_are_keyboard_reachable(touch, header, shortcut, kebab)
+            touch.goto(f"{base_url}/settings/appearance")
+            toggle = touch.get_by_test_id("show-project-header-actions-on-touch-toggle")
+            toggle.click()
+            expect(toggle).to_have_attribute("aria-checked", "true")
+            expect(touch).to_have_url(re.compile(r"/settings/appearance$"))
+            touch.goto(f"{base_url}/c/{session_id}?sidebar=open")
+            touch.reload()
+            header = _folder_header(touch, project)
+            shortcut = touch.get_by_role("link", name=f"New session in {project}", exact=True)
+            kebab = touch.get_by_role("button", name=f"Project actions for {project}")
+            _assert_touch_folder_actions_are_visible(touch, header, shortcut, kebab)
+
+            before = header.get_attribute("aria-expanded")
+            kebab.tap()
+            expect(touch.get_by_role("menu")).to_be_visible()
+            touch.wait_for_timeout(750)
+            expect(_folder_header(touch, project, include_hidden=True)).to_have_attribute(
+                "aria-expanded", before
+            )
+            touch.keyboard.press("Escape")
+            shortcut.tap()
             expect(touch).to_have_url(f"{base_url}/?project={project.replace(' ', '%20')}")
             if viewport["width"] < 768:
                 expect(
                     touch.get_by_role("button", name="Open sidebar", exact=True)
                 ).to_be_visible()
-            return
+        else:
+            expect(shortcut).to_be_visible()
+            # Turning on the touch-only preference must not change fine-hover
+            # controls, including at a narrow viewport.
+            touch.goto(f"{base_url}/settings/appearance")
+            toggle = touch.get_by_test_id("show-project-header-actions-on-touch-toggle")
+            toggle.click()
+            expect(toggle).to_have_attribute("aria-checked", "true")
+            touch.goto(f"{base_url}/c/{session_id}?sidebar=open")
+            header = _folder_header(touch, project)
+            shortcut = touch.get_by_role("link", name=f"New session in {project}", exact=True)
+            kebab = touch.get_by_role("button", name=f"Project actions for {project}")
+            expect(shortcut).to_be_visible()
+            for expanded in [True, False]:
+                if header.get_attribute("aria-expanded") != str(expanded).lower():
+                    header.click()
+                    touch.mouse.move(viewport["width"] - 1, 0)
+                expect(kebab).to_be_visible()
+                assert kebab.evaluate("""element => {
+                    for (let node = element; node; node = node.parentElement) {
+                        if (getComputedStyle(node).opacity === '0') return false;
+                    }
+                    const box = element.getBoundingClientRect();
+                    return box.width >= 24 && box.height >= 24 && element.contains(
+                        document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2)
+                    );
+                }""")
+                title_box = header.locator("span.truncate").bounding_box()
+                action_box = shortcut.bounding_box()
+                assert title_box is not None and action_box is not None
+                assert title_box["x"] + title_box["width"] <= action_box["x"]
 
-        expect(shortcut).to_be_visible()
-        for expanded in [True, False]:
-            if header.get_attribute("aria-expanded") != str(expanded).lower():
-                header.click()
-                touch.mouse.move(viewport["width"] - 1, 0)
-            expect(kebab).to_be_visible()
-            assert kebab.evaluate("""element => {
-                for (let node = element; node; node = node.parentElement) {
-                    if (getComputedStyle(node).opacity === '0') return false;
-                }
-                const box = element.getBoundingClientRect();
-                return box.width >= 24 && box.height >= 24 && element.contains(
-                    document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2)
-                );
-            }""")
-            title_box = header.locator("span.truncate").bounding_box()
-            action_box = shortcut.bounding_box()
-            assert title_box is not None and action_box is not None
-            assert title_box["x"] + title_box["width"] <= action_box["x"]
-
-        before = header.get_attribute("aria-expanded")
-        kebab.click()
-        expect(touch.get_by_test_id("project-new-session-menu")).to_be_hidden()
-        expect(_folder_header(touch, project, include_hidden=True)).to_have_attribute(
-            "aria-expanded", before
-        )
-        touch.keyboard.press("Escape")
-        shortcut.click()
-        expect(touch).to_have_url(f"{base_url}/?project={project.replace(' ', '%20')}")
-        expect(touch.get_by_role("button", name="Open sidebar", exact=True)).to_be_visible()
+            before = header.get_attribute("aria-expanded")
+            kebab.click()
+            expect(touch.get_by_test_id("project-new-session-menu")).to_be_hidden()
+            expect(_folder_header(touch, project, include_hidden=True)).to_have_attribute(
+                "aria-expanded", before
+            )
+            touch.keyboard.press("Escape")
+            shortcut.click()
+            expect(touch).to_have_url(f"{base_url}/?project={project.replace(' ', '%20')}")
+            expect(touch.get_by_role("button", name="Open sidebar", exact=True)).to_be_visible()
     finally:
         context.close()
 
@@ -447,8 +489,8 @@ def _assert_touch_folder_uses_long_press(
     for expanded in [True, False]:
         if header.get_attribute("aria-expanded") != str(expanded).lower():
             header.tap()
-        expect(shortcut).to_be_hidden()
-        expect(kebab).to_be_hidden()
+        expect(shortcut.locator("xpath=../..")).to_have_css("opacity", "0")
+        expect(kebab.locator("xpath=../..")).to_have_css("opacity", "0")
         # No control column is reserved, so the title keeps the row's own inset.
         assert header.evaluate("element => getComputedStyle(element).paddingRight") == "8px"
 
@@ -467,3 +509,52 @@ def _assert_touch_folder_uses_long_press(
     expect(_folder_header(page, project, include_hidden=True)).to_have_attribute(
         "aria-expanded", before
     )
+
+
+def _assert_touch_folder_actions_are_keyboard_reachable(
+    page: Page, header: Locator, shortcut: Locator, kebab: Locator
+) -> None:
+    """With touch actions off, keyboard focus reveals both sibling controls."""
+    expect(shortcut.locator("xpath=../..")).to_have_css("opacity", "0")
+    header.focus()
+    page.keyboard.press("Tab")
+    expect(shortcut).to_be_focused()
+    page.keyboard.press("Tab")
+    expect(kebab).to_be_focused()
+    page.keyboard.press("Enter")
+    menu = page.get_by_role("menu")
+    expect(menu.get_by_role("menuitem", name="Rename project")).to_be_visible()
+    expect(menu.get_by_role("menuitem", name="Project settings")).to_be_visible()
+    page.keyboard.press("Escape")
+    expect(menu).to_be_hidden()
+    expect(kebab).to_be_focused()
+    page.keyboard.press("Shift+Tab")
+    expect(shortcut).to_be_focused()
+    title_box = header.locator("span.truncate").bounding_box()
+    action_box = shortcut.bounding_box()
+    assert title_box is not None and action_box is not None
+    assert title_box["x"] + title_box["width"] <= action_box["x"]
+    page.keyboard.press("Enter")
+    expect(page).to_have_url(re.compile(r"/\?project="))
+
+
+def _assert_touch_folder_actions_are_visible(
+    page: Page, header: Locator, shortcut: Locator, kebab: Locator
+) -> None:
+    """When enabled, touch controls are visible, large enough, and clear the title."""
+    expect(shortcut).to_be_visible()
+    expect(kebab).to_be_visible()
+    for expanded in [True, False]:
+        if header.get_attribute("aria-expanded") != str(expanded).lower():
+            header.tap()
+        for control in [shortcut, kebab]:
+            assert control.evaluate("""element => {
+                const box = element.getBoundingClientRect();
+                return box.width >= 44 && box.height >= 44 && element.contains(
+                    document.elementFromPoint(box.x + box.width / 2, box.y + box.height / 2)
+                );
+            }""")
+        title_box = header.locator("span.truncate").bounding_box()
+        action_box = shortcut.bounding_box()
+        assert title_box is not None and action_box is not None
+        assert title_box["x"] + title_box["width"] <= action_box["x"]

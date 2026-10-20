@@ -41,6 +41,7 @@ import {
 } from "@/hooks/useUnseenConversations";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { isMacPlatform } from "@/lib/hotkeys";
+import { writeShowProjectHeaderActionsOnTouch } from "@/lib/projectHeaderActionPreferences";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
 import {
@@ -3008,7 +3009,7 @@ describe("Sidebar project sections", () => {
     );
   });
 
-  it("keeps project header actions to fine hover so touch uses the long-press menu", async () => {
+  it("keeps touch actions keyboard reachable when off and paints them when enabled", async () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
@@ -3020,11 +3021,20 @@ describe("Sidebar project sections", () => {
     const menuButton = screen.getByTestId("project-actions");
     const cluster = menuButton.parentElement!;
     expect(cluster).toContainElement(shortcut);
-    expect(cluster).toHaveClass("hidden", "fine-hover:flex");
-    // Without the painted cluster, the title keeps the row's own padding.
+    expect(cluster).toHaveClass("flex", "items-center");
+    const revealWrapper = menuButton.closest("div[class*=transition-opacity]")!;
+    expect(revealWrapper).toHaveClass(
+      "no-fine-hover:opacity-0",
+      "no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:opacity-100",
+    );
     const header = document.querySelector<HTMLElement>('[data-project-order-name="Customer X"]')!;
     expect(header).not.toHaveClass("pr-8");
     expect(header).toHaveClass("fine-hover:pr-14", "fine-hover:md:pr-2");
+    expect(header.className).toContain(
+      "no-fine-hover:group-has-[[data-header-controls]:focus-within]/header:pr-24",
+    );
+    const outerBox = menuButton.closest("[data-header-controls]")!;
+    expect(outerBox).toHaveClass("no-fine-hover:pointer-events-none");
     fireEvent.pointerDown(screen.getByRole("button", { name: "Project actions for Customer X" }), {
       button: 0,
       ctrlKey: false,
@@ -3033,6 +3043,14 @@ describe("Sidebar project sections", () => {
     expect(menuItem).not.toHaveClass("hidden");
     expect(menuItem).toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:hidden");
     expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
+
+    stubViewportWidth(390, true, true, false);
+    act(() => writeShowProjectHeaderActionsOnTouch(true));
+    expect(revealWrapper).toHaveClass("no-fine-hover:opacity-100");
+    expect(header.className).toContain("no-fine-hover:pr-24");
+    expect(shortcut).toHaveClass("no-fine-hover:size-11");
+    expect(menuButton).toHaveClass("no-fine-hover:size-11");
+    expect(outerBox).not.toHaveClass("no-fine-hover:pointer-events-none");
   });
 
   it("reveals project actions on hover only on wide fine-pointer layouts", () => {
@@ -3948,10 +3966,11 @@ describe("Sidebar open/close motion", () => {
     expect(aside).toHaveAttribute("data-sidebar-motion");
     expect(aside).toHaveClass("md:transition-[width,opacity]");
 
-    fireEvent.pointerDown(screen.getByRole("separator", { name: "Resize sidebar" }));
+    const handle = screen.getByRole("separator", { name: "Resize sidebar" });
+    fireEvent.pointerDown(handle, { button: 0, pointerId: 1 });
     expect(aside).not.toHaveAttribute("data-sidebar-motion");
     expect(aside).not.toHaveClass("md:transition-[width,opacity]");
-    fireEvent.pointerUp(document);
+    fireEvent.pointerUp(handle, { pointerId: 1 });
     expect(aside).toHaveAttribute("data-sidebar-motion");
   });
 });

@@ -1,5 +1,5 @@
-import { act, renderHook } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, renderHook } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
 import {
   FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
@@ -18,6 +18,10 @@ import {
   useProjectFolderCollapse,
   useProjectFolderPageSize,
 } from "./projectFolderPaginationPreferences";
+import {
+  SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH_STORAGE_KEY,
+  useShowProjectHeaderActionsOnTouch,
+} from "./projectHeaderActionPreferences";
 import { applyImportedSettings, collectSettings } from "./settingsPortability";
 import {
   type SessionWorkspaceState,
@@ -33,6 +37,7 @@ import {
 } from "./workspaceTabPreferences";
 
 beforeEach(() => localStorage.clear());
+afterEach(cleanup);
 
 it("round-trips workspace pins and default without restoring stale selections", () => {
   writePinnedWorkspaceTabs(["changes", "subagents"]);
@@ -189,4 +194,23 @@ it("carries project folder pagination through export and import and updates moun
     applyImportedSettings(exported);
   });
   expect(result.current).toEqual([false, 3]);
+});
+
+describe("project header action portability", () => {
+  it("exports and imports the preference and refreshes mounted consumers", () => {
+    localStorage.setItem(SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH_STORAGE_KEY, "true");
+    const exported = collectSettings()!;
+    expect(exported.settings[SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH_STORAGE_KEY]).toBe("true");
+
+    const { result } = renderHook(() => useShowProjectHeaderActionsOnTouch());
+    expect(result.current).toBe(true);
+
+    act(() => applyImportedSettings({ version: 1, settings: {} }));
+    expect(localStorage.getItem(SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH_STORAGE_KEY)).toBeNull();
+    expect(result.current).toBe(false);
+
+    act(() => applyImportedSettings(exported));
+    expect(localStorage.getItem(SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH_STORAGE_KEY)).toBe("true");
+    expect(result.current).toBe(true);
+  });
 });
