@@ -646,11 +646,14 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
     )
     # Managed settings own routing over a global ``auth:`` (as in
     # ``resolve_native_claude_config``); a subscription label would strip gateway ids.
-    spec_pins_route = agent_spec.executor.auth is not None or bool(
-        agent_spec.executor.profile or agent_spec.executor.config.get("profile")
+    from_global_auth = (
+        provider.detail == "databricks auth"
+        and agent_spec.executor.auth is None
+        and not (agent_spec.executor.profile or agent_spec.executor.config.get("profile"))
     )
     if canonical_harness in ("claude-native", "native-claude") and (
-        provider.kind == SUBSCRIPTION_KIND or (entry is None and not spec_pins_route)
+        provider.kind == SUBSCRIPTION_KIND
+        or (entry is None and (provider.kind == NONE_KIND or from_global_auth))
     ):
         from omnigent.onboarding.ambient import claude_managed_gateway_routes
 

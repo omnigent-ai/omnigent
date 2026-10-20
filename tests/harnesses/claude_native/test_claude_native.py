@@ -8854,6 +8854,38 @@ def test_resolve_native_claude_config_managed_gateway_beats_global_auth(
     assert seen == []
 
 
+def test_resolve_native_claude_config_managed_gateway_defers_to_ambient_key(
+    _isolated_provider_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without a global ``auth:``, preview and session share the ambient route.
+
+    Managed settings only displace the global ``auth:`` step; an ambient key
+    still resolves the same way for the spec-less preview and the session.
+    """
+    managed_settings = _isolated_provider_config / "managed-settings.json"
+    managed_settings.write_text(
+        json.dumps(
+            {
+                "apiKeyHelper": "print-token",
+                "env": {"ANTHROPIC_BASE_URL": "https://gw.example/ai-gateway/anthropic"},
+            }
+        )
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,)
+    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
+
+    preview = claude_native.resolve_native_claude_config(spec=None, refresh_models=False)
+    session = claude_native.resolve_native_claude_config(
+        spec=_no_auth_claude_spec(), refresh_models=False
+    )
+
+    assert claude_native.claude_catalog_fingerprint(preview) == (
+        claude_native.claude_catalog_fingerprint(session)
+    )
+
+
 def test_resolve_native_claude_config_databricks_provider_uses_ucode(
     _isolated_provider_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

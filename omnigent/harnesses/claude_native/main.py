@@ -3412,9 +3412,9 @@ def resolve_native_claude_config(
        model → ambient detection), falling back to the spec's own
        ``executor.profile`` (ucode) when it routed to legacy databricks;
     2. when spec-less (``omnigent claude``): an explicit per-family default
-       → Claude Code managed gateway settings (→ ``None``) → global ``auth:``
-       (→ ucode) → ambient detection. A spec that pins no auth/profile also
-       takes the managed-settings and global ``auth:`` steps after step 1;
+       → global ``auth:`` (→ ucode, or ``None`` when Claude Code managed
+       gateway settings own routing) → ambient detection. A spec that pins no
+       auth/profile also takes the global ``auth:`` step after step 1;
     3. otherwise ``None`` (Claude's own login).
 
     Credentials are controlled exclusively by the spec or by
@@ -3480,12 +3480,11 @@ def resolve_native_claude_config(
             spec.executor.profile or spec.executor.config.get("profile")
         ):
             # A spec that pins no route must match the spec-less New Chat
-            # preview (step 2); step 1 already applied the explicit and
-            # ambient defaults, so only these two checks differ.
-            if claude_managed_gateway_routes(_managed_settings_paths()):
-                return None
+            # preview (step 2), which also routes a global databricks ``auth:``.
             global_auth = _load_global_auth()
             if isinstance(global_auth, DatabricksAuth):
+                if claude_managed_gateway_routes(_managed_settings_paths()):
+                    return None
                 ucode_config = _ucode_config_for_profile(
                     global_auth.profile, refresh_models=refresh_models
                 )
@@ -3499,13 +3498,13 @@ def resolve_native_claude_config(
         entry = default_provider_for_harness(explicit, "claude-sdk")
         if entry is not None:
             return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
-        if claude_managed_gateway_routes(_managed_settings_paths()):
-            # Claude Code's managed settings override any env we pass, so a
-            # ucode route below would only mislabel where inference goes.
-            return None
         # A global databricks auth block → ucode.
         global_auth = _load_global_auth()
         if isinstance(global_auth, DatabricksAuth):
+            if claude_managed_gateway_routes(_managed_settings_paths()):
+                # Claude Code's managed settings override any env we pass, so a
+                # ucode route would only mislabel where inference goes.
+                return None
             return _ucode_config_for_profile(global_auth.profile, refresh_models=refresh_models)
         if global_auth is not None:
             # A global api_key auth: let Claude's own login handle it (parity
