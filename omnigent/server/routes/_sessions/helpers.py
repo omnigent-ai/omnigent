@@ -1898,6 +1898,7 @@ def _resolve_harness_impl(
     *,
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
+    agent: Agent | None = None,
 ) -> str | None:
     """
     Resolve the canonical harness for a conversation's bound agent.
@@ -1914,6 +1915,8 @@ def _resolve_harness_impl(
     :param conv: The conversation entity, or ``None``.
     :param agent_store: Optional store for resolving the bound agent.
     :param agent_cache: Optional cache for loading the bound agent spec.
+    :param agent: The bound agent row when the caller already holds it, so
+        the store is not read again. Ignored unless it is ``conv``'s agent.
     :returns: The canonical harness (e.g. ``"openai-agents"`` or
         ``"claude-sdk"``), or ``None`` when unavailable.
     """
@@ -1930,17 +1933,18 @@ def _resolve_harness_impl(
         from omnigent.harness_aliases import canonicalize_harness
         from omnigent.runtime import get_agent_cache
 
-        if agent_store is None:
-            from omnigent.runtime._globals import _agent_store
+        if agent is None or agent.id != conv.agent_id:
+            if agent_store is None:
+                from omnigent.runtime._globals import _agent_store
 
-            agent_store = _agent_store
-        if agent_store is None:
+                agent_store = _agent_store
+            if agent_store is None:
+                return None
+            agent = agent_store.get(conv.agent_id)
+        if agent is None:
             return None
         if agent_cache is None:
             agent_cache = get_agent_cache()
-        agent = agent_store.get(conv.agent_id)
-        if agent is None:
-            return None
         loaded = agent_cache.load(
             agent.id, agent.bundle_location, expand_env=agent.operator_authored
         )
@@ -8866,14 +8870,15 @@ def _load_agent_spec_for_session(*args: Any, **kwargs: Any) -> AgentSpec | None:
 def _load_agent_spec_for_session_impl(
     conv: Conversation,
     agent_store: AgentStore,
+    agent: Agent | None = None,
 ) -> AgentSpec | None:
-    # Split from _build_policy_engine_from_spec so the caller can run the
-    # cheap guardrails/default-policy skip check between the two and avoid
-    # paying for engine construction when no policy could fire. Both halves
-    # are blocking DB/IO, so each is run under asyncio.to_thread.
+    # Split from _build_policy_engine_from_spec so callers can skip engine
+    # construction when no policy could fire; both halves run in to_thread.
+    # A caller already holding conv's agent row passes it to skip the store read.
     if conv.agent_id is None:
         return None
-    agent = agent_store.get(conv.agent_id)
+    if agent is None or agent.id != conv.agent_id:
+        agent = agent_store.get(conv.agent_id)
     if agent is None:
         return None
     agent_cache = cast(AgentCache, get_agent_cache())

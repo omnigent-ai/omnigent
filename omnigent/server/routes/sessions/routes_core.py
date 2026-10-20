@@ -30,7 +30,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
 )
-from omnigent.db.utils import generate_agent_id, generate_file_id
+from omnigent.db.utils import generate_agent_id, generate_file_id, shared_read_scope
 from omnigent.debug_logging import add_audit_attrs, debug_event, set_current_runner_id
 from omnigent.entities import (
     Agent,
@@ -39,6 +39,7 @@ from omnigent.entities import (
     StoredFile,
     synthesize_conversation_title,
 )
+from omnigent.entities.pagination import PagedList
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.models.model_override import validate_model_override
@@ -183,6 +184,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _labels_for_viewer,
     _persist_model_change_note,
     _publish_runner_recovered_status,
+    _read_session_snapshot_inputs,
     _run_managed_launch,
     _spawn_archive_stop,
     _validate_session_model_selection,
@@ -386,6 +388,19 @@ async def _restore_refused_settings(
 def _codex_update_unconfirmed(result: _RunnerForwardResult) -> bool:
     """Return whether Codex timed out before confirming a settings update it may still apply."""
     return _runner_reply_field(result.body, "error") == "codex_native_settings_update_timeout"
+
+
+@dataclasses.dataclass(frozen=True)
+class _SessionPageReads:
+    """Store reads behind one ``GET /sessions`` page, taken in a single read burst."""
+
+    page: PagedList[Conversation]
+    conv_ids: list[str] = dataclasses.field(default_factory=list)
+    perms_by_conv: dict[str, list[SessionPermission]] = dataclasses.field(default_factory=dict)
+    agent_names_by_id: dict[str, str] = dataclasses.field(default_factory=dict)
+    child_ids_by_parent: dict[str, list[str]] = dataclasses.field(default_factory=dict)
+    user_is_admin: bool = False
+    comments_fingerprints: dict[str, CommentsFingerprint] = dataclasses.field(default_factory=dict)
 
 
 def register_core_routes(
@@ -1548,13 +1563,16 @@ def register_core_routes(
         """
         response.headers["Cache-Control"] = "no-store"
         user_id = _get_user_id(request, auth_provider)
-        # Single permission pass: authorize + resolve the display level +
-        # fetch the conversation once, then reuse the conversation in the
-        # snapshot (the snapshot's read is skipped). Replaces the former
-        # require_access + get_permission_level + snapshot-get_conversation
-        # sequence, which made ~5-6 separate store round-trips.
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        # One read burst over a single pool checkout: authorization, the
+        # conversation row and the bound agent row, each reused by the
+        # snapshot instead of re-read.
+        access, conv, agent = await asyncio.to_thread(
+            _read_session_snapshot_inputs,
+            user_id,
+            session_id,
+            permission_store,
+            conversation_store,
+            agent_store,
         )
         return await _get_session_snapshot(
             conversation_store,
@@ -1562,7 +1580,8 @@ def register_core_routes(
             access.level,
             agent_store,
             agent_cache,
-            conversation=access.conversation,
+            conversation=conv,
+            agent=agent,
             liveness_lookup=liveness_lookup if include_liveness else None,
             include_items=include_items,
             include_live_status=include_live_status,
@@ -1754,38 +1773,69 @@ def register_core_routes(
             shared_only_param = False
             include_archived_param = include_archived
             archived_only_param = False
-        page = await asyncio.to_thread(
-            conversation_store.list_conversations,
-            limit=limit,
-            after=after,
-            before=before,
-            agent_id=agent_id,
-            agent_name=agent_name,
-            accessible_by=accessible_by_param,
-            owned_by=owned_by_param,
-            shared_only=shared_only_param,
-            has_agent_id=True,
-            # The store treats ``None`` as "no kind filter"; the API
-            # spells that ``kind=any`` to keep the param required-ish
-            # and pattern-validated.
-            kind=None if kind == "any" else kind,
-            order=order,
-            sort_by=sort_by,
-            search_query=normalized_query,
-            include_archived=include_archived_param,
-            archived_only=archived_only_param,
-            project=project,
-            pinned=pinned,
-            # Pins are per-user: filter to the caller's own pin key.
-            pinned_owner=user_id,
-        )
-        # Side chats surface only as Workspace-rail tabs, so drop any
-        # side-chat-labeled fork from the sidebar list (it is still a normal
-        # session, just not listed as a top-level one here).
-        page.data = [conv for conv in page.data if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})]
-        # list_conversations may return rows with agent_id=None for
-        # legacy conversations; skip them before building the batch IDs.
-        conv_ids = [conv.id for conv in page.data if conv.agent_id is not None]
+
+        def _read_page() -> _SessionPageReads:
+            # One read-only burst over a single pool checkout per engine: the
+            # page query plus every per-row enrichment read it feeds. Nothing
+            # here waits on a runner or host.
+            with shared_read_scope():
+                page = conversation_store.list_conversations(
+                    limit=limit,
+                    after=after,
+                    before=before,
+                    agent_id=agent_id,
+                    agent_name=agent_name,
+                    accessible_by=accessible_by_param,
+                    owned_by=owned_by_param,
+                    shared_only=shared_only_param,
+                    has_agent_id=True,
+                    # The store treats ``None`` as "no kind filter"; the API
+                    # spells that ``kind=any`` to keep the param required-ish
+                    # and pattern-validated.
+                    kind=None if kind == "any" else kind,
+                    order=order,
+                    sort_by=sort_by,
+                    search_query=normalized_query,
+                    include_archived=include_archived_param,
+                    archived_only=archived_only_param,
+                    project=project,
+                    pinned=pinned,
+                    # Pins are per-user: filter to the caller's own pin key.
+                    pinned_owner=user_id,
+                )
+                # Side chats surface only as Workspace-rail tabs, so drop any
+                # side-chat-labeled fork from the sidebar list (it is still a
+                # normal session, just not listed as a top-level one here).
+                page.data = [
+                    conv for conv in page.data if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})
+                ]
+                # list_conversations may return rows with agent_id=None for
+                # legacy conversations; skip them before building the batch IDs.
+                conv_ids = [conv.id for conv in page.data if conv.agent_id is not None]
+                if not conv_ids:
+                    return _SessionPageReads(page=page)
+                unique_agent_ids = list({c.agent_id for c in page.data if c.agent_id is not None})
+                perms_by_conv: dict[str, list[SessionPermission]] = {}
+                user_is_admin = False
+                if permission_store is not None:
+                    perms_by_conv = permission_store.list_for_sessions(conv_ids)
+                    if user_id is not None:
+                        user_is_admin = permission_store.is_admin(user_id)
+                return _SessionPageReads(
+                    page=page,
+                    conv_ids=conv_ids,
+                    perms_by_conv=perms_by_conv,
+                    agent_names_by_id=agent_store.get_names(unique_agent_ids),
+                    child_ids_by_parent=conversation_store.list_child_conversation_ids_by_parent(
+                        conv_ids
+                    ),
+                    user_is_admin=user_is_admin,
+                    comments_fingerprints=_comments_fingerprints_sync(conv_ids),
+                )
+
+        reads = await asyncio.to_thread(_read_page)
+        page = reads.page
+        conv_ids = reads.conv_ids
         if not conv_ids:
             return PaginatedList(
                 data=[],
@@ -1793,39 +1843,14 @@ def register_core_routes(
                 last_id=page.last_id,
                 has_more=page.has_more,
             )
-        # Batch-fetch permissions and agent names concurrently.
-        # The tasks table has been removed — status comes exclusively from
-        # the relay-fed ``_session_status_cache``.
-        unique_agent_ids = list({c.agent_id for c in page.data if c.agent_id is not None})
-        perms_by_conv: dict[str, list[SessionPermission]]
-        if permission_store is not None:
-            perms_by_conv, agent_names_by_id, child_ids_by_parent = await asyncio.gather(
-                asyncio.to_thread(permission_store.list_for_sessions, conv_ids),
-                asyncio.to_thread(agent_store.get_names, unique_agent_ids),
-                asyncio.to_thread(
-                    conversation_store.list_child_conversation_ids_by_parent,
-                    conv_ids,
-                ),
-            )
-            user_is_admin = (
-                await asyncio.to_thread(permission_store.is_admin, user_id)
-                if user_id is not None
-                else False
-            )
-        else:
-            agent_names_by_id, child_ids_by_parent = await asyncio.gather(
-                asyncio.to_thread(agent_store.get_names, unique_agent_ids),
-                asyncio.to_thread(
-                    conversation_store.list_child_conversation_ids_by_parent,
-                    conv_ids,
-                ),
-            )
-            perms_by_conv = {}
-            user_is_admin = False
+        perms_by_conv = reads.perms_by_conv
+        agent_names_by_id = reads.agent_names_by_id
+        child_ids_by_parent = reads.child_ids_by_parent
+        user_is_admin = reads.user_is_admin
+        comments_fingerprints = reads.comments_fingerprints
         # In-memory lookup — no I/O, so batching avoids re-acquiring
         # the index's lock per row but otherwise has no DB cost.
         pending_counts = pending_elicitations.counts_for(conv_ids)
-        comments_fingerprints = await _comments_fingerprints_for(conv_ids)
         # ── Lazy-on-read backstop for orphaned "running" sessions. ────────
         # A session whose persisted live_status is still running/waiting but
         # whose runner is confirmed gone — a replica that restarted and
@@ -1915,14 +1940,14 @@ def register_core_routes(
             has_more=page.has_more,
         )
 
-    async def _comments_fingerprints_for(
+    def _comments_fingerprints_sync(
         conv_ids: list[str],
     ) -> dict[str, CommentsFingerprint]:
         """
         Batch-fetch comment change fingerprints for the given sessions.
 
-        Shared by the ``GET /v1/sessions`` page builder and
-        ``WS /v1/sessions/updates`` so both emit the same
+        Shared by the ``GET /v1/sessions`` page builder (inside its read
+        burst) and ``WS /v1/sessions/updates`` so both emit the same
         ``comments_count`` / ``comments_updated_at`` values and the
         stream's diff fires when a comment is added, edited, addressed,
         or deleted.
@@ -1935,7 +1960,13 @@ def register_core_routes(
         """
         if comment_store is None or not conv_ids:
             return {}
-        return await asyncio.to_thread(comment_store.get_comments_fingerprints, conv_ids)
+        return comment_store.get_comments_fingerprints(conv_ids)
+
+    async def _comments_fingerprints_for(
+        conv_ids: list[str],
+    ) -> dict[str, CommentsFingerprint]:
+        """Threaded :func:`_comments_fingerprints_sync` for the updates stream."""
+        return await asyncio.to_thread(_comments_fingerprints_sync, conv_ids)
 
     # ── WS /sessions/updates ────────────────────────────────────
 
