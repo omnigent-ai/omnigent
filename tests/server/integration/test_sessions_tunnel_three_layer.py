@@ -2553,6 +2553,21 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             return get_liveness(conversation_id)
 
         monkeypatch.setattr(store, "get_runner_liveness", flaky_liveness)
+
+    held_at: list[float] = []
+    log_hold = sessions_module._log_host_offline_hold
+
+    def _record_hold_start(event: str, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if event == "runner_disconnect_held_host_offline":
+            held_at.append(time.monotonic())
+        return log_hold(event, *args, **kwargs)
+
+    monkeypatch.setattr(sessions_module, "_log_host_offline_hold", _record_hold_start)
+
+    def _hold_deadline_passed() -> bool:
+        # Reads past the hold's deadline belong to its final re-check.
+        return bool(held_at) and time.monotonic() >= held_at[0] + hold
+
     reconnect_started: list[bool] = []
     reconnected_at_expiry: list[ApplicationCommunicator] = []
     if scenario == "reconnect_at_expiry":
@@ -2565,8 +2580,8 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             return comm
 
         def reconnect_during_final_read(conversation_id: str):  # type: ignore[no-untyped-def]
-            # The read after the hold expired: the runner comes back in the middle of it.
-            hold_over = any(r["event_name"] == "runner_disconnect_hold_ended" for r in rows)
+            # A read at the hold's deadline: the runner comes back in the middle of it.
+            hold_over = _hold_deadline_passed()
             if hold_over and not reconnect_started:
                 reconnect_started.append(True)
                 future = asyncio.run_coroutine_threadsafe(_reconnect_runner(), loop)
@@ -2579,8 +2594,8 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
         get_liveness = store.get_runner_liveness
 
         def remote_live_during_final_read(conversation_id: str):  # type: ignore[no-untyped-def]
-            # The first final read fails while another replica takes the runner over.
-            hold_over = any(r["event_name"] == "runner_disconnect_hold_ended" for r in rows)
+            # A read at the deadline fails while another replica takes the runner over.
+            hold_over = _hold_deadline_passed()
             if hold_over and not remote_stamped:
                 remote_stamped.append(True)
                 store.touch_runner_liveness([runner_id], int(time.time()) + 5)
@@ -2594,7 +2609,7 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
 
         def store_down_after_hold(conversation_id: str):  # type: ignore[no-untyped-def]
             # The store stays down for more reads than any fixed retry budget.
-            hold_over = any(r["event_name"] == "runner_disconnect_hold_ended" for r in rows)
+            hold_over = _hold_deadline_passed()
             if hold_over and len(final_read_failures) < 8:
                 final_read_failures.append(True)
                 raise RuntimeError("store unavailable")
@@ -2815,9 +2830,9 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
             "host_back_without_runner": "host_back_without_runner",
             "recheck_error": "expired",
             "nested": "expired",
-            "reconnect_at_expiry": "expired",
+            "reconnect_at_expiry": "runner_reconnected",
             "list_during_hold": "runner_reconnected",
-            "remote_live_at_expiry": "expired",
+            "remote_live_at_expiry": "live_elsewhere",
             "label_write_retry": "runner_reconnected",
             "label_clear_retry": "runner_reconnected",
             "shutdown_keeps_label": "server_shutdown",

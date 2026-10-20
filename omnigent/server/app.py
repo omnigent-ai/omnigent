@@ -3676,15 +3676,12 @@ def create_app(
                 await _mark_runner_sessions_offline(settle_now, error, conversation_store)
                 # This hold's own deadline: clears remove only this value.
                 hold_value = str(int(time.time() + HOST_OFFLINE_HOLD_S))
-                outcome = await _hold_while_host_offline(
+                outcome, to_fail = await _hold_while_host_offline(
                     runner_id, host_id, held, reference_stamp, hold_value
                 )
                 if outcome not in ("expired", "host_back_without_runner"):
                     return
                 try:
-                    to_fail = await _expired_hold_sessions_to_fail(
-                        runner_id, held, reference_stamp
-                    )
                     if outcome == "expired":
                         error = ErrorDetail(
                             code="runner_disconnected",
@@ -3698,69 +3695,6 @@ def create_app(
                     await asyncio.shield(_clear_hold_labels(held, hold_value))
                 return
         await _mark_runner_sessions_offline(affected, error, conversation_store)
-
-    async def _expired_hold_sessions_to_fail(
-        runner_id: str, held: "list[Conversation]", reference_stamp: int | None
-    ) -> "list[Conversation]":
-        """Return the held sessions an expired hold fails, after a verified read.
-
-        A failed read is retried until one succeeds, so this task keeps owning
-        the turns instead of settling rows it never saw or abandoning them, and
-        nothing fails when the runner is back here or live on another replica.
-
-        :param runner_id: The dropped runner.
-        :param held: The sessions the hold kept running.
-        :param reference_stamp: This replica's last liveness stamp for the runner.
-        :returns: Sessions still bound to *runner_id* with no sign of it being live.
-        """
-        from omnigent.server.routes._sessions.orchestration import (
-            _runner_stamp_is_live_elsewhere,
-        )
-        from omnigent.server.routes.sessions import (
-            _HOST_OFFLINE_RECHECK_S,
-            _relinquish_session_live_state,
-        )
-
-        bound: list[tuple[Conversation, int | None]] | None = None
-        attempt = 0
-        while bound is None:
-            attempt += 1
-            try:
-                bound, _ = await _held_still_bound(runner_id, held)
-            except Exception:  # noqa: BLE001 — retried; nothing fails unread
-                _logger.warning(
-                    "Runner %s: final binding read after host-offline hold failed "
-                    "(attempt %d); retrying",
-                    runner_id,
-                    attempt,
-                    exc_info=True,
-                )
-                # A returning runner or a stopping server ends the wait unread.
-                if tunnel_registry.get(runner_id) is not None:
-                    return []
-                if shutdown_state.server_shutting_down():
-                    return []
-                await asyncio.sleep(_HOST_OFFLINE_RECHECK_S)
-        # The runner may reconnect during those reads, here or on another replica.
-        if tunnel_registry.get(runner_id) is not None:
-            _logger.info(
-                "Runner %s reconnected as its host-offline hold ended; skipping offline-marking",
-                runner_id,
-            )
-            return []
-        if any(
-            _runner_stamp_is_live_elsewhere(stamp=stamp, reference_stamp=reference_stamp)
-            for _, stamp in bound
-        ):
-            for conv, _ in bound:
-                _relinquish_session_live_state(conv.id)
-            _logger.info(
-                "Runner %s is live on another replica as its host-offline hold ended; "
-                "skipping offline-marking",
-                runner_id,
-            )
-            return []
-        return [conv for conv, _ in bound]
 
     async def _held_still_bound(
         runner_id: str, held: "list[Conversation]"
@@ -3801,7 +3735,7 @@ def create_app(
         held: "list[Conversation]",
         reference_stamp: int | None,
         hold_value: str,
-    ) -> str:
+    ) -> "tuple[str, list[Conversation]]":
         """Wait for a runner whose host went offline mid-turn, and report how it ended.
 
         Holding the interrupted turns instead of failing them lets a laptop that
@@ -3809,7 +3743,8 @@ def create_app(
         lives in the runner's disconnect-grace slot, so a reconnect resolves it
         and a crash report cancels it. A host that returns without its runner
         gets one more grace for the runner, then the turns fail as before.
-        Unreadable rows keep the deadline and retry on the next check.
+        Unreadable rows keep the deadline and retry on the next check; at the
+        deadline the check repeats until a read succeeds, so nothing fails unread.
         Every hold logs its end, including ``"cancelled"`` by a crash report.
 
         :param runner_id: The dropped runner.
@@ -3817,9 +3752,10 @@ def create_app(
         :param held: The interrupted sessions being held.
         :param reference_stamp: This replica's last liveness stamp for the runner.
         :param hold_value: Epoch-seconds deadline written as the hold's label.
-        :returns: ``"runner_reconnected"``, ``"live_elsewhere"``, ``"rebound"``,
-            ``"stopped"`` or ``"server_shutdown"`` when nothing should fail, else
-            ``"expired"`` or ``"host_back_without_runner"``.
+        :returns: The outcome and the sessions to fail. Nothing fails after
+            ``"runner_reconnected"``, ``"live_elsewhere"``, ``"rebound"``,
+            ``"stopped"`` or ``"server_shutdown"``; ``"expired"`` and
+            ``"host_back_without_runner"`` fail those still bound to the runner.
         """
         from omnigent.server.routes._sessions.orchestration import (
             _runner_stamp_is_live_elsewhere,
@@ -3851,6 +3787,7 @@ def create_app(
         # A task, so a crash report's cancel leaves the write for the cleanup
         # below to wait on; retried on every re-check until each held session
         # carries its deadline.
+        to_fail: list[Conversation] = []
         label_write = asyncio.ensure_future(_mark_hold(held, hold_labels))
         try:
             unlabeled = await asyncio.shield(label_write)
@@ -3859,19 +3796,19 @@ def create_app(
                 wait_until = deadline
                 if host_back_at is not None:
                     wait_until = min(wait_until, host_back_at + RUNNER_DISCONNECT_GRACE_S)
-                if now >= wait_until:
-                    outcome = "expired" if host_back_at is None else "host_back_without_runner"
-                    break
-                reconnected = await tunnel_registry.wait_for_runner(
-                    runner_id, timeout_s=min(_HOST_OFFLINE_RECHECK_S, wait_until - now)
-                )
-                if reconnected is not None:
+                ended = now >= wait_until
+                if not ended and (
+                    await tunnel_registry.wait_for_runner(
+                        runner_id, timeout_s=min(_HOST_OFFLINE_RECHECK_S, wait_until - now)
+                    )
+                    is not None
+                ):
                     outcome = "runner_reconnected"
                     break
                 if shutdown_state.server_shutting_down():
                     outcome = "server_shutdown"
                     break
-                if unlabeled:
+                if unlabeled and not ended:
                     label_write = asyncio.ensure_future(_mark_hold(unlabeled, hold_labels))
                     unlabeled = await asyncio.shield(label_write)
                 try:
@@ -3882,6 +3819,11 @@ def create_app(
                         runner_id,
                         exc_info=True,
                     )
+                    if ended:
+                        if tunnel_registry.get(runner_id) is not None:
+                            outcome = "runner_reconnected"
+                            break
+                        await asyncio.sleep(_HOST_OFFLINE_RECHECK_S)
                     continue
                 # A runner that reconnected here during those reads would look live elsewhere.
                 if tunnel_registry.get(runner_id) is not None:
@@ -3899,6 +3841,10 @@ def create_app(
                     # Every held session was stopped or moved to another runner;
                     # none is ours to fail.
                     outcome = "stopped" if len(stopped) == len(held) else "rebound"
+                    break
+                if ended:
+                    outcome = "expired" if host_back_at is None else "host_back_without_runner"
+                    to_fail = [conv for conv, _ in bound]
                     break
                 if host_back_at is None and await _host_offline_state(host_id) is False:
                     host_back_at = loop.time()
@@ -3918,7 +3864,7 @@ def create_app(
             await asyncio.shield(
                 _settle_hold_labels(label_write, held, hold_value, clear=concluded)
             )
-        return outcome
+        return outcome, to_fail
 
     async def _settle_hold_labels(
         write: "asyncio.Future[list[Conversation]]",
