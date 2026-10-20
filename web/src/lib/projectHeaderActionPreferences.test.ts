@@ -42,22 +42,7 @@ describe("projectHeaderActionPreferences", () => {
     expect(result.current).toBe(true);
   });
 
-  it("refreshes from another tab's storage event", () => {
-    const { result } = renderHook(() => useShowProjectHeaderActionsOnTouch());
-    localStorage.setItem(SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH_STORAGE_KEY, "true");
-
-    act(() => {
-      window.dispatchEvent(
-        new StorageEvent("storage", {
-          key: SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH_STORAGE_KEY,
-        }),
-      );
-    });
-
-    expect(result.current).toBe(true);
-  });
-
-  it("ignores storage events for unrelated keys", () => {
+  it("refreshes from its own storage event and ignores unrelated keys", () => {
     const { result } = renderHook(() => useShowProjectHeaderActionsOnTouch());
     expect(result.current).toBe(false);
     localStorage.setItem(SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH_STORAGE_KEY, "true");
