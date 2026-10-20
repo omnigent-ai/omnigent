@@ -42,6 +42,8 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import AsyncIterator, Collection
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -145,7 +147,7 @@ async def _send_cursor_keys(bridge_dir: Path, session_id: str, *keys: str) -> bo
             await asyncio.sleep(_KEY_ENTER_SETTLE_S)
         try:
             await asyncio.to_thread(send_cursor_pane_keys, bridge_dir, key)
-        except RuntimeError:
+        except (RuntimeError, OSError):
             _logger.exception(
                 "failed to send cursor keystroke %r (of %r); session=%s", key, keys, session_id
             )
@@ -153,6 +155,31 @@ async def _send_cursor_keys(bridge_dir: Path, session_id: str, *keys: str) -> bo
         await asyncio.sleep(_KEY_INTERVAL_S)
     _logger.debug("cursor keystrokes sent: %r; session=%s", keys, session_id)
     return True
+
+
+async def _deliver_verdict_keys(bridge_dir: Path, session_id: str, *keys: str) -> bool:
+    """Send a verdict's keys to completion even if the task is cancelled midway.
+
+    A half-sent sequence can strand the TUI (a decline needs its Enter to close
+    the reason prompt), so cancellation waits for the keys already owed.
+    """
+    delivery = asyncio.ensure_future(_send_cursor_keys(bridge_dir, session_id, *keys))
+    try:
+        return await asyncio.shield(delivery)
+    except asyncio.CancelledError:
+        # Repeated cancels must not abandon the owed keys; the task's own
+        # cancellation propagates once delivery has settled.
+        while not delivery.done():
+            with suppress(asyncio.CancelledError, Exception):
+                await asyncio.shield(delivery)
+        if not delivery.cancelled() and (error := delivery.exception()) is not None:
+            _logger.error(
+                "cursor keystrokes %r failed while cancelling; session=%s",
+                keys,
+                session_id,
+                exc_info=error,
+            )
+        raise
 
 
 async def _run_one_approval(
@@ -178,7 +205,7 @@ async def _run_one_approval(
         return
     action = result.get("action")
     if action == "accept":
-        await _send_cursor_keys(bridge_dir, session_id, prompt.accept_key)
+        await _deliver_verdict_keys(bridge_dir, session_id, prompt.accept_key)
     elif action in {"decline", "cancel"}:
         # Cursor's tool-reject doesn't dismiss on the decline key alone — it
         # opens a "Reason for rejection (Enter to submit, Esc to cancel)"
@@ -187,7 +214,7 @@ async def _run_one_approval(
         # the TUI parked at the reason input (which the user then has to clear
         # by hand). The settle pause before Enter (see _send_cursor_keys) gives
         # the reason prompt time to render first.
-        await _send_cursor_keys(bridge_dir, session_id, prompt.decline_key, "Enter")
+        await _deliver_verdict_keys(bridge_dir, session_id, prompt.decline_key, "Enter")
 
 
 async def _run_one_question(
@@ -228,11 +255,11 @@ async def _run_one_question(
         _logger.debug(
             "cursor question accept; session=%s content=%r keys=%r", session_id, content, keys
         )
-        await _send_cursor_keys(bridge_dir, session_id, *keys)
+        await _deliver_verdict_keys(bridge_dir, session_id, *keys)
     elif action in {"decline", "cancel"}:
         # The question picker's "Esc to skip" dismisses cleanly (no rejection-
         # reason sub-prompt like the tool-approval gate has), so a single key.
-        await _send_cursor_keys(bridge_dir, session_id, _TRANSCRIPT_DECLINE_KEY)
+        await _deliver_verdict_keys(bridge_dir, session_id, _TRANSCRIPT_DECLINE_KEY)
     else:
         _logger.warning(
             "cursor question verdict: unexpected action=%r; session=%s", action, session_id
@@ -791,6 +818,31 @@ async def _yolo_auto_accept(
     return _YoloAccept.SENT
 
 
+async def _cancel_cursor_elicitation_tasks(tasks: Collection[asyncio.Task[None]]) -> None:
+    pending = tuple(tasks)
+    for task in pending:
+        if not task.done():
+            task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+
+
+def _report_cursor_elicitation_result(task: asyncio.Task[None]) -> None:
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        _logger.error("cursor elicitation task failed: %s", task.get_name(), exc_info=error)
+
+
+@asynccontextmanager
+async def _cursor_elicitation_tasks() -> AsyncIterator[set[asyncio.Task[None]]]:
+    tasks: set[asyncio.Task[None]] = set()
+    try:
+        yield tasks
+    finally:
+        await _cancel_cursor_elicitation_tasks(tasks)
+
+
 async def supervise_cursor_transcript_elicitations(
     *,
     base_url: str,
@@ -856,7 +908,10 @@ async def supervise_cursor_transcript_elicitations(
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
     from omnigent.cli_auth import open_server_client
 
-    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
+    async with (
+        open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client,
+        _cursor_elicitation_tasks() as pending_tasks,
+    ):
         while True:
             try:
                 if store_path is None or not store_path.exists():
@@ -876,9 +931,15 @@ async def supervise_cursor_transcript_elicitations(
                     entry = active.pop(tool_call_id)
                     task = entry["task"]
                     if isinstance(task, asyncio.Task) and not task.done():
-                        await _post_external_elicitation_resolved(
-                            client, session_id, str(entry["elicitation_id"])
-                        )
+                        # Release the card while its hook request is still parked so
+                        # the server clears it now; a severed request instead waits
+                        # out the server's re-park grace and reads as unanswered.
+                        try:
+                            await _post_external_elicitation_resolved(
+                                client, session_id, str(entry["elicitation_id"])
+                            )
+                        finally:
+                            await _cancel_cursor_elicitation_tasks((task,))
                 # Calls that vanished before settling were auto-approved — drop
                 # their debounce timer silently (no card was ever shown).
                 for tool_call_id in [tcid for tcid in first_seen if tcid not in seen_ids]:
@@ -962,6 +1023,9 @@ async def supervise_cursor_transcript_elicitations(
                             elicitation_id=elicitation_id,
                         )
                     task = asyncio.create_task(coro, name=f"cursor-approval-{elicitation_id}")
+                    pending_tasks.add(task)
+                    task.add_done_callback(pending_tasks.discard)
+                    task.add_done_callback(_report_cursor_elicitation_result)
                     active[call.tool_call_id] = {
                         "elicitation_id": elicitation_id,
                         "task": task,
