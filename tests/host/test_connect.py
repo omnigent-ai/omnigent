@@ -4432,9 +4432,13 @@ def test_temp_dir_names_survive_daemon_and_runner_hops(
 
     monkeypatch.delenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", raising=False)
     monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
-    monkeypatch.setenv("TEMP", r"D:\scratch\temp")
-    monkeypatch.setenv("TMP", r"D:\scratch\tmp")
-    monkeypatch.setenv("UNRELATED_SECRET_TOKEN", "must-not-forward")
+    foreground_env = {
+        "TEMP": r"D:\scratch\temp",
+        "TMP": r"D:\scratch\tmp",
+        "UNRELATED_SECRET_TOKEN": "must-not-forward",
+    }
+    for name, value in foreground_env.items():
+        monkeypatch.setenv(name, value)
 
     daemon_env = _build_host_daemon_env(server_url=server_url)
     # A foreground host spawns runners from its own env, a daemon from its filtered one.
@@ -4447,7 +4451,7 @@ def test_temp_dir_names_survive_daemon_and_runner_hops(
             workspace="/ws",
             parent_pid=42,
         )
-        for base in (dict(os.environ), daemon_env)
+        for base in (foreground_env, daemon_env)
     ]
 
     for env in (daemon_env, *runner_envs):
