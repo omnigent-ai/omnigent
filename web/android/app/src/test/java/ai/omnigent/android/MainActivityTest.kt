@@ -42,6 +42,7 @@ import java.time.Duration
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executor
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -381,14 +382,17 @@ class MainActivityTest {
             fixture.profile,
             false,
         )
-        awaitWorkspace(activity)
+        awaitWorkspace(activity) {
+            it.declared<ConnectionStatus?>("connectionStatus") is ConnectionStatus.SignInRequired &&
+                it.findViewById<Button>(R.id.status_primary).isEnabled
+        }
         assertTrue(
             activity.declared<ConnectionStatus?>(
                 "connectionStatus",
             ) is ConnectionStatus.SignInRequired,
         )
 
-        activity.findViewById<Button>(R.id.status_primary).performClick()
+        assertTrue(activity.findViewById<Button>(R.id.status_primary).performClick())
         assertEquals(
             fixture.page,
             activity.declared<DatabricksWebContext?>("pendingRecoveryContext"),
@@ -401,11 +405,8 @@ class MainActivityTest {
                 putExtra(OAuthCallbackActivity.EXTRA_OAUTH_CALLBACK, true)
             },
         )
-        awaitWorkspace(activity)
-        repeat(100) {
-            shadowOf(Looper.getMainLooper()).idle()
-            if (activity.declared<URI?>("lastWorkspacePageUri") != null) return@repeat
-            Thread.sleep(5)
+        awaitWorkspace(activity) {
+            it.declared<URI?>("lastWorkspacePageUri") == fixture.page.pageUri
         }
         assertEquals(fixture.page.pageUri, activity.declared<URI?>("lastWorkspacePageUri"))
         assertEquals(fixture.page.pageUri.toString(), shadowOf(activity.webView()).lastLoadedUrl)
@@ -432,7 +433,9 @@ class MainActivityTest {
             fixture.profile,
             false,
         )
-        awaitWorkspace(activity)
+        awaitWorkspace(activity) {
+            it.declared<ConnectionStatus?>("connectionStatus") is ConnectionStatus.ServerUnreachable
+        }
         assertTrue(
             activity.declared<ConnectionStatus?>(
                 "connectionStatus",
@@ -461,7 +464,9 @@ class MainActivityTest {
             fixture.profile,
             false,
         )
-        awaitWorkspace(activity)
+        awaitWorkspace(activity) {
+            it.declared<ConnectionStatus?>("connectionStatus") is ConnectionStatus.WorkspaceFailure
+        }
         assertTrue(
             activity.declared<ConnectionStatus?>(
                 "connectionStatus",
@@ -1108,17 +1113,21 @@ class MainActivityTest {
             .set(this, value)
     }
 
-    private fun awaitWorkspace(activity: MainActivity) {
-        val future = activity.declared<CompletableFuture<DatabricksWebSession>?>("workspaceFuture")
-        repeat(100) {
-            shadowOf(Looper.getMainLooper()).idle()
-            if (future?.isDone == true) {
-                shadowOf(Looper.getMainLooper()).idle()
-                return
-            }
-            Thread.sleep(5)
+    private fun awaitWorkspace(
+        activity: MainActivity,
+        settled: (MainActivity) -> Boolean,
+    ) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+        while (System.nanoTime() < deadline) {
+            shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(10))
+            if (settled(activity)) return
+            Thread.sleep(10)
         }
-        error("Workspace future did not finish")
+        val future = activity.declared<CompletableFuture<DatabricksWebSession>?>("workspaceFuture")
+        error(
+            "Workspace UI did not settle: futureDone=${future?.isDone}, " +
+                "status=${activity.declared<ConnectionStatus?>("connectionStatus")}",
+        )
     }
 
     private class WorkspaceFixture {
