@@ -395,7 +395,10 @@ def test_preference_cli_import_machine_override_and_restore(tmp_path, db_uri, su
         )
 
 
-def test_saved_session_preferences_resume_on_fresh_host(tmp_path, db_uri, mock_llm_server_url):
+@pytest.mark.parametrize("model_source", ["agent", "preferences"])
+def test_saved_session_preferences_resume_on_fresh_host(
+    tmp_path, db_uri, mock_llm_server_url, model_source
+):
     """Real server → two independent hosts → runner init; deterministic provider only."""
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from tests._helpers.host import isolated_host
@@ -411,7 +414,7 @@ def test_saved_session_preferences_resume_on_fresh_host(tmp_path, db_uri, mock_l
             "config.yaml": (
                 "spec_version: 1\nname: saved-preference-test\nprompt: Say hello.\n"
                 "executor:\n  type: omnigent\n  config:\n    harness: openai-agents\n"
-                f"  model: {model}\n"
+                + (f"  model: {model}\n" if model_source == "agent" else "")
             ).encode()
         }
     )

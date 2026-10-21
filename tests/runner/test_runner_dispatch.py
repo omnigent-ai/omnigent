@@ -2048,8 +2048,9 @@ async def _post_stream_message(http: httpx.AsyncClient, conv: str, **body: Any) 
     return await http.post(f"/v1/sessions/{conv}/events?stream=true", json=payload)
 
 
+@pytest.mark.parametrize("source", ["legacy", "shared", "machine", "project", "agent"])
 def test_build_spawn_env_applies_model_override(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
 ) -> None:
     """A per-session ``/model`` override overrides ``HARNESS_<H>_MODEL``.
 
@@ -2082,13 +2083,41 @@ def test_build_spawn_env_applies_model_override(
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
     )
 
-    base = _build_spawn_env_from_spec(spec, "claude-sdk")
-    overridden = _build_spawn_env_from_spec(spec, "claude-sdk", model_override="claude-sonnet-4-6")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    if source != "legacy":
+        from omnigent.preference_startup import PREFERENCE_SNAPSHOT_ENV
+        from omnigent.preference_sync import (
+            PreferenceNamespace,
+            SharedPreferenceEntry,
+            SharedPreferenceKey,
+        )
+        from tests._helpers.preferences import preference_snapshot
+
+        key = SharedPreferenceKey(kind="model", name="model")
+        path = preference_snapshot(
+            tmp_path / "saved",
+            identity=PreferenceNamespace(authority_id="test", workspace_id="0", user_id="local"),
+            shared=[SharedPreferenceEntry(key=key, version=1, value="test-shared")],
+            machine=[SharedPreferenceEntry(key=key, version=0, value="test-machine")]
+            if source == "machine"
+            else [],
+        )
+        monkeypatch.setenv(PREFERENCE_SNAPSHOT_ENV, str(path))
+        if source == "project":
+            (workspace / ".omnigent").mkdir()
+            (workspace / ".omnigent/config.yaml").write_text("model: test-project\n")
+        if source == "agent":
+            spec.executor.model = "test-agent"
+    base = _build_spawn_env_from_spec(spec, "claude-sdk", cwd=workspace)
+    overridden = _build_spawn_env_from_spec(
+        spec, "claude-sdk", cwd=workspace, model_override="claude-sonnet-4-6"
+    )
     assert base is not None and overridden is not None
-    # Baseline uses the provider/catalog default (not the override) …
-    assert base["HARNESS_CLAUDE_SDK_MODEL"] != "claude-sonnet-4-6"
-    # … and the override wins, landing in the model env var the SDK reads.
+    expected = "test-default" if source == "legacy" else f"test-{source}"
+    assert base["HARNESS_CLAUDE_SDK_MODEL"] == expected
     assert overridden["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
+    assert spec.executor.model == ("test-agent" if source == "agent" else None)
 
 
 def test_build_spawn_env_routes_hermes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

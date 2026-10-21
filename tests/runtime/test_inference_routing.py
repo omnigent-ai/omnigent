@@ -139,9 +139,34 @@ def test_unbound_host_keeps_its_explicit_provider_and_model(harness, tmp_path) -
 
 
 @pytest.mark.parametrize("harness", ["codex", "claude-sdk", "pi", "qwen", "openai-agents"])
-def test_bound_sdk_selected_model_precedes_an_obsolete_spec_pin(harness: str) -> None:
+@pytest.mark.parametrize("source", ["agent", "preferences"])
+def test_bound_sdk_selected_model_precedes_an_obsolete_spec_pin(
+    harness: str, source: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from omnigent.runner.app import _HARNESS_MODEL_ENV_KEY, _build_spawn_env_from_spec
 
+    spec = _spec(harness, "obsolete-spec-model" if source == "agent" else None)
+    if source == "preferences":
+        from omnigent.preference_startup import PREFERENCE_SNAPSHOT_ENV
+        from omnigent.preference_sync import (
+            PreferenceNamespace,
+            SharedPreferenceEntry,
+            SharedPreferenceKey,
+        )
+        from tests._helpers.preferences import preference_snapshot
+
+        snapshot = preference_snapshot(
+            tmp_path / "saved",
+            identity=PreferenceNamespace(authority_id="test", workspace_id="0", user_id="local"),
+            shared=[
+                SharedPreferenceEntry(
+                    key=SharedPreferenceKey(kind="model", name="model"),
+                    version=1,
+                    value="obsolete-shared-model",
+                )
+            ],
+        )
+        monkeypatch.setenv(PREFERENCE_SNAPSHOT_ENV, str(snapshot))
     profile = _profile()
     profile["inference"] = {
         "harnesses": {
@@ -153,11 +178,12 @@ def test_bound_sdk_selected_model_precedes_an_obsolete_spec_pin(harness: str) ->
         }
     }
     with inference_config_scope(profile):
-        env = _build_spawn_env_from_spec(
-            _spec(harness, "obsolete-spec-model"), harness, model_override="model-a"
-        )
+        with pytest.raises(OmnigentError, match="not in the configured model list"):
+            _build_spawn_env_from_spec(spec, harness, cwd=tmp_path)
+        env = _build_spawn_env_from_spec(spec, harness, cwd=tmp_path, model_override="model-a")
     assert env is not None
     assert env[_HARNESS_MODEL_ENV_KEY[harness]] == "model-a"
+    assert spec.executor.model == ("obsolete-spec-model" if source == "agent" else None)
 
 
 def test_sdk_harness_override_resolves_its_own_provider_binding() -> None:

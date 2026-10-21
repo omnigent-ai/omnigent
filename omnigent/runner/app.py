@@ -8134,6 +8134,12 @@ def _build_spawn_env_from_spec(
     from omnigent.sandbox.copy_on_write import validate_copy_on_write_harness
 
     validate_copy_on_write_harness(getattr(spec, "os_env", None), harness)
+    from omnigent.preference_models import adopted_model
+    from omnigent.preference_startup import inherited_launch
+
+    if not is_native_harness(harness) and inherited_launch() is not None:
+        model = adopted_model(harness, cwd or Path.cwd(), spec_model=spec.executor.model)
+        spec = dataclasses.replace(spec, executor=dataclasses.replace(spec.executor, model=model))
     effective_spec = spec
     from omnigent.inference_config import load_runtime_inference_config, parse_inference_config
 

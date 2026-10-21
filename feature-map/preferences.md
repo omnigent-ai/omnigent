@@ -10,7 +10,7 @@ host’s defaults once, preserve unavailable choices, and offer explicit recover
 Managed deployment wiring remains separate integration work. Pending edits
 retry on host reconnect without polling between messages.
 Claude/Codex native and SDK sessions also apply plugin toggles in private settings.
-Native startup applies adopted model defaults and retains known-unavailable choices.
+Native and SDK startup apply adopted model defaults and retain requested choices.
 Saved native arguments are applied once by the runner, including browser launches.
 
 ## Sub-features
@@ -198,8 +198,14 @@ uv run --no-sync pytest tests/stores/test_preference_snapshot.py \
 The real-process journey creates a session, changes shared defaults, and runs the
 same session on two isolated hosts, the second without a preference profile or
 cache. Both runners initialize with the original snapshot and complete a scripted
-provider turn. It checks saved intent and process handoff; the agent explicitly
-specifies its model, so this does not establish SDK default-model selection.
+provider turn. It checks saved intent and process handoff; the agent
+either specifies its model or leaves it to the saved shared default. Both variants
+must get replies from the selected scripted model on each host, after the current
+shared default has changed. This checks SDK default-model selection and resume;
+it does not establish live provider availability.
+The runner and inference-routing component scenarios also check shared, machine,
+project and explicit-agent precedence, unchanged source specs, session-only model
+switches, and visible policy rejection across five SDK adapters.
 Store cases cover single/split databases, bundle/registered create, reopen,
 children, forks and oversized input. Account mismatch and temporary/adopted
 contradictions are rejected at the server boundary. Legacy sessions resume with

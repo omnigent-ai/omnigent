@@ -1,4 +1,4 @@
-"""Native launch selection for sessions that adopted portable preferences."""
+"""Model selection for sessions that adopted portable preferences."""
 
 from __future__ import annotations
 
