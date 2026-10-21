@@ -242,6 +242,52 @@ def _build_liveness_app(
 
 
 @pytest.mark.asyncio
+async def test_public_api_docs_can_be_disabled(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A public deployment can remove generated docs without removing its API.
+
+    The checked-in OpenAPI artifact remains available to build and SDK tooling;
+    this setting only removes the unauthenticated runtime documentation routes.
+    """
+    monkeypatch.setenv("OMNIGENT_PUBLIC_API_DOCS", "0")
+    app = _build_liveness_app(db_uri, tmp_path).app
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        for path in ("/docs", "/redoc", "/openapi.json"):
+            response = await client.get(path)
+            assert response.status_code == 404, path
+
+
+@pytest.mark.asyncio
+async def test_spa_history_fallback_rejects_unknown_and_hidden_paths(tmp_path: Path) -> None:
+    """Only known UI routes may receive the SPA shell after a static miss."""
+    web_ui_dist = tmp_path / "web-ui"
+    web_ui_dist.mkdir()
+    (web_ui_dist / "index.html").write_text("<!doctype html><div id='root'></div>")
+
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    app.mount("/", server_app._SPAStaticFiles(directory=web_ui_dist, html=True))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        history_route = await client.get("/c/conv_abc123")
+        grid_route = await client.get("/grid/grid_abc123")
+        misses = {
+            path: await client.get(path)
+            for path in ("/.env", "/.git/config", "/docs", "/acceptance-probe-miss")
+        }
+
+    assert history_route.status_code == 200
+    assert history_route.headers["content-type"].startswith("text/html")
+    assert grid_route.status_code == 200
+    assert grid_route.headers["content-type"].startswith("text/html")
+    for path, response in misses.items():
+        assert response.status_code == 404, path
+
+
+@pytest.mark.asyncio
 async def test_health_batch_reports_strict_runner_and_host_liveness(
     db_uri: str,
     tmp_path: Path,

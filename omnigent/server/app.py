@@ -321,8 +321,9 @@ _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
 # FastAPI's built-in docs endpoints (`docs`, `redoc`, `openapi.json`), and the
 # SPA's own static-asset mount (`assets`) — a base path of `/assets` would be
 # indistinguishable from an already-destripped `/assets/<file>` request under a
-# prefix-stripping proxy, double-stripping it into a 404. Doubles as the
-# SPA-fallback allowlist and the base-path collision check (see
+# prefix-stripping proxy, double-stripping it into a 404. Together with
+# `_WEB_UI_ROUTE_PREFIXES`, it also decides whether a static-file miss may use
+# the SPA history fallback; it remains the base-path collision check (see
 # `_normalize_base_path` / `_is_web_ui_api_fallback_path`).
 _WEB_UI_API_FALLBACK_PREFIXES = frozenset(
     {
@@ -359,6 +360,7 @@ _WEB_UI_ROUTE_PREFIXES = frozenset(
         "c",
         "canvas",
         "extensions",
+        "grid",
         "inbox",
         "login",
         "members",
@@ -1376,6 +1378,7 @@ def create_app(
     host_sharded: bool = False,
     *,
     preference_store: PreferenceStore | None = None,
+    public_api_docs: bool | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1526,6 +1529,11 @@ def create_app(
         400 recovers only for a client that sent the slice-key header and
         retries without it, which the web client does only for requests it
         keyed itself.
+    :param public_api_docs: Whether to expose FastAPI's interactive API docs
+        and OpenAPI route. ``None`` reads ``OMNIGENT_PUBLIC_API_DOCS`` and
+        defaults to enabled for backwards compatibility. Deployments with a
+        public tenant URL can set it false while keeping the checked-in schema
+        available to their build and SDK tooling.
     :returns: A fully configured :class:`FastAPI` application.
     :raises ValueError: If ``permission_store`` is provided
         without an ``auth_provider``.
@@ -1538,6 +1546,13 @@ def create_app(
     # pick it up without threading a kwarg. Empty → root deployment (default).
     resolved_base_path = _normalize_base_path(
         base_path if base_path is not None else os.environ.get("OMNIGENT_WEB_BASE_PATH")
+    )
+    from omnigent.server.auth import env_var_is_truthy
+
+    resolved_public_api_docs = (
+        public_api_docs
+        if public_api_docs is not None
+        else env_var_is_truthy("OMNIGENT_PUBLIC_API_DOCS", default=True)
     )
 
     from omnigent.server.server_config import (
@@ -1899,7 +1914,13 @@ def create_app(
         else None
     )
 
-    app = FastAPI(title="Omnigent Server", lifespan=_lifespan)
+    app = FastAPI(
+        title="Omnigent Server",
+        lifespan=_lifespan,
+        docs_url="/docs" if resolved_public_api_docs else None,
+        redoc_url="/redoc" if resolved_public_api_docs else None,
+        openapi_url="/openapi.json" if resolved_public_api_docs else None,
+    )
     from omnigent.runtime import telemetry
 
     telemetry.instrument_fastapi_app(app)
@@ -4796,11 +4817,12 @@ class _SPAStaticFiles(StaticFiles):
     for the literal root and directory paths, so a refresh on
     ``/c/abc`` would 404.
 
-    The fallback is gated by an API-prefix and extension check: unmatched
-    ``/v1`` / ``/api`` / ``/auth`` / ``/health`` paths return a JSON 404,
-    and a path with a file extension (``.js``, ``.css``, ``.png``,
-    ``.woff2``, …) returns the static 404 verbatim. Other extensionless
-    paths fall back to ``index.html``.
+    The fallback is gated by the API namespace, a known UI-route prefix, and
+    an extension check: unmatched ``/v1`` / ``/api`` / ``/auth`` / ``/health``
+    paths return a JSON 404, paths outside the UI routes return 404, and a path
+    with a file extension (``.js``, ``.css``, ``.png``, ``.woff2``, …) returns
+    the static 404 verbatim. This keeps hidden paths and arbitrary probes from
+    receiving the SPA shell as a successful response.
 
     The HTML shell is rebased for the deployment ``base_path`` once at
     startup (see :func:`_rewrite_web_ui_index`) and served from memory with
@@ -4870,7 +4892,11 @@ class _SPAStaticFiles(StaticFiles):
                         }
                     },
                 )
-            if exc.status_code == 404 and "." not in path.rsplit("/", 1)[-1]:
+            if (
+                exc.status_code == 404
+                and "." not in path.rsplit("/", 1)[-1]
+                and _is_web_ui_history_fallback_path(path)
+            ):
                 served_path = "index.html"
                 response = (
                     self._shell_response(scope)
@@ -4897,6 +4923,24 @@ def _is_web_ui_api_fallback_path(path: str) -> bool:
     """
     first_segment = path.lstrip("/").split("/", 1)[0]
     return first_segment in _WEB_UI_API_FALLBACK_PREFIXES
+
+
+def _is_web_ui_history_fallback_path(path: str) -> bool:
+    """Return whether a missing path is a valid SPA navigation target.
+
+    Static assets are resolved before this predicate. A miss may receive the
+    HTML shell only when it starts with a route implemented by ``web/src/App``.
+    Dot-prefixed path components are never UI routes, so they stay 404 even if
+    a prefix otherwise happens to match.
+
+    :param path: Static mount-relative path, e.g. ``"c/conv_abc123"``.
+    :returns: True when the miss may fall back to ``index.html``.
+    """
+    segments = tuple(segment for segment in path.split("/") if segment)
+    return not segments or (
+        segments[0] in _WEB_UI_ROUTE_PREFIXES
+        and not any(segment.startswith(".") for segment in segments)
+    )
 
 
 class _RangeAwareGZipMiddleware(GZipMiddleware):
