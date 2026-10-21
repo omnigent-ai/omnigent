@@ -11,6 +11,7 @@ import {
   ArchiveIcon,
   ArrowLeftIcon,
   BlocksIcon,
+  BoxIcon,
   BotIcon,
   DownloadIcon,
   GitBranchIcon,
@@ -42,6 +43,7 @@ export type SettingsSectionId =
   | "git"
   | "integrations"
   | "mcp"
+  | "sandboxes"
   | "shortcuts"
   | "import"
   | "account"
@@ -60,6 +62,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "git",
   "integrations",
   "mcp",
+  "sandboxes",
   "shortcuts",
   "import",
   "account",
@@ -100,6 +103,7 @@ export function settingsNavGroups(
   isSingleUser = false,
   integrationsEnabled = false,
   customAgentsEnabled = false,
+  managedSandboxesEnabled = false,
   mcpEnabled = false,
 ): SettingsNavGroup[] {
   const harnesses: SettingsNavItem = {
@@ -163,6 +167,8 @@ export function settingsNavGroups(
     const adminItems: SettingsNavItem[] = [];
     if (!isSingleUser) adminItems.push({ id: "members", label: "Members", icon: UsersIcon });
     adminItems.push({ id: "policies", label: "Policies", icon: ShieldCheckIcon });
+    if (managedSandboxesEnabled)
+      adminItems.push({ id: "sandboxes", label: "Sandboxes", icon: BoxIcon });
     if (!isSingleUser) adminItems.push({ id: "sharing", label: "Sharing", icon: Share2Icon });
     groups.push({ title: "Admin", items: adminItems });
   }
@@ -265,6 +271,7 @@ export function SettingsSidebarBody({
     isSingleUserMode(info),
     integrationsEnabled,
     customAgentsSettingsEnabled(info),
+    info !== "loading" && info.managed_sandboxes_enabled,
     mcpEnabled,
   );
 

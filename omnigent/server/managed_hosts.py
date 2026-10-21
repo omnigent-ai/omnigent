@@ -1324,6 +1324,30 @@ def _apply_keep_warm(
     return merged
 
 
+def deployment_with_sandbox_profile(
+    deployment: ManagedSandboxDeployment, snapshot: dict[str, Any] | None
+) -> ManagedSandboxDeployment:
+    """Apply the saved launch configuration to fresh provider instances."""
+    if snapshot is None:
+        return deployment
+    entry = deployment.for_provider(snapshot["provider"])
+    if entry is None:
+        raise HTTPException(status_code=400, detail="The sandbox profile provider is unavailable")
+
+    def launcher_factory() -> SandboxHostLauncher:
+        launcher = entry.launcher_factory()
+        launcher.apply_profile(snapshot["config"])
+        return launcher
+
+    return replace(
+        deployment,
+        configs=tuple(
+            replace(config, launcher_factory=launcher_factory) if config is entry else config
+            for config in deployment.configs
+        ),
+    )
+
+
 def deployment_with_inference_snapshot(
     deployment: ManagedSandboxDeployment, snapshot: dict[str, Any] | None
 ) -> ManagedSandboxDeployment:

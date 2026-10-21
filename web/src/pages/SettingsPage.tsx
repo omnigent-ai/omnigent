@@ -75,6 +75,7 @@ import {
 import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
 import { SettingsGroup } from "@/components/SettingsGroup";
+import { SettingsSandboxesSection } from "@/pages/settings/SettingsSandboxesSection";
 import { SettingsLabel } from "@/components/SettingsLabel";
 import { McpRegistryConnections } from "@/components/McpRegistry";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
@@ -359,6 +360,7 @@ export function SettingsPage() {
           )}
         </Section>
       )}
+      {section === "sandboxes" && <SettingsSandboxesSection />}
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "import" && <ImportSection />}
       {section === "account" && hasAuthSession && <AccountSection />}

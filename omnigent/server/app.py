@@ -1964,6 +1964,38 @@ def create_app(
     host_registry.launch_authorizer = _admit_host_launch
     app.state.agent_store = agent_store
     app.state.sandbox_config = sandbox_config
+    from omnigent.server.sandbox_profiles import SandboxProfileCatalog
+
+    sandbox_profiles = (
+        SandboxProfileCatalog(host_store._engine, sandbox_config)
+        if host_store is not None
+        else None
+    )
+    app.state.sandbox_profiles = sandbox_profiles
+    if host_store is not None and sandbox_profiles is not None:
+
+        def admit_profiled_launch(
+            host_id: str,
+            session_id: str,
+            owner: str | None,
+            generation: str | None,
+            allow_unbound: bool = False,
+            transfer_from_host_id: str | None = None,
+        ) -> None:
+            sandbox_profiles.require_session_host(session_id, host_id, bind=False)
+            _admit_host_launch(
+                host_id,
+                session_id,
+                owner,
+                generation,
+                allow_unbound,
+                transfer_from_host_id,
+            )
+            # Caller-host routes commit new bindings after their atomic runner bind.
+            if not allow_unbound and transfer_from_host_id is None:
+                sandbox_profiles.require_session_host(session_id, host_id)
+
+        host_registry.launch_authorizer = admit_profiled_launch
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
@@ -3453,6 +3485,15 @@ def create_app(
         tags=["extensions"],
     )
     from omnigent.server.routes.sandbox_inference import create_sandbox_inference_router
+    from omnigent.server.routes.sandbox_profiles import create_sandbox_profiles_router
+
+    app.include_router(
+        create_sandbox_profiles_router(
+            auth_provider=auth_provider, permission_store=permission_store
+        ),
+        prefix="/v1",
+        tags=["sandbox profiles"],
+    )
 
     app.include_router(
         create_sandbox_inference_router(

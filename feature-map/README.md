@@ -147,6 +147,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   custom-agent targets, fork access checks, archive, reconnect, and resume.
 - [Video recordings](./video-rendering.md) covers inline chat playback, remote
   recording links, file previews, and download fallbacks.
+- [Sandbox profiles](./sandbox-profiles.md) covers administrator Settings,
+  desktop and mobile profile selection, and the boundary between browser
+  request proof and live resource/network enforcement.
 
 - [GitLab merge requests](./gitlab.md) covers the shared MR panel, composer,
   Canvas links, and native tracking.
@@ -225,7 +228,8 @@ interruptions for claude-native are tracked as scenario rows in
 header-menu/custom-agent fork combination still needs a manual browser drive.
 
 **No UI test lane yet:** Slack, the iOS and Android apps, policies and cost
-budgets, MCP servers, sandbox providers, and smart routing.
+budgets, MCP servers, sandbox provider lifecycle beyond profile configuration,
+and smart routing.
 
 ## Keeping the map current
 

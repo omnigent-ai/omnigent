@@ -289,6 +289,46 @@ Providers declare their feature set via a `capabilities` property returning
 
 ## Network policy for harness bridge servers
 
+### Managed sandbox profiles
+
+Direct `kubernetes` and `agent_sandbox` provisioning supports admin-defined
+profiles with `image`, `resources`, and `egress` settings. The launcher receives
+the selected, persisted configuration through `apply_profile(config)` before
+preparation or allocation. Other providers and agent-sandbox warm pools reject
+selected profiles, including an empty configuration, rather than ignoring them.
+Resource overrides use the existing `requests` / `limits` mapping with `cpu`,
+`memory`, and `ephemeral-storage` Kubernetes quantity strings.
+Sessions retain the accepted profile overrides on resume; omitted fields still
+use the deployment's current defaults. Profile snapshots do not freeze the
+complete image, credentials, mounts, or provider configuration.
+Once bound, a profiled session cannot move to another host; forks can launch on
+new hosts, and wake or replacement preserves the original host identity.
+
+`egress` is the native Kubernetes NetworkPolicy egress rule list: IP blocks,
+Pod/namespace selectors, and protocol/port restrictions. Omitting it preserves
+the deployment's network behavior. `egress: []` requests Kubernetes default-deny
+egress; administrators must explicitly allow DNS, the Omnigent server, repository
+clones, and model endpoints their workload needs. `egress: [{}]` permits all
+outbound traffic, following native Kubernetes semantics. These rules do not
+filter HTTP methods or guarantee that web requests disclose no data.
+
+The provider creates and verifies an Egress-only NetworkPolicy before creating
+the runner workload. A digest of its rules identifies both the immutable policy
+and its Pod selector; initial launch and resume use the same labels. The server
+ServiceAccount needs `create` and `get` on `networking.k8s.io/networkpolicies`
+in the runner namespace. The bundled sandbox-runners Role includes these grants.
+
+Enforcement requires a NetworkPolicy-capable CNI and follows its supported
+protocols and Kubernetes system-traffic exceptions. Kubernetes combines all
+policies that select a Pod: another policy can permit traffic these rules omit.
+Configure the runner namespace accordingly before treating profiles as network limits.
+Policies persist across session termination and are shared by identical rule sets.
+Administrators may delete obsolete `omnigent-egress-*` policies only after no
+running, suspended, or restorable sandbox references their rules; deleting an
+active policy can remove its network restrictions.
+
+### Local harness connectivity
+
 Native harnesses (e.g. `claude-native`) run small HTTP servers on the sandbox
 host that the harness's hook and helper subprocesses call back into: a tool
 relay, which **by default binds loopback only (`127.0.0.1`)** so an ordinary

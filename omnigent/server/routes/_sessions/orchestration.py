@@ -364,6 +364,7 @@ from omnigent.server.routes._sessions.helpers import (
     _wait_for_runner_client,
 )
 from omnigent.server.runner_session_init import RunnerSessionInitializer
+from omnigent.server.sandbox_profile_launch import prepare_profile, record_profile, saved_profile
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
     ChildSessionSummary,
@@ -4329,6 +4330,7 @@ async def _run_managed_launch(
     agent_store: AgentStore | None = None,
     agent_id: str | None = None,
     host_id: str | None = None,
+    sandbox_profiles: Any = None,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -4399,8 +4401,30 @@ async def _run_managed_launch(
     from omnigent.server.managed_hosts import (
         deployment_with_inference_snapshot,
         host_slice_key_enabled,
+        deployment_with_sandbox_profile,
         resolve_managed_agent_label,
     )
+
+    try:
+        profile = await saved_profile(
+            sandbox_profiles,
+            session_id,
+            host_id=relaunch_host.host_id if relaunch_host is not None else None,
+        )
+        if profile is not None:
+            sandbox_config = deployment_with_sandbox_profile(sandbox_config, profile)
+            provider = profile["provider"]
+    except (OmnigentError, HTTPException) as exc:
+        reason = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+        tracker.fail(session_id, reason)
+        _publish_sandbox_status(session_id, "failed", reason)
+        return
+    except Exception:  # noqa: BLE001 — background launches must settle their tracker
+        _logger.exception("Failed to load sandbox profile", extra={"session_id": session_id})
+        reason = "failed to load sandbox profile"
+        tracker.fail(session_id, reason)
+        _publish_sandbox_status(session_id, "failed", reason)
+        return
 
     saved_conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
     if saved_conversation is not None:
@@ -4447,6 +4471,7 @@ async def _run_managed_launch(
             host_registry=host_registry,
             tunnel_registry=tunnel_registry,
             relaunch_host=relaunch_host,
+            sandbox_profiles=sandbox_profiles,
         )
 
 
@@ -4461,6 +4486,7 @@ async def _bind_and_launch_managed_runner(
     host_registry: HostRegistry | None,
     tunnel_registry: TunnelRegistry | None,
     relaunch_host: Host | None = None,
+    sandbox_profiles: Any = None,
 ) -> None:
     """
     Bind a provisioned managed host to its session and launch a runner.
@@ -4506,6 +4532,8 @@ async def _bind_and_launch_managed_runner(
     )
     try:
         conv = await asyncio.shield(bind)
+        if sandbox_profiles is not None:
+            await asyncio.to_thread(sandbox_profiles.bind_host, session_id, managed.host_id)
     except asyncio.CancelledError:
         # Shutdown cancelled the launch mid-write. Let the write land so the
         # row, which the cancelled launch reads to decide whether it failed,
@@ -4532,6 +4560,16 @@ async def _bind_and_launch_managed_runner(
         _publish_sandbox_status(
             session_id, "failed", "session was deleted while its sandbox was provisioning"
         )
+        return
+    except Exception:  # noqa: BLE001 — settle the tracker and release the fresh sandbox
+        _logger.exception("Failed to bind managed host", extra={"session_id": session_id})
+        reason = "failed to bind managed host"
+        tracker.fail(session_id, reason)
+        _publish_sandbox_status(session_id, "failed", reason)
+        if relaunch_host is None:
+            host = await asyncio.to_thread(host_store.get_host, managed.host_id)
+            if host is not None:
+                await terminate_managed_host(host, host_store, sandbox_config)
         return
     # From here a shutdown may cancel the launch: the host's replica finishes it.
     if (launch_task := asyncio.current_task()) is not None:
@@ -4560,6 +4598,15 @@ async def _bind_and_launch_managed_runner(
                 )
             except OmnigentError as exc:
                 reason = str(exc)
+            except Exception as exc:  # noqa: BLE001 — admission can fail after provisioning
+                _logger.exception(
+                    "Failed to launch sandbox runner", extra={"session_id": session_id}
+                )
+                reason = (
+                    str(exc.detail)
+                    if isinstance(exc, HTTPException)
+                    else "failed to launch sandbox runner"
+                )
             if reason is not None:
                 # The sandbox image should bake in the harness, but if the
                 # host refuses, fail the launch loudly (mirroring the
@@ -5325,6 +5372,7 @@ def _kick_managed_relaunch(
             relaunch_host=host,
             agent_store=agent_store,
             agent_id=conv.agent_id,
+            sandbox_profiles=getattr(app_state, "sandbox_profiles", None),
         )
     )
     _managed_launch_tasks.add(relaunch_task)
@@ -5418,6 +5466,7 @@ def _kick_managed_wake_impl(
             tunnel_registry=getattr(app_state, "tunnel_registry", None),
             agent_store=wake_agent_store,
             agent_id=conv.agent_id,
+            sandbox_profiles=getattr(app_state, "sandbox_profiles", None),
         )
     )
     _managed_launch_tasks.add(wake_task)
@@ -5436,6 +5485,7 @@ async def _run_managed_wake(
     tunnel_registry: TunnelRegistry | None,
     agent_store: AgentStore | None = None,
     agent_id: str | None = None,
+    sandbox_profiles: Any = None,
 ) -> None:
     """
     Wake a dormant resumable managed host in the background, settling the
@@ -5474,6 +5524,7 @@ async def _run_managed_wake(
     from omnigent.server.managed_hosts import (
         deployment_with_inference_snapshot,
         host_slice_key_enabled,
+        deployment_with_sandbox_profile,
         resolve_managed_agent_label,
         resume_managed_host,
     )
@@ -5499,6 +5550,8 @@ async def _run_managed_wake(
         _publish_sandbox_status(session_id, stage)
 
     try:
+        profile = await saved_profile(sandbox_profiles, session_id, host_id=host_id)
+        sandbox_config = deployment_with_sandbox_profile(sandbox_config, profile)
         # Wake the same sandbox in place; resume_managed_host is single-flight
         # per host and a no-op if it's already online.
         # Re-derived here rather than by the caller, matching the launch path:
@@ -5555,6 +5608,7 @@ async def _run_managed_wake(
                 relaunch_host=host,
                 agent_store=agent_store,
                 agent_id=agent_id,
+                sandbox_profiles=sandbox_profiles,
             )
             return
         _publish_sandbox_status(session_id, "connecting")
@@ -11316,6 +11370,12 @@ async def _create_session_from_existing_agent(
             conversation_store,
         )
 
+    sandbox_profile = await prepare_profile(
+        request, body, inherited_session_id=body.parent_session_id
+    )
+    if sandbox_profile is not None and body.host_type == "managed":
+        body = body.model_copy(update={"sandbox_provider": sandbox_profile["provider"]})
+
     # Reject an undeclared sub-agent before persisting the row. Downstream
     # spec swaps warn and keep the parent on a miss, which is right for a
     # name that once resolved and has since been renamed or removed — but
@@ -11826,6 +11886,7 @@ async def _create_session_from_existing_agent(
                 harness_override=harness_override,
                 **snapshot_kwargs,
             )
+            await record_profile(request, conv.id, sandbox_profile, conversation_store)
     except NameAlreadyExistsError as exc:
         if (
             created_worktree_path is not None
