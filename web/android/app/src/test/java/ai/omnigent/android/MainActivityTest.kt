@@ -254,6 +254,96 @@ class MainActivityTest {
     }
 
     @Test
+    fun `legacy ticket poll denial leaves the handoff for sign in setup`() {
+        LocalHttpServer { request ->
+            when (request.path) {
+                "/auth/cli-login" -> {
+                    LocalHttpServer.Response(200, """{"ticket":"abc","login_url":"/auth/login"}""")
+                }
+
+                "/auth/cli-poll" -> {
+                    LocalHttpServer.Response(410)
+                }
+
+                else -> {
+                    LocalHttpServer.Response(404)
+                }
+            }
+        }.use { server ->
+            ServerStore(ApplicationProvider.getApplicationContext()).connect(server.origin)
+            val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+            val activity = controller.get()
+            try {
+                val webView = activity.webView()
+                webView.webViewClient.onPageStarted(webView, "https://idp.example.test/login", null)
+                awaitMainThread {
+                    activity.declared<ConnectionStatus?>("connectionStatus") is
+                        ConnectionStatus.AuthTabHandoff
+                }
+                awaitMainThread { activity.isFinishing }
+                val setup = shadowOf(activity).nextStartedActivity
+                assertEquals(ConnectActivity::class.java.name, setup.component?.className)
+                assertTrue(setup.getStringExtra(ConnectActivity.EXTRA_ERROR)?.isNotBlank() == true)
+            } finally {
+                controller.pause().stop().destroy()
+            }
+        }
+    }
+
+    @Test
+    fun `Back during legacy browser wait cancels late session delivery`() {
+        LocalHttpServer { request ->
+            when (request.path) {
+                "/auth/cli-login" -> {
+                    LocalHttpServer.Response(200, """{"ticket":"abc","login_url":"/auth/login"}""")
+                }
+
+                "/auth/cli-poll" -> {
+                    LocalHttpServer.Response(202)
+                }
+
+                else -> {
+                    LocalHttpServer.Response(404)
+                }
+            }
+        }.use { server ->
+            ServerStore(ApplicationProvider.getApplicationContext()).connect(server.origin)
+            val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+            val activity = controller.get()
+            try {
+                val webView = activity.webView()
+                webView.webViewClient.onPageStarted(webView, "https://idp.example.test/login", null)
+                awaitMainThread {
+                    activity.declared<ConnectionStatus?>("connectionStatus") is
+                        ConnectionStatus.AuthTabHandoff
+                }
+                shadowOf(activity).nextStartedActivity // consume browser launch
+
+                activity.onBackPressedDispatcher.onBackPressed()
+
+                assertTrue(activity.isFinishing)
+                assertEquals(
+                    ConnectActivity::class.java.name,
+                    shadowOf(activity).nextStartedActivity.component?.className,
+                )
+                val manager = activity.declared<OidcLoginManager>("oidcLoginManager")
+                val callback =
+                    OidcLoginManager::class.java
+                        .getDeclaredField("sessionCallback")
+                        .apply {
+                            isAccessible = true
+                        }.get(manager)
+                assertNull(callback)
+                shadowOf(activity).clearNextStartedActivities()
+                activity.invoke("onSessionToken", arrayOf(String::class.java), "aaa.bbb.ccc")
+                assertNull(shadowOf(activity).nextStartedActivity)
+            } finally {
+                controller.pause().stop().destroy()
+            }
+        }
+    }
+
+    @Test
     fun `unreachable server offers retry then a successful commit clears the screen`() {
         var manifestReads = 0
         MainActivity.manifestReader = {
@@ -999,25 +1089,100 @@ class MainActivityTest {
     }
 
     @Test
-    fun `Databricks App cold start leaves foreign sign-in accessible`() {
+    fun `Databricks App connecting uncovers only a committed foreign sign-in page`() {
         ServerStore(ApplicationProvider.getApplicationContext())
             .connect("https://myapp.databricksapps.com")
         val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
         val webView = activity.webView()
         val loginUrl = "https://login.databricks.com/sign-in"
 
+        assertTrue(
+            activity.declared<ConnectionStatus?>("connectionStatus") is ConnectionStatus.Connecting,
+        )
+        assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
         webView.webViewClient.onPageStarted(webView, loginUrl, null)
-        webView.webViewClient.onPageCommitVisible(webView, loginUrl)
         webView.webViewClient.onReceivedError(
             webView,
             request(loginUrl),
             FakeWebResourceError(-6, "net::ERR_CONNECTION_REFUSED"),
         )
+        webView.webViewClient.onPageCommitVisible(webView, loginUrl)
+        assertTrue(
+            activity.declared<ConnectionStatus?>("connectionStatus") is ConnectionStatus.Connecting,
+        )
+
+        webView.webViewClient.onPageStarted(webView, loginUrl, null)
+        val sslHandler = Shadow.newInstanceOf(SslErrorHandler::class.java)
+        webView.webViewClient.onReceivedSslError(
+            webView,
+            sslHandler,
+            SslError(
+                SslError.SSL_UNTRUSTED,
+                SslCertificate("host", "issuer", java.util.Date(), java.util.Date()),
+                loginUrl,
+            ),
+        )
+        webView.webViewClient.onPageCommitVisible(webView, loginUrl)
+        assertTrue(
+            activity.declared<ConnectionStatus?>("connectionStatus") is ConnectionStatus.Connecting,
+        )
+        val sslShadow = Shadow.extract<ShadowSslErrorHandler>(sslHandler)
+        assertTrue(sslShadow.wasCancelCalled())
+        assertFalse(sslShadow.wasProceedCalled())
+
+        webView.webViewClient.onPageStarted(webView, loginUrl, null)
+        webView.webViewClient.onPageCommitVisible(webView, loginUrl)
         shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(10_500))
 
         assertNull(activity.declared<ConnectionStatus?>("connectionStatus"))
         assertEquals(View.GONE, activity.declared<View>("connectionOverlay").visibility)
         assertEquals(View.IMPORTANT_FOR_ACCESSIBILITY_AUTO, webView.importantForAccessibility)
+    }
+
+    @Test
+    fun `Databricks App stalled load reaches slow and Retry stays covered until commit`() {
+        ServerStore(ApplicationProvider.getApplicationContext())
+            .connect("https://myapp.databricksapps.com")
+        val activity = Robolectric.buildActivity(MainActivity::class.java).setup().get()
+        val webView = activity.webView()
+        val page = "https://myapp.databricksapps.com/"
+
+        assertTrue(
+            activity.declared<ConnectionStatus?>("connectionStatus") is ConnectionStatus.Connecting,
+        )
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(10_500))
+        assertTrue(
+            activity.declared<ConnectionStatus?>("connectionStatus") is
+                ConnectionStatus.ConnectingSlow,
+        )
+        assertEquals(View.VISIBLE, activity.findViewById<Button>(R.id.status_secondary).visibility)
+        assertEquals(View.VISIBLE, activity.findViewById<Button>(R.id.status_cancel).visibility)
+
+        webView.webViewClient.onPageStarted(webView, page, null)
+        webView.webViewClient.onReceivedError(
+            webView,
+            request(page),
+            FakeWebResourceError(-6, "net::ERR_CONNECTION_REFUSED"),
+        )
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(600))
+        assertTrue(
+            activity.declared<ConnectionStatus?>("connectionStatus") is
+                ConnectionStatus.ServerUnreachable,
+        )
+        activity.findViewById<Button>(R.id.status_primary).performClick()
+        assertTrue(
+            activity.declared<ConnectionStatus?>("connectionStatus") is ConnectionStatus.Connecting,
+        )
+        assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
+        assertEquals(
+            View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS,
+            webView.importantForAccessibility,
+        )
+
+        webView.webViewClient.onPageStarted(webView, page, null)
+        webView.webViewClient.onPageCommitVisible(webView, page)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(600))
+        assertEquals(View.GONE, activity.declared<View>("connectionOverlay").visibility)
     }
 
     @Test
