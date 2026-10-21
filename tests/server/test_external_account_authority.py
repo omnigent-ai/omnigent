@@ -101,6 +101,7 @@ def test_external_auth_lifespan_and_websocket_writes(db_uri, without_users, sour
     tasks = SqlAlchemyScheduledTaskStore(db_uri)
     task_id = uuid4().hex
     host_id = uuid4().hex
+    timer_host_id = uuid4().hex
 
     async def background_write():
         task = await asyncio.to_thread(
@@ -119,9 +120,27 @@ def test_external_auth_lifespan_and_websocket_writes(db_uri, without_users, sour
             updated = await asyncio.to_thread(tasks.update, task_id, state="paused")
         assert updated.state == "paused"
 
+    async def timer_write():
+        # The scheduler arms fires with ``loop.call_later``; the policy must reach that callback.
+        host = await asyncio.to_thread(
+            hosts.upsert_on_connect, timer_host_id, "Timer laptop", "alice"
+        )
+        assert host.account_generation is None
+
     @asynccontextmanager
     async def lifespan(app):
         await asyncio.create_task(background_write())
+        loop = asyncio.get_running_loop()
+        timer_done: asyncio.Future[None] = loop.create_future()
+
+        def _relay(done: asyncio.Future[None]) -> None:
+            if (exc := done.exception()) is not None:
+                timer_done.set_exception(exc)
+            else:
+                timer_done.set_result(None)
+
+        loop.call_later(0, lambda: loop.create_task(timer_write()).add_done_callback(_relay))
+        await timer_done
         yield
 
     app = FastAPI(lifespan=lifespan)
@@ -139,6 +158,7 @@ def test_external_auth_lifespan_and_websocket_writes(db_uri, without_users, sour
             assert ws.receive_json() == {"user_id": "alice", "generation": None}
     assert tasks.get(task_id).state == "paused"
     assert hosts.get_host(host_id).user_id == "alice"
+    assert hosts.get_host(timer_host_id).user_id == "alice"
 
     # App execution must not change the default for standalone store calls.
     with pytest.raises(DBAPIError):

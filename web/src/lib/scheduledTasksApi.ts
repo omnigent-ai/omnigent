@@ -11,8 +11,11 @@
 
 import { authenticatedFetch } from "./identity";
 
-/** Lifecycle state of a scheduled task. `paused` tasks don't fire. */
-export type ScheduledTaskState = "active" | "paused";
+/**
+ * Lifecycle state of a scheduled task. `paused` tasks don't fire. The server sets
+ * `deleted` when the owner's registration is gone; the Automations page hides those.
+ */
+export type ScheduledTaskState = "active" | "paused" | "deleted";
 
 /**
  * Where each firing runs. `connected_host` pins/resolves the owner's own
@@ -140,7 +143,8 @@ export interface UpdateScheduledTaskInput {
    * also set `hostId` / `workspace` in the same update.
    */
   executionTarget?: ScheduledTaskExecutionTarget;
-  state?: ScheduledTaskState;
+  /** Pause or resume. The server rejects `deleted`; use `deleteScheduledTask`. */
+  state?: Exclude<ScheduledTaskState, "deleted">;
 }
 
 /** Wire shape of a task row (snake_case), matching `_to_response`. */
