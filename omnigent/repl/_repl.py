@@ -69,9 +69,10 @@ from rich.console import RenderableType
 from rich.markup import escape
 from rich.text import Text
 
+from omnigent.chat import set_session_host
 from omnigent.cli_invocation import cli_invocation
 from omnigent.harness_aliases import canonicalize_harness
-from omnigent.remote_launch import pin_remote_launch_host, resolve_remote_launch_host
+from omnigent.remote_launch import resolve_remote_launch_host
 from omnigent.spec.types import SkillSpec
 
 if TYPE_CHECKING:
@@ -1661,6 +1662,8 @@ class _SessionsChatReplAdapter:
             attributes.
         :returns: None.
         """
+        if self._session_id is not None:
+            set_session_host(self._session_id, getattr(session, "host_id", None))
         self._agent_id = session.agent_id
         # The agent name changes when the session is switched in place
         # to a different agent (web UI "Switch agent"). Don't clobber
@@ -1781,7 +1784,7 @@ class _SessionsChatReplAdapter:
                         f"against it with `{cli_invocation()} host --server <url>` (or run the "
                         f"agent locally with `{cli_invocation()} run <agent.yaml>`), then retry."
                     )
-            if pending_debug:
+            if pending_debug and self._runner_id is not None:
                 print(
                     f"[sessions-adapter] adopted server runner {self._runner_id!r}",
                     file=sys.stderr,
@@ -1790,8 +1793,6 @@ class _SessionsChatReplAdapter:
         # Snapshot the pre-create /model pick before hydration clobbers
         # it; applied after create since create has no such field.
         pending_model_override = self._model_override
-        if launch_host_id is not None:
-            pin_remote_launch_host(self._client.sessions, launch_host_id)
         session = await self._client.sessions.create_from_agent_id(
             agent_id,
             reasoning_effort=self._reasoning_effort,
@@ -1800,6 +1801,8 @@ class _SessionsChatReplAdapter:
         )
         self._session_id = session.id
         self._hydrate_from_session_snapshot(session)
+        if launch_host_id is not None:
+            set_session_host(session.id, launch_host_id)
         await self._apply_pending_model_override(pending_model_override, session)
         if pending_debug:
             print(

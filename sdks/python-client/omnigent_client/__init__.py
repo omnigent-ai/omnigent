@@ -26,6 +26,7 @@ Or consume semantic blocks via :class:`BlockStream`::
         ...
 """
 
+from ._agent_catalog import AgentCatalogEntry, RegisteredAgentCatalog
 from ._blocks import (
     AnyBlock,
     BlockContext,
@@ -84,6 +85,7 @@ from .tools import ToolMetadata, ToolState, tool
 __all__ = [
     "MCP_ELICITATION_METHOD",
     "TERMINAL_TASK_STATUSES",
+    "AgentCatalogEntry",
     "AnyBlock",
     "BlockContext",
     "BlockStream",
@@ -106,6 +108,7 @@ __all__ = [
     "ReasoningChunk",
     "ReasoningStartBlock",
     "RegisteredAgent",
+    "RegisteredAgentCatalog",
     "ResponseEndBlock",
     "ResponseStartBlock",
     "RetryBlock",

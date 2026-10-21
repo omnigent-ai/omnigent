@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import httpx
 import pytest
+from omnigent_client import OmnigentClient
 
 from omnigent.chat import (
     _DatabricksTokenAuth,
+    _route_remote_session_request,
     get_session_host,
     set_session_host,
 )
@@ -74,20 +76,32 @@ def test_auth_no_key_off_workspace() -> None:
 
 
 @pytest.mark.parametrize("session_host", ["host_new", None], ids=["override", "fallback"])
-def test_repointed_session_host_overrides_the_launch_header(session_host: str | None) -> None:
-    """Prefer the session host, preserving the launch pin for a hostless child."""
-    mount = "https://acme.databricks.com/api/2.0/omnigent"
+@pytest.mark.asyncio
+async def test_request_routing_follows_the_target_session(
+    monkeypatch: pytest.MonkeyPatch, session_host: str | None
+) -> None:
+    """The SDK hook overrides stale auth routing without changing shared headers."""
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "host_fallback")
+    monkeypatch.setenv("OMNIGENT_REMOTE_AUTH_TOKEN", "test-token")
+    mount = "http://127.0.0.1/api/2.0/omnigent"
     set_session_host("conv_old", "host_old")
     set_session_host("conv_new", session_host)
     auth = _DatabricksTokenAuth(server_url=mount, session_id="conv_old")
-    auth.pin_session("conv_new")
-    flow = auth.auth_flow(
-        httpx.Request(
-            "GET",
-            f"{mount}/v1/sessions/conv_new/events",
-            headers={OMNIGENT_SLICE_KEY_HEADER: "host_old"},
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/2.0/omnigent/v1/sessions/conv_new"
+        assert request.headers[OMNIGENT_SLICE_KEY_HEADER] == (session_host or "host_fallback")
+        assert request.headers["Authorization"] == "Bearer test-token"
+        return httpx.Response(
+            200, json={"id": "conv_new", "agent_id": "ag_new", "status": "idle", "created_at": 0}
         )
-    )
-    request = next(flow)
-    flow.close()
-    assert request.headers[OMNIGENT_SLICE_KEY_HEADER] == (session_host or "host_old")
+
+    async with OmnigentClient(
+        mount, auth=auth, request_hooks=[_route_remote_session_request]
+    ) as client:
+        async with httpx.MockTransport(handler) as transport:
+            with monkeypatch.context() as patcher:
+                patcher.setattr(client._http, "_transport", transport)
+                assert (await client.sessions.get("conv_new")).id == "conv_new"
+                assert OMNIGENT_SLICE_KEY_HEADER not in client._http.headers

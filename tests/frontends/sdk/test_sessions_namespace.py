@@ -1656,8 +1656,10 @@ async def test_list_launch_hosts_skips_malformed_rows_and_names_by_id() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_launch_hosts_tolerates_a_non_list_listing() -> None:
-    assert await _launch_hosts({"hosts": {"oops": True}}) == []
+@pytest.mark.parametrize("body", [{}, {"hosts": None}, {"hosts": {"oops": True}}])
+async def test_list_launch_hosts_rejects_a_non_list_listing(body: dict[str, object]) -> None:
+    with pytest.raises(OmnigentError, match=r"GET /v1/hosts.*unexpected hosts listing"):
+        await _launch_hosts(body)
 
 
 @pytest.mark.asyncio
@@ -1763,3 +1765,17 @@ async def test_list_launch_hosts_treats_auto_or_empty_harness_as_unknown(harness
     hosts = [_host("h1", harnesses={"claude-sdk": False})]
 
     assert [ok for _, _, ok, _ in await _launch_hosts({"hosts": hosts}, harness=harness)] == [True]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", [None, {}, {"id": "ag_bad", "name": ""}])
+async def test_resolve_agent_validates_the_whole_matching_page(invalid: object) -> None:
+    """A matching first row cannot hide malformed registrations later in that page."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": [{"id": "ag_good", "name": "good"}, invalid]})
+
+    namespace, client = _make_namespace(handler)
+    async with client:
+        with pytest.raises(OmnigentError, match="malformed agent row"):
+            await namespace.resolve_agent("good")

@@ -33,6 +33,7 @@ from pydantic import TypeAdapter
 
 from omnigent.server.schemas import ServerStreamEvent
 
+from ._agent_catalog import AgentCatalogEntry, RegisteredAgent, RegisteredAgentCatalog
 from ._child_status import child_summary_busy
 from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
 from ._timeouts import _HOST_LAUNCH_READ_TIMEOUT_S, _SSE_TIMEOUT
@@ -181,6 +182,7 @@ class Session:
         returned with ``visibility="archived"`` or with
         ``visibility="all", include_archived=True``. ``False`` for normal
         sessions.
+    :param host_id: Host owning this session's runner, or ``None`` when unbound.
     """
 
     id: str
@@ -202,6 +204,7 @@ class Session:
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None
     archived: bool = False
+    host_id: str | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Session:
@@ -238,6 +241,7 @@ class Session:
             last_task_error=raw.get("last_task_error"),
             external_session_id=raw.get("external_session_id"),
             archived=bool(raw.get("archived", False)),
+            host_id=raw.get("host_id"),
         )
 
 
@@ -347,21 +351,6 @@ class LaunchHost:
     name: str
     launchable: bool = True
     unavailable_reason: str | None = None
-
-
-@dataclass(frozen=True)
-class RegisteredAgent:
-    """
-    A server-registered agent resolved by display name.
-
-    :param id: The agent's durable identifier, e.g. ``"ag_abc123"``.
-    :param harness: Harness the agent runs on, e.g.
-        ``"openai-agents"``. ``None`` when the server did not report
-        one.
-    """
-
-    id: str
-    harness: str | None = None
 
 
 class SessionsNamespace:
@@ -554,65 +543,33 @@ class SessionsNamespace:
             ``last_id`` cursor (a stalled walk, not an absent agent).
         :raises LookupError: If no registered agent has that name.
         """
-        # Cap the miss-path name list: a large deployment should not
-        # build thousands of names just to render one error message.
-        names: list[str] = []
-        truncated = False
-        # Server agents first, then the caller's own (``omnigent agent add``).
-        for scope in (None, "user"):
-            after: str | None = None
-            while True:
-                params: dict[str, str | int] = {"limit": 1000}
-                if scope is not None:
-                    params["scope"] = scope
-                if after is not None:
-                    params["after"] = after
-                resp = await self._http.get(f"{self._base}/v1/agents", params=params)
-                if scope is not None and resp.status_code in (401, 403, 404, 422):
-                    # No usable user-agent listing: only server agents count.
-                    break
-                raise_for_status(resp.status_code, response_body(resp))
-                listing = require_json_object(resp, "GET /v1/agents")
-                data = listing.get("data", [])
-                for item in data if isinstance(data, list) else []:
-                    if not isinstance(item, dict):
-                        continue
-                    name = item.get("name")
-                    if name == agent_name:
-                        harness = item.get("harness")
-                        return RegisteredAgent(
-                            id=str(item["id"]),
-                            harness=str(harness) if isinstance(harness, str) else None,
-                        )
-                    if isinstance(name, str) and name not in names:
-                        if len(names) < 50:
-                            names.append(name)
-                        else:
-                            truncated = True
-                if not listing.get("has_more"):
-                    break
-                last_id = listing.get("last_id")
-                if not last_id:
-                    # Server reports more pages but provides no cursor to advance
-                    # — raise rather than silently stopping, so callers can
-                    # distinguish a pagination stall from "agent not found".
-                    raise OmnigentError(
-                        f"agent listing stalled: server returned has_more=True but"
-                        f" no last_id cursor (searched so far: {', '.join(names) or '<none>'})"
-                    )
-                next_after = str(last_id)
-                if next_after == after:
-                    # A cursor that does not advance would page forever; raise
-                    # instead of looping on the same page.
-                    raise OmnigentError(
-                        f"agent listing stalled: server repeated cursor {next_after!r}"
-                        f" with has_more=True (searched so far: {', '.join(names) or '<none>'})"
-                    )
-                after = next_after
-        available = ", ".join(names) + (", …" if truncated else "")
+        agents = await self.list_registered_agents(stop_at=agent_name)
+        for agent in agents:
+            if agent.name == agent_name:
+                return RegisteredAgent(id=agent.id, harness=agent.harness)
+        names = [agent.name for agent in agents]
+        available = ", ".join(names[:50]) + (", ..." if len(names) > 50 else "")
         raise LookupError(
             f"No agent named {agent_name!r} is registered on this server. Available: {available}"
         )
+
+    async def list_registered_agents(
+        self, *, stop_at: str | None = None
+    ) -> list[AgentCatalogEntry]:
+        """List server and user registrations with server-first name precedence.
+
+        :param stop_at: Stop after a validated page containing this name.
+        :returns: Unique registrations in catalog order.
+        :raises OmnigentError: On failed requests, malformed rows or stalled pagination.
+        """
+        catalog = RegisteredAgentCatalog(stop_at=stop_at)
+        while not catalog.done:
+            resp = await self._http.get(f"{self._base}/v1/agents", params=catalog.params)
+            if catalog.skip_unavailable_scope(resp.status_code):
+                break
+            raise_for_status(resp.status_code, response_body(resp))
+            catalog.add_page(require_json_object(resp, "GET /v1/agents"))
+        return list(catalog.entries.values())
 
     async def resolve_online_runner(
         self,
@@ -695,7 +652,9 @@ class SessionsNamespace:
         resp = await self._http.get(f"{self._base}/v1/hosts")
         raise_for_status(resp.status_code, response_body(resp))
         listing = require_json_object(resp, "GET /v1/hosts")
-        hosts = listing.get("hosts", [])
+        hosts = listing.get("hosts")
+        if not isinstance(hosts, list):
+            raise OmnigentError("GET /v1/hosts returned an unexpected hosts listing")
 
         def _norm(name: str) -> str:
             return canonicalize(name) if canonicalize is not None else name
@@ -703,7 +662,7 @@ class SessionsNamespace:
         # Like the server's launch check, no specific harness means unknown readiness.
         wanted = {harness, _norm(harness)} if harness not in (None, "", "auto") else set()
         result: list[LaunchHost] = []
-        for item in hosts if isinstance(hosts, list) else []:
+        for item in hosts:
             if not isinstance(item, dict) or item.get("status") != "online":
                 continue
             if item.get("sandbox_provider") is not None:

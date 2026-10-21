@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import secrets
@@ -28,8 +29,12 @@ import click
 import httpx
 import yaml
 from omnigent_client import (
+    AgentCatalogEntry as _AgentChoice,
+)
+from omnigent_client import (
     OmnigentClient,
     RegisteredAgent,
+    RegisteredAgentCatalog,
     SessionToolCallInfo,
     ToolCallable,
     ToolCallInfo,
@@ -624,8 +629,6 @@ def run_attach(
     # snapshot gives the agent name + harness for an honest banner.
     info = _attach_session_info(base_url=base_url, conversation_id=conversation_id)
     if not info.runner_online:
-        from omnigent.util.server_url import display_server_url
-
         raise click.ClickException(
             f"Session {conversation_id} has no online runner on "
             f"{display_server_url(base_url)} — its "
@@ -711,6 +714,30 @@ def get_session_host(session_id: str) -> str | None:
     :returns: The host id, or ``None`` (session not seen yet, or hostless).
     """
     return _session_hosts.get(session_id)
+
+
+async def _route_remote_session_request(request: httpx.Request) -> None:
+    """Route each remote CLI request by its own host, without pinning the client."""
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, databricks_request_headers
+
+    base_path, separator, route = request.url.path.partition("/v1/sessions")
+    if not separator:
+        return
+    host_id = None
+    if (
+        not route
+        and request.method == "POST"
+        and "application/json" in request.headers.get("content-type", "")
+    ):
+        host_id = json.loads(request.content).get("host_id")
+    elif route.startswith("/"):
+        host_id = get_session_host(urllib.parse.unquote(route.split("/")[1]))
+    request.headers.pop(OMNIGENT_SLICE_KEY_HEADER, None)
+    request.headers.update(
+        databricks_request_headers(
+            str(request.url.copy_with(path=base_path, query=None)), host_id=host_id
+        )
+    )
 
 
 def _remote_headers(
@@ -900,16 +927,13 @@ class _DatabricksTokenAuth(httpx.Auth):
         # from the session→host map. An unsharded server has no sharding layer,
         # so no key.
         if self._server_url:
-            from omnigent.cli_auth import (
-                OMNIGENT_SLICE_KEY_HEADER,
-                databricks_request_headers,
-            )
+            from omnigent.cli_auth import databricks_request_headers
 
             session_host = get_session_host(self._session_id) if self._session_id else None
             request.headers.update(
                 databricks_request_headers(
                     self._server_url,
-                    host_id=session_host or request.headers.get(OMNIGENT_SLICE_KEY_HEADER),
+                    host_id=session_host,
                 )
             )
         if self._static_token:
@@ -1124,8 +1148,6 @@ def _chat_with_server(
         if agent_name is None and fork_session_id is not None:
             agent_name = "agent"
         if agent_name is None and initial_message is not None:
-            from omnigent.util.server_url import display_server_url
-
             # --agent is rejected with --resume, so the generic "pass --agent"
             # advice would be a dead end here.
             raise _server_setup_error(
@@ -1532,26 +1554,6 @@ def _discovery_get(
     return body
 
 
-def _listing_items(
-    body: dict[str, Any], base_url: str, path: str, *, what: str = "Agent discovery"
-) -> list[dict[str, Any]]:
-    """Return listing rows without silently discarding malformed entries."""
-    data = body.get("data")
-    if not isinstance(data, list):
-        raise _discovery_error(base_url, path, "returned an unexpected body shape", what=what)
-    if any(not isinstance(item, dict) for item in data):
-        raise _discovery_error(base_url, path, "returned a malformed agent row", what=what)
-    return data
-
-
-@dataclass(frozen=True, kw_only=True)
-class _AgentChoice(RegisteredAgent):
-    """A catalog entry whose identity survives the CLI's display-name picker."""
-
-    name: str
-    source: str
-
-
 #: Most agent names an error message spells out before summarizing the rest.
 _MAX_LISTED_AGENTS = 20
 
@@ -1563,87 +1565,24 @@ def _format_agent_names(names: list[str]) -> str:
     return f"{shown} (and {hidden} more)" if hidden > 0 else shown
 
 
-def _server_agents(
-    base_url: str, *, stop_at: str | None = None, scope: str | None = None
-) -> list[_AgentChoice]:
-    """
-    Return selectable catalog entries, retaining their ids and harnesses.
-
-    Walks ``GET /v1/agents``, the same listing ``resolve_agent`` binds a new
-    session against, so every name returned here can start a session.
-
-    :param base_url: Server base URL.
-    :param stop_at: Stop paging as soon as this name is seen, e.g. ``"scribe"``.
-    :param scope: ``"user"`` to list the caller's own agents instead.
-    :returns: Registered agents in listing order; only the pages read so
-        far when *stop_at* was found early.
-    :raises click.ClickException: If the server is unreachable or the listing
-        reports more agents without a usable cursor.
-    """
-    agents: list[_AgentChoice] = []
-    seen: set[str] = set()
-    after: str | None = None
-    while True:
-        params: dict[str, Any] = {"limit": 1000}
-        if scope is not None:
-            params["scope"] = scope
-        if after is not None:
-            params["after"] = after
-        page = _discovery_get(base_url, "/v1/agents", params)
-        for item in _listing_items(page, base_url, "/v1/agents"):
-            name = item.get("name")
-            agent_id = item.get("id")
-            harness = item.get("harness")
-            if (
-                not isinstance(name, str)
-                or not name.strip()
-                or not isinstance(agent_id, str)
-                or not agent_id.strip()
-            ):
-                raise _discovery_error(
-                    base_url,
-                    "/v1/agents",
-                    "returned a malformed agent row (expected non-empty string id and name)",
-                )
-            if name not in seen:
-                seen.add(name)
-                agents.append(
-                    _AgentChoice(
-                        id=agent_id,
-                        name=name,
-                        harness=harness if isinstance(harness, str) else None,
-                        source=scope or "server",
-                    )
-                )
-        if (stop_at is not None and stop_at in seen) or not page.get("has_more"):
-            return agents
-        last_id = page.get("last_id")
-        if not last_id or last_id == after:
-            raise _discovery_error(
-                base_url, "/v1/agents", "reported more agents but no usable cursor to fetch them"
-            )
-        after = last_id
-
-
 def _registered_agents(base_url: str, *, stop_at: str | None = None) -> list[_AgentChoice]:
-    """Agents a new session can start with: server agents, then the caller's own."""
-    agents = _server_agents(base_url, stop_at=stop_at)
-    if stop_at is not None and any(agent.name == stop_at for agent in agents):
-        return agents
-    try:
-        user_agents = _server_agents(base_url, scope="user", stop_at=stop_at)
-    except click.ClickException as exc:
-        cause = exc.__cause__
-        if not isinstance(cause, httpx.HTTPStatusError) or cause.response.status_code not in (
-            401,
-            403,
-            404,
-            422,
-        ):
+    """Read the SDK catalog policy through the CLI's authenticated sync transport."""
+    catalog = RegisteredAgentCatalog(stop_at=stop_at)
+    while not catalog.done:
+        try:
+            page = _discovery_get(base_url, "/v1/agents", catalog.params)
+        except click.ClickException as exc:
+            cause = exc.__cause__
+            if isinstance(cause, httpx.HTTPStatusError) and catalog.skip_unavailable_scope(
+                cause.response.status_code
+            ):
+                break
             raise
-        user_agents = []
-    seen = {agent.name for agent in agents}
-    return agents + [agent for agent in user_agents if agent.name not in seen]
+        try:
+            catalog.add_page(page)
+        except ClientOmnigentError as exc:
+            raise _discovery_error(base_url, "/v1/agents", str(exc)) from exc
+    return list(catalog.entries.values())
 
 
 def _server_setup_error(message: str) -> click.ClickException:
@@ -1657,8 +1596,6 @@ def _server_setup_error(message: str) -> click.ClickException:
 
 def _no_registered_agents_message(base_url: str) -> str:
     """Build the error for a server that has no registered agents at all."""
-    from omnigent.util.server_url import display_server_url
-
     return (
         f"No agents are registered on {display_server_url(base_url)}. Install one with "
         f"`{cli_invocation()} agent add <path> --server <url>`, or register one when starting "
@@ -1683,7 +1620,6 @@ def _require_registered_agent(base_url: str, agent_name: str) -> _AgentChoice:
     names = [agent.name for agent in agents]
     if not names:
         raise _server_setup_error(_no_registered_agents_message(base_url))
-    from omnigent.util.server_url import display_server_url
 
     raise _server_setup_error(
         f"Agent {printable(repr(agent_name))} is not registered on "
@@ -1719,8 +1655,6 @@ def _pick_agent(base_url: str, *, quiet: bool = False, interactive: bool = True)
         return agents[0]
 
     if quiet or not interactive:
-        from omnigent.util.server_url import display_server_url
-
         names = _format_agent_names([agent.name for agent in agents])
         raise _server_setup_error(
             f"Several agents are available on {display_server_url(base_url)}; pass "
@@ -1856,7 +1790,6 @@ def _unreachable_server_message(base_url: str) -> str:
             f"It may have stopped — run `{cli_invocation()} stop`, then try again. "
             f"Server logs are under {process_log_dir_reference('server')}."
         )
-    from omnigent.util.server_url import display_server_url
 
     return (
         f"Could not connect to the Omnigent server at {display_server_url(base_url)}. "
@@ -2597,6 +2530,7 @@ def _run_headless_prompt(
             base_url=base_url,
             headers=_server_headers(runner_id=runner_id),
             auth=_server_auth(server_url=base_url, session_id=None),
+            request_hooks=[_route_remote_session_request],
         ) as client:
             # Both a local bundle and a remote registered agent go through
             # the sessions API; _query_sessions_once picks the create route
@@ -2677,7 +2611,6 @@ async def _query_sessions_once(
     """
     from omnigent.remote_launch import (
         LaunchHostError,
-        pin_remote_launch_host,
         resolve_remote_launch_host,
     )
 
@@ -2689,9 +2622,9 @@ async def _query_sessions_once(
     launch_host_id: str | None = None
     if runner_id is None and session_bundle is None:
         if resume_conversation_id is not None:
-            # A resumed session may use an uploaded agent that isn't
-            # resolvable by name, so take the harness from the session.
+            # Resumed sessions may use unnamed uploads; take the harness from the session.
             resumed = await client.sessions.get(resume_conversation_id)
+            set_session_host(resume_conversation_id, getattr(resumed, "host_id", None))
             harness = resumed.harness if isinstance(resumed.harness, str) else None
             if harness is not None and not harness.strip():
                 harness = None
@@ -2730,13 +2663,13 @@ async def _query_sessions_once(
             )
     tool_callables = _sessions_tool_callables(tool_handler, agent_name)
     if launch_host_id is not None and agent is not None:
-        pin_remote_launch_host(client.sessions, launch_host_id)
         # The server launches and binds the host's runner itself.
         bound = await client.sessions.create_from_agent_id(
             agent.id,
             workspace=os.getcwd(),
             host_id=launch_host_id,
         )
+        set_session_host(bound.id, launch_host_id)
     elif runner_id is None:
         raise RuntimeError(
             "Sessions API headless prompt requires a registered runner id. "
@@ -2765,6 +2698,7 @@ async def _query_sessions_once(
                 workspace=os.getcwd(),
             )
         bound = await client.sessions.bind_runner(created.id, runner_id=runner_id)
+        set_session_host(bound.id, getattr(bound, "host_id", None))
     del agent_name
     try:
         if on_session_ready is not None:
@@ -4485,6 +4419,7 @@ def _run_repl(
             base_url=base_url,
             headers=_server_headers(runner_id=runner_id),
             auth=server_auth,
+            request_hooks=[_route_remote_session_request],
         ) as client:
             # When --fork is set, call the fork endpoint before
             # entering the REPL so the user lands in the fork.

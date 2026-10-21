@@ -2049,6 +2049,7 @@ def test_pick_agent_without_registered_agents_is_a_clean_error(
         _pick_agent("http://127.0.0.1:6767")
 
     assert suppresses_recovery_hint(excinfo.value)
+    assert "agent add" in str(excinfo.value)
 
 
 def test_require_registered_agent_rejects_an_unknown_name(
@@ -5573,21 +5574,9 @@ def test_one_shot_uses_selected_catalog_id_without_resolving_the_name_again(
     assert result == "pong"
     assert sessions.created["agent_id"] == "ag_selected"
     assert harnesses == ["openai-agents"]
+    assert sessions.created.get("host_id") == ("host_local" if online_runner is None else None)
+    assert sessions.bound == ([] if online_runner is None else [online_runner])
     assert sessions.events == ([("conv_new", _STOP)] if online_runner is None else [])
-
-
-def test_one_shot_launches_on_this_host_and_stops_the_runner(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """No online runner but this machine is a connected host: launch there, then stop it."""
-    _local_host(monkeypatch, "host_local")
-    sessions = _LaunchSessions()
-
-    assert _launch_turn(sessions, monkeypatch) == "pong"
-
-    assert sessions.created["host_id"] == "host_local"
-    assert sessions.bound == []  # the server binds the runner it launched
-    assert sessions.events == [("conv_new", _STOP)]
 
 
 @pytest.mark.asyncio
@@ -5655,6 +5644,7 @@ async def test_one_shot_host_launch_routes_actual_http_requests(
         transport=httpx.MockTransport(handler),
         headers=chat_module._server_headers(),
         auth=chat_module._server_auth(server_url=base_url, session_id=None),
+        event_hooks={"request": [chat_module._route_remote_session_request]},
     ) as http:
         sessions = SessionsNamespace(http, base_url)
         result = await _query_sessions_once(
@@ -5762,17 +5752,7 @@ def test_one_shot_stop_failure_keeps_the_reply(monkeypatch: pytest.MonkeyPatch) 
     sessions = _LaunchSessions(stop_error=ClientOmnigentError("gone"))
 
     assert _launch_turn(sessions, monkeypatch) == "pong"
-
-
-def test_one_shot_leaves_an_adopted_runner_running(monkeypatch: pytest.MonkeyPatch) -> None:
-    _local_host(monkeypatch, "host_local")
-    sessions = _LaunchSessions(online_runner="runner_shared")
-
-    assert _launch_turn(sessions, monkeypatch) == "pong"
-
-    assert "host_id" not in sessions.created or sessions.created["host_id"] is None
-    assert sessions.bound == ["runner_shared"]
-    assert sessions.events == []
+    assert sessions.events == [("conv_new", _STOP)]
 
 
 def test_one_shot_with_only_other_machines_hosts_names_them(
@@ -6152,10 +6132,3 @@ def test_user_agents_follow_the_listing_cursor(monkeypatch: pytest.MonkeyPatch) 
     )
 
     assert chat_module._require_registered_agent("http://127.0.0.1:6799", "b").id == "ag_b"
-
-
-def test_no_registered_agents_message_mentions_agent_add() -> None:
-    message = chat_module._no_registered_agents_message("http://127.0.0.1:6799")
-
-    assert "No agents are registered" in message
-    assert "agent add" in message

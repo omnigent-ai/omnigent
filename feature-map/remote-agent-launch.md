@@ -44,60 +44,20 @@ the host-launch case. Use this checkout's frozen dependencies, a local mock
 model, isolated homes, and only fixture-owned processes. Interactive process
 coverage requires `pexpect`; a skipped variant is not proof.
 
-- `catalog`, `selection`, and `identity`: component cases in
-  `tests/cli/test_chat.py` cover fresh/used catalogs, pagination, server/user
-  collisions, and headless ambiguity. The real-service scenario
-  `tests/e2e/test_remote_url_chat_fresh_session_2437.py::test_run_one_shot_on_fresh_server_asks_for_agent_then_answers_with_it`
-  checks ambiguity, explicit selection, and unchanged choices after the first
-  session. The real-service adapter scenario
-  `tests/e2e/test_remote_url_chat_fresh_session_2437.py::test_repl_adapter_creates_session_without_bundle`
-  uploads a differing same-name bundle and verifies the registered reply
-  without another name lookup; it does not drive the terminal UI.
-- Interactive selection:
-  `tests/cli/test_chat.py::test_pick_agent_menu_accepts_a_name_or_index`
-  checks menu selection by name and index with a mocked catalog.
-  For terminal proof, register A and B on an isolated server, run A once, then
-  run the interactive CLI, choose unused B by name, and send `hi`. Capture the
-  menu, B's scripted reply, exit status, and its catalog ID from the session.
-  The complete menu-to-reply journey still needs a dedicated PTY regression.
-- `runner-lifecycle`: both parameters of
-  `tests/e2e/test_remote_url_chat_fresh_session_2437.py::test_run_launches_a_runner_on_this_machines_host`
-  run the real CLI against an isolated server and host with no initial runner.
-  Check the reply, exit status, selected agent ID, host ID, workspace, and
-  one-shot cleanup versus interactive runner ownership. Component matrices in
-  `tests/cli/test_remote_launch.py`,
-  `tests/repl/test_repl_remote_agent_lookup.py`, and
-  `tests/frontends/sdk/test_sessions_namespace.py` cover readiness decoding,
-  harness matching, other machines, adopted runners, and redundant binding.
-  `tests/cli/test_chat.py::test_one_shot_host_launch_routes_actual_http_requests`
-  checks creation, session reads, and cleanup headers with and without bearer
-  auth and host sharding. The interactive startup matrix checks creation and
-  later session reads without bearer auth. These use mocked HTTP, not a live
-  sharded deployment.
-  `tests/cli/test_chat.py::test_one_shot_stops_the_launched_runner_on_failure`
-  covers turn errors, turn interrupts, and session-ready callback interrupts.
-- `existing-session`: `tests/cli/test_chat.py` covers source-session lookup,
-  missing resume harnesses, and fork independence from a failing or ambiguous
-  catalog. `tests/cli/test_cli.py` covers early rejection of fork with `-p`.
-  `tests/cli/test_chat.py::test_resume_one_shot_uses_the_sessions_harness_or_agent`
-  covers a valid session harness and missing or malformed harness fallbacks.
-  These regressions are component checks, not a complete process-level fork or
-  resume journey.
-- `errors`: `tests/cli/test_chat.py` and
-  `tests/cli/test_cli_diagnostics.py` check failure messages and recovery advice;
-  `tests/cli/test_login_databricks.py` covers the malformed-proxy URL probe.
-  Mocked HTTP errors do not verify real authentication or access control.
-  Mixed valid/malformed catalog rows must fail instead of auto-selecting the
-  valid survivor; missing optional harness metadata remains supported.
-  Host-listing failures name `GET /v1/hosts` and the HTTP status rather than
-  advising users to start a host. Only a 404 retains the older-server fallback.
-  Host-targeted creation waits beyond the server's maximum launch budget;
-  ordinary requests keep their timeout. A remaining create-time timeout names
-  the host and warns that launch may still complete before suggesting a retry.
-  `tests/frontends/sdk/test_sessions_namespace.py::test_host_launch_waits_past_the_ordinary_http_read_timeout`
-  covers a delayed loopback HTTP reply; it is not a real host-process delay.
-  `tests/cli/test_chat.py::test_one_shot_host_launch_timeout_is_a_clean_cli_error`
-  checks the headless error boundary with injected transport timeouts.
+1. Register A and B on an isolated server. Run A with `--agent A -p "hi"`;
+   then choose unused B in the interactive menu and verify its reply.
+2. With both agents registered, omit `--agent` from a headless run. Verify the
+   error lists choices and creates no session.
+3. Connect this machine's host with no matching runner online. Exercise both
+   interactive and one-shot launches; verify the selected registration, host,
+   workspace, reply and runner ownership after exit.
+4. Resume or fork an existing session and verify its original agent is used.
+   Within the REPL, `/new` should start a fresh session without inheriting a
+   previous launch's routing header.
+
+The process scenarios live in
+`tests/e2e/test_remote_url_chat_fresh_session_2437.py`; catalog, host policy,
+error and routing matrices live in the component suites below.
 
 Run component coverage without browser flags:
 
@@ -133,6 +93,9 @@ point does not establish the others.
 - Resume and fork do not gain automatic offline-runner relaunch. Interactive
   resume of an old snapshot with no agent name can still fall back to a menu;
   headless resume without a usable harness must fail rather than guess.
+- A create-time timeout before the session ID arrives leaves the launch
+  outcome unknown. A late runner may remain running; check the host before
+  retrying. The CLI cannot stop a session whose ID it never received.
 - Catalog IDs identify registrations, not immutable spec revisions. Optional
   user-listing compatibility errors differ from a failed primary catalog.
 - Local mock-model process tests do not prove live provider authentication,

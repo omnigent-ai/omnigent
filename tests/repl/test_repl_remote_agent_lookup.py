@@ -12,6 +12,7 @@ from omnigent_client import RegisteredAgent, SessionsNamespace
 from omnigent_client._sessions import Session
 
 import omnigent.host.identity as identity
+from omnigent.chat import _route_remote_session_request
 from omnigent.repl._repl import _SessionsChatReplAdapter
 
 
@@ -155,17 +156,24 @@ async def test_remote_repl_runner_startup_uses_sdk_host_policy(
             )
             return httpx.Response(200, json={"hosts": hosts})
         if path == "/v1/sessions" and request.method == "POST":
+            if created:
+                assert request.headers["X-Databricks-Omnigent-Slice-Key"] == "host_unrelated"
             created.append(json.loads(request.content))
             if created[-1].get("host_id"):
                 assert request.headers["X-Databricks-Omnigent-Slice-Key"] == "host_local"
                 assert request.extensions["timeout"]["read"] > 3600
             return httpx.Response(201, json=snapshot)
-        if path == "/v1/sessions/conv_remote" and request.method == "GET":
+        if path == f"/v1/sessions/{snapshot['id']}" and request.method == "GET":
+            if len(created) > 1:
+                assert request.headers["X-Databricks-Omnigent-Slice-Key"] == "host_next"
+                return httpx.Response(200, json=snapshot)
             if scenario != "resume":
                 assert created[-1]["host_id"] == "host_local"
                 assert request.headers["X-Databricks-Omnigent-Slice-Key"] == "host_local"
             return httpx.Response(200, json=snapshot)
         if path == "/v1/sessions/conv_remote" and request.method == "PATCH":
+            if json.loads(request.content) == {"runner_id": ""}:
+                return httpx.Response(200, json=snapshot)
             assert scenario == "online-runner"
             assert json.loads(request.content) == {"runner_id": "runner_existing"}
             snapshot["runner_id"] = "runner_existing"
@@ -175,7 +183,10 @@ async def test_remote_repl_runner_startup_uses_sdk_host_policy(
     async def _stream() -> None:
         return
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(_handler)) as http:
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler),
+        event_hooks={"request": [_route_remote_session_request]},
+    ) as http:
         adapter = _SessionsChatReplAdapter(
             SimpleNamespace(sessions=SessionsNamespace(http, "http://srv")),  # type: ignore[arg-type]
             "reviewer",
@@ -205,5 +216,13 @@ async def test_remote_repl_runner_startup_uses_sdk_host_policy(
                 assert created == [expected_body]
                 if "host_id" in expected_body:
                     await adapter._client.sessions.get("conv_remote")
+                assert "X-Databricks-Omnigent-Slice-Key" not in http.headers
+                if scenario == "local-host" and readiness is True:
+                    await adapter.start_new_conversation()
+                    snapshot.update(id="conv_next", host_id="host_next")
+                    assert await adapter._ensure_session() == "conv_next"
+                    await adapter._client.sessions.get("conv_next")
+                    assert "host_id" not in created[-1]
+                    assert "X-Databricks-Omnigent-Slice-Key" not in http.headers
         finally:
             await adapter.aclose()
