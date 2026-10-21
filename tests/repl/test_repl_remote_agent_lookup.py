@@ -6,13 +6,14 @@ import json
 import os
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
 import pytest
 from omnigent_client import OmnigentError, RegisteredAgent, SessionsNamespace
 from omnigent_client._sessions import Session
-from rich.text import Text
+from omnigent_ui_sdk import TerminalHost
 
 import omnigent.host.identity as identity
 from omnigent import session_host
@@ -113,13 +114,15 @@ async def _remote_adapter(
 async def test_remote_repl_runner_startup_uses_sdk_host_policy(
     monkeypatch: pytest.MonkeyPatch,
     scenario: str,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
 ) -> None:
     """Adopt a matching runner, launch for a mismatch, or resume without discovery."""
     monkeypatch.setattr(
         identity, "load_host_identity_if_present", lambda: SimpleNamespace(host_id="host_local")
     )
     requests: list[str] = []
-    output: list[Text] = []
+    host = TerminalHost(model_name="test", history_file=tmp_path / "history")
     snapshot = {
         "id": "conv_remote",
         "agent_id": "ag_selected",
@@ -160,9 +163,8 @@ async def test_remote_repl_runner_startup_uses_sdk_host_policy(
             expected = {"agent_id": "ag_selected", "workspace": os.getcwd()}
             if scenario in {"mismatched-runner", "launch-error"}:
                 expected["host_id"] = "host_local"
-                assert [text.plain for text in output] == [
-                    "Waiting for this machine to start your agent..."
-                ]
+                assert host._live_line_count > 0
+                assert "Waiting for this machine to start your agent..." in capsys.readouterr().out
             assert json.loads(request.content) == expected
             if scenario == "launch-error":
                 return httpx.Response(502, json={"error": {"message": "Host launch refused"}})
@@ -180,7 +182,7 @@ async def test_remote_repl_runner_startup_uses_sdk_host_policy(
     async with _remote_adapter(
         monkeypatch, handler, session_id="conv_remote" if scenario == "resume" else None
     ) as adapter:
-        monkeypatch.setattr(adapter, "_host", SimpleNamespace(output=output.append))
+        monkeypatch.setattr(adapter, "_host", host)
         if scenario == "no-host":
             with pytest.raises(RuntimeError, match="no online runner"):
                 await adapter._ensure_session()
@@ -196,8 +198,8 @@ async def test_remote_repl_runner_startup_uses_sdk_host_policy(
             if scenario == "resume":
                 assert requests == ["GET /v1/sessions/conv_remote"]
                 assert adapter._agent_name == "uploaded-only"
-        if scenario not in {"mismatched-runner", "launch-error"}:
-            assert output == []
+        assert host._live_line_count == 0
+        assert "Waiting for this machine" not in capsys.readouterr().out
 
 
 @pytest.mark.asyncio

@@ -50,6 +50,7 @@ from omnigent_ui_sdk import (
     save_user_config,
     update_user_config,
 )
+from omnigent_ui_sdk.terminal import StreamLive
 
 # ``FormattedItem`` is the SDK formatter's per-method return type
 # (``Rich.RenderableType | StreamingText | StreamReplace``). The
@@ -1796,14 +1797,19 @@ class _SessionsChatReplAdapter:
         # Snapshot the pre-create /model pick before hydration clobbers
         # it; applied after create since create has no such field.
         pending_model_override = self._model_override
-        if launch_host_id is not None and self._host is not None:
-            self._host.output(Text(REMOTE_LAUNCH_MESSAGE))
-        session = await self._client.sessions.create_from_agent_id(
-            agent.id,
-            reasoning_effort=self._reasoning_effort,
-            workspace=os.getcwd(),
-            host_id=launch_host_id,
-        )
+        progress_host = self._host if launch_host_id is not None else None
+        if progress_host is not None:
+            progress_host.output(StreamLive(Text(REMOTE_LAUNCH_MESSAGE)))
+        try:
+            session = await self._client.sessions.create_from_agent_id(
+                agent.id,
+                reasoning_effort=self._reasoning_effort,
+                workspace=os.getcwd(),
+                host_id=launch_host_id,
+            )
+        finally:
+            if progress_host is not None:
+                progress_host.clear_streamed_text()
         self._session_id = session.id
         self._hydrate_from_session_snapshot(session)
         if launch_host_id is not None:
