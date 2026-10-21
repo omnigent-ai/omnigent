@@ -42,7 +42,7 @@ it("shares inventory per provider, skips closed pickers, and isolates owners and
   const { rerender } = render(rows(false));
   expect(fetch).not.toHaveBeenCalled();
   rerender(rows(true));
-  await waitFor(() => expect(screen.getAllByText("Sandbox: running")).toHaveLength(2));
+  await waitFor(() => expect(screen.getAllByText("running")).toHaveLength(2));
   expect(fetch).toHaveBeenCalledTimes(1);
   rerender(rows(false));
   rerender(rows(true));
@@ -50,10 +50,10 @@ it("shares inventory per provider, skips closed pickers, and isolates owners and
   fetch.mockImplementation(() => new Promise(() => {}));
   rerender(rows(true, "other"));
   await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
-  expect(screen.getAllByText("Sandbox: running")).toHaveLength(1);
+  expect(screen.getAllByText("running")).toHaveLength(1);
   vi.mocked(useViewerId).mockReturnValueOnce("bob").mockReturnValueOnce("bob");
   rerender(rows(true, "other"));
-  expect(screen.queryByText("Sandbox: running")).not.toBeInTheDocument();
+  expect(screen.queryByText("running")).not.toBeInTheDocument();
   await waitFor(() => expect(fetch).toHaveBeenCalledTimes(4));
 });
 
@@ -113,7 +113,7 @@ it("marks stale state and replaces it with unavailable on failure, then recovers
   await act(async () => {
     await client.invalidateQueries({ queryKey: ["sandbox-discovery"] });
   });
-  expect(await screen.findByText("Sandbox: running")).toBeVisible();
+  expect(await screen.findByText("running")).toBeVisible();
 });
 
 it("bounds slow lookups and preserves unknown state for older host responses", async () => {

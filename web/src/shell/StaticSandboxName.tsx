@@ -19,7 +19,7 @@ export function StaticSandboxEdit({ onEdit }: { onEdit: () => void }) {
     <span
       data-sandbox-edit=""
       aria-hidden="true"
-      className="ml-auto flex h-8 shrink-0 cursor-pointer items-center text-xs text-muted-foreground underline-offset-2 opacity-0 hover:text-foreground hover:underline group-hover/sandbox:opacity-100 group-focus/sandbox:opacity-100 group-data-[active=true]/sandbox:opacity-100 group-data-[state=checked]/sandbox:opacity-100 max-md:opacity-100"
+      className="ml-auto flex h-6 shrink-0 cursor-pointer items-center text-xs font-normal text-muted-foreground underline-offset-2 opacity-0 hover:text-foreground hover:underline group-hover/sandbox:opacity-100 group-focus/sandbox:opacity-100 group-data-[active=true]/sandbox:opacity-100 group-data-[state=checked]/sandbox:opacity-100 max-md:opacity-100"
       onPointerUp={(event) => event.preventDefault()}
       onClick={(event) => {
         event.preventDefault();

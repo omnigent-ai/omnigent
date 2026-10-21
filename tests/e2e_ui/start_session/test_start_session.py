@@ -3626,7 +3626,7 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
                 row = page.get_by_test_id("new-chat-landing-host-host_devbox")
                 await expect(row).to_be_visible()
                 await expect(row).to_contain_text("Offline")
-                await expect(row).to_contain_text("Sandbox: running")
+                await expect(row.get_by_text("running", exact=True)).to_be_visible()
                 menu = page.get_by_test_id("new-chat-landing-host-menu")
                 await expect(menu.get_by_role("menuitem").nth(-2)).to_have_text(
                     "Existing Static Sandbox"
@@ -3655,7 +3655,7 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
                 assert wake_calls == ["POST"]
                 await expect(page.locator("[data-sandbox-edit]")).to_have_count(0)
                 await chip.click()
-                await expect(row).to_contain_text("Sandbox: starting")
+                await expect(row.get_by_text("starting", exact=True)).to_be_visible()
                 await row.hover()
                 await expect(row.get_by_text("Edit", exact=True)).to_be_visible()
                 await page.screenshot(
@@ -3676,7 +3676,7 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
                 inventory_unavailable = True
                 await chip.click()
                 await expect(row).to_contain_text("State unavailable")
-                await expect(row).not_to_contain_text("Sandbox: starting")
+                await expect(row.get_by_text("starting", exact=True)).to_have_count(0)
                 await page.screenshot(
                     path=str(tmp_path / "state-unavailable.png"), animations="disabled"
                 )
@@ -3717,7 +3717,7 @@ def test_attached_sandbox_wakes_and_remains_a_reusable_picker_target(
                 )
                 await clone.get_by_test_id("fork-session-host-select").tap()
                 clone_row = page.get_by_test_id("fork-session-host-option-host_devbox")
-                await expect(clone_row).to_contain_text("Sandbox: running")
+                await expect(clone_row.get_by_text("running", exact=True)).to_be_visible()
                 await expect(clone_row.get_by_text("Edit", exact=True)).to_be_visible()
                 await page.screenshot(
                     path=str(tmp_path / "edit-in-clone-picker.png"), animations="disabled"

@@ -11,6 +11,7 @@ import {
 import { authenticatedFetch } from "@/lib/identity";
 import type { Host } from "@/hooks/useHosts";
 import { useViewerId } from "@/hooks/useViewerId";
+import { cn } from "@/lib/utils";
 
 interface Sandbox {
   sandbox_id: string;
@@ -39,22 +40,35 @@ function useSandboxInventory(provider: string | null, enabled = true) {
 }
 
 /** Optional controller information, never a gate on selecting or waking a host. */
-export function StaticSandboxState({ host, enabled }: { host: Host; enabled: boolean }) {
+export function StaticSandboxState({
+  host,
+  enabled,
+  className,
+}: {
+  host: Host;
+  enabled: boolean;
+  className?: string;
+}) {
   const provider =
     host.sandbox_attached && host.sandbox_id ? (host.sandbox_provider ?? null) : null;
   const inventory = useSandboxInventory(provider, enabled);
   if (!enabled || provider === null) return null;
+  const labelClass = cn(
+    "min-w-0 truncate text-xs font-normal leading-4 text-muted-foreground first-letter:uppercase",
+    className,
+  );
   if (inventory.isError) {
-    return <span className="text-xs text-muted-foreground">State unavailable</span>;
+    return <span className={labelClass}>State unavailable</span>;
   }
   const state = inventory.data?.find((box) => box.sandbox_id === host.sandbox_id)?.state;
   if (!state) return null;
   return (
     <span
-      className="max-w-36 truncate text-xs text-muted-foreground"
+      className={labelClass}
       title={`Controller state: ${state}. Checked ${new Date(inventory.dataUpdatedAt).toLocaleString()}. Separate from host connectivity.`}
     >
-      {inventory.isStale ? "Last reported" : "Sandbox"}: {state}
+      {inventory.isStale && "Last reported: "}
+      {state}
     </span>
   );
 }

@@ -91,6 +91,7 @@ import { resolveWorkspacePath, useResolvedHostHome } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
 import { StaticSandboxPicker, StaticSandboxState } from "./StaticSandboxPicker";
 import { StaticSandboxEdit, StaticSandboxName } from "./StaticSandboxName";
+import { cn } from "@/lib/utils";
 import { WorkspacePathField } from "./WorkspacePathField";
 import {
   ConnectHostInstructions,
@@ -139,15 +140,17 @@ function ForkFieldError({ message }: { message: string | null }) {
 function HostLabel({ host }: { host: Host }) {
   const isOnline = host.status === "online";
   return (
-    <span className="flex items-center gap-2">
+    <span className="flex min-w-0 items-center gap-2">
       {host.name.toLowerCase().includes("cloud") ? (
         <MonitorCloudIcon className="size-4 text-muted-foreground" />
       ) : (
         <MonitorIcon className="size-4 text-muted-foreground" />
       )}
-      <span className="font-mono text-sm">{host.display_name ?? host.name}</span>
+      <span className={cn("min-w-0 truncate text-sm", !host.sandbox_attached && "font-mono")}>
+        {host.display_name ?? host.name}
+      </span>
       <span
-        className={`inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${
+        className={`inline-flex shrink-0 items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${
           isOnline ? "text-green-600" : "text-muted-foreground"
         }`}
       >
@@ -1603,7 +1606,10 @@ function SupportedForkSessionForm({
                         value={host.host_id}
                         disabled={host.status === "offline" && !host.sandbox_attached}
                         data-testid={`fork-session-host-option-${host.host_id}`}
-                        className="group/sandbox"
+                        className={cn(
+                          "group/sandbox",
+                          host.sandbox_attached && "grid grid-cols-[minmax(0,1fr)_auto] gap-y-0",
+                        )}
                         aria-description={
                           host.sandbox_attached
                             ? "Right Arrow to edit the sandbox name."
@@ -1628,9 +1634,13 @@ function SupportedForkSessionForm({
                         }}
                         action={
                           host.sandbox_attached && (
-                            <span className="ml-auto flex min-w-0 shrink-0 flex-col items-end">
+                            <span className="contents!">
                               <StaticSandboxEdit onEdit={() => editSandboxName(host)} />
-                              <StaticSandboxState host={host} enabled={hostMenuOpen} />
+                              <StaticSandboxState
+                                host={host}
+                                enabled={hostMenuOpen}
+                                className="col-span-2 col-start-1 row-start-2 pl-6"
+                              />
                             </span>
                           )
                         }

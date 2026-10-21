@@ -478,7 +478,12 @@ function HostOption({
 }) {
   const isOnline = host.status === "online";
   return (
-    <span className="flex w-full min-w-0 items-center gap-1">
+    <span
+      className={cn(
+        "w-full min-w-0 items-center",
+        host.sandbox_attached ? "grid grid-cols-[16px_minmax(0,1fr)_auto] gap-x-2" : "flex gap-1",
+      )}
+    >
       <span className="flex size-4 shrink-0 items-center justify-center">
         {cloud ? (
           <MonitorCloudIcon className="size-3.5 text-muted-foreground" />
@@ -494,7 +499,7 @@ function HostOption({
       </span>
       <span className="min-w-0 flex-1 truncate">
         {displayName}
-        {displayName !== host.name && (
+        {displayName !== host.name && !host.sandbox_attached && (
           <span className="text-xs text-muted-foreground"> • {host.name}</span>
         )}
         {subtitle && <span className="text-xs text-muted-foreground"> • {subtitle}</span>}
@@ -6219,9 +6224,13 @@ export function NewChatLandingScreen() {
           }
           action={
             host.sandbox_attached ? (
-              <span className="ml-auto flex min-w-0 shrink-0 flex-col items-end">
+              <span className="contents">
                 <StaticSandboxEdit onEdit={() => editSandboxName(host)} />
-                <StaticSandboxState host={host} enabled={hostMenuOpen} />
+                <StaticSandboxState
+                  host={host}
+                  enabled={hostMenuOpen}
+                  className="col-span-2 col-start-2 row-start-2"
+                />
               </span>
             ) : reconnect ? (
               <span
