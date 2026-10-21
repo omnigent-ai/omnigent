@@ -1208,6 +1208,46 @@ async def test_offline_host_gets_real_grace_before_native_failure(
         if record.__dict__.get("event_name") == "runner_client_wait"
     ]
     assert wait_event.attributes["outcome"] == "host_offline"
+
+
+async def test_offline_host_send_held_by_client_records_nothing(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A client that resends after reconnect gets a refusal, not a failed turn."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = await _offline_native_host_session(client, app)
+    set_runner_client(None)
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", 0.05)
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
+
+    response = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        headers={"x-omnigent-hold-when-host-offline": "on"},
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        },
+    )
+
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "host_offline"
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    assert [item for item in items if item["type"] == "error"] == []
+    assert [item for item in items if item.get("role") == "user"] == []
+    session = (await client.get(f"/v1/sessions/{session_id}")).json()
+    assert session.get("status") != "failed"
+    [wait_event] = [
+        record
+        for record in caplog.records
+        if record.__dict__.get("event_name") == "runner_client_wait"
+    ]
+    assert wait_event.attributes["outcome"] == "host_offline_held"
     assert wait_event.attributes["attempts"] == 0
 
 
@@ -2490,6 +2530,55 @@ async def test_host_session_message_relaunches_offline_runner(
         "relaunch must mint a NEW runner_id (replace_runner_id); a stale id "
         "would keep routing messages to the dead runner"
     )
+    assert launch_frame.superseded_runner_ids == (original_runner_id,), (
+        "the relaunch must name the binding it replaced so the host stops it"
+    )
+
+
+async def test_unbound_host_session_relaunch_names_no_superseded_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relaunch after /clear moved the runner away supersedes nothing.
+
+    /clear unbinds the old session and hands its runner to the successor; if
+    the launch frame named no runners explicitly, the host would stop every
+    runner it launched for this session, including the successor's.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+    SqlAlchemyConversationStore(db_uri).clear_runner_id(session_id)
+
+    set_runner_client(None)
+    post_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "hi"}],
+                },
+            },
+        )
+    )
+    try:
+        launch_frame = await _wait_for_launch(comm, budget_s=budget(5.0))
+    finally:
+        post_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await post_task
+
+    assert launch_frame is not None, "a message to an unbound host session must relaunch"
+    assert launch_frame.superseded_runner_ids == ()
 
 
 async def test_first_message_during_host_spawn_does_not_launch_replacement(

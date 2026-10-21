@@ -519,6 +519,8 @@ describe("index.css native safe-area layout on the rendered WorkspacePanel", () 
           handleProps: { tabIndex: 0 },
           rightRailTab: "files",
           onRightRailTabChange: () => {},
+          openPanels: [],
+          onClosePanel: () => {},
           showFilesPanel: true,
           showGithubTab: false,
           showBrowserTab: false,

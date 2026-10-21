@@ -179,6 +179,9 @@ class ErrorCode:
         §Elicitation completion invariant.
     :cvar RUNNER_UNAVAILABLE: No online runner can serve the
         requested dispatch (HTTP 503).
+    :cvar HOST_OFFLINE: A native message found its session's user-run
+        host offline, and the client said it keeps the message and sends it
+        once the host reconnects (HTTP 503). Nothing was recorded.
     :cvar WRONG_REPLICA: The session's bound runner exists but its
         tunnel is not registered on the replica that served this request
         (HTTP 400). When replicas are sharded by host, a request keyed for
@@ -244,11 +247,13 @@ class ErrorCode:
     INTERNAL_ERROR = "internal_error"
     HARNESS_PROTOCOL_VIOLATION = "harness_protocol_violation"
     RUNNER_UNAVAILABLE = "runner_unavailable"
+    HOST_OFFLINE = "host_offline"
     WRONG_REPLICA = "wrong_replica"
     RUNNER_CAPABILITY_MISMATCH = "runner_capability_mismatch"
     # Keep the string equal to frames.HARNESS_NOT_CONFIGURED_ERROR_CODE —
     # the host's wire error code passes through as the API error code.
     HARNESS_NOT_CONFIGURED = "harness_not_configured"
+    REFRESH_UNSUPPORTED = "refresh_unsupported"
     WORKSPACE_MISSING = "workspace_missing"
     SESSION_AGENT_MISSING = "session_agent_missing"
     UPSTREAM_CANCELLED = "upstream_cancelled"
@@ -282,6 +287,8 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # can fix them; investigation needed in the harness wrap).
     ErrorCode.HARNESS_PROTOCOL_VIOLATION: 500,
     ErrorCode.RUNNER_UNAVAILABLE: 503,
+    # 503 like RUNNER_UNAVAILABLE: the send succeeds once the host is back.
+    ErrorCode.HOST_OFFLINE: 503,
     # 400, not 503: the request reached a replica that can't serve it, but the
     # request is valid — the fix is to re-address it (reissue without the key),
     # not to wait and retry. A 4xx also keeps this expected routing event out of
@@ -295,6 +302,7 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # can't satisfy it until the user runs `omnigent setup` there —
     # neither a 400 (input is fine) nor a 503 (a retry won't help).
     ErrorCode.HARNESS_NOT_CONFIGURED: 412,
+    ErrorCode.REFRESH_UNSUPPORTED: 409,
     ErrorCode.WORKSPACE_MISSING: 410,
     # 410 Gone, like WORKSPACE_MISSING: a valid request whose bound agent was
     # deleted; a retry cannot recreate it.
@@ -335,8 +343,11 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     # A valid request the caller cannot fix by retry or re-input; the
     # deployment/host must change.
     ErrorCode.RUNNER_UNAVAILABLE: ErrorCategory.CONFIG,
+    # The human's own machine is asleep or disconnected.
+    ErrorCode.HOST_OFFLINE: ErrorCategory.USER,
     ErrorCode.RUNNER_CAPABILITY_MISMATCH: ErrorCategory.CONFIG,
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorCategory.CONFIG,
+    ErrorCode.REFRESH_UNSUPPORTED: ErrorCategory.CONFIG,
     # The human deleted their own workspace on the host.
     ErrorCode.WORKSPACE_MISSING: ErrorCategory.USER,
     # The session's agent was deleted or rebound; the caller must recreate the
@@ -383,6 +394,7 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     # artifact the client re-addresses, and an upstream cancellation a retry
     # outlives. No progress is lost.
     ErrorCode.RUNNER_UNAVAILABLE: ErrorImpact.TRANSIENT,
+    ErrorCode.HOST_OFFLINE: ErrorImpact.TRANSIENT,
     ErrorCode.WRONG_REPLICA: ErrorImpact.TRANSIENT,
     ErrorCode.UPSTREAM_CANCELLED: ErrorImpact.TRANSIENT,
     # A single rejected request; the session stays healthy and usable.
@@ -392,6 +404,7 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.INVALID_INPUT: ErrorImpact.BENIGN,
     ErrorCode.ALREADY_EXISTS: ErrorImpact.BENIGN,
     ErrorCode.CONFLICT: ErrorImpact.BENIGN,
+    ErrorCode.REFRESH_UNSUPPORTED: ErrorImpact.BENIGN,
     ErrorCode.STALE_CURSOR: ErrorImpact.BENIGN,
 }
 
@@ -421,8 +434,10 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.CONFLICT: ErrorPhase.REQUEST,
     ErrorCode.WRONG_REPLICA: ErrorPhase.ROUTING,
     ErrorCode.RUNNER_UNAVAILABLE: ErrorPhase.RUNNER_LAUNCH,
+    ErrorCode.HOST_OFFLINE: ErrorPhase.RUNNER_LAUNCH,
     ErrorCode.RUNNER_CAPABILITY_MISMATCH: ErrorPhase.RUNNER_LAUNCH,
     ErrorCode.HARNESS_NOT_CONFIGURED: ErrorPhase.HARNESS_SETUP,
+    ErrorCode.REFRESH_UNSUPPORTED: ErrorPhase.HARNESS_SETUP,
     ErrorCode.WORKSPACE_MISSING: ErrorPhase.HARNESS_SETUP,
     ErrorCode.SESSION_AGENT_MISSING: ErrorPhase.HARNESS_SETUP,
     ErrorCode.HARNESS_PROTOCOL_VIOLATION: ErrorPhase.TURN,

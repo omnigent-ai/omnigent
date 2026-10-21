@@ -42,7 +42,6 @@ import os
 import secrets
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -54,6 +53,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.live_server import find_free_port
 from tests.e2e_ui.conftest import (
     _create_native_codex_session,
     configure_mock_llm,
@@ -91,12 +91,6 @@ _CODEX_MOCK_MODEL = "gpt-4o"
 # executor as "Codex native thread never started: ...").
 _STARTUP_TIMEOUT_MARKER = "startup timed out"
 _NEVER_STARTED_MARKER = "never started a thread"
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 # Proxy-blind client: CI forces an egress proxy via HTTP(S)_PROXY env vars
@@ -199,7 +193,7 @@ harness:
         encoding="utf-8",
     )
 
-    port = _free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     binding_token = secrets.token_urlsafe(32)
 

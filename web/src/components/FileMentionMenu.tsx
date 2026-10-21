@@ -46,7 +46,10 @@ export function FileMentionMenu({
 
   return (
     <div className="absolute bottom-full left-0 z-10 mb-2 flex items-end gap-2">
-      <div className="w-80 max-w-[calc(100vw-2rem)] shrink-0 overflow-hidden rounded-[12px] border border-border bg-popover p-2 shadow-menu">
+      <div
+        data-testid="file-mention-menu"
+        className="w-80 max-w-[calc(100vw-2rem)] shrink-0 overflow-hidden rounded-[12px] border border-border bg-popover p-2 shadow-menu dark:backdrop-blur-xl dark:backdrop-saturate-150"
+      >
         <div className="flex items-center justify-between gap-2 px-1.5 py-1 text-sm font-medium text-muted-foreground">
           <span className="truncate">{currentDir ? `/${currentDir}` : "Workspace"}</span>
           <span className="shrink-0 text-[10px]">↵ open · ⇥ attach</span>

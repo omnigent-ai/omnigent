@@ -32,6 +32,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    InjectionDeliveryAmbiguous,
     Message,
     ReasoningChunk,
     SubAgentCompleted,
@@ -724,6 +725,10 @@ class ExecutorAdapter(HarnessApp):
                     )
                     try:
                         accepted = await executor.enqueue_session_message(self._session_key, text)
+                        outcome = "executor_accepted" if accepted else "executor_refused"
+                    except InjectionDeliveryAmbiguous:
+                        # The harness may already hold the message; resending could duplicate it.
+                        accepted, outcome = True, "executor_ambiguous"
                     except BaseException as exc:
                         log_input_event(
                             _logger,
@@ -739,7 +744,7 @@ class ExecutorAdapter(HarnessApp):
                         _logger,
                         "native_input_steering_finished",
                         session_id=ctx.session_id,
-                        outcome="executor_accepted" if accepted else "executor_refused",
+                        outcome=outcome,
                     )
             except Exception:
                 _logger.exception(

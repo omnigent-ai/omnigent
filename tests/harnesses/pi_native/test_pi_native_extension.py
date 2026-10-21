@@ -3328,6 +3328,154 @@ def test_inbox_model_change_unknown_model_posts_error(tmp_path: Path) -> None:
     _run_extension_script(node, _extension_path(), script)
 
 
+def test_input_waits_for_inbox_model_change_to_settle(tmp_path: Path) -> None:
+    """A routed web turn runs on the routed model, not the old one.
+
+    The executor queues ``model_change`` then ``user_message``; the poller
+    fires the switch without awaiting it, and Pi's ``setModel`` only commits
+    after an async auth check. The ``input`` handler must hold the message's
+    turn until that switch settles.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  let committed = null;
+  pi.setModel = async (model) => {
+    setModelCalls.push(model);
+    await sleep(150); // Pi's checkAuth before agent.state.model is set
+    committed = model.id;
+    return true;
+  };
+  await handlers.session_start({}, ctx);
+  const file = path.join(inboxDir, "000-model.json");
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ id: "m1", type: "model_change", model: "databricks-claude-opus-4-1" }),
+  );
+  while (fs.existsSync(file)) await sleep(10);
+  assert.equal(committed, null); // still in flight
+  await handlers.input({ text: "routed turn", source: "extension" }, ctx);
+  assert.equal(committed, "databricks-claude-opus-4-1");
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_tui_prompt_routes_once_via_route_turn(tmp_path: Path) -> None:
+    """A prompt typed in the Pi TUI asks route-turn once and applies the pick.
+
+    Web messages (``source: "extension"``) were routed server-side and must
+    not be routed again; slash commands are not prompts; and once the server
+    answered, later prompts skip the round trip.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  const routeCalls = [];
+  global.fetch = async (url, request) => {
+    const body = JSON.parse(request.body);
+    if (url.endsWith("/hooks/route-turn")) {
+      routeCalls.push({ url, body });
+      return {
+        ok: true,
+        json: async () => ({
+          action: "route",
+          model: "omnigent/databricks-claude-opus-4-1",
+          terminal: false,
+        }),
+      };
+    }
+    posted.push(body);
+    return { ok: true };
+  };
+  await handlers.session_start({}, ctx);
+  await handlers.input({ text: "from the web", source: "extension" }, ctx);
+  await handlers.input({ text: "/model", source: "interactive" }, ctx);
+  assert.equal(routeCalls.length, 0);
+
+  await handlers.input({ text: "fix the bug", source: "interactive" }, ctx);
+  assert.equal(routeCalls.length, 1);
+  assert.equal(
+    routeCalls[0].url,
+    "http://omnigent.test/v1/sessions/session-1/hooks/route-turn",
+  );
+  assert.deepEqual(routeCalls[0].body, {
+    harness: "pi-native",
+    prompt: "fix the bug",
+    model: "omnigent/databricks-claude-sonnet-4-6",
+  });
+  assert.deepEqual(setModelCalls.map((m) => m.id), ["databricks-claude-opus-4-1"]);
+
+  await handlers.input({ text: "next prompt", source: "interactive" }, ctx);
+  assert.equal(routeCalls.length, 1);
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_tui_prompt_route_turn_failure_fails_open(tmp_path: Path) -> None:
+    """An unreachable route-turn leaves the model alone and is not retried."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  let routeCalls = 0;
+  global.fetch = async (url, request) => {
+    if (url.endsWith("/hooks/route-turn")) {
+      routeCalls += 1;
+      throw new Error("ECONNREFUSED");
+    }
+    posted.push(JSON.parse(request.body));
+    return { ok: true };
+  };
+  await handlers.session_start({}, ctx);
+  await handlers.input({ text: "one", source: "interactive" }, ctx);
+  await handlers.input({ text: "two", source: "interactive" }, ctx);
+  assert.equal(routeCalls, 1);
+  assert.equal(setModelCalls.length, 0);
+  // The user's prompt is still mirrored to Omnigent.
+  assert.ok(
+    posted.some(
+      (e) => e.type === "external_conversation_item" && e.data.item_data.role === "user",
+    ),
+  );
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
 def test_bound_models_use_literal_ids_and_only_managed_providers() -> None:
     """A raw gateway selection cannot switch to an ambient vendor provider."""
     node = shutil.which("node")
@@ -3461,6 +3609,87 @@ def test_session_start_posts_model_options_from_registry(tmp_path: Path) -> None
   const changes = posted.filter((e) => e.type === "external_model_change");
   assert.equal(changes.length, 1, JSON.stringify(posted));
   assert.equal(changes[0].data.model, "omnigent/databricks-claude-sonnet-4-6");
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_session_start_scoped_models_curate_model_options(tmp_path: Path) -> None:
+    """
+    A session with a resolved model scope posts THAT scope, not the registry.
+
+    Pi resolves ``--models`` / settings ``enabledModels`` into
+    ``ctx.scopedModels`` — the exact set its own Ctrl+P picker cycles. When
+    the scope is non-empty the extension must post it as the picker catalog
+    (keeping the launch model listed even when the scope excludes it) instead
+    of dumping ``registry.getAvailable()`` — the union of every logged-in
+    provider's full catalog. An empty scope still falls back to the registry.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  // Scope excludes the launch model: the posted catalog is the launch model
+  // plus the scope, and the registry is never consulted (it throws if read).
+  const throwingRegistry = {
+    getAvailable: () => { throw new Error("scoped session must not list the registry"); },
+    getAll: () => { throw new Error("scoped session must not list the registry"); },
+  };
+  const scopedCtx = {
+    ...ctx,
+    scopedModels: [
+      { model: { provider: "omnigent", id: "databricks-claude-opus-4-1", name: "Opus" } },
+    ],
+    modelRegistry: throwingRegistry,
+  };
+  await handlers.session_start({}, scopedCtx);
+  let opts = posted.filter((e) => e.type === "external_model_options");
+  assert.equal(opts.length, 1, JSON.stringify(posted));
+  assert.deepEqual(
+    opts[0].data.models.map((m) => m.id),
+    [
+      "omnigent/databricks-claude-sonnet-4-6",
+      "omnigent/databricks-claude-opus-4-1",
+    ],
+    JSON.stringify(opts[0].data.models),
+  );
+  assert.equal(opts[0].data.models[1].displayName, "Opus");
+
+  // Scope includes the launch model: exactly the scope, no duplicate row.
+  const inScopeCtx = {
+    ...scopedCtx,
+    scopedModels: [
+      { model: { provider: "omnigent", id: "databricks-claude-sonnet-4-6", name: "Sonnet" } },
+    ],
+  };
+  await handlers.session_start({}, inScopeCtx);
+  opts = posted.filter((e) => e.type === "external_model_options");
+  assert.equal(opts.length, 2, JSON.stringify(posted));
+  assert.deepEqual(opts[1].data.models.map((m) => m.id), [
+    "omnigent/databricks-claude-sonnet-4-6",
+  ]);
+
+  // An empty scope means "no curation": fall back to getAvailable().
+  await handlers.session_start({}, { ...ctx, scopedModels: [] });
+  opts = posted.filter((e) => e.type === "external_model_options");
+  assert.equal(opts.length, 3, JSON.stringify(posted));
+  assert.deepEqual(
+    opts[2].data.models.map((m) => m.id),
+    [
+      "omnigent/databricks-claude-sonnet-4-6",
+      "omnigent/databricks-claude-opus-4-1",
+    ],
+  );
   finish();
 })().catch((error) => {
   finish();

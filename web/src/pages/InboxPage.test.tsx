@@ -10,15 +10,15 @@ import { SidebarDataProvider } from "@/hooks/useSidebarData";
 //  - `useCommentInbox` (the comment side of the inbox),
 //  - `getSession` / `approve` (per-session snapshot fetch + the verdict POST).
 // The pure assembly helper `collectInboxItems` and the display helpers are
-// left REAL, so raw `response.elicitation_request` event dicts flow through
-// the same parse path the app uses. `ApprovalCard` is stubbed to a minimal
-// component that just exposes an Accept button wired to its `onSubmit`, which
-// lets us drive the approve/rollback path without the real card's internals.
+// left REAL, so raw events follow the production parse path. Native delivery
+// tests also use the real ApprovalCard; other prompts use an Accept-button stub.
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { InboxPage } from "./InboxPage";
+import type * as approvalCard from "@/components/blocks/ApprovalCard";
+import type { ComponentProps } from "react";
 import type { Conversation } from "@/hooks/useConversations";
 import * as conversationsHook from "@/hooks/useConversations";
 import * as commentInboxHook from "@/hooks/useCommentInbox";
@@ -30,46 +30,37 @@ import {
   seedReadState,
 } from "@/hooks/useUnseenConversations";
 
-// Minimal ApprovalCard stub: renders the message and an Accept button that
-// forwards to the page's submit handler. The real card's form/preview UX is
-// out of scope here — we only need to exercise `makeSubmit` → `approve`.
-vi.mock("@/components/blocks/ApprovalCard", () => ({
-  ApprovalCard: ({
-    elicitationId,
-    message,
-    status,
-    allowAutoMode,
-    onSubmit,
-    requester,
-  }: {
-    elicitationId: string;
-    message: string;
-    status: string;
-    allowAutoMode?: boolean;
-    onSubmit: (id: string, action: "accept" | "decline", content?: Record<string, unknown>) => void;
-    requester?: { sessionId: string; ancestorSessionId: string } | null;
-  }) => (
-    <div data-testid="approval-card" data-status={status}>
-      <span>{message}</span>
-      {requester && (
-        <span data-testid="approval-card-requester">
-          {requester.sessionId} under {requester.ancestorSessionId}
-        </span>
-      )}
-      <button type="button" onClick={() => onSubmit(elicitationId, "accept")}>
-        Stub Accept
-      </button>
-      {allowAutoMode && (
-        <button
-          type="button"
-          onClick={() => onSubmit(elicitationId, "accept", { allow_auto_mode: true })}
-        >
-          Stub Auto Mode
-        </button>
-      )}
-    </div>
-  ),
-}));
+// Keep the real native-delivery controls and their attempt-token submission.
+vi.mock("@/components/blocks/ApprovalCard", async (importActual) => {
+  const actual = await importActual<typeof approvalCard>();
+  return {
+    ApprovalCard: (props: ComponentProps<typeof actual.ApprovalCard>) => {
+      if (props.nativeDelivery) return <actual.ApprovalCard {...props} />;
+      const { elicitationId, message, status, allowAutoMode, onSubmit, requester } = props;
+      return (
+        <div data-testid="approval-card" data-status={status}>
+          <span>{message}</span>
+          {requester && (
+            <span data-testid="approval-card-requester">
+              {requester.sessionId} under {requester.ancestorSessionId}
+            </span>
+          )}
+          <button type="button" onClick={() => onSubmit!(elicitationId, "accept")}>
+            Stub Accept
+          </button>
+          {allowAutoMode && (
+            <button
+              type="button"
+              onClick={() => onSubmit!(elicitationId, "accept", { allow_auto_mode: true })}
+            >
+              Stub Auto Mode
+            </button>
+          )}
+        </div>
+      );
+    },
+  };
+});
 
 vi.mock("@/hooks/useConversations", async (importActual) => ({
   ...(await importActual<typeof conversationsHook>()),
@@ -128,11 +119,10 @@ function commentInboxStub(overrides: Partial<CommentInbox> = {}): CommentInbox {
   };
 }
 
-function renderPage() {
+function renderPage(
+  queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+) {
   // Fresh client per render so cached queries never leak between tests.
-  const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
-  });
   return render(
     <QueryClientProvider client={queryClient}>
       <SidebarDataProvider>
@@ -736,4 +726,109 @@ describe("InboxPage filter tabs", () => {
     selectTab("Awaiting response");
     expect(screen.getByText("No approvals waiting")).toBeInTheDocument();
   });
+});
+
+it.each(
+  ["success", "failure"].flatMap((outcome) =>
+    [false, true].map((retryFirst) => ({ outcome, retryFirst })),
+  ),
+)(
+  "adopts a newer Inbox attempt during a stalled POST ($outcome, retry first: $retryFirst)",
+  async ({ outcome, retryFirst }) => {
+    const row = conversation();
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    let delivery = { state: "ready", attempt: "first", action: "accept" };
+    vi.mocked(sessionsApi.getSession).mockImplementation(
+      async () =>
+        ({
+          pendingElicitations: [
+            rawElicitation("eli_1", "Approve pwd", { native_delivery: delivery }),
+          ],
+        }) as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>,
+    );
+    const submissions: {
+      resolve: (value: Awaited<ReturnType<typeof sessionsApi.approve>>) => void;
+      reject: (error: Error) => void;
+    }[] = [];
+    vi.mocked(sessionsApi.approve).mockImplementation(
+      () =>
+        new Promise((resolve, reject) => {
+          submissions.push({ resolve, reject });
+        }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const poll = () =>
+      act(async () => {
+        await queryClient.refetchQueries({ queryKey: ["inbox-elicitations"] });
+      });
+    renderPage(queryClient);
+    fireEvent.click(await screen.findByRole("button", { name: "Approve" }));
+    await poll();
+    expect(screen.getByText("Waiting for Kiro to confirm")).toBeInTheDocument();
+    delivery = { state: "unconfirmed", attempt: "second", action: "accept" };
+    await poll();
+    const retry = await screen.findByRole("button", { name: "Retry sending approval" });
+    expect(retry).toBeEnabled();
+    if (retryFirst) fireEvent.click(retry);
+    await act(async () => {
+      if (outcome === "failure") submissions[0]!.reject(new Error("offline"));
+      else submissions[0]!.resolve({} as Awaited<ReturnType<typeof sessionsApi.approve>>);
+    });
+    if (!retryFirst)
+      fireEvent.click(screen.getByRole("button", { name: "Retry sending approval" }));
+    await poll();
+    expect(screen.getByText("Waiting for Kiro to confirm")).toBeInTheDocument();
+    expect(submissions).toHaveLength(2);
+    expect(sessionsApi.approve).toHaveBeenLastCalledWith("sess_1", "eli_1", {
+      action: "accept",
+      _meta: { native_delivery_attempt: "second" },
+    });
+    await act(async () => {
+      submissions[1]!.reject(new Error("retry failed"));
+    });
+    expect(await screen.findByRole("button", { name: "Retry sending approval" })).toBeEnabled();
+  },
+);
+
+it("recovers a native request after an empty snapshot without reloading", async () => {
+  vi.useFakeTimers();
+  const row = conversation();
+  vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+  const pending = [
+    rawElicitation("eli_1", "Approve pwd", {
+      native_delivery: { state: "unconfirmed", attempt: "recovered", action: "accept" },
+    }),
+  ];
+  let pendingElicitations = pending;
+  vi.mocked(sessionsApi.getSession).mockImplementation(
+    async () =>
+      ({ pendingElicitations }) as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>,
+  );
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: 30_000, refetchOnWindowFocus: false } },
+  });
+  const poll = () =>
+    act(async () => {
+      await vi.advanceTimersByTimeAsync(1001);
+    });
+  try {
+    await act(async () => {
+      renderPage(queryClient);
+    });
+    await poll();
+    expect(screen.getByRole("button", { name: "Retry sending approval" })).toBeVisible();
+    pendingElicitations = [];
+    await poll();
+    expect(
+      screen.queryByRole("button", { name: "Retry sending approval" }),
+    ).not.toBeInTheDocument();
+    pendingElicitations = pending;
+    await poll();
+    expect(screen.getByRole("button", { name: "Retry sending approval" })).toBeVisible();
+    expect(sessionsApi.approve).not.toHaveBeenCalled();
+  } finally {
+    cleanup();
+    queryClient.clear();
+    vi.useRealTimers();
+  }
 });

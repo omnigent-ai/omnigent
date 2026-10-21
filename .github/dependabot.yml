@@ -56,6 +56,10 @@ updates:
       # migrations the team schedules; a bot PR for them is only churn.
       - dependency-name: "*"
         update-types: ["version-update:semver-major"]
+      # web's pdfjs-dist must equal react-pdf's own pdfjs-dist: PdfViewer loads
+      # the worker from it, and pdf.js rejects a mismatched worker. Bump it only
+      # together with react-pdf.
+      - dependency-name: "pdfjs-dist"
 
   # ── Pinned harness CLIs installed by CI: intentional exact pins, never bump.
   #    Declared so the security toggle does not file ungrouped PRs for them.

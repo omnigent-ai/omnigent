@@ -17,6 +17,10 @@ from omnigent.entities import (
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
 
+# Pending inputs share the item store, but are not harness transcript history yet.
+PENDING_INPUT_RESPONSE_ID = "pending_input"
+MAX_PENDING_INPUTS = 100
+
 if TYPE_CHECKING:
     from omnigent.db.account_authority import AccountAuthority
 
@@ -197,6 +201,7 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
         "omnigent.codex_native.bridge_id",
         "omnigent.last_context_tokens",
         "omnigent.last_context_window",
+        "omnigent.startup",
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     }
 )
@@ -413,6 +418,53 @@ class ConversationStore(ABC):
     paginated listing, appending items, full-text search,
     updates, and deletion.
     """
+
+    def list_pending_inputs_page(
+        self,
+        conversation_id: str,  # noqa: ARG002
+        *,
+        after: int | None = None,  # noqa: ARG002
+        limit: int = MAX_PENDING_INPUTS,  # noqa: ARG002
+    ) -> tuple[list[ConversationItem], int | None]:
+        """
+        Page the conversation's startup inputs in submission order.
+
+        :param after: The cursor a previous page returned, or ``None`` to start.
+        :param limit: Most inputs to return.
+        :returns: The inputs and the cursor for the next page, ``None`` at the end.
+        """
+        return [], None
+
+    def list_pending_inputs(self, conversation_id: str) -> list[ConversationItem]:
+        """Return all startup inputs (at most ``MAX_PENDING_INPUTS``) in submission order."""
+        items: list[ConversationItem] = []
+        after: int | None = None
+        while True:
+            page, after = self.list_pending_inputs_page(conversation_id, after=after)
+            items.extend(page)
+            if after is None:
+                return items
+
+    def transition_pending_input(
+        self,
+        conversation_id: str,
+        item_id: str,
+        *,
+        expected: str,
+        status: str | None,
+    ) -> bool:
+        """Compare-and-set delivery state; None discards a canceled, unsent input."""
+        raise NotImplementedError
+
+    def list_host_conversation_ids(
+        self,
+        host_id: str,  # noqa: ARG002
+        *,
+        after: str | None = None,  # noqa: ARG002
+        limit: int = 32,  # noqa: ARG002
+    ) -> list[str]:
+        """Page the sessions assigned to a host, including not-yet-launched sessions."""
+        return []
 
     def __init__(
         self, storage_location: str, conversation_storage_location: str | None = None

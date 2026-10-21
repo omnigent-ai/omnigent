@@ -1,3 +1,4 @@
+import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Block walker — converts a flat `AnyBlock[]` into a list of bubble
 // groups for the JSX layer to map over.
 //
@@ -130,6 +131,7 @@ export type RenderItem =
     }
   | {
       kind: "elicitation";
+      nativeDelivery?: NativePermissionDelivery;
       itemId: string | null;
       elicitationId: string;
       targetSessionId?: string | null;
@@ -1660,6 +1662,7 @@ function buildAssistantItems(
     if (b.type === "elicitation") {
       items.push({
         kind: "elicitation",
+        ...(b.nativeDelivery ? { nativeDelivery: b.nativeDelivery } : {}),
         itemId: b.ctx.itemId,
         elicitationId: b.elicitationId,
         targetSessionId: b.targetSessionId,

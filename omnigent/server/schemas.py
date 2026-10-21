@@ -1402,6 +1402,31 @@ class SessionEventInput(BaseModel):
         return data
 
 
+class SessionStartupInput(SessionEventInput):
+    """A first user input the server accepts durably before provisioning a host."""
+
+    @model_validator(mode="after")
+    def _validate_startup_input(self) -> Self:
+        from omnigent.entities.conversation import MessageData
+
+        if self.type not in ("message", "slash_command"):
+            raise ValueError("initial_input must be a message or skill invocation")
+        if self.created_by is not None:
+            raise ValueError("initial_input attribution comes from the authenticated creator")
+        if self.type == "message":
+            message = MessageData.model_validate(self.data)
+            if message.role != "user":
+                raise ValueError("initial_input must be a user message")
+        elif (
+            self.data.get("kind") != "skill"
+            or not isinstance(self.data.get("name"), str)
+            or not self.data["name"].strip()
+            or not isinstance(self.data.get("arguments", ""), str)
+        ):
+            raise ValueError("initial_input slash_command requires a skill name and arguments")
+        return self
+
+
 class SessionGitOptions(BaseModel):
     """
     Git worktree options for ``POST /v1/sessions``.
@@ -1636,6 +1661,7 @@ class _SessionCreateRequestBase(BaseModel):
     agent_id: Any
     project_id: str | None = None
     initial_items: list[SessionEventInput] = Field(default_factory=list)
+    initial_input: SessionStartupInput | None = None
     mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] = Field(default_factory=dict)
@@ -1657,6 +1683,15 @@ class _SessionCreateRequestBase(BaseModel):
     subagent_routing_override: str | None = None
     harness_override: str | None = None
     smart_routing_message: str | None = None
+
+    @model_validator(mode="after")
+    def _check_startup_input(self) -> Self:
+        if self.initial_input is not None and (self.host_type != "managed" or self.initial_items):
+            raise ValueError(
+                "initial_input requires host_type=managed "
+                "and cannot be combined with initial_items"
+            )
+        return self
 
     @model_validator(mode="after")
     def _check_git_requires_host(self) -> Self:
@@ -1881,6 +1916,14 @@ class SessionCreateMetadata(BaseModel):
     sandbox_provider: str | None = None
 
     model_config = ConfigDict(extra="forbid")
+
+    initial_input: SessionStartupInput | None = None
+
+    @model_validator(mode="after")
+    def _check_startup_input(self) -> Self:
+        if self.initial_input is not None and self.host_type != "managed":
+            raise ValueError("initial_input requires host_type=managed")
+        return self
 
     @model_validator(mode="after")
     def _check_managed_bundle_fields(self) -> SessionCreateMetadata:
@@ -2262,15 +2305,13 @@ class SessionResponse(BaseModel):
         Empty list when no prompts are outstanding. Sourced from
         the Omnigent server's in-memory
         :mod:`omnigent.runtime.pending_elicitations` index.
-    :param pending_inputs: Un-consumed web-composer user messages on
-        native-terminal (claude-native / codex-native) sessions at
-        snapshot time, each ``{"pending_id", "content"}``. Native
-        sessions don't persist a web message at POST time (the
-        transcript forwarder is the single writer), so a client that
-        posted then navigated away / rebound would lose its optimistic
-        bubble; replaying these re-hydrates it. Empty list otherwise.
-        Sourced from the in-memory
-        :mod:`omnigent.runtime.pending_inputs` index.
+    :param pending_inputs: Accepted messages awaiting consumption, each
+        ``{"pending_id", "content"}``. Includes durable managed-startup
+        inputs and native messages awaiting a transcript receipt. Clients
+        restore their pending bubbles from this list after reconnecting.
+        Ordinary native sends use the in-memory
+        :mod:`omnigent.runtime.pending_inputs` index; startup inputs also
+        survive server restart in the conversation store.
     :param workspace: Absolute path on disk where the runner cd's,
         e.g. ``"/Users/corey/universe/src/foo"``. Set when the
         session was bound to a host workspace at create-time, or
@@ -2365,13 +2406,8 @@ class SessionResponse(BaseModel):
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     pending_elicitations: list[dict[str, Any]] = Field(default_factory=list)
-    # Un-consumed web-composer user messages on native-terminal
-    # sessions at snapshot time, each ``{"pending_id", "content"}``.
-    # Replayed so a client that posted a message then navigated away /
-    # rebound re-hydrates the optimistic bubble (the live SSE stream
-    # has no replay). Empty for non-native sessions, which persist the
-    # message at POST time and thus already carry it in ``items``.
-    # Source: :mod:`omnigent.runtime.pending_inputs`.
+    # Durable startup inputs plus ordinary native inputs awaiting a receipt.
+    # Each {"pending_id", "content"} restores a pending bubble on reconnect.
     pending_inputs: list[dict[str, Any]] = Field(default_factory=list)
     workspace: str | None = None
     git_branch: str | None = None
@@ -2430,7 +2466,7 @@ class UpdateSessionRequest(BaseModel):
         ``"plan"`` enters Plan mode and ``"default"`` returns to Default
         mode for subsequent Codex turns. Only valid for sessions stamped
         with the codex-native wrapper label. Omitted leaves unchanged.
-    :param permission_mode: Claude-native permission mode to switch a
+    :param permission_mode: Owner-only Claude-native permission mode to switch a
         running session to, e.g. ``"auto"``. Only the modes Claude Code's
         shift+tab cycle can reach are accepted (``default``,
         ``acceptEdits``, ``plan``, ``auto``) — ``dontAsk`` and
@@ -2479,6 +2515,7 @@ class UpdateSessionRequest(BaseModel):
         surface programmer errors. ``None`` leaves unchanged.
     :param terminal_launch_args: Per-session native-terminal
         pass-through args, e.g. ``["--dangerously-skip-permissions"]``.
+        Updating this field requires session ownership.
         A list (including ``[]``) replaces the stored value wholesale
         — resume is last-write-wins, never an append. Bounds (count /
         length) are validated server-side. ``None`` leaves unchanged.

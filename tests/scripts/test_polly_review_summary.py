@@ -196,6 +196,32 @@ def test_single_file_accepts_plain_parameterized_case_labels(case: str) -> None:
     assert case in result
 
 
+def test_single_changed_file_accepts_case_rows_alongside_existing_tests_from_other_files() -> None:
+    review = (
+        _REVIEW.replace(
+            "tests/test_parser.py::test_empty",
+            "`test_empty[missing-input]` — added",
+        )
+        .replace(
+            "### Tests\n",
+            "### Tests\nChanged test file: `tests/test_parser.py`.\n",
+        )
+        .replace(
+            "### Scope\n",
+            "| `tests/test_other.py::test_existing` — unchanged | Existing behavior |"
+            " Unit | keep | Still relevant. |\n"
+            "### Scope\n",
+        )
+    )
+
+    result = _HELPERS["compose_review"](
+        review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+    )
+
+    assert "`test_empty[missing-input]` — added" in result
+    assert "`tests/test_other.py::test_existing` — unchanged" in result
+
+
 def test_single_file_accepts_case_row_with_an_example_path() -> None:
     review = _REVIEW.replace(
         "tests/test_parser.py::test_empty",

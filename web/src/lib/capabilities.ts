@@ -64,7 +64,9 @@ export type FeatureKey =
   | "arca_shutdown_warnings"
   | "import_review"
   | "custom_agents_settings_ui"
-  | "sidebar_grouping_ui";
+  | "sidebar_grouping_ui"
+  | "workspace_content_search"
+  | "grid_sessions_display_ui";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -105,6 +107,8 @@ export interface ServerInfo {
    * the new-session host picker.
    */
   managed_sandboxes_enabled: boolean;
+  /** The create request durably accepts managed sessions' first input. */
+  durable_initial_input?: boolean;
   /**
    * Short name of the backing sandbox provider (e.g. ``"modal"``,
    * ``"lakebox"``) used to label the new-session sandbox option per
@@ -364,6 +368,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           needs_setup: data.needs_setup === true,
           databricks_features: data.databricks_features === true,
           managed_sandboxes_enabled: data.managed_sandboxes_enabled === true,
+          durable_initial_input: data.durable_initial_input === true,
           sandbox_provider:
             typeof data.sandbox_provider === "string" ? data.sandbox_provider : null,
           sandbox_providers: Array.isArray(data.sandbox_providers)

@@ -32,6 +32,7 @@
 //      on `POST /v1/sessions/{id}/elicitations/{eid}/resolve`,
 //   3. rolls back to "pending" on network error.
 
+import type { NativePermissionDelivery } from "@/lib/nativePermissionDelivery";
 import { useContext } from "react";
 import {
   CheckIcon,
@@ -109,7 +110,7 @@ function extractOptionLabels(schema: Record<string, unknown>): string[] {
  */
 export type SubmitApprovalFn = (
   elicitationId: string,
-  action: "accept" | "decline",
+  action: "accept" | "decline" | "cancel",
   content?: Record<string, unknown>,
   meta?: Record<string, unknown>,
 ) => void;
@@ -147,6 +148,7 @@ function SubagentRequesterLine({ sessionId, ancestorSessionId }: SubagentRequest
 }
 
 interface ApprovalCardProps {
+  nativeDelivery?: NativePermissionDelivery;
   elicitationId: string;
   message: string;
   phase: string;
@@ -240,6 +242,7 @@ interface ApprovalCardProps {
 const EMPTY_CODEX_PERSIST_MODES: CodexPersistMode[] = [];
 
 export function ApprovalCard({
+  nativeDelivery,
   elicitationId,
   message,
   phase,
@@ -265,7 +268,7 @@ export function ApprovalCard({
   // the child's elicitation rather than the main conversation's. null (the main
   // transcript) leaves submitApproval on its active-conversation default.
   const scopedConversationId = useContext(ConversationScopeContext);
-  const submit: SubmitApprovalFn =
+  const submitVerdict: SubmitApprovalFn =
     onSubmit ??
     ((id, action, content, meta) => {
       const store = useChatStore.getState();
@@ -279,6 +282,14 @@ export function ApprovalCard({
         void store.submitApproval(id, action, content, meta);
       }
     });
+  const submit: SubmitApprovalFn = (...args) => {
+    if (!nativeDelivery) return submitVerdict(...args);
+    const [id, action, content, meta] = args;
+    submitVerdict(id, action, content, {
+      ...meta,
+      native_delivery_attempt: nativeDelivery.attempt,
+    });
+  };
   const submitBinary = (action: "accept" | "decline") => {
     submit(elicitationId, action);
   };
@@ -555,6 +566,46 @@ export function ApprovalCard({
 
   const requesterLine = requester ? <SubagentRequesterLine {...requester} /> : null;
 
+  if (status === "pending" && nativeDelivery && nativeDelivery.state !== "ready") {
+    const unconfirmed = nativeDelivery.state === "unconfirmed";
+    return (
+      <Alert
+        data-testid="approval-card"
+        data-state={nativeDelivery.state}
+        className={cn("flex flex-col gap-2", className)}
+      >
+        <AlertTitle className="flex items-center gap-2 text-ui">
+          <ClockIcon className="size-4 text-muted-foreground" />
+          {unconfirmed ? "Approval delivery unconfirmed" : "Waiting for Kiro to confirm"}
+        </AlertTitle>
+        <AlertDescription className="flex flex-col gap-2 text-sm">
+          {requesterLine}
+          <span>
+            {unconfirmed
+              ? "Kiro hasn't confirmed your decision. The previous attempt may still be pending."
+              : "This request stays pending until Kiro confirms your decision."}
+          </span>
+          {formattedPreview && (
+            <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap break-words">
+              {formattedPreview}
+            </pre>
+          )}
+          {unconfirmed && nativeDelivery.action && (
+            <div className="flex flex-wrap gap-2">
+              <Button
+                size="sm"
+                onClick={() => submit(elicitationId, nativeDelivery.action!, undefined)}
+                componentId="approval.retry_delivery"
+              >
+                Retry sending {nativeDelivery.action === "accept" ? "approval" : "rejection"}
+              </Button>
+            </div>
+          )}
+        </AlertDescription>
+      </Alert>
+    );
+  }
+
   if (status === "responded" && response) {
     const autoResolved = response.action === "auto_resolved";
     const promptExpired = autoResolved && response.reason === "unanswered";
@@ -608,7 +659,7 @@ export function ApprovalCard({
           <TooltipContent className="max-w-72">{AUTO_RESOLVED_DETAIL}</TooltipContent>
         </Tooltip>
       );
-      label = "Resolved elsewhere";
+      label = nativeDelivery ? "Resolved in Kiro" : "Resolved elsewhere";
     } else if (response.action === "cancel") {
       // Dismissed without deciding — neither approved nor rejected.
       icon = <InfoIcon className="size-4 text-muted-foreground" />;
@@ -880,6 +931,7 @@ export function ElicitationCard({
   return (
     <ApprovalCard
       elicitationId={item.elicitationId}
+      nativeDelivery={item.nativeDelivery}
       message={item.message}
       phase={item.phase}
       policyName={item.policyName}

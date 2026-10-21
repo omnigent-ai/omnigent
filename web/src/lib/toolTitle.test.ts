@@ -13,14 +13,17 @@ describe("formatToolTitle", () => {
     expect(formatToolTitle("sys_os_read", { path: "/tmp/foo.py" })).toEqual({
       verb: "Read",
       body: "/tmp/foo.py",
+      filePath: "/tmp/foo.py",
     });
     expect(formatToolTitle("sys_os_write", { path: "out.txt", content: "x" })).toEqual({
       verb: "Write",
       body: "out.txt",
+      filePath: "out.txt",
     });
     expect(formatToolTitle("sys_os_edit", { path: "a.py", oldText: "x", newText: "y" })).toEqual({
       verb: "Edit",
       body: "a.py",
+      filePath: "a.py",
     });
   });
 
@@ -147,8 +150,13 @@ describe("formatToolTitle", () => {
     expect(formatToolTitle("Read", { file_path: "/repo/README.md" })).toEqual({
       verb: "Read",
       body: "/repo/README.md",
+      filePath: "/repo/README.md",
     });
-    expect(formatToolTitle("Edit", { file_path: "a.py" })).toEqual({ verb: "Edit", body: "a.py" });
+    expect(formatToolTitle("Edit", { file_path: "a.py" })).toEqual({
+      verb: "Edit",
+      body: "a.py",
+      filePath: "a.py",
+    });
     expect(formatToolTitle("Grep", { pattern: "TODO" })).toEqual({
       verb: "Search:",
       body: "TODO",
@@ -172,11 +180,21 @@ describe("formatToolTitle", () => {
       formatToolTitle("apply_patch", {
         changes: [{ path: "/repo/notes.txt", kind: { type: "update" } }],
       }),
-    ).toEqual({ verb: "Edit", body: "/repo/notes.txt" });
+    ).toEqual({ verb: "Edit", body: "/repo/notes.txt", filePath: "/repo/notes.txt" });
     expect(formatToolTitle("apply_patch", { changes: [{ path: "a" }, { path: "b" }] })).toEqual({
       verb: "Edit",
       body: "2 files",
     });
+  });
+
+  it("sets filePath only when the call targets exactly one file", () => {
+    expect(formatToolTitle("NotebookEdit", { notebook_path: "n.ipynb" }).filePath).toBe("n.ipynb");
+    expect(formatToolTitle("write", { filePath: "b.md", path: "c.md" }).filePath).toBe("b.md");
+    expect(formatToolTitle("Bash", { command: "cat a.md" }).filePath).toBeUndefined();
+    expect(formatToolTitle("Write", { file_path: "" }).filePath).toBeUndefined();
+    expect(
+      formatToolTitle("apply_patch", { changes: [{ path: "a" }, { path: "b" }] }).filePath,
+    ).toBeUndefined();
   });
 
   it("formats pi / opencode lowercase tools, honoring filePath and path args", () => {
@@ -187,14 +205,17 @@ describe("formatToolTitle", () => {
     expect(formatToolTitle("read", { filePath: "/repo/notes.txt" })).toEqual({
       verb: "Read",
       body: "/repo/notes.txt",
+      filePath: "/repo/notes.txt",
     });
     expect(formatToolTitle("edit", { path: "notes.txt", edits: [] })).toEqual({
       verb: "Edit",
       body: "notes.txt",
+      filePath: "notes.txt",
     });
     expect(formatToolTitle("write", { filePath: "out.txt" })).toEqual({
       verb: "Write",
       body: "out.txt",
+      filePath: "out.txt",
     });
   });
 

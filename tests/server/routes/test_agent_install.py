@@ -177,6 +177,41 @@ async def test_config_patch_preserves_identity_and_omitted_fields(client, agent_
     assert reinstalled.json()["description"] == "reinstalled"
 
 
+@pytest.mark.parametrize("method", ["GET", "PATCH"])
+async def test_local_config_rejects_legacy_source_tools(
+    client, agent_store, artifact_store, monkeypatch, method
+) -> None:
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    installed = await _install(client, ALICE, "orion")
+    assert installed.status_code == 200, installed.text
+    path = f"/v1/agents/{installed.json()['id']}"
+    config = await client.get(f"{path}/config", headers=ALICE)
+    assert config.status_code == 200, config.text
+    agent = agent_store.get(installed.json()["id"])
+    assert agent is not None
+    legacy = bundle_files(
+        {
+            "config.yaml": b"spec_version: 1\nname: orion\n",
+            "tools/python/echo.py": b"def echo(text: str) -> str:\n    return text\n",
+        }
+    )
+    # Older installations can contain bundles current HTTP uploads would reject.
+    artifact_store.put(agent.bundle_location, legacy)
+    response = await client.request(
+        method,
+        f"{path}/config" if method == "GET" else path,
+        headers={**ALICE, "If-Match": config.headers["etag"]},
+        **({"json": {"description": "updated"}} if method == "PATCH" else {}),
+    )
+    assert response.status_code == 400, response.text
+    assert "Invalid agent configuration" in response.text
+    persisted = agent_store.get(agent.id)
+    assert persisted is not None
+    assert persisted.bundle_location == agent.bundle_location
+    assert persisted.version == agent.version
+    assert artifact_store.get(agent.bundle_location) == legacy
+
+
 async def test_config_patch_checks_owner_before_preconditions(client, agent_store) -> None:
     owned = (await _install(client, BOB, "orion")).json()["id"]
     unowned = agent_store.create_user_agent(generate_agent_id(), "legacy", "missing", owner=None)

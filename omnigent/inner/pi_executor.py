@@ -55,6 +55,7 @@ from importlib.resources import files
 from typing import Any, NotRequired, Protocol, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
+from omnigent.databricks_ai_gateway import PI_AGENT, gateway_attribution_headers, is_ug_route
 from omnigent.harnesses.pi_native.credentials import (
     _databricks_workspace_url_for_gateway,
     _is_databricks_ai_gateway_url,
@@ -68,6 +69,7 @@ from omnigent.models.pi_model_compatibility import (
     SYSTEM_AI_RESPONSES_KEYWORDS,
     databricks_model_aliases,
     enrich_databricks_model_catalog,
+    pi_generic_model_json_entry,
     pi_model_is_reasoning,
     pi_model_json_entry,
     unsupported_in_pi,
@@ -197,6 +199,7 @@ class _PiProviderConfig(TypedDict):
     models: list[_JsonObject]
     authHeader: NotRequired[bool]
     compat: NotRequired[_JsonObject]
+    headers: NotRequired[dict[str, str]]
 
 
 class _PiModelsConfig(TypedDict):
@@ -838,7 +841,6 @@ def _build_models_json(
         "supportsDeveloperRole": False,
         "supportsStore": False,
         "supportsStrictMode": False,
-        "supportsReasoningEffort": False,
     }
     provider_models: dict[str, list[_JsonObject]] = {
         "databricks-openai": [],
@@ -905,7 +907,6 @@ def _build_models_json(
                     "supportsDeveloperRole": False,
                     "supportsStore": False,
                     "supportsStrictMode": False,
-                    "supportsReasoningEffort": False,
                     "supportsUsageInStreaming": False,
                 },
                 "models": provider_models["databricks-mlflow"],
@@ -921,7 +922,6 @@ def _build_models_json(
                     "supportsDeveloperRole": False,
                     "supportsStore": False,
                     "supportsStrictMode": False,
-                    "supportsReasoningEffort": False,
                     # Gemini/Qwen/Llama/inkling models reject stream_options
                     # (which carries include_usage) with 400 "unknown field".
                     "supportsUsageInStreaming": False,
@@ -951,10 +951,21 @@ def _build_models_json(
             # provider-side 400 on image turns — a deliberate trade (loud error
             # over silent loss), since most current gateway models are
             # multimodal and text-only turns are unaffected.
-            entry: _JsonObject = {"id": model, "input": ["text", "image"]}
-            if pi_model_is_reasoning(model):
-                entry["reasoning"] = True
+            if any(
+                url == provider["baseUrl"] and not _is_databricks_gateway_base_url(url)
+                for url in (base_urls or {}).values()
+            ):
+                entry = dict(pi_generic_model_json_entry(model))
+            else:
+                entry = {"id": model, "input": ["text", "image"]}
+                if pi_model_is_reasoning(model):
+                    entry["reasoning"] = True
             provider["models"] = [*provider["models"], entry]
+    for provider_config in config["providers"].values():
+        if _is_databricks_ai_gateway_url(provider_config["baseUrl"]):
+            provider_config["headers"] = gateway_attribution_headers(
+                PI_AGENT, via_ug=is_ug_route(provider_config["baseUrl"])
+            )
     return config
 
 
@@ -2358,7 +2369,7 @@ class PiExecutor(Executor):
         tools: list[ToolSpec],
         tool_server_port: int | None,
         tool_server_token: str | None,
-        model: str | None,
+        models_json: _PiModelsConfig | None,
     ) -> PiSubprocessConfig:
         """Build env dict, temp dir, and extra CLI args for a Pi subprocess.
 
@@ -2369,12 +2380,11 @@ class PiExecutor(Executor):
             (:attr:`_ToolServer.token`), embedded in the generated
             extension so requests authenticate. Non-``None`` whenever
             *tool_server_port* is.
-        :param model: The resolved model id this subprocess will run, e.g.
-            ``"moonshotai/kimi-k2.6"``; registered in the generated
-            ``models.json`` on the gateway path so the
-            ``provider/<model>`` selector resolves. ``None`` when no model
-            is pinned (Pi picks its own default).
+        :param models_json: Provider configuration resolved off-loop before
+            allocating session files; ``None`` for Pi-owned configuration.
         """
+        if self._gateway and models_json is None:
+            raise ValueError("Gateway provider configuration must be resolved before startup")
         env = dict(self._env)
         tmp_parent = None
         if self._sandboxed:
@@ -2384,18 +2394,11 @@ class PiExecutor(Executor):
         extra_args: list[str] = list(self._extra_args)
 
         if self._gateway:
-            effective_model = model
             assert tool_server_port is not None and tool_server_token is not None
+            assert models_json is not None
             auth_client = _write_gateway_auth_client(tmp_dir, tool_server_port, tool_server_token)
-            models_json = _build_models_json(
-                self._gateway_workspace_url or self._databricks_host,
-                f"!node {shlex.quote(str(auth_client))}",
-                self._base_urls_override,
-                model=effective_model,
-                catalog_models=self._gateway_model_entries or (),
-                model_wire_apis=self._gateway_model_wire_apis,
-                openai_wire_api=self._openai_wire_api,
-            )
+            for provider in models_json["providers"].values():
+                provider["apiKey"] = f"!node {shlex.quote(str(auth_client))}"
             models_path = os.path.join(tmp_dir, "models.json")
             with open(models_path, "w") as f:
                 json.dump(models_json, f)
@@ -2409,6 +2412,10 @@ class PiExecutor(Executor):
                 pathlib.Path(tmp_dir),
                 overlay=self._retry_policy.pi.settings(),
             )
+            from omnigent.inner.pi_gateway import pi_gateway_extension_args
+
+            assert models_json is not None
+            extra_args.extend(pi_gateway_extension_args(pathlib.Path(tmp_dir), models_json))
 
         # Pi natively supports retry config via ``.pi/settings.json``
         # (see ``RetryPolicy.pi.settings()`` for schema). On the non-gateway
@@ -2565,6 +2572,18 @@ class PiExecutor(Executor):
             return state.rpc
 
         wire_catalog = await self._load_gateway_model_wire_apis()
+        models_json = None
+        if self._gateway:
+            models_json = await run_sync_on_thread(
+                _build_models_json,
+                self._gateway_workspace_url or self._databricks_host,
+                "",  # The session's credential helper is attached when writing models.json.
+                self._base_urls_override,
+                model=effective_model,
+                catalog_models=self._gateway_model_entries or (),
+                model_wire_apis=wire_catalog,
+                openai_wire_api=self._openai_wire_api,
+            )
 
         if state.rpc is not None:
             await state.rpc.close()
@@ -2572,7 +2591,7 @@ class PiExecutor(Executor):
         tool_server_port = await self._ensure_tool_server(tools)
         tool_server_token = self._tool_server.token if self._tool_server is not None else None
         subprocess_config = self._build_env_and_dir(
-            tools, tool_server_port, tool_server_token, effective_model
+            tools, tool_server_port, tool_server_token, models_json
         )
         env = subprocess_config.env
         tmp_dir = subprocess_config.tmp_dir

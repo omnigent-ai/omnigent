@@ -17,8 +17,17 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent.inner.executor import ExecutorError, TextChunk, ToolCallComplete, TurnComplete
+from omnigent.inner.executor import (
+    ExecutorConfig,
+    ExecutorError,
+    TextChunk,
+    ToolCallComplete,
+    TurnComplete,
+)
 from omnigent.inner.pi_harness import _build_pi_executor
+from omnigent.models.model_catalog import ModelEntry
+from omnigent.models.model_metadata import ModelCapability, ModelMetadata, ModelWireAPI
+from omnigent.onboarding.providers import ModelInfo
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
 from tests.e2e.conftest import configure_mock_llm, get_mock_requests, reset_mock_llm
 
@@ -56,9 +65,14 @@ _STALE_HARNESS_ENV = (
 )
 
 
-async def _run_turn(executor, prompt: str) -> list:
+async def _run_turn(executor, prompt: str, effort: str = "low") -> list:
     messages = [{"role": "user", "content": prompt, "session_id": _SESSION_ID}]
-    return [event async for event in executor.run_turn(messages, _TOOLS, _SYSTEM_PROMPT)]
+    return [
+        event
+        async for event in executor.run_turn(
+            messages, _TOOLS, _SYSTEM_PROMPT, ExecutorConfig(extra={"reasoning_effort": effort})
+        )
+    ]
 
 
 def _streamed_text(events: list) -> str:
@@ -85,9 +99,10 @@ def rotating_gateway(
         def do_POST(self) -> None:
             body = self.rfile.read(int(self.headers["Content-Length"]))
             expected = token_file.read_text() if token_file.exists() else None
-            valid = (
-                expected is not None and self.headers.get("Authorization") == f"Bearer {expected}"
+            credential = (
+                self.headers.get("Authorization") or f"Bearer {self.headers.get('x-api-key')}"
             )
+            valid = expected is not None and credential == f"Bearer {expected}"
             accepted.append(valid)
             if valid:
                 response = httpx.post(
@@ -119,15 +134,38 @@ def rotating_gateway(
 
 
 @pytest.mark.timeout(300)
-@pytest.mark.parametrize("sandboxed", [False, True], ids=["unsandboxed", "sandboxed"])
+@pytest.mark.parametrize(
+    ("wire_api", "sandboxed", "databricks", "reasoning"),
+    [
+        ("chat", False, False, True),
+        ("chat", True, False, True),
+        ("responses", False, False, True),
+        ("anthropic", False, False, True),
+        ("chat", False, True, True),
+        ("responses", False, True, True),
+        ("chat", False, True, False),
+    ],
+    ids=[
+        "chat-unsandboxed",
+        "chat-sandboxed",
+        "responses",
+        "anthropic",
+        "gateway-chat",
+        "gateway-responses",
+        "gateway-nonreasoning",
+    ],
+)
 async def test_pi_session_stays_in_sync_after_retry_recovery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     mock_llm_server_url: str,
     rotating_gateway: tuple[str, Path, list[bool]],
     sandboxed: bool,
+    wire_api: str,
+    databricks: bool,
+    reasoning: bool,
 ) -> None:
-    """Retries and credential rotation preserve the process and tool history."""
+    """Effort changes, retries and credential rotation preserve process and history."""
     skip_if_harness_cli_missing("pi")
     if sandboxed and sys.platform != "darwin" and not shutil.which("bwrap"):
         pytest.skip("requires Seatbelt or bubblewrap")
@@ -138,25 +176,81 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
     workspace.mkdir()
 
     mock_model = "mock-pi-retry-session-sync"
-    reset_mock_llm(mock_llm_server_url)
-    configure_mock_llm(
-        mock_llm_server_url,
-        [
-            {"error": _RETRYABLE_ERROR, "status_code": 503},
-            {"tool_calls": [{"call_id": "remember-1", "name": "remember", "arguments": "{}"}]},
-            {"text": _FIRST_ANSWER},
-            {"text": _SECOND_ANSWER},
-            {"text": "THIRD_ANSWER"},
-            {"tool_calls": [{"call_id": "remember-2", "name": "remember", "arguments": "{}"}]},
-            {"text": "AUTH_RECOVERED"},
-        ],
-        key=mock_model,
+    if databricks:
+        mock_model = f"system.ai.{mock_model}"
+        entry = ModelEntry(
+            id=mock_model,
+            family="other",
+            metadata=ModelMetadata(
+                supported_capabilities=frozenset({ModelCapability.REASONING})
+                if reasoning
+                else frozenset(),
+                wire_apis=frozenset(
+                    {
+                        ModelWireAPI.OPENAI_CHAT
+                        if wire_api == "chat"
+                        else ModelWireAPI.OPENAI_RESPONSES
+                    }
+                ),
+            ),
+        )
+        monkeypatch.setattr(
+            "omnigent.models.model_catalog.fetch_databricks_model_service_entries",
+            lambda *_: [entry],
+        )
+        monkeypatch.setattr("omnigent.models.model_catalog.catalog_model_entries", lambda *_: [])
+        monkeypatch.setattr(
+            "omnigent.inner.pi_executor._databricks_workspace_url_for_gateway",
+            lambda *_args, **_kwargs: gateway_url,
+        )
+    monkeypatch.setattr(
+        "omnigent.onboarding.providers.find_catalog_models",
+        lambda _: [ModelInfo(name=mock_model, provider="openai", supports_reasoning=True)],
     )
+    gateway_chat = databricks and wire_api == "chat"
+    # The gateway deliberately repeats the tool name as its call ID across turns.
+    tool = {
+        "call_id": "remember" if gateway_chat else "remember-1",
+        "name": "remember",
+        "arguments": "{}",
+        **({"thoughtSignature": "first-tool-signature"} if gateway_chat else {}),
+    }
+    responses = [
+        {"error": _RETRYABLE_ERROR, "status_code": 503},
+        {"tool_calls": [tool]},
+        {"text": _FIRST_ANSWER, "stream": True},
+        {"text": _SECOND_ANSWER, "stream": True},
+        {"text": "THIRD_ANSWER", "stream": True},
+        {"tool_calls": [{**tool, "thoughtSignature": "second-tool-signature"}]}
+        if gateway_chat
+        else {"tool_calls": [{"call_id": "remember-2", "name": "remember", "arguments": "{}"}]},
+        {"text": "AUTH_RECOVERED", "stream": True},
+    ]
+    if gateway_chat:
+        for response in responses:
+            if "text" in response:
+                response["chat_content"] = [
+                    {"type": "reasoning", "text": "PRIVATE_GATEWAY_REASONING"},
+                    {"type": "text", "text": response["text"]},
+                ]
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(mock_llm_server_url, responses, key=mock_model)
 
     # The harness env the runtime emits for an OpenAI-compatible provider.
     monkeypatch.setenv("HARNESS_PI_MODEL", mock_model)
     monkeypatch.setenv("HARNESS_PI_GATEWAY", "true")
-    monkeypatch.setenv("HARNESS_PI_GATEWAY_BASE_URLS", json.dumps({"openai": f"{gateway_url}/v1"}))
+    monkeypatch.setenv(
+        "HARNESS_PI_GATEWAY_BASE_URLS",
+        json.dumps(
+            {"claude": gateway_url}
+            if wire_api == "anthropic"
+            else {
+                "openai": f"{gateway_url}/ai-gateway/codex/v1"
+                if databricks
+                else f"{gateway_url}/v1"
+            }
+        ),
+    )
     monkeypatch.setenv("HARNESS_PI_GATEWAY_HOST", gateway_url)
     monkeypatch.setenv("HARNESS_PI_GATEWAY_AUTH_COMMAND", f"cat {shlex.quote(str(token_file))}")
     monkeypatch.setenv("HARNESS_PI_GATEWAY_AUTH_REFRESH_INTERVAL_MS", "100")
@@ -182,14 +276,16 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
             ),
         )
 
+    if wire_api != "anthropic":
+        monkeypatch.setenv("HARNESS_PI_GATEWAY_OPENAI_WIRE_API", wire_api)
     executor = _build_pi_executor()
     calls: list[str] = []
     tool_pids: list[int] = []
 
     async def remember(name, args, *, call_id):
-        calls.append(call_id)
+        calls.append(name)
         tool_pids.append(executor._session_states[_SESSION_ID].rpc.process.pid)
-        if call_id == "remember-1":
+        if len(calls) == 1:
             token_file.write_text("during-tool-token")
         else:
             token_file.unlink()
@@ -200,7 +296,7 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
     executor._tool_executor = remember
     try:
         assert executor._sandboxed is sandboxed
-        first = await _run_turn(executor, _FIRST_PROMPT)
+        first = await _run_turn(executor, _FIRST_PROMPT, "high")
         assert _errors(first) == [], (
             "the first turn was reported as a failure instead of completing with pi's "
             f"recovered answer: {_errors(first)}"
@@ -224,7 +320,7 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
         assert _errors(recovered) == []
         assert _streamed_text(recovered) == "AUTH_RECOVERED"
         assert executor._session_states[_SESSION_ID].rpc.process.pid == pid
-        assert calls == ["remember-1", "remember-2"]
+        assert calls == ["remember", "remember"]
         assert tool_pids == [pid, pid]
     finally:
         await executor.close()
@@ -260,8 +356,40 @@ async def test_pi_session_stays_in_sync_after_retry_recovery(
         "expected the retry, tool continuation, later prompts and auth recovery; "
         f"got {len(requests)} provider call(s)"
     )
+    if wire_api == "anthropic":
+        budgets = [r.get("thinking", {}).get("budget_tokens") for r in requests]
+        assert all(isinstance(budget, int) for budget in budgets), budgets
+        assert budgets[0] == budgets[1] == budgets[2] > budgets[3] > 0
+        assert budgets[3:] == [budgets[3]] * 4
+    else:
+        efforts = [
+            r.get("reasoning_effort")
+            if wire_api == "chat"
+            else r.get("reasoning", {}).get("effort")
+            for r in requests
+        ]
+        assert efforts == (["high"] * 3 + ["low"] * 4 if reasoning else [None] * 7)
     for request in requests[-2:]:
-        history = request["messages"]
-        assert _FIRST_PROMPT in json.dumps(history)
-        assert _FIRST_ANSWER in json.dumps(history)
-        assert any(m["role"] == "tool" and _TOOL_RESULT in m["content"] for m in history)
+        history = json.dumps(request.get("messages", request.get("input")))
+        assert _FIRST_PROMPT in history
+        assert _FIRST_ANSWER in history
+        assert _TOOL_RESULT in history
+
+    history = json.dumps(requests[-1].get("messages", requests[-1].get("input")))
+    if gateway_chat:
+        wire_calls = [
+            call for message in requests[-1]["messages"] for call in message.get("tool_calls", [])
+        ]
+        assert [call.get("thoughtSignature") for call in wire_calls] == [
+            "first-tool-signature",
+            "second-tool-signature",
+        ]
+        ids = [call["id"] for call in wire_calls]
+        assert len(set(ids)) == 2 and "remember" not in ids
+        result_ids = [
+            message["tool_call_id"]
+            for message in requests[-1]["messages"]
+            if message["role"] == "tool"
+        ]
+        assert result_ids == ids
+        assert "PRIVATE_GATEWAY_REASONING" not in history and "[object Object]" not in history
