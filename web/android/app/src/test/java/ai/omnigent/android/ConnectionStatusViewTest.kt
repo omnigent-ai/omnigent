@@ -6,13 +6,18 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.res.Configuration
 import android.graphics.Rect
+import android.graphics.drawable.ColorDrawable
 import android.os.Looper
+import android.text.Spanned
+import android.text.style.AbsoluteSizeSpan
+import android.text.style.ForegroundColorSpan
 import android.view.Gravity
 import android.view.View
 import android.widget.Button
 import android.widget.ImageView
 import android.widget.ScrollView
 import android.widget.TextView
+import androidx.core.content.ContextCompat
 import androidx.test.core.app.ApplicationProvider
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -30,6 +35,80 @@ import java.time.Duration
 @Config(sdk = [35])
 class ConnectionStatusViewTest {
     private val context = ApplicationProvider.getApplicationContext<Context>()
+
+    @Test
+    fun `expanded details use muted labels divider and copy icon in both themes`() {
+        for (nightMode in listOf(Configuration.UI_MODE_NIGHT_NO, Configuration.UI_MODE_NIGHT_YES)) {
+            val themed =
+                context.createConfigurationContext(
+                    Configuration(context.resources.configuration).apply {
+                        uiMode = (uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or nightMode
+                    },
+                )
+            themed.setTheme(R.style.Theme_Omnigent)
+            val view = ConnectionStatusView(themed) {}
+            view.show(
+                ConnectionStatus.ServerUnreachable(
+                    "example.com",
+                    UnreachableKind.GENERIC,
+                    ConnectionFailureDetails("https://example.com", "ERROR_CONNECT", 1234L),
+                ),
+                immediate = true,
+            )
+            view.findViewById<Button>(R.id.status_details_toggle).performClick()
+
+            val detailsText = view.findViewById<TextView>(R.id.status_details_text)
+            val rendered = detailsText.text
+            assertTrue(rendered is Spanned)
+            val styled = rendered as Spanned
+            for (label in listOf(
+                R.string.status_server,
+                R.string.status_error,
+                R.string.status_time,
+                R.string.status_app_version_label,
+            )) {
+                val start = styled.indexOf(themed.getString(label))
+                assertTrue(start >= 0)
+                val color =
+                    styled.getSpans(
+                        start,
+                        start + themed.getString(label).length,
+                        ForegroundColorSpan::class.java,
+                    )
+                val size =
+                    styled.getSpans(
+                        start,
+                        start + themed.getString(label).length,
+                        AbsoluteSizeSpan::class.java,
+                    )
+                assertEquals(
+                    ContextCompat.getColor(themed, R.color.brand_muted_foreground),
+                    color.single().foregroundColor,
+                )
+                assertEquals(12, size.single().size)
+            }
+            val dividerId =
+                themed.resources.getIdentifier(
+                    "status_details_divider",
+                    "id",
+                    themed.packageName,
+                )
+            assertTrue(dividerId != 0)
+            val divider = view.findViewById<View>(dividerId)
+            assertEquals(View.VISIBLE, divider.visibility)
+            assertEquals(
+                ContextCompat.getColor(themed, R.color.brand_border),
+                (divider.background as ColorDrawable).color,
+            )
+            val copy = view.findViewById<Button>(R.id.status_copy_details)
+            assertEquals(
+                (48 * themed.resources.displayMetrics.density + .5f).toInt(),
+                copy.layoutParams.height,
+            )
+            assertTrue(copy.compoundDrawablesRelative[0] != null)
+            assertEquals(Gravity.START or Gravity.CENTER_VERTICAL, copy.gravity)
+        }
+    }
 
     @Test
     fun `host chip and details use the approved icons and alignment`() {
