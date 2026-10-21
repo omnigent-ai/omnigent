@@ -119,6 +119,14 @@ class ExecutorEvent:
 
 
 @dataclass
+class NativeInputAccepted(ExecutorEvent):
+    """Trusted native RPC receipt; never inferred from transcript text."""
+
+    input_id: str
+    turn_id: str
+
+
+@dataclass
 class TextChunk(ExecutorEvent):
     """Streaming text output.
 

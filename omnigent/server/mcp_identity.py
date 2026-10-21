@@ -11,7 +11,10 @@ from omnigent.server.routes._sessions.helpers import _build_actor
 def mcp_policy_actor(
     request: Request, conversation: Conversation, caller: str | None
 ) -> dict[str, str] | None:
-    """Use the recorded turn actor only for a server-authorized runner."""
+    """Prefer verified input identity; actor labels are legacy attribution only."""
+    identity = getattr(request.state, "link_identity", None)
+    if identity is not None:
+        return _build_actor(identity.requester)
     token = (request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER) or "").strip()
     allowed = getattr(request.app.state, "runner_tunnel_tokens", None)
     if token and (

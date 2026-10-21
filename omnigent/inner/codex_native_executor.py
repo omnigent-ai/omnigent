@@ -61,6 +61,7 @@ from omnigent.inner.executor import (
     ExecutorError,
     ExecutorEvent,
     Message,
+    NativeInputAccepted,
     ToolSpec,
     TurnComplete,
 )
@@ -328,7 +329,8 @@ async def _start_codex_turn(
     state: CodexNativeBridgeState,
     input_items: list[dict[str, object]],
     settings_overrides: Mapping[str, object],
-) -> None:
+    input_authority_id: str | None = None,
+) -> str | None:
     """Apply optional settings and start one Codex turn on an idle thread."""
     settings_overrides = dict(settings_overrides)
     # Settings applied while their config write failed are recorded beside the config.
@@ -381,6 +383,7 @@ async def _start_codex_turn(
         {
             "threadId": state.thread_id,
             "input": input_items,
+            **({"clientUserMessageId": input_authority_id} if input_authority_id else {}),
             "environments": [
                 {
                     "environmentId": "local",
@@ -397,6 +400,8 @@ async def _start_codex_turn(
     if isinstance(turn_id, str) and turn_id:
         update_active_turn_id(bridge_dir, turn_id)
         _logger.info("Codex native started turn: turn_id=%s", turn_id)
+        return turn_id
+    return None
 
 
 async def _steer_codex_turn(
@@ -405,7 +410,8 @@ async def _steer_codex_turn(
     bridge_dir: Path,
     state: CodexNativeBridgeState,
     input_items: list[dict[str, object]],
-) -> None:
+    input_authority_id: str | None = None,
+) -> str | None:
     """Steer one bridge-recorded active Codex turn."""
     assert state.active_turn_id is not None
     response = await _native_delivery_request(
@@ -415,6 +421,7 @@ async def _steer_codex_turn(
             "threadId": state.thread_id,
             "expectedTurnId": state.active_turn_id,
             "input": input_items,
+            **({"clientUserMessageId": input_authority_id} if input_authority_id else {}),
         },
         state,
         bridge_dir=bridge_dir,
@@ -424,6 +431,8 @@ async def _steer_codex_turn(
     if isinstance(turn_id, str) and turn_id:
         update_active_turn_id(bridge_dir, turn_id)
         _logger.info("Codex native steered active turn: turn_id=%s", turn_id)
+        return turn_id
+    return None
 
 
 async def _inject_codex_turn(
@@ -433,27 +442,28 @@ async def _inject_codex_turn(
     state: CodexNativeBridgeState,
     input_items: list[dict[str, object]],
     settings_overrides: Mapping[str, object],
-) -> None:
+    input_authority_id: str | None = None,
+) -> str | None:
     """Steer an active turn or start one, recovering one proven stale steer."""
     if state.active_turn_id is None:
-        await _start_codex_turn(
+        return await _start_codex_turn(
             client,
             bridge_dir=bridge_dir,
             state=state,
             input_items=input_items,
             settings_overrides=settings_overrides,
+            input_authority_id=input_authority_id,
         )
-        return
 
     expected_turn_id = state.active_turn_id
     try:
-        await _steer_codex_turn(
+        return await _steer_codex_turn(
             client,
             bridge_dir=bridge_dir,
             state=state,
             input_items=input_items,
+            input_authority_id=input_authority_id,
         )
-        return
     except CodexAppServerResponseError as error:
         if not is_stale_active_turn_error(error):
             raise
@@ -470,20 +480,21 @@ async def _inject_codex_turn(
             "Codex native stale steer raced with a newer turn; steering turn_id=%s",
             recovered_state.active_turn_id,
         )
-        await _steer_codex_turn(
+        return await _steer_codex_turn(
             client,
             bridge_dir=bridge_dir,
             state=recovered_state,
             input_items=input_items,
+            input_authority_id=input_authority_id,
         )
-        return
     _logger.info("Codex native reconciled completed stale turn: turn_id=%s", expected_turn_id)
-    await _start_codex_turn(
+    return await _start_codex_turn(
         client,
         bridge_dir=bridge_dir,
         state=recovered_state,
         input_items=input_items,
         settings_overrides=settings_overrides,
+        input_authority_id=input_authority_id,
     )
 
 
@@ -674,6 +685,9 @@ class CodexNativeExecutor(Executor):
         """
         del tools, system_prompt
         settings_overrides = _model_effort_overrides(config)
+        authority_value = config.extra.get("input_authority_id") if config else None
+        input_authority_id = authority_value if isinstance(authority_value, str) else None
+        accepted_turn_id: str | None = None
         latest_user_content = _latest_user_content(messages)
         goal_objective = goal_objective_from_content(latest_user_content)
         if goal_objective is not None:
@@ -821,12 +835,13 @@ class CodexNativeExecutor(Executor):
                                         "objective": goal_objective,
                                     },
                                 )
-                            await _inject_codex_turn(
+                            accepted_turn_id = await _inject_codex_turn(
                                 client,
                                 bridge_dir=self._bridge_dir,
                                 state=state,
                                 input_items=input_items,
                                 settings_overrides=settings_overrides,
+                                input_authority_id=input_authority_id,
                             )
                     except Exception as exc:
                         if isinstance(exc, _CodexNativeInputUndelivered):
@@ -881,6 +896,8 @@ class CodexNativeExecutor(Executor):
                 undelivered=undelivered,
             )
         else:
+            if input_authority_id is not None and accepted_turn_id is not None:
+                yield NativeInputAccepted(input_id=input_authority_id, turn_id=accepted_turn_id)
             yield TurnComplete(response=None)
 
 

@@ -362,6 +362,7 @@ def configure_mock_llm(
     *,
     key: str = "default",
     match: str | None = None,
+    required_tools: list[str] | None = None,
 ) -> None:
     """
     Configure a keyed response queue on the mock LLM server.
@@ -404,6 +405,8 @@ def configure_mock_llm(
         regardless of ``model``. Use a deliberately-unique token (the
         message the test sends). Also used as the queue *key* when *key*
         is left at its default, so each match-routed queue is distinct.
+    :param required_tools: Only consume this queue when these tools are advertised;
+        prevents background policy requests from taking an agent's response.
     """
     if mock_llm_server_url is None:
         return
@@ -413,6 +416,8 @@ def configure_mock_llm(
     }
     if match is not None:
         payload["match"] = match
+    if required_tools is not None:
+        payload["required_tools"] = required_tools
     resp = httpx.post(
         f"{mock_llm_server_url}/mock/configure",
         json=payload,

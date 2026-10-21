@@ -6093,6 +6093,7 @@ def _build_native_terminal_message_event(
         # which always includes it.
         "agent_id": conv.agent_id,
     }
+    event.update(body._trusted_transport)
     if agent_revision is not None:
         event["agent_revision"] = agent_revision
     # The web's stable id for this message rides along so the runner can name
@@ -6880,6 +6881,7 @@ async def _forward_event_to_runner(
     }
     if agent_revision is not None:
         runner_body["agent_revision"] = agent_revision
+    runner_body.update(body._trusted_transport)
     # Persist the turn-initiating actor so /policies/evaluate and MCP
     # tools/call can read it back on any server replica.  Skip system-driven
     # forwards (sub-agent results, parent-wake carry created_by=None) — they
@@ -11833,6 +11835,9 @@ async def _create_session_from_existing_agent(
             # Dispatch (not a plain forward) so native-terminal sessions take the
             # single-writer bypass — otherwise the forwarder's echo duplicates the kickoff.
             for item in body.initial_items:
+                link_service = getattr(request.app.state, "session_links", None)
+                if link_service is not None:
+                    await asyncio.to_thread(link_service.capture_input, request, conv.id, item)
                 pending_background_title = prepare_background_session_title(
                     coordinator=background_title_coordinator,
                     conversation=conv,
@@ -12132,6 +12137,11 @@ async def _handle_mcp_tools_call(
         step: str,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {"method": "tools/call", "params": execute_params}
+        from omnigent.session_authority import REQUEST_AUTHORITY_FIELD
+
+        authority = getattr(getattr(request, "state", None), "link_authority", None)
+        if authority is not None:
+            body[REQUEST_AUTHORITY_FIELD] = authority.to_wire()
         if operation_id is not None:
             body["_omnigent_operation"] = {"id": operation_id, "step": step}
         return body

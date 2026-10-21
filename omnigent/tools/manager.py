@@ -114,6 +114,7 @@ class ToolManager:
         os_env: OSEnvironment | None = None,
         *,
         os_env_schema_only: bool = False,
+        session_links_enabled: bool = False,
     ) -> None:
         """
         Initialize the tool manager and register built-in,
@@ -148,6 +149,7 @@ class ToolManager:
         self._workdir = workdir
         self._sandbox_enabled = sandbox_enabled
         self._pre_resolved_os_env = os_env
+        self._session_links_enabled = session_links_enabled
         self._started = False
         self._tools: dict[str, Tool] = {}
         self._srt_available = is_srt_available()
@@ -457,6 +459,11 @@ class ToolManager:
         self._tools[SysSessionListTool.name()] = SysSessionListTool()
         self._tools[SysSessionGetHistoryTool.name()] = SysSessionGetHistoryTool()
         self._tools[SysSessionGetInfoTool.name()] = SysSessionGetInfoTool()
+        from omnigent.tools.builtins.session_links import LINK_TOOL_TYPES
+
+        if self._session_links_enabled:
+            for tool_type in LINK_TOOL_TYPES:
+                self._tools[tool_type.name()] = tool_type()
 
         # Session sharing: opt-in via the dedicated
         # ``agent_session_sharing`` flag, independent of spawn / declared

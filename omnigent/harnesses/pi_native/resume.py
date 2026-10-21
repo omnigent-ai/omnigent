@@ -45,6 +45,7 @@ import httpx
 
 from omnigent.host.daemon_launch import error_text
 from omnigent.native.native_terminal import url_component
+from omnigent.session_authority import may_replay_session_item
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 # Pi session ids are UUIDv7 hex with dashes (e.g.
@@ -606,7 +607,7 @@ async def fetch_all_session_items_for_pi_resume(
         if not isinstance(data, list):
             raise RuntimeError(f"History fetch for {session_id!r} returned an invalid item list.")
         for item in data:
-            if isinstance(item, dict):
+            if isinstance(item, dict) and may_replay_session_item(item):
                 items.append(item)
         if not payload.get("has_more"):
             return items

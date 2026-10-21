@@ -943,6 +943,43 @@ runner id. The write replaces any previous value in
 Codex-native session routes, including the Codex Goal subresource, are
 documented in [codex-API.md](codex-API.md).
 
+### Directed Session Links (experimental)
+
+These routes require the default-off `session_links` feature. They return 404
+when it is disabled. A signed-in owner of both sessions approves each direction
+within one tenant workspace. Approving A→B does not change either session's
+permissions, parent, host, or lifecycle. See [the tool and delivery contract](../../docs/session-links.md).
+
+| Method and path | Input | Result |
+|---|---|---|
+| `GET /v1/sessions/{source_id}/links` | `incoming=false`, `after`, `limit=50` (1–100) | Visible directions in `data`, plus `next_cursor`. Readers need access to both endpoints; a current endpoint owner can also inspect a stale link with its inaccessible peer's title hidden. |
+| `POST /v1/sessions/{source_id}/links` | `{"target_id":"…"}` | 201; the approved direction and its generation. Repeating an unchanged approval is idempotent. |
+| `DELETE /v1/sessions/{source_id}/links/{target_id}` | No body | 204; either current endpoint owner can disconnect. Prevents new work and replies, waiting for any claimed handoff to settle or expire. Accepted work continues. |
+| `POST /v1/sessions/{source_id}/linked-requests` | `target_id`, `message`, `operation_id` | 202; a durable delivery receipt. Requires the source's bound runner and verified requester context. |
+| `GET /v1/sessions/{source_id}/linked-requests/{request_id}` | `after`, `limit=50` (1–100) | Receipt, `worker_status`, addressed `replies`, and `next_cursor`; rechecks the original requester's access and link. |
+| `POST /v1/sessions/{worker_id}/linked-requests/{request_id}/replies` | `message`, `operation_id` | `reply_id`, `request_id`, `published`; copies an addressed reply into the originating session. |
+
+Messages contain 1–8,000 UTF-8 bytes; operation IDs contain 1–128 UTF-8 bytes.
+The runner supplies operation IDs and immutable input references outside model
+arguments. User-supplied attribution is never an authorization credential.
+Reusing an operation ID for different content returns 409.
+
+Delivery receipts contain `id`, `source_id`, `target_id`, `delivery_state`,
+`created_at`, and `accepted_at`. States are `pending`, `handoff`, `claimed`,
+`accepted`, `rejected`, and `uncertain`. Accepted means the ordinary input path
+received the message, not that the worker finished. An uncertain handoff must
+be inspected or polled; sending a new operation could duplicate work. Offline
+workers are not automatically launched or retried.
+
+Only explicit replies enter A. A's current and later readers can see retained
+copies, including after unlinking. B's ordinary output, full history, terminal,
+and files keep their own access checks. New B→A work needs a separate link;
+replies remain bound to their original A→B request.
+
+The development candidate still needs a verified human-versus-runner credential
+boundary before use in a multi-user deployment. Local header-auth tests do not
+establish that boundary; a runner-header check alone is insufficient.
+
 ### Post Event
 
 ```

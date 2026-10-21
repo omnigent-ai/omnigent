@@ -107,6 +107,23 @@ def register_items_routes(
             order=order,
         )
         data = [m.to_api_dict() for m in page.data]
+        linked_ids = [item["linked_request_id"] for item in data if item.get("linked_request_id")]
+        if linked_ids:
+            from omnigent.stores.session_link_store import SessionLinkStore
+
+            # This also applies after disabling new links: refused persisted
+            # inputs must never become recovery instructions.
+            accepted = (
+                await asyncio.to_thread(
+                    SessionLinkStore(permission_store.storage_location).accepted_inputs,
+                    linked_ids,
+                )
+                if permission_store is not None
+                else set()
+            )
+            for item in data:
+                if item.get("linked_request_id"):
+                    item["linked_input_accepted"] = item["linked_request_id"] in accepted
         return PaginatedList(
             data=data,
             first_id=page.first_id,

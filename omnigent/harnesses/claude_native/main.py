@@ -5484,6 +5484,8 @@ async def _fetch_all_session_items_for_claude_resume(
     :raises click.ClickException: If an item page cannot be fetched or
         parsed.
     """
+    from omnigent.session_authority import may_replay_session_item
+
     items: list[_JsonObject] = []
     after: str | None = None
     limit = _CLAUDE_RESUME_ITEMS_PAGE_LIMIT
@@ -5557,7 +5559,7 @@ async def _fetch_all_session_items_for_claude_resume(
             )
         for item in data:
             parsed_item = _json_object(item)
-            if parsed_item is not None:
+            if parsed_item is not None and may_replay_session_item(parsed_item):
                 items.append(parsed_item)
         if payload is None or not payload.get("has_more"):
             return items

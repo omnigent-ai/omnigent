@@ -54,6 +54,9 @@ def get_user_id(
     :param auth_provider: The auth provider, or ``None`` to skip auth.
     :returns: User ID string, or ``None`` if no auth provider.
     """
+    inherited = getattr(getattr(request, "state", None), "link_identity", None)
+    if inherited is not None:
+        return inherited.requester
     if auth_provider is None:
         return None
     return auth_provider.get_user_id(request)
@@ -88,7 +91,7 @@ def require_user(
     """
     if auth_provider is None:
         return None
-    user_id = auth_provider.get_user_id(request)
+    user_id = get_user_id(request, auth_provider)
     if user_id is None:
         raise OmnigentError(
             "Authentication required",

@@ -23,6 +23,7 @@ class Feature(StrEnum):
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
     CANVAS = "canvas"
+    SESSION_LINKS = "session_links"
     ARCA_SHUTDOWN_WARNINGS = "arca_shutdown_warnings"
     IMPORT_REVIEW = "import_review"
     CUSTOM_AGENTS_SETTINGS_UI = "custom_agents_settings_ui"
@@ -45,6 +46,12 @@ class FeatureDefinition:
 
 
 FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
+    FeatureDefinition(
+        feature=Feature.SESSION_LINKS,
+        description="Human-approved directed links between existing sessions",
+        owner="sessions",
+        review_by_release="0.21.0",
+    ),
     FeatureDefinition(
         feature=Feature.GRID_SESSIONS_DISPLAY_UI,
         description="Local session grids with up to four live conversations",

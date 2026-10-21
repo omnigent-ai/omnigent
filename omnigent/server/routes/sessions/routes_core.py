@@ -936,6 +936,9 @@ def register_core_routes(
             # message survives in each entry's `msg`.
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
+        from omnigent.server.session_links import SessionLinkService
+
+        SessionLinkService.require_child_creation(request, body.parent_session_id)
         # Checked before the session exists so a rejected create leaves nothing
         # behind.
         await _check_initial_input(request, body.initial_input)
@@ -1009,6 +1012,10 @@ def register_core_routes(
                         conv,
                         server_version=VERSION,
                         suppress_recovery_turn=True,
+                        request_authority_required=getattr(
+                            request.app.state, "session_links", None
+                        )
+                        is not None,
                     )
                 except Exception:
                     # Must not fail the create, but the degradation loses the
@@ -1157,6 +1164,9 @@ def register_core_routes(
         if not isinstance(bundle, StarletteUploadFile):
             raise HTTPException(status_code=422, detail=[_multipart_missing_detail("bundle")])
         parsed_metadata = _parse_session_create_metadata(metadata)
+        from omnigent.server.session_links import SessionLinkService
+
+        SessionLinkService.require_child_creation(request, parsed_metadata.parent_session_id)
         creation_metadata(
             parent_session_id=parsed_metadata.parent_session_id,
             host_type=parsed_metadata.host_type,
@@ -2900,6 +2910,10 @@ def register_core_routes(
                             json=build_runner_session_init_payload(
                                 conv,
                                 server_version=VERSION,
+                                request_authority_required=getattr(
+                                    request.app.state, "session_links", None
+                                )
+                                is not None,
                             ),
                             timeout=10.0,
                         )

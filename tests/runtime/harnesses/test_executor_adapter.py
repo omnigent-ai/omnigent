@@ -2227,6 +2227,36 @@ async def test_watch_injections_emits_consumed_marker_on_accept() -> None:
 
 
 @pytest.mark.asyncio
+async def test_watch_injections_reports_definitive_refusal() -> None:
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import CreateResponseRequest, InjectionRefusedEvent
+
+    executor = AsyncMock()
+    executor.enqueue_session_message.return_value = False
+    adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="sk")
+    ctx = _OneInjectionCtx(
+        CreateResponseRequest(model="m", input="queued follow-up", injection_id="inj_queued")
+    )
+    task = asyncio.create_task(adapter._watch_injections(ctx, executor))  # type: ignore[arg-type]
+    try:
+        for _ in range(200):
+            if ctx.emitted:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    executor.enqueue_session_message.assert_awaited_once_with("sk", "queued follow-up")
+    assert len(ctx.emitted) == 1
+    assert isinstance(ctx.emitted[0], InjectionRefusedEvent)
+    assert ctx.emitted[0].injection_id == "inj_queued"
+
+
+@pytest.mark.asyncio
 async def test_watch_injections_drops_injection_when_turn_cancelled() -> None:
     """A queued injection is dropped if the turn was interrupted.
 

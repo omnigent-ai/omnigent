@@ -38,7 +38,9 @@ from omnigent.runner.mcp_execution_registry import (
     McpExecutionRegistry,
 )
 from omnigent.runner.mcp_manager import McpSchemasResult
+from omnigent.runner.request_authority import RequesterClient
 from omnigent.runner.tool_dispatch import MCP_PROXY_CALL_TIMEOUT_S
+from omnigent.session_authority import REQUEST_AUTHORITY_FIELD, RequestAuthority
 from omnigent.spec.types import AgentSpec
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -158,6 +160,7 @@ class ProxyMcpManager:
         ap_client: httpx.AsyncClient,
         publish_event: _EventPublisher | None = None,
         execution_registry: McpExecutionRegistry | None = None,
+        request_authority: RequestAuthority | None = None,
     ) -> None:
         """Create a proxy manager bound to one session.
 
@@ -176,6 +179,7 @@ class ProxyMcpManager:
         self._omnigent_client = ap_client
         self._publish_event = publish_event
         self._execution_registry = execution_registry
+        self._request_authority = request_authority
         self._registry_services: set[str] = set()
 
     @property
@@ -358,6 +362,9 @@ class ProxyMcpManager:
         managed = bool(separator and service in self._registry_services)
         wire_name = upstream_name if managed else tool_name
         url = f"/v1/mcp/{service}" if managed else self._mcp_url
+        client = self._omnigent_client
+        if self._request_authority is not None and tool_name.startswith("sys_session_"):
+            client = RequesterClient(client, self._session_id, self._request_authority)
 
         def _initial_payload() -> _JsonObject:
             return {
@@ -368,6 +375,11 @@ class ProxyMcpManager:
                     "name": wire_name,
                     "arguments": arguments,
                     MCP_OPERATION_ID_PARAM: operation_id,
+                    **(
+                        {REQUEST_AUTHORITY_FIELD: self._request_authority.to_wire()}
+                        if self._request_authority is not None
+                        else {}
+                    ),
                 },
             }
 
@@ -400,7 +412,7 @@ class ProxyMcpManager:
         while True:
             request_generation = pending_approvals.current_server_generation()
             try:
-                resp = await self._omnigent_client.post(
+                resp = await client.post(
                     url,
                     json=payload,
                     headers={"X-Omnigent-Session-Id": self._session_id} if managed else {},

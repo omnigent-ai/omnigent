@@ -2172,6 +2172,8 @@ async def _fetch_all_session_items_for_codex_resume(
     :raises click.ClickException: If the server rejects the request or returns
         an invalid page.
     """
+    from omnigent.session_authority import may_replay_session_item
+
     items: list[_JsonObject] = []
     after: str | None = None
     while True:
@@ -2233,7 +2235,8 @@ async def _fetch_all_session_items_for_codex_resume(
                     f"History fetch for {session_id!r} returned a non-object "
                     f"item at index {index}."
                 )
-            items.append(item)
+            if may_replay_session_item(item):
+                items.append(item)
         if not payload.get("has_more"):
             return items
         last_id = payload.get("last_id")

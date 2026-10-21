@@ -7384,6 +7384,12 @@ def _build_new_item(
         ) from exc
     if isinstance(data, MessageData) and data.role == "user" and not data.is_meta:
         data = data.model_copy(update={"user_authored": True})
+    if isinstance(data, MessageData):
+        from omnigent.session_authority import LINKED_REQUEST_FIELD
+
+        data = data.model_copy(
+            update={"linked_request_id": body._trusted_transport.get(LINKED_REQUEST_FIELD)}
+        )
     return NewConversationItem(
         type=body.type,
         response_id=response_id,

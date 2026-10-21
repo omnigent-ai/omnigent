@@ -322,6 +322,7 @@ class MessageData(BaseModel):
     is_meta: bool = Field(default=False, exclude_if=lambda value: value is False)
     user_authored: bool = Field(default=False, exclude_if=lambda value: value is False)
     subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    linked_request_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
     stream_message_id: str | None = None
     startup_options: StartupInputOptions | None = Field(

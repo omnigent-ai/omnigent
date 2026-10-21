@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 import httpx
-from fastapi import FastAPI, Query, Request
+from fastapi import Depends, FastAPI, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
@@ -1583,6 +1583,7 @@ def create_app(
     runner_session_initializer = RunnerSessionInitializer(
         tunnel_registry,
         server_version=_server_version(),
+        request_authority_required=resolved_feature_flags.enabled(Feature.SESSION_LINKS),
         conversation_store=conversation_store,
         file_store=file_store,
         agent_store=agent_store,
@@ -1869,7 +1870,11 @@ def create_app(
         else None
     )
 
-    app = FastAPI(title="Omnigent Server", lifespan=_lifespan)
+    from omnigent.server.session_links import bind_requester
+
+    app = FastAPI(
+        title="Omnigent Server", lifespan=_lifespan, dependencies=[Depends(bind_requester)]
+    )
     from omnigent.runtime import telemetry
 
     telemetry.instrument_fastapi_app(app)
@@ -1936,6 +1941,30 @@ def create_app(
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
+    app.state.session_links = None
+    if resolved_feature_flags.enabled(Feature.SESSION_LINKS):
+        from omnigent.server.session_links import SessionLinkService
+        from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+        if (
+            auth_provider is None
+            or permission_store is None
+            or not isinstance(conversation_store, SqlAlchemyConversationStore)
+        ):
+            raise ValueError(
+                "Session links require authentication and SQL-backed permissions/history"
+            )
+        app.state.session_links = SessionLinkService(
+            conversation_store,
+            permission_store,
+            artifact_store,
+            agent_store,
+            runner_router,
+            auth_provider,
+        )
+    from omnigent.server.routes.session_links import create_session_links_router
+
+    app.include_router(create_session_links_router(), prefix="/v1", tags=["session-links"])
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
     # strip) can prefix it themselves. "" for a root deployment.
