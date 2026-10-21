@@ -110,15 +110,25 @@ checklist.
 ### Pi SDK bundled resources (own environment)
 
 For `launch-reply`, launch an uploaded Pi agent bundle through the server/runner,
-then run `omnigent run <bundle>` from a sibling workspace. Include an extension,
+then run `omnigent run <bundle>` from a sibling workspace under Linux Bubblewrap.
+Include an extension,
 a skill and bundle-root instructions; verify all reach the provider request and
 that tools still use the session workspace. Existing scenarios:
 `tests/e2e/omnigent/test_pi_bundle_extensions_cwd_e2e.py`,
 `tests/e2e/omnigent/test_pi_bundle_project_resources_e2e.py`, and
 `tests/e2e/omnigent/test_pi_managed_extensions_e2e.py`.
 The managed-extensions filename refers to extension provisioning, not Managed
-Omnigent. The Linux case runs a real Bubblewrap sandbox; a macOS skip does not
+Omnigent. The uploaded-bundle and existing global-extension CLI scenarios cover
+unsandboxed startup;
+the separate CLI bundle case covers real Bubblewrap isolation; a macOS skip does not
 validate that boundary. Native Pi resource discovery is a separate path.
+
+Run the scoped `launch-reply` checks (own environments; real Pi, scripted provider):
+
+```sh
+uv run --no-sync pytest tests/e2e/omnigent/test_pi_bundle_extensions_cwd_e2e.py tests/e2e/omnigent/test_pi_bundle_project_resources_e2e.py tests/e2e/omnigent/test_pi_managed_extensions_e2e.py --reruns 0 -q
+```
+
 
 ### Deterministic checks versus live canaries
 

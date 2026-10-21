@@ -3746,12 +3746,8 @@ def test_resolve_pi_skill_args_no_bundle() -> None:
 
 
 def test_resolve_pi_skill_args_finds_pi_native_skills_layout(tmp_path: Path) -> None:
-    """``skills_filter='all'`` surfaces a skill shipped in Pi's own
-    ``.pi/skills/<name>/`` layout via ``--skill``.
-
-    Pi only discovers ``.pi/skills`` from its cwd (the session workspace),
-    so without the explicit flag a bundle using Pi's idiomatic layout
-    silently ships no skills.
+    """``skills_filter='all'`` surfaces a skill shipped in Pi's own ``.pi/skills/<name>/``
+    layout via ``--skill``.
     """
     from omnigent.inner.pi_executor import _resolve_pi_skill_args
 
@@ -3788,11 +3784,8 @@ def test_resolve_pi_skill_args_named_subset_spans_both_skill_roots(tmp_path: Pat
 
 
 def test_resolve_pi_bundle_extension_args_extension_entries(tmp_path: Path) -> None:
-    """Each bundled extension entry point is passed via ``--extension``
-    so bundled extensions load regardless of Pi's cwd.
-
-    Entry *files* are passed, not the directory: Pi treats a directory
-    ``--extension`` source as a package root, not an extensions dir.
+    """Each bundled extension entry point is passed via ``--extension`` so bundled extensions
+    load regardless of Pi's cwd.
     """
     from omnigent.inner.pi_executor import _resolve_pi_bundle_extension_args
 
@@ -3890,9 +3883,9 @@ def test_resolve_pi_bundle_extension_entries_root_entry_wins(tmp_path: Path) -> 
 def test_read_pi_bundle_context_follows_pi_candidate_order(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The bundle-root context file is read by content in Pi's own
-    precedence order; a missing, blank or undecodable file yields nothing,
-    the last with a warning instead of failing executor construction.
+    """The bundle-root context file is read by content in Pi's own precedence order; a missing,
+    blank or undecodable file yields nothing, the last with a warning instead of failing
+    executor construction.
     """
     from omnigent.inner.pi_executor import _read_pi_bundle_context
 
@@ -3921,9 +3914,9 @@ def test_read_pi_bundle_context_follows_pi_candidate_order(
 
 
 def test_bundle_context_follows_context_files_and_skips_duplicates(tmp_path: Path) -> None:
-    """The bundle-root context file is an automatic context file: it is
-    dropped with ``context_files=False`` and not appended twice when the
-    composed instructions already carry it (``instructions: AGENTS.md``).
+    """The bundle-root context file is an automatic context file: it is dropped with
+    ``context_files=False`` and not appended twice when the composed instructions
+    already carry it (``instructions: AGENTS.md``).
     """
     bundle = tmp_path / "bundle"
     bundle.mkdir()
@@ -5089,9 +5082,8 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
 
 
 def test_pi_bundle_resource_roots_follow_passed_args(tmp_path: Path) -> None:
-    """Only the bundle roots that contributed a ``--skill`` / ``--extension``
-    path are granted, in a stable order; no bundle or no resources grants
-    nothing.
+    """Only the bundle roots that contributed a ``--skill`` / ``--extension`` path are granted,
+    in a stable order; no bundle or no resources grants nothing.
     """
     from omnigent.inner.pi_executor import _pi_bundle_resource_roots
 
@@ -5113,16 +5105,7 @@ def test_pi_bundle_resource_roots_follow_passed_args(tmp_path: Path) -> None:
 
 
 def test_pi_sandbox_grants_bundle_resource_dirs_as_read_roots(monkeypatch, tmp_path) -> None:
-    """A sandboxed Pi is granted the bundle resource directories it is passed.
-
-    The runner extracts bundles under the host temp dir, which the sandbox
-    replaces with a private tmpfs, so without these grants Pi aborts on its
-    ``--extension`` path. The bundle root itself stays ungranted: the dotfile
-    mask would hide its ``.pi/`` entry.
-
-    :param monkeypatch: Pytest monkeypatch fixture.
-    :param tmp_path: Pytest tmp dir hosting both the cwd and the bundle.
-    """
+    """A sandboxed Pi is granted the bundle resource directories it is passed."""
     from omnigent.inner import sandbox as sandbox_mod
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.inner.sandbox import SandboxPolicy

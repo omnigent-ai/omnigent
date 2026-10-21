@@ -3,20 +3,19 @@
 from __future__ import annotations
 
 import os
-import time
 import uuid
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
-import yaml
 
+from tests._helpers.polling import poll_until
 from tests._helpers.server_runner import server_runner
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.conftest import get_mock_requests
-from tests.e2e.omnigent._pi_mock_gateway import write_pi_gateway_config
+from tests.e2e.omnigent._pi_mock_gateway import write_pi_gateway_config, write_pi_resource_bundle
 from tests.e2e.omnigent.conftest import configure_mock_llm, reset_mock_llm
 
 _EXT_MARKER = "OMNI_PI_BUNDLE_EXT_ACTIVE"
@@ -33,43 +32,6 @@ pytestmark = pytest.mark.skipif(
         f"{_pytest_pi_unavailable}. Install/fix Pi to run this test."
     ),
 )
-
-
-def _build_bundle(bundle: Path, model: str) -> None:
-    """Write an extension, skill and context file visible only through the bundle."""
-    ext_dir = bundle / ".pi" / "extensions" / "omni-marker"
-    ext_dir.mkdir(parents=True)
-    (ext_dir / "index.js").write_text(
-        "module.exports = function (pi) {\n"
-        '  pi.on("before_agent_start", async (event) => {\n'
-        f"    return {{ systemPrompt: `${{event.systemPrompt}}\\n\\n{_EXT_MARKER}` }};\n"
-        "  });\n"
-        "};\n",
-        encoding="utf-8",
-    )
-    (bundle / "AGENTS.md").write_text(
-        f"# Bundle guidance\n\n{_AGENTSMD_MARKER}: always answer like a pirate.\n",
-        encoding="utf-8",
-    )
-    skill_dir = bundle / ".pi" / "skills" / "grilling"
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text(
-        f"---\nname: grilling\ndescription: {_SKILL_MARKER} grilling tips\n---\n# Grilling\n",
-        encoding="utf-8",
-    )
-    (bundle / "config.yaml").write_text(
-        yaml.safe_dump(
-            {
-                "spec_version": 1,
-                "name": "pi_ext_bundle_agent",
-                "prompt": _AGENT_PROMPT,
-                "executor": {"model": model, "config": {"harness": "pi"}},
-                "os_env": {"type": "caller_process", "cwd": ".", "sandbox": {"type": "none"}},
-            },
-            sort_keys=False,
-        ),
-        encoding="utf-8",
-    )
 
 
 def _create_session(client: httpx.Client, bundle: Path, runner_id: str) -> str:
@@ -96,10 +58,11 @@ def _drive_turn_to_terminal(client: httpx.Client, session_id: str, prompt: str) 
         "data": {"role": "user", "content": [{"type": "input_text", "text": prompt}]},
     }
     client.post(f"/v1/sessions/{session_id}/events", json=body).raise_for_status()
-    deadline = time.monotonic() + _TURN_TIMEOUT
     seen_running = False
     last: dict[str, Any] = {}
-    while time.monotonic() < deadline:
+
+    def terminal() -> bool:
+        nonlocal seen_running, last
         last = client.get(f"/v1/sessions/{session_id}").json()
         status = last.get("status")
         if status in ("running", "waiting"):
@@ -110,12 +73,10 @@ def _drive_turn_to_terminal(client: httpx.Client, session_id: str, prompt: str) 
             if item.get("type") not in ("resource_event",)
             and not (item.get("type") == "message" and item.get("data", {}).get("role") == "user")
         ]
-        if status == "failed" or (status == "idle" and (seen_running or turn_items)):
-            return last
-        time.sleep(1.0)
-    raise AssertionError(
-        f"session {session_id} did not become terminal in {_TURN_TIMEOUT}s; last={last}"
-    )
+        return status == "failed" or (status == "idle" and (seen_running or bool(turn_items)))
+
+    poll_until(terminal, timeout_s=_TURN_TIMEOUT, interval_s=1)
+    return last
 
 
 def _captured_system_prompts(mock_url: str, model: str) -> list[str]:
@@ -150,8 +111,13 @@ def test_pi_bundle_extensions_reach_session_cwd(
     )
 
     bundle = tmp_path / "myagent"
-    bundle.mkdir()
-    _build_bundle(bundle, model)
+    write_pi_resource_bundle(
+        bundle,
+        model=model,
+        markers=(_AGENT_PROMPT, _EXT_MARKER, _SKILL_MARKER, _AGENTSMD_MARKER),
+        extension_suffix="js",
+        sandbox={"type": "none"},
+    )
 
     config_home = tmp_path / "omnigent-config"
     write_pi_gateway_config(config_home, mock_url=mock_llm_server_url, model=model)
@@ -178,33 +144,9 @@ def test_pi_bundle_extensions_reach_session_cwd(
                 client, session_id, "Introduce yourself in one sentence."
             )
 
-    assert snapshot.get("status") != "failed", (
-        f"pi turn failed instead of exercising the extension path: "
-        f"{snapshot.get('last_task_error') or snapshot.get('error')}"
-    )
-
+    assert snapshot.get("status") == "idle", snapshot
     system_prompts = _captured_system_prompts(mock_llm_server_url, model)
-    assert system_prompts, (
-        "mock LLM captured no system prompt — the pi turn never reached the "
-        "model, so the extension-loading path was not exercised"
-    )
+    assert system_prompts, "Pi never sent a system prompt to the provider"
     joined = "\n".join(system_prompts)
-
-    assert _EXT_MARKER in joined, (
-        "bundle's project-local .pi/extensions extension did not load — its "
-        f"before_agent_start marker {_EXT_MARKER!r} is absent from the system "
-        "prompt pi sent to the model (pi ran in the session workspace, not the "
-        "bundle directory)."
-    )
-    assert _AGENTSMD_MARKER in joined, (
-        "bundle-root AGENTS.md did not reach pi — its marker "
-        f"{_AGENTSMD_MARKER!r} is absent from the system prompt (pi's cwd-based "
-        "context loader never saw the bundle directory)."
-    )
-    assert _SKILL_MARKER in joined, (
-        "bundle's .pi/skills skill did not reach pi — its description marker "
-        f"{_SKILL_MARKER!r} is absent from the skill index in the system prompt."
-    )
-    assert _AGENT_PROMPT in joined, (
-        "the agent's own prompt was lost while appending the bundle resources"
-    )
+    for marker in (_EXT_MARKER, _AGENTSMD_MARKER, _SKILL_MARKER, _AGENT_PROMPT):
+        assert marker in joined, f"bundle resource missing from provider request: {marker}"

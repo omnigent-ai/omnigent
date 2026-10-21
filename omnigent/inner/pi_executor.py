@@ -1761,15 +1761,7 @@ _PI_BUNDLE_CONTEXT_FILE_CANDIDATES = (
 
 
 def _pi_extension_dir_entries(ext_dir: pathlib.Path) -> list[pathlib.Path]:
-    """
-    Resolve one extension directory to its entry-point file(s).
-
-    Mirrors Pi's ``resolveExtensionEntries``: a ``package.json`` with a
-    ``pi.extensions`` manifest wins, else ``index.ts``, else ``index.js``.
-
-    :param ext_dir: A directory that may hold a Pi extension.
-    :returns: The entry files, or ``[]`` when *ext_dir* has none.
-    """
+    """Resolve one extension directory to its entry-point file(s)."""
     manifest_path = ext_dir / "package.json"
     if manifest_path.is_file():
         try:
@@ -1809,17 +1801,7 @@ def _pi_extension_dir_entries(ext_dir: pathlib.Path) -> list[pathlib.Path]:
 
 
 def _resolve_pi_bundle_extension_entries(extensions_dir: pathlib.Path) -> list[pathlib.Path]:
-    """
-    Discover extension entry files under a bundle's ``.pi/extensions``.
-
-    Mirrors Pi's own project discovery (``collectAutoExtensionEntries``):
-    an entry point at the directory root wins; otherwise top-level
-    ``*.ts``/``*.js`` files and subdirectories with their own entry point
-    are collected. Dotfiles and ``node_modules`` are skipped.
-
-    :param extensions_dir: The bundle's ``.pi/extensions`` directory.
-    :returns: Entry files in sorted order.
-    """
+    """Discover extension entry files under a bundle's ``.pi/extensions``."""
     root_entries = _pi_extension_dir_entries(extensions_dir)
     if root_entries:
         return root_entries
@@ -1842,15 +1824,7 @@ def _resolve_pi_bundle_extension_entries(extensions_dir: pathlib.Path) -> list[p
 
 
 def _resolve_pi_bundle_extension_args(bundle_dir: pathlib.Path | None) -> list[str]:
-    """Pass bundled extension entry files explicitly; Pi's cwd is the workspace.
-
-    Passing the .pi directory would also load skills outside skills_filter.
-    Extension hooks run normally; extension-defined tools remain excluded by --tools.
-
-    :param bundle_dir: The agent bundle's extracted on-disk path.
-        ``None`` when no bundle is available — no flags are emitted.
-    :returns: A list of CLI tokens to extend ``self._extra_args`` with.
-    """
+    """Pass bundled extension entry files explicitly; Pi's cwd is the workspace."""
     if bundle_dir is None:
         return []
     extensions_dir = bundle_dir / ".pi" / "extensions"
@@ -1865,14 +1839,9 @@ def _resolve_pi_bundle_extension_args(bundle_dir: pathlib.Path | None) -> list[s
 def _pi_bundle_resource_roots(
     bundle_dir: pathlib.Path | None, args: Sequence[str]
 ) -> list[pathlib.Path]:
-    """Grant read access to bundle resources passed through --skill or --extension.
+    """Grant selected resource roots; sandbox tmpfs hides extracted bundles.
 
-    Sandbox tmpfs hides extracted bundles. Grant resource roots individually;
-    granting the bundle root would leave .pi hidden by the dotfile mask.
-
-    :param bundle_dir: The agent bundle's extracted on-disk path, or ``None``.
-    :param args: The resolved Pi CLI tokens, e.g. ``self._extra_args``.
-    :returns: The resource roots to grant, in a stable order.
+    Granting only the bundle root would leave .pi hidden by the dotfile mask.
     """
     if bundle_dir is None:
         return []
@@ -1894,16 +1863,7 @@ def _squash_ws(text: str) -> str:
 
 
 def _read_pi_bundle_context(bundle_dir: pathlib.Path | None) -> str | None:
-    """Read the first readable bundle context file in Pi's precedence order.
-
-    Pass its contents into the prompt: Pi's workspace cwd cannot discover the bundle.
-
-    :param bundle_dir: The agent bundle's extracted on-disk path, or ``None``.
-    :returns: The stripped file content of the first readable candidate, or
-        ``None`` when there is no bundle, no readable candidate, or only
-        whitespace. An unreadable or undecodable candidate is skipped with a
-        warning.
-    """
+    """Read the first readable bundle context file in Pi's precedence order."""
     if bundle_dir is None:
         return None
     for candidate in _PI_BUNDLE_CONTEXT_FILE_CANDIDATES:
@@ -2738,10 +2698,7 @@ class PiExecutor(Executor):
         state.applied_thinking = thinking
 
     def _with_bundle_context(self, system_prompt: str) -> str:
-        """Append bundle context unless the prompt already starts with it.
-
-        The spec parser may have adopted the same file as the agent's instructions.
-        """
+        """Append bundle context unless the prompt already starts with it."""
         context = self._bundle_context
         if not context or _squash_ws(system_prompt).startswith(_squash_ws(context)):
             return system_prompt

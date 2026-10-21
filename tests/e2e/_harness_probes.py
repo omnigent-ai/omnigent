@@ -225,13 +225,7 @@ def skip_if_harness_cli_missing(harness: str) -> None:
 
 @cache
 def bwrap_namespace_unavailable_reason() -> str | None:
-    """
-    Return ``None`` when bwrap can spawn a namespace here, else a skip reason.
-
-    Nested sandboxes (CI agents already running inside bubblewrap) cannot
-    create user namespaces, so tests that execute a real ``linux_bwrap``
-    launcher skip there while mount-plan tests keep running.
-    """
+    """Return ``None`` when bwrap can spawn a namespace here, else a skip reason."""
     if not sys.platform.startswith("linux") or shutil.which("bwrap") is None:
         return "Linux with bubblewrap is required"
     probe = subprocess.run(
