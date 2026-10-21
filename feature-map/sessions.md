@@ -19,8 +19,8 @@ the header menu), and each place is a separate entry point.
 - `pin-reorder`: drag a pinned row onto another pinned row to change the Pinned
   order, which persists across reloads; dropping an unpinned row onto a pinned
   row pins it into that slot.
-- `rename`: from the row, the header menu, or the header title; long titles are
-  limited.
+- `rename`: from the row, the header menu, the header title, or Cmd/Ctrl+Alt+R
+  on desktop; long titles are limited.
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to
@@ -182,6 +182,12 @@ pin, fork, export, rename, mark as unread, add to project, archive or
 unarchive, and delete. Clicking the title also renames, and the title's folder
 tag also moves the session into a project. Sub-agent sessions hide owner-only
 actions.
+
+**Rename shortcut:** in an owner-managed top-level session on desktop, press
+Cmd+Option+R on macOS or Ctrl+Alt+R elsewhere, including while writing a draft.
+The header title becomes an input with its text selected. Enter or blur saves;
+Escape cancels. The shortcut leaves terminals, code editors, and open menus or
+dialogs alone. It is listed in Keyboard shortcuts and Settings.
 
 **Message actions:** fork through a specific assistant message, excluding later
 turns. The header's Fork action copies the whole session instead. In either
@@ -363,6 +369,8 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`rename`:**
   `tests/e2e_ui/sessions/test_sidebar_rename.py::test_rename_session_enforces_user_title_limit`,
   `tests/e2e_ui/sessions/test_header_session_menu.py::test_header_session_menu_renames_owner_and_hides_for_subagent`.
+  The desktop shortcut, including draft preservation, cancellation, and reload:
+  `tests/e2e_ui/sessions/test_header_session_menu.py::test_rename_hotkey_from_composer_persists_and_cancels`.
   The iOS drawer rename under the soft keyboard:
   `tests/e2e_ui/mobile/test_rename_keeps_sidebar_sessions_reachable.py::test_rename_keeps_sidebar_sessions_reachable`,
   `tests/e2e_ui/mobile/test_rename_keeps_sidebar_sessions_reachable.py::test_rename_scrolls_edit_row_into_view_above_keyboard`
