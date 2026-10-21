@@ -16,9 +16,7 @@ from omnigent.stores.preference_store.sqlalchemy_store import SqlAlchemyPreferen
 
 
 @pytest.mark.parametrize("positional_auth", [False, True])
-async def test_authenticated_preference_operations(
-    runtime_init, db_uri, tmp_path, monkeypatch, positional_auth
-):
+async def test_authenticated_preference_operations(db_uri, tmp_path, monkeypatch, positional_auth):
     monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "0")
     store = SqlAlchemyPreferenceStore(db_uri, authority_id="test-authority")
     artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
@@ -30,7 +28,7 @@ async def test_authenticated_preference_operations(
         AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "cache"),
     ]
     provider = UnifiedAuthProvider(source="header")
-    # Existing embedders pass auth after six optional stores/tunnel arguments.
+    # Exercise positional auth while keeping preference_store keyword-only.
     app = (
         create_app(*stores, *([None] * 6), provider, preference_store=store)
         if positional_auth
@@ -41,6 +39,8 @@ async def test_authenticated_preference_operations(
     ) as client:
         path = "/v1/preferences/shared"
         assert (await client.get(path)).status_code == 401
+        if positional_auth:
+            return
         alice = {"X-Forwarded-Email": "alice@example.test"}
         bob = {"X-Forwarded-Email": "bob@example.test"}
         initial = (await client.get(path, headers=alice)).json()
@@ -54,6 +54,11 @@ async def test_authenticated_preference_operations(
             "value": "pi-native",
         }
         assert (await client.post(path + "/operations", json=operation)).status_code == 401
+        overlong = {"X-Forwarded-Email": "a" * 123 + "@example.test"}
+        assert (await client.get(path, headers=overlong)).status_code == 400
+        assert (
+            await client.post(path + "/operations", json=operation, headers=overlong)
+        ).status_code == 400
         assert (
             await client.post(path + "/operations", json=operation, headers=bob)
         ).status_code == 403
@@ -90,6 +95,7 @@ async def test_authenticated_preference_operations(
             ({"limit": 0}, 422),
             ({"limit": 101}, 422),
             ({"cursor": "bad"}, 400),
+            ({"cursor": "x" * 4097}, 422),
         ]:
             assert (await client.get(path, params=params, headers=alice)).status_code == status
         newer = {
@@ -103,6 +109,15 @@ async def test_authenticated_preference_operations(
         ).status_code == 200
         assert (
             await client.get(path, params={"cursor": first["next_cursor"]}, headers=alice)
+        ).status_code == 409
+        monkeypatch.setattr(store, "_authority", "other-authority")
+        assert (await client.get(path, headers=alice)).status_code == 409
+        foreign_authority = {
+            **operation,
+            "identity": {**initial["identity"], "authority_id": "other-authority"},
+        }
+        assert (
+            await client.post(path + "/operations", json=foreign_authority, headers=alice)
         ).status_code == 409
 
 

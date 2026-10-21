@@ -18,7 +18,6 @@ def test_shared_preferences_across_replicas_and_restart(tmp_path, db_uri):
     arguments = ("--config", str(config), "--database-uri", db_uri)
     server_env = {"OMNIGENT_LOCAL_SINGLE_USER": "0"}
     alice = {"X-Forwarded-Email": "alice@example.test"}
-    bob = {"X-Forwarded-Email": "bob@example.test"}
     path = "/v1/preferences/shared"
     with isolated_local_server(tmp_path / "first", extra_args=arguments, env=server_env) as first:
         with isolated_local_server(
@@ -63,39 +62,21 @@ def test_shared_preferences_across_replicas_and_restart(tmp_path, db_uri):
                 resolved = submit((first, resolution))
                 assert resolved["entry"]["version"] == 2
                 assert submit((second, resolution)) == resolved
-                extra_edits = [
-                    operation("model", "opencode_model", "opencode-default"),
-                    operation("harness", "default", "pi-native"),
-                    operation("harness_args", "claude", []),
-                    operation(
-                        "plugin",
-                        {"ecosystem": "claude", "source": "catalog", "name": "tools"},
-                        False,
-                    ),
-                ]
-                for edit in extra_edits:
-                    assert submit((second, edit))["status"] == "applied"
-                assert client.get(first + path, headers=bob).json()["entries"] == []
-                assert (
-                    client.post(
-                        first + path + "/operations", json=resolution, headers=bob
-                    ).status_code
-                    == 403
-                )
-                with httpx.Client(trust_env=False) as anonymous:
-                    assert anonymous.get(first + path).status_code == 401
+                # A second key forces pagination across replicas and the later restart.
+                extra = operation("model", "opencode_model", "opencode-default")
+                assert submit((second, extra))["status"] == "applied"
                 saved = client.get(first + path).json()
                 assert saved == client.get(second + path).json()
                 assert saved["conflicts"] == []
-                first_page = client.get(first + path, params={"limit": 2}).json()
+                first_page = client.get(first + path, params={"limit": 1}).json()
                 pages = [first_page]
                 while pages[-1]["next_cursor"]:
                     reply = client.get(
-                        second + path, params={"limit": 2, "cursor": pages[-1]["next_cursor"]}
+                        second + path, params={"limit": 1, "cursor": pages[-1]["next_cursor"]}
                     )
                     assert reply.status_code == 200, reply.text
                     pages.append(reply.json())
-                assert len(pages) == 3
+                assert len(pages) == 2
                 assert all(page["revision"] == saved["revision"] for page in pages)
                 assert [entry for page in pages for entry in page["entries"]] == saved["entries"]
     with isolated_local_server(
@@ -105,7 +86,7 @@ def test_shared_preferences_across_replicas_and_restart(tmp_path, db_uri):
             base_url=restarted, headers=alice, timeout=20, trust_env=False
         ) as client:
             assert client.get(path).json() == saved
-            resumed = client.get(path, params={"limit": 2, "cursor": first_page["next_cursor"]})
+            resumed = client.get(path, params={"limit": 1, "cursor": first_page["next_cursor"]})
             assert resumed.status_code == 200 and resumed.json() == pages[1]
             assert client.post(path + "/operations", json=resolution).json() == resolved
             removal = operation("model", "model", None, 2)

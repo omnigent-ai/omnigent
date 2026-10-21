@@ -14,7 +14,7 @@ separate deployments must use different IDs. Keep the ID across restarts and
 URL changes. Existing stored state rejects an inconsistent authority.
 
 Embedded deployments opt in by passing a `PreferenceStore` to `create_app`.
-Universe wiring and managed verification remain separate. The server derives
+The server derives
 user identity from its configured authentication provider and workspace identity
 from the existing trusted workspace context. An installation ID describes the
 source of an edit; it is not proof of machine identity or an authorization grant.
@@ -31,10 +31,13 @@ history; work per page is O(limit), independent of receipt count.
 
 Every cursor binds the authenticated namespace and revision. If any edit commits
 between pages, the server returns 409: discard all collected pages and restart
-from page one. Each page is one SQL statement combining a metadata point lookup with two
-independently limited index ranges, so its rows come from one consistent view. Only publish a complete
+from page one. Each page is one SQL statement combining a metadata point lookup with up to two
+independently limited index ranges; after a value cursor only the value range remains.
+Its rows come from one consistent view. Only publish a complete
 snapshot from one revision; never adopt a partial page. Malformed or foreign
-cursors return 400. A cursor is not an authorization credential.
+cursors return 400; cursors over 4,096 characters return 422. A cursor is not an
+authorization credential. Authenticated user IDs that do not fit the namespace
+name rules return 400.
 
 Reads do not create records or initialize adoption. Each entry includes its
 `key`, `version`, `value`, and originating `installation_id`. A missing key has
@@ -112,13 +115,26 @@ failures. Value, conflict, counter, and receipt updates commit together.
 Per user/workspace, version 1 allows 512 distinct keys including deletions,
 128 unresolved conflicts, and 10,000 consumed operations. Each JSON-encoded
 `{"value": ...}` is limited to 8,192 UTF-8 bytes. Names are at most 128 characters;
-individual stored records fit the existing 65,535-byte BLOB contract.
+individual raw JSON records are capped at 16,000 UTF-8 bytes, below 16 KiB with
+room for storage framing. A receipt stores a SHA-256 fingerprint of the canonical
+request and its original result; it does not duplicate the submitted value.
+An oversized full record is rejected without consuming the operation.
 
 Receipts and deletions do not expire. Hitting a limit rejects further work rather
-than discarding history; existing reads and receipt retries still work. Resolve
-conflicts before reaching the operation cap. Raising limits or compacting history
-requires a migration/protocol plan before broad activation. Account deletion
-uses the existing cleanup of all user preference rows.
+than discarding history; existing reads and receipt retries still work. The
+10,000-operation cap permanently blocks every new operation ID in that namespace,
+including unchanged edits and conflict resolutions. Open conflicts remain visible
+but cannot be resolved once the cap is reached. There is no automatic reset or
+compaction. Receipt retention/compaction requires a migration and retry-identity
+design before broad activation. Account deletion currently uses the existing
+single-transaction cleanup of all user preference rows; bounded cleanup remains
+a prerequisite for broad activation.
+
+The version-1 key encoding is explicit and pinned by digest tests. Changing its
+encoding, harness aliases, or stored-record validation requires a migration or a
+new storage version. Invalid stored rows fail the read; they are never silently
+discarded. This unmerged format is not a migration for databases created from
+earlier development revisions.
 
 ## Verify the implemented path
 
@@ -132,6 +148,7 @@ uv run --no-sync pytest tests/e2e/omnigent/test_shared_preferences_e2e.py --reru
 ```
 
 Both the store tests and this server test can use an isolated PostgreSQL, MySQL,
-or CockroachDB instance via the existing `OMNIGENT_TEST_DB_URI` fixture. Managed deployment, Arclet startup, automatic
-outbox/reconnect handling, import/rollback, and native plugin isolation remain
-unverified follow-ups. An empty API snapshot is not an adoption marker.
+or CockroachDB instance when `OMNIGENT_TEST_DB_URI` is configured. CI's external
+database lanes run the store tests; running the real-process scenario on those
+backends is an explicit verification step. An empty API snapshot is not an
+adoption marker.

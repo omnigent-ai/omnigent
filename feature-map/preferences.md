@@ -119,14 +119,16 @@ uv run --no-sync pytest tests/e2e/omnigent/test_shared_preferences_e2e.py --reru
 
 This drives two isolated CLI servers sharing a SQLite database through actual
 HTTP requests (or another isolated backend via `OMNIGENT_TEST_DB_URI`). It checks
-all preference groups, conflicting edits, explicit
-resolution, retries, user isolation, deletion, and persistence after restart.
+conflicting edits, explicit resolution, retries, deletion, and persistence after
+restart. Key/value and authentication matrices stay in the store and route tests.
 It also walks small pages across replicas, resumes a cursor after restart,
 and rejects continuation after another edit; a stable traversal has no missing
 or duplicated preferences.
 No services or providers are mocked; no model is called. This verifies the local
 OSS API, not managed deployment or actual native application of preferences.
-The store matrix also runs on PostgreSQL, MySQL, and CockroachDB:
+The store matrix can also run on PostgreSQL, MySQL, and CockroachDB when
+`OMNIGENT_TEST_DB_URI` names an isolated backend. CI's external-database lanes
+run `tests/stores`; the real-process test is an explicit run on those backends:
 
 ```sh
 uv run --no-sync pytest tests/stores/test_preference_store.py \
@@ -137,7 +139,10 @@ The standard component matrix also checks page boundaries, malformed/foreign
 cursors, edits during and between pages, partial conflict resolution, and
 wrong-key rejection without consuming the operation ID. A SQLite query-plan/VM
 check adds 10,000 receipt rows and verifies page work stays bounded. Route tests
-cover both keyword and legacy positional authentication. These are store/HTTP
+cover keyword authentication, a separate positional-auth check, overlong user
+IDs, and authority mismatch. Store tests cover simultaneous delivery of one
+operation ID, compact receipts at the UTF-8 value limit, and unresolved conflicts
+at the operation cap. These are store/HTTP
 checks; the process recipe above covers replica and restart transport.
 
 For later slices, continue live verification of each newly connected path on an
@@ -146,6 +151,13 @@ observed results, any mocked services, and remaining entry-point gaps.
 
 ## Gotchas
 
+- Before broad activation, design receipt retention/compaction and bounded
+  account-deletion batches. At 10,000 consumed operations, new edits and conflict
+  resolutions stop permanently; reads and identical retries still work.
+- Request parsing currently has no route-specific body-size or rate limit.
+  Add these before broad activation; the value cap applies after JSON parsing.
+- Managed deployment, Universe wiring, Arclet startup, automatic outbox/reconnect,
+  import/rollback, and native plugin isolation remain unverified follow-ups.
 - `--global` means this machine's user YAML, not a shared workspace write.
   Reading or editing YAML does not opt into shared preferences.
 - `config list` displays user and project defaults under their file paths;

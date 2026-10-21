@@ -4407,6 +4407,19 @@ def server(
     from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
 
     cfg = _load_config(config_path)
+    authority_id = cfg.get("shared_preferences_authority_id")
+    if authority_id is not None:
+        from pydantic import TypeAdapter, ValidationError
+
+        from omnigent.preference_sync import Name
+
+        try:
+            authority_id = TypeAdapter(Name).validate_python(authority_id)
+        except ValidationError:
+            raise click.ClickException(
+                "Invalid shared_preferences_authority_id: expected a nonempty string "
+                "of at most 128 characters without surrounding whitespace."
+            ) from None
     title_server_config = cfg
     if config_path is None:
         global_cfg = _load_global_config()
@@ -4452,7 +4465,7 @@ def server(
     scheduled_task_store = SqlAlchemyScheduledTaskStore(db_uri)
     project_store = SqlAlchemyProjectStore(db_uri)
     preference_store = None
-    if authority_id := cfg.get("shared_preferences_authority_id"):
+    if authority_id is not None:
         from omnigent.stores.preference_store.sqlalchemy_store import SqlAlchemyPreferenceStore
 
         preference_store = SqlAlchemyPreferenceStore(db_uri, authority_id=authority_id)

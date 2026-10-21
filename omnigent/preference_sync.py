@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Annotated, Literal, Self
 from uuid import UUID
 
@@ -34,7 +35,7 @@ MAX_KEYS = 512
 MAX_OPERATIONS = 10000
 MAX_CONFLICTS = 128
 MAX_VALUE_BYTES = 8192
-MAX_RECORD_BYTES = 65533
+MAX_RECORD_BYTES = 16000
 
 
 class ProtocolModel(BaseModel):
@@ -76,7 +77,18 @@ class SharedPreferenceKey(ProtocolModel):
         return self
 
     def storage_key(self) -> str:
-        return hashlib.sha256(self.model_dump_json().encode()).hexdigest()
+        name = self.name
+        encoded_name = (
+            {"ecosystem": name.ecosystem, "source": name.source, "name": name.name}
+            if isinstance(name, PluginName)
+            else name
+        )
+        encoded = json.dumps(
+            {"kind": self.kind.value, "name": encoded_name},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(encoded.encode()).hexdigest()
 
 
 class PreferenceMutation(ProtocolModel):
@@ -98,6 +110,8 @@ class PreferenceMutation(ProtocolModel):
 
     @model_validator(mode="after")
     def validate_value(self) -> Self:
+        if len(self.model_dump_json(include={"value"}).encode()) > MAX_VALUE_BYTES:
+            raise ValueError("encoded preference value envelope exceeds 8192 bytes")
         if self.value is not None:
             value = tuple(self.value) if isinstance(self.value, list) else self.value
             PreferenceLayer(
@@ -105,8 +119,6 @@ class PreferenceMutation(ProtocolModel):
             )
         if len(self.resolves) != len(set(self.resolves)):
             raise ValueError("conflict IDs must be unique")
-        if len(self.model_dump_json(include={"value"}).encode()) > MAX_VALUE_BYTES:
-            raise ValueError("encoded preference value envelope exceeds 8192 bytes")
         return self
 
 
@@ -133,7 +145,7 @@ class PreferenceSnapshot(ProtocolModel):
     conflicts: list[PreferenceMutation] = Field(default_factory=list)
 
     def as_layer(self) -> PreferenceLayer:
-        """Expose acknowledged values without adopting them into a running client."""
+        """Reserved for explicit client adoption of a complete acknowledged snapshot."""
         return PreferenceLayer(
             PreferenceScope.SHARED,
             self.identity.as_identity(),

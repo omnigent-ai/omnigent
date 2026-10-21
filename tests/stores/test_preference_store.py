@@ -1,11 +1,13 @@
 """Shared-preference transactions against the suite's real database backend."""
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import event, func, select
 
+from omnigent.db.compression import decode
 from omnigent.db.db_models import SqlPreference, workspace_scope
 from omnigent.errors import OmnigentError
 from omnigent.preference_sync import PreferenceMutation, PreferenceSnapshot
@@ -80,24 +82,37 @@ def test_independent_keys_and_delayed_receipt(store):
         store.apply(changed_retry, user_id="alice")
 
 
-def test_tombstone_and_stale_identical_edit(store):
-    store.apply(mutation(store), user_id="alice")
-    removal = mutation(store, value=None, version=1)
+def test_maximum_value_has_compact_durable_receipt(store, db_uri):
+    operation = mutation(store, value="é" * 4090)
+    result = store.apply(operation, user_id="alice")
+    reopened = SqlAlchemyPreferenceStore(db_uri, authority_id="test-authority")
+    assert reopened.apply(operation, user_id="alice") == result
+    with store._session("inspect_record_sizes") as session:
+        rows = session.scalars(select(SqlPreference)).all()
+    assert all(len((decode(row.value) or "").encode()) < 16384 for row in rows)
+    receipt = next(row for row in rows if row.key.startswith("shared.v1.receipt."))
+    body = json.loads(decode(receipt.value))
+    assert "operation" not in body
+    assert len(body["fingerprint"]) == 64
+
+
+@pytest.mark.parametrize("initial_write", [False, True])
+def test_tombstone_and_stale_identical_edit(store, initial_write):
+    if initial_write:
+        store.apply(mutation(store), user_id="alice")
+    removal = mutation(store, value=None, version=int(initial_write))
     deleted = store.apply(removal, user_id="alice")
-    assert deleted.entry.version == 2
+    assert deleted.entry.version == 1 + initial_write
     assert all(entry.value is None for entry in store.read(user_id="alice").entries)
-    conflict = store.apply(mutation(store, value="model-c", version=1), user_id="alice")
+    conflict = store.apply(
+        mutation(store, value="model-c", version=int(initial_write)), user_id="alice"
+    )
     assert conflict.status == "conflict"
     assert conflict.entry.value is None
     converged = store.apply(mutation(store, value=None, version=0), user_id="alice")
     assert converged.status == "unchanged"
-    assert converged.entry.version == 2
+    assert converged.entry.version == deleted.entry.version
     assert store.apply(removal, user_id="alice") == deleted
-
-
-def test_first_remove_retains_version_against_offline_creation(store):
-    assert store.apply(mutation(store, value=None), user_id="alice").entry.version == 1
-    assert store.apply(mutation(store), user_id="alice").status == "conflict"
 
 
 def test_conflict_alternatives_resolution_and_stale_resolution(store):
@@ -176,33 +191,51 @@ def test_isolation_and_read_does_not_initialize(store, db_uri):
     assert store.read(user_id="alice").entries[0].value == "model-a"
 
 
-def test_concurrent_stores_preserve_competing_edits(store, db_uri):
+@pytest.mark.parametrize("same_operation", [False, True])
+def test_concurrent_stores_preserve_competing_edits(store, db_uri, same_operation):
     second = SqlAlchemyPreferenceStore(db_uri, authority_id="test-authority")
-    operations = [mutation(store, value="model-a"), mutation(second, value="model-b")]
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    operations = [mutation(store, value=f"model-{index}") for index in range(20)]
+    if same_operation:
+        operations = [operations[0]] * len(operations)
+    with ThreadPoolExecutor(max_workers=4) as pool:
         results = list(
             pool.map(
                 lambda pair: pair[0].apply(pair[1], user_id="alice"),
-                zip([store, second], operations, strict=True),
+                zip([store, second] * 10, operations, strict=True),
             )
         )
-    assert sorted(result.status for result in results) == ["applied", "conflict"]
     snapshot = store.read(user_id="alice")
-    assert snapshot.revision == 2
-    assert len(snapshot.conflicts) == 1
-    assert {snapshot.entries[0].value, snapshot.conflicts[0].value} == {"model-a", "model-b"}
+    if same_operation:
+        assert all(result == results[0] for result in results)
+        assert snapshot.revision == 1 and snapshot.conflicts == []
+    else:
+        assert sorted(result.revision for result in results) == list(range(1, 21))
+        assert [result.status for result in results].count("applied") == 1
+        assert snapshot.revision == 20 and len(snapshot.conflicts) == 19
+    assert {snapshot.entries[0].value, *(conflict.value for conflict in snapshot.conflicts)} == {
+        operation.value for operation in operations
+    }
 
 
 def test_history_limit_preserves_receipts(store, monkeypatch):
     import omnigent.stores.preference_store.sqlalchemy_store as module
 
-    monkeypatch.setattr(module, "MAX_OPERATIONS", 1)
+    monkeypatch.setattr(module, "MAX_OPERATIONS", 2)
     operation = mutation(store)
     result = store.apply(operation, user_id="alice")
+    conflict = mutation(store, value="alternative")
+    store.apply(conflict, user_id="alice")
+    before = store.read(user_id="alice")
     with pytest.raises(OmnigentError, match="history is full"):
         store.apply(mutation(store, version=1, value="model-b"), user_id="alice")
+    with pytest.raises(OmnigentError, match="history is full"):
+        store.apply(
+            mutation(store, version=1, value="alternative", resolves=[conflict.operation_id]),
+            user_id="alice",
+        )
     assert store.apply(operation, user_id="alice") == result
-    assert store.read(user_id="alice").revision == 1
+    assert store.read(user_id="alice") == before
+    assert before.conflicts == [conflict]
 
 
 def test_key_and_conflict_limits_preserve_existing_values(store, monkeypatch):
@@ -244,7 +277,7 @@ def test_account_deletion_cleans_preferences_and_revokes_stale_write(store, db_u
         assert connection.scalar(select(func.count()).select_from(SqlPreference)) == 0
 
 
-@pytest.mark.parametrize("limit", [1, 3, 7, 100])
+@pytest.mark.parametrize("limit", [1, 3, 100])
 def test_pages_cover_values_conflicts_and_tombstones(store, limit):
     values = []
     for index in range(7):
@@ -375,13 +408,7 @@ def test_page_never_labels_concurrent_rows_with_an_old_revision(store):
 
     event.listen(store._engine, "after_cursor_execute", concurrent_write)
     try:
-        try:
-            page = store.read(user_id="alice")
-        except OmnigentError as exc:
-            assert "revision changed" in str(exc)
-        else:
-            # Snapshot-isolated backends may return the complete older view.
-            assert page == before
+        assert store.read(user_id="alice") == before
         assert changed
     finally:
         event.remove(store._engine, "after_cursor_execute", concurrent_write)

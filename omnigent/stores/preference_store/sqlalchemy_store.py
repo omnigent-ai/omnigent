@@ -1,13 +1,13 @@
-"""Durable per-key versions and operation receipts in the preferences table.
+"""Per-key versions, conflicts and retry receipts in preferences rows.
 
-A namespace row serializes writes across replicas. Receipts and tombstones do
-not expire: bounded quotas reject new writes rather than silently losing retry
-or deletion history. This API does not mark a workspace imported/adopted.
+A namespace row serializes writers.
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 from typing import Annotated, TypeVar
 
 from pydantic import BaseModel, Field
@@ -67,13 +67,30 @@ class _Cursor(ProtocolModel):
 
 
 class _Receipt(ProtocolModel):
-    operation: PreferenceMutation
+    fingerprint: str
     result: PreferenceResult
+
+
+def _fingerprint(operation: PreferenceMutation) -> str:
+    payload = {
+        "protocol_version": operation.protocol_version,
+        "authority_id": operation.identity.authority_id,
+        "user_id": operation.identity.user_id,
+        "workspace_id": operation.identity.workspace_id,
+        "operation_id": str(operation.operation_id),
+        "installation_id": operation.installation_id,
+        "key": operation.key.storage_key(),
+        "expected_version": operation.expected_version,
+        "value": operation.value,
+        "resolves": [str(conflict) for conflict in operation.resolves],
+    }
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def _serialize(value: BaseModel) -> str:
     raw = value.model_dump_json()
-    # Compression's raw framing adds two bytes; fit every supported BLOB backend.
+    # Bound the raw record independently of compression, with room for framing.
     if len(raw.encode()) > MAX_RECORD_BYTES:
         raise OmnigentError(
             "Preference record exceeds storage limit", code=ErrorCode.INVALID_INPUT
@@ -229,10 +246,11 @@ class SqlAlchemyPreferenceStore:
             self._check_authority(metadata)
 
             def read_record(key: str, model: type[_Model]) -> _Model | None:
+                # Current reads avoid stale snapshots under MySQL REPEATABLE READ.
                 raw = session.scalar(
-                    select(type_coerce(SqlPreference.value, LargeBinary)).where(
-                        *scope, SqlPreference.key == key
-                    )
+                    select(type_coerce(SqlPreference.value, LargeBinary))
+                    .where(*scope, SqlPreference.key == key)
+                    .with_for_update()
                 )
                 return None if raw is None else _decode(raw, model)
 
@@ -248,7 +266,7 @@ class SqlAlchemyPreferenceStore:
 
             receipt_key = _RECEIPT + operation.operation_id.hex
             if receipt := read_record(receipt_key, _Receipt):
-                if receipt.operation != operation:
+                if receipt.fingerprint != _fingerprint(operation):
                     raise OmnigentError(
                         "Operation ID already used for a different edit", code=ErrorCode.CONFLICT
                     )
@@ -324,7 +342,7 @@ class SqlAlchemyPreferenceStore:
                 revision=metadata.revision,
                 entry=current,
             )
-            add_record(receipt_key, _Receipt(operation=operation, result=result))
+            add_record(receipt_key, _Receipt(fingerprint=_fingerprint(operation), result=result))
             session.execute(
                 update(SqlPreference)
                 .where(*scope, SqlPreference.key == _META)
