@@ -2893,15 +2893,14 @@ def register_core_routes(
                     # so a rebind after a cross-harness create initializes the
                     # override harness — a bare body left the runner resolving
                     # from the spec, and the recovery turn that executes seeded
-                    # initial_items ran on the spec's harness. Recovery stays
-                    # enabled: on rebind it is what runs the pending kickoff.
+                    # initial_items ran on the spec's harness. Recovery runs the
+                    # pending kickoff on rebind, except a side chat's copied turn.
                     try:
                         runner_init_resp = await _runner_client.post(
                             "/v1/sessions",
                             json=build_runner_session_init_payload(
                                 conv,
                                 server_version=VERSION,
-                                # A side chat's copied history must not rerun the source's turn.
                                 suppress_recovery_turn=conv.labels.get(SIDE_CHAT_LABEL_KEY) == "1",
                             ),
                             timeout=10.0,

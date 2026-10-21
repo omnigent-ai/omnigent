@@ -358,10 +358,7 @@ async def test_patch_bind_side_chat_init_suppresses_recovery_turn(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Binding a side chat must not resume the source's unanswered turn.
-
-    A mid-turn source's copied history ends with a request recovery would rerun.
-    """
+    """Binding a side chat to a runner asks the runner to skip its recovery turn."""
     captured = _stub_late_runner_bind(monkeypatch)
 
     agent = await create_test_agent(client)
