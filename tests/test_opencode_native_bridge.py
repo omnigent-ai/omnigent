@@ -6,7 +6,9 @@ import json
 import os
 import threading
 from pathlib import Path
+from typing import Any
 
+import httpx
 import pytest
 
 from omnigent.harnesses.opencode_native import bridge
@@ -106,6 +108,98 @@ def test_update_active_message_id(bridge_dir: Path) -> None:
     assert loaded is not None
     assert loaded.active_message_id is None
     assert loaded.status == "idle"
+
+
+async def test_web_prompt_send_never_reverts_a_tui_session_switch(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The runner's session switch survives a web prompt sent by the harness.
+
+    The switch lands right after the harness's first bridge-state read, or
+    during the POST if it reads none, so a stale read-modify-write would undo it.
+    The prompt's echo in the old session must not switch the forwarder back.
+    """
+    from omnigent.harnesses.opencode_native.client import OpenCodeEvent, OpenCodeSession
+    from omnigent.harnesses.opencode_native.forwarder import OpenCodeNativeForwarder
+    from omnigent.harnesses.opencode_native.http_transport import OpenCodeHttpTransport
+    from omnigent.native.native_server_transport import NativePrompt
+
+    write_bridge_state(bridge_dir, _state(bridge_dir, opencode_session_id="ses_old"))
+    real_read = bridge.read_bridge_state
+    switched = False
+
+    def switch_once() -> None:
+        nonlocal switched
+        if not switched:
+            switched = True
+            bridge.update_opencode_session_id(bridge_dir, "ses_new")
+
+    def read_then_switch(path: Path) -> OpenCodeNativeBridgeState | None:
+        state = real_read(path)
+        switch_once()
+        return state
+
+    sent: list[dict[str, Any]] = []
+
+    class _Client:
+        async def prompt_async(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+            sent.append(payload)
+            switch_once()
+            return {}
+
+        async def get_session(self, session_id: str) -> OpenCodeSession:
+            return OpenCodeSession(id=session_id)
+
+        async def aclose(self) -> None:
+            return None
+
+    class _Server:
+        async def post(self, url: str, **_kw: Any) -> httpx.Response:
+            return httpx.Response(200, request=httpx.Request("POST", url))
+
+        async def patch(self, url: str, **_kw: Any) -> httpx.Response:
+            return httpx.Response(200, request=httpx.Request("PATCH", url))
+
+    monkeypatch.setattr(bridge, "read_bridge_state", read_then_switch)
+    transport = OpenCodeHttpTransport(
+        bridge_dir=bridge_dir,
+        client_factory=lambda: _Client(),  # type: ignore[arg-type,return-value]
+    )
+    await transport.send_prompt("ses_old", NativePrompt(text="hi"))
+
+    state = real_read(bridge_dir)
+    assert switched
+    assert state is not None and state.opencode_session_id == "ses_new"
+    assert bridge.web_prompt_pending(bridge_dir)
+
+    forwarder = OpenCodeNativeForwarder(
+        session_id="conv_1",
+        opencode_session_id="ses_new",
+        opencode_client=_Client(),  # type: ignore[arg-type]
+        server_client=_Server(),  # type: ignore[arg-type]
+        bridge_dir=bridge_dir,
+    )
+    # A turn in the new session ends before the old session echoes the prompt.
+    await forwarder.handle_event(
+        OpenCodeEvent(id=None, type="session.idle", properties={"sessionID": "ses_new"}, raw={})
+    )
+    echo = {"id": sent[0]["messageID"], "sessionID": "ses_old", "role": "user"}
+    await forwarder.handle_event(
+        OpenCodeEvent(
+            id=None,
+            type="message.updated",
+            properties={"sessionID": "ses_old", "info": echo},
+            raw={},
+        )
+    )
+    state = real_read(bridge_dir)
+    assert state is not None and state.opencode_session_id == "ses_new"
+
+
+def test_clear_state_drops_a_stale_web_prompt_marker(bridge_dir: Path) -> None:
+    bridge.mark_web_prompt_pending(bridge_dir)
+    clear_bridge_state(bridge_dir)
+    assert not bridge.web_prompt_pending(bridge_dir)
 
 
 def test_update_model_override(bridge_dir: Path) -> None:

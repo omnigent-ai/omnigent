@@ -1548,6 +1548,14 @@ async def _opencode_native_launch_config(
     fork_carry_history = (
         isinstance(labels, dict) and labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
     )
+    from omnigent.harnesses.opencode_native.bridge import OPENCODE_NATIVE_ACTIVE_SESSION_LABEL_KEY
+
+    # Resume the session the TUI last switched to, not the first one.
+    active_session_id = (
+        labels.get(OPENCODE_NATIVE_ACTIVE_SESSION_LABEL_KEY) if isinstance(labels, dict) else None
+    )
+    if isinstance(active_session_id, str) and active_session_id:
+        external_session_id = active_session_id
     return _OpenCodeNativeLaunchConfig(
         workspace=_codex_session_workspace(session_workspace),
         policy_server_url=_required_runner_env("RUNNER_SERVER_URL"),
@@ -1907,8 +1915,27 @@ async def _auto_create_opencode_terminal(
                 conversation_id=session_id,
             ),
         )
+
+        async def _on_server_exit(returncode: int | None) -> None:
+            # Without this the turn shows running forever and the frozen TUI keeps
+            # pointing at a dead server; closing it lets the next turn relaunch both.
+            _logger.warning(
+                "opencode serve exited unexpectedly for session %s (code=%s)",
+                session_id,
+                returncode,
+                extra={"session_id": session_id},
+            )
+            await forwarder.fail_turn_after_server_exit(returncode)
+            clear_bridge_state(bridge_dir)
+            with contextlib.suppress(Exception):
+                await resource_registry.close_terminal(
+                    session_id, terminal_resource_id("opencode", "main")
+                )
+
         forwarder_task = asyncio.create_task(
-            _supervise_opencode_forwarder(session_id, server, forwarder),
+            _supervise_opencode_forwarder(
+                session_id, server, forwarder, on_server_exit=_on_server_exit
+            ),
             name=f"opencode-forwarder-{session_id}",
         )
         _register_auto_forwarder_task(session_id, forwarder_task)
@@ -1963,10 +1990,24 @@ async def _auto_create_opencode_terminal(
     return terminal_view
 
 
+_OPENCODE_SERVER_EXIT_POLL_S = 1.0
+
+
+async def _wait_for_opencode_server_exit(server: OpenCodeNativeServer) -> int | None:
+    """Return the exit code once the ``opencode serve`` process has exited."""
+    while True:
+        process = server.process
+        if process is not None and process.poll() is not None:
+            return process.returncode
+        await asyncio.sleep(_OPENCODE_SERVER_EXIT_POLL_S)
+
+
 async def _supervise_opencode_forwarder(
     session_id: str,
     server: OpenCodeNativeServer,
     forwarder: OpenCodeNativeForwarder,
+    *,
+    on_server_exit: Callable[[int | None], Awaitable[None]] | None = None,
 ) -> None:
     """
     Run the OpenCode SSE forwarder, closing the server when it ends.
@@ -1979,11 +2020,26 @@ async def _supervise_opencode_forwarder(
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
     :param server: The :class:`OpenCodeNativeServer` to close on exit.
     :param forwarder: The :class:`OpenCodeNativeForwarder` to run.
+    :param on_server_exit: Called with the exit code when ``opencode serve``
+        dies on its own (crash, OOM kill) while the forwarder still runs.
     :returns: None.
     """
+    forward_task = asyncio.create_task(forwarder.run())
+    exit_task = asyncio.create_task(_wait_for_opencode_server_exit(server))
     try:
-        await forwarder.run()
+        await asyncio.wait({forward_task, exit_task}, return_when=asyncio.FIRST_COMPLETED)
+        if forward_task.done():
+            await forward_task
+        else:
+            # The forwarder would reconnect to a dead server forever.
+            forward_task.cancel()
+            await asyncio.gather(forward_task, return_exceptions=True)
+            if on_server_exit is not None:
+                await on_server_exit(exit_task.result())
     finally:
+        for task in (forward_task, exit_task):
+            task.cancel()
+        await asyncio.gather(forward_task, exit_task, return_exceptions=True)
         leftover = _AUTO_OPENCODE_SERVERS.pop(session_id, None)
         if leftover is not None:
             with contextlib.suppress(Exception):

@@ -46,6 +46,10 @@ OPENCODE_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_OPENCODE_NATIVE_REQUEST_SE
 # Label key recording the bridge id on the conversation, mirroring the
 # codex-native ``omnigent.codex_native.bridge_id`` label.
 OPENCODE_NATIVE_BRIDGE_ID_LABEL_KEY = "omnigent.opencode_native.bridge_id"
+# Label recording the OpenCode session the TUI switched to (``/new`` or the
+# session picker). ``external_session_id`` is write-once, so a relaunch resumes
+# this one instead when set.
+OPENCODE_NATIVE_ACTIVE_SESSION_LABEL_KEY = "omnigent.opencode_native.active_session_id"
 
 # OpenCode server basic-auth env vars (see opencode ``attach``/``serve``).
 OPENCODE_SERVER_PASSWORD_ENV_VAR = "OPENCODE_SERVER_PASSWORD"
@@ -54,6 +58,9 @@ OPENCODE_SERVER_USERNAME_ENV_VAR = "OPENCODE_SERVER_USERNAME"
 OPENCODE_DEFAULT_USERNAME = "opencode"
 
 _STATE_FILE = "state.json"
+# Marker the harness creates when it injects a web prompt; the forwarder removes
+# it at turn end. Kept out of ``state.json`` so the runner stays its only writer.
+_WEB_PROMPT_PENDING_FILE = "web_prompt_pending"
 _AUTH_SECRET_FILE = "auth.secret"
 _XDG_DATA_DIR = "xdg-data"
 _XDG_CONFIG_DIR = "xdg-config"
@@ -620,10 +627,8 @@ def clear_bridge_state(bridge_dir: Path) -> None:
     :param bridge_dir: Native OpenCode bridge directory.
     :returns: None.
     """
-    try:
-        state_path(bridge_dir).unlink()
-    except FileNotFoundError:
-        return
+    state_path(bridge_dir).unlink(missing_ok=True)
+    clear_web_prompt_pending(bridge_dir)
 
 
 def read_bridge_state(bridge_dir: Path) -> OpenCodeNativeBridgeState | None:
@@ -701,6 +706,75 @@ def update_active_message_id(
             state,
             active_message_id=active_message_id,
             status=status if status is not None else state.status,
+        ),
+    )
+
+
+def mark_web_prompt_pending(bridge_dir: Path, message_id: str = "") -> None:
+    """
+    Record that a web prompt was injected but its turn has not ended yet.
+
+    :param bridge_dir: Native OpenCode bridge directory.
+    :param message_id: OpenCode id of the injected user message, if known.
+    :returns: None.
+    """
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    marker = bridge_dir / _WEB_PROMPT_PENDING_FILE
+    marker.touch(mode=0o600)
+    marker.write_text(message_id, encoding="utf-8")
+
+
+def clear_web_prompt_pending(bridge_dir: Path) -> None:
+    """
+    Drop the pending web prompt marker, if any.
+
+    :param bridge_dir: Native OpenCode bridge directory.
+    :returns: None.
+    """
+    (bridge_dir / _WEB_PROMPT_PENDING_FILE).unlink(missing_ok=True)
+
+
+def web_prompt_pending(bridge_dir: Path) -> bool:
+    """
+    Whether a web prompt was injected and its turn has not ended yet.
+
+    :param bridge_dir: Native OpenCode bridge directory.
+    :returns: ``True`` while the pending marker exists.
+    """
+    return (bridge_dir / _WEB_PROMPT_PENDING_FILE).is_file()
+
+
+def web_prompt_message_id(bridge_dir: Path) -> str | None:
+    """
+    Return the user message id of the pending web prompt, if recorded.
+
+    :param bridge_dir: Native OpenCode bridge directory.
+    :returns: The OpenCode message id, e.g. ``"msg_..."``, or ``None``.
+    """
+    try:
+        message_id = (bridge_dir / _WEB_PROMPT_PENDING_FILE).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return message_id.strip() or None
+
+
+def update_opencode_session_id(bridge_dir: Path, opencode_session_id: str) -> None:
+    """
+    Point web injection at the OpenCode session the TUI switched to.
+
+    :param bridge_dir: Native OpenCode bridge directory.
+    :param opencode_session_id: OpenCode session id now shown in the TUI.
+    :returns: None.
+    """
+    state = read_bridge_state(bridge_dir)
+    if state is None:
+        return
+    import dataclasses
+
+    write_bridge_state(
+        bridge_dir,
+        dataclasses.replace(
+            state, opencode_session_id=opencode_session_id, active_message_id=None, status="idle"
         ),
     )
 

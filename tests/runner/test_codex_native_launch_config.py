@@ -607,3 +607,33 @@ async def test_persistent_rate_limit_stops_within_budget(
 
     assert client.calls == attempts
     assert retry_sleeps == delays
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("active_label", "expected"),
+    [("ses_after_new", "ses_after_new"), ("", "ses_first"), (None, "ses_first")],
+)
+async def test_opencode_launch_resumes_the_session_the_tui_switched_to(
+    active_label: str | None, expected: str
+) -> None:
+    """A relaunch follows the TUI's ``/new`` session; a blank label (web ``/clear``) does not."""
+    from omnigent.harnesses.opencode_native.bridge import OPENCODE_NATIVE_ACTIVE_SESSION_LABEL_KEY
+
+    labels = (
+        {} if active_label is None else {OPENCODE_NATIVE_ACTIVE_SESSION_LABEL_KEY: active_label}
+    )
+    client = _SequenceClient(
+        [
+            _Resp(
+                200,
+                {"workspace": "/tmp/repo", "external_session_id": "ses_first", "labels": labels},
+            )
+        ]
+    )
+
+    cfg = await _orchestration._opencode_native_launch_config(
+        session_id="conv_1", server_client=client
+    )
+
+    assert cfg.external_session_id == expected

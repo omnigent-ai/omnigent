@@ -13,6 +13,9 @@ an injected ``client_factory`` (tests), a running
 from __future__ import annotations
 
 import logging
+import secrets
+import string
+import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from pathlib import Path
 from typing import TypeAlias
@@ -23,7 +26,11 @@ from omnigent.harnesses.opencode_native.app_server import (
     client_for_state,
     opencode_terminal_env,
 )
-from omnigent.harnesses.opencode_native.bridge import read_bridge_state
+from omnigent.harnesses.opencode_native.bridge import (
+    clear_web_prompt_pending,
+    mark_web_prompt_pending,
+    read_bridge_state,
+)
 from omnigent.harnesses.opencode_native.client import OpenCodeClient
 from omnigent.native.native_server_transport import (
     NativeEvent,
@@ -45,6 +52,22 @@ _JsonMapping: TypeAlias = Mapping[str, object]
 # alias reads as intended public API (its only other use is a PEP 563 stringified
 # annotation, which static analysis can't see as a load).
 __all__ = ["ClientFactory", "OpenCodeHttpTransport", "build_prompt_payload"]
+
+
+_BASE62 = string.digits + string.ascii_uppercase + string.ascii_lowercase
+
+
+def new_opencode_message_id() -> str:
+    """
+    Mint an id in OpenCode's ascending format for a prompt's user message.
+
+    OpenCode orders messages by id, so this sorts by creation time like its own.
+
+    :returns: ``"msg_"`` + 12 hex timestamp chars + 14 random base62 chars.
+    """
+    stamp = (time.time_ns() // 1_000_000 * 4096) & ((1 << 48) - 1)
+    suffix = "".join(secrets.choice(_BASE62) for _ in range(14))
+    return f"msg_{stamp:012x}{suffix}"
 
 
 def build_prompt_payload(prompt: NativePrompt) -> _JsonObject:
@@ -210,10 +233,28 @@ class OpenCodeHttpTransport:
             await client.aclose()
 
     async def send_prompt(self, session_id: str, prompt: NativePrompt) -> _JsonMapping:
-        """Inject a prompt via ``POST /session/{id}/prompt_async``."""
+        """Inject a prompt via ``POST /session/{id}/prompt_async``.
+
+        Marks the web prompt pending first so a server crash before the forwarder
+        sees the turn still fails it; marking before the POST lets a fast turn's
+        end land last. The marker is a separate file so the runner-owned
+        ``state.json`` is never rewritten from this process. It names the user
+        message id sent here, so the forwarder can tell this prompt from a TUI one.
+        """
         client = self._client()
+        payload = build_prompt_payload(prompt)
+        message_id = new_opencode_message_id()
+        payload["messageID"] = message_id
+        if self._bridge_dir is not None:
+            mark_web_prompt_pending(self._bridge_dir, message_id)
         try:
-            return await client.prompt_async(session_id, build_prompt_payload(prompt))
+            return await client.prompt_async(session_id, payload)
+        except BaseException:
+            if self._bridge_dir is not None:
+                state = read_bridge_state(self._bridge_dir)
+                if state is None or state.active_message_id is None:
+                    clear_web_prompt_pending(self._bridge_dir)
+            raise
         finally:
             await client.aclose()
 
