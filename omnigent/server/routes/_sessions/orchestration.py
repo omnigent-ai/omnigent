@@ -4400,8 +4400,8 @@ async def _run_managed_launch(
     """
     from omnigent.server.managed_hosts import (
         deployment_with_inference_snapshot,
-        host_slice_key_enabled,
         deployment_with_sandbox_profile,
+        host_slice_key_enabled,
         resolve_managed_agent_label,
     )
 
@@ -4414,6 +4414,12 @@ async def _run_managed_launch(
         if profile is not None:
             sandbox_config = deployment_with_sandbox_profile(sandbox_config, profile)
             provider = profile["provider"]
+        elif sandbox_profiles is not None:
+            await asyncio.to_thread(
+                sandbox_profiles.require_selection,
+                relaunch_host.sandbox_provider if relaunch_host is not None else provider,
+                user_id=owner,
+            )
     except (OmnigentError, HTTPException) as exc:
         reason = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
         tracker.fail(session_id, reason)
@@ -5523,8 +5529,8 @@ async def _run_managed_wake(
     from omnigent.onboarding.sandboxes.base import SandboxGoneError
     from omnigent.server.managed_hosts import (
         deployment_with_inference_snapshot,
-        host_slice_key_enabled,
         deployment_with_sandbox_profile,
+        host_slice_key_enabled,
         resolve_managed_agent_label,
         resume_managed_host,
     )
@@ -5551,6 +5557,13 @@ async def _run_managed_wake(
 
     try:
         profile = await saved_profile(sandbox_profiles, session_id, host_id=host_id)
+        if profile is None and sandbox_profiles is not None:
+            host = await asyncio.to_thread(host_store.get_host, host_id)
+            await asyncio.to_thread(
+                sandbox_profiles.require_selection,
+                host.sandbox_provider if host is not None else None,
+                user_id=host.user_id if host is not None else None,
+            )
         sandbox_config = deployment_with_sandbox_profile(sandbox_config, profile)
         # Wake the same sandbox in place; resume_managed_host is single-flight
         # per host and a no-op if it's already online.
@@ -11371,7 +11384,7 @@ async def _create_session_from_existing_agent(
         )
 
     sandbox_profile = await prepare_profile(
-        request, body, inherited_session_id=body.parent_session_id
+        request, body, user_id=user_id, inherited_session_id=body.parent_session_id
     )
     if sandbox_profile is not None and body.host_type == "managed":
         body = body.model_copy(update={"sandbox_provider": sandbox_profile["provider"]})

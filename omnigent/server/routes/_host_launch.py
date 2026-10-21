@@ -288,6 +288,12 @@ def resolve_host_launch(
             raise HTTPException(status_code=404, detail="session not found")
 
     if sandbox_profiles is not None:
-        sandbox_profiles.require_session_host(session_id, host_id, bind=False)
+        sandbox_profiles.require_session_host(
+            session_id,
+            host_id,
+            bind=False,
+            sandbox_provider=host.sandbox_provider,
+            user_id=host.user_id,
+        )
 
     return HostLaunchTarget(host=host, conn=conn, conv=conv)

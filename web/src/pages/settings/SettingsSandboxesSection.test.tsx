@@ -9,12 +9,16 @@ vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 
 let profiles: SandboxProfile[];
 let canManage: boolean;
+let providers: string[];
+let managedProviders: string[];
 let rejectSave: boolean;
 const reply = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
 
 beforeEach(() => {
   profiles = [];
   canManage = true;
+  providers = ["agent_sandbox"];
+  managedProviders = [];
   rejectSave = false;
   vi.mocked(authenticatedFetch).mockReset();
   vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
@@ -35,7 +39,8 @@ beforeEach(() => {
     }
     return reply({
       profiles,
-      providers: ["agent_sandbox"],
+      providers,
+      managed_providers: managedProviders,
       can_manage: canManage,
       next_cursor: null,
     });
@@ -91,4 +96,39 @@ it("does not offer profile writes to a non-admin", async () => {
   mount();
   await screen.findByText("Only administrators can manage sandbox profiles.");
   expect(screen.queryByRole("button", { name: "New profile" })).toBeNull();
+});
+
+it("keeps provider-owned profiles read-only for admins alongside editable profiles with the same ID", async () => {
+  const profile: SandboxProfile = {
+    id: "large",
+    name: "Local build",
+    description: "",
+    provider: "agent_sandbox",
+    revision: "revision-1",
+    config: {},
+    enabled: true,
+  };
+  profiles = [profile, { ...profile, provider: "remote", name: "Remote build", managed: true }];
+  managedProviders = ["remote"];
+  mount();
+  expect(await screen.findByRole("button", { name: "Edit Local build" })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Disable Local build" })).toBeVisible();
+  expect(screen.getByText("Remote build")).toBeVisible();
+  expect(screen.getByText("Managed by provider")).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Edit Remote build" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Disable Remote build" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "New profile" }));
+  fireEvent.click(screen.getByRole("combobox"));
+  expect(screen.getAllByRole("option")).toHaveLength(1);
+});
+
+it("does not promise default launches when a provider-managed catalog is empty", async () => {
+  canManage = false;
+  providers = [];
+  managedProviders = ["remote"];
+  mount();
+  expect(await screen.findByText(/need an available profile before starting a chat/)).toBeVisible();
+  expect(screen.queryByRole("button", { name: "New profile" })).toBeNull();
+  expect(screen.queryByText("Only administrators can manage sandbox profiles.")).toBeNull();
+  expect(screen.queryByText(/Sessions use the server default/)).toBeNull();
 });

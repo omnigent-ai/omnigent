@@ -11,7 +11,6 @@ from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider, local_single
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.sandbox_profiles import SandboxProfileCatalog, SandboxProfileWrite
 from omnigent.stores.permission_store import PermissionStore
-from omnigent.stores.sandbox_profile_store import PROFILE_ID_PATTERN
 
 
 def create_sandbox_profiles_router(
@@ -43,7 +42,7 @@ def create_sandbox_profiles_router(
     async def list_profiles(
         request: Request,
         response: Response,
-        cursor: str | None = Query(default=None, pattern=PROFILE_ID_PATTERN),
+        cursor: str | None = Query(default=None, max_length=256),
         limit: int = Query(default=100, ge=1, le=100),
     ) -> dict[str, Any]:
         admin = await can_manage(request)
@@ -52,13 +51,19 @@ def create_sandbox_profiles_router(
         if service is None:
             return {"profiles": [], "providers": [], "can_manage": False, "next_cursor": None}
         profiles, next_cursor = await asyncio.to_thread(
-            service.list_profiles, include_disabled=admin, cursor=cursor, limit=limit
+            service.list_profiles,
+            include_disabled=admin,
+            cursor=cursor,
+            limit=limit,
+            user_id=require_user(request, auth_provider),
         )
         providers = await asyncio.to_thread(service.providers)
+        managed_providers = await asyncio.to_thread(service.managed_providers)
         return {
             "profiles": profiles,
             "providers": providers,
-            "can_manage": admin,
+            "can_manage": admin and bool(providers),
+            "managed_providers": managed_providers,
             "next_cursor": next_cursor,
         }
 

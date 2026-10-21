@@ -824,7 +824,13 @@ export async function forkSession(
       terminalLaunchArgs?: string[];
       codexBypassSandbox?: boolean;
     };
-    sandbox?: { provider?: string | null; workspace?: string | null; hostId?: string };
+    sandbox?: {
+      provider?: string | null;
+      workspace?: string | null;
+      hostId?: string;
+      profileId?: string;
+      profileRevision?: string;
+    };
     /** Mark the fork as a side chat (hidden from the left sidebar). */
     sideChat?: boolean;
   } = {},
@@ -840,6 +846,8 @@ export async function forkSession(
     codex_bypass_sandbox?: boolean;
     host_type?: "managed";
     sandbox_provider?: string;
+    sandbox_profile_id?: string;
+    sandbox_profile_revision?: string;
     host_id?: string;
     workspace?: string | null;
     side_chat?: boolean;
@@ -875,6 +883,10 @@ export async function forkSession(
     // A provider the server didn't name is omitted so it picks its first.
     if (sandbox.provider != null) {
       body.sandbox_provider = sandbox.provider;
+    }
+    if (sandbox.profileId !== undefined) {
+      body.sandbox_profile_id = sandbox.profileId;
+      body.sandbox_profile_revision = sandbox.profileRevision;
     }
     // Key presence is the signal here: an explicit null means "empty
     // sandbox", while omitting it inherits the source's repository.

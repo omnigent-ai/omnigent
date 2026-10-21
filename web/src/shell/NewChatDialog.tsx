@@ -48,8 +48,10 @@ import {
 import { ComposerMentionChips } from "@/components/composer/ComposerMentionChips";
 import {
   SandboxProfilePicker,
+  useSandboxProfileCatalog,
   type SandboxProfileSelection,
 } from "@/components/SandboxProfilePicker";
+import { SANDBOX_PROFILES_QUERY_KEY } from "@/lib/sandboxProfilesApi";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   MonitorCloudIcon,
@@ -2518,6 +2520,10 @@ export function NewChatLandingScreen() {
   // is what the launch will use.
   const effectiveSandboxProvider =
     sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
+  const { launchError: sandboxProfileError } = useSandboxProfileCatalog(
+    sandboxSelected ? effectiveSandboxProvider : null,
+    sandboxProfile,
+  );
   const sandboxMultiRepo =
     info !== "loading" &&
     effectiveSandboxProvider !== null &&
@@ -2851,6 +2857,7 @@ export function NewChatLandingScreen() {
       prefillConfigSig !== seededConfigSigRef.current;
     if (!projectChanged && !configChanged) return;
     setSandboxSelected(false);
+    setSandboxProfile(null);
     setSelectedHostId(null);
     setPickedAgentId(projectParam !== "" ? null : readLastAgentId());
     agentExplicitlySelectedRef.current = false;
@@ -5092,6 +5099,7 @@ export function NewChatLandingScreen() {
     !pendingSkillCompletion &&
     pickerSelectionError === null &&
     sandboxCatalogError === null &&
+    sandboxProfileError === null &&
     selectedAgent != null &&
     (sandboxSelected ? sandboxRepoValid : selectedHost?.status === "online" && workspaceValid) &&
     !creating;
@@ -5108,8 +5116,8 @@ export function NewChatLandingScreen() {
         ? "Loading skills…"
         : pickerLoading || workspaceStartLoading || worktreeRequestPending
           ? "Loading session configuration…"
-          : pickerSelectionError || sandboxCatalogError
-            ? (pickerSelectionError ?? sandboxCatalogError)
+          : pickerSelectionError || sandboxCatalogError || sandboxProfileError
+            ? (pickerSelectionError ?? sandboxCatalogError ?? sandboxProfileError)
             : sandboxSelected && sandboxRepoOverCap
               ? `This sandbox provider clones at most ${maxSandboxRepos} ${
                   maxSandboxRepos === 1 ? "repository" : "repositories"
@@ -5806,7 +5814,7 @@ export function NewChatLandingScreen() {
                 ...(createProjectId !== null ? { workspace: null, git: null } : {}),
                 // Omitted when null so a default create is unchanged.
                 ...(sandboxProvider !== null ? { sandbox_provider: sandboxProvider } : {}),
-                ...(sandboxProfile !== null
+                ...(sandboxProfile !== null && sandboxProfile.provider === effectiveSandboxProvider
                   ? {
                       sandbox_profile_id: sandboxProfile.id,
                       sandbox_profile_revision: sandboxProfile.revision,
@@ -5908,6 +5916,9 @@ export function NewChatLandingScreen() {
         const confirmed = (async (): Promise<{ id: string } | { error: string }> => {
           const response = await createRequest;
           if (!response.ok) {
+            if (sandboxSelected) {
+              void queryClient.invalidateQueries({ queryKey: SANDBOX_PROFILES_QUERY_KEY });
+            }
             if (sandboxPreviewEnabled && response.status === 409) {
               void queryClient.invalidateQueries({
                 queryKey: sandboxModelOptionsKey(
@@ -7406,6 +7417,11 @@ export function NewChatLandingScreen() {
                   Go to Integrations
                 </button>
               )}
+            </p>
+          )}
+          {sandboxProfileError && (
+            <p className="text-sm text-muted-foreground" role="status">
+              {sandboxProfileError}
             </p>
           )}
           {pickerSelectionError && (

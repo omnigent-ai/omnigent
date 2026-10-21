@@ -12932,7 +12932,7 @@
             "schema": {
               "anyOf": [
                 {
-                  "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+                  "maxLength": 256,
                   "type": "string"
                 },
                 {

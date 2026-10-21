@@ -1247,7 +1247,10 @@ def register_core_routes(
             )
 
         sandbox_profile = await prepare_profile(
-            request, parsed_metadata, inherited_session_id=parsed_metadata.parent_session_id
+            request,
+            parsed_metadata,
+            user_id=user_id,
+            inherited_session_id=parsed_metadata.parent_session_id,
         )
         if sandbox_profile is not None and parsed_metadata.host_type == "managed":
             parsed_metadata = parsed_metadata.model_copy(
@@ -2881,7 +2884,32 @@ def register_core_routes(
         if conv is None:
             raise _session_not_found()
         previous_runner_id = conv.runner_id
+        profile_catalog = getattr(request.app.state, "sandbox_profiles", None)
         if body.runner_id is not None:
+            if (
+                profile_catalog is not None
+                and conv.runner_id
+                and conv.host_id
+                and body.runner_id.strip() != conv.runner_id
+            ):
+                host_store = getattr(request.app.state, "host_store", None)
+                host = (
+                    await asyncio.to_thread(host_store.get_host, conv.host_id)
+                    if host_store is not None
+                    else None
+                )
+                host_profile = await asyncio.to_thread(
+                    profile_catalog.get_host_snapshot, conv.host_id
+                )
+                managed_providers = await asyncio.to_thread(profile_catalog.managed_providers)
+                if host_profile is not None or (
+                    host is not None and host.sandbox_provider in managed_providers
+                ):
+                    # Keep the authoritative runner-to-host link for admission checks.
+                    raise OmnigentError(
+                        "Stop this managed host instead of changing its runner binding",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
             # Empty string is the clear sentinel (None = leave unchanged);
             # used by /clear and /switch to move the runner between sessions.
             if body.runner_id == "":
@@ -2923,7 +2951,6 @@ def register_core_routes(
                         runner_router.require_mcp_registry_support,
                         dataclasses.replace(conv, runner_id=runner_id),
                     )
-                profile_catalog = getattr(request.app.state, "sandbox_profiles", None)
                 if profile_catalog is not None and runner_id != conv.runner_id:
                     profile = await asyncio.to_thread(
                         profile_catalog.get_session_snapshot, session_id
@@ -2947,9 +2974,47 @@ def register_core_routes(
                                 "profile instead of assigning a runner directly",
                                 code=ErrorCode.INVALID_INPUT,
                             )
-                        await asyncio.to_thread(
-                            profile_catalog.require_session_host, session_id, host_id, bind=False
+                    bindings = await asyncio.to_thread(
+                        conversation_store.list_conversations_by_runner_id, runner_id
+                    )
+                    host_ids = set()
+                    for binding in bindings:
+                        host_id = await asyncio.to_thread(
+                            routing_host_id, binding, conversation_store
                         )
+                        if host_id is not None:
+                            host_ids.add(host_id)
+                    host_store = getattr(request.app.state, "host_store", None)
+                    for host_id in host_ids:
+                        host = (
+                            await asyncio.to_thread(host_store.get_host, host_id)
+                            if host_store is not None
+                            else None
+                        )
+                        if host is None:
+                            raise OmnigentError(
+                                "The runner's host is no longer available",
+                                code=ErrorCode.INVALID_INPUT,
+                            )
+                        if user_id is not None and host.user_id != user_id:
+                            raise HTTPException(status_code=403, detail="Host owner mismatch")
+                        await asyncio.to_thread(
+                            profile_catalog.require_session_host,
+                            session_id,
+                            host_id,
+                            bind=False,
+                            sandbox_provider=host.sandbox_provider,
+                            user_id=host.user_id,
+                        )
+                        host_profile = await asyncio.to_thread(
+                            profile_catalog.get_host_snapshot, host_id
+                        )
+                        if profile is None and host_profile is not None:
+                            raise OmnigentError(
+                                "Launch this session on the managed host instead of assigning "
+                                "its runner directly",
+                                code=ErrorCode.INVALID_INPUT,
+                            )
                 try:
                     await asyncio.to_thread(
                         conversation_store.replace_runner_id, session_id, runner_id
@@ -3611,7 +3676,9 @@ def register_core_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
 
-        sandbox_profile = await prepare_profile(request, body, inherited_session_id=source_id)
+        sandbox_profile = await prepare_profile(
+            request, body, user_id=user_id, inherited_session_id=source_id
+        )
         if sandbox_profile is not None and body.host_type == "managed":
             body = body.model_copy(update={"sandbox_provider": sandbox_profile["provider"]})
 

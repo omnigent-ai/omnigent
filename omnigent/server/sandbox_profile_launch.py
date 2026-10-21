@@ -15,7 +15,11 @@ _logger = logging.getLogger(__name__)
 
 
 async def prepare_profile(
-    request: Request, body: Any, *, inherited_session_id: str | None = None
+    request: Request,
+    body: Any,
+    *,
+    user_id: str | None = None,
+    inherited_session_id: str | None = None,
 ) -> dict[str, Any] | None:
     """Resolve a selection, or inherit from an already-authorized session."""
     catalog = getattr(request.app.state, "sandbox_profiles", None)
@@ -27,17 +31,24 @@ async def prepare_profile(
             body.sandbox_profile_id,
             expected_revision=body.sandbox_profile_revision,
             provider=body.sandbox_provider,
+            user_id=user_id,
         )
-    if catalog is None or inherited_session_id is None:
+    if catalog is None:
         return None
-    snapshot = await asyncio.to_thread(catalog.get_session_snapshot, inherited_session_id)
+    snapshot = (
+        await asyncio.to_thread(catalog.get_session_snapshot, inherited_session_id)
+        if inherited_session_id is not None
+        else None
+    )
     if snapshot is not None:
-        await asyncio.to_thread(catalog.validate_snapshot, snapshot)
+        snapshot = await asyncio.to_thread(catalog.inherit_snapshot, snapshot, user_id)
         if body.sandbox_provider not in (None, snapshot["provider"]):
             raise OmnigentError(
                 "Choose a new sandbox profile to change the inherited provider",
                 code=ErrorCode.INVALID_INPUT,
             )
+    elif body.host_type == "managed":
+        await asyncio.to_thread(catalog.require_selection, body.sandbox_provider, user_id=user_id)
     return snapshot
 
 

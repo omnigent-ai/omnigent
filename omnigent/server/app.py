@@ -1982,7 +1982,6 @@ def create_app(
             allow_unbound: bool = False,
             transfer_from_host_id: str | None = None,
         ) -> None:
-            sandbox_profiles.require_session_host(session_id, host_id, bind=False)
             _admit_host_launch(
                 host_id,
                 session_id,
@@ -1990,6 +1989,14 @@ def create_app(
                 generation,
                 allow_unbound,
                 transfer_from_host_id,
+            )
+            host = host_store.get_host(host_id)
+            sandbox_profiles.require_session_host(
+                session_id,
+                host_id,
+                bind=False,
+                sandbox_provider=host.sandbox_provider if host is not None else None,
+                user_id=host.user_id if host is not None else None,
             )
             # Caller-host routes commit new bindings after their atomic runner bind.
             if not allow_unbound and transfer_from_host_id is None:

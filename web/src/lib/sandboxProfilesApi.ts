@@ -8,16 +8,18 @@ export interface SandboxProfile {
   config: Record<string, unknown>;
   revision: string;
   enabled: boolean;
+  managed?: boolean;
 }
 
 export interface SandboxProfilesResponse {
   profiles: SandboxProfile[];
   providers: string[];
+  managed_providers?: string[];
   can_manage: boolean;
   next_cursor: string | null;
 }
 
-export type SandboxProfileInput = Omit<SandboxProfile, "id" | "revision">;
+export type SandboxProfileInput = Omit<SandboxProfile, "id" | "revision" | "managed">;
 export const SANDBOX_PROFILES_QUERY_KEY = ["sandbox-profiles"];
 
 async function profileRequest(path = "", init?: RequestInit): Promise<Response> {

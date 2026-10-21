@@ -1,8 +1,9 @@
 # Sandbox profiles
 
-Administrators save named sandbox configurations in Settings. Users choose a
-profile beside the repository picker when starting a managed session. Existing
-sandboxes retain the configuration accepted at launch.
+Administrators save named sandbox configurations in Settings, or a customer
+sandbox provider supplies a read-only catalog authorized for the current user.
+Users choose a profile beside the repository picker when starting a managed
+session. Existing sandboxes retain the configuration accepted at launch.
 
 ## Sub-features
 
@@ -12,19 +13,25 @@ sandboxes retain the configuration accepted at launch.
 - `selection`: matching enabled profiles, deployment default, and changed-profile warnings.
 - `revision`: session creation submits the selected profile ID and accepted revision.
 - `gating`: administrator management and configured managed-provider availability.
+- `provider-owned`: per-user read-only profiles, required selection, revocation,
+  and provider failures without default-launch fallback.
 
 ## How to get to it (user POV)
 
 - Desktop Settings: open Settings, then Admin → Sandboxes; use New profile,
   Edit, or Disable. Edit also contains the Enabled switch.
 - Mobile Settings: open Settings, then Admin → Sandboxes in the settings
-  navigation; the same actions open a scrollable editor.
-- Direct link: `/settings/sandboxes` opens the catalog. On mobile, select
-  Sandboxes from the initial settings navigation to reveal its content.
+  navigation; use Back to settings menu when already inside a section.
+  Locally managed profiles open a scrollable editor.
+- Direct link: `/settings/sandboxes` opens the catalog on desktop and mobile.
+  Provider-managed rows have a badge and no local edit/disable controls.
 - Desktop new session: open New session or the home page, select a managed
   sandbox provider, and use the Sandbox profile menu beside the repository.
 - Mobile new session: open New session, close the navigation drawer if open,
   and use the profile menu above the message composer.
+- Clone on desktop/mobile: open a session's actions menu → Clone session,
+  choose a sandbox destination, then use Sandbox profile. A provider-owned
+  destination requires an explicit selection before cloning.
 
 ## Driving it with the repro environment
 
@@ -52,6 +59,16 @@ cluster. Build this checkout with `pnpm --filter web run build` first.
   Catalog writes, reads, and API cross-checks use the real server. The session
   POST is intercepted and returns a controlled provisioning error; this proves
   the launch request and restored draft, not resource allocation or networking.
+- Provider-owned desktop/mobile Settings and Clone, per-user choices, required selection,
+  revocation, and unavailable-provider states are covered by
+  `tests/e2e_ui/onboarding/test_sandbox_profiles.py::test_provider_owned_profiles`.
+  The same command runs both tests. This second own-environment case installs
+  the example package into a temporary directory and uses real entry-point
+  discovery and authenticated server requests; it needs `uv` and package-build
+  dependencies. Allowed browser session/fork POSTs are intercepted. Direct
+  requests verify omitted/unauthorized selections fail before allocation.
+  Lifecycle enforcement uses a recording launcher in
+  `tests/server/integration/test_sandbox_profile_launch.py`.
 - Component checks cover management permissions, save errors, matching-provider
   selection, pagination, and Settings navigation while identity loads:
 
@@ -73,15 +90,21 @@ cluster. Build this checkout with `pnpm --filter web run build` first.
 
 ## Gotchas
 
-- The profile menu appears only when the chosen provider has an enabled profile
-  or a profile is already selected. Default retains deployment configuration.
-  Local-host sessions do not use this menu.
+- The profile menu shows loading/error/empty states for configured providers.
+  Default retains deployment configuration only for locally managed catalogs.
+  Provider-managed catalogs require an explicit authorized selection, even if
+  empty. Local-host sessions do not use this menu.
 - A selected profile keeps its revision. If an administrator edits or disables
   it, a refreshed menu asks the user to choose again; the server rejects stale
   or unavailable selections before provisioning.
 - Editing a profile affects new launches. Existing sandboxes keep their saved
   configuration; disabling a profile also prevents their subsequent wake or
   replacement until it is enabled again.
+- Provider-owned profiles are reauthorized for the saved execution identity
+  before wake/replacement, and the new caller before a fork. Revoking access
+  blocks subsequent use but does not terminate an already running sandbox.
+  The example retires old config revisions after edits, so old sessions cannot
+  silently wake with different settings. No live directory is used by these tests.
 - JSON supports optional image, native Kubernetes resource requests/limits,
   and native NetworkPolicy egress rules. Omitting egress keeps deployment
   policy. Empty egress denies outbound traffic including DNS, the Omnigent

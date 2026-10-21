@@ -1,0 +1,32 @@
+{
+  "profiles": [
+    {
+      "id": "demo-small",
+      "name": "Small development sandbox",
+      "description": "One CPU and 2 GiB for everyday development.",
+      "users": ["alice", "bob"],
+      "workspaces": [0, 1],
+      "config": {
+        "image": "ghcr.io/omnigent-ai/omnigent-host:latest",
+        "resources": {
+          "requests": {"cpu": "1", "memory": "2Gi"},
+          "limits": {"cpu": "1", "memory": "2Gi"}
+        }
+      }
+    },
+    {
+      "id": "demo-large",
+      "name": "Large development sandbox",
+      "description": "Four CPUs and 8 GiB for larger development workloads.",
+      "users": ["alice"],
+      "workspaces": [0, 1],
+      "config": {
+        "image": "ghcr.io/omnigent-ai/omnigent-host:latest",
+        "resources": {
+          "requests": {"cpu": "4", "memory": "8Gi"},
+          "limits": {"cpu": "4", "memory": "8Gi"}
+        }
+      }
+    }
+  ]
+}

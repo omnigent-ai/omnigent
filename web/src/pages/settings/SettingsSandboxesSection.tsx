@@ -41,7 +41,8 @@ export function SettingsSandboxesSection() {
   const [error, setError] = useState<string | null>(null);
 
   async function disable(profile: SandboxProfile) {
-    setDisabling(profile.id);
+    if (profile.managed) return;
+    setDisabling(`${profile.provider}:${profile.id}`);
     setError(null);
     try {
       await disableSandboxProfile(profile.id);
@@ -83,7 +84,7 @@ export function SettingsSandboxesSection() {
             Try again
           </Button>
         )}
-        {profiles.data && !canManage && (
+        {profiles.data && !canManage && providers.length > 0 && (
           <p className="text-sm text-muted-foreground">
             Only administrators can manage sandbox profiles.
           </p>
@@ -93,20 +94,22 @@ export function SettingsSandboxesSection() {
             <BoxIcon className="mb-1 size-7 text-muted-foreground" />
             <h2 className="font-medium">No sandbox profiles yet</h2>
             <p className="max-w-sm text-sm text-muted-foreground">
-              Sessions use the server default. Add a profile to offer another configuration when
-              starting a chat.
+              {profiles.data.managed_providers?.length
+                ? "Provider-managed sandboxes need an available profile before starting a chat."
+                : "Sessions use the server default. Add a profile to offer another configuration when starting a chat."}
             </p>
           </div>
         )}
         {profiles.data?.profiles.map((profile) => (
           <div
-            key={profile.id}
+            key={`${profile.provider}:${profile.id}`}
             className="flex flex-wrap items-center justify-between gap-4 rounded-xl border bg-card p-4"
           >
             <div className="min-w-0 flex-1">
               <div className="flex flex-wrap items-center gap-2">
                 <h2 className="font-medium">{profile.name}</h2>
                 <Badge variant="secondary">{sandboxOptionLabel(profile.provider)}</Badge>
+                {profile.managed && <Badge variant="outline">Managed by provider</Badge>}
                 {!profile.enabled && <Badge variant="outline">Disabled</Badge>}
               </div>
               {profile.description && (
@@ -114,7 +117,7 @@ export function SettingsSandboxesSection() {
               )}
               <p className="mt-2 font-mono text-xs text-muted-foreground">{profile.id}</p>
             </div>
-            {canManage && (
+            {canManage && !profile.managed && (
               <div className="flex shrink-0 gap-2">
                 <Button
                   variant="outline"
@@ -132,14 +135,14 @@ export function SettingsSandboxesSection() {
                     onClick={() => void disable(profile)}
                     aria-label={`Disable ${profile.name}`}
                   >
-                    {disabling === profile.id ? "Disabling…" : "Disable"}
+                    {disabling === `${profile.provider}:${profile.id}` ? "Disabling…" : "Disable"}
                   </Button>
                 )}
               </div>
             )}
           </div>
         ))}
-        {canManage && (
+        {canManage && providers.length > 0 && (
           <p className="text-xs text-muted-foreground">
             Existing sessions keep their saved profile overrides; omitted settings use deployment
             defaults. Disabling a profile blocks new sandbox starts and wakes.

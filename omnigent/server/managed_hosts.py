@@ -727,6 +727,8 @@ class ManagedSandboxConfig:
     default_model_options: Callable[[str, str | None], Awaitable[list[dict[str, Any]]]] | None = (
         None
     )
+    # Request-scoped reference; teardown must not depend on launch authorization.
+    profile_selection: dict[str, Any] | None = None
 
 
 class NoReachableModels(Exception):
@@ -1333,6 +1335,14 @@ def deployment_with_sandbox_profile(
     entry = deployment.for_provider(snapshot["provider"])
     if entry is None:
         raise HTTPException(status_code=400, detail="The sandbox profile provider is unavailable")
+    if snapshot.get("managed") is True:
+        return replace(
+            deployment,
+            configs=tuple(
+                replace(config, profile_selection=snapshot) if config is entry else config
+                for config in deployment.configs
+            ),
+        )
 
     def launcher_factory() -> SandboxHostLauncher:
         launcher = entry.launcher_factory()
@@ -3724,6 +3734,22 @@ def build_owner_launcher(
     return launcher
 
 
+async def _select_launch_profile(
+    launcher: SandboxHostLauncher, entry: ManagedSandboxConfig, owner: str
+) -> None:
+    from omnigent.server.provider_sandbox_profiles import select_provider_profile
+
+    snapshot = entry.profile_selection
+    if snapshot is not None:
+        if snapshot.get("user_id") != owner:
+            raise HTTPException(
+                status_code=403, detail="Sandbox profile execution identity mismatch"
+            )
+        await asyncio.to_thread(select_provider_profile, launcher, snapshot)
+    elif getattr(launcher, "manages_profiles", False):
+        raise HTTPException(status_code=422, detail="Choose a sandbox profile for this provider")
+
+
 async def launch_managed_host(
     *,
     config: ManagedSandboxDeployment,
@@ -3785,7 +3811,8 @@ async def launch_managed_host(
         provisioning, cloning, host startup, or registration fails.
     """
     entry = _select_provider_config(config, provider)
-    launcher = build_owner_launcher(entry, config, owner)
+    launcher = await asyncio.to_thread(build_owner_launcher, entry, config, owner)
+    await _select_launch_profile(launcher, entry, owner)
     repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
     slice_key_enabled = host_id is not None
     host_id = host_id or uuid.uuid4().hex
@@ -3867,7 +3894,7 @@ async def relaunch_managed_host(
         longer matches the configured launcher; 502 when
         provisioning, cloning, host startup, or registration fails.
     """
-    launcher = _launcher_for_teardown(host, config)
+    launcher = await asyncio.to_thread(_launcher_for_teardown, host, config)
     if launcher is None:
         raise HTTPException(
             status_code=400,
@@ -3879,6 +3906,7 @@ async def relaunch_managed_host(
     # Stay on the host's provider so the new generation is armed with ITS
     # token TTL, not the deployment default's.
     entry = config.recorded(host.sandbox_provider)
+    await _select_launch_profile(launcher, entry, host.user_id)
     repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
     # The old generation is normally already dead (that is why we are
     # here), but terminate defensively so a transient tunnel outage
@@ -4374,13 +4402,14 @@ async def resume_managed_host(
             return
         # Provider-matched launcher (None if config dropped / provider changed).
         # Non-resumable providers (e.g. Modal) fall through to a fresh relaunch.
-        launcher = _launcher_for_teardown(host, config)
+        launcher = await asyncio.to_thread(_launcher_for_teardown, host, config)
         if launcher is None or not launcher.capabilities.resume_stopped or host.sandbox_id is None:
             return
         # Agent-sandbox recreates its Pod and may lose HOME. Other resumable
         # providers retain their filesystem and do not need workspace prep.
         workspace_repos = repos if launcher.provider == "agent_sandbox" else ()
         entry = config.recorded(host.sandbox_provider)
+        await _select_launch_profile(launcher, entry, host.user_id)
         workspace_repos = _apply_git_clone_options(launcher, workspace_repos, entry.git_clone)
         sandbox_id = host.sandbox_id
         _logger.info(
@@ -4479,7 +4508,7 @@ async def terminate_managed_host(
     tombstone = await asyncio.to_thread(host_store.delete_host, host.host_id)
     if tombstone is None:
         return
-    launcher = _launcher_for_teardown(tombstone, config)
+    launcher = await asyncio.to_thread(_launcher_for_teardown, tombstone, config)
     sandbox_ids = dict.fromkeys((tombstone.sandbox_id, tombstone.terminating_sandbox_id))
     for sandbox_id in sandbox_ids:
         if sandbox_id is not None:

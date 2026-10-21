@@ -1253,6 +1253,7 @@ def _make_managed_sandbox_dispatch(deps: FireDeps) -> LaunchDispatch:
             provider=None,
             agent_store=deps.agent_store,
             agent_id=task.agent_id,
+            sandbox_profiles=getattr(deps.app_state, "sandbox_profiles", None),
         )
         if launch is not None and launch.error is not None:
             raise RuntimeError(f"managed sandbox launch failed: {launch.error}")
