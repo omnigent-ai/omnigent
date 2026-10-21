@@ -1,0 +1,79 @@
+[
+  {
+    "group": "runtime-harnesses",
+    "paths": "tests/runtime/harnesses",
+    "dist": "worksteal"
+  },
+  {
+    "group": "runtime-policies",
+    "paths": "tests/runtime/policies"
+  },
+  {
+    "group": "runtime-core",
+    "paths": "tests/runtime --ignore=tests/runtime/harnesses --ignore=tests/runtime/policies",
+    "dist": "worksteal"
+  },
+  {
+    "group": "inner-rest",
+    "paths": "tests/inner"
+  },
+  {
+    "group": "tools",
+    "paths": "tests/tools tests/test_errors.py"
+  },
+  {
+    "group": "repl-sdk",
+    "paths": "tests/frontends tests/repl tests/terminals"
+  },
+  {
+    "group": "server-approvals",
+    "paths": "tests/server/integration/test_sessions_permission_request_hook.py tests/server/integration/test_sessions_elicitation_resolve_url.py tests/server/integration/test_sessions_policy_evaluate.py",
+    "workers": "4"
+  },
+  {
+    "group": "server-integration",
+    "paths": "tests/server/integration --ignore=tests/server/integration/test_sessions_permission_request_hook.py --ignore=tests/server/integration/test_sessions_elicitation_resolve_url.py --ignore=tests/server/integration/test_sessions_policy_evaluate.py",
+    "workers": "4",
+    "dist": "worksteal"
+  },
+  {
+    "group": "server-rest",
+    "paths": "tests/server --ignore=tests/server/integration tests/onboarding",
+    "workers": "4"
+  },
+  {
+    "group": "spec-llms",
+    "paths": "tests/spec tests/llms"
+  },
+  {
+    "group": "integration-mock",
+    "paths": "tests/integration",
+    "workers": "0"
+  },
+  {
+    "group": "runner-app",
+    "paths": "tests/runner",
+    "dist": "worksteal"
+  },
+  {
+    "group": "stores",
+    "paths": "tests/stores",
+    "dist": "worksteal"
+  },
+  {
+    "group": "misc",
+    "paths": "tests --ignore=tests/e2e --ignore=tests/integration --ignore=tests/runtime --ignore=tests/inner --ignore=tests/tools --ignore=tests/test_errors.py --ignore=tests/frontends --ignore=tests/repl --ignore=tests/terminals --ignore=tests/server --ignore=tests/onboarding --ignore=tests/spec --ignore=tests/llms --ignore=tests/codex_parity --ignore=tests/runner --ignore=tests/stores",
+    "dist": "worksteal"
+  },
+  {
+    "group": "databricks",
+    "paths": "tests/db tests/deploy tests/server/test_smart_routing.py",
+    "extra": "databricks",
+    "markexpr": "databricks"
+  },
+  {
+    "group": "slack",
+    "paths": "integrations/slack/tests",
+    "extra": "slack"
+  }
+]

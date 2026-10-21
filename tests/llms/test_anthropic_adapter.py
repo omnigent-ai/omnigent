@@ -566,6 +566,46 @@ async def test_model_metadata_lookup_uses_models_api_and_caches() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_base", "models_url"),
+    [
+        (
+            "https://gateway.example.com/anthropic/v4",
+            "https://gateway.example.com/anthropic/v4/models",
+        ),
+        ("https://gateway.example.com/v4/", "https://gateway.example.com/v4/models"),
+        ("https://gateway.example.com/v10", "https://gateway.example.com/v10/models"),
+        ("https://gateway.example.com/v1beta", "https://gateway.example.com/v1beta/v1/models"),
+        ("https://gateway.example.com/v4/proxy", "https://gateway.example.com/v4/proxy/v1/models"),
+        ("https://gateway.example.com/v٤", "https://gateway.example.com/v%D9%A4/v1/models"),
+        ("https://v4", "https://v4/v1/models"),
+    ],
+)
+async def test_model_metadata_lookup_keeps_a_versioned_base(
+    provider_base: str, models_url: str
+) -> None:
+    """Only a final ASCII version path segment suppresses the default ``/v1``."""
+    requests_seen: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(request)
+        if str(request.url) != f"{models_url}/claude-opus-4-8":
+            return httpx.Response(404, json={"error": {"type": "not_found_error"}})
+        return httpx.Response(200, json={"id": "claude-opus-4-8", "max_input_tokens": 200_000})
+
+    metadata = await _get_anthropic_model_metadata(
+        {"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+        provider_base,
+        "claude-opus-4-8",
+        transport=httpx.MockTransport(_handler),
+    )
+
+    assert [str(request.url) for request in requests_seen] == [f"{models_url}/claude-opus-4-8"]
+    assert metadata is not None
+    assert metadata.context_window == 200_000
+
+
+@pytest.mark.asyncio
 async def test_model_metadata_lookup_does_not_cache_failures(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

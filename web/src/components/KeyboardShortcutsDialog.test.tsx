@@ -11,8 +11,16 @@ import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPr
 // The pinned-session row shows in both shells; only its chord differs (Alt in
 // the browser). Default the mock to browser (false); flip per-test for native.
 const isNativeShell = vi.fn(() => false);
+const isElectronShell = vi.fn(() => false);
+const supportsBrowser = vi.fn(() => false);
+const contentSearchEnabled = vi.fn(() => false);
+vi.mock("@/lib/CapabilitiesContext", () => ({
+  useServerInfo: () => ({ features: { workspace_content_search: contentSearchEnabled() } }),
+}));
 vi.mock("@/lib/nativeBridge", () => ({
   isNativeShell: () => isNativeShell(),
+  isElectronShell: () => isElectronShell(),
+  supportsBrowser: () => supportsBrowser(),
   // DialogContent (rendered here) reads isIOSShell to size modals for the iOS
   // keyboard; this suite exercises the browser path, so it's always false.
   isIOSShell: () => false,
@@ -20,6 +28,9 @@ vi.mock("@/lib/nativeBridge", () => ({
 
 beforeEach(() => {
   isNativeShell.mockReturnValue(false);
+  isElectronShell.mockReturnValue(false);
+  supportsBrowser.mockReturnValue(false);
+  contentSearchEnabled.mockReturnValue(false);
   localStorage.clear();
 });
 afterEach(() => {
@@ -40,11 +51,12 @@ function keysFor(label: string): string[] {
 }
 
 describe("KeyboardShortcutsList composer rows", () => {
-  it("shows Enter to send and Shift+Enter for a new line by default", () => {
+  it("shows Enter to send and Shift+Enter or Alt+Enter for a new line by default", () => {
     render(<KeyboardShortcutsList />);
 
     expect(keysFor("Send message")).toEqual(["↵"]);
-    expect(keysFor("New line in message")).toEqual(["⇧", "↵"]);
+    expect(keysFor("New line in message")).toEqual(["⇧", "↵", "Alt", "↵"]);
+    expect(screen.getByText("New line in message").closest("li")).toHaveTextContent("⇧↵orAlt↵");
   });
 
   it("shows Ctrl+Enter to send and Enter for a new line in alternate mode", () => {
@@ -80,9 +92,27 @@ describe("KeyboardShortcutsList settings layout", () => {
 });
 
 describe("KeyboardShortcutsDialog", () => {
+  it("shows the workspace search shortcut only when the feature is enabled", () => {
+    const { rerender } = render(<KeyboardShortcutsList />);
+    expect(screen.queryByText("Search workspace contents")).toBeNull();
+    expect(keysFor("Select a workspace tab")).toContain("1…4");
+    contentSearchEnabled.mockReturnValue(true);
+    rerender(<KeyboardShortcutsList />);
+    expect(keysFor("Search workspace contents")).toEqual(["Ctrl", "⇧", "F"]);
+    expect(keysFor("Select a workspace tab")).toContain("1…5");
+  });
+
   it("advertises the session-search chord without taking the Print shortcut", () => {
     render(<KeyboardShortcutsList />);
     expect(keysFor("Find a session by name")).toEqual(["Ctrl", "Alt", "S"]);
+  });
+
+  it("keeps native new-session keys and updates the Settings reference", () => {
+    const { rerender } = render(<KeyboardShortcutsList variant="settings" />);
+    expect(keysFor("Start a new session")).toEqual(["Ctrl", "Shift", "O"]);
+    isNativeShell.mockReturnValue(true);
+    rerender(<KeyboardShortcutsList variant="settings" />);
+    expect(keysFor("Start a new session")).toEqual(["Ctrl", "Alt", "N"]);
   });
 
   it("renders nothing until opened", () => {
@@ -97,7 +127,10 @@ describe("KeyboardShortcutsDialog", () => {
     expect(screen.getByText("Keyboard shortcuts")).toBeTruthy();
     // General / In chats / Navigation / View / Slash commands — one each.
     expect(screen.getByText("Start a new session")).toBeTruthy();
+    expect(keysFor("Start a new session")).toEqual(["Ctrl", "Shift", "O"]);
     expect(screen.getByText("Open command palette")).toBeTruthy();
+    expect(keysFor("Open Settings")).toEqual(["Ctrl", "Alt", ","]);
+    expect(keysFor("Rename current session")).toEqual(["Ctrl", "Alt", "R"]);
     expect(screen.getByText("Show keyboard shortcuts")).toBeTruthy();
     expect(screen.getByText("Send message")).toBeTruthy();
     expect(keysFor("Open model picker")).toEqual(["Ctrl", "⇧", "M"]);
@@ -105,9 +138,24 @@ describe("KeyboardShortcutsDialog", () => {
     expect(screen.getByText("Previous session")).toBeTruthy();
     expect(keysFor("Previous session")).toEqual(["Ctrl", "["]);
     expect(keysFor("Next session")).toEqual(["Ctrl", "]"]);
+    expect(keysFor("Toggle Chat / Terminal view")).toEqual(["Ctrl", "Alt", "\\"]);
     expect(screen.getByText("Toggle conversations sidebar")).toBeTruthy();
+    expect(screen.getByText("Focus or close workspace sidebar")).toBeTruthy();
+    expect(screen.queryByText("Open a new browser tab")).toBeNull();
     expect(screen.getByText("Open a new shell")).toBeTruthy();
+    const workspaceTabRow = screen.getByText("Select a workspace tab").closest("li");
+    expect(keysFor("Select a workspace tab")).toEqual(["Ctrl", "Alt", "]", "1…4"]);
+    expect(workspaceTabRow?.textContent?.match(/\+/g)).toHaveLength(1);
     expect(screen.getByText("Navigate suggestions")).toBeTruthy();
+  });
+
+  it("shows the Browser shortcut only when the desktop bridge supports it", () => {
+    const { rerender } = render(<KeyboardShortcutsList />);
+    expect(screen.queryByText("Open a new browser tab")).toBeNull();
+
+    supportsBrowser.mockReturnValue(true);
+    rerender(<KeyboardShortcutsList />);
+    expect(keysFor("Open a new browser tab")).toEqual(["Ctrl", "Alt", "B"]);
   });
 
   it("toggles closed on a second hotkey press", async () => {
@@ -144,5 +192,18 @@ describe("KeyboardShortcutsDialog", () => {
     expect(row).toBeTruthy();
     expect(within(row!).queryByText("Alt")).toBeNull();
     expect(within(row!).getByText("1…0")).toBeTruthy();
+  });
+
+  it("shows the recent-session switcher only in Electron", () => {
+    const { rerender } = render(<KeyboardShortcutsList />);
+    expect(screen.queryByText("Switch recent sessions")).toBeNull();
+
+    isNativeShell.mockReturnValue(true);
+    isElectronShell.mockReturnValue(true);
+    rerender(<KeyboardShortcutsList />);
+    expect(keysFor("Switch recent sessions")).toEqual(["Ctrl", "Tab"]);
+    expect(
+      screen.getByRole("heading", { name: "Navigation" }).closest("section")?.querySelector("li"),
+    ).toHaveTextContent("Switch recent sessions");
   });
 });

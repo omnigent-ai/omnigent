@@ -34,12 +34,15 @@ import signal
 import subprocess
 import sys
 import threading
+import uuid
 from pathlib import Path
 
 import httpx
 import pytest
 
-from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from omnigent.host.daemon_lifecycle import HostDaemonRecord
+from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN, RUNNER_PARENT_PID_ENV_VAR
+from tests._helpers.session import bundle_files, post_session_bundle
 from tests.e2e.omnigent.test_host_ctrl_c_stop_server import (
     _connect_env,
     _read_local_server_record,
@@ -64,9 +67,18 @@ def _telemetry_env(base_env: dict[str, str], home: Path) -> dict[str, str]:
     :returns: Environment dict for the CLI subprocess.
     """
     env = _connect_env(base_env, home)
+    # Reconnecting hosts with the same owner/name replace each other's rows.
+    host_id = uuid.uuid4().hex
+    env["OMNIGENT_HOST_ID"] = host_id
+    env["OMNIGENT_HOST_NAME"] = f"telemetry-env-{host_id}"
     env["CLAUDE_CODE_ENABLE_TELEMETRY"] = "1"
     env["OTEL_METRICS_EXPORTER"] = "otlp"
     env["OMNIGENT_TELEMETRY_ENABLED"] = "1"
+    # /proc exposes exec-time env, not a zygote-forked runner's os.environ
+    # updates (the fork never re-execs, so its environ stays frozen at
+    # whatever the zygote itself was launched with). Force a direct spawn so
+    # the process observation below tests the runner's actually-delivered env.
+    env["OMNIGENT_RUNNER_ZYGOTE"] = "0"
     return env
 
 
@@ -92,12 +104,12 @@ def _spawn_background_daemon(
     )
 
 
-def _wait_for_daemon_pid(home: Path, *, timeout: float) -> int:
-    """Wait for the daemon registry record and return the daemon pid.
+def _wait_for_daemon_record(home: Path, *, timeout: float) -> HostDaemonRecord:
+    """Read the daemon's process and host identity from its own registry.
 
     :param home: Isolated HOME holding ``.omnigent/daemons``.
     :param timeout: Max seconds to poll for the record.
-    :returns: The detached daemon's pid.
+    :returns: The detached daemon's registry record.
     :raises AssertionError: If no record appears within *timeout*.
     """
     daemons = home / ".omnigent" / "daemons"
@@ -105,7 +117,7 @@ def _wait_for_daemon_pid(home: Path, *, timeout: float) -> int:
     while elapsed < timeout:
         records = sorted(daemons.glob("*.json")) if daemons.is_dir() else []
         if records:
-            return int(json.loads(records[0].read_text())["pid"])
+            return HostDaemonRecord(**json.loads(records[0].read_text()))
         _POLL_PAUSE.wait(0.25)
         elapsed += 0.25
     raise AssertionError(f"daemon record never appeared under {daemons}")
@@ -182,7 +194,7 @@ def test_background_daemon_env_keeps_claude_telemetry_flag(
     daemon_pid = -1
     server_pid = -1
     try:
-        daemon_pid = _wait_for_daemon_pid(home, timeout=_BOOT_TIMEOUT)
+        daemon_pid = _wait_for_daemon_record(home, timeout=_BOOT_TIMEOUT).pid
         server_pid, _port = _read_local_server_record(home)
         _assert_telemetry_flag_survived(_proc_environ(daemon_pid), process="daemon")
     finally:
@@ -223,7 +235,9 @@ def test_daemon_spawned_runner_receives_claude_telemetry_flag(
     server_pid = -1
     runner_pid = -1
     try:
-        daemon_pid = _wait_for_daemon_pid(home, timeout=_BOOT_TIMEOUT)
+        daemon = _wait_for_daemon_record(home, timeout=_BOOT_TIMEOUT)
+        daemon_pid = daemon.pid
+        assert daemon.host_id, "daemon record did not identify its host"
         server_pid, port = _read_local_server_record(home)
         base = f"http://127.0.0.1:{port}"
         with httpx.Client(
@@ -231,15 +245,19 @@ def test_daemon_spawned_runner_receives_claude_telemetry_flag(
             timeout=30.0,
             headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
         ) as client:
-            host_id = _online_host_id(client, timeout=_BOOT_TIMEOUT)
-            agents = client.get("/v1/agents")
-            agents.raise_for_status()
-            rows = agents.json()["data"]
-            assert rows, "server registered no agents"
-            create = client.post(
+            host_id = _online_host_id(client, host_id=daemon.host_id, timeout=_BOOT_TIMEOUT)
+            bundle = bundle_files(
+                {
+                    "agent.yaml": b"name: telemetry-env\n"
+                    b"executor:\n  harness: openai-agents\n  model: mock-model\n"
+                    b"prompt: Reply briefly.\n"
+                }
+            )
+            create = post_session_bundle(
+                client.post,
                 "/v1/sessions",
-                json={
-                    "agent_id": rows[0]["id"],
+                bundle,
+                metadata={
                     "host_id": host_id,
                     "workspace": str(workspace),
                 },
@@ -247,7 +265,9 @@ def test_daemon_spawned_runner_receives_claude_telemetry_flag(
             )
             create.raise_for_status()
 
-        runner_pid = _wait_for_runner_pid(workspace, timeout=_RUNNER_APPEAR_TIMEOUT)
+        runner_pid = _wait_for_runner_pid(
+            workspace, daemon_pid=daemon_pid, timeout=_RUNNER_APPEAR_TIMEOUT
+        )
         _assert_telemetry_flag_survived(_proc_environ(runner_pid), process="runner")
     finally:
         if runner_pid > 0:
@@ -258,34 +278,63 @@ def test_daemon_spawned_runner_receives_claude_telemetry_flag(
             _sigterm(server_pid)
 
 
-def _online_host_id(client: httpx.Client, timeout: float) -> str:
-    """Poll ``GET /v1/hosts`` until a host is online; return its id.
+def _online_host_id(client: httpx.Client, *, host_id: str, timeout: float) -> str:
+    """Wait for this daemon's host, even when other hosts reconnect locally.
 
     :param client: HTTP client pointed at the detached local server.
+    :param host_id: Host identity from this daemon's registry record.
     :param timeout: Max seconds to wait for the daemon's host registration.
     :returns: The online host's ``host_id``.
-    :raises AssertionError: If no host comes online within *timeout*.
+    :raises AssertionError: If this host does not come online within *timeout*.
     """
     elapsed = 0.0
     while elapsed < timeout:
-        resp = client.get("/v1/hosts")
-        if resp.status_code == 200:
-            online = [h for h in resp.json().get("hosts", []) if h.get("status") == "online"]
-            if online:
-                return str(online[0]["host_id"])
+        resp = client.get(f"/v1/hosts/{host_id}")
+        if resp.status_code == 200 and resp.json().get("status") == "online":
+            return host_id
         _POLL_PAUSE.wait(0.5)
         elapsed += 0.5
-    raise AssertionError(f"no host came online within {timeout}s")
+    raise AssertionError(f"host {host_id} did not come online within {timeout}s")
 
 
-def _wait_for_runner_pid(workspace: Path, *, timeout: float) -> int:
+def _proc_ppid(pid: int) -> int | None:
+    """Return *pid*'s parent pid, or ``None`` if it can't be read.
+
+    :param pid: Target process id.
+    :returns: The parent pid from ``/proc/<pid>/status``, or ``None`` if the
+        process is gone or the field is unreadable.
+    """
+    try:
+        raw = Path(f"/proc/{pid}/status").read_text()
+    except OSError:
+        return None
+    for line in raw.splitlines():
+        if line.startswith("PPid:"):
+            with contextlib.suppress(ValueError):
+                return int(line.split(":", 1)[1].strip())
+    return None
+
+
+def _wait_for_runner_pid(workspace: Path, *, daemon_pid: int, timeout: float) -> int:
     """Find the daemon-spawned runner for *workspace* by scanning ``/proc``.
 
     The runner env is built by ``_build_runner_env``, which always stamps
     ``OMNIGENT_RUNNER_WORKSPACE`` with the session workspace — a per-test
     unique tmp path, so the match cannot pick up another test's runner.
+    That alone is not enough to name *this* runner, though: a claude-sdk /
+    claude-native session also auto-launches an interactive terminal
+    (tmux -> zsh -> ...) that inherits the runner's whole environment,
+    including ``OMNIGENT_RUNNER_WORKSPACE`` and ``RUNNER_SERVER_URL`` — and
+    that terminal tree gets reparented to the daemon (the installed
+    subreaper) once its own launcher exits, so its ``ppid`` is
+    indistinguishable from the runner's by that alone. What the terminal
+    tree does NOT carry is the runner's own ``OMNIGENT_RUNNER_PARENT_PID``
+    stamp (it inherits a *different* value, or none), so requiring that to
+    equal *daemon_pid* is what actually singles out the runner.
 
     :param workspace: The session workspace passed at session create.
+    :param daemon_pid: This test's daemon pid — the runner's expected parent,
+        both by direct ``ppid`` and by its own ``OMNIGENT_RUNNER_PARENT_PID``.
     :param timeout: Max seconds to poll for the runner process.
     :returns: The runner's pid.
     :raises AssertionError: If no runner appears within *timeout*.
@@ -296,12 +345,22 @@ def _wait_for_runner_pid(workspace: Path, *, timeout: float) -> int:
         for entry in Path("/proc").iterdir():
             if not entry.name.isdigit():
                 continue
+            pid = int(entry.name)
+            if _proc_ppid(pid) != daemon_pid:
+                continue
             try:
-                env = _proc_environ(int(entry.name))
+                env = _proc_environ(pid)
             except (OSError, PermissionError):
                 continue
-            if env.get("OMNIGENT_RUNNER_WORKSPACE") == needle and "RUNNER_SERVER_URL" in env:
-                return int(entry.name)
+            if (
+                env.get("OMNIGENT_RUNNER_WORKSPACE") == needle
+                and "RUNNER_SERVER_URL" in env
+                and env.get(RUNNER_PARENT_PID_ENV_VAR) == str(daemon_pid)
+            ):
+                return pid
         _POLL_PAUSE.wait(0.5)
         elapsed += 0.5
-    raise AssertionError(f"no runner with OMNIGENT_RUNNER_WORKSPACE={needle} within {timeout}s")
+    raise AssertionError(
+        f"no runner with OMNIGENT_RUNNER_WORKSPACE={needle} and "
+        f"{RUNNER_PARENT_PID_ENV_VAR}={daemon_pid} within {timeout}s"
+    )

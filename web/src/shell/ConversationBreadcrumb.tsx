@@ -3,7 +3,10 @@ import type { ReactNode } from "react";
 import { Link } from "@/lib/routing";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
-import { nativeCodingAgentForSubagentWrapper } from "@/lib/nativeCodingAgents";
+import {
+  nativeCodingAgentForAgentName,
+  nativeCodingAgentForSubagentWrapper,
+} from "@/lib/nativeCodingAgents";
 import type { Agent } from "@/hooks/useAgents";
 import { cn } from "@/lib/utils";
 import { ProjectRowIcon } from "./ProjectPicker";
@@ -89,6 +92,7 @@ export function ConversationBreadcrumb({
   const subAgentSegment = isChildSession
     ? (nativeCodingAgentForSubagentWrapper(wrapperLabel)?.displayName ??
       (subAgentName?.trim() || null) ??
+      nativeCodingAgentForAgentName(boundAgent?.name)?.displayName ??
       boundAgent?.name ??
       null)
     : null;

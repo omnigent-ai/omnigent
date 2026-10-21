@@ -3,7 +3,7 @@
 Bridges the connection store and the Databricks OAuth client: reads the stored
 connection and transparently refreshes an expired access token, so the broker
 always vends a currently-valid token together with its workspace host (needed to
-build the AI Gateway MCP URL). Mirrors :mod:`omnigent.server.github_identity`.
+build the Unity Gateway MCP URL). Mirrors :mod:`omnigent.server.github_identity`.
 See ``designs/DATABRICKS_CONNECT.md``.
 """
 
@@ -65,7 +65,7 @@ async def resolve_databricks_credential(
     The provider adapter the generic credential broker
     (:mod:`omnigent.server.routes.host_credentials`) calls: returns the vended
     (server-refreshed) access token plus the ``workspace_host`` the sandbox
-    needs to target the AI Gateway, or ``None`` when the owner has not linked
+    needs to target the Unity Gateway, or ``None`` when the owner has not linked
     Databricks. Mirrors
     :func:`omnigent.server.github_identity.resolve_github_credential`.
     """

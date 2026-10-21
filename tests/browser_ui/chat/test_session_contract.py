@@ -44,7 +44,7 @@ def test_contract_drives_history_catalog_and_live_status(
     assert [model["id"] for model in session["model_options"]] == ["sonnet", "opus"]
     configure = page.get_by_role("button", name="Configure session")
     configure.click()
-    page.get_by_role("menuitem", name="Model: Default").click()
+    page.get_by_test_id("composer-agent-edit").click()
     expect(page.get_by_role("menuitemcheckbox", name="Sonnet")).to_be_visible()
     expect(page.get_by_role("menuitemcheckbox", name="Opus")).to_be_visible()
     page.keyboard.press("Escape")

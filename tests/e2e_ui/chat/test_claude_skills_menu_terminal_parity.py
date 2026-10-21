@@ -1,19 +1,9 @@
-"""Recording driver: the claude-native composer menu matches the terminal.
+"""Record native and bridged portable skills in the Claude composer menu.
 
-Drives the fixed journey in a real browser for the after-fix clip: a
-``claude-native`` session whose workspace carries skills under both
-``.claude/skills`` and ``.agents/skills``, with a user skill in
-``$CLAUDE_CONFIG_DIR/skills`` (the env var must be exported to the spawned
-runner before pytest starts, with the skill seeded inside it). Opening the
-composer's ``/`` menu must list the ``.claude`` tier and the config-dir
-user tier — the skills the Claude terminal itself loads — and must NOT
-list the ``.agents/skills`` entry the terminal cannot invoke.
-
-The harness is ``claude-native`` deliberately: the terminal-matching menu
-resolution is native-only, so a native spec is what exercises it. The
-``/skills`` endpoint resolves from the spec's harness independent of whether
-the CLI terminal actually launches, so the composer menu is populated even
-under the suite's mock LLM.
+Set ``CLAUDE_CONFIG_DIR`` to the isolated host's config directory to also
+check its user skill tier. The single online host is selected automatically; set
+``OMNIGENT_E2E_HOST_ID`` to select one when multiple hosts are connected.
+The host-backed menu resolves skills without a model turn.
 """
 
 from __future__ import annotations
@@ -25,6 +15,8 @@ from pathlib import Path
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests._helpers.session import post_session_bundle
 
 _CLAUDE_AGENT_YAML = """\
 name: skills_parity
@@ -72,47 +64,50 @@ def _seed_skill(skills_dir: Path, name: str, description: str) -> None:
 def test_claude_menu_lists_only_terminal_loadable_skills(
     page: Page,
     live_server: str,
-    runner_id: str,
     tmp_path: Path,
 ) -> None:
-    """The ``/`` menu shows the Claude tiers and omits ``.agents/skills``.
+    """The ``/`` menu includes native and bridged ``.agents/skills`` tiers.
 
     :param page: Playwright page (fresh context per test).
     :param live_server: Base URL of the spawned server serving the SPA.
-    :param runner_id: Token-bound id of the spawned runner to bind to.
     :param tmp_path: Workspace root seeded with the two workspace tiers.
     """
     workspace = tmp_path / "workspace"
     _seed_skill(workspace / ".claude" / "skills", "claude-dir-skill", "workspace claude skill")
     _seed_skill(workspace / ".agents" / "skills", "agents-only-skill", "workspace agents skill")
     cfg = os.environ.get("CLAUDE_CONFIG_DIR", "")
-    if not cfg:
-        pytest.skip("export CLAUDE_CONFIG_DIR to a writable dir before pytest")
-    _seed_skill(Path(cfg) / "skills", "user-cfg-skill", "user config-dir skill")
+    host_id = os.environ.get("OMNIGENT_E2E_HOST_ID")
+    if not host_id:
+        response = httpx.get(f"{live_server}/v1/hosts", timeout=10.0)
+        response.raise_for_status()
+        hosts = [host for host in response.json()["hosts"] if host.get("status") == "online"]
+        if len(hosts) != 1:
+            pytest.skip("set OMNIGENT_E2E_HOST_ID when there is not exactly one online host")
+        host_id = hosts[0]["host_id"]
+    if cfg:
+        _seed_skill(Path(cfg) / "skills", "user-cfg-skill", "user config-dir skill")
 
-    create = httpx.post(
+    create = post_session_bundle(
+        httpx.post,
         f"{live_server}/v1/sessions",
-        data={"metadata": json.dumps({"workspace": str(workspace)})},
-        files={"bundle": ("agent.tar.gz", _bundle(), "application/gzip")},
+        _bundle(),
+        metadata={"workspace": str(workspace), "host_id": host_id},
         timeout=30.0,
     )
     create.raise_for_status()
     session_id = create.json()["session_id"]
-    httpx.patch(
-        f"{live_server}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    ).raise_for_status()
 
+    page.add_init_script(
+        f"localStorage.setItem({json.dumps(f'omnigent:imports-reviewed:{host_id}')}, 'true')"
+    )
     page.goto(f"{live_server}/c/{session_id}")
     composer = page.get_by_label("Message the agent")
     expect(composer).to_be_visible(timeout=30_000)
     composer.fill("/")
 
-    # Both tiers Claude Code itself loads are listed…
     expect(page.get_by_test_id("slash-menu-item-claude-dir-skill")).to_be_visible(timeout=15_000)
-    expect(page.get_by_test_id("slash-menu-item-user-cfg-skill")).to_be_visible()
-    # …and the .agents/skills entry the terminal can't invoke is not.
-    expect(page.get_by_test_id("slash-menu-item-agents-only-skill")).to_have_count(0)
+    if cfg:
+        expect(page.get_by_test_id("slash-menu-item-user-cfg-skill")).to_be_visible()
+    expect(page.get_by_test_id("slash-menu-item-agents-only-skill")).to_be_visible()
     # Hold the corrected menu on screen so the clip ends on the outcome.
     page.wait_for_timeout(1_500)

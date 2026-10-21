@@ -13,6 +13,7 @@ gated e2e test.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import types
@@ -48,6 +49,8 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.onboarding import copilot_auth
+from omnigent.runtime.harnesses._executor_adapter import _bridge_one_dispatch
+from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
 
 
 def _user(content: str, session_id: str = "conv1") -> Message:
@@ -419,7 +422,7 @@ async def test_hostless_executor_clears_a_leftover_host(monkeypatch: pytest.Monk
 
 
 def test_capabilities() -> None:
-    ex = CopilotExecutor()
+    ex = CopilotExecutor(github_token="fixture-token")
     assert ex.supports_streaming() is True
     assert ex.supports_tool_calling() is True
     assert ex.handles_tools_internally() is True
@@ -443,12 +446,75 @@ def test_encode_tool_result_variants(monkeypatch: pytest.MonkeyPatch) -> None:
     assert js.result_type == "success" and "value" in js.text_result_for_llm
 
 
+@pytest.mark.parametrize("is_error", [False, True])
+@pytest.mark.asyncio
+async def test_image_tool_dispatch_preserves_text_and_status(
+    monkeypatch: pytest.MonkeyPatch, is_error: bool
+) -> None:
+    _install_fake_copilot(monkeypatch)
+    output = encode_mcp_image_result(
+        [
+            {"type": "text", "text": "Image tool evidence"},
+            {
+                "type": "image",
+                "mimeType": "image/gif",
+                "data": "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7",
+            },
+            {"type": "text", "text": "Trailing detail"},
+        ],
+        is_error=is_error,
+    )
+
+    async def dispatch_tool(**kwargs: object) -> str:
+        assert kwargs["name"] == "image_tool"
+        return output
+
+    ctx: Any = types.SimpleNamespace(dispatch_tool=dispatch_tool)
+
+    async def tool_executor(name: str, args: dict[str, Any]) -> object:
+        return await _bridge_one_dispatch(ctx, "copilot", name, args)
+
+    ex = CopilotExecutor(github_token="fixture-token")
+    ex._tool_executor = tool_executor
+    handler = ex._make_handler("image_tool")
+    result = await handler(types.SimpleNamespace(arguments={}, tool_call_id="image-call"))
+
+    assert result.text_result_for_llm == output
+    assert json.loads(result.text_result_for_llm) == json.loads(output)
+    assert result.result_type == ("failure" if is_error else "success")
+    assert result.error == (result.text_result_for_llm if is_error else None)
+
+
+@pytest.mark.parametrize(
+    ("payload", "result_type"),
+    [
+        ('{"error": "string payload"}', "success"),
+        ({"result": '{"error":"documentation example"}'}, "success"),
+        ({"content": {"blocked": True}}, "success"),
+        ({"cancelled": True}, "success"),
+        ({"cancelled": True, "blocked": True}, "failure"),
+        ({"cancelled": True, "error": "boom"}, "failure"),
+    ],
+)
+def test_encode_tool_result_preserves_ordinary_payload_and_cancellation_behavior(
+    monkeypatch: pytest.MonkeyPatch, payload: object, result_type: str
+) -> None:
+    _install_fake_copilot(monkeypatch)
+
+    result = _encode_tool_result(payload)
+
+    assert result.text_result_for_llm == (
+        payload if isinstance(payload, str) else json.dumps(payload)
+    )
+    assert result.result_type == result_type
+
+
 @pytest.mark.asyncio
 async def test_bridged_tool_handler_routes_to_tool_executor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_fake_copilot(monkeypatch)
-    ex = CopilotExecutor()
+    ex = CopilotExecutor(github_token="fixture-token")
     seen: list[tuple[str, dict[str, Any]]] = []
 
     async def fake_exec(name: str, args: dict[str, Any]) -> Any:
@@ -468,7 +534,7 @@ async def test_bridged_tool_handler_surfaces_exception_as_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _install_fake_copilot(monkeypatch)
-    ex = CopilotExecutor()
+    ex = CopilotExecutor(github_token="fixture-token")
 
     async def boom(name: str, args: dict[str, Any]) -> Any:
         raise RuntimeError("kaboom")
@@ -1291,7 +1357,7 @@ async def test_empty_prompt_completes_without_send(monkeypatch: pytest.MonkeyPat
 @pytest.mark.asyncio
 async def test_bridged_tool_handler_no_executor_wired(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_copilot(monkeypatch)
-    ex = CopilotExecutor()  # _tool_executor stays None (single-process / pre-turn)
+    ex = CopilotExecutor(github_token="fixture-token")  # _tool_executor stays None
     handler = ex._make_handler("sys_x")
     result = await handler(types.SimpleNamespace(arguments={}, tool_call_id="c"))
     assert result.result_type == "failure"

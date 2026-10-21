@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import io
 import sys
+from collections.abc import Callable
 
+import httpx
 import pytest
 import yaml
 
@@ -60,6 +62,7 @@ def test_configure_host_git_resets_then_adds_broker_helper(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    monkeypatch.setenv("GIT_TOKEN", "shared-test-token")
     calls: list[list[str]] = []
     monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
     cred = {"connected": True, "owner": "alice@example.com", "login": "octo"}
@@ -147,6 +150,7 @@ def test_configure_clone_credentials_wires_broker_when_connected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    monkeypatch.setenv("GIT_TOKEN", "shared-test-token")
     calls: list[list[str]] = []
     monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
     monkeypatch.setattr(h, "_fetch", lambda *a, **k: {"connected": True, "owner": "a@b.com"})
@@ -201,6 +205,76 @@ def test_configure_clone_credentials_fails_closed_when_probe_fails(
     assert any(
         c[:5] == ["git", "config", "--global", "--add", key] and "host1" in c[-1] for c in calls
     )
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "expected"),
+    [
+        (404, '{"detail":"unknown credential provider"}', {"connected": False}),
+        (404, '{"detail":"Not Found"}', None),
+        (404, "<html>Not Found</html>", None),
+        (404, "", None),
+        (404, "[]", None),
+        (404, '"unknown credential provider"', None),
+        (401, '{"detail":"unknown credential provider"}', None),
+        (503, '{"detail":"unknown credential provider"}', None),
+        (200, '{"connected":true,"token":"T"}', {"connected": True, "token": "T"}),
+        (200, '{"connected":false}', {"connected": False}),
+        (200, "[]", None),
+        (200, "invalid JSON", None),
+    ],
+)
+def test_fetch_classifies_provider_response(
+    monkeypatch: pytest.MonkeyPatch, status: int, body: str, expected: dict | None
+) -> None:
+    response = httpx.Response(status, content=body)
+    monkeypatch.setattr(h.httpx, "get", lambda *a, **k: response)
+    assert h._fetch("http://s", "hid", "tok") == expected
+
+
+@pytest.mark.parametrize("configure", [h.configure_clone_credentials, h.configure_host_git])
+def test_unknown_404_keeps_broker_authoritative(
+    monkeypatch: pytest.MonkeyPatch, configure: Callable[[str, str], object]
+) -> None:
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    monkeypatch.setenv("GIT_TOKEN", "shared-test-token")
+    response = httpx.Response(404, json={"detail": "Not Found"})
+    monkeypatch.setattr(h.httpx, "get", lambda *a, **k: response)
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(h, "_git_config", lambda *args: calls.append(args))
+
+    configure("http://srv", "host1")
+
+    key = "credential.https://github.com.helper"
+    assert len(calls) == 2
+    assert calls[0] == ("--replace-all", key, "")
+    assert calls[1][:2] == ("--add", key)
+    assert "omnigent.git_credential_github" in calls[1][2]
+
+
+def test_configure_clone_credentials_keeps_shared_helper_on_provider_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
+    response = httpx.Response(404, json={"detail": "unknown credential provider"})
+    monkeypatch.setattr(h.httpx, "get", lambda *a, **k: response)
+    assert h.configure_clone_credentials("http://srv", "host1") is False
+    assert calls == []  # ambient/shared helper chain untouched
+
+
+def test_configure_host_git_clears_stale_broker_on_provider_404(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "launch-tok")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(h.subprocess, "run", lambda args, **k: calls.append(args) or None)
+    response = httpx.Response(404, json={"detail": "unknown credential provider"})
+    monkeypatch.setattr(h.httpx, "get", lambda *a, **k: response)
+    h.configure_host_git("http://srv", "host1")
+    key = "credential.https://github.com.helper"
+    assert calls == [["git", "config", "--global", "--unset-all", key]]
 
 
 def test_configure_host_gh_writes_hosts_yml(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:

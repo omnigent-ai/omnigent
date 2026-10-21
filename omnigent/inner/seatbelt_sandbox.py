@@ -371,6 +371,8 @@ class SeatbeltSandboxBackend(SandboxBackend):
             ``sandbox-exec`` binary cannot be located.
         """
         sandbox_spec = spec.sandbox or OSEnvSandboxSpec(type=self.type_name)
+        if any(grant.copy_on_write for grant in sandbox_spec.write_path_specs):
+            raise ValueError("copy_on_write requires sandbox.type=linux_bwrap")
 
         if sys.platform != "darwin":
             raise OSError(
@@ -394,10 +396,7 @@ class SeatbeltSandboxBackend(SandboxBackend):
         # the spec opts in. Empty default honours the "no surprise
         # writes" contract — agents that need an editable project
         # tree opt in via ``write_paths: ["."]``.
-        write_paths_config = (
-            sandbox_spec.write_paths if sandbox_spec.write_paths is not None else []
-        )
-        write_roots = [_resolve_root(cwd, root) for root in write_paths_config]
+        write_roots = [_resolve_root(cwd, grant.path) for grant in sandbox_spec.write_path_specs]
 
         write_files: list[Path] = []
         if sandbox_spec.write_files is not None:
@@ -448,6 +447,7 @@ class SeatbeltSandboxBackend(SandboxBackend):
                 else None
             ),
             credential_proxy=sandbox_spec.credential_proxy,
+            git_ssh=sandbox_spec.git_ssh,
         )
 
     def wrap_launcher_argv(
@@ -1103,11 +1103,19 @@ def _build_profile(
             "(allow network-outbound (remote unix-socket "
             f"(path-literal {_quote(canonical_socket)})))"
         )
+    elif policy.git_ssh_socket_path is not None:
+        lines.append(";; Git SSH active — only its parent Unix socket is reachable")
     elif policy.allow_network:
         lines.append(";; allow_network=true — host network shared")
         lines.append("(allow network*)")
     else:
         lines.append(";; allow_network=false — covered by (deny default); no allow rules emitted")
+
+    if policy.git_ssh_socket_path is not None:
+        git_socket = str(Path(policy.git_ssh_socket_path).resolve(strict=False))
+        lines.append(
+            f"(allow network-outbound (remote unix-socket (path-literal {_quote(git_socket)})))"
+        )
 
     # ----------------------------------------------------------------
     # AF_UNIX control-socket denials.

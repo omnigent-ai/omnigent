@@ -3,7 +3,7 @@
 Unlike codex/claude/pi — which consume ``HARNESS_*_GATEWAY_*`` env vars that
 their CLIs translate into provider config — OpenCode reads its provider/auth
 from its own config file under the per-session ``XDG_CONFIG_HOME``. So routing
-opencode-native through the Databricks AI gateway (or any OpenAI-compatible
+opencode-native through the Databricks Unity Gateway (or any OpenAI-compatible
 endpoint) means writing an ``opencode.json`` into the runner-owned
 ``opencode serve``'s config dir at spawn, declaring a custom
 ``@ai-sdk/openai-compatible`` provider pointed at ``{host}/serving-endpoints``.
@@ -29,6 +29,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from omnigent.databricks_ai_gateway import (
+    OPENCODE_AGENT,
+    is_databricks_ai_gateway_url,
+    with_gateway_attribution,
+)
 from omnigent.models import model_catalog
 
 if TYPE_CHECKING:
@@ -41,7 +46,7 @@ _logger = logging.getLogger(__name__)
 # Provider id used in the synthesized opencode.json for the Databricks gateway.
 # The per-prompt model is pinned as ``{DATABRICKS_GATEWAY_PROVIDER_ID}/<endpoint>``.
 DATABRICKS_GATEWAY_PROVIDER_ID = "databricks-gateway"
-DATABRICKS_GATEWAY_PROVIDER_NAME = "Databricks AI Gateway"
+DATABRICKS_GATEWAY_PROVIDER_NAME = "Databricks Unity Gateway"
 # Endpoint that exposes the workspace's OpenAI-compatible chat completions.
 _SERVING_ENDPOINTS_PATH = "serving-endpoints"
 # Optional deployment default: a ``databricks-*`` serving-endpoint id used when a
@@ -160,9 +165,53 @@ def build_opencode_provider_config(resolution: OpenCodeGatewayResolution) -> dic
     }
 
 
+def _with_gateway_attribution(config: Mapping[str, object]) -> Mapping[str, object]:
+    """
+    Add usage-attribution headers to each model of a Unity Gateway provider.
+
+    Per-model ``headers`` are where ug puts its own: OpenCode merges them
+    last, after its built-in ``User-Agent``.
+
+    :param config: An ``opencode.json`` dict; it is not modified.
+    :returns: *config*, with gateway providers' model entries copied and stamped.
+    """
+    providers = config.get("provider")
+    if not isinstance(providers, Mapping):
+        return config
+    stamped: dict[str, object] = {}
+    for provider_id, provider in providers.items():
+        stamped[provider_id] = provider
+        if not isinstance(provider, Mapping):
+            continue
+        options = provider.get("options")
+        base_url = options.get("baseURL") if isinstance(options, Mapping) else None
+        models = provider.get("models")
+        if not isinstance(base_url, str) or not is_databricks_ai_gateway_url(base_url):
+            continue
+        if not isinstance(models, Mapping):
+            continue
+        stamped_models: dict[str, object] = {}
+        for model_id, model in models.items():
+            stamped_models[model_id] = model
+            if isinstance(model, Mapping):
+                headers = model.get("headers")
+                stamped_models[model_id] = {
+                    **model,
+                    "headers": with_gateway_attribution(
+                        headers if isinstance(headers, Mapping) else None,
+                        OPENCODE_AGENT,
+                        base_url,
+                    ),
+                }
+        stamped[provider_id] = {**provider, "models": stamped_models}
+    return {**config, "provider": stamped}
+
+
 def write_opencode_provider_config(xdg_config_home: Path, config: Mapping[str, object]) -> Path:
     """
     Atomically write ``<xdg_config_home>/opencode/opencode.json`` (``0600``).
+
+    Unity Gateway providers get usage-attribution headers on the way out.
 
     :param xdg_config_home: The per-session ``XDG_CONFIG_HOME`` the server uses.
     :param config: The provider config dict (see
@@ -172,7 +221,7 @@ def write_opencode_provider_config(xdg_config_home: Path, config: Mapping[str, o
     cfg_dir = xdg_config_home / "opencode"
     cfg_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = cfg_dir / "opencode.json"
-    payload = json.dumps(config, indent=2, sort_keys=True) + "\n"
+    payload = json.dumps(_with_gateway_attribution(config), indent=2, sort_keys=True) + "\n"
     fd, tmp_name = tempfile.mkstemp(prefix="opencode.json.", dir=str(cfg_dir))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -332,7 +381,7 @@ def resolve_databricks_gateway(
     model_id: str | None = None,
 ) -> OpenCodeGatewayResolution | None:
     """
-    Resolve a Databricks AI gateway for opencode from a ``~/.databrickscfg`` profile.
+    Resolve a Databricks Unity Gateway for opencode from a ``~/.databrickscfg`` profile.
 
     Uses ``databricks-sdk`` (the ``databricks`` extra) to obtain the workspace
     host + a bearer token for *profile*, then targets the workspace's

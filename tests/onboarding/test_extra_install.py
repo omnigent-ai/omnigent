@@ -138,6 +138,7 @@ def test_extra_install_command_pip_fallback(monkeypatch: pytest.MonkeyPatch) -> 
     cmd = extra_install_command("copilot")
     assert cmd == [
         extra_install.sys.executable,
+        "-P",
         "-m",
         "pip",
         "install",

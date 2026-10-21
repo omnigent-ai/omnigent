@@ -45,6 +45,71 @@ async def test_bind_session_runner_patches_encoded_session_path() -> None:
 
 
 @pytest.mark.asyncio
+async def test_bind_session_runner_retries_429_with_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner binding retries rate limits and honors ``Retry-After``."""
+    attempts = 0
+    sleeps: list[float] = []
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        """Rate limit two attempts before accepting the binding."""
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(429, headers={"Retry-After": "30"}, request=request)
+        if attempts == 2:
+            return httpx.Response(429, request=request)
+        return httpx.Response(200, json={}, request=request)
+
+    async def _fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(native_terminal, "_sleep", _fake_sleep)
+    async with httpx.AsyncClient(
+        base_url="https://example.databricks.com",
+        transport=httpx.MockTransport(_handler),
+    ) as client:
+        await native_terminal.bind_session_runner(client, "conv_abc", "runner_abc")
+
+    assert attempts == 3
+    assert sleeps == [10.0, 1.0]
+
+
+@pytest.mark.asyncio
+async def test_bind_session_runner_surfaces_429_after_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The final rate-limit response remains user-facing after the retry budget."""
+    attempts = 0
+    sleeps: list[float] = []
+
+    async def _handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "30"},
+            json={"error_code": "RESOURCE_EXHAUSTED"},
+            request=request,
+        )
+
+    async def _fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(native_terminal, "_sleep", _fake_sleep)
+    async with httpx.AsyncClient(
+        base_url="https://example.databricks.com",
+        transport=httpx.MockTransport(_handler),
+    ) as client:
+        with pytest.raises(click.ClickException, match="RESOURCE_EXHAUSTED"):
+            await native_terminal.bind_session_runner(client, "conv_abc", "runner_abc")
+
+    assert attempts == 5
+    assert sleeps == [10.0] * 4
+
+
+@pytest.mark.asyncio
 async def test_bind_session_runner_raises_click_exception_on_http_error() -> None:
     """
     HTTP failures surface as ClickException with server detail.
@@ -52,6 +117,8 @@ async def test_bind_session_runner_raises_click_exception_on_http_error() -> Non
     Native wrappers call this during CLI setup, so the failure must be
     user-facing instead of leaking a raw ``httpx.Response`` shape.
     """
+
+    attempts = 0
 
     async def _handler(request: httpx.Request) -> httpx.Response:
         """
@@ -61,6 +128,8 @@ async def test_bind_session_runner_raises_click_exception_on_http_error() -> Non
             :func:`native_terminal.bind_session_runner`.
         :returns: HTTP 409 response with JSON error detail.
         """
+        nonlocal attempts
+        attempts += 1
         return httpx.Response(
             409,
             json={"detail": "runner already bound"},
@@ -73,6 +142,8 @@ async def test_bind_session_runner_raises_click_exception_on_http_error() -> Non
     ) as client:
         with pytest.raises(click.ClickException, match="runner already bound"):
             await native_terminal.bind_session_runner(client, "conv_abc", "runner_abc")
+
+    assert attempts == 1
 
 
 @pytest.mark.asyncio

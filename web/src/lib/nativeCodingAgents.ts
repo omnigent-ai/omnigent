@@ -39,6 +39,10 @@ export function claudeNativeSubagentLabel(
 export const CODEX_NATIVE_SUBAGENT_WRAPPER = "codex-native-ui-subagent";
 /** Friendly nickname forwarded onto a Codex sub-agent child, e.g. `"Side chat"`. */
 export const CODEX_NATIVE_NICKNAME_LABEL_KEY = "omnigent.codex_native.agent_nickname";
+/** Wrapper stamped on a child row that tracks an OpenCode sub-agent. */
+export const OPENCODE_NATIVE_SUBAGENT_WRAPPER = "opencode-native-ui-subagent";
+/** Wrapper stamped on a child row that tracks an Antigravity sub-agent. */
+export const ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER = "antigravity-native-ui-subagent";
 
 /**
  * Human-readable label for a Codex sub-agent session (including `/side` forks).

@@ -38,6 +38,7 @@ import httpx
 import pytest
 from playwright.sync_api import Browser, BrowserContext, Page, Route, expect
 
+from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import (
     _build_hello_world_bundle,
     _ensure_runner_online,
@@ -94,11 +95,7 @@ def shared_browse(
     # tree really re-rooted rather than showing a workspace file of the same name.
     (outside / "owner-only.txt").write_text("visible only to the owner\n")
 
-    create = owner.post(
-        "/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", _build_hello_world_bundle(), "application/gzip")},
-    )
+    create = post_session_bundle(owner.post, "/v1/sessions", _build_hello_world_bundle())
     create.raise_for_status()
     session_id = create.json()["session_id"]
     owner.patch(
@@ -254,6 +251,7 @@ def test_owner_browses_outside_workspace_but_shared_collaborator_cannot(
         picker = owner_page.get_by_test_id("workspace-picker")
         expect(picker).to_be_visible(timeout=15_000)
         picker.get_by_test_id(f"workspace-picker-entry-{outside.name}").click()
+        picker.get_by_test_id("workspace-picker-select").click()
 
         # Proof the tree re-rooted: this file exists only outside the workspace.
         expect(owner_rail.get_by_text("owner-only.txt")).to_be_visible(timeout=30_000)

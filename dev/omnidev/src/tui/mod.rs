@@ -586,12 +586,62 @@ mod tests {
     }
 
     #[test]
+    fn restart_key_targets_selected_tab() {
+        let (mut app, mut rx) = app();
+        press(&mut app, KeyCode::Char('1'));
+        press(&mut app, KeyCode::Char('r'));
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Restart(ProcId::Server))));
+
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Char('r'));
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Restart(ProcId::Host))));
+
+        press(&mut app, KeyCode::Char('3'));
+        press(&mut app, KeyCode::Char('r'));
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Restart(ProcId::Vite))));
+
+        press(&mut app, KeyCode::Char('0'));
+        press(&mut app, KeyCode::Char('r'));
+        assert!(matches!(rx.try_recv(), Ok(Cmd::RestartBackend)));
+
+        press(&mut app, KeyCode::Char('R'));
+        assert!(matches!(rx.try_recv(), Ok(Cmd::RestartBackend)));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn renders_tail_by_default() {
         let (app, _rx) = app();
         seed(&app, 100);
         let rows = body(&app, 40, 12); // 4 header + 7 body + 1 footer
         assert_eq!(rows.last().unwrap(), "line099");
         assert!(rows.iter().any(|r| r == "line093"));
+    }
+
+    #[test]
+    fn ansi_log_colors_and_reset_survive_rendering() {
+        let (app, _rx) = app();
+        app.shared
+            .lock()
+            .unwrap()
+            .all
+            .push("\x1b[31mred\x1b[0m plain");
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        terminal.draw(|frame| render::draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = (0..9)
+            .map(|column| buffer.cell((column, 4)).unwrap().symbol())
+            .collect();
+        assert_eq!(text, "red plain");
+        for column in 0..9 {
+            let foreground = buffer.cell((column, 4)).unwrap().fg;
+            let expected = if column < 3 {
+                ratatui::style::Color::Red
+            } else {
+                ratatui::style::Color::Reset
+            };
+            assert_eq!(foreground, expected, "column {column}");
+        }
     }
 
     #[test]

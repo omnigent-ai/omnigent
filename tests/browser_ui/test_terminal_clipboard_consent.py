@@ -65,7 +65,10 @@ def _open_right_rail(page: Page) -> None:
     expect(toggle).to_be_visible(timeout=20_000)
     if toggle.get_attribute("aria-label") == "Expand right panel":
         toggle.click()
-    expect(page.get_by_role("complementary", name="Workspace")).to_be_visible()
+    rail = page.get_by_role("complementary", name="Workspace")
+    expect(rail).to_be_visible()
+    # The sliding rail can move the shell's close button under a pending click.
+    rail.evaluate("el => Promise.all(el.getAnimations().map(animation => animation.finished))")
 
 
 def _terminal_id(session_id: str) -> str:
@@ -294,6 +297,15 @@ def clipboard_browser(
             rf"/v1/sessions/({'|'.join(map(re.escape, session_ids))})/child_sessions(?:\?.*)?$"
         ),
         empty_list,
+    )
+    browser_contract.json(
+        re.compile(rf"/v1/sessions/({'|'.join(map(re.escape, session_ids))})/policies"),
+        empty_list,
+    )
+    browser_contract.json("/v1/policy-registry", empty_list)
+    browser_contract.json(
+        re.compile(rf"/v1/sessions/({'|'.join(map(re.escape, session_ids))})/owner"),
+        {"owner": None},
     )
     browser_contract.response(
         re.compile(

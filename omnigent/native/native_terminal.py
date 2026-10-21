@@ -2,17 +2,59 @@
 
 from __future__ import annotations
 
+import asyncio
 import urllib.parse
 import warnings
+from collections.abc import Awaitable, Callable
 
 import click
 import httpx
 
 from omnigent.host.daemon_launch import error_text
+from omnigent.util.http_retry import bounded_retry_after_seconds
 
 DAEMON_HOST_ONLINE_TIMEOUT_S = 30.0
 DAEMON_RUNNER_ONLINE_TIMEOUT_S = 60.0
 DAEMON_TERMINAL_READY_TIMEOUT_S = 60.0
+_HTTP_429_RETRY_DELAYS_S = (0.5, 1.0, 2.0, 4.0)
+_HTTP_429_MAX_RETRY_AFTER_S = 10.0
+_sleep = asyncio.sleep
+
+
+async def request_with_429_retry(
+    send: Callable[[], Awaitable[httpx.Response]],
+    *,
+    delays_s: tuple[float, ...] = _HTTP_429_RETRY_DELAYS_S,
+    max_retry_after_s: float = _HTTP_429_MAX_RETRY_AFTER_S,
+) -> httpx.Response:
+    """Send an HTTP request, retrying only explicit 429 responses.
+
+    The callable rebuilds the request for every attempt, which keeps multipart
+    session creation bodies replayable. ``Retry-After`` takes precedence over
+    the bounded exponential fallback schedule.
+
+    Retries are bounded by attempt count, not a wall-clock deadline: with
+    every hint capped, the sleeps total at most
+    ``len(delays_s) * max_retry_after_s`` (40s with the defaults).
+
+    :param send: Callable that creates and sends one request attempt.
+    :param delays_s: Fallback pause before each retry when the response has
+        no usable ``Retry-After`` hint, e.g. ``(0.5, 1.0, 2.0)``.
+    :param max_retry_after_s: Cap on any single pause, e.g. ``10.0``.
+    :returns: The first non-429 response, or the final 429 response.
+    """
+    for fallback_delay_s in delays_s:
+        response = await send()
+        if response.status_code != 429:
+            return response
+        await _sleep(
+            bounded_retry_after_seconds(
+                response,
+                fallback=fallback_delay_s,
+                max_delay=max_retry_after_s,
+            )
+        )
+    return await send()
 
 
 def normalize_extra_args(
@@ -96,9 +138,11 @@ async def bind_session_runner(
     :raises click.ClickException: If binding fails.
     """
     try:
-        resp = await client.patch(
-            f"/v1/sessions/{url_component(session_id)}",
-            json={"runner_id": runner_id},
+        resp = await request_with_429_retry(
+            lambda: client.patch(
+                f"/v1/sessions/{url_component(session_id)}",
+                json={"runner_id": runner_id},
+            )
         )
     except httpx.ConnectError as exc:
         # Connection refused/reset or DNS failure: the server was never reached.

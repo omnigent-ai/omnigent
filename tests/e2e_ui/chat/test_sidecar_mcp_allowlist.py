@@ -49,6 +49,7 @@ from pathlib import Path
 import httpx
 from playwright.sync_api import Page, expect
 
+from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import (
     _bind_session_runner,
     _ensure_runner_online,
@@ -141,11 +142,8 @@ def _create_sidecar_allowlist_session(
         mcp_info.size = len(sidecar)
         tar.addfile(mcp_info, io.BytesIO(sidecar))
 
-    create = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
+    create = post_session_bundle(
+        httpx.post, f"{base_url}/v1/sessions", buf.getvalue(), timeout=30.0
     )
     create.raise_for_status()
     session_id = str(create.json()["session_id"])

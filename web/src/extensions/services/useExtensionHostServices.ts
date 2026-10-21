@@ -3,7 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useTheme } from "next-themes";
 import { resolveIdentity } from "@/lib/identity";
 import { getOmnigentServerIdentity } from "@/lib/host";
-import { fetchGithubInfo } from "@/hooks/useGithub";
+import { fetchPullRequestInfo } from "@/hooks/usePullRequests";
 import { useNavigate } from "@/lib/routing";
 import type { ExtensionCatalogItem, ExtensionPullRequest } from "../types";
 import { ExtensionHostServiceError } from "./errors";
@@ -181,7 +181,7 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
           // Shares the GitHub panel's cache so the runner is asked at most every 30s per session.
           const info = await queryClient.fetchQuery({
             queryKey: ["github-info", sessionId],
-            queryFn: () => fetchGithubInfo(sessionId),
+            queryFn: () => fetchPullRequestInfo(sessionId),
             staleTime: 30_000,
           });
           const pr = info.available ? info.pr : null;

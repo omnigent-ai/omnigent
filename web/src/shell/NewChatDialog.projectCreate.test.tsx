@@ -1,3 +1,4 @@
+import type * as WorkspacePickerModule from "./WorkspacePicker";
 import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
 
 vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
@@ -116,7 +117,8 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 }));
 // The file browser is heavy UI; a stub button stands in for a user selection —
 // deliberately re-picking the config workspace through the modal commit path.
-vi.mock("./WorkspacePicker", () => ({
+vi.mock("./WorkspacePicker", async (importOriginal) => ({
+  ...(await importOriginal<typeof WorkspacePickerModule>()),
   isNavigablePath: () => false,
   WorkspacePicker: (props: { onSelect: (path: string) => void }) => (
     <button

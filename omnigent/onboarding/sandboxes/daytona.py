@@ -206,6 +206,7 @@ class DaytonaSandboxLauncher(SandboxLauncher):
             file_copy=True,
             streaming_exec=False,
             foreground_exec=True,
+            git_clone_options=super().capabilities.git_clone_options,
         )
 
     def __init__(self, *, image: str | None = None, env: Sequence[str] | None = None) -> None:

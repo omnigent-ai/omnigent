@@ -2,11 +2,13 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 
-import { controlHost, getHostIdentity, isElectronShell } from "@/lib/nativeBridge";
-import type { HostActionResult, HostIdentity } from "@/lib/nativeBridge";
+import { writeArcaHostId } from "@/lib/arcaHost";
+import { connectArcaHost, controlHost, getHostIdentity, isElectronShell } from "@/lib/nativeBridge";
+import type { ArcaConnectResult, HostActionResult, HostIdentity } from "@/lib/nativeBridge";
 import { useSessionReconnect } from "./useSessionReconnect";
 
 vi.mock("@/lib/nativeBridge", () => ({
+  connectArcaHost: vi.fn(),
   controlHost: vi.fn(),
   getHostIdentity: vi.fn(),
   isElectronShell: vi.fn(),
@@ -30,8 +32,13 @@ beforeEach(() => {
   vi.mocked(isElectronShell).mockReturnValue(true);
   vi.mocked(getHostIdentity).mockResolvedValue({ cliInstalled: true, hostId: "this-mac" });
   vi.mocked(controlHost).mockResolvedValue({ ok: true });
+  vi.mocked(connectArcaHost).mockResolvedValue({ ok: true });
+  writeArcaHostId(null);
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  writeArcaHostId(null);
+});
 
 describe("useSessionReconnect", () => {
   it("starts the local host on the first action without opening the dialog", async () => {
@@ -97,6 +104,69 @@ describe("useSessionReconnect", () => {
     expect(result.current.dialogOpen).toBe(true);
     expect(result.current.localReconnect).toBeUndefined();
     expect(controlHost).not.toHaveBeenCalled();
+  });
+
+  it("offers an explicit Arca reconnect without starting it from the offline banner", async () => {
+    writeArcaHostId("arca-host");
+    const { result } = renderHook(() =>
+      useSessionReconnect({ ...localSession, hostId: "arca-host" }),
+    );
+
+    await act(async () => {
+      await result.current.reconnect();
+    });
+
+    expect(result.current.dialogOpen).toBe(true);
+    expect(result.current.arcaReconnect).toBeDefined();
+    expect(connectArcaHost).not.toHaveBeenCalled();
+    expect(getHostIdentity).not.toHaveBeenCalled();
+    expect(controlHost).not.toHaveBeenCalled();
+  });
+
+  it("reconnects the remembered Arca host only after the explicit dialog action", async () => {
+    writeArcaHostId("arca-host");
+    const pending = deferred<ArcaConnectResult>();
+    vi.mocked(connectArcaHost).mockReturnValue(pending.promise);
+    const { result } = renderHook(() =>
+      useSessionReconnect({ ...localSession, hostId: "arca-host" }),
+    );
+    await act(async () => {
+      await result.current.reconnect();
+    });
+
+    act(() => result.current.arcaReconnect?.onReconnect());
+    expect(connectArcaHost).toHaveBeenCalledOnce();
+    expect(result.current.arcaReconnect?.reconnecting).toBe(true);
+
+    await act(async () => {
+      pending.resolve({ ok: true });
+      await pending.promise;
+    });
+    expect(result.current.dialogOpen).toBe(false);
+    expect(result.current.arcaReconnect?.reconnecting).toBe(false);
+    expect(toast.success).toHaveBeenCalledWith("Arca reconnect requested.");
+  });
+
+  it.each([
+    { result: { ok: false, canceled: true }, expectedError: null },
+    { result: { ok: false, shownInConsole: true }, expectedError: null },
+    { result: { ok: false, error: "Arca failed" }, expectedError: "Arca failed" },
+  ])("keeps the reconnect dialog open after an Arca non-success: $result", async (testCase) => {
+    writeArcaHostId("arca-host");
+    vi.mocked(connectArcaHost).mockResolvedValue(testCase.result);
+    const { result } = renderHook(() =>
+      useSessionReconnect({ ...localSession, hostId: "arca-host" }),
+    );
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    act(() => {
+      result.current.arcaReconnect?.onReconnect();
+    });
+    await vi.waitFor(() => expect(result.current.arcaReconnect?.reconnecting).toBe(false));
+
+    expect(result.current.dialogOpen).toBe(true);
+    expect(result.current.arcaReconnect?.error).toBe(testCase.expectedError);
   });
 
   it.each([

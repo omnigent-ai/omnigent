@@ -47,17 +47,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import io
-import json
 import os
 import secrets
 import shutil
 import signal
-import socket
 import subprocess
 import sys
-import tarfile
-import tempfile
 import threading
 import time
 from collections.abc import Iterator
@@ -67,6 +62,9 @@ from pathlib import Path
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests._helpers.live_server import find_free_port
+from tests._helpers.native_session import create_native_session
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -101,12 +99,6 @@ _ERROR_PILL = '[data-testid="error-pill"]'
 # Proxy-blind client: CI forces an egress proxy via HTTP(S)_PROXY env vars
 # that must not intercept loopback requests to the spawned server.
 _client = httpx.Client(trust_env=False)
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 #: Ambient variables that would otherwise leak into the rig: provider
@@ -191,7 +183,7 @@ class _SnapshotDelayProxy:
 
     def __init__(self, backend_port: int) -> None:
         self._backend_port = backend_port
-        self.port = _free_port()
+        self.port = find_free_port()
         self._pattern: bytes | None = None
         # Let the first ``_stall_after`` matching GETs pass through untouched
         # (the bind/init snapshot reads), and only degrade the match after that
@@ -381,7 +373,7 @@ def cursor_launch_rig(
     for path in (config_home, home_dir, artifacts):
         path.mkdir(parents=True, exist_ok=True)
 
-    port = _free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     proxy = _SnapshotDelayProxy(backend_port=port)
     runner_server_url = f"http://127.0.0.1:{proxy.port}"
@@ -522,48 +514,13 @@ def _create_unbound_cursor_session(base_url: str) -> str:
     :param base_url: Real (non-proxied) server base URL.
     :returns: The new session/conversation id.
     """
-    from omnigent._wrapper_labels import (
-        CURSOR_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
+    created = create_native_session(
+        _client,
+        base_url,
+        harness="cursor",
+        metadata={"workspace": str(_REPO_ROOT), "terminal_launch_args": ["-f"]},
     )
-    from omnigent.harnesses.cursor_native.main import _materialize_cursor_agent_spec
-
-    with tempfile.TemporaryDirectory() as tmp:
-        spec_path = _materialize_cursor_agent_spec(Path(tmp))
-        yaml_text = spec_path.read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        # Non-config.yaml arcname -> omnigent compat translator (the spec has
-        # no spec_version), matching the conftest native session factories.
-        info = tarfile.TarInfo("cursor-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    labels = {
-        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY: CURSOR_NATIVE_WRAPPER_VALUE,
-    }
-    # Cursor keys its chat store on md5(cwd) and needs a concrete launch cwd;
-    # the repo root is a valid dir on the runner. ``-f`` trusts the dir +
-    # auto-approves tools so the unattended pane never blocks on a prompt (only
-    # relevant on the fixed path, where the pane actually launches).
-    metadata = {
-        "labels": labels,
-        "workspace": str(_REPO_ROOT),
-        "terminal_launch_args": ["-f"],
-    }
-    create = _client.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps(metadata)},
-        files={"bundle": ("cursor-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    return str(create.json()["session_id"])
+    return str(created["session_id"])
 
 
 def _real_runner_log(work: Path) -> str:

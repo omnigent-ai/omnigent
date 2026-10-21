@@ -481,14 +481,14 @@ def test_detection_priority_order(clean_env, monkeypatch: pytest.MonkeyPatch) ->
 
 # ── Codex config.toml custom provider (cli-config) detection ───────────────
 
-# The exact shape `isaac configure codex` writes (AI Gateway mode): a custom
+# The exact shape `isaac configure codex` writes (Unity Gateway mode): a custom
 # [model_providers.Databricks] table authenticated by a token-printing
 # command, selected via a top-level model_provider — and NO auth.json.
 _ISAAC_STYLE_CODEX_CONFIG = """
 model_provider = "Databricks"
 
 [model_providers.Databricks]
-name = "Databricks AI Gateway"
+name = "Databricks Unity Gateway"
 base_url = "https://example.ai-gateway.cloud.databricks.com/codex/v1"
 wire_api = "responses"
 
@@ -511,7 +511,7 @@ _ISAAC_STYLE_DETECTION = DetectedProvider(
     family="openai",
     source="~/.codex/config.toml provider 'Databricks'",
     model_provider="Databricks",
-    display_name="Databricks AI Gateway",
+    display_name="Databricks Unity Gateway",
 )
 
 
@@ -955,7 +955,7 @@ def test_claude_managed_gateway_synthesizes_a_subscription_entry(clean_env, monk
 @pytest.mark.parametrize(
     "payload,expected",
     [
-        (_ISAAC_CLAUDE_SETTINGS, "Databricks AI Gateway"),
+        (_ISAAC_CLAUDE_SETTINGS, "Databricks Unity Gateway"),
         (
             {
                 "env": {"ANTHROPIC_BASE_URL": "https://llm.corp.example.com/v1"},
@@ -974,6 +974,23 @@ def test_claude_managed_gateway_display_name(
     """The display label reflects the backing; None when no credential is delivered."""
     _write_managed_settings(clean_env, monkeypatch, payload)
     assert ambient.claude_managed_gateway_display_name() == expected
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (_ISAAC_CLAUDE_SETTINGS, "https://dbc-test.cloud.databricks.com/ai-gateway/anthropic"),
+        ({"env": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}, "apiKeyHelper": "t"}, None),
+        ({"env": {"ANTHROPIC_BASE_URL": "https://gw.example/anthropic"}}, None),
+        ({"apiKeyHelper": "print-token"}, None),
+    ],
+)
+def test_claude_managed_gateway_routes(
+    clean_env, monkeypatch, payload: object, expected: str | None
+) -> None:
+    """Only a credentialed, non-Anthropic managed gateway owns Claude routing."""
+    _write_managed_settings(clean_env, monkeypatch, payload)
+    assert ambient.claude_managed_gateway_routes() == expected
 
 
 def test_claude_managed_gateway_missing_file_is_graceful(clean_env, monkeypatch) -> None:

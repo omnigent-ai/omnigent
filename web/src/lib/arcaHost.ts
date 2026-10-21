@@ -1,18 +1,23 @@
-/**
- * Remembering which host is the user's Arca instance (Databricks-internal).
- *
- * The only reliable signal is the host id captured when "Run on Arca"
- * connected it: a host row's `name` is the machine's hostname, which has no
- * dependable relationship to the arca instance name, so no heuristic
- * matching is attempted.
- */
+/** Isaac seeds "<user>'s arca"; accept that suffix or the id saved by Run on Arca. */
 
-const STORAGE_KEY = "omnigent:arca-host-id";
+import type { Host } from "@/hooks/useHosts";
+
+export const ARCA_HOST_ID_STORAGE_KEY = "omnigent:arca-host-id";
+
+export function isArcaHost(
+  host: Pick<Host, "host_id" | "name">,
+  storedArcaHostId: string | null,
+): boolean {
+  return (
+    host.name.endsWith("'s arca") ||
+    (storedArcaHostId !== null && host.host_id === storedArcaHostId)
+  );
+}
 
 /** The host id last connected via Run on Arca, or null. */
 export function readArcaHostId(): string | null {
   try {
-    return localStorage.getItem(STORAGE_KEY);
+    return localStorage.getItem(ARCA_HOST_ID_STORAGE_KEY);
   } catch {
     return null;
   }
@@ -21,8 +26,8 @@ export function readArcaHostId(): string | null {
 /** Remember (or with null, forget) the Arca host id. */
 export function writeArcaHostId(hostId: string | null): void {
   try {
-    if (hostId === null) localStorage.removeItem(STORAGE_KEY);
-    else localStorage.setItem(STORAGE_KEY, hostId);
+    if (hostId === null) localStorage.removeItem(ARCA_HOST_ID_STORAGE_KEY);
+    else localStorage.setItem(ARCA_HOST_ID_STORAGE_KEY, hostId);
   } catch {
     // Storage unavailable (private mode) — the Arca option simply stays
     // offered; reconnecting an already-connected host is harmless.

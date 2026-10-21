@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -269,7 +270,10 @@ class SessionStatusPoller:
     unchanged file costs one ``stat``, and edge-deduping so a status
     callback fires only on ``running`` ⇄ ``idle`` transitions.
 
-    Lifecycle, all on the single watcher thread (no lock needed):
+    File reads and dedup baselines live on the watcher thread. Other threads
+    may request a resync; a lock protects only that pending request.
+
+    Lifecycle:
 
     - **Resolving:** each :meth:`tick` retries :func:`resolve_status_file`
       until it locks on or :data:`_MAX_RESOLVE_ATTEMPTS` is exhausted.
@@ -322,6 +326,8 @@ class SessionStatusPoller:
         self._last_mtime: float | None = None
         self._last_edge: tuple[str, str | None] | None = None
         self._last_status: SessionStatus | None = None
+        self._resync_lock = threading.Lock()
+        self._resync_requested = False
 
     @property
     def active(self) -> bool:
@@ -340,6 +346,12 @@ class SessionStatusPoller:
         Safe to call every poll; a no-op once resolution is exhausted, and
         an unchanged active file costs a single ``stat``.
         """
+        with self._resync_lock:
+            requested = self._resync_requested
+            self._resync_requested = False
+        if requested:
+            self._last_mtime = None
+            self._last_edge = None
         if self._exhausted:
             return
         if self._path is None:
@@ -396,26 +408,22 @@ class SessionStatusPoller:
         self._exhausted = True
 
     def resync(self) -> None:
-        """Forget what was published so the next tick re-asserts the file.
+        """Request that the watcher re-assert the file on its next tick.
 
-        The file is written only when its value *changes*, so a poller that
-        already published ``running`` has nothing more to say until Claude's
-        status moves. That is a problem when the *listener* restarts: a server
-        recycle wipes its status cache, and the session would sit on a stale
-        ``idle`` for the rest of the turn because every source believes it
-        already reported. Dropping the edge/mtime baselines makes the next tick
-        publish the file's current value verbatim.
+        The file changes only when Claude's status changes. A server recycle
+        or forwarded idle edge must re-arm the watcher so it reports the current
+        value again. A request during an in-flight read stays pending for the
+        following tick instead of being overwritten by that read.
 
-        Keeps the resolved path and the attempt count — this re-asserts a
-        working poller, it does not restart resolution.
+        Keeps the resolved path and attempt count; resolution is not restarted.
         """
         _logger.info(
             "claude status file resync: path=%s",
             self._path,
             extra={"session_id": self._omnigent_session_id},
         )
-        self._last_mtime = None
-        self._last_edge = None
+        with self._resync_lock:
+            self._resync_requested = True
 
     @property
     def blocked_on(self) -> str | None:

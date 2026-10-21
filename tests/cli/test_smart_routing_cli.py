@@ -688,7 +688,7 @@ def test_an_unavailable_preflight_blocks_the_launch(
 # ── credential-provider gating, end to end ───────────────────────────────
 #
 # The shape a Databricks user actually has: Claude Code pointed at the workspace
-# AI Gateway, Codex signed in to a personal ChatGPT subscription. Routing is
+# Unity Gateway, Codex signed in to a personal ChatGPT subscription. Routing is
 # applied by rewriting the launch model to a gateway catalog id, so only the
 # Claude pane can honour it — a routed launch into Codex must fail fast.
 
@@ -714,7 +714,7 @@ def test_claude_route_survives_codex_being_on_a_subscription() -> None:
     ("args", "gateway"),
     [
         (["codex", "--smart-routing"], _CODEX_ON_SUBSCRIPTION),
-        # No AI Gateway anywhere: every entry point errors, Claude included.
+        # No Unity Gateway anywhere: every entry point errors, Claude included.
         (["claude", "--smart-routing"], _NO_GATEWAY_AT_ALL),
         (["codex", "--smart-routing"], _NO_GATEWAY_AT_ALL),
     ],

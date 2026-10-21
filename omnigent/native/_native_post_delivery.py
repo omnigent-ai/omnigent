@@ -32,6 +32,7 @@ from omnigent.native._native_forwarder_health import (
 from omnigent.native._native_forwarder_health import (
     record_post_failure as record_native_post_failure,
 )
+from omnigent.native.failure_telemetry import normalize_failure_context
 
 _logger = logging.getLogger(__name__)
 
@@ -177,6 +178,8 @@ async def post_external_session_status(
     background_tasks: list[dict[str, object]] | None = None,
     response_id: str | None = None,
     failure_detail: str | None = None,
+    failure_context: object = None,
+    turn_completed: bool | None = None,
 ) -> None:
     """Post one ``external_session_status`` event to the Sessions API.
 
@@ -209,6 +212,13 @@ async def post_external_session_status(
         edge, e.g. ``"API Error: 500 Internal server error"``. Unlike
         ``output`` it keeps the harness-neutral failure code, and servers
         that predate it ignore it. Ignored when falsy.
+    :param turn_completed: Whether this ``"idle"`` edge reports a turn the
+        harness knows finished (e.g. Claude's ``Stop`` hook, which never fires
+        on an interrupt). ``True`` lets the runner deliver a sub-agent
+        ``completed`` as fact; ``None`` (the default) marks a quiescence-derived
+        edge that cannot distinguish "finished" from "stopped early".
+    :param failure_context: Optional bounded native error evidence, independent
+        of display text. Older servers ignore this additive field.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
     data: dict[str, object] = {"status": status}
@@ -216,12 +226,16 @@ async def post_external_session_status(
         data["output"] = output
     if failure_detail:
         data["failure_detail"] = failure_detail
+    if status == "failed" and (context := normalize_failure_context(failure_context)):
+        data["failure_context"] = context
     if background_task_count is not None:
         data["background_task_count"] = background_task_count
     if background_tasks is not None:
         data["background_tasks"] = background_tasks
     if response_id is not None:
         data["response_id"] = response_id
+    if turn_completed is not None:
+        data["turn_completed"] = turn_completed
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={"type": "external_session_status", "data": data},

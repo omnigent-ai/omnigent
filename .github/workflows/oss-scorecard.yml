@@ -46,13 +46,13 @@ jobs:
 
       - name: Checkout
         if: steps.gate.outputs.ready == 'true'
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
       - name: Run analysis
         if: steps.gate.outputs.ready == 'true'
-        uses: ossf/scorecard-action@4eaacf0543bb3f2c246792bd56e8cdeffafb205a  # v2.4.3
+        uses: ossf/scorecard-action@fa7117db83c52d787ae5a89f350999701505d78e  # v2.5.0
         with:
           results_file: results.sarif
           results_format: sarif

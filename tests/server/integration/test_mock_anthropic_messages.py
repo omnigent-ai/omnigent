@@ -78,7 +78,13 @@ async def test_nonstream_tool_use_has_decoded_input() -> None:
         configured.raise_for_status()
         response = await client.post(
             "/v1/messages",
-            json={"model": "synthetic-model", "messages": [], "max_tokens": 8, "stream": False},
+            json={
+                "model": "synthetic-model",
+                "messages": [],
+                "max_tokens": 8,
+                "stream": False,
+                "tools": [{"name": "inspect", "input_schema": {"type": "object"}}],
+            },
         )
         response.raise_for_status()
         message = response.json()

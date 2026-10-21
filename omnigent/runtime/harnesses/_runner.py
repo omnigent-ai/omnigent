@@ -44,6 +44,7 @@ package shape and §Process management.
 from __future__ import annotations
 
 import argparse
+import gc
 import importlib
 import os
 import signal
@@ -73,6 +74,11 @@ _UVICORN_LOG_LEVEL = "warning"
 # stuck streaming response blocks the process forever — the root
 # cause of SIGTERM-resistant orphaned runners.
 _GRACEFUL_SHUTDOWN_TIMEOUT_S = float(os.environ.get("OMNIGENT_HARNESS_SHUTDOWN_TIMEOUT_S", "5"))
+
+# Idle keep-alive lifetime for the runner's connection. It must outlast the
+# runner client's 5 s idle expiry, or a request sent right at 5 s reuses a
+# connection the harness is closing ("Server disconnected without sending a response").
+_KEEP_ALIVE_TIMEOUT_S = 75
 
 # Interval between parent-PID liveness probes in the watchdog
 # thread. 1 s is responsive enough (parent crash → runner exit
@@ -380,6 +386,7 @@ def _create_uvicorn_config(
             log_level=_UVICORN_LOG_LEVEL,
             log_config=None,
             timeout_graceful_shutdown=graceful_timeout,
+            timeout_keep_alive=_KEEP_ALIVE_TIMEOUT_S,
         )
     if bind:
         host, _, port = bind.rpartition(":")
@@ -390,6 +397,7 @@ def _create_uvicorn_config(
             log_level=_UVICORN_LOG_LEVEL,
             log_config=None,
             timeout_graceful_shutdown=graceful_timeout,
+            timeout_keep_alive=_KEEP_ALIVE_TIMEOUT_S,
         )
     sys.exit("runner: exactly one of --socket or --bind is required")
 
@@ -463,6 +471,13 @@ def main(argv: list[str] | None = None) -> None:
             _set_pdeathsig()
         _start_parent_watchdog(args.parent_pid)
     config = _create_uvicorn_config(app, args.socket, args.bind)
+    # Move the now-static import graph out of GC's tracked set, so a full
+    # collection mid-session no longer walks it (a ~50 ms pause on a warm turn).
+    # The executor's lazily imported SDK is frozen after the first turn.
+    gc.freeze()
+    from omnigent.runtime.harnesses._scaffold import arm_gc_freeze_after_first_turn
+
+    arm_gc_freeze_after_first_turn()
     _HardExitServer(config).run()
 
 

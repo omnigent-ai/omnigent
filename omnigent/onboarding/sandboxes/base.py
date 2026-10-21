@@ -28,6 +28,7 @@ import shlex
 from abc import ABC, abstractmethod
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, ClassVar
 
 import click
@@ -510,6 +511,11 @@ class SandboxLifecycle(ABC):
             file_copy=self._is_capability_overridden("put"),
             streaming_exec=self._is_capability_overridden("stream_exec"),
             foreground_exec=self._is_capability_overridden("exec_foreground"),
+            git_clone_options=(
+                getattr(type(self), "start_host", None) is ExecModelHostLauncher.start_host
+                and getattr(type(self), "materialize_workspace", None)
+                is ExecModelHostLauncher.materialize_workspace
+            ),
         )
 
     def _is_capability_overridden(self, name: str) -> bool:
@@ -939,7 +945,10 @@ class SandboxHostLauncher(SandboxLifecycle):
 
         :param sandbox_id: The sandbox from :meth:`provision`.
         :param token: The raw launch token the host authenticates with.
-        :param host_id: Server-chosen host identity, e.g. ``"host_a1b2c3d4..."``.
+        :param host_id: Host identity, e.g. ``"host_a1b2c3d4..."``, minted by the
+            server or chosen by a managed create's ``host_id``. The host must
+            register under exactly this id: *token* resolves only for it, and the
+            session's caller may already route by it.
         :param host_name: Server-chosen host display name, e.g.
             ``"managed-a1b2c3d4"``.
         :param server_url: URL of this server the host dials back to.
@@ -1000,6 +1009,12 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
 
         :returns: The absolute in-sandbox workspace path.
         """
+        if any(repo.git_clone != _sandbox_types.GitCloneOptions() for repo in repos):
+            if not self.capabilities.git_clone_options:
+                raise click.ClickException(
+                    f"sandbox provider '{self.provider}' does not support "
+                    "sandbox.git_clone options"
+                )
         home = self.run(sandbox_id, 'printf %s "$HOME"').stdout.strip()
         if not home:
             raise click.ClickException(
@@ -1013,16 +1028,21 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
                 on_stage("cloning")
             # Distinct URLs can derive the same repo_name (e.g. two orgs' "api");
             # disambiguate so they don't clone into one colliding directory.
-            clone_dirs = [
-                self.materialize_workspace(
-                    sandbox_id,
-                    workspace=workspace,
-                    repo_url=repo.url,
-                    repo_branch=repo.branch,
-                    repo_name=dirname,
+            clone_dirs = []
+            for repo, dirname in zip(repos, _sandbox_types.clone_dir_names(repos), strict=True):
+                materialize = self.materialize_workspace
+                # Preserve the old override signature when no policy was configured.
+                if repo.git_clone != _sandbox_types.GitCloneOptions():
+                    materialize = partial(materialize, git_clone=repo.git_clone)
+                clone_dirs.append(
+                    materialize(
+                        sandbox_id,
+                        workspace=workspace,
+                        repo_url=repo.url,
+                        repo_branch=repo.branch,
+                        repo_name=dirname,
+                    )
                 )
-                for repo, dirname in zip(repos, _sandbox_types.clone_dir_names(repos), strict=True)
-            ]
             # One repo → drop the agent straight into it; several → the
             # workspace root that parents them all.
             workspace = clone_dirs[0] if len(clone_dirs) == 1 else workspace
@@ -1038,10 +1058,17 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
                 (HOST_NAME_ENV_VAR, host_name),
             )
         )
-        self.run_background(
-            sandbox_id,
-            f"{env_prefix} omnigent host --server {shlex.quote(server_url)}",
-        )
+        try:
+            self.run_background(
+                sandbox_id,
+                f"{env_prefix} omnigent host --server {shlex.quote(server_url)}",
+            )
+        except click.ClickException as exc:
+            # Provider errors echo the failed command, and this one carries the token.
+            # Redact in place so subclasses such as SandboxGoneError keep their type.
+            exc.message = exc.message.replace(token, "[redacted]")  # type: ignore[read-only]
+            exc.args = (exc.message,)
+            raise exc from None
         return workspace
 
     def materialize_workspace(
@@ -1053,6 +1080,7 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
         repo_branch: str | None,
         repo_name: str | None,
         on_stage: Callable[[str], None] | None = None,
+        git_clone: _sandbox_types.GitCloneOptions = _sandbox_types.GitCloneOptions(),
     ) -> str:
         """
         Materialize the requested repository into the sandbox and return the
@@ -1064,15 +1092,13 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
         if on_stage is not None:
             on_stage("cloning")
         clone_dir = f"{workspace}/{repo_name}"
-        branch_args = (
-            f"--branch {shlex.quote(repo_branch)} --single-branch "
-            if repo_branch is not None
-            else ""
+        command = shlex.join(
+            ["git", "clone", *git_clone.clone_args(repo_branch), "--", repo_url, clone_dir]
         )
         try:
             self.run(
                 sandbox_id,
-                f"git clone {branch_args}-- {shlex.quote(repo_url)} {shlex.quote(clone_dir)}",
+                command,
             )
         except click.ClickException as exc:
             raise click.ClickException(

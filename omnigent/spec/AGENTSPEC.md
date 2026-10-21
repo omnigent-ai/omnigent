@@ -173,6 +173,43 @@ tools:
     - web_fetch                            # no config needed
 ```
 
+**`web_read` — read one page's content as clean markdown:** Fetches a single
+URL's content through a managed retrieval backend that renders JavaScript (and,
+on the keyed backends, uses managed retrieval for higher reliability) — where a
+plain `web_fetch` would return an empty or error page. Use it to read a specific
+URL you already have; use `web_search` to find URLs first. The backend is chosen
+explicitly via `read_provider` (no default, no env-var fallback).
+
+```yaml
+tools:
+  builtins:
+    - name: web_read
+      read_provider: jina                # keyless (rate-limited); cheap default
+    - name: web_read
+      read_provider: nimble              # browser-rendered; keyed
+      api_key: ${NIMBLE_API_KEY}
+      # optional: driver (auto | vx8 default | vx10 | vx12, + -pro variants | vx6 plain HTTP); output_format (markdown | html)
+    - name: web_read
+      read_provider: firecrawl           # LLM-native markdown, self-hostable; keyed
+      api_key: ${FIRECRAWL_API_KEY}
+      # optional: proxy (basic | enhanced | auto default)
+```
+
+- **`jina`** — Jina Reader. Keyless by default (an `api_key` only lifts the rate
+  limit). Fast and cheap for public pages; lightest-weight of the three.
+- **`nimble`** — Nimble Web API. Browser-rendered for higher reliability on
+  JavaScript-heavy pages. Requires `api_key`. Drivers (from Nimble's documented
+  set): `vx8` (default, renders JS), higher tiers `vx10` / `vx12` and their
+  `-pro` variants, `auto` (Nimble picks and escalates per domain), and the
+  plain-HTTP tiers `vx6` / `media-vx6` / `fast-vx6`.
+- **`firecrawl`** — Firecrawl. LLM-native markdown, self-hostable. Requires
+  `api_key`. Escalating proxy tiers.
+
+`web_read` reads a single page — it is not a crawler — and calls a
+rate-limited or paid backend, so agents should use it deliberately. Only
+public, non-authenticated URLs are supported (http/https); it does not access
+logins or paywalls. See the tool's "Responsible use" note for details.
+
 ---
 
 ## Instructions
@@ -268,15 +305,15 @@ defaults apply: **5 seconds** for the initial HTTP connection handshake and
 `timeout` overrides both values to the same number of seconds.
 
 **Security note — `${VAR}` is NOT expanded for uploaded bundles:**
-``${VAR}`` references in `headers`, `env`, and connection blocks are
-resolved against the spec author's *own* environment at the client /
+``${VAR}`` references in MCP `url`, `headers`, `env`, and connection blocks
+are resolved against the spec author's *own* environment at the client /
 registration boundary (`omnigent.cli._resolve_bundle_env_vars`), never
 at runtime by the server or runner for a tenant-uploaded
 (session-scoped) bundle. Expanding an uploaded spec's ``${VAR}`` against
 the server process env would let any tenant exfiltrate server-side
 secrets by referencing them in a header pointed at an attacker URL
 (W7-3). Only operator-authored template agents
-(`--agent`, built-ins; `Agent.session_id is None`) expand server-side.
+(`--agent`, built-ins; `Agent.operator_authored`) expand server-side.
 
 **Security note — SSRF risk:** The omnigent server makes outbound HTTP
 requests to the configured `url`. There is currently no application-level

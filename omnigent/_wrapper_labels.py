@@ -27,6 +27,9 @@ from __future__ import annotations
 # policy labels.
 WRAPPER_LABEL_KEY = "omnigent.wrapper"
 
+# Identifies parent-owned children reported over ACP.
+ACP_SUBAGENT_ID_LABEL_KEY = "omnigent.acp.subagent_id"
+
 # Label key + value that put the Web UI in terminal-first mode (the inline
 # native-CLI terminal renders as the main view; the Web UI gates on
 # ``labels["omnigent.ui"] == "terminal"``). Stamped at creation for the
@@ -69,6 +72,9 @@ GOOSE_NATIVE_WRAPPER_VALUE = "goose-native-ui"
 # Value the ``omnigent antigravity`` native (agy TUI) wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 ANTIGRAVITY_NATIVE_WRAPPER_VALUE = "antigravity-native-ui"
+
+# Value stamped on mirrored Antigravity child sessions.
+ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE = "antigravity-native-ui-subagent"
 
 # Value the ``omnigent qwen`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.

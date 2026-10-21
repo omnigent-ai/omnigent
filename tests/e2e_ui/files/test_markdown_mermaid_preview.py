@@ -18,6 +18,8 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests.e2e_ui.conftest import open_previewable_files_in_preview
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 _MARKDOWN_FILE_PATH = "mermaid_preview.md"
@@ -60,20 +62,7 @@ def test_mermaid_fence_renders_as_preview_diagram(
 ) -> None:
     """Preview turns Mermaid fences into SVGs and preserves other code fences."""
     base_url, session_id = seeded_mermaid_markdown_session
-    page.add_init_script(
-        """
-        window.localStorage.setItem(
-          "omnigent:file-view-preferences",
-          JSON.stringify({
-            diffActive: false,
-            diffLayout: "unified",
-            previewableViewMode: "preview",
-            hideWhitespace: false,
-            wrapLines: false,
-          }),
-        );
-        """
-    )
+    open_previewable_files_in_preview(page)
     page.goto(f"{base_url}/c/{session_id}?file={_MARKDOWN_FILE_PATH}")
 
     file_viewer = page.locator('[data-testid="file-viewer"]:visible')

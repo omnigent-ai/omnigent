@@ -323,6 +323,30 @@ async def test_resolve_session_skill_returns_runner_side_meta_text(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_resolve_accepts_frontmatter_name_from_older_server(tmp_path: Path) -> None:
+    """An older server sends a bundled skill's frontmatter name, not its directory."""
+    bundle = tmp_path / "bundle"
+    skill_dir = bundle / "skills" / "review"
+    skill_dir.mkdir(parents=True)
+    bundled = [
+        SkillSpec(
+            name="review",
+            description="Review changes.",
+            content="Look hard.",
+            skill_dir=skill_dir,
+            display_name="code-review",
+        ),
+    ]
+    app = _make_app(bundle, bundled, "none")
+
+    async for c in _client(app):
+        resp = await c.post("/v1/sessions/conv_r/skills/resolve", json={"name": "code-review"})
+
+    assert resp.status_code == 200, resp.text
+    assert "<name>review</name>" in resp.json()["meta_text"]
+
+
+@pytest.mark.asyncio
 async def test_resolve_session_skill_unknown_returns_404_with_available(tmp_path: Path) -> None:
     """
     Resolving a skill the session does not expose returns 404 plus the

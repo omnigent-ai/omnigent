@@ -9,6 +9,7 @@ import {
   harnessUnavailableReasonOnHost,
   harnessUnconfiguredOnHost,
   resolveSetupSteps,
+  skillInvocationPrefix,
 } from "./harnessSetup";
 import type { SetupStepWire } from "@/lib/agentLabels";
 import type { Host } from "@/hooks/useHosts";
@@ -420,5 +421,26 @@ describe("resolveSetupSteps", () => {
   it("returns [] with no descriptor or no harness", () => {
     expect(resolveSetupSteps(undefined, "codex", hostWith({ codex: false }))).toEqual([]);
     expect(resolveSetupSteps(CODEX_STEPS, null, hostWith({ codex: false }))).toEqual([]);
+  });
+});
+
+describe("skillInvocationPrefix", () => {
+  it("returns $ for codex-native", () => {
+    expect(skillInvocationPrefix("codex-native")).toBe("$");
+  });
+
+  it("returns / for non-Codex native harnesses", () => {
+    expect(skillInvocationPrefix("claude-native")).toBe("/");
+    expect(skillInvocationPrefix("cursor-native")).toBe("/");
+  });
+
+  it("returns / for SDK and bare harness spellings", () => {
+    expect(skillInvocationPrefix("codex")).toBe("/");
+    expect(skillInvocationPrefix("claude")).toBe("/");
+  });
+
+  it("returns / for null and undefined", () => {
+    expect(skillInvocationPrefix(null)).toBe("/");
+    expect(skillInvocationPrefix(undefined)).toBe("/");
   });
 });

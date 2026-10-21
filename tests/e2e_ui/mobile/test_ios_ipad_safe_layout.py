@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 from playwright.sync_api import Page, expect
 
 _IPAD_VIEWPORT = {"width": 1024, "height": 768}
@@ -69,3 +70,61 @@ def test_ios_ipad_keeps_header_and_composer_in_visible_viewport(
         f"composer bottom is y={composer_bottom:.0f}, behind the simulated "
         f"keyboard starting at y={_KEYBOARD_TOP}"
     )
+
+
+@pytest.mark.parametrize(
+    "viewport",
+    [{"width": 834, "height": 1210}, {"width": 1210, "height": 834}],
+    ids=["portrait", "landscape"],
+)
+def test_ios_ipad_uses_docked_keyboard_geometry(
+    page: Page, seeded_session: tuple[str, str], viewport: dict[str, int]
+) -> None:
+    """Floating keyboard controls leave the shell full-height; docked keys do not."""
+    base_url, session_id = seeded_session
+    page.set_viewport_size(viewport)
+    page.add_init_script(_IOS_SHELL_INIT_SCRIPT)
+    page.add_init_script("""
+        let visibleHeight = innerHeight;
+        let webHeight = innerHeight;
+        const callbacks = new Set();
+        window.omnigentNative.getKeyboardViewport = () => ({
+            width: innerWidth, height: visibleHeight,
+        });
+        window.omnigentNative.onKeyboardViewportChanged = callback => {
+            callbacks.add(callback);
+            return () => callbacks.delete(callback);
+        };
+        Object.defineProperty(visualViewport, 'height', { get: () => webHeight });
+        window.setKeyboardGeometry = (webInset, dockedInset) => {
+            webHeight = innerHeight - webInset;
+            visibleHeight = innerHeight - dockedInset;
+            visualViewport.dispatchEvent(new Event('resize'));
+            callbacks.forEach(callback => callback());
+        };
+    """)
+    page.goto(f"{base_url}/c/{session_id}")
+    shell = page.locator(".app-shell")
+    composer = page.get_by_role("textbox", name="Message the agent")
+    expect(composer).to_be_visible()
+    composer.fill("Keyboard layout regression")
+    before = composer.bounding_box()
+    assert before is not None
+
+    page.evaluate("setKeyboardGeometry(149, 0)")
+    page.evaluate("() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
+    expect(shell).to_have_css("height", f"{viewport['height']}px")
+    after = composer.bounding_box()
+    assert after is not None
+    assert abs(after["y"] - before["y"]) <= 1
+
+    keyboard_top = viewport["height"] - 370
+    page.evaluate("setKeyboardGeometry(370, 370)")
+    expect(shell).to_have_css("height", f"{keyboard_top}px")
+    above_keyboard = composer.bounding_box()
+    assert above_keyboard is not None
+    assert above_keyboard["y"] + above_keyboard["height"] <= keyboard_top
+
+    page.evaluate("setKeyboardGeometry(0, 0)")
+    expect(shell).to_have_css("height", f"{viewport['height']}px")
+    expect(composer).to_have_value("Keyboard layout regression")

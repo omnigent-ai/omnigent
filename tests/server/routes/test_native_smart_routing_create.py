@@ -1142,7 +1142,7 @@ def _routing_request(host: Host | None) -> Any:  # type: ignore[explicit-any]
     [
         ({"claude-native": True, "codex-native": False}, "Codex"),
         ({"claude-native": False, "codex-native": True}, "Claude"),
-        # No AI Gateway anywhere: both arms are named.
+        # No Unity Gateway anywhere: both arms are named.
         ({"claude-native": False, "codex-native": False}, "Claude and Codex"),
     ],
 )
@@ -1787,6 +1787,37 @@ async def test_turn_catalog_and_verdict_follow_the_panes_vocabulary() -> None:
         _routed_turn_model_spelling("conv_vocab", conv, "databricks-gpt-5-5")
         == "databricks-gpt-5-5"
     )
+
+
+async def test_turn_catalog_uses_pi_native_pushed_registry() -> None:
+    """A pi-native pane routes within its own ``provider/id`` registry.
+
+    Pi's ``setModel`` resolves only what its extension pushed as
+    ``external_model_options``; a runner ``databricks-*`` catalog would route
+    the turn onto ids the pane cannot switch to.
+    """
+    from omnigent.harness_plugins import PI_NATIVE_CODING_AGENT
+    from omnigent.server.routes._sessions.orchestration import (
+        _native_turn_catalog,
+        _pushed_model_options_cache,
+    )
+
+    session_id = "conv_pi_vocab"
+    conv = SimpleNamespace(
+        id=session_id, labels={"omnigent.wrapper": PI_NATIVE_CODING_AGENT.wrapper_label}
+    )
+    assert await _native_turn_catalog(session_id, conv) is None
+    _pushed_model_options_cache[session_id] = [
+        {"id": "omnigent/databricks-claude-opus-4-8", "displayName": "Opus"},
+        {"id": "omnigent-openai/system.ai.gpt-5-4-mini", "displayName": "mini"},
+    ]
+    try:
+        assert await _native_turn_catalog(session_id, conv) == [
+            "omnigent/databricks-claude-opus-4-8",
+            "omnigent-openai/system.ai.gpt-5-4-mini",
+        ]
+    finally:
+        _pushed_model_options_cache.pop(session_id, None)
 
 
 async def test_turn_catalog_spells_managed_models_outside_claude_families() -> None:

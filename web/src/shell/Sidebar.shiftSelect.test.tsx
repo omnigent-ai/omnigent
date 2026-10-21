@@ -1,19 +1,17 @@
+import { conversationPage } from "@/test/sidebarMockHelpers";
+import { renderSidebar } from "@/test/sidebarTestHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
-import { SidebarDataProvider } from "@/hooks/useSidebarData";
 // Tests for shift-click range selection in the sidebar's multi-session mode.
 // Covers the pure range computation helper and the integrated click behavior.
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
-import { TooltipProvider } from "@/components/ui/tooltip";
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as IdentityModule from "@/lib/identity";
 
 // ── Pure unit tests ─────────────────────────────────────────────────────────
-import { computeShiftSelectRange, Sidebar } from "./Sidebar";
+import { computeShiftSelectRange } from "./Sidebar";
 
 describe("computeShiftSelectRange", () => {
   const ids = ["a", "b", "c", "d", "e"];
@@ -58,62 +56,42 @@ const { projectsMock, conversationsRef, projectSessionsMock, bulkArchiveMock } =
   bulkArchiveMock: { mutate: vi.fn() },
 }));
 
-vi.mock("@/hooks/useConversations", () => ({
-  useConversations: vi.fn(),
-  useLeaveSession: () => ({ mutate: vi.fn(), isPending: false }),
-  useArchiveConversation: () => ({ mutate: vi.fn() }),
-  useBulkArchiveConversations: () => ({
-    mutate: bulkArchiveMock.mutate,
-    isPending: false,
-    isError: false,
-  }),
-  useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkMoveToProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useConnectedConversations: () => [],
-  useStopAndDeleteConversation: () => ({ mutate: vi.fn() }),
-  usePinnedConversations: () => ({
-    data: { conversations: [], filterHonored: true },
-    isSuccess: true,
-  }),
-  useTogglePinnedConversation: () => ({ mutate: vi.fn() }),
-  setConversationPinned: vi.fn(() => Promise.resolve({})),
-  PINNED_CONVERSATIONS_KEY: ["pinned-conversations"],
-  useRenameConversation: () => ({ mutate: vi.fn() }),
-  useStopSession: () => ({ mutate: vi.fn() }),
-  useProjects: () => ({ data: projectsMock.map((name: string) => ({ id: `p_${name}`, name })) }),
-  useProjectSessions: (project: string, enabled: boolean) => {
-    const override = projectSessionsMock.current[project];
-    const rows = !enabled
-      ? []
-      : (override ??
-        conversationsRef.current.filter(
-          (c) => (c.labels?.omni_project ?? null) === project && c.archived !== true,
-        ));
-    return {
-      data: enabled
-        ? {
-            pages: [{ data: rows, first_id: null, last_id: null, has_more: false }],
-            pageParams: [undefined],
-          }
-        : undefined,
-      isLoading: false,
+vi.mock("@/hooks/useConversations", async () => {
+  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  return {
+    ...conversationHooksMock(),
+    useBulkArchiveConversations: () => ({
+      mutate: bulkArchiveMock.mutate,
+      isPending: false,
       isError: false,
-      error: null,
-      fetchNextPage: vi.fn(),
-      hasNextPage: false,
-      isFetchingNextPage: false,
-    };
-  },
-  useMoveToProject: () => ({ mutate: vi.fn() }),
-  useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  useProjectConfig: () => ({ data: undefined, isLoading: false }),
-  useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
-  fetchProjectSessionIds: vi.fn(() => Promise.resolve([] as string[])),
-  PROJECT_LABEL_KEY: "omni_project",
-}));
+    }),
+    useProjects: () => ({ data: projectsMock.map((name: string) => ({ id: `p_${name}`, name })) }),
+    useProjectSessions: (project: string, enabled: boolean) => {
+      const override = projectSessionsMock.current[project];
+      const rows = !enabled
+        ? []
+        : (override ??
+          conversationsRef.current.filter(
+            (c) => (c.labels?.omni_project ?? null) === project && c.archived !== true,
+          ));
+      return {
+        data: enabled
+          ? {
+              pages: [{ data: rows, first_id: null, last_id: null, has_more: false }],
+              pageParams: [undefined],
+            }
+          : undefined,
+        isLoading: false,
+        isError: false,
+        error: null,
+        fetchNextPage: vi.fn(),
+        hasNextPage: false,
+        isFetchingNextPage: false,
+      };
+    },
+    fetchProjectSessionIds: vi.fn(() => Promise.resolve([] as string[])),
+  };
+});
 
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
@@ -145,43 +123,7 @@ function conv(id: string, partial: Partial<Conversation> = {}): Conversation {
 
 function mockConversations(convs: Conversation[]) {
   conversationsRef.current = convs;
-  useConvMock.mockImplementation(
-    () =>
-      ({
-        data: {
-          pages: [
-            {
-              data: convs,
-              first_id: convs[0]?.id ?? null,
-              last_id: convs.at(-1)?.id ?? null,
-              has_more: false,
-            },
-          ],
-          pageParams: [undefined],
-        },
-        isLoading: false,
-        isError: false,
-        error: null,
-        fetchNextPage: vi.fn(),
-        hasNextPage: false,
-        isFetchingNextPage: false,
-      }) as unknown as ReturnType<typeof useConversations>,
-  );
-}
-
-function renderSidebar() {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={qc}>
-      <SidebarDataProvider>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/"]}>
-            <Sidebar open onClose={vi.fn()} />
-          </MemoryRouter>
-        </TooltipProvider>
-      </SidebarDataProvider>
-    </QueryClientProvider>,
-  );
+  useConvMock.mockImplementation(() => conversationPage(convs));
 }
 
 beforeEach(() => {

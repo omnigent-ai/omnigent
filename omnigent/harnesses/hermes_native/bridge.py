@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import TypeAlias
 
 from omnigent._platform import stable_user_id
+from omnigent.native.input_ready import PaneSettledProbe
 
 _logger = logging.getLogger(__name__)
 
@@ -930,3 +931,8 @@ def send_hermes_pane_keys(bridge_dir: Path, *keys: str) -> None:
     if info is None:
         raise RuntimeError("hermes-native tmux target not advertised")
     _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], *keys)
+
+
+#: Provider ``input_ready_probe``: Hermes renders no idle marker, so apply the
+#: same pane-settled gate as :func:`_settle_pane` to the watcher's captures.
+native_input_ready = PaneSettledProbe(_SETTLE_STABLE_POLLS)

@@ -41,36 +41,21 @@ Run::
 
 from __future__ import annotations
 
-import json
 import os
-import secrets
 import shutil
-import signal
-import socket
-import subprocess
-import sys
 import time
 from pathlib import Path
 
 import httpx
 import pytest
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+from tests._helpers.native_session import create_native_session
+from tests._helpers.server_runner import server_runner
 
 # CI shells can carry an egress proxy in the environment; every HTTP call in
 # this test targets 127.0.0.1, so bypass proxy autodetection entirely.
 _http = httpx.Client(trust_env=False)
 
-# The runner imports ``omnigent_client`` / ``omnigent_ui_sdk``; in a worktree
-# they resolve from sdks/, in an installed venv from site-packages.
-_PYTHONPATH = os.pathsep.join(
-    [
-        str(_REPO_ROOT),
-        str(_REPO_ROOT / "sdks" / "python-client"),
-        str(_REPO_ROOT / "sdks" / "ui"),
-        os.environ.get("PYTHONPATH", ""),
-    ]
-)
 
 # Bootstrap for the spawned server: monkeypatch the conversation store so
 # item pages ABOVE the deployed failure threshold raise — the REAL route and
@@ -103,7 +88,6 @@ main()
 # run's hook capture persisted as ``external_session_id``).
 _EXTERNAL_SID = "11111111-2222-4333-8444-555566667777"
 
-_HEALTH_TIMEOUT_S = 120.0
 _POLL_S = 1.0
 # Terminal auto-create includes bridge prep + tmux boot; generous for CI.
 _ARGV_TIMEOUT_S = 180.0
@@ -112,112 +96,6 @@ pytestmark = pytest.mark.skipif(
     shutil.which("tmux") is None,
     reason="claude-native terminals run inside tmux; tmux not installed",
 )
-
-
-def _find_free_port() -> int:
-    """Grab an ephemeral port for the spawned server."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _localhost_env(extra: dict[str, str]) -> dict[str, str]:
-    """Subprocess env with worktree imports and no proxy in the way.
-
-    :param extra: Overrides/additions applied after the base env.
-    :returns: Environment mapping for ``subprocess.Popen``.
-    """
-    env = {
-        **os.environ,
-        "PYTHONPATH": _PYTHONPATH,
-        # CI shells often carry an egress proxy; localhost must bypass it.
-        "NO_PROXY": "127.0.0.1,localhost",
-        "no_proxy": "127.0.0.1,localhost",
-    }
-    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
-        env.pop(name, None)
-    env.update(extra)
-    return env
-
-
-def _terminate(proc: subprocess.Popen[bytes] | None) -> None:
-    """Best-effort SIGTERM -> SIGKILL teardown for a spawned process."""
-    if proc is None or proc.poll() is not None:
-        return
-    proc.send_signal(signal.SIGTERM)
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
-
-
-def _wait_http_ok(url: str, deadline: float) -> None:
-    """Poll *url* until it returns 200 or *deadline* (monotonic) passes."""
-    last = "not polled"
-    while time.monotonic() < deadline:
-        try:
-            if _http.get(url, timeout=2.0).status_code == 200:
-                return
-            last = "non-200"
-        except httpx.HTTPError as exc:
-            last = f"{type(exc).__name__}: {exc}"
-        time.sleep(_POLL_S)
-    raise AssertionError(f"{url} never became healthy: {last}")
-
-
-def _create_claude_native_session(base_url: str) -> str:
-    """Create a claude-native wrapper session exactly like ``omnigent claude``.
-
-    Reuses the production spec materializer and stamps the same wrapper /
-    terminal-first labels the CLI writes, so the runner's claude-native
-    auto-bootstrap recognizes the session.
-
-    :param base_url: Spawned server base URL.
-    :returns: The new session/conversation id.
-    """
-    import io
-    import tarfile
-    import tempfile
-
-    from omnigent._wrapper_labels import (
-        CLAUDE_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
-    )
-    from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
-
-    with tempfile.TemporaryDirectory() as tmp:
-        yaml_text = _materialize_claude_agent_spec(Path(tmp)).read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        # Non-config.yaml arcname routes through the omnigent compat
-        # translator (the wrapper spec has no ``spec_version``).
-        info = tarfile.TarInfo("claude-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    labels = {
-        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY: CLAUDE_NATIVE_WRAPPER_VALUE,
-    }
-    create = _http.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({"labels": labels})},
-        files={
-            "bundle": (
-                "claude-native-ui.tar.gz",
-                buf.getvalue(),
-                "application/gzip",
-            )
-        },
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    return str(create.json()["session_id"])
 
 
 def _seed_large_history(database_uri: str, session_id: str) -> None:
@@ -280,15 +158,6 @@ def test_cold_resume_resumes_history_when_large_item_page_500s(
 
     :param tmp_path: Per-test temp dir (server DB, stub claude, runner HOME).
     """
-    port = _find_free_port()
-    base_url = f"http://127.0.0.1:{port}"
-    db_path = tmp_path / "chat.db"
-    database_uri = f"sqlite:///{db_path}"
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    runner_home = tmp_path / "home"
-    runner_home.mkdir()
-
     # Stub Claude CLI: records its argv (the launch decision under test) and
     # parks so the tmux pane stays alive. No Claude login needed. The runner
     # also runs headless ``claude -p "/model"`` catalog probes against the
@@ -319,77 +188,18 @@ def test_cold_resume_resumes_history_when_large_item_page_500s(
                 return argv
         return None
 
-    binding_token = secrets.token_urlsafe(32)
-    from omnigent.runner.identity import token_bound_runner_id
-
-    runner_id = token_bound_runner_id(binding_token)
-
-    server_log = (tmp_path / "server.log").open("w")
-    runner_log = (tmp_path / "runner.log").open("w")
-    server_proc: subprocess.Popen[bytes] | None = None
-    runner_proc: subprocess.Popen[bytes] | None = None
-    try:
-        server_proc = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                _SERVER_BOOTSTRAP,
-                "server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--database-uri",
-                database_uri,
-                "--artifact-location",
-                str(tmp_path / "artifacts"),
-            ],
-            env=_localhost_env({"OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token}),
-            stdout=server_log,
-            stderr=subprocess.STDOUT,
-        )
-        _wait_http_ok(f"{base_url}/health", time.monotonic() + _HEALTH_TIMEOUT_S)
-
-        runner_proc = subprocess.Popen(
-            [sys.executable, "-m", "omnigent.runner._entry"],
-            env=_localhost_env(
-                {
-                    "OMNIGENT_RUNNER_ID": runner_id,
-                    "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
-                    "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-                    "RUNNER_SERVER_URL": base_url,
-                    "OMNIGENT_RUNNER_WORKSPACE": str(workspace),
-                    # Hermetic HOME: the resume transcript synthesizes under
-                    # ``$HOME/.claude/projects`` and provider config resolves
-                    # from ``$HOME/.omnigent`` — keep both off the real HOME.
-                    "HOME": str(runner_home),
-                    # The stub shadows any real claude on PATH.
-                    "PATH": f"{stub_bin}{os.pathsep}{os.environ.get('PATH', '')}",
-                }
-            ),
-            stdout=runner_log,
-            stderr=subprocess.STDOUT,
-        )
-        deadline = time.monotonic() + _HEALTH_TIMEOUT_S
-        online = False
-        while time.monotonic() < deadline:
-            try:
-                status = _http.get(f"{base_url}/v1/runners/{runner_id}/status", timeout=2.0)
-                if status.status_code == 200 and status.json().get("online") is True:
-                    online = True
-                    break
-            except httpx.HTTPError:
-                # The server/runner is still booting; transient connection
-                # errors are expected while polling and simply retried.
-                pass
-            time.sleep(_POLL_S)
-        assert online, (
-            f"runner never came online; log:\n{(tmp_path / 'runner.log').read_text()[-3000:]}"
+    with server_runner(tmp_path, server_bootstrap=_SERVER_BOOTSTRAP) as stack:
+        base_url, runner_id = stack.base_url, stack.runner_id
+        database_uri = stack.database_uri
+        stack.start_runner(
+            env={
+                "PATH": f"{stub_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+            }
         )
 
         # A prior large claude-native conversation with the Claude session
         # id captured — the state a user resumes into.
-        session_id = _create_claude_native_session(base_url)
+        session_id = str(create_native_session(_http, base_url, harness="claude")["session_id"])
         _http.patch(
             f"{base_url}/v1/sessions/{session_id}",
             json={"external_session_id": _EXTERNAL_SID},
@@ -450,8 +260,3 @@ def test_cold_resume_resumes_history_when_large_item_page_500s(
             "the same history serves fine at limit<=400 — the prior "
             f"conversation is lost. launched argv: {argv}"
         )
-    finally:
-        _terminate(runner_proc)
-        _terminate(server_proc)
-        server_log.close()
-        runner_log.close()

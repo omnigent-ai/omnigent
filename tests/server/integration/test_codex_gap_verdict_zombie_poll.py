@@ -33,6 +33,7 @@ import pytest
 
 from omnigent.runtime import pending_elicitations, session_stream
 from omnigent.server.routes import sessions as sessions_route
+from tests.server.helpers import create_session_for_agent as _create_session
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -56,13 +57,6 @@ _CODEX_GATE: dict[str, Any] = {
 # build it parks for the hook's full timeout, so a short budget converts
 # "verdict lost" into a deterministic failure.
 _REPARK_VERDICT_BUDGET_S = 3.0
-
-
-async def _create_session(client: httpx.AsyncClient, agent_id: str) -> str:
-    """Create a minimal session and return its id."""
-    resp = await client.post("/v1/sessions", json={"agent_id": agent_id})
-    assert resp.status_code == 201, f"create failed: {resp.status_code} {resp.text}"
-    return resp.json()["id"]
 
 
 async def _drain_until_elicitation(

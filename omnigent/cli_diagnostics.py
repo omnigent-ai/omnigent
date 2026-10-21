@@ -36,6 +36,8 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import cast
 
+import click
+
 from omnigent.cli_invocation import cli_invocation
 from omnigent.process_logging import (
     RedactingLogFormatter,
@@ -409,6 +411,11 @@ def print_stale_host_hint() -> None:
 SUPPRESS_RECOVERY_HINT_ATTR = "omnigent_suppress_recovery_hint"
 
 
+def printable(text: str) -> str:
+    """Escape control characters so untrusted text can't rewrite the terminal."""
+    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in text)
+
+
 def suppresses_recovery_hint(exc: BaseException) -> bool:
     """
     Report whether the stale-host recovery hint should be withheld for *exc*.
@@ -422,11 +429,12 @@ def suppresses_recovery_hint(exc: BaseException) -> bool:
     pointing at the real fix.
 
     :param exc: The exception about to be surfaced by :func:`omnigent.cli.main`.
-    :returns: ``True`` when the hint should be suppressed — either *exc* is an
-        :class:`ImportError` (missing dependency) or it carries a truthy
-        :data:`SUPPRESS_RECOVERY_HINT_ATTR` marker.
+    :returns: ``True`` when the hint should be suppressed — *exc* is an
+        :class:`ImportError` (missing dependency), a :class:`click.UsageError`
+        (a bad invocation the parser rejected, such as an unknown subcommand),
+        or it carries a truthy :data:`SUPPRESS_RECOVERY_HINT_ATTR` marker.
     """
-    if isinstance(exc, ImportError):
+    if isinstance(exc, ImportError | click.UsageError):
         return True
     return bool(getattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, False))
 

@@ -13,8 +13,66 @@ GC later calls ``BaseSubprocessTransport.__del__`` which does
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import logging
+from collections.abc import Callable
 from typing import Any
+
+from . import _proc
+
+logger = logging.getLogger(__name__)
+
+
+async def terminate_subprocess(
+    proc: Any,  # type: ignore[explicit-any]
+    *,
+    terminate_timeout: float,
+    kill_timeout: float,
+    label: str,
+    terminate_tree: Callable[[Any], None] = _proc.terminate_tree,  # type: ignore[explicit-any]
+    kill_tree: Callable[[Any], None] = _proc.kill_tree,  # type: ignore[explicit-any]
+) -> bool:
+    """Terminate a process tree and wait only within explicit bounds.
+
+    Returns whether the direct child was reaped. A false result means SIGKILL
+    was sent but the child did not become waitable before the final deadline;
+    callers must close its transport and continue cleanup rather than hang.
+    """
+    if getattr(proc, "returncode", None) is None:
+        terminate_tree(proc)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=terminate_timeout)
+        except asyncio.TimeoutError:
+            kill_tree(proc)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=kill_timeout)
+            except asyncio.TimeoutError:
+                logger.error(
+                    "%s pid=%s did not reap within %.2fs after SIGKILL",
+                    label,
+                    getattr(proc, "pid", None),
+                    kill_timeout,
+                )
+                return False
+        else:
+            # The direct child exiting does not prove its process group or
+            # detached descendants are empty.
+            kill_tree(proc)
+    else:
+        # A dead leader does not prove that descendants in its owned process
+        # group exited. Keep the tree broadcast as a best-effort final sweep.
+        kill_tree(proc)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=kill_timeout)
+        except asyncio.TimeoutError:
+            logger.error(
+                "%s pid=%s remained unreaped after leader exit",
+                label,
+                getattr(proc, "pid", None),
+            )
+            return False
+    return True
 
 
 def close_subprocess_transport(proc: Any) -> None:  # type: ignore[explicit-any]
@@ -37,7 +95,56 @@ def close_anyio_subprocess_transport(anyio_proc: Any) -> None:  # type: ignore[e
     close_subprocess_transport(inner)
 
 
+async def terminate_direct_subprocess(
+    proc: Any,  # type: ignore[explicit-any]
+    *,
+    terminate_timeout: float,
+    kill_timeout: float,
+) -> bool:
+    """Terminate only *proc* and reap it without touching its process group.
+
+    This is for disposable client processes such as ``tmux attach``. Their
+    parent tmux server and pane are owned elsewhere and must never receive a
+    group signal.
+
+    :param proc: An asyncio subprocess handle for the disposable client.
+    :param terminate_timeout: Seconds to wait after ``proc.terminate()``.
+    :param kill_timeout: Seconds to wait after ``proc.kill()``.
+    :returns: ``True`` when the direct child was reaped.
+    """
+    reaped = getattr(proc, "returncode", None) is not None
+    try:
+        if not reaped:
+            with contextlib.suppress(Exception):
+                proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=terminate_timeout)
+            except Exception:  # noqa: BLE001 - force-kill is the bounded backstop
+                if getattr(proc, "returncode", None) is None:
+                    with contextlib.suppress(Exception):
+                        proc.kill()
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(proc.wait(), timeout=kill_timeout)
+            reaped = getattr(proc, "returncode", None) is not None
+        return reaped
+    finally:
+        close_subprocess_transport(proc)
+
+
+async def await_cleanup_task(task: asyncio.Task[Any]) -> None:  # type: ignore[explicit-any]
+    """Await cleanup despite repeated caller cancellation, then propagate errors."""
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    task.result()
+
+
 __all__ = [
+    "await_cleanup_task",
     "close_anyio_subprocess_transport",
     "close_subprocess_transport",
+    "terminate_direct_subprocess",
+    "terminate_subprocess",
 ]

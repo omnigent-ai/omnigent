@@ -37,7 +37,7 @@ from tests.e2e_ui.conftest import open_right_rail
 _COMPOSER = "Send a message…"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _SUBAGENT_ROW = '[data-testid="subagent-row"]'
-_SUBAGENT_STATUS_DOT = '[data-testid="subagent-status-dot"]'
+_SUBAGENT_STATUS_AVATAR = '[data-testid="subagent-status-avatar"]'
 
 # One relay = dispatch turn + two sub-agent turns + the auto-wake
 # continuation, several serial real-LLM calls, so the nonce assertions
@@ -96,8 +96,8 @@ def test_two_joke_subagents_appear_and_navigate(
     expect(rows).to_have_count(2, timeout=30_000)
     expect(rail).to_contain_text("comic_one")
     expect(rail).to_contain_text("comic_two")
-    # Each row carries a status dot and its own child session id.
-    expect(rows.first.locator(_SUBAGENT_STATUS_DOT)).to_be_visible()
+    # Each row carries a status avatar and its own child session id.
+    expect(rows.first.locator(_SUBAGENT_STATUS_AVATAR)).to_be_visible()
     # The count badge grew past the lone-agent baseline of 1 (main + 2).
     expect(agents_tab).to_contain_text("3")
 

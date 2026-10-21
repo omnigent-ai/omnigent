@@ -53,6 +53,9 @@ const _PARK_REATTACH_MIN_ELAPSED_MS = _PARK_ATTEMPT_TIMEOUT_MS - 5_000;
 // the rounds and then deny, instead of riding the 24h park ceiling to a
 // fail-open. The brief inter-round sleep means this bounds wall-time too.
 const _MAX_RAW_ASK_ROUNDS = 50;
+
+// Allow the 5s routing call and 6s relay to fail open before the 8s client deadline.
+const _ROUTE_TURN_TIMEOUT_MS = 8_000;
 // Reason surfaced when the tool-call gate cannot obtain a usable verdict and
 // fails CLOSED. PHASE_TOOL_CALL is the sole enforcement point for a native
 // connector tool, so an unevaluable policy must block, not proceed — matching
@@ -81,6 +84,58 @@ function readConfig() {
   try {
     return JSON.parse(fs.readFileSync(configPath, "utf8"));
   } catch (_err) {
+    return null;
+  }
+}
+
+function nativeAuthFailure(message, ctx) {
+  const authDir = process.env.OMNIGENT_PI_NATIVE_AUTH_DIR;
+  const error = message && message.errorMessage;
+  const provider =
+    (message && message.provider) || (ctx && ctx.model && ctx.model.provider);
+  if (!authDir || typeof provider !== "string" || typeof error !== "string")
+    return null;
+  // Match wrap_auth_command's provider key and Pi's resolver error wording.
+  const id = crypto
+    .createHash("sha256")
+    .update(provider)
+    .digest("hex")
+    .slice(0, 16);
+  const file = `auth-${id}.json`;
+  if (
+    !error.includes("Failed to resolve API key for provider") ||
+    !error.includes(file)
+  )
+    return null;
+  try {
+    const resultPath = path.join(authDir, `${file}.result.json`);
+    const result = JSON.parse(fs.readFileSync(resultPath, "utf8"));
+    const age = Date.now() - result.at;
+    if (
+      result.piPid !== process.pid ||
+      !Number.isFinite(age) ||
+      age < 0 ||
+      age > 30_000
+    )
+      return null;
+    const reasons = {
+      timeout: "timed out before Pi's ten-second deadline",
+      failed_exit: "exited unsuccessfully",
+      empty: "returned an empty token",
+      invalid_output: "returned invalid UTF-8",
+      output_limit: "exceeded the output limit",
+      start_failed: "could not start",
+      invalid_command: "has no command configured",
+      cancelled: "was cancelled",
+    };
+    const reason = reasons[result.kind];
+    if (!reason) return null;
+    fs.unlinkSync(resultPath);
+    return {
+      code: `pi_auth_${result.kind}`,
+      message: `Pi authentication helper ${reason}. Check the configured token command, then send another message to retry. Your session is preserved.`,
+    };
+  } catch (_) {
     return null;
   }
 }
@@ -779,7 +834,29 @@ function headers(config) {
   };
 }
 
-async function postEvent(config, body) {
+const _ASSISTANT_ITEM_MAX_ATTEMPTS = 3;
+const _ASSISTANT_ITEM_INITIAL_BACKOFF_MS = 50;
+const _ASSISTANT_ITEM_MAX_BACKOFF_MS = 250;
+const _ASSISTANT_ITEM_POST_TIMEOUT_MS = 5_000;
+
+function boundedSourceId(sourceId) {
+  const value = typeof sourceId === "string" ? sourceId.trim() : "";
+  if (!value) throw new Error("assistant conversation item requires source_id");
+  if (value.length <= 256) return value;
+  return `pi:${crypto.createHash("sha256").update(value).digest("hex")}`;
+}
+
+function eventPostError(response) {
+  const status = response && response.status;
+  if (typeof status === "number" && Number.isFinite(status)) {
+    const error = new Error(`Omnigent event POST failed with HTTP ${status}`);
+    error.status = status;
+    return error;
+  }
+  return new Error("Omnigent event POST returned an invalid response");
+}
+
+async function postEventChecked(config, body, signal) {
   if (
     !config ||
     !config.serverUrl ||
@@ -788,15 +865,91 @@ async function postEvent(config, body) {
   )
     return;
   const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/events`;
+  const request = {
+    method: "POST",
+    headers: headers(config),
+    body: JSON.stringify(body),
+  };
+  if (signal) request.signal = signal;
+  const response = await fetch(url, request);
+  const status = response && response.status;
+  if (
+    !response ||
+    (typeof status === "number" &&
+      (!Number.isFinite(status) || status < 200 || status >= 300)) ||
+    (typeof status !== "number" && response.ok !== true)
+  ) {
+    throw eventPostError(response);
+  }
+  return response;
+}
+
+async function postEvent(config, body) {
   try {
-    await fetch(url, {
-      method: "POST",
-      headers: headers(config),
-      body: JSON.stringify(body),
-    });
+    await postEventChecked(config, body);
   } catch (_err) {
     // Keep Pi responsive even if Omnigent is temporarily unavailable.
   }
+}
+
+function isRetryableAssistantError(error) {
+  const status = error && error.status;
+  if (typeof status !== "number") return true;
+  return status === 408 || status === 429 || (status >= 500 && status <= 599);
+}
+
+function assistantItemPostTimeoutMs(config) {
+  const configured = config && config.assistantItemPostTimeoutMs;
+  return typeof configured === "number" &&
+    Number.isFinite(configured) &&
+    configured > 0
+    ? configured
+    : _ASSISTANT_ITEM_POST_TIMEOUT_MS;
+}
+
+// Final assistant messages and errors survive transient transport failures.
+async function postConversationItem(config, data, sourceId) {
+  const body = {
+    type: "external_conversation_item",
+    data: { ...data, source_id: boundedSourceId(sourceId) },
+  };
+  let backoff = _ASSISTANT_ITEM_INITIAL_BACKOFF_MS;
+  let lastError;
+  for (let attempt = 1; attempt <= _ASSISTANT_ITEM_MAX_ATTEMPTS; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(
+      () => controller.abort(),
+      assistantItemPostTimeoutMs(config),
+    );
+    try {
+      return await postEventChecked(config, body, controller.signal);
+    } catch (err) {
+      lastError = err;
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (
+      attempt === _ASSISTANT_ITEM_MAX_ATTEMPTS ||
+      !isRetryableAssistantError(lastError)
+    )
+      break;
+    await sleep(backoff);
+    backoff = Math.min(backoff * 2, _ASSISTANT_ITEM_MAX_BACKOFF_MS);
+  }
+  throw lastError || new Error("assistant conversation item POST failed");
+}
+
+function assistantMessageSourceId(message, responseId, text) {
+  const response =
+    message && typeof message.responseId === "string" && message.responseId
+      ? `response:${message.responseId}`
+      : "";
+  const timestamp =
+    message && typeof message.timestamp === "number"
+      ? `timestamp:${message.timestamp}`
+      : "";
+  const identity = response || timestamp || `turn:${responseId}:${fingerprint(text)}`;
+  return boundedSourceId(`pi:assistant:${identity}`);
 }
 
 async function patchExternalSessionId(config, nativeSessionId) {
@@ -840,34 +993,7 @@ function interruptActiveContext(ctx) {
   }
 }
 
-/**
- * Trigger Pi's own context compaction on the resident ExtensionContext.
- *
- * Pi owns its context window inside this TUI process, so explicit /compact
- * must run here (the Omnigent server's AP-side compaction would only
- * summarise the transcript mirror and desync the two). ctx.compact() is
- * fire-and-forget (returns void); Pi summarises older messages and appends a
- * CompactionEntry to the session. We bracket it with external_compaction_status
- * events the server republishes as response.compaction.* SSE, so the web UI's
- * "Compacting conversation…" spinner tracks Pi's real progress.
- *
- * The server raises the spinner on the in_progress SSE and dismisses it on
- * completed/failed, so a completed/failed that reaches the server before
- * in_progress strands the spinner. ctx.compact() may invoke its callbacks
- * synchronously, so in_progress is AWAITED before the call: the server then
- * holds the spinner-raising edge before any terminal edge can post.
- *
- * Async and self-contained: the poller discards the returned promise, so every
- * edge is published here, never by the caller. Three outcomes:
- *   - No resident compaction API (ctx missing or ctx.compact not a function):
- *     post a visible error item so a user's /compact does not silently vanish
- *     (the runner already returned 200, so the server runs no fallback), post
- *     no spinner edge, return false.
- *   - ctx.compact() threw synchronously: in_progress was already posted, so the
- *     catch posts failed to dismiss the spinner, return false.
- *   - Submitted: in_progress posted and awaited; completed/failed follows from
- *     Pi's onComplete/onError, return true.
- */
+/** Run Pi compaction through its callback API, publishing ordered progress events. */
 async function triggerCompaction(config, ctx, customInstructions) {
   if (!ctx || typeof ctx.compact !== "function") {
     await postEvent(config, {
@@ -887,29 +1013,24 @@ async function triggerCompaction(config, ctx, customInstructions) {
     });
     return false;
   }
-  const options = {
-    onComplete: () => {
-      postEvent(config, {
-        type: "external_compaction_status",
-        data: { status: "completed" },
-      });
-    },
-    onError: (_error) => {
-      postEvent(config, {
-        type: "external_compaction_status",
-        data: { status: "failed" },
-      });
-    },
-  };
-  if (typeof customInstructions === "string" && customInstructions.trim()) {
-    options.customInstructions = customInstructions;
-  }
   try {
     await postEvent(config, {
       type: "external_compaction_status",
       data: { status: "in_progress" },
     });
-    ctx.compact(options);
+    await new Promise((resolve, reject) => {
+      ctx.compact({
+        onComplete: resolve,
+        onError: reject,
+        ...(typeof customInstructions === "string" && customInstructions.trim()
+          ? { customInstructions }
+          : {}),
+      });
+    });
+    await postEvent(config, {
+      type: "external_compaction_status",
+      data: { status: "completed" },
+    });
     return true;
   } catch (_err) {
     await postEvent(config, {
@@ -1041,6 +1162,28 @@ async function applyModelChange(pi, config, ctx, modelId) {
   }
 }
 
+/**
+ * Route native TUI input before Pi binds its model; composer input is routed upstream.
+ * Errors and timeouts return null, preserving the current model.
+ * @returns {Promise<{action: string, model?: string, terminal?: boolean} | null>}
+ */
+async function routeTurn(config, prompt, model) {
+  if (!config || !config.serverUrl || !config.sessionId || typeof fetch !== "function")
+    return null;
+  const url = `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/hooks/route-turn`;
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: headers(config),
+      body: JSON.stringify({ harness: "pi-native", prompt, model: model || null }),
+      signal: AbortSignal.timeout(_ROUTE_TURN_TIMEOUT_MS),
+    });
+    return resp.ok ? await resp.json() : null;
+  } catch (_err) {
+    return null;
+  }
+}
+
 async function postModelChangeError(config, message) {
   await postEvent(config, {
     type: "external_conversation_item",
@@ -1065,37 +1208,36 @@ function modelReference(model) {
 }
 
 /**
- * Report Pi's live model catalog to Omnigent for the Web UI model picker.
- *
- * Sourced from Pi's model registry — the models Pi actually loaded for THIS
- * session, whatever their origin: an Omnigent-configured provider's generated
- * models.json, or Pi's own ``/login`` / ``~/.pi`` config. Posting the live
- * registry (rather than the server reading a launch-written file) means the
- * picker populates in every auth path, including ``/login`` where no Omnigent
- * models.json exists.
- *
- * Prefers ``getAvailable()`` — only models with configured auth — over
- * ``getAll()`` (Pi's entire built-in catalog spanning every vendor, most with
- * no credentials). This scopes the picker to models the user can actually
- * switch to, and naturally to whichever provider(s) they are logged into.
- * Falls back to ``getAll()`` only when ``getAvailable()`` is unavailable
- * (older Pi). Best-effort and fire-and-forget: an empty or unavailable
- * registry posts nothing, leaving the picker hidden.
+ * Publish Pi's scoped models plus the current model to the web picker.
+ * Without a scope, use authenticated models; older registries fall back to getAll.
+ * An empty or unavailable registry posts nothing.
  */
 async function postModelOptions(config, ctx) {
-  const registry = ctx ? ctx.modelRegistry : undefined;
-  if (!registry) return;
-  let models;
-  try {
-    if (typeof registry.getAvailable === "function") {
-      models = registry.getAvailable();
-    } else if (typeof registry.getAll === "function") {
-      models = registry.getAll();
-    } else {
+  let models = [];
+  const scoped = ctx && Array.isArray(ctx.scopedModels) ? ctx.scopedModels : [];
+  for (const entry of scoped) {
+    if (entry && entry.model) models.push(entry.model);
+  }
+  if (models.length > 0) {
+    const current = ctx ? ctx.model : undefined;
+    const currentId = modelReference(current);
+    if (currentId && !models.some((model) => modelReference(model) === currentId)) {
+      models = [current, ...models];
+    }
+  } else {
+    const registry = ctx ? ctx.modelRegistry : undefined;
+    if (!registry) return;
+    try {
+      if (typeof registry.getAvailable === "function") {
+        models = registry.getAvailable();
+      } else if (typeof registry.getAll === "function") {
+        models = registry.getAll();
+      } else {
+        return;
+      }
+    } catch (_err) {
       return;
     }
-  } catch (_err) {
-    return;
   }
   if (!Array.isArray(models) || models.length === 0) return;
   const options = [];
@@ -1117,6 +1259,21 @@ async function postModelOptions(config, ctx) {
   });
 }
 
+/**
+ * Tell the runner's terminal watcher that Pi now accepts input: the inbox
+ * poller is armed, so queued web messages will be delivered. The runner
+ * clears the marker before each launch and logs ``native_input_ready`` when
+ * it appears. Best-effort — readiness logging must never break the session.
+ */
+function markInputReady(config) {
+  if (!config || !config.bridgeDir) return;
+  try {
+    fs.writeFileSync(path.join(config.bridgeDir, "input_ready"), "");
+  } catch (_err) {
+    // Diagnostics only.
+  }
+}
+
 function startInboxPoller(
   pi,
   config,
@@ -1125,6 +1282,7 @@ function startInboxPoller(
   handleModelChange,
   handleThinkingLevelChange,
   isTurnActive,
+  isCompacting,
 ) {
   if (!config || !config.inboxDir || pi.__omnigentInboxPoller) return;
   // Bound the dedup set (FIFO eviction) — delivered files are unlinked, so a
@@ -1164,6 +1322,14 @@ function startInboxPoller(
         try {
           fs.unlinkSync(fullPath);
         } catch (_err) {}
+        continue;
+      }
+      // Pi's extension API cannot accept prompts during manual compaction.
+      // Leave them on disk, in order, until its completion callback fires.
+      if (
+        (payload.type === "user_message" || payload.type === "compact") &&
+        isCompacting()
+      ) {
         continue;
       }
       if (
@@ -1286,17 +1452,13 @@ function startInboxPoller(
 }
 
 module.exports = function (pi) {
+  process.env.OMNIGENT_PI_NATIVE_PID = String(process.pid);
   const config = readConfig();
   let sequence = 0;
   let turnOrdinal = 0;
   let activeResponseId = null;
   // Response id shared across a turn's ``running`` → ``idle`` status pair.
-  // The web store only clears its local "streaming" flag when an ``idle``
-  // edge's response_id matches the ``running`` edge that opened the turn; a
-  // fresh id per edge would leave the composer stuck in "queued" until a tab
-  // switch resets the store. Minted on agent_start, reused on agent_end.
-  // Must be separate from activeResponseId — turn_start overwrites that with a
-  // turn-level id between agent_start and agent_end.
+  // Kept separate from activeResponseId, which turn_start overwrites.
   let turnStatusResponseId = null;
   // Dedicated loop-state flag, set on agent_start / cleared on agent_end. Used
   // as the no-isIdle() fallback for requestInterrupt instead of
@@ -1305,11 +1467,17 @@ module.exports = function (pi) {
   // agent_start, before turn_start) would look idle by activeResponseId yet the
   // loop is genuinely running — agentRunning arms it correctly. See F18.
   let agentRunning = false;
+  let compacting = false;
   let latestContext = null;
+  // Promise of the last inbox model_change, awaited by ``input``.
+  let pendingModelChange = null;
+  // Set once route-turn gives a final answer for this session (see ``input``).
+  let turnRoutingDone = false;
   let pendingInterruptUntil = 0;
   const postedToolCalls = new Set();
   const postedToolResults = new Set();
   const postedReasoning = new Set();
+  const postedAssistantMessages = new Set();
   const streamedReasoningBlocks = new Set();
   const toolCallsById = new Map();
   const pendingInterruptMs = 30_000;
@@ -1534,18 +1702,8 @@ module.exports = function (pi) {
     if (changed) await publishTaskList();
   }
 
-  // Cumulative session token usage. Pi reports PER-MESSAGE counts (one
-  // assistant message per LLM call); session billing is their SUM — each call
-  // is billed for the full context it re-sent, so summing per-message inputs is
-  // the correct cumulative input. The server applies vendor pricing to these
-  // cumulative totals and republishes a ``session.usage`` event (the SAME
-  // contract claude-native / codex-native / cursor-native use), so the web
-  // Session-cost badge + per-model token breakdown light up with no
-  // server/frontend changes. Dedup by message fingerprint so a re-emitted
-  // ``message_end`` / ``turn_end`` / ``agent_end`` carrying the same assistant
-  // message never double-counts. ``usageModel`` tracks the latest message's
-  // model (mirrors a mid-session model switch). ``lastPostedUsageKey`` dedups
-  // the POST itself so a flush with no new tokens is skipped.
+  // Sum each assistant message once; restored totals cover pre-relaunch messages.
+  // The POST key skips unchanged totals.
   const countedUsageMessages = new Set();
   let cumulativeInputTokens = 0;
   let cumulativeOutputTokens = 0;
@@ -1608,6 +1766,9 @@ module.exports = function (pi) {
     const postKey = `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${usageModel || ""}`;
     if (postKey === lastPostedUsageKey) return;
     lastPostedUsageKey = postKey;
+    // Persist the running total before the POST so a relaunch restores it even
+    // when the flush fails and the server never records this report.
+    persistCumulativeUsage();
     const data = {
       cumulative_input_tokens: cumulativeInputTokens,
       cumulative_output_tokens: cumulativeOutputTokens,
@@ -1615,6 +1776,70 @@ module.exports = function (pi) {
     };
     if (usageModel) data.model = usageModel;
     await postEvent(config, { type: "external_session_usage", data });
+  }
+
+  // Restore cumulative totals before recording new usage after a relaunch.
+  function usageStatePath() {
+    if (!config || !config.bridgeDir) return null;
+    return path.join(config.bridgeDir, "cumulative_usage.json");
+  }
+
+  function persistCumulativeUsage() {
+    const statePath = usageStatePath();
+    if (!statePath) return;
+    // Per-pid temp name: an exiting Pi process and its relaunched successor
+    // can flush concurrently, and a shared temp path could persist a torn file.
+    const tmp = `${statePath}.${process.pid}.tmp`;
+    try {
+      fs.writeFileSync(
+        tmp,
+        JSON.stringify({
+          cumulative_input_tokens: cumulativeInputTokens,
+          cumulative_output_tokens: cumulativeOutputTokens,
+          cumulative_cache_read_input_tokens: cumulativeCacheReadTokens,
+          model: usageModel,
+        }),
+      );
+      fs.renameSync(tmp, statePath);
+    } catch (_err) {
+      // Remove temporary state after a failed best-effort checkpoint.
+      try {
+        fs.unlinkSync(tmp);
+      } catch (_cleanupErr) {}
+    }
+  }
+
+  function raiseUsageTotals(saved) {
+    if (!saved || typeof saved !== "object") return;
+    const input = toInt(saved.cumulative_input_tokens);
+    const output = toInt(saved.cumulative_output_tokens);
+    const cacheRead = toInt(saved.cumulative_cache_read_input_tokens);
+    // Only raise the counters; a stale file must never pull a live total down.
+    if (input > cumulativeInputTokens) cumulativeInputTokens = input;
+    if (output > cumulativeOutputTokens) cumulativeOutputTokens = output;
+    if (cacheRead > cumulativeCacheReadTokens) cumulativeCacheReadTokens = cacheRead;
+    if (!usageModel && typeof saved.model === "string" && saved.model)
+      usageModel = saved.model;
+  }
+
+  function restoreCumulativeUsage() {
+    const baseline = config && config.usageBaseline;
+    raiseUsageTotals(baseline);
+    const statePath = usageStatePath();
+    if (statePath) {
+      try {
+        raiseUsageTotals(JSON.parse(fs.readFileSync(statePath, "utf8")));
+      } catch (_err) {}
+    }
+    // The server already holds this baseline. Only reassert a newer local total.
+    if (
+      baseline &&
+      cumulativeInputTokens === toInt(baseline.cumulative_input_tokens) &&
+      cumulativeOutputTokens === toInt(baseline.cumulative_output_tokens) &&
+      cumulativeCacheReadTokens === toInt(baseline.cumulative_cache_read_input_tokens)
+    ) {
+      lastPostedUsageKey = `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${usageModel || ""}`;
+    }
   }
 
   function rememberContext(ctx) {
@@ -1856,6 +2081,7 @@ module.exports = function (pi) {
 
   pi.on("session_start", async (_event, ctx) => {
     rememberContext(ctx);
+    restoreCumulativeUsage();
     registerTaskToolIfMissing();
     restoreTaskList(ctx);
     if (taskList.length) await publishTaskList();
@@ -1864,9 +2090,30 @@ module.exports = function (pi) {
       pi,
       config,
       () => requestInterrupt(latestContext),
-      (customInstructions) =>
-        triggerCompaction(config, latestContext, customInstructions),
-      (model) => applyModelChange(pi, config, latestContext, model),
+      async (customInstructions) => {
+        const responseId = turnStatusResponseId ?? newResponseId("compact");
+        compacting = true;
+        try {
+          await postEvent(config, {
+            type: "external_session_status",
+            data: { status: "running", response_id: responseId },
+          });
+          await triggerCompaction(config, latestContext, customInstructions);
+        } finally {
+          if (!agentRunning) {
+            await postEvent(config, {
+              type: "external_session_status",
+              data: { status: "idle", response_id: responseId },
+            });
+          }
+          compacting = false;
+        }
+      },
+      (model) => {
+        // Await the composer's async model switch before input binds the turn's model.
+        pendingModelChange = applyModelChange(pi, config, latestContext, model);
+        return pendingModelChange;
+      },
       (level) => pi.setThinkingLevel(level),
       () => {
         // Prefer the SDK's live idle signal; fall back to the agent loop
@@ -1875,7 +2122,9 @@ module.exports = function (pi) {
         const idle = safeIsIdle(latestContext);
         return idle === null ? agentRunning : !idle;
       },
+      () => compacting,
     );
+    markInputReady(config);
     const nativeSessionId =
       ctx && ctx.sessionManager && ctx.sessionManager.getSessionId
         ? ctx.sessionManager.getSessionId()
@@ -1896,6 +2145,8 @@ module.exports = function (pi) {
         data: { model: startupModel },
       });
     }
+    // Publish readiness before usage so a hung POST cannot delay input handling.
+    await postSessionUsage();
     // Readiness is not turn completion: a queued prompt may already be running.
     // Only agent_end publishes idle so startup cannot complete a child task.
   });
@@ -1941,15 +2192,13 @@ module.exports = function (pi) {
     postedToolCalls.clear();
     postedToolResults.clear();
     postedReasoning.clear();
+    postedAssistantMessages.clear();
     streamedReasoningBlocks.clear();
     toolCallsById.clear();
     streamedTextIndex.clear();
     finalizedTextBlocks.clear();
     streamingMessageOrdinal = 0;
-    // Pin the response_id for this agent loop. agent_end MUST emit the same id
-    // so the web client can match the idle edge to the running edge and clear
-    // the "streaming" status — which unblocks queued follow-up messages.
-    // Use a dedicated variable: activeResponseId is overwritten by turn_start.
+    // Pin the status response_id for this agent loop through agent_end.
     turnStatusResponseId = `pi-${Date.now()}-${++sequence}`;
     await postEvent(config, {
       type: "external_session_status",
@@ -1983,6 +2232,8 @@ module.exports = function (pi) {
     const endResponseId =
       turnStatusResponseId ?? `pi-${Date.now()}-${++sequence}`;
     turnStatusResponseId = null;
+    // Manual compact aborts the turn first; its own completion publishes idle.
+    if (compacting) return;
     await postEvent(config, {
       type: "external_session_status",
       data: { status: "idle", response_id: endResponseId },
@@ -2094,6 +2345,22 @@ module.exports = function (pi) {
     setOmnigentStatus(config, ctx, "running");
     const text = event && typeof event.text === "string" ? event.text : "";
     if (!text) return;
+    if (pendingModelChange) {
+      const pending = pendingModelChange;
+      pendingModelChange = null;
+      await pending.catch(() => {});
+    }
+    // Route TUI input once. Stop after a final decision or failure so later
+    // prompts do not repeatedly wait for an unreachable server.
+    if (!turnRoutingDone && event.source !== "extension" && !text.startsWith("/")) {
+      const decision = await routeTurn(config, text, modelReference(ctx && ctx.model));
+      if (!decision || decision.terminal || decision.action === "route") {
+        turnRoutingDone = true;
+      }
+      if (decision && decision.action === "route" && decision.model) {
+        await applyModelChange(pi, config, ctx, decision.model);
+      }
+    }
     await postEvent(config, {
       type: "external_conversation_item",
       data: {
@@ -2111,9 +2378,15 @@ module.exports = function (pi) {
     rememberContext(ctx);
     replayPendingInterrupt(ctx);
     setOmnigentStatus(config, ctx, undefined);
-    const message = event ? event.message : undefined;
+    let message = event ? event.message : undefined;
     const role = messageRole(message);
     if (role !== "assistant") return;
+    const authFailure = nativeAuthFailure(message, ctx);
+    if (authFailure) {
+      message = { ...message, errorMessage: authFailure.message };
+      if (ctx && ctx.ui && ctx.ui.notify)
+        ctx.ui.notify(authFailure.message, "error");
+    }
     const responseId = currentResponseId();
     // Close the live preview for this message (no-op if nothing streamed),
     // then bump the ordinal so the NEXT assistant message of this turn
@@ -2140,28 +2413,31 @@ module.exports = function (pi) {
         ? message.errorMessage
         : "";
     if (stopReason === "error" && errorMessage) {
-      await postEvent(config, {
-        type: "external_conversation_item",
-        data: {
+      await postConversationItem(
+        config,
+        {
           response_id: responseId,
           item_type: "error",
           item_data: {
             source: "execution",
-            code: "RuntimeError",
+            code: authFailure ? authFailure.code : "RuntimeError",
             message: `Pi model error: ${errorMessage}`,
           },
         },
-      });
+        assistantMessageSourceId(message, responseId, errorMessage),
+      );
       return;
     }
     const text = textFromMessage(message);
     if (!text) return;
+    const sourceId = assistantMessageSourceId(message, responseId, text);
+    if (postedAssistantMessages.has(sourceId)) return;
     // The authoritative assistant item. The web UI retires + replaces the
     // oldest in-flight live preview in place with this (FIFO; one preview
     // per message), so the streamed partials never duplicate the final.
-    await postEvent(config, {
-      type: "external_conversation_item",
-      data: {
+    await postConversationItem(
+      config,
+      {
         response_id: responseId,
         item_type: "message",
         item_data: {
@@ -2170,7 +2446,11 @@ module.exports = function (pi) {
           content: [{ type: "output_text", text }],
         },
       },
-    });
+      sourceId,
+    );
+    // Retry a failed callback on its next delivery; only suppress duplicates
+    // after the authoritative POST has been accepted.
+    postedAssistantMessages.add(sourceId);
   });
 
   pi.on("turn_end", async (event, ctx) => {

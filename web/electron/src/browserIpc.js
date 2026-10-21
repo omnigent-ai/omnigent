@@ -8,6 +8,8 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { buildBrowserActionScript } = require("./browserActionScript.mjs");
+const { decodeLegacyBrowserAction } = require("./browserLegacyAction");
 const { buildDesignModeScript } = require("./designModeScript");
 
 // Max age of a real native input event for a design-mode submit marker to be
@@ -256,7 +258,14 @@ function makeDesignModeInputHandler(gestureState) {
  *          (import('./browserViewRegistry').Registry | null)} deps.getRegistryForEvent
  *        Resolves the sender window's own browser-view registry.
  */
-function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent }) {
+function registerBrowserIpc({
+  ipcMain,
+  isPinnedOriginSender,
+  getRegistryForEvent,
+  getAgentContextForEvent = () => null,
+  recoverAgentNavigationForEvent = async () => false,
+  getAgentNavigationHintForEvent = () => null,
+}) {
   /**
    * Resolve the sender's registry after the privileged-origin gate. Returns
    * `{ registry }` on success or `{ error }` (a structured result, never a
@@ -284,14 +293,57 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
   // Open (create-if-absent) or navigate a conversation's view, and measure it
   // into place. `force` reloads even on the same URL (agent "bring me back"
   // intent). Returns the registry's structured `{ ok, created, error }`.
-  ipcMain.handle("omnigent:browser-open-or-navigate", (event, args) => {
+  ipcMain.handle("omnigent:browser-open-or-navigate", async (event, args) => {
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
     const { conversationId, url, bounds, opts } = args ?? {};
     if (typeof conversationId !== "string" || !conversationId) {
       return { ok: false, error: "conversationId is required" };
     }
-    const r = g.registry.openOrNavigate(conversationId, url, bounds, opts);
+    const isCurrentNavigation = g.registry.beginAgentNavigation(conversationId);
+    const cancelled = { ok: false, created: false, error: "navigation superseded or closed" };
+    const isCurrent = () => isCurrentNavigation() && isPinnedOriginSender(event);
+    const navigate = async (registry) => {
+      // The first-party renderer supplies the source-session host; main owns
+      // the target and eligibility. Caller exception flags never establish identity.
+      const agentContext = getAgentContextForEvent(event, opts?.sourceHostId);
+      if (url) {
+        const verdict = await registry.checkAgentNavigation(conversationId, url, agentContext);
+        if (!isCurrent()) return cancelled;
+        if (!verdict.ok) return verdict;
+      }
+      return registry.openOrNavigate(conversationId, url, bounds, {
+        force: !!opts?.force,
+        // Renderer flags do not establish user intent.
+        agent: true,
+        agentContext,
+      });
+    };
+    let r = await navigate(g.registry);
+    if (!isCurrent()) return cancelled;
+    let recovered = false;
+    if (!r.ok && opts?.agent) {
+      try {
+        recovered = await recoverAgentNavigationForEvent(
+          event,
+          url,
+          opts?.sourceHostId,
+          opts?.rememberedArcaHostId,
+          opts?.sourceIsArcaHost,
+        );
+      } catch {
+        recovered = false;
+      }
+    }
+    if (!isCurrent()) return cancelled;
+    if (recovered) {
+      // Recovery updates main-owned identity, so rebuild the context and ask
+      // the registry to evaluate the same navigation once more.
+      const refreshed = gateRegistry(event);
+      if (refreshed.error || refreshed.registry !== g.registry) return cancelled;
+      r = await navigate(refreshed.registry);
+      if (!isCurrent()) return cancelled;
+    }
     // On first creation, wire nav listeners here (not in the registry factory,
     // which stays Electron-free) so the URL bar can live-track the real url.
     if (r.ok && r.created && r.entry) {
@@ -302,7 +354,21 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
       });
     }
     // Strip the non-serializable `entry` before it crosses the IPC boundary.
-    return { ok: r.ok, created: r.created ?? false, error: r.error };
+    const hint =
+      !r.ok && opts?.agent
+        ? getAgentNavigationHintForEvent(
+            event,
+            url,
+            opts?.sourceHostId,
+            opts?.rememberedArcaHostId,
+            opts?.sourceIsArcaHost,
+          )
+        : null;
+    return {
+      ok: r.ok,
+      created: r.created ?? false,
+      error: hint ? `${r.error} ${hint}` : r.error,
+    };
   });
 
   // Attach the named conversation's view to the host window (detaching the
@@ -323,6 +389,21 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     if (g.error) return { ok: false, error: g.error };
     const r = g.registry.setSuppressed(!!args?.suppressed);
     return { ok: r.ok, error: r.error };
+  });
+
+  // Intercept embedded-page Ctrl+Tab only while a compatible renderer is
+  // subscribed; older server UIs must retain ownership of the shortcut.
+  ipcMain.handle("omnigent:browser-set-recent-session-switch-supported", (event, args) => {
+    const g = gateRegistry(event);
+    if (g.error) return { ok: false, error: g.error };
+    return g.registry.setRecentSessionSwitchSupported(!!args?.supported);
+  });
+
+  // A supported renderer can still decline the gesture when no sessions exist.
+  ipcMain.handle("omnigent:browser-cancel-recent-session-switch", (event) => {
+    const g = gateRegistry(event);
+    if (g.error) return { ok: false, error: g.error };
+    return g.registry.cancelRecentSessionSwitch();
   });
 
   // Reposition the active conversation's view to freshly-measured bounds.
@@ -355,25 +436,28 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     }
   });
 
-  // Run relay-template JS in the conversation's view. PRIVATE to the relay's
-  // fixed templates (snapshot / click / type) — NOT an agent-facing generic
-  // `evaluate` (trust boundary; see README).
-  ipcMain.handle("omnigent:browser-execute", async (event, args) => {
+  // Both transports converge on main-owned scripts and the same sender gate.
+  async function performBrowserAction(event, args, legacy = false) {
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
-    const { conversationId, js } = args ?? {};
-    if (typeof js !== "string") return { ok: false, error: "js must be a string" };
+    const { conversationId } = args ?? {};
     const entry = g.registry.get(conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
     try {
-      // `true` = user gesture, so the page can call gesture-gated APIs.
-      const result = await entry.view.webContents.executeJavaScript(js, true);
-      // Normalize to a string — the relay JSON.parses snapshot/upload results.
+      const { action, params } = legacy ? decodeLegacyBrowserAction(args?.js) : (args ?? {});
+      const js = buildBrowserActionScript(action, params);
+      const result = await entry.view.webContents.executeJavaScript(js, false);
       return { ok: true, result: typeof result === "string" ? result : JSON.stringify(result) };
     } catch (e) {
       return { ok: false, error: e && e.message ? e.message : String(e) };
     }
-  });
+  }
+  ipcMain.handle("omnigent:browser-perform-action", (event, args) =>
+    performBrowserAction(event, args),
+  );
+  ipcMain.handle("omnigent:browser-execute", (event, args) =>
+    performBrowserAction(event, args, true),
+  );
 
   // Whether a view currently exists for a conversation. Lets a (re)mounting
   // pane re-attach an already-created view without waiting for a create event.

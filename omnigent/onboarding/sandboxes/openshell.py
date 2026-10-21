@@ -27,9 +27,8 @@ Notes that shape this launcher:
   protobufs, so the spec is built from the generated ``openshell._proto``
   module — the only path to a non-default image.
 - **No file-transfer RPC.** OpenShell exposes command execution but no
-  upload primitive, so :meth:`put` streams the file's bytes to ``cat``
-  over the exec channel's stdin — the same approach NVIDIA's own
-  LangChain backend uses.
+  upload primitive, so :meth:`put` sends a snapshot of the file to ``cat``
+  in bounded exec stdin chunks to stay under the gateway's message cap.
 - **No local port forwarding.** OpenShell has no local→sandbox port
   forward for the in-sandbox App OAuth callback, so the CLI skips that
   auth step automatically (``supports_local_port_forward = False``).
@@ -85,6 +84,10 @@ WORKSPACE_ENV_VAR: str = "OMNIGENT_OPENSHELL_WORKSPACE"
 operations (create, get, delete, wait_ready). Defaults to ``"default"``."""
 
 _DEFAULT_WORKSPACE: str = "default"
+
+# Upload chunk size. The gateway rejects a gRPC message whose decoded size
+# exceeds 1 MiB; stay well under it to leave room for framing overhead.
+_PUT_CHUNK_BYTES = 512 * 1024
 
 _READY_TIMEOUT_S = 300
 _EXEC_TIMEOUT_S = 300
@@ -174,8 +177,6 @@ class _OpenShellClient:
                 "`openshell gateway select <name>` (or set OPENSHELL_GATEWAY)."
             ) from exc
         self._workspace = workspace
-        # Petname (public handle) -> opaque sandbox id, which exec needs.
-        self._ids: dict[str, str] = {}
         # Daemon threads holding long-lived exec streams open (see
         # exec_background): OpenShell kills an exec's processes when the
         # ExecSandbox RPC returns, so a backgrounded host must be kept on
@@ -206,7 +207,6 @@ class _OpenShellClient:
             ),
         )
         sandbox_name: str = ready.name
-        self._ids[sandbox_name] = ready.id
         return sandbox_name
 
     def execute(
@@ -218,12 +218,13 @@ class _OpenShellClient:
         timeout: int = _EXEC_TIMEOUT_S,
     ) -> ExecResult:
         """Run *command* (argv) in the sandbox and return its ExecResult."""
-        sandbox_id = self._id_for(name)
+        ws = self._workspace
         return self._guard(
             f"Remote command failed on OpenShell sandbox '{name}'",
             lambda: self._client.exec(
-                sandbox_id,
+                name,
                 command,
+                workspace=ws,
                 stdin=stdin,
                 timeout_seconds=timeout,
                 workdir=_SANDBOX_HOME,
@@ -236,12 +237,12 @@ class _OpenShellClient:
         import grpc
         from openshell import ExecChunk, ExecResult, SandboxError
 
-        sandbox_id = self._id_for(name)
         exit_code = 0
         try:
             for item in self._client.exec_stream(
-                sandbox_id,
+                name,
                 command,
+                workspace=self._workspace,
                 timeout_seconds=timeout,
                 workdir=_SANDBOX_HOME,
                 env={"HOME": _SANDBOX_HOME},
@@ -274,13 +275,14 @@ class _OpenShellClient:
         """
         import threading
 
-        sandbox_id = self._id_for(name)
+        ws = self._workspace
 
         def _pump() -> None:
             try:
                 for _ in self._client.exec_stream(
-                    sandbox_id,
+                    name,
                     command,
+                    workspace=ws,
                     timeout_seconds=timeout,
                     workdir=_SANDBOX_HOME,
                     env={"HOME": _SANDBOX_HOME},
@@ -321,23 +323,19 @@ class _OpenShellClient:
             lambda: start(name, workspace=ws),
             gone_on_not_found=True,
         )
-        ready = self._guard(
+        self._guard(
             f"OpenShell sandbox '{name}' did not become ready after resume",
             lambda: self._client.wait_ready(name, workspace=ws, timeout_seconds=_READY_TIMEOUT_S),
             gone_on_not_found=True,
         )
-        # The resumed instance may carry a fresh opaque id; recache it so
-        # subsequent execs reach the live instance.
-        self._ids[name] = ready.id
 
     def get_status(self, name: str) -> None:
-        """Resolve a sandbox by name (validates access) and cache its id."""
+        """Resolve a sandbox by name, which validates access to it."""
         ws = self._workspace
-        ref = self._guard(
+        self._guard(
             f"Could not resolve OpenShell sandbox '{name}'",
             lambda: self._client.get(name, workspace=ws),
         )
-        self._ids[name] = ref.id
 
     def delete_sandbox(self, name: str) -> None:
         """Delete a sandbox; a missing sandbox is treated as already gone."""
@@ -348,31 +346,16 @@ class _OpenShellClient:
             self._client.delete(name, workspace=self._workspace)
         except grpc.RpcError as exc:
             if isinstance(exc, grpc.Call) and exc.code() == grpc.StatusCode.NOT_FOUND:
-                self._ids.pop(name, None)
                 return
             raise click.ClickException(
                 f"Failed to delete OpenShell sandbox '{name}': {exc}"
             ) from exc
         except SandboxError as exc:
             if "not found" in str(exc).lower():
-                self._ids.pop(name, None)
                 return
             raise click.ClickException(
                 f"Failed to delete OpenShell sandbox '{name}': {exc}"
             ) from exc
-        self._ids.pop(name, None)
-
-    def _id_for(self, name: str) -> str:
-        cached = self._ids.get(name)
-        if cached is None:
-            ws = self._workspace
-            ref = self._guard(
-                f"Could not resolve OpenShell sandbox '{name}'",
-                lambda: self._client.get(name, workspace=ws),
-            )
-            cached = ref.id
-            self._ids[name] = cached
-        return cached
 
     def _guard(
         self,
@@ -517,20 +500,29 @@ class OpenShellSandboxLauncher(SandboxLauncher):
         return RemoteCommandResult(returncode=0, stdout="launched\n", stderr="")
 
     def put(self, sandbox_id: str, local_path: Path, remote_path: str) -> None:
-        """Copy a local file into the sandbox by piping its bytes to ``cat``."""
+        """Copy a local file into the sandbox by piping its bytes to ``cat``.
+
+        Snapshot before sending: another bootstrap may rebuild the source.
+        Each exec's stdin is one gRPC message, capped at 1 MiB by the gateway.
+        The first chunk truncates the destination; later chunks append. Empty
+        files still make one request, and retrying the whole upload starts clean.
+        """
         content = local_path.read_bytes()
         parent = shlex.quote(str(PurePosixPath(remote_path).parent))
         dest = shlex.quote(remote_path)
-        result = self._openshell().execute(
-            sandbox_id,
-            ["bash", "-c", f"mkdir -p {parent} && cat > {dest}"],
-            stdin=content,
-        )
-        if result.exit_code != 0:
-            raise click.ClickException(
-                f"File upload to OpenShell sandbox '{sandbox_id}' failed "
-                f"(exit {result.exit_code}): {result.stderr.strip()}"
+        client = self._openshell()
+        for offset in range(0, max(len(content), 1), _PUT_CHUNK_BYTES):
+            redirect = ">" if offset == 0 else ">>"
+            result = client.execute(
+                sandbox_id,
+                ["bash", "-c", f"mkdir -p {parent} && cat {redirect} {dest}"],
+                stdin=content[offset : offset + _PUT_CHUNK_BYTES],
             )
+            if result.exit_code != 0:
+                raise click.ClickException(
+                    f"File upload to OpenShell sandbox '{sandbox_id}' failed "
+                    f"(exit {result.exit_code}): {result.stderr.strip()}"
+                )
 
     def exec_foreground(self, sandbox_id: str, command: str) -> int:
         """

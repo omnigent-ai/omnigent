@@ -30,6 +30,11 @@ import time
 # POST exhausts its retries.
 _state: dict[str, tuple[float, str] | None] = {"last_post_failure": None}
 
+# Monotonic time of the last forwarder POST that got an HTTP response. The runner
+# idle watchdog reads it, so a sub-agent still streaming while its parent is idle
+# counts as activity; once posts stop, the idle window bounds the hold.
+_last_post_at: dict[str, float | None] = {"value": None}
+
 
 def record_post_failure(event_type: str, error: BaseException) -> None:
     """
@@ -74,9 +79,22 @@ def note_post_success() -> None:
     populated; once it recovers, the next success empties it and the watchdog
     won't blame a long-resolved failure for an unrelated later stall.
 
+    Also stamps :func:`last_post_at` for the runner idle watchdog.
+
     :returns: None.
     """
     _state["last_post_failure"] = None
+    _last_post_at["value"] = time.monotonic()
+
+
+def last_post_at() -> float | None:
+    """
+    Return the monotonic time of the last forwarder POST round-trip.
+
+    :returns: Seconds on the monotonic clock, or ``None`` when no forwarder
+        POST has received a response in this process yet.
+    """
+    return _last_post_at["value"]
 
 
 def recent_post_failure(within_s: float) -> str | None:
@@ -101,7 +119,7 @@ def recent_post_failure(within_s: float) -> str | None:
 
 def clear() -> None:
     """
-    Forget any recorded forwarder POST failure.
+    Forget any recorded forwarder POST failure and activity timestamp.
 
     Lets a test isolate from earlier records; harmless in production (the next
     failure overwrites the slot regardless).
@@ -109,3 +127,4 @@ def clear() -> None:
     :returns: None.
     """
     _state["last_post_failure"] = None
+    _last_post_at["value"] = None

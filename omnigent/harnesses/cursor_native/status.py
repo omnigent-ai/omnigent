@@ -1,6 +1,6 @@
-"""Turn-completion ("idle") signal for the cursor-native harness.
+"""Authoritative turn outcome from the cursor-native ``stop`` hook.
 
-cursor-agent fires its ``stop`` hook once per completed turn (see
+cursor-agent fires its ``stop`` hook when a turn completes, aborts, or fails (see
 :func:`omnigent.harnesses.cursor_native.bridge.build_hooks_config`, which registers the
 :mod:`omnigent.harnesses.cursor_native.usage` recorder). That hook is the ONLY
 authoritative "this turn just finished" signal cursor-agent exposes: its SQLite
@@ -12,7 +12,7 @@ orchestrator.
 So the stop hook ALSO appends a turn-end marker line here (alongside its usage
 line), and the runner-owned
 :func:`omnigent.harnesses.cursor_native.forwarder.forward_cursor_store_to_session` poll
-loop tails it and POSTs an ``external_session_status: idle`` event — the SAME
+loop tails it and POSTs an ``external_session_status`` event with its outcome — the SAME
 server contract claude-/codex-/opencode-native use to mark a sub-agent turn
 terminal and wake its parent's inbox. Without this a cursor-native sub-agent
 finished silently and never notified the orchestrator.
@@ -29,20 +29,19 @@ import os
 import time
 from pathlib import Path
 
-#: Append-only log of per-turn completion markers written by the cursor ``stop``
-#: hook (one JSON object per completed turn) and tailed by the forwarder.
+#: Append-only log of per-turn outcomes written by the cursor ``stop`` hook.
 TURN_END_FILE = "cursor_turn_end.jsonl"
 
 #: Durable poster state: how many turn-end markers the forwarder has already
-#: turned into an ``external_session_status: idle`` post. Persisted so a
+#: turned into an ``external_session_status`` post. Persisted so a
 #: supervisor restart never re-wakes the parent for a turn it already reported.
 _STATE_FILE = "cursor_status_forwarder.json"
 
 
 def record_turn_end(bridge_dir: Path, payload: object | None = None) -> None:
-    """Append one turn-completion marker (called from the cursor ``stop`` hook).
+    """Append one turn-outcome marker (called from the cursor ``stop`` hook).
 
-    Fires on EVERY completed turn — including turns with no billable token usage,
+    Fires on EVERY ended turn — including turns with no billable token usage,
     which :func:`omnigent.harnesses.cursor_native.usage.record_usage_payload` skips — so the
     parent wake never depends on a turn having produced usage. Best-effort and
     stdlib-only; the caller swallows failures so usage/idle capture never breaks
@@ -50,24 +49,28 @@ def record_turn_end(bridge_dir: Path, payload: object | None = None) -> None:
 
     :param bridge_dir: The cursor-native bridge dir (where the forwarder reads).
     :param payload: The cursor ``stop`` hook payload, if any — its
-        ``generation_id`` is recorded for traceability (not required).
+        ``generation_id`` and authoritative ``status`` are retained when present.
     """
     line: dict[str, object] = {"ts": time.time()}
     if isinstance(payload, dict):
         gen_id = payload.get("generation_id") or payload.get("conversation_id")
         if isinstance(gen_id, str) and gen_id:
             line["generation_id"] = gen_id
+        hook_status = payload.get("status")
+        if hook_status in ("completed", "aborted", "error"):
+            line["status"] = hook_status
     bridge_dir.mkdir(parents=True, exist_ok=True)
-    # O_APPEND keeps a fast-firing hook's short JSON line from interleaving.
+    # A leading separator isolates this record from a previous short write.
+    # Blank lines are ignored by readers, including older forwarders.
     with open(bridge_dir / TURN_END_FILE, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(line, sort_keys=True) + "\n")
+        handle.write("\n" + json.dumps(line, sort_keys=True) + "\n")
 
 
 def count_turn_ends(bridge_dir: Path) -> int:
     """Return how many turn-end markers have been recorded (0 if none/unreadable).
 
     The marker file is append-only, so the line count is the number of turns that
-    have completed since the terminal was (re-)created.
+    have ended since the terminal was (re-)created.
     """
     try:
         text = (bridge_dir / TURN_END_FILE).read_text(encoding="utf-8")
@@ -76,8 +79,31 @@ def count_turn_ends(bridge_dir: Path) -> int:
     return sum(1 for raw in text.splitlines() if raw.strip())
 
 
+def read_turn_outcome(bridge_dir: Path, turn_end: int) -> str:
+    """Read the outcome at a snapshotted marker count, ignoring later appends.
+
+    Legacy markers without a status retain their completed-turn behavior.
+    Unreadable or corrupt markers raise so the forwarder can retry delivery.
+    """
+    if turn_end <= 0:
+        raise ValueError("turn-end marker count must be positive")
+    lines = (bridge_dir / TURN_END_FILE).read_text(encoding="utf-8").splitlines()
+    markers = [raw for raw in lines if raw.strip()]
+    marker = json.loads(markers[turn_end - 1])
+    if not isinstance(marker, dict):
+        raise ValueError("turn-end marker must be an object")
+    hook_status = marker.get("status", "completed")
+    if hook_status == "aborted":
+        return "cancelled"
+    if hook_status == "error":
+        return "failed"
+    if hook_status == "completed":
+        return "completed"
+    raise ValueError(f"unknown cursor turn outcome: {hook_status!r}")
+
+
 def read_posted_count(bridge_dir: Path) -> int:
-    """Load the count of turn-ends already POSTed as idle (0 on cold/unreadable)."""
+    """Load the count of turn-ends already POSTed (0 on cold/unreadable)."""
     try:
         data = json.loads((bridge_dir / _STATE_FILE).read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -87,9 +113,9 @@ def read_posted_count(bridge_dir: Path) -> int:
 
 
 def write_posted_count(bridge_dir: Path, posted: int) -> None:
-    """Atomically persist the count of turn-ends already POSTed as idle.
+    """Atomically persist the count of turn-ends already POSTed.
 
-    Persisted only AFTER a successful idle POST so a failed flush is retried (the
+    Persisted only AFTER a successful status POST so a failed flush is retried (the
     unreported turn-ends stay unreported until the post lands).
     """
     bridge_dir.mkdir(parents=True, exist_ok=True)

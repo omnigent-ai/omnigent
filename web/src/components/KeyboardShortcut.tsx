@@ -1,7 +1,9 @@
 import type { ReactNode } from "react";
 
+export { CompactKbd, CompactShortcutKeys } from "@/components/ui/kbd";
 import { TooltipContent } from "@/components/ui/tooltip";
 import { isMacPlatform } from "@/lib/hotkeys";
+import { isNativeShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 
 const IS_MAC = isMacPlatform();
@@ -13,6 +15,16 @@ export const CTRL_KEY = IS_MAC ? "⌃" : "Ctrl";
 export const ALT_KEY = IS_MAC ? "⌥" : "Alt";
 export const ENTER_KEY = "↵";
 export const SHIFT_KEY = "⇧";
+export const ARIA_MOD_KEY = IS_MAC ? "Meta" : "Control";
+export const VIEW_MODE_TOGGLE_KEYS = [MOD_KEY, ALT_KEY, "\\"] as const;
+
+export function newSessionShortcutKeys(native = isNativeShell()): string[] {
+  return native ? [MOD_KEY, ALT_KEY, "N"] : [MOD_KEY, IS_MAC ? SHIFT_KEY : "Shift", "O"];
+}
+
+export function newSessionAriaShortcut(native = isNativeShell()): string {
+  return `${ARIA_MOD_KEY}+${native ? "Alt+N" : "Shift+O"}`;
+}
 
 export function composerSendShortcutKeys(submitWithModEnter: boolean): string[] {
   return submitWithModEnter ? [MOD_KEY, ENTER_KEY] : [ENTER_KEY];
@@ -46,26 +58,14 @@ export function Kbd({
   );
 }
 
-export function KeyboardShortcutHint({ label, keys }: { label: string; keys: string[] }) {
-  return (
-    <>
-      <span>{label}</span>
-      {keys.map((key) => (
-        <Kbd key={`${label}-${key}`} variant="dark">
-          {key}
-        </Kbd>
-      ))}
-    </>
-  );
-}
-
 export function KeyboardShortcutTooltipContent({ label, keys }: { label: string; keys: string[] }) {
   return (
     <TooltipContent
       side="top"
+      shortcut={keys}
       className="border border-slate-700 bg-slate-900 text-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
     >
-      <KeyboardShortcutHint label={label} keys={keys} />
+      <span>{label}</span>
     </TooltipContent>
   );
 }

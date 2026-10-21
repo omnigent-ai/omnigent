@@ -185,6 +185,16 @@ def validate_omnigent_executor(
             " — harness manages context internally",
         )
     harness = spec.executor.config.get("harness")
+    if "context_files" in spec.executor.config:
+        if not isinstance(spec.executor.config["context_files"], bool):
+            result.add("executor.config.context_files", "must be a boolean")
+        if harness != "pi":
+            result.add("executor.config.context_files", "only supported with harness 'pi'")
+    if "system_prompt_mode" in spec.executor.config:
+        if spec.executor.config["system_prompt_mode"] not in ("append", "replace"):
+            result.add("executor.config.system_prompt_mode", "must be 'append' or 'replace'")
+        if harness != "pi":
+            result.add("executor.config.system_prompt_mode", "only supported with harness 'pi'")
     if not harness:
         result.add(
             "executor.config.harness",

@@ -41,6 +41,8 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from tests.server.helpers import CapturingRunnerClient, create_test_agent
+from tests.server.helpers import create_session_for_agent as _create_session
+from tests.server.helpers import policy_tool_call_request as _tool_call_request
 
 pytestmark = pytest.mark.asyncio
 
@@ -173,43 +175,6 @@ def _ask_for_bash(event: dict[str, Any]) -> dict[str, Any]:
 
 
 # ── Helpers ─────────────────────────────────────────────────
-
-
-async def _create_session(client: httpx.AsyncClient, agent_id: str) -> str:
-    """
-    Create a session bound to an agent.
-
-    :param client: Test HTTP client.
-    :param agent_id: Agent to bind.
-    :returns: New session id.
-    """
-    resp = await client.post("/v1/sessions", json={"agent_id": agent_id})
-    assert resp.status_code == 201, f"create failed: {resp.status_code} {resp.text}"
-    return resp.json()["id"]
-
-
-def _tool_call_request(
-    tool_name: str = "Bash",
-    arguments: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """
-    Build a PHASE_TOOL_CALL EvaluationRequest.
-
-    :param tool_name: Tool name, e.g. ``"Bash"``.
-    :param arguments: Tool arguments dict.
-    :returns: EvaluationRequest JSON dict.
-    """
-    return {
-        "event": {
-            "type": "PHASE_TOOL_CALL",
-            "target": "",
-            "data": {
-                "name": tool_name,
-                "arguments": arguments or {},
-            },
-            "context": {},
-        },
-    }
 
 
 def _tool_result_request(
@@ -775,6 +740,59 @@ def _patch_default_policies(monkeypatch: pytest.MonkeyPatch, fn_path: str) -> No
     )
 
 
+@pytest.mark.parametrize("tool_name", ["sys_scheduled_task_create", "sys_scheduled_task_update"])
+async def test_scheduled_changes_require_explicit_approval_without_custom_policies(
+    client: httpx.AsyncClient,
+    tool_name: str,
+) -> None:
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+    drain = asyncio.create_task(_drain_elicitation_id(session_id))
+    await asyncio.sleep(0.05)
+    evaluate = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_tool_call_request(tool_name),
+        )
+    )
+    try:
+        # The built-in scheduled-task gate must fire even with no custom policies.
+        elicitation_id = await asyncio.wait_for(drain, timeout=5)
+        assert not evaluate.done()
+        response = await client.post(
+            f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
+            json={"action": "accept"},
+        )
+        assert response.status_code == 202, response.text
+        response = await asyncio.wait_for(evaluate, timeout=5)
+        assert response.status_code == 200, response.text
+        assert response.json()["result"] == "POLICY_ACTION_ALLOW"
+    finally:
+        for task in (drain, evaluate):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(drain, evaluate, return_exceptions=True)
+
+
+@pytest.mark.parametrize("tool_name", ["sys_scheduled_task_list", "sys_scheduled_task_delete"])
+async def test_schedule_read_and_removal_do_not_require_new_approval(
+    client: httpx.AsyncClient,
+    tool_name: str,
+) -> None:
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+    # A regression that gates these tools would park the request; fail fast instead.
+    response = await asyncio.wait_for(
+        client.post(
+            f"/v1/sessions/{session_id}/policies/evaluate",
+            json=_tool_call_request(tool_name),
+        ),
+        timeout=5,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["result"] == "POLICY_ACTION_ALLOW"
+
+
 async def test_tool_call_ask_holds_gate_and_returns_allow_on_accept(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -1039,7 +1057,7 @@ async def test_concurrent_cost_asks_serialize_and_collapse_sibling(
         elif entries == 2:
             second_in_gate.set()
         if result.state_updates:
-            engine.apply_state_updates(result.state_updates)
+            engine.apply_state_updates(result.state_updates, approved=True)
         return True
 
     monkeypatch.setattr(sessions_routes, "_hold_native_ask_gate", _controllable_gate)
@@ -1493,7 +1511,7 @@ async def _seed_authenticated_session(auth_client: httpx.AsyncClient, db_uri: st
                             "allow_all": {
                                 "type": "function",
                                 "on": ["tool_call"],
-                                "function": "tests.runtime.policies.conftest._always_allow",
+                                "function": "omnigent.policies.builtins.safety.ask_on_os_tools",
                             }
                         }
                     },
@@ -1558,7 +1576,7 @@ async def test_authenticated_evaluate_route_sql_budget(
     payload = {
         "event": {
             "type": "PHASE_TOOL_CALL",
-            "data": {"name": "Bash", "arguments": {"command": "ls"}},
+            "data": {"name": "echo", "arguments": {}},
         }
     }
     # Warm the spec / policy / ACL caches so the count is the steady-state one.

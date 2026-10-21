@@ -44,6 +44,7 @@ import pexpect
 import pytest
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from tests._helpers.session import post_session_bundle
 from tests.e2e._native_resume_helpers import (
     inject_user_message,
     wait_for_terminal_ready,
@@ -316,12 +317,11 @@ def test_web_followup_preserves_real_repl_question(
                 "executor:\n  type: omnigent\n  config:\n    harness: claude-native\n"
                 "os_env:\n  type: caller_process\n  cwd: .\n  sandbox:\n    type: none\n"
             )
-            created = client.post(
+            created = post_session_bundle(
+                client.post,
                 "/v1/sessions",
-                data={"metadata": json.dumps({"host_id": host_id, "workspace": str(workspace)})},
-                files={
-                    "bundle": ("agent.tar.gz", build_agent_bundle(agent_dir), "application/gzip")
-                },
+                build_agent_bundle(agent_dir),
+                metadata={"host_id": host_id, "workspace": str(workspace)},
                 headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
                 timeout=60,
             )

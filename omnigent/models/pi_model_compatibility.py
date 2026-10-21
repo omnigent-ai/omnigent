@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import replace
 from enum import Enum
 from typing import TYPE_CHECKING, NotRequired, TypedDict
 
-from omnigent.models.model_metadata import ModelMetadata
+from omnigent.models.model_metadata import ModelCapability, ModelMetadata
 
 if TYPE_CHECKING:
     from omnigent.models.model_catalog import ModelEntry
@@ -27,7 +28,7 @@ def unsupported_in_pi(model_id_lower: str) -> bool:
 
 
 class DatabricksPiSurface(Enum):
-    """A Databricks AI Gateway protocol surface Pi can be pointed at.
+    """A Databricks Unity Gateway protocol surface Pi can be pointed at.
 
     The gateway serves each protocol under the same workspace origin, and each
     model accepts only some of them; sending a model to the wrong surface is
@@ -103,16 +104,25 @@ def pi_model_is_reasoning(model_id: str) -> bool:
     return any(fragment in lower for fragment in PI_REASONING_MODEL_FRAGMENTS)
 
 
+def pi_model_entry_is_reasoning(model: ModelEntry) -> bool:
+    """Whether a catalog entry needs Pi's ``reasoning`` flag: catalog capability or id floor."""
+    return (
+        model.metadata.supports(ModelCapability.REASONING) is True
+        or pi_model_is_reasoning(model.id)
+        or any(fragment in model.id.lower() for fragment in PI_CLAUDE_THINKING_MODEL_FRAGMENTS)
+    )
+
+
 def pi_model_json_entry(model: ModelEntry) -> PiModelEntry:
     """Translate normalized catalog metadata into Pi's ``models.json`` schema.
 
     Shared by every surface that renders a Pi ``models.json`` — the spawned
     harness in :mod:`omnigent.inner.pi_executor` and the interactive
     ``omnigent pi`` launch in :mod:`omnigent.harnesses.pi_native.credentials` — so both
-    advertise the same limits for the same model. Pi defaults an entry with no
-    ``contextWindow``/``maxTokens`` to 128000/16384, which silently truncates
-    the 1M-context gateway models, so limits are carried whenever the catalog
-    reports them.
+    advertise the same limits and reasoning flag for the same model. Pi
+    defaults an entry with no ``contextWindow``/``maxTokens`` to 128000/16384,
+    which silently truncates the 1M-context gateway models, so limits are
+    carried whenever the catalog reports them.
 
     :param model: A catalog entry, normally from
         :func:`~omnigent.models.model_catalog.fetch_databricks_model_service_entries`
@@ -125,10 +135,44 @@ def pi_model_json_entry(model: ModelEntry) -> PiModelEntry:
         entry["contextWindow"] = model.metadata.context_window
     if model.metadata.max_output_tokens is not None:
         entry["maxTokens"] = model.metadata.max_output_tokens
-    if pi_model_is_reasoning(model.id) or any(
-        fragment in model.id.lower() for fragment in PI_CLAUDE_THINKING_MODEL_FRAGMENTS
-    ):
+    if pi_model_entry_is_reasoning(model):
         entry["reasoning"] = True
+    return entry
+
+
+def pi_generic_model_json_entry(
+    model_id: str,
+    *,
+    configured_context_window: int | None = None,
+    configured_max_output_tokens: int | None = None,
+) -> PiModelEntry:
+    """Render a configured model with catalog capabilities and token limits.
+
+    Native and SDK providers share the same metadata even when the user supplies
+    both limits. Configured limits override catalog values; an unavailable
+    catalog retains the model and Pi's defaults.
+    """
+    from omnigent.models.model_catalog import ModelEntry
+    from omnigent.onboarding.providers import find_catalog_models
+
+    matches = []
+    with suppress(OSError):
+        matches = find_catalog_models(model_id)
+    reasoning = {model.supports_reasoning for model in matches}
+    contexts = {model.max_input_tokens for model in matches if model.max_input_tokens is not None}
+    outputs = {model.max_output_tokens for model in matches if model.max_output_tokens is not None}
+    metadata = ModelMetadata(
+        supported_capabilities=(
+            frozenset({ModelCapability.REASONING}) if reasoning == {True} else frozenset()
+        ),
+        context_window=next(iter(contexts)) if len(contexts) == 1 else None,
+        max_output_tokens=next(iter(outputs)) if len(outputs) == 1 else None,
+    )
+    entry = pi_model_json_entry(ModelEntry(id=model_id, family="other", metadata=metadata))
+    if configured_context_window is not None:
+        entry["contextWindow"] = configured_context_window
+    if configured_max_output_tokens is not None:
+        entry["maxTokens"] = configured_max_output_tokens
     return entry
 
 

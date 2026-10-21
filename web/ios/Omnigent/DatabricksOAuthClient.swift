@@ -136,13 +136,7 @@ struct DatabricksOAuthClient: DatabricksTokenRefreshing {
     request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
     request.setValue("application/json", forHTTPHeaderField: "Accept")
     request.timeoutInterval = 30
-    let unreserved = CharacterSet(
-      charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
-    let fields = [("client_id", scope.clientID)] + fields
-    request.httpBody = Data(
-      fields.map {
-        "\($0.0.addingPercentEncoding(withAllowedCharacters: unreserved)!)=\($0.1.addingPercentEncoding(withAllowedCharacters: unreserved)!)"
-      }.joined(separator: "&").utf8)
+    request.httpBody = OAuthSupport.formBody([("client_id", scope.clientID)] + fields)
     return request
   }
 

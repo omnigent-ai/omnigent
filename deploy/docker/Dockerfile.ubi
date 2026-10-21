@@ -16,7 +16,9 @@ ARG PYTHON_VERSION=3.12
 ARG NODE_VERSION=22
 
 # ── Web UI builder ──────────────────────────────────────
-FROM registry.access.redhat.com/ubi9/nodejs-${NODE_VERSION} AS web-builder
+# Build-platform pinned like the standard Dockerfile's web-builder: the
+# bundle is arch-independent and the emulated arm64 web build has stalled.
+FROM --platform=$BUILDPLATFORM registry.access.redhat.com/ubi9/nodejs-${NODE_VERSION} AS web-builder
 ARG NPM_CONFIG_REGISTRY=
 ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
 
@@ -27,6 +29,7 @@ WORKDIR /web
 # source edits. The electron package JSON is included so the root workspace is
 # structurally complete, but we --filter web to avoid downloading Electron.
 COPY pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY patches/ ./patches/
 COPY web/package.json ./web/
 COPY web/electron/package.json ./web/electron/
 

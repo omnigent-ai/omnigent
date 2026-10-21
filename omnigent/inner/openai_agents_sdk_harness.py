@@ -90,8 +90,12 @@ Env vars read at startup:
 
 from __future__ import annotations
 
+import functools
+import importlib
 import logging
 import os
+import platform
+import threading
 from typing import cast
 
 from fastapi import FastAPI
@@ -124,6 +128,38 @@ _ENV_API_KEY = "HARNESS_OPENAI_AGENTS_API_KEY"
 # match the claude-sdk / codex / pi wraps' parsers for
 # consistency — operators learn one set of conventions, not five.
 _TRUTHY_STRINGS = ("1", "true", "yes")
+
+
+# Prewarm SDK imports and platform metadata while the harness waits for its
+# first message. ``AsyncOpenAI.responses`` loads the openai resources lazily.
+_PREWARM_MODULES = ("agents", "openai.resources", "openai.resources.responses")
+# The first turn waits at most this long for the prewarm before importing itself.
+_PREWARM_JOIN_TIMEOUT_S = 60.0
+
+
+def _prewarm_first_turn() -> None:
+    """Pay the first turn's one-time costs early, leaving any failure to that turn.
+
+    A failed import is removed from ``sys.modules``, so the first turn retries
+    it and reports the error exactly as it would without the prewarm.
+    """
+    try:
+        for module in _PREWARM_MODULES:
+            importlib.import_module(module)
+        # Cached by the stdlib; openai reads it for its request headers.
+        platform.platform()
+    except Exception:  # noqa: BLE001 — the first turn reports it instead
+        _logger.debug("openai-agents first-turn prewarm failed", exc_info=True)
+
+
+@functools.cache
+def _sdk_prewarm() -> threading.Thread:
+    """Start the SDK prewarm once per process and return its thread."""
+    thread = threading.Thread(
+        target=_prewarm_first_turn, name="openai-agents-sdk-prewarm", daemon=True
+    )
+    thread.start()
+    return thread
 
 
 def _is_databricks_non_gpt_model(model: str | None) -> bool:
@@ -203,6 +239,17 @@ def _build_openai_agents_sdk_executor() -> Executor:
         :func:`_get_openai_async_client` fails loud with a
         message naming the profile.
     """
+    # Never import the SDK concurrently with the prewarm thread: concurrent
+    # imports of one package's submodules can see it partially initialized.
+    prewarm = _sdk_prewarm()
+    prewarm.join(timeout=_PREWARM_JOIN_TIMEOUT_S)
+    if prewarm.is_alive():
+        # Don't wait on a stalled prewarm forever. The turn can still block on
+        # the module lock of an import the prewarm is stuck in.
+        _logger.warning(
+            "openai-agents SDK prewarm still running after %.0fs; building the executor anyway",
+            _PREWARM_JOIN_TIMEOUT_S,
+        )
     # Single canonical spelling for the profile env var:
     # ``DATABRICKS_PROFILE`` (Databricks-specific). The AP-side
     # spawn-env builder always emits this name; the parametrized
@@ -252,4 +299,7 @@ def create_app() -> FastAPI:
         app-boot crash).
     """
     adapter = ExecutorAdapter(executor_factory=_build_openai_agents_sdk_executor)
-    return adapter.build()
+    app = adapter.build()
+    # Overlap the first turn's one-time costs with the wait for its message.
+    _sdk_prewarm()
+    return app

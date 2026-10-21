@@ -13,6 +13,11 @@ API) lives in the e2e suite via :mod:`tests.e2e.test_harness_wrap_e2e`.
 
 from __future__ import annotations
 
+import importlib
+import sys
+import types
+from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -347,3 +352,120 @@ def test_executor_factory_no_env_returns_blank_config(
     assert captured["model"] is None
     assert captured["use_responses"] is True
     assert captured["reasoning_item_id_policy"] is None
+
+
+def test_create_app_starts_the_first_turn_prewarm() -> None:
+    """``create_app()`` itself kicks off the prewarm, before any turn."""
+    started: list[None] = []
+
+    with patch.object(openai_agents_sdk_harness, "_sdk_prewarm", lambda: started.append(None)):
+        openai_agents_sdk_harness.create_app()
+
+    assert started == [None]
+
+
+@pytest.fixture
+def fresh_prewarm() -> Iterator[None]:
+    """Drain and reset the process-wide prewarm so a test sees no prior thread."""
+
+    def _drain() -> None:
+        if openai_agents_sdk_harness._sdk_prewarm.cache_info().currsize:
+            openai_agents_sdk_harness._sdk_prewarm().join(timeout=60)
+        openai_agents_sdk_harness._sdk_prewarm.cache_clear()
+
+    _drain()
+    yield
+    _drain()
+
+
+@pytest.mark.usefixtures("fresh_prewarm")
+def test_sdk_prewarm_runs_once_and_loads_the_first_turn_modules() -> None:
+    thread = openai_agents_sdk_harness._sdk_prewarm()
+
+    assert openai_agents_sdk_harness._sdk_prewarm() is thread
+    thread.join(timeout=60)
+    assert not thread.is_alive()
+    for module in openai_agents_sdk_harness._PREWARM_MODULES:
+        assert module in sys.modules
+
+
+class _FakePrewarm:
+    def __init__(self, order: list[str], *, alive_after_join: bool) -> None:
+        self._order = order
+        self._alive = alive_after_join
+
+    def join(self, timeout: float | None = None) -> None:
+        self._order.append(f"join({timeout})")
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+
+@pytest.mark.parametrize("alive_after_join", [False, True])
+def test_executor_factory_waits_for_the_prewarm_before_building(
+    alive_after_join: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The first turn joins the prewarm first; a stalled prewarm doesn't block it."""
+    order: list[str] = []
+    prewarm = _FakePrewarm(order, alive_after_join=alive_after_join)
+
+    def _fake_init(self: Any, **_kwargs: Any) -> None:
+        order.append("executor")
+
+    with (
+        patch.object(openai_agents_sdk_harness, "_sdk_prewarm", lambda: prewarm),
+        patch(
+            "omnigent.inner.openai_agents_sdk_harness.OpenAIAgentsSDKExecutor.__init__",
+            _fake_init,
+        ),
+        caplog.at_level("WARNING", logger=openai_agents_sdk_harness.__name__),
+    ):
+        openai_agents_sdk_harness._build_openai_agents_sdk_executor()
+
+    assert order == [f"join({openai_agents_sdk_harness._PREWARM_JOIN_TIMEOUT_S})", "executor"]
+    assert ("prewarm still running" in caplog.text) is alive_after_join
+
+
+@pytest.mark.usefixtures("fresh_prewarm")
+def test_prewarm_leaves_a_missing_sdk_to_the_first_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed prewarm import is swallowed; the first turn still raises the actionable error."""
+    from omnigent.inner.openai_agents_sdk_executor import _ensure_agents_sdk
+
+    platform_calls: list[None] = []
+    monkeypatch.setitem(sys.modules, "agents", None)  # ``import agents`` now fails
+    monkeypatch.setattr(
+        openai_agents_sdk_harness.platform, "platform", lambda: platform_calls.append(None)
+    )
+
+    openai_agents_sdk_harness._prewarm_first_turn()
+
+    assert platform_calls == []
+    with pytest.raises(ImportError, match="requires the 'openai-agents' package"):
+        _ensure_agents_sdk()
+
+
+@pytest.mark.usefixtures("fresh_prewarm")
+def test_prewarm_import_failure_is_retried_by_the_first_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An import that starts and then fails leaves nothing behind, so a retry succeeds."""
+    gate = types.SimpleNamespace(fail=True)
+    monkeypatch.setitem(sys.modules, "_prewarm_test_gate", gate)
+    (tmp_path / "_prewarm_flaky.py").write_text(
+        "import sys\n"
+        "if sys.modules['_prewarm_test_gate'].fail:\n"
+        "    raise ImportError('transient failure mid-import')\n"
+        "LOADED = True\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, "_prewarm_flaky", raising=False)
+    monkeypatch.setattr(openai_agents_sdk_harness, "_PREWARM_MODULES", ("_prewarm_flaky",))
+    monkeypatch.setattr(openai_agents_sdk_harness.platform, "platform", lambda: "")
+
+    openai_agents_sdk_harness._prewarm_first_turn()
+
+    assert "_prewarm_flaky" not in sys.modules
+    gate.fail = False
+    assert importlib.import_module("_prewarm_flaky").LOADED is True

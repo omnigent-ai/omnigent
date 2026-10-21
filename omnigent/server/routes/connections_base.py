@@ -70,7 +70,7 @@ class ConnectionHooks(Protocol):
         """Non-secret, provider-specific ``status`` fields (never tokens)."""
 
     def begin(self, request: Request, build_state: Any) -> ConnectStart | None:
-        """Start authorization. ``build_state(extra_claims)`` returns a signed
+        """Start authorization in a worker thread. ``build_state(extra_claims)`` returns a signed
         state string carrying ``extra_claims`` alongside the shared ones. Return
         ``None`` on bad input (e.g. a missing/invalid workspace)."""
 
@@ -158,7 +158,11 @@ def create_connection_router(
             payload["account_generation"] = account_generation(user_id)
             return jwt.encode(payload, key, algorithm=_STATE_ALG)
 
-        start = hooks.begin(request, build_state)
+        try:
+            start = await asyncio.to_thread(hooks.begin, request, build_state)
+        except ConnectionError as exc:
+            _logger.warning("%s connect failed for %s: %s", provider, user_id, exc)
+            return redirect_with_status(provider, clamped, "error")
         if start is None:
             return redirect_with_status(provider, clamped, "error")
         return RedirectResponse(url=start.authorize_url, status_code=302)

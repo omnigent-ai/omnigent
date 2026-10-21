@@ -6,6 +6,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from fastapi import FastAPI
 from starlette.requests import HTTPConnection
 
 from omnigent.runtime.agent_cache import AgentCache
@@ -380,6 +381,90 @@ async def test_me_is_admin_honors_admin_list_before_db_promotion(
     # matching what /auth/users would authorize for the same caller.
     assert resp.status_code == 200
     assert resp.json() == {"user_id": "alice@example.com", "is_admin": True}
+
+
+def _header_app(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    perm_store: SqlAlchemyPermissionStore,
+) -> FastAPI:
+    """Multi-user header-auth app whose admin-list file lists only alice."""
+    from omnigent.server.auth import create_auth_provider
+
+    monkeypatch.setenv("OMNIGENT_AUTH_PROVIDER", "header")
+    monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER", raising=False)
+    admin_file = tmp_path / "admins"
+    admin_file.write_text("alice@example.com\n")
+    monkeypatch.setenv("OMNIGENT_ADMIN_LIST_PATH", str(admin_file))
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return app_module.create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        permission_store=perm_store,
+        auth_provider=create_auth_provider(),
+    )
+
+
+async def test_me_promotes_listed_admin_so_admin_routes_authorize(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Header auth has no login step, so ``/v1/me`` promotes a listed admin.
+
+    Without it, alice would see the Sharing page (``/v1/me`` reports the list)
+    but get 403 from every route that checks only the database flag. Alice has
+    no user row at all, the real header-mode case. Unlisted bob is not
+    promoted, gets no row, and is still refused.
+    """
+    perm_store = SqlAlchemyPermissionStore(db_uri)
+    assert not perm_store.user_exists("alice@example.com")
+    app = _header_app(db_uri, tmp_path, monkeypatch, perm_store)
+    alice = {"X-Forwarded-Email": "alice@example.com"}
+    bob = {"X-Forwarded-Email": "bob@example.com"}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        assert (await client.get("/v1/sharing", headers=alice)).status_code == 403
+        me = await client.get("/v1/me", headers=alice)
+        sharing = await client.get("/v1/sharing", headers=alice)
+        bob_me = await client.get("/v1/me", headers=bob)
+        bob_sharing = await client.get("/v1/sharing", headers=bob)
+
+    assert me.json() == {"user_id": "alice@example.com", "is_admin": True}
+    assert perm_store.is_admin("alice@example.com") is True
+    assert sharing.status_code == 200, sharing.text
+    assert bob_me.json() == {"user_id": "bob@example.com", "is_admin": False}
+    assert not perm_store.user_exists("bob@example.com")
+    assert bob_sharing.status_code == 403
+
+
+async def test_me_still_answers_when_admin_promotion_fails(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed promotion write is logged, not surfaced: ``/v1/me`` still
+    returns 200 and still reports the listed admin, as it did before."""
+    perm_store = SqlAlchemyPermissionStore(db_uri)
+    app = _header_app(db_uri, tmp_path, monkeypatch, perm_store)
+
+    def _fail(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(perm_store, "set_admin", _fail)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        me = await client.get("/v1/me", headers={"X-Forwarded-Email": "alice@example.com"})
+
+    assert me.status_code == 200
+    assert me.json() == {"user_id": "alice@example.com", "is_admin": True}
+    assert perm_store.is_admin("alice@example.com") is False
 
 
 async def test_web_ui_serves_service_worker_uncached(

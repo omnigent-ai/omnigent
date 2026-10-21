@@ -39,8 +39,8 @@ function makeHarness({ captureEvents = false, existingTools = [] } = {}) {
   // global fetch that lets a test capture the posted event bodies. Without
   // them postEvent fails closed (the interrupt tests rely on that).
   const config = captureEvents
-    ? { inboxDir, serverUrl: "http://mock", sessionId: "conv_test" }
-    : { inboxDir };
+    ? { inboxDir, bridgeDir: inboxDir, serverUrl: "http://mock", sessionId: "conv_test" }
+    : { inboxDir, bridgeDir: inboxDir };
   fs.writeFileSync(configPath, JSON.stringify(config));
   process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
 
@@ -487,6 +487,19 @@ async function testSessionStartupDoesNotCompleteATurn() {
   );
 }
 
+async function testSessionStartMarksInputReady() {
+  const h = makeHarness();
+  const marker = path.join(h.inboxDir, "input_ready");
+  assert("input-ready marker is absent before session_start", !fs.existsSync(marker));
+
+  await h.handlers.session_start({}, makeCtx({ idle: true }));
+
+  assert(
+    "session_start writes the input-ready marker once the inbox poller is armed",
+    fs.existsSync(marker) && !!h.pi.__omnigentInboxPoller,
+  );
+}
+
 async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
   const h = makeHarness({ captureEvents: true });
   const ctx = makeCtx({ idle: true });
@@ -549,6 +562,7 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
 (async () => {
   try {
     await testSessionStartupDoesNotCompleteATurn();
+    await testSessionStartMarksInputReady();
     await testQueuedPromptDuringStartupStaysRunningUntilAgentEnd();
     await testRunningIdleShareResponseId();
     await testTaskPlanPublishesTodos();

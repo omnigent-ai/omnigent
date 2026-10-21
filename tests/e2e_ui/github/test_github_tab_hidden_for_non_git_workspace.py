@@ -1,7 +1,7 @@
-"""E2E: the GitHub rail tab stays visible for non-Git workspaces.
+"""E2E: the Pull Requests rail tab stays visible for non-Git workspaces.
 
 Previously the tab was hidden when the runner reported not_a_git_repo, leaving
-users no way to see why GitHub wasn't working.  Now the tab is always shown
+users no way to see why pull requests were not working.  Now the tab is always shown
 (matching the Files gate) and the panel renders a "Not a git repository" empty
 state instead.
 
@@ -37,7 +37,7 @@ def test_github_tab_shows_empty_state_for_non_git_workspace(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """GitHub tab is visible and shows the 'Not a git repository' empty state."""
+    """The Pull Requests tab is visible and shows the 'Not a git repository' empty state."""
     base_url, session_id = seeded_session
     _stub_not_a_git_repo(page)
     page.goto(f"{base_url}/c/{session_id}")
@@ -45,8 +45,8 @@ def test_github_tab_shows_empty_state_for_non_git_workspace(
     open_right_rail(page)
     rail = page.get_by_role("complementary", name="Workspace")
 
-    # The GitHub tab must be present — the panel handles the empty state.
-    github_tab = rail.get_by_role("tab", name="GitHub")
+    # The Pull Requests tab must be present — the panel handles the empty state.
+    github_tab = rail.get_by_role("tab", name="Pull Requests")
     expect(github_tab).to_be_visible(timeout=30_000)
 
     # Clicking it must render the empty state, not crash or show a blank panel.

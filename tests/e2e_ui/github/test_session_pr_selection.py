@@ -146,7 +146,9 @@ def test_session_pr_selection_and_unlink(
     expect(indicator).to_have_accessible_name("2 PRs", timeout=30_000)
     indicator.click()
     rail = page.get_by_role("complementary", name="Workspace")
-    expect(rail.get_by_role("tab", name="GitHub")).to_have_attribute("aria-selected", "true")
+    expect(rail.get_by_role("tab", name="Pull Requests")).to_have_attribute(
+        "aria-selected", "true"
+    )
     picker = rail.get_by_role("combobox", name="Session pull request")
     expect(picker).to_have_text(one_label)
     expect(picker).not_to_have_attribute("title", re.compile(r".*"))
@@ -204,7 +206,7 @@ def test_session_pr_selection_and_unlink(
     expect(page.get_by_role("listbox")).to_have_count(0)
     expect(picker).to_have_text(two_label)
     expect(picker).not_to_have_attribute("title", re.compile(r".*"))
-    expect(rail.get_by_text("Loading GitHub…", exact=True)).to_be_visible()
+    expect(rail.get_by_text("Loading pull requests…", exact=True)).to_be_visible()
     expect(rail.get_by_text("First repository", exact=True)).to_have_count(0)
     assert original_picker.evaluate("element => element.isConnected")
     expect(rail.get_by_role("button", name="Link a PR", exact=True)).to_be_enabled()

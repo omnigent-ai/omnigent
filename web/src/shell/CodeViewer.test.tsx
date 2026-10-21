@@ -1,14 +1,21 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { useFileContent } from "@/hooks/useFileContent";
+import type * as fileContentModule from "@/hooks/useFileContent";
 import type { Comment } from "@/hooks/useComments";
 import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
+import { FileViewerContext } from "./FileViewerContext";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
-import { HTML_PREVIEW_SANDBOX } from "./codeViewerHelpers";
+import { HTML_PREVIEW_SANDBOX, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
+import { highlightCode } from "@/components/ai-elements/code-block";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
+vi.mock("@/hooks/useFileContent", async (importOriginal) => ({
+  ...(await importOriginal<typeof fileContentModule>()),
+  useFileContent: vi.fn(() => ({ data: undefined })),
+}));
 // Stub Shiki so the highlighting effect never fires an async callback that
 // would mutate state after the test cleans up.
 vi.mock("@/components/ai-elements/code-block", () => ({
@@ -20,7 +27,9 @@ vi.mock("./MarkdownRichTextViewer", () => ({ MarkdownRichTextViewer: () => null 
 // Stub the lazy Monaco editor so the heavy monaco-editor bundle isn't loaded in
 // jsdom; its presence in the DOM is the signal that a file was routed to Monaco.
 vi.mock("./MonacoCodeEditor", () => ({
-  MonacoCodeEditor: () => <div data-testid="monaco-editor-stub" />,
+  MonacoCodeEditor: ({ largeMarkdown }: { largeMarkdown?: boolean }) => (
+    <div data-testid="monaco-editor-stub" data-large-markdown={String(!!largeMarkdown)} />
+  ),
 }));
 // Stub the lazy PdfViewer so react-pdf / the pdf.js worker (no PDF engine in
 // jsdom) never load; its testid presence is the signal that a file was routed
@@ -88,6 +97,11 @@ function makePdfQuery(
 
 const noopRef = { current: null };
 
+const MINIMAL_NB = JSON.stringify({
+  nbformat: 4,
+  cells: [{ cell_type: "markdown", metadata: {}, source: ["# Notebook Title\n"] }],
+});
+
 function renderViewer(
   content: string,
   panelOpen = true,
@@ -95,6 +109,8 @@ function renderViewer(
   opts: {
     viewMode?: "editor" | "preview" | "source" | "diff";
     truncated?: boolean;
+    markdownSourceFallback?: boolean;
+    mediaActive?: boolean;
     position?: { line: number };
     onRequestEditMode?: () => void;
   } = {},
@@ -105,6 +121,7 @@ function renderViewer(
   // a .md path to exercise the remaining Shiki path.
   return render(
     <CodeViewer
+      markdownSourceFallback={opts.markdownSourceFallback ?? false}
       position={opts.position}
       conversationId="conv_1"
       path={path}
@@ -113,6 +130,7 @@ function renderViewer(
       activeSelection={null}
       onSetActiveSelection={() => {}}
       panelOpen={panelOpen}
+      mediaActive={opts.mediaActive}
       searchOpen={false}
       setSearchOpen={() => {}}
       searchInputRef={noopRef}
@@ -121,6 +139,20 @@ function renderViewer(
     />,
   );
 }
+
+describe("video previews", () => {
+  it("does not mount a player when the editor remains open in a hidden rail", () => {
+    renderViewer("", true, "demo.webm", { mediaActive: false });
+    expect(screen.queryByRole("button", { name: "Play video: demo.webm" })).toBeNull();
+  });
+
+  it("opens a recording player rather than a source editor or binary notice", () => {
+    renderViewer("", true, "demo.webm");
+    expect(screen.getByRole("button", { name: "Play video: demo.webm" })).toBeVisible();
+    expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+    expect(screen.queryByText(/Preview not available/)).toBeNull();
+  });
+});
 
 /**
  * Dispatches a `copy` event to `document` with a mock clipboardData.
@@ -162,6 +194,7 @@ describe("CodeViewer find-in-file shortcut", () => {
       <>
         <textarea aria-label="Prompt" />
         <CodeViewer
+          markdownSourceFallback={false}
           conversationId="conv_1"
           path="notes.md"
           fileQuery={makeFileQuery("hello")}
@@ -373,10 +406,14 @@ describe("CodeViewer editor routing", () => {
   });
 
   it("keeps markdown source on the Shiki path (not Monaco)", () => {
+    vi.mocked(highlightCode).mockClear();
     renderViewer("# heading", true, "notes.md");
     // Markdown source must NOT route to Monaco — it stays on the Shiki render
     // (TipTap handles markdown editing; Monaco is for non-markdown files).
     expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+    // The preview-only highlight skip must not reach here: markdown source still
+    // tokenizes through Shiki.
+    expect(highlightCode).toHaveBeenCalled();
   });
 });
 
@@ -392,6 +429,101 @@ describe("CodeViewer truncated preview", () => {
   it("shows no banner in markdown preview when not truncated", () => {
     renderViewer("# full file", true, "notes.md", { viewMode: "preview", truncated: false });
     expect(screen.queryByText(/too large to load fully/)).toBeNull();
+  });
+});
+
+const previewOpenFile = vi.fn();
+const PREVIEW_FILE_VIEWER = {
+  openFile: previewOpenFile,
+  openGithubTab: () => {},
+  isChangedPath: () => false,
+  conversationId: "conv_1",
+  workspaceRoot: "/ws",
+  workspaceHome: null,
+};
+
+describe("CodeViewer markdown preview links", () => {
+  const renderPreview = (content: string, path: string) => {
+    previewOpenFile.mockClear();
+    render(
+      <FileViewerContext.Provider value={PREVIEW_FILE_VIEWER}>
+        <CodeViewer
+          markdownSourceFallback={false}
+          conversationId="conv_1"
+          path={path}
+          fileQuery={makeFileQuery(content)}
+          comments={[]}
+          activeSelection={null}
+          onSetActiveSelection={() => {}}
+          panelOpen
+          searchOpen={false}
+          setSearchOpen={() => {}}
+          searchInputRef={noopRef}
+          viewMode="preview"
+        />
+      </FileViewerContext.Provider>,
+    );
+    return previewOpenFile;
+  };
+
+  it("opens a relative link in the FileViewer instead of navigating the app", () => {
+    // As an anchor, `../notes/plan.md` would resolve against `/c/<id>` and load
+    // a session named after the file.
+    const openFile = renderPreview("See [the plan](../notes/plan.md#steps).", "docs/guide.md");
+
+    const link = screen.getByText("the plan");
+    expect(link.getAttribute("href")).toBeNull();
+    fireEvent.click(link);
+
+    expect(openFile).toHaveBeenCalledWith("notes/plan.md");
+  });
+
+  it("opens URLs outside the app window and keeps in-page anchors in place", () => {
+    // A same-window URL navigates the app off its server; the desktop app's
+    // Databricks browser sign-in treats that as a lost session.
+    const openFile = renderPreview(
+      "[docs](https://example.com/docs), [cdn](//cdn.example.com/docs), " +
+        "[mail](mailto:docs@example.com) and [below](#usage)\n\n## Usage",
+      "docs/guide.md",
+    );
+
+    for (const [text, href] of [
+      ["docs", "https://example.com/docs"],
+      ["cdn", "//cdn.example.com/docs"],
+      ["mail", "mailto:docs@example.com"],
+    ]) {
+      const link = screen.getByText(text);
+      expect(link.getAttribute("href")).toBe(href);
+      expect(link.getAttribute("target")).toBe("_blank");
+      expect(link.getAttribute("rel")).toBe("noopener noreferrer");
+    }
+    const anchor = screen.getByText("below");
+    expect(anchor.getAttribute("href")).toBe("#usage");
+    expect(anchor.getAttribute("target")).toBeNull();
+    expect(openFile).not.toHaveBeenCalled();
+  });
+
+  it("follows a URL click the way chat links do", () => {
+    const followed: HTMLAnchorElement[] = [];
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      followed.push(this);
+    });
+    const popupDocument = document.implementation.createHTMLDocument();
+    const openSpy = vi
+      .spyOn(window, "open")
+      .mockReturnValue({ opener: window, document: popupDocument } as Window);
+
+    renderPreview("[docs](https://example.com/docs)", "docs/guide.md");
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 });
+    screen.getByText("docs").dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(openSpy).toHaveBeenCalledWith("about:blank", "_blank");
+    expect(followed.map((link) => [link.ownerDocument, link.href])).toEqual([
+      [popupDocument, "https://example.com/docs"],
+    ]);
   });
 });
 
@@ -688,6 +820,86 @@ describe("CodeViewer HTML preview sandbox", () => {
   });
 });
 
+describe("CodeViewer rendered previews skip Shiki highlighting", () => {
+  // Rendered previews use their own surfaces and never consume Shiki tokens, so
+  // tokenizing the whole file is wasted work that can freeze a large file.
+
+  it("does not tokenize the file when rendering the HTML preview", () => {
+    vi.mocked(highlightCode).mockClear();
+    const { container } = renderViewer(
+      "<!doctype html><html><body><p>hello</p></body></html>",
+      true,
+      "report.html",
+      { viewMode: "preview" },
+    );
+    expect(container.querySelector('iframe[title="HTML preview"]')).not.toBeNull();
+    expect(highlightCode).not.toHaveBeenCalled();
+  });
+
+  it("tokenizes markdown only on entering source view, not across preview transitions", () => {
+    const fileQuery = makeFileQuery("# heading");
+    const build = (viewMode: "preview" | "source") => (
+      <CodeViewer
+        markdownSourceFallback={false}
+        conversationId="conv_1"
+        path="notes.md"
+        fileQuery={fileQuery}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+        panelOpen
+        searchOpen={false}
+        setSearchOpen={() => {}}
+        searchInputRef={noopRef}
+        viewMode={viewMode}
+      />
+    );
+    vi.mocked(highlightCode).mockClear();
+    const { rerender } = render(build("preview"));
+    expect(highlightCode).not.toHaveBeenCalled();
+
+    rerender(build("source"));
+    expect(highlightCode).toHaveBeenCalled();
+
+    vi.mocked(highlightCode).mockClear();
+    rerender(build("preview"));
+    expect(highlightCode).not.toHaveBeenCalled();
+  });
+
+  // `.ipynb` and `.txt` both detect as "text", so only the notebook path makes
+  // this a rendered preview; toggling it must start and stop highlighting even
+  // though the language never changes.
+  it("toggles highlighting when notebook eligibility changes with the language unchanged", () => {
+    const fileQuery = makeFileQuery(MINIMAL_NB);
+    const build = (path: string) => (
+      <CodeViewer
+        markdownSourceFallback={false}
+        conversationId="conv_1"
+        path={path}
+        fileQuery={fileQuery}
+        comments={[]}
+        activeSelection={null}
+        onSetActiveSelection={() => {}}
+        panelOpen
+        searchOpen={false}
+        setSearchOpen={() => {}}
+        searchInputRef={noopRef}
+        viewMode="preview"
+      />
+    );
+    vi.mocked(highlightCode).mockClear();
+    const { rerender } = render(build("analysis.ipynb"));
+    expect(highlightCode).not.toHaveBeenCalled();
+
+    rerender(build("analysis.txt"));
+    expect(highlightCode).toHaveBeenCalled();
+
+    vi.mocked(highlightCode).mockClear();
+    rerender(build("analysis.ipynb"));
+    expect(highlightCode).not.toHaveBeenCalled();
+  });
+});
+
 describe("CodeViewer image rendering", () => {
   // jsdom implements neither URL.createObjectURL nor revokeObjectURL; ImageViewer
   // calls both, so stub them and capture the blob it encodes.
@@ -711,6 +923,7 @@ describe("CodeViewer image rendering", () => {
   function renderImage(contentType: string, path = "logo.png", truncated = false) {
     return render(
       <CodeViewer
+        markdownSourceFallback={false}
         conversationId="conv_1"
         path={path}
         fileQuery={makeImageQuery(contentType, truncated)}
@@ -756,6 +969,7 @@ describe("CodeViewer image rendering", () => {
     render(
       <ImageLightboxProvider>
         <CodeViewer
+          markdownSourceFallback={false}
           conversationId="conv_1"
           path="assets/logo.png"
           fileQuery={makeImageQuery("image/png")}
@@ -795,6 +1009,7 @@ describe("CodeViewer PDF routing", () => {
   ) {
     return render(
       <CodeViewer
+        markdownSourceFallback={false}
         conversationId="conv_1"
         path={path}
         fileQuery={makePdfQuery(contentType, truncated)}
@@ -872,6 +1087,7 @@ describe("CodeViewer 3D model routing", () => {
   function renderModel(path: string, encoding: "base64" | "utf-8", contentType: string | null) {
     return render(
       <CodeViewer
+        markdownSourceFallback={false}
         conversationId="conv_1"
         path={path}
         fileQuery={makeModelQuery(encoding, contentType)}
@@ -923,11 +1139,6 @@ describe("CodeViewer 3D model routing", () => {
 });
 
 describe("CodeViewer .ipynb routing", () => {
-  const MINIMAL_NB = JSON.stringify({
-    nbformat: 4,
-    cells: [{ cell_type: "markdown", metadata: {}, source: ["# Notebook Title\n"] }],
-  });
-
   it("renders the notebook preview in preview mode", () => {
     renderViewer(MINIMAL_NB, true, "analysis.ipynb", { viewMode: "preview" });
     expect(screen.getByRole("heading", { name: "Notebook Title" })).toBeDefined();
@@ -984,3 +1195,17 @@ it.each([true, false])(
     }
   },
 );
+
+describe("large Markdown source fallback", () => {
+  it.each(["editor", "preview", "source"] as const)("uses Monaco in %s mode", async (viewMode) => {
+    vi.mocked(highlightCode).mockClear();
+    renderViewer("a".repeat(MAX_RICH_MARKDOWN_BYTES + 1), true, "large.md", {
+      viewMode,
+      markdownSourceFallback: true,
+    });
+    expect(await screen.findByTestId("monaco-editor-stub")).toBeVisible();
+    expect(screen.getByTestId("monaco-editor-stub")).toHaveAttribute("data-large-markdown", "true");
+    expect(highlightCode).not.toHaveBeenCalled();
+    expect(screen.queryByText(/too large to load fully/)).not.toBeInTheDocument();
+  });
+});

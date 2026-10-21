@@ -15,6 +15,7 @@ from omnigent.runner.app import _build_spawn_env_from_spec
 from omnigent.runtime import get_agent_cache, get_agent_store, get_conversation_store
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes._sessions.helpers import _load_agent_spec_for_session
+from tests._helpers.providers import isolate_provider_resolution
 from tests.server.helpers import build_agent_bundle, create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -29,9 +30,7 @@ _UNLISTED = "another-model"
 @pytest.fixture(autouse=True)
 def _isolated_provider_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Use synthetic provider configuration without ambient credentials or network discovery."""
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
-    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
-    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    isolate_provider_resolution(monkeypatch, tmp_path)
     providers: dict[str, Any] = {}
     for name, default, alternate in (
         ("curated", _DEFAULT, _ALTERNATE),
@@ -577,3 +576,74 @@ async def test_unloadable_bundle_rejects_model_patch_without_mutation(
     assert after.title == before.title
     assert after.labels == before.labels
     assert orchestration._model_options_cache[session_id] == cached
+
+
+@pytest.mark.parametrize("selected_model", [None, _ALTERNATE, _UNLISTED])
+async def test_create_ignores_server_acp_default_for_remote_selection(
+    client: httpx.AsyncClient, tmp_path: Path, selected_model: str | None
+) -> None:
+    agent = await create_test_agent(client, executor=_executor(), include_llm=False)
+    path = tmp_path / "config.yaml"
+    config = yaml.safe_load(path.read_text())
+    config["acp"]["agents"] = [
+        {"name": "Synthetic", "command": "synthetic-acp", "model": _UNLISTED},
+        {"name": "Goose", "command": "server-goose", "model": _UNLISTED},
+    ]
+    path.write_text(yaml.safe_dump(config))
+    store = get_conversation_store()
+    before = {conv.id for conv in store.list_conversations().data}
+    response = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "harness_override": "acp:goose",
+            "model_override": selected_model,
+        },
+    )
+    if selected_model == _UNLISTED:
+        assert response.status_code == 400, response.text
+        assert {conv.id for conv in store.list_conversations().data} == before
+        return
+    assert response.status_code == 201, response.text
+    # The runner has a different command and an allowed default for the same name.
+    config["acp"]["agents"] = [{"name": "Goose", "command": "runner-goose", "model": _DEFAULT}]
+    path.write_text(yaml.safe_dump(config))
+    conv = store.get_conversation(response.json()["id"])
+    spec = _load_agent_spec_for_session(conv, get_agent_store())
+    env = _build_spawn_env_from_spec(
+        spec, conv.harness_override, model_override=conv.model_override
+    )
+    assert env["HARNESS_ACP_COMMAND"] == "runner-goose"
+    assert env["HARNESS_ACP_MODEL"] == (selected_model or _DEFAULT)
+
+
+@pytest.mark.parametrize("model", [_ALTERNATE, "default"])
+async def test_patch_ignores_server_acp_default(
+    client: httpx.AsyncClient, tmp_path: Path, model: str
+) -> None:
+    agent = await create_test_agent(client, executor=_executor(), include_llm=False)
+    path = tmp_path / "config.yaml"
+    config = yaml.safe_load(path.read_text())
+    config["acp"]["agents"][0]["model"] = _UNLISTED
+    path.write_text(yaml.safe_dump(config))
+    response = await client.patch(
+        f"/v1/sessions/{agent['_session_id']}", json={"model_override": model, "silent": True}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["model_override"] == (None if model == "default" else model)
+
+
+async def test_multipart_ignores_server_acp_default(
+    client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    path = tmp_path / "config.yaml"
+    config = yaml.safe_load(path.read_text())
+    config["acp"]["agents"][0]["model"] = _UNLISTED
+    path.write_text(yaml.safe_dump(config))
+    bundle = build_agent_bundle("remote-acp", executor=_executor(), include_llm=False)
+    response = await client.post(
+        "/v1/sessions",
+        data={"metadata": "{}"},
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    assert response.status_code == 201, response.text

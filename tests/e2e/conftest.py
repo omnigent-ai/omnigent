@@ -54,6 +54,9 @@ from tests._helpers.compat import (
     runner_executable,
     server_executable,
 )
+from tests._helpers.live_server import find_free_port
+from tests._helpers.operator_agents import operator_agent_store, post_operator_session
+from tests._helpers.session import post_session_bundle
 from tests._model_pools import current_attempt, resolve_model
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
 from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S, lookup_databricks_host
@@ -194,19 +197,6 @@ _SYS_TERMINAL_TEST_DIR = _REPO_ROOT / "tests" / "resources" / "agents" / "sys-te
 # only binds built-in agents, and plain (not the polly supervisor) so a
 # recall assertion isn't flaky.
 _SDK_CHAT_BUILTIN_SPEC = _REPO_ROOT / "tests" / "resources" / "agents" / "sdk-chat-builtin.yaml"
-
-
-def find_free_port() -> int:
-    """
-    Find a free TCP port by binding to port 0.
-
-    :returns: An available port number.
-    """
-    import socket
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def wait_for_server(base_url: str, timeout: float = 20.0) -> None:
@@ -820,7 +810,7 @@ def live_server(
                 and status_resp.json()["online"] is True
             ):
                 break
-        except httpx.ConnectError:
+        except httpx.TransportError:
             pass
         time.sleep(POLL_INTERVAL_S)
     else:
@@ -850,7 +840,8 @@ def live_server(
         )
 
     try:
-        yield base_url
+        with operator_agent_store(base_url, f"sqlite:///{db_path}", artifact_dir):
+            yield base_url
     finally:
         runner_proc = _live_runner_state.get("process", runner_proc)
         if runner_proc.poll() is None:
@@ -962,6 +953,7 @@ def upload_agent(
     *,
     rewrite_model_for_databricks: bool = False,
     databricks_profile: str | None = None,
+    operator_authored: bool = False,
 ) -> str:
     """
     Upload an agent bundle via multipart ``POST /v1/sessions``.
@@ -984,6 +976,7 @@ def upload_agent(
         no profile and 401; harness agents that already carry a
         profile are left untouched. Only applied when
         ``rewrite_model_for_databricks`` is True.
+    :param operator_authored: Register through local stores like ``server --agent``.
     :returns: The agent name.
     """
     bundle = build_agent_bundle(
@@ -991,21 +984,11 @@ def upload_agent(
         rewrite_model_for_databricks=rewrite_model_for_databricks,
         databricks_profile=databricks_profile,
     )
-    import json as _json
 
-    resp = client.post(
-        "/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={
-            "bundle": (
-                "agent.tar.gz",
-                bundle,
-                "application/gzip",
-            ),
-        },
-        # First-party sentinel Origin so the multipart create passes the
-        # require_trusted_origin guard regardless of which client is passed.
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    # Announce the caller as first-party so trusted-Origin checks stay active.
+    provision = post_operator_session if operator_authored else post_session_bundle
+    resp = provision(
+        client.post, "/v1/sessions", bundle, headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
     )
     if resp.status_code == 409:
         return agent_dir.name
@@ -1027,12 +1010,14 @@ def register_inline_agent(
     mock_llm_base_url: str | None = None,
     builtin_tools: list[str] | None = None,
     extra_config: dict[str, Any] | None = None,
+    operator_authored: bool = False,
 ) -> str:
     """
     Register a single-file omnigent agent built in-memory.
 
     Tarballs a minimal ``<name>.yaml`` (no directory on disk) and
-    uploads it via multipart ``POST /v1/sessions``. Idempotent: a
+    uploads it via multipart ``POST /v1/sessions`` by default. Operator-owned
+    fixtures can opt into local registration. Idempotent: a
     409 (already registered from a prior parametrize row against the
     same session-scoped server) is treated as success. The model is
     load-balanced via :func:`tests._model_pools.resolve_model`.
@@ -1051,10 +1036,10 @@ def register_inline_agent(
     :param extra_config: When set, top-level keys shallow-merged into
         the agent YAML before upload (e.g. ``tools`` and ``policies``).
         ``name``/``prompt``/``executor`` stay helper-controlled.
+    :param operator_authored: Register through local stores like ``server --agent``.
     :returns: The agent name (use the return value, not the *name*
         argument, they differ on rerun attempts).
     """
-    import json as _json
 
     attempt = current_attempt()
     if attempt > 0:
@@ -1095,13 +1080,10 @@ def register_inline_agent(
             tar.addfile(info, io.BytesIO(yaml_bytes))
         bundle = buf.getvalue()
 
-    resp = client.post(
-        "/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        # First-party sentinel Origin so the multipart create passes the
-        # require_trusted_origin guard regardless of which client is passed.
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    # Announce the caller as first-party so trusted-Origin checks stay active.
+    provision = post_operator_session if operator_authored else post_session_bundle
+    resp = provision(
+        client.post, "/v1/sessions", bundle, headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
     )
     # 409 = already registered by a prior parametrize row against the
     # same session-scoped server; treat as success. Explicit raise (not
@@ -1122,16 +1104,11 @@ def register_dir_agent_with_mock_llm(
     mock_llm_base_url: str,
 ) -> str:
     """
-    Register a directory-bundle agent that ships its function tools as
-    Python source under ``tools/python/``, routed at a mock LLM.
+    Register an operator-owned directory bundle routed at a mock LLM.
 
-    Unlike :func:`register_inline_agent` (a single ``<name>.yaml`` whose
-    tool callables are dotted import paths), this tars *agent_dir* — whose
-    ``tools/python/*.py`` files the server loads by absolute file path from
-    the unpacked bundle (auto-discovered, like the ``archer`` fixture). So
-    the tools resolve on any server version without the server importing
-    the repo's ``tests/`` tree — the server-version backwards-compat failure
-    mode that dotted ``tests.*`` callables hit when the server is isolated.
+    Python source tools require trusted registration, like ``server --agent``.
+    The live-server fixture supplies its own stores; the HTTP session create
+    references the registered agent by id.
 
     The bundle's ``config.yaml`` is stamped per call: ``name`` and
     ``executor.model`` are overridden and an ``executor.auth`` api-key block
@@ -1146,7 +1123,6 @@ def register_dir_agent_with_mock_llm(
     :param mock_llm_base_url: Mock server base URL including ``/v1``.
     :returns: The registered agent name (use the return value, not *name*).
     """
-    import json as _json
 
     attempt = current_attempt()
     if attempt > 0:
@@ -1176,11 +1152,8 @@ def register_dir_agent_with_mock_llm(
                 tar.add(str(entry), arcname=str(entry.relative_to(agent_dir)))
         bundle = buf.getvalue()
 
-    resp = client.post(
-        "/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    resp = post_operator_session(
+        client.post, "/v1/sessions", bundle, headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
     )
     if resp.status_code not in (200, 201, 409):
         raise RuntimeError(f"dir-agent register failed: {resp.status_code} {resp.text[:500]}")
@@ -1380,6 +1353,7 @@ def archer_agent(http_client: httpx.Client, databricks_workspace_host: str | Non
     return upload_agent(
         http_client,
         _ARCHER_DIR,
+        operator_authored=True,
         rewrite_model_for_databricks=databricks_workspace_host is not None,
     )
 

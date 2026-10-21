@@ -1,3 +1,4 @@
+import { testAgent } from "@/test/agentFixtures";
 import type * as ReactRouterDomModule from "react-router-dom";
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -24,22 +25,12 @@ const useAvailableAgentsMock = vi.mocked(useAvailableAgents);
 const createSessionMock = vi.mocked(createSession);
 
 const AGENTS: AvailableAgent[] = [
-  {
-    id: "ag_claude",
-    name: "claude-native-ui",
+  testAgent("ag_claude", "claude-native-ui", {
     display_name: "Claude Code",
     description: "Claude Code agent",
     harness: "claude-native",
-    skills: [],
-  },
-  {
-    id: "ag_codex",
-    name: "codex",
-    display_name: "codex",
-    description: null,
-    harness: "codex",
-    skills: [],
-  },
+  }),
+  testAgent("ag_codex", "codex", { display_name: "codex", harness: "codex" }),
 ];
 
 function mockAgents(agents: AvailableAgent[]) {

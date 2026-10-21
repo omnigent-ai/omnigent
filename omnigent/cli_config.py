@@ -295,7 +295,7 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
 
 def _run_configure_databricks() -> None:
     """
-    Configure coding harnesses to use Databricks Unity AI Gateway.
+    Configure coding harnesses to use Databricks Unity Gateway.
 
     Shells out to ``ucode configure`` to authenticate workspaces and set
     up harnesses (Claude SDK, Codex, OpenAI Agents, Pi). After setup,
@@ -565,8 +565,10 @@ def _family_credential_label(  # type: ignore[explicit-any]  # config is a yaml-
     :returns: A human label, e.g. ``"Anthropic API Key ($ANTHROPIC_API_KEY)"``
         when disambiguation applies, else ``"Anthropic API Key"``.
     """
-    from omnigent.onboarding.provider_config import KEY_KIND
+    from omnigent.onboarding.provider_config import GATEWAY_KIND, GEMINI_FAMILY, KEY_KIND
 
+    if family == GEMINI_FAMILY and entry.kind == GATEWAY_KIND:
+        return name
     base = _credential_label(name, entry)
     if entry.kind != KEY_KIND or _family_key_count(config, family) <= 1:
         return base
@@ -616,6 +618,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         CHAT_WIRE_API,
         CLI_CONFIG_KIND,
         DATABRICKS_KIND,
+        GEMINI_FAMILY,
         OPENAI_FAMILY,
         PI_SURFACE,
         RESPONSES_WIRE_API,
@@ -638,7 +641,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
     # harness, the menu is scoped to that harness's surface.
     options = add_menu_options_for_family(family) if family is not None else add_menu_options()
     # A custom provider defined by the user's own ~/.codex/config.toml
-    # (e.g. isaac's Databricks AI Gateway) that is not currently configured
+    # (e.g. isaac's Databricks Unity Gateway) that is not currently configured
     # gets its own add option. This is the only way back after Remove —
     # removal dismisses the detection so it stops auto-adopting, and there
     # is nothing to type/paste here (the credential lives in that file).
@@ -766,12 +769,16 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         # requires an explicit model id.
         from omnigent.onboarding.providers import default_chat_model
 
-        catalog_default = default_chat_model(provider)
+        catalog_default = default_chat_model(provider) if family != GEMINI_FAMILY else None
         # default=catalog_default (str | None): a known provider pre-fills its
         # default (blank-enter accepts it); an unknown provider has no default,
         # so the user types a model id. ``.strip() or None`` keeps an
         # all-whitespace entry from becoming a bogus pin.
-        typed = prompt_text("Default model", default=catalog_default)
+        typed = (
+            prompt_text("agy model (--model value; leave empty for agy default)", default="")
+            if family == GEMINI_FAMILY
+            else prompt_text("Default model", default=catalog_default)
+        )
         default_model = typed.strip() or None
 
         # A third-party OpenAI-compatible vendor (OpenRouter, Groq, …) is
@@ -786,6 +793,24 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         else:
             base_url = default_base_url_for_family(family)
             key_wire_api = None
+        if family == GEMINI_FAMILY and api_key_ref in {
+            "env:GEMINI_API_KEY",
+            "env:OMNIGENT_GEMINI_API_KEY",
+        }:
+            from omnigent.errors import OmnigentError
+            from omnigent.onboarding.gemini_gateway import (
+                GEMINI_BASE_URL_ENV,
+                validate_gemini_base_url,
+            )
+            from omnigent.util.env_credentials import getenv_nonempty_with_omnigent_prefix
+
+            ambient_endpoint = getenv_nonempty_with_omnigent_prefix(GEMINI_BASE_URL_ENV)
+            if ambient_endpoint is not None:
+                try:
+                    base_url = validate_gemini_base_url(ambient_endpoint[1])
+                except OmnigentError as exc:
+                    click.echo(str(exc))
+                    return None
         entry = build_key_provider_entry(
             family=family,
             base_url=base_url,
@@ -847,32 +872,59 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         entry = build_subscription_provider_entry(cli_name)
 
     elif kind == "gateway":
-        name = prompt_text("Name for this gateway", default="gateway")
-        base_url = prompt_text("Gateway base_url (OpenAI/Anthropic-compatible)")
-        pasted = prompt_text("Gateway API key", hide_input=True)
-        secret_store.store_secret(name, pasted)
-        # Which harness surfaces — one clear pick instead of two y/n prompts.
-        # (These are *harness* surfaces: Codex/OpenAI → codex + openai-agents;
-        # Claude/Anthropic → claude-sdk + native-claude.)
-        surface_choice = select(
-            "Which harnesses can this gateway drive?",
-            [
-                "Both Claude and Codex",
-                "Codex / OpenAI only (codex, openai-agents)",
-                "Claude only (claude-sdk, native-claude)",
-            ],
-            default=0,
-            clear_on_exit=True,
-        )
-        if surface_choice < 0:  # Esc — abort the add
+        gemini_gateway = family == GEMINI_FAMILY
+        if gemini_gateway:
+            from omnigent.errors import OmnigentError
+            from omnigent.onboarding.gemini_gateway import validate_gemini_base_url
+
+            console.print(
+                "  [dim]Requires the native Gemini API and x-goog-api-key authentication. "
+                "OpenAI Responses / Chat Completions endpoints are not supported. "
+                "The gateway must serve agy's main and auxiliary Gemini models. "
+                "For Databricks, go back and choose Databricks — profile.[/dim]"
+            )
+            name = prompt_text("Gateway label (e.g. team-gemini)", default="gateway")
+            while True:
+                entered = prompt_text(
+                    "Gemini gateway API root (without /v1beta or /openai; empty to go back)",
+                    default="",
+                )
+                if not entered.strip():
+                    return None
+                try:
+                    base_url = validate_gemini_base_url(entered)
+                except OmnigentError as exc:
+                    console.print(f"  [red]{exc.message}[/red]")
+                else:
+                    break
+        else:
+            name = prompt_text("Name for this gateway", default="gateway")
+            base_url = prompt_text("Gateway base_url (OpenAI/Anthropic-compatible)")
+        pasted = prompt_text("Gateway API key", hide_input=True).strip()
+        if not pasted:
             return None
-        families = (
-            [OPENAI_FAMILY, ANTHROPIC_FAMILY]
-            if surface_choice == 0
-            else [OPENAI_FAMILY]
-            if surface_choice == 1
-            else [ANTHROPIC_FAMILY]
-        )
+        if gemini_gateway:
+            families = [GEMINI_FAMILY]
+        else:
+            surface_choice = select(
+                "Which harnesses can this gateway drive?",
+                [
+                    "Both Claude and Codex",
+                    "Codex / OpenAI only (codex, openai-agents)",
+                    "Claude only (claude-sdk, native-claude)",
+                ],
+                default=0,
+                clear_on_exit=True,
+            )
+            if surface_choice < 0:
+                return None
+            families = (
+                [OPENAI_FAMILY, ANTHROPIC_FAMILY]
+                if surface_choice == 0
+                else [OPENAI_FAMILY]
+                if surface_choice == 1
+                else [ANTHROPIC_FAMILY]
+            )
         # Wire protocol for the OpenAI surface: OpenAI / LiteLLM speak the
         # Responses API; OpenRouter and many OSS-model gateways are
         # Chat-Completions-only. Picking wrong makes every turn fail (the
@@ -909,6 +961,11 @@ def _configure_harness_add(family: str | None = None) -> str | None:
             models[ANTHROPIC_FAMILY] = prompt_text(
                 "Default model for the Claude surface (the gateway's Claude model id)"
             ).strip()
+        if GEMINI_FAMILY in families:
+            models[GEMINI_FAMILY] = prompt_text(
+                "agy model (--model value; leave empty for agy default)", default=""
+            ).strip()
+        secret_store.store_secret(name, pasted)
         entry = build_gateway_provider_entry(
             base_url=base_url,
             api_key_ref=f"keychain:{name}",
@@ -950,6 +1007,40 @@ def _configure_harness_add(family: str | None = None) -> str | None:
             api_key_ref=api_key_ref,
             default_model=default_model,
         )
+
+    elif kind == DATABRICKS_KIND and family == GEMINI_FAMILY:
+        from shlex import quote
+
+        from rich.markup import escape
+
+        from omnigent.errors import OmnigentError
+        from omnigent.harnesses.antigravity_native.credentials import databricks_token_source
+        from omnigent.onboarding.databricks_config import (
+            DATABRICKS_EXTRA_INSTALL_HINT,
+            databricks_sdk_installed,
+        )
+
+        if not databricks_sdk_installed():
+            console.print(f"  [red]{escape(DATABRICKS_EXTRA_INSTALL_HINT)}[/red]")
+            return None
+        profile = prompt_text(
+            "Databricks profile (from ~/.databrickscfg; empty to go back)"
+        ).strip()
+        if not profile:
+            return None
+        try:
+            credentials = databricks_token_source(profile)
+            credentials.resolve()
+        except (OmnigentError, OSError, ValueError):
+            console.print(
+                f"  [red]Could not authenticate Databricks profile {escape(profile)!r}. "
+                "Check the profile configuration. For CLI OAuth, sign in again with "
+                f"`databricks auth login --profile {escape(quote(profile))}`.[/red]"
+            )
+            return None
+        name = f"databricks-gemini-{profile}"
+        entry = {**build_databricks_provider_entry(profile), "native_gemini": True}
+        console.print("  Gemini model availability is checked when agy starts.")
 
     else:  # databricks
         # Gate on the `databricks` extra: a `kind: databricks` provider mints
@@ -998,7 +1089,7 @@ def _configure_harness_add(family: str | None = None) -> str | None:
         _routed = f"{family_label(family)}'s" if family is not None else "your harnesses'"
         console.print(
             f"  [dim]Routes {_routed} model calls through this workspace's "
-            "Databricks Unity AI Gateway (via ucode), so usage is governed and "
+            "Databricks Unity Gateway (via ucode), so usage is governed and "
             "billed there. This signs you into the workspace and runs "
             "`ucode configure` for it.[/dim]"
         )
@@ -1184,7 +1275,7 @@ def _claude_managed_gateway_label() -> str | None:
     When Claude Code's own settings deliver a gateway credential (enterprise
     ``ANTHROPIC_BASE_URL`` + ``apiKeyHelper``), the Claude "subscription" the
     machine really carries is that gateway, so setup names it as such (e.g.
-    ``"Databricks AI Gateway"``) instead of the generic ``"Subscription"``.
+    ``"Databricks Unity Gateway"``) instead of the generic ``"Subscription"``.
     Purely a display derivation from live managed settings — nothing persisted.
 
     :returns: The gateway label, or ``None`` when no managed credential is present.
@@ -1225,7 +1316,7 @@ def _compact_credential_label(det: DetectedProvider) -> str:
         brand = _CLI_LOGIN_BRAND.get(det.name, det.name)
         return f"{brand} Subscription"
     # A cli-config detection carries the provider's own display name
-    # ("Databricks AI Gateway"); other kinds ignore the keyword.
+    # ("Databricks Unity Gateway"); other kinds ignore the keyword.
     return credential_label(det.kind, det.name, display_name=det.display_name)
 
 
@@ -1339,7 +1430,7 @@ def _credential_label(name: str, entry: ProviderEntry) -> str:
     from omnigent.onboarding.provider_config import SUBSCRIPTION_KIND
 
     # A Claude subscription whose real backing is Claude Code's managed-settings
-    # gateway reads as that gateway (e.g. "Databricks AI Gateway") rather than
+    # gateway reads as that gateway (e.g. "Databricks Unity Gateway") rather than
     # the generic "Subscription", so the credential the user recognizes is named
     # — the Claude analogue of the "Codex-Databricks" row. Display only; the
     # persisted entry stays a plain subscription (no new shape on disk).
@@ -1818,10 +1909,8 @@ def _prompt_install_antigravity() -> str | None:
 def _manage_antigravity_harness() -> None:
     """Run the level-2 loop for Antigravity auth.
 
-    Antigravity can authenticate either through the native ``agy`` auth service
-    (Google sign-in for ``antigravity-native``) or through a Gemini API key for
-    the in-process SDK harness. The API key is stored in the secret store and
-    referenced from the ``antigravity:`` config block.
+    Native agy supports its own Google sign-in or a shared Gemini provider.
+    The legacy key in ``antigravity:`` remains usable by native agy and the SDK.
 
     When both the optional ``google-antigravity`` SDK and ``agy`` are missing,
     the drill-in first offers to install the SDK
@@ -1829,8 +1918,7 @@ def _manage_antigravity_harness() -> None:
     to the auth choices so SDK setup never hides the native sign-in path.
 
     :returns: None. Side effects: may launch ``agy``, install the
-        ``antigravity`` extra, and write the ``antigravity:`` config block and
-        secret store.
+        ``antigravity`` extra, and write provider/Antigravity config and secrets.
     """
     from omnigent.onboarding import secrets as secret_store
     from omnigent.onboarding.antigravity_auth import (
@@ -1848,7 +1936,7 @@ def _manage_antigravity_harness() -> None:
         harness_login,
     )
     from omnigent.onboarding.interactive import select
-    from omnigent.onboarding.provider_config import GEMINI_FAMILY
+    from omnigent.onboarding.provider_config import GEMINI_FAMILY, surface_default_provider
 
     # Offer the install once on entry (not per loop iteration); the returned status
     # seeds the menu's transient status line.
@@ -1884,6 +1972,7 @@ def _manage_antigravity_harness() -> None:
             spec = harness_install_spec(GEMINI_FAMILY)
             hint = spec.install_hint if spec is not None and spec.install_hint else "install agy"
             rows.append(_HarnessMenuRow(f"Install agy first ({hint})", action="show_install"))
+        rows.append(_HarnessMenuRow("Configure native agy API key / gateway", action="providers"))
         rows.append(_HarnessMenuRow("← Back", action="back"))
 
         auth_bits: list[str] = []
@@ -1894,6 +1983,12 @@ def _manage_antigravity_harness() -> None:
         else:
             auth_bits.append("agy not installed")
         auth_bits.append("Gemini API key configured" if key_set else "no Gemini API key")
+        native_provider = surface_default_provider(config, GEMINI_FAMILY)
+        if native_provider is not None:
+            label = _family_credential_label(
+                config, GEMINI_FAMILY, native_provider.name, native_provider
+            )
+            auth_bits.append(f"native agy: {label}")
         header = f"Antigravity — {' · '.join(auth_bits)}"
         idx = select(header, [r.label for r in rows], clear_on_exit=True, status=status)
         if idx < 0:  # Esc / q
@@ -1913,6 +2008,8 @@ def _manage_antigravity_harness() -> None:
                 if harness_login(GEMINI_FAMILY)
                 else "✗ Antigravity sign-in not detected"
             )
+        elif action == "providers":
+            _manage_harness_providers(GEMINI_FAMILY)
         elif action == "set_key":
             status = _set_antigravity_api_key()
         elif action == "remove_key":
@@ -3125,7 +3222,7 @@ def _manage_credential(provider: str, family: str) -> str | None:
     # harness configs outside ~/.omnigent/config.yaml — so removing it
     # also cleans those edits up (otherwise codex keeps routing through
     # the workspace gateway).
-    if entry.kind == DATABRICKS_KIND:
+    if entry.kind == DATABRICKS_KIND and not entry.native_gemini:
         return _remove_databricks_provider(provider)
     return _remove_credential(provider)
 
@@ -3568,6 +3665,33 @@ def _manage_opencode_harness() -> None:
             status = None
 
 
+def _repair_conflicting_provider_defaults() -> bool:
+    """Resolve ambiguous defaults before adoption or menu construction; allow cancellation."""
+    from rich.markup import escape
+
+    from omnigent.onboarding.configure_models import family_label
+    from omnigent.onboarding.interactive import select
+    from omnigent.onboarding.provider_config import load_providers
+
+    entries = load_providers(_load_global_config())
+    families = sorted({family for entry in entries.values() for family in entry.default_families})
+    for family in families:
+        candidates = sorted(
+            name for name, entry in entries.items() if family in entry.default_families
+        )
+        if len(candidates) < 2:
+            continue
+        choice = select(
+            f"Multiple defaults for {family_label(family)} — choose one to keep",
+            [escape(name) for name in candidates],
+        )
+        if choice < 0:
+            click.echo("Default conflict left unresolved. Run omni setup again to choose.")
+            return False
+        _set_harness_default(candidates[choice], family)
+    return True
+
+
 def _run_configure_harnesses_interactive() -> None:
     """Run the interactive model/credential three-level picker.
 
@@ -3645,6 +3769,8 @@ def _run_configure_harnesses_interactive() -> None:
     # what was auto-configured and from where. No progress spinner here: a
     # transient spinner over the (fast) detection left a cleared-region gap and
     # a residual line directly above the menu on first paint.
+    if not _repair_conflicting_provider_defaults():
+        return
     _adopt_ambient_credentials()
 
     # Level 1: pick a harness. The cursor moves between Claude, Codex, Pi, and
@@ -3880,8 +4006,26 @@ def _run_configure_harnesses_interactive() -> None:
 
         rows.append(_family_row(PI_SURFACE))
 
-        # Antigravity — native agy sign-in OR Gemini key (SDK extra is soft, like Cursor).
-        if antigravity_api_key_configured(config) or any(
+        # Native providers resolve independently of the SDK's legacy API key.
+        from omnigent.harnesses.antigravity_native.credentials import antigravity_credentials_ready
+        from omnigent.onboarding.provider_config import surface_default_provider
+
+        agy_provider = surface_default_provider(config, GEMINI_FAMILY)
+        if agy_provider is not None:
+            agy_ready = harness_cli_installed(GEMINI_FAMILY) and antigravity_credentials_ready()
+            label = _family_credential_label(
+                config, GEMINI_FAMILY, agy_provider.name, agy_provider
+            )
+            rows.append(
+                (
+                    _ANTIGRAVITY,
+                    "Antigravity",
+                    label if agy_ready else "Credential needs setup",
+                    "ready" if agy_ready else "warn",
+                    "Open to configure native agy credentials.",
+                )
+            )
+        elif antigravity_api_key_configured(config) or any(
             os.environ.get(v) for v in ANTIGRAVITY_ENV_VARS
         ):
             rows.append((_ANTIGRAVITY, "Antigravity", "Gemini API key", "ready", ""))

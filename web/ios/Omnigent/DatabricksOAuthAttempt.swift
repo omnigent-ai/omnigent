@@ -1,6 +1,4 @@
-import CryptoKit
 import Foundation
-import Security
 
 /// Transient material for one authorization-code flow; never persisted or sent to JavaScript.
 struct DatabricksOAuthAttempt: Sendable {
@@ -28,7 +26,7 @@ struct DatabricksOAuthAttempt: Sendable {
       URLQueryItem(name: "response_type", value: "code"),
       URLQueryItem(name: "scope", value: Self.scope),
       URLQueryItem(name: "state", value: state),
-      URLQueryItem(name: "code_challenge", value: Self.challenge(for: verifier)),
+      URLQueryItem(name: "code_challenge", value: OAuthSupport.challenge(for: verifier)),
       URLQueryItem(name: "code_challenge_method", value: "S256"),
     ]
     if let workspaceID = credentialScope.workspaceID {
@@ -91,23 +89,12 @@ struct DatabricksOAuthAttempt: Sendable {
       ], issuer: issuer)
   }
 
-  static func challenge(for verifier: String) -> String {
-    base64URL(Data(SHA256.hash(data: Data(verifier.utf8))))
-  }
-
   private static let scope = "all-apis offline_access"
 
   private static func randomValue() throws -> String {
-    var bytes = [UInt8](repeating: 0, count: 32)
-    guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
+    guard let value = OAuthSupport.randomValue() else {
       throw DatabricksOAuthError.randomGenerationFailed
     }
-    return base64URL(Data(bytes))
+    return value
   }
-
-  private static func base64URL(_ data: Data) -> String {
-    data.base64EncodedString().replacingOccurrences(of: "+", with: "-")
-      .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
-  }
-
 }

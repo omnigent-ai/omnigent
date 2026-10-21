@@ -7,12 +7,17 @@
 const { describe, it, mock, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("fs");
+const http = require("http");
+const os = require("os");
+const path = require("path");
+const { spawnSync } = require("child_process");
 
 const {
   normalizeServerUrl,
   isLoopbackServer,
   sameLoopbackServer,
   parseLocalServerPidfile,
+  localServerHealthy,
   candidatePaths,
   resolveCliPath,
   cliCommandParts,
@@ -107,6 +112,65 @@ describe("parseLocalServerPidfile", () => {
     assert.equal(parseLocalServerPidfile("abc\ndef"), null); // non-numeric
     assert.equal(parseLocalServerPidfile(""), null);
     assert.equal(parseLocalServerPidfile(null), null);
+  });
+});
+
+describe("localServerHealthy", () => {
+  const prevDataDir = process.env.OMNIGENT_DATA_DIR;
+  afterEach(() => {
+    if (prevDataDir === undefined) delete process.env.OMNIGENT_DATA_DIR;
+    else process.env.OMNIGENT_DATA_DIR = prevDataDir;
+  });
+
+  // Point the data dir at a temp dir holding `pidfile` (or none).
+  function withPidfile(pidfile) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-pidfile-test-"));
+    if (pidfile !== undefined) fs.writeFileSync(path.join(dir, "local_server.pid"), pidfile);
+    process.env.OMNIGENT_DATA_DIR = dir;
+  }
+
+  // A loopback server answering /health; resolves its port.
+  async function healthServer() {
+    const server = http.createServer((_req, res) => res.end("ok"));
+    await new Promise((resolve) => {
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    return { server, port: server.address().port };
+  }
+
+  it("is null without a pidfile", async () => {
+    withPidfile(undefined);
+    assert.equal(await localServerHealthy(), null);
+  });
+
+  it("is null for a stale pidfile (dead pid)", async () => {
+    // A just-exited child's pid is dead (reuse within the test is negligible).
+    const { pid } = spawnSync(process.execPath, ["-e", ""]);
+    withPidfile(`${pid}\n6767\n`);
+    assert.equal(await localServerHealthy(), null);
+  });
+
+  it("is null when the pid is alive but nothing serves the port", async () => {
+    const { server, port } = await healthServer();
+    await new Promise((resolve) => {
+      server.close(resolve); // port now free
+    });
+    withPidfile(`${process.pid}\n${port}\n`);
+    assert.equal(await localServerHealthy(), null);
+  });
+
+  it("returns the server when the pid is alive and /health answers", async () => {
+    const { server, port } = await healthServer();
+    try {
+      withPidfile(`${process.pid}\n${port}\n`);
+      assert.deepEqual(await localServerHealthy(), {
+        url: `http://127.0.0.1:${port}`,
+        pid: process.pid,
+        port,
+      });
+    } finally {
+      server.close();
+    }
   });
 });
 

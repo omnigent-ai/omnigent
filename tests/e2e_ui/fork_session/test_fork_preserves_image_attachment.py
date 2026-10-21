@@ -20,10 +20,11 @@ from __future__ import annotations
 
 import base64
 import re
-import time
 from pathlib import Path
 
 from playwright.sync_api import Page, Response, expect
+
+from tests._helpers.polling import poll_until
 
 _COMPOSER_LABEL = "Message the agent"
 _SCREENSHOT_NAME = "fork-attachment.png"
@@ -116,11 +117,9 @@ def test_fork_carries_image_reference_and_its_resource(
     # the fork owns its own copy of the underlying resource.
     forked_user_bubble = page.locator(_USER)
     forked_img = forked_user_bubble.locator("img").first
-    expect(forked_img).to_be_attached(timeout=30_000)
-    src = forked_img.get_attribute("src")
-    assert src is not None and f"/sessions/{fork_id}/resources/files/" in src, (
-        f"expected the fork's copied image block to reference its OWN session id "
-        f"{fork_id!r} (a fresh copy is expected to own its data), got src={src!r}"
+    # Navigation can update the URL before React replaces the source transcript.
+    expect(forked_img).to_have_attribute(
+        "src", re.compile(rf"/sessions/{re.escape(fork_id)}/resources/files/"), timeout=30_000
     )
     # The preview renders with loading="lazy"; scroll it into view so the
     # browser actually issues the fetch instead of deferring it.
@@ -132,17 +131,7 @@ def test_fork_carries_image_reference_and_its_resource(
                 return status
         return None
 
-    _wait_for(lambda: _fork_file_status() is not None, timeout_s=30.0)
+    poll_until(lambda: _fork_file_status() is not None, timeout_s=30.0, interval_s=0.25)
     assert _fork_file_status() == 200, (
         f"expected the fork's own copy of the image to load, got {file_responses!r}"
     )
-
-
-def _wait_for(predicate, *, timeout_s: float = 15.0, interval_s: float = 0.25) -> None:
-    """Poll *predicate* until truthy or the deadline passes."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(interval_s)
-    raise AssertionError("condition not met within timeout")

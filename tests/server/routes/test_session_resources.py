@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
+import re
+import threading
+import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
+from urllib.parse import quote
 
 import httpx
 import pytest
@@ -27,9 +32,20 @@ from omnigent.runtime import (
     set_runner_router,
 )
 from omnigent.server._runner_ws_tunnel import DirectAttachEndpoint
+from omnigent.server.auth import (
+    LEVEL_EDIT,
+    LEVEL_MANAGE,
+    LEVEL_OWNER,
+    LEVEL_READ,
+    UnifiedAuthProvider,
+)
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
+from omnigent.stores.host_store import HostStore
+from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
+from tests.server.routes.test_shell_permission_gate import _StubPermissionStore
 
 
 class _ConversationStore:
@@ -128,10 +144,20 @@ class _ConversationStore:
             ),
         }
         self.appended_items: list[Any] = []
+        # Items appended with a stable_id, keyed by it — the real store uses the
+        # stable_id as the row id, which ``get_item`` looks up.
+        self.persisted_by_stable_id: dict[str, Any] = {}
 
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         """Return the conversation or None."""
         return self._conversations.get(conversation_id)
+
+    def get_item(self, conversation_id: str, item_id: str) -> Any:
+        """Return an appended item by stable id or fake id, else ``None``."""
+        del conversation_id
+        if item_id in self.persisted_by_stable_id:
+            return self.persisted_by_stable_id[item_id]
+        return next((item for item in self.appended_items if item.id == item_id), None)
 
     def list_conversations(
         self,
@@ -234,6 +260,8 @@ class _ConversationStore:
                 created_by=getattr(item, "created_by", None),
             )
             self.appended_items.append(persisted)
+            if getattr(item, "stable_id", None):
+                self.persisted_by_stable_id[item.stable_id] = persisted
             result.append(persisted)
         return result
 
@@ -456,16 +484,24 @@ class _FakeRunnerRouter:
 
 @pytest.fixture
 def runner_globals_reset() -> Iterator[None]:
+    from omnigent.server.routes._sessions.common import (
+        get_server_runner_router,
+        set_server_runner_router,
+    )
+
     prior_client = _globals._runner_client
     prior_router = _globals._runner_router
     prior_direct = _globals._runner_direct_attach_resolver
+    prior_server_router = get_server_runner_router()
     set_runner_client(None)
     set_runner_router(None)
     set_runner_direct_attach_resolver(None)
+    set_server_runner_router(None)
     yield
     set_runner_client(prior_client)
     set_runner_router(prior_router)
     set_runner_direct_attach_resolver(prior_direct)
+    set_server_runner_router(prior_server_router)
 
 
 @pytest.fixture
@@ -678,7 +714,7 @@ async def test_list_session_resources_missing_session_agent_returns_typed_410(
     message = body["error"]["message"]
     assert "session spec resolver" not in message
     assert "ag_gone" not in message
-    assert "no longer available" in message
+    assert "no longer exists" in message
 
 
 @pytest.mark.asyncio
@@ -742,6 +778,10 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
         ("POST", "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals"),
         ("POST", "/v1/sessions/64a784c3aa907d1774f44313546947c6/events"),
     ]
+    forwarded = fake_runner.post_json_calls[1][1]
+    assert re.fullmatch(r"[0-9a-f]{32}", forwarded["delivery_attempt_id"])
+    assert isinstance(forwarded["input_enqueued_at_ms"], int)
+    assert forwarded["input_enqueued_at_ms"] > 0
     assert fake_runner.post_json_calls == [
         (
             "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals",
@@ -763,6 +803,9 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
                 # Forwarded so the runner resolves the harness spec on the
                 # first message (before POST /v1/sessions caches it).
                 "agent_id": "087b7cb7ac30abf4debfaa578d052ec6",
+                "pending_id": body["pending_id"],
+                "delivery_attempt_id": forwarded["delivery_attempt_id"],
+                "input_enqueued_at_ms": forwarded["input_enqueued_at_ms"],
             },
         ),
     ]
@@ -1310,7 +1353,7 @@ async def test_get_resource_by_id_missing_session_agent_returns_typed_410(
     message = body["error"]["message"]
     assert "session spec resolver" not in message
     assert "ag_gone" not in message
-    assert "no longer available" in message
+    assert "no longer exists" in message
 
 
 @pytest.mark.asyncio
@@ -1721,6 +1764,28 @@ async def test_create_terminal_surfaces_runner_error_without_crashing(
 
 
 @pytest.mark.asyncio
+async def test_sign_in_link_proxies_to_runner(
+    client: httpx.AsyncClient,
+) -> None:
+    """GET /sign-in-link validates the session, then asks the runner for the live prompt."""
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/sign-in-link"
+    payload = {
+        "pending": True,
+        "url": "https://signin.example.com/device",
+        "code": "HQ7M-2KPD",
+        "terminal_id": "terminal_claude_main",
+    }
+    fake_runner = _FakeRunnerClient(responses={path: (200, payload)})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(path)
+
+    assert resp.status_code == 200
+    assert resp.json() == payload
+    assert fake_runner.calls == [("GET", path)]
+
+
+@pytest.mark.asyncio
 async def test_delete_terminal_proxies_to_runner(
     client: httpx.AsyncClient,
 ) -> None:
@@ -1745,6 +1810,114 @@ async def test_delete_terminal_proxies_to_runner(
             "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/terminals/terminal_bash_s1",
         ),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_level,target_level,host_owner,expected_status,admin,inherited",
+    [
+        (LEVEL_READ, LEVEL_OWNER, "alice@example.com", 403, False, False),
+        (LEVEL_EDIT, LEVEL_OWNER, "alice@example.com", 403, False, False),
+        (LEVEL_MANAGE, LEVEL_OWNER, "alice@example.com", 403, False, False),
+        (LEVEL_OWNER, LEVEL_READ, "alice@example.com", 403, False, False),
+        (LEVEL_OWNER, LEVEL_EDIT, "alice@example.com", 403, False, False),
+        (LEVEL_OWNER, LEVEL_MANAGE, "alice@example.com", 403, False, False),
+        (LEVEL_OWNER, LEVEL_OWNER, "bob@example.com", 403, False, False),
+        (LEVEL_OWNER, LEVEL_OWNER, None, 403, False, False),
+        (LEVEL_OWNER, LEVEL_OWNER, "", 404, False, False),
+        (LEVEL_OWNER, LEVEL_OWNER, "alice@example.com", 200, False, False),
+        (LEVEL_READ, LEVEL_READ, "bob@example.com", 403, True, False),
+        (LEVEL_READ, LEVEL_READ, "bob@example.com", 403, True, True),
+        (LEVEL_OWNER, LEVEL_OWNER, "alice@example.com", 200, False, True),
+    ],
+)
+async def test_terminal_transfer_requires_session_and_host_ownership(
+    db_uri: str,
+    runner_globals_reset: None,
+    source_level: int,
+    target_level: int,
+    host_owner: str | None,
+    expected_status: int,
+    admin: bool,
+    inherited: bool,
+) -> None:
+    """Placement changes require authority over both sessions and their host."""
+    del runner_globals_reset
+    source_id = "79b22ebd2309e48fdeb450c65611d51b"
+    target_id = "5d29bee4350489d66feafecfebd94a97"
+    host_id = uuid.uuid4().hex
+    conversations = _ConversationStore()
+    source = conversations.get_conversation(source_id)
+    target = conversations.get_conversation(target_id)
+    assert source is not None and target is not None
+    source.host_id = host_id
+    source.workspace = "/workspace/project"
+    source.git_branch = "feature/rotation"
+    if inherited:
+        parent = conversations.get_conversation("64a784c3aa907d1774f44313546947c6")
+        assert parent is not None
+        parent.host_id = host_id
+        source.host_id = None
+        source.kind = "sub_agent"
+        source.parent_conversation_id = parent.id
+        source.runner_id = "runner_one"
+    permissions = _StubPermissionStore()
+    if admin:
+        permissions.add_admin("alice@example.com")
+    permissions.add_grant("alice@example.com", source_id, source_level)
+    permissions.add_grant("alice@example.com", target_id, target_level)
+    if inherited:
+        permissions.add_grant("alice@example.com", parent.id, source_level)
+    application = FastAPI()
+    if host_owner is not None:
+        hosts = HostStore(db_uri)
+        # An empty owner leaves the host unregistered in a configured store.
+        if host_owner:
+            hosts.upsert_on_connect(host_id, "test-host", host_owner)
+        application.state.host_store = hosts
+
+    @application.exception_handler(OmnigentError)
+    async def handle_error(request: Request, exc: OmnigentError) -> JSONResponse:
+        del request
+        return JSONResponse(status_code=exc.http_status, content={"error": exc.code})
+
+    application.include_router(
+        create_sessions_router(
+            conversations,  # type: ignore[arg-type]
+            Mock(),  # Agent loading is outside the transfer boundary.
+            auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+            permission_store=permissions,  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+    # No terminal process is needed to exercise authorization and stored placement.
+    runner = _FakeRunnerClient(payload={"id": "terminal_main", "session_id": target_id})
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=application), base_url="http://server"
+    ) as client:
+        response = await client.post(
+            f"/v1/sessions/{source_id}/resources/terminals/terminal_main/transfer",
+            json={"target_session_id": target_id},
+            headers={"X-Forwarded-Email": "alice@example.com"},
+        )
+    assert response.status_code == expected_status, response.text
+    assert source.host_id == (None if inherited else host_id)
+    assert source.workspace == "/workspace/project"
+    if expected_status == 200 and not inherited:
+        assert response.json()["session_id"] == target_id
+        assert target.host_id == source.host_id
+        assert target.workspace == source.workspace
+        assert target.git_branch == source.git_branch
+    else:
+        if expected_status == 200:
+            assert runner.calls
+            assert response.json()["session_id"] == target_id
+        else:
+            assert runner.calls == []
+        assert target.host_id is None
+        assert target.workspace is None
+        assert target.git_branch is None
 
 
 @pytest.mark.asyncio
@@ -1884,6 +2057,53 @@ async def test_transfer_terminal_surfaces_runner_error_without_crashing(
     # The transfer failed, so no resource is returned.
     assert "id" not in body
     # The proxy POST was actually attempted before the error was raised.
+    assert fake_runner.calls == [("POST", path)]
+
+
+@pytest.mark.asyncio
+async def test_transfer_terminal_surfaces_a_runner_conflict_as_409(
+    client: httpx.AsyncClient,
+) -> None:
+    """A terminal-name collision on the target reaches the caller as a 409.
+
+    The runner returns 409 ``resource_conflict`` when the target session
+    already owns a terminal under the same name — a state conflict the
+    caller cannot fix by changing its request. Mapping it to
+    ``INVALID_INPUT`` surfaced it as a 400, so a real collision was
+    indistinguishable from a malformed transfer, and the 409 a client did
+    see had to have come from somewhere else entirely.
+
+    :param client: Server test client.
+    :returns: None.
+    """
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    path = f"/v1/sessions/{session_id}/resources/terminals/terminal_bash_s1/transfer"
+    fake_runner = _FakeRunnerClient(
+        responses={
+            path: (
+                409,
+                {
+                    "error": {
+                        "code": "resource_conflict",
+                        "message": (
+                            "target session already has terminal 'bash' for session key 's1'"
+                        ),
+                    }
+                },
+            ),
+        },
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.post(path, json={"target_session_id": "5d29bee4350489d66feafecfebd94a97"})
+
+    assert resp.status_code == 409
+    body = resp.json()
+    assert body["error"]["code"] == ErrorCode.CONFLICT
+    assert body["error"]["message"] == (
+        "target session already has terminal 'bash' for session key 's1'"
+    )
+    assert "id" not in body
     assert fake_runner.calls == [("POST", path)]
 
 
@@ -2429,7 +2649,7 @@ async def test_downscaled_upload_reaches_native_resolver(
 
     from omnigent.inner.codex_native_executor import _content_to_input_items
     from omnigent.inner.native_attachments import framework_notices
-    from omnigent.runner.app import _resolve_forwarded_message_content
+    from omnigent.runner.app_support import _resolve_forwarded_message_content
     from omnigent.runtime import content_resolver
 
     monkeypatch.setattr(content_resolver, "IMAGE_MODEL_BUDGET_BYTES", 1024)
@@ -2960,6 +3180,48 @@ async def test_github_info_proxies_to_runner(client: httpx.AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_github_label_edit_relays_the_runner_refusal(client: httpx.AsyncClient) -> None:
+    """A provider refusal keeps the runner's status and message for the panel."""
+    from omnigent.runner import github_resource
+    from omnigent.server.routes import _host_filesystem
+    from omnigent.server.routes.sessions import routes_resources
+
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/labels"
+    detail = "The GitHub account on the host cannot edit this pull request's labels."
+    fake_runner = _FakeRunnerClient(responses={path: (400, {"detail": detail})})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    timeouts: list[float | None] = []
+    proxy_get, proxy_post = fake_runner.get, fake_runner.post
+
+    async def get(url: str, *, params: Any = None, timeout: float | None = None) -> httpx.Response:
+        timeouts.append(timeout)
+        return await proxy_get(url, params=params, timeout=timeout)
+
+    async def post(url: str, *, json: Any = None, timeout: float | None = None) -> httpx.Response:
+        timeouts.append(timeout)
+        return await proxy_post(url, json=json, timeout=timeout)
+
+    fake_runner.get, fake_runner.post = get, post  # type: ignore[method-assign]
+
+    resp = await client.post(
+        path, json={"pr_url": "https://github.com/acme/widgets/pull/17", "add": ["bug"]}
+    )
+    malformed = await client.post(path, json={"add": ["bug"]})
+    await client.get(path, params={"pr_url": "https://github.com/acme/widgets/pull/17"})
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == detail
+    assert malformed.status_code == 400
+    # The server and the host tunnel both outwait the runner's label request budget.
+    assert timeouts == [routes_resources._LABEL_PROXY_TIMEOUT_S] * 2
+    assert github_resource._LABEL_REQUEST_SECONDS < routes_resources._LABEL_PROXY_TIMEOUT_S
+    assert github_resource._LABEL_REQUEST_SECONDS < _host_filesystem._FS_TIMEOUT_S
+    assert fake_runner.post_json_calls == [
+        (path, {"pr_url": "https://github.com/acme/widgets/pull/17", "add": ["bug"], "remove": []})
+    ]
+
+
+@pytest.mark.asyncio
 async def test_github_changes_proxies_to_runner(client: httpx.AsyncClient) -> None:
     """GET /resources/github/changes proxies the PR file list to the runner."""
     fake_runner = _FakeRunnerClient(payload={"object": "list", "data": [], "has_more": False})
@@ -2994,7 +3256,20 @@ async def test_github_pr_diff_proxies_whole_patch(client: httpx.AsyncClient) -> 
 
 
 @pytest.mark.asyncio
-async def test_github_diff_proxies_path_and_base(client: httpx.AsyncClient) -> None:
+@pytest.mark.parametrize(
+    ("previous_path", "status"),
+    [
+        (None, 200),
+        ("old/%2F #?.py", 200),
+        ("folder/../old.py", 400),
+        ("folder//old.py", 400),
+        ("", 400),
+        ("/old.py", 400),
+    ],
+)
+async def test_github_diff_proxies_path_and_base(
+    client: httpx.AsyncClient, previous_path: str | None, status: int
+) -> None:
     """GET /resources/github/diff/{path} proxies the path + base to the runner."""
     payload = {
         "object": "session.github.file_diff",
@@ -3005,17 +3280,24 @@ async def test_github_diff_proxies_path_and_base(client: httpx.AsyncClient) -> N
     fake_runner = _FakeRunnerClient(payload=payload)
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
+    params = {"base": "main"}
+    if previous_path is not None:
+        params["previous_path"] = previous_path
     resp = await client.get(
-        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff/src/app.py?base=main"
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff/src/app.py",
+        params=params,
     )
 
-    assert resp.status_code == 200
+    assert resp.status_code == status, resp.text
+    if status == 400:
+        assert fake_runner.calls == []
+        return
     assert resp.json() == payload
     assert (
         "GET",
         "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff/src/app.py",
     ) in fake_runner.calls
-    assert {"base": "main"} in fake_runner.get_params
+    assert params in fake_runner.get_params
 
 
 @pytest.mark.asyncio
@@ -3448,11 +3730,16 @@ async def test_filesystem_download_streams_runner_attachment(
     client: httpx.AsyncClient,
     tmp_path: Path,
 ) -> None:
-    """``?download=true`` forwards the runner's attachment and headers verbatim."""
+    """``?download=true`` forwards the runner's attachment and headers verbatim.
+
+    The download URL is assembled separately from the listing/read URL, so
+    this also pins that the owner's workspace-relative download carries the
+    ``scope=reach`` mark the runner needs to follow an outward symlink.
+    """
     payload = bytes(range(256)) * 64
     (tmp_path / "big.bin").write_bytes(payload)
     runner = FastAPI()
-    seen: list[tuple[str, bool]] = []
+    seen: list[tuple[str, bool, str | None]] = []
 
     @runner.get(_FS_ROUTE)
     async def _serve(
@@ -3460,9 +3747,10 @@ async def test_filesystem_download_streams_runner_attachment(
         environment_id: str,
         relative_path: str,
         download: bool = False,
+        scope: str | None = None,
     ) -> FileResponse:
         del session_id, environment_id
-        seen.append((relative_path, download))
+        seen.append((relative_path, download, scope))
         return FileResponse(
             tmp_path / "big.bin",
             filename="big.bin",
@@ -3477,7 +3765,7 @@ async def test_filesystem_download_streams_runner_attachment(
     assert resp.headers["content-disposition"] == 'attachment; filename="big.bin"'
     assert resp.headers["content-length"] == str(len(payload))
     assert resp.headers["cache-control"] == "no-store"
-    assert seen == [("data/big.bin", True)]
+    assert seen == [("data/big.bin", True, "reach")]
 
 
 @pytest.mark.asyncio
@@ -3574,7 +3862,7 @@ async def test_filesystem_download_missing_session_agent_returns_typed_410(
     message = body["error"]["message"]
     assert "session spec resolver" not in message
     assert "ag_gone" not in message
-    assert "no longer available" in message
+    assert "no longer exists" in message
 
 
 @pytest.mark.asyncio
@@ -3617,7 +3905,7 @@ async def test_filesystem_write_missing_session_agent_returns_typed_410(
     message = body["error"]["message"]
     assert "session spec resolver" not in message
     assert "ag_gone" not in message
-    assert "no longer available" in message
+    assert "no longer exists" in message
 
 
 @pytest.mark.asyncio
@@ -3655,6 +3943,65 @@ async def test_filesystem_forwards_a_literal_percent_still_encoded(
             await client.get(url, params={"download": "true"} if operation == "download" else None)
 
     assert seen == ["%2Fetc/passwd"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resource",
+    [
+        "environments/default/filesystem",
+        "environments/default/diff",
+        "github/diff",
+        "environments/default/search",
+    ],
+)
+@pytest.mark.parametrize("name", ["docs/release #1?.md", "notes/%2Fdata.txt"])
+async def test_resource_reads_preserve_literal_paths(
+    client: httpx.AsyncClient, resource: str, name: str
+) -> None:
+    runner = FastAPI()
+    seen: list[tuple[str, str]] = []
+
+    @runner.get(f"/v1/sessions/{{session_id}}/resources/{resource}/{{relative_path:path}}")
+    async def serve(request: Request, session_id: str, relative_path: str) -> JSONResponse:
+        del session_id
+        seen.append((relative_path, request.query_params.get("q", "")))
+        return JSONResponse({"path": relative_path})
+
+    base = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources"
+    async with _runner_app_client(runner):
+        response = await client.get(f"{base}/{resource}/{quote(name)}", params={"q": "notes"})
+    assert response.status_code == 200, response.text
+    assert seen == [(name, "notes" if resource.endswith("search") else "")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method,resource",
+    [
+        ("GET", "environments/default/filesystem"),
+        ("PUT", "environments/default/filesystem"),
+        ("PATCH", "environments/default/filesystem"),
+        ("DELETE", "environments/default/filesystem"),
+        ("GET", "environments/default/diff"),
+        ("GET", "github/diff"),
+        ("GET", "environments/default/search"),
+    ],
+)
+async def test_resource_paths_reject_parent_segments_before_forwarding(
+    client: httpx.AsyncClient, method: str, resource: str
+) -> None:
+    runner = _FakeRunnerClient(payload={})
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    base = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources"
+    response = await client.request(
+        method,
+        f"{base}/{resource}/folder/%2E%2E/notes.txt",
+        params={"q": "notes"},
+        json={"content": "notes", "encoding": "utf-8", "old_text": "old", "new_text": "new"},
+    )
+    assert response.status_code == 400, response.text
+    assert runner.calls == []
 
 
 @pytest.mark.asyncio
@@ -4630,7 +4977,30 @@ async def test_relay_dedupes_duplicate_error_persistence_but_forwards_live_frame
 
 
 @pytest.mark.asyncio
-async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error() -> None:
+@pytest.mark.parametrize(
+    "failure_context",
+    [
+        pytest.param(None, id="legacy"),
+        pytest.param("malformed", id="malformed-context"),
+        pytest.param(
+            {
+                "failure_id": "err_synthetic_startup",
+                "failure_source": "native_terminal_start",
+                "exception_type": "RuntimeError",
+                "exception_cause_type": "FileNotFoundError",
+                "native_launch_os_errno": 2,
+                "native_launch_os_errno_name": "ENOENT",
+                "origin": "forged",
+                "exception_message": "private launch path",
+            },
+            id="structured-context",
+        ),
+    ],
+)
+async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error(
+    caplog: pytest.LogCaptureFixture,
+    failure_context: object,
+) -> None:
     """Definitive native terminal failure consumes the user message quickly.
 
     The Omnigent server first asks the runner to ensure the native terminal.
@@ -4651,7 +5021,10 @@ async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error
                     "error": {
                         "code": "native_terminal_start_failed",
                         "message": "Native Claude requires the 'claude' CLI on PATH.",
-                    }
+                    },
+                    **(
+                        {"failure_context": failure_context} if failure_context is not None else {}
+                    ),
                 },
             )
         }
@@ -4693,10 +5066,26 @@ async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error
     assert len(errors) == 1
     assert errors[0].data.code == "native_terminal_start_failed"
     assert errors[0].data.message == "Native Claude requires the 'claude' CLI on PATH."
+    [record] = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "session_turn_failed"
+    ]
+    assert record.attributes["origin"] == "native_terminal_boot_failed"
+    if isinstance(failure_context, dict):
+        assert record.attributes["failure_id"] == failure_context["failure_id"]
+        assert record.attributes["exception_cause_type"] == "FileNotFoundError"
+        assert record.attributes["native_launch_os_errno"] == "2"
+        assert record.attributes["native_launch_os_errno_name"] == "ENOENT"
+        assert "private launch path" not in str(record.attributes)
+    else:
+        assert "failure_id" not in record.attributes
 
 
 @pytest.mark.asyncio
-async def test_kiro_native_dispatch_forwards_without_persisting() -> None:
+@pytest.mark.parametrize("agent_revision", [None, "bundle.zip:mcp:selection-v2"])
+async def test_kiro_native_dispatch_forwards_without_persisting(
+    caplog: pytest.LogCaptureFixture,
+    agent_revision: str | None,
+) -> None:
     """Kiro web-chat input is mirrored by Kiro's session forwarder."""
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
@@ -4708,8 +5097,13 @@ async def test_kiro_native_dispatch_forwards_without_persisting() -> None:
     client = _FakeRunnerClient()
     body = SessionEventInput(
         type="message",
-        data={"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        data={
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+            "stable_id": "a" * 32,
+        },
     )
+    caplog.set_level("INFO")
 
     try:
         result = await _dispatch_session_event_to_runner(
@@ -4719,6 +5113,7 @@ async def test_kiro_native_dispatch_forwards_without_persisting() -> None:
             store,  # type: ignore[arg-type]
             client,  # type: ignore[arg-type]
             agent_name="kiro-native-ui",
+            agent_revision=agent_revision,
             file_store=None,
             artifact_store=None,
             created_by="alice@example.com",
@@ -4737,13 +5132,104 @@ async def test_kiro_native_dispatch_forwards_without_persisting() -> None:
         assert store.appended_items == []
         forwarded = client.post_json_calls[1][1]
         assert forwarded["agent_id"] == "2c515637c67d0717ad0bebc2747b71bc"
+        if agent_revision is None:
+            assert "agent_revision" not in forwarded
+        else:
+            assert forwarded["agent_revision"] == agent_revision
         assert forwarded["model"] == "kiro-native-ui"
+        assert forwarded["input_stable_id"] == "a" * 32
+        assert forwarded["pending_id"] == result.pending_id
+        assert len(forwarded["delivery_attempt_id"]) == 32
+        assert forwarded["input_enqueued_at_ms"] > 0
+        repeated = await _dispatch_session_event_to_runner(
+            conv.id,
+            conv,
+            body,
+            store,
+            client,  # type: ignore[arg-type]
+            agent_name="kiro-native-ui",
+            agent_revision=agent_revision,
+            file_store=None,
+            artifact_store=None,
+            created_by="alice@example.com",
+        )
+        assert repeated.pending_id == result.pending_id
+        assert len([call for call in client.post_json_calls if call[0].endswith("/events")]) == 1
+        events = {getattr(r, "event_name", None): r for r in caplog.records}
+        for event_name in (
+            "native_input_enqueued",
+            "turn_dispatched",
+            "native_input_retry_deduplicated",
+        ):
+            attrs = events[event_name].attributes
+            assert attrs["input_stable_id"] == "a" * 32
+            assert attrs["pending_id"] == result.pending_id
+            assert attrs["delivery_attempt_id"] == forwarded["delivery_attempt_id"]
+            assert "hello" not in repr(attrs)
     finally:
         pending_inputs.reset_for_tests()
 
 
 @pytest.mark.asyncio
-async def test_kiro_native_dispatch_clears_pending_when_injection_fails() -> None:
+async def test_codex_side_dispatch_forwards_without_pending_input_diagnostics(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A side-chat command bypasses the parent's pending-input queue."""
+    from omnigent.native.input_diagnostics import INPUT_FIELDS, input_delivery_scope
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    conv = store.get_conversation("823dbd1aab969b5a813fac59bb977a77")
+    assert conv is not None
+    conv.labels["omnigent.wrapper"] = "codex-native-ui"
+    client = _FakeRunnerClient()
+    body = SessionEventInput(
+        type="message",
+        data={
+            "role": "user",
+            "content": [{"type": "input_text", "text": "/side explain this function"}],
+            "stable_id": "a" * 32,
+        },
+    )
+    caplog.set_level("INFO")
+
+    try:
+        with input_delivery_scope({"input_stable_id": "b" * 32}):
+            result = await _dispatch_session_event_to_runner(
+                conv.id,
+                conv,
+                body,
+                store,
+                client,  # type: ignore[arg-type]
+                agent_name="codex-native-ui",
+                file_store=None,
+                artifact_store=None,
+            )
+
+        assert result.item_id is None
+        assert result.pending_id is None
+        assert pending_inputs.snapshot_for(conv.id) == []
+        assert store.appended_items == []
+        [forwarded] = [
+            payload for path, payload in client.post_json_calls if path.endswith("/events")
+        ]
+        assert forwarded["content"] == body.data["content"]
+        assert not INPUT_FIELDS.intersection(forwarded)
+        assert not any(
+            str(getattr(record, "event_name", "")).startswith("native_input_")
+            for record in caplog.records
+        )
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_kiro_native_dispatch_clears_pending_when_injection_fails(
+    cancelled: bool, caplog: pytest.LogCaptureFixture
+) -> None:
     """A failed Kiro tmux injection must not leave a ghost pending input."""
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
@@ -4752,18 +5238,30 @@ async def test_kiro_native_dispatch_clears_pending_when_injection_fails() -> Non
     store = _ConversationStore()
     conv = store.get_conversation("823dbd1aab969b5a813fac59bb977a77")
     assert conv is not None
-    client = _FakeRunnerClient(
+
+    class _FailingForwardClient(_FakeRunnerClient):
+        def _make_response(self, method: str, url: str) -> httpx.Response:
+            if cancelled and url.endswith("/events"):
+                raise asyncio.CancelledError()
+            return super()._make_response(method, url)
+
+    client = _FailingForwardClient(
         responses={
             "/v1/sessions/823dbd1aab969b5a813fac59bb977a77/events": (500, {"error": "tmux failed"})
         }
     )
     body = SessionEventInput(
         type="message",
-        data={"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        data={
+            "role": "user",
+            "content": [{"type": "input_text", "text": "private prompt"}],
+            "stable_id": "a" * 32,
+        },
     )
+    caplog.set_level("INFO")
 
     try:
-        with pytest.raises(HTTPException):
+        with pytest.raises(asyncio.CancelledError if cancelled else HTTPException):
             await _dispatch_session_event_to_runner(
                 "823dbd1aab969b5a813fac59bb977a77",
                 conv,
@@ -4782,6 +5280,18 @@ async def test_kiro_native_dispatch_clears_pending_when_injection_fails() -> Non
         ]
         assert store.appended_items == []
         assert pending_inputs.snapshot_for("823dbd1aab969b5a813fac59bb977a77") == []
+        [record] = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "native_input_forward_finished"
+        ]
+        forwarded = client.post_json_calls[1][1]
+        attrs = record.attributes
+        assert attrs["outcome"] == ("cancelled" if cancelled else "error")
+        assert attrs["input_stable_id"] == "a" * 32
+        for key in ("pending_id", "delivery_attempt_id", "input_enqueued_at_ms"):
+            assert attrs[key] == forwarded[key]
+        assert "private prompt" not in repr(attrs)
     finally:
         pending_inputs.reset_for_tests()
 
@@ -4959,6 +5469,1060 @@ async def test_kiro_duplicate_repost_restores_skipped_entries_unpersisted() -> N
         assert all(item.deduplicated for item in store.appended_items)
         snapshot = pending_inputs.snapshot_for(sid)
         assert [entry["pending_id"] for entry in snapshot] == recorded
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_mirror_matches_pending_text_and_reports_lost_input() -> None:
+    """A web message Claude never recorded must not take the next message's drain.
+
+    A pasted message the TUI never recorded (a dying host, a hook that failed
+    closed) leaves its entry at the head of the queue. Draining by position
+    would hand that entry to the NEXT mirrored message and name it in
+    ``session.input.consumed``, so every client settles the wrong bubble and the
+    new message renders twice. The mirror's text selects its own entry; the
+    skipped one is persisted as an undelivered message with an error.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    pending_inputs.record(
+        sid, [{"type": "input_text", "text": "lost in the reconnect"}], created_by="a@example.com"
+    )
+    pending_inputs.record(
+        sid, [{"type": "input_text", "text": "still here?"}], created_by="a@example.com"
+    )
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "still here?"}],
+            },
+            "response_id": "resp_still_here",
+            "source_id": "claude:still-here:0",
+        },
+    )
+
+    try:
+        item_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        lost_user, lost_error, matched_user = store.appended_items
+        assert lost_user.data.content == [{"type": "input_text", "text": "lost in the reconnect"}]
+        assert lost_user.created_by == "a@example.com"
+        assert lost_error.data.code == "native_prompt_not_recorded"
+        assert lost_error.data.message.startswith("Claude never recorded this message")
+        assert matched_user.data.content == [{"type": "input_text", "text": "still here?"}]
+        assert matched_user.created_by == "a@example.com"
+        assert item_id == matched_user.id
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_mirror_without_text_match_drains_the_oldest_entry() -> None:
+    """A mirror whose text the transcript reformatted still drains by position.
+
+    Nothing is skipped and no undelivered pair is written: the oldest entry is
+    the message, exactly as before text matching existed.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    pending_id = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "> quoted line\n\nwhat about this?"}],
+        created_by="a@example.com",
+    )
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "quoted line -- what about this?"}],
+            },
+            "response_id": "resp_reformatted",
+            "source_id": "claude:reformatted:0",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["message"]
+        assert store.appended_items[0].created_by is None
+        assert pending_inputs.snapshot_for(sid) == []
+        assert pending_id  # the drained entry was the reformatted message itself
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_mirror_without_text_match_never_takes_an_interrupted_entry() -> None:
+    """A message typed in the TUI after a cancelled web message is not the cancelled one.
+
+    With no text match the mirror falls back to the oldest entry. A cancelled
+    entry is never that guess: the TUI message would inherit its attachment,
+    author and client id, and the entry would be reported as settled.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    cancelled = pending_inputs.record(
+        sid,
+        [
+            {"type": "input_image", "file_id": "file_shot1", "filename": "shot.png"},
+            {"type": "input_text", "text": "the cancelled web message"},
+        ],
+        created_by="alice@example.com",
+        stable_id="ab" * 16,
+    )
+    pending_inputs.mark_interrupted(sid, [cancelled])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "typed in the terminal"}],
+            },
+            "response_id": "resp_typed",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+            created_by="bob@example.com",
+        )
+
+        assert [item.type for item in store.appended_items] == ["message"]
+        typed = store.appended_items[0]
+        assert typed.data.content == [{"type": "input_text", "text": "typed in the terminal"}]
+        assert typed.created_by == "bob@example.com"
+        assert store.persisted_by_stable_id == {}
+        # The cancelled entry is untouched: hidden, and left to a later match or the TTL.
+        assert pending_inputs.pending_ids(sid) == [cancelled]
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_mirror_matches_text_behind_attachment_markers() -> None:
+    """Attachment marker lines the executor prepends don't defeat the text match."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    pending_inputs.record(
+        sid, [{"type": "input_text", "text": "lost"}], created_by="a@example.com"
+    )
+    image = {"type": "input_image", "file_id": "file_x", "filename": "shot.png"}
+    pending_inputs.record(
+        sid, [image, {"type": "input_text", "text": "look at this"}], created_by="a@example.com"
+    )
+    mirrored_text = "[Attached: /tmp/omnigent/shot.png]\n\nlook at this"
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": mirrored_text}],
+            },
+            "response_id": "resp_attached",
+            "source_id": "claude:attached:0",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        lost_user, _lost_error, matched_user = store.appended_items
+        assert lost_user.data.content == [{"type": "input_text", "text": "lost"}]
+        assert lost_user.data.user_authored is True
+        assert image in matched_user.data.content
+        assert {"type": "input_text", "text": mirrored_text} in matched_user.data.content
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_retried_mirror_leaves_the_queue_alone() -> None:
+    """A forwarder retry of an already-persisted mirror must not drain anything.
+
+    The retried text can match a NEWER identical queued message; draining that
+    would skip everything queued in between and mark it undelivered although
+    it may still be on its way. The store already holds the item under its
+    source-derived id, so the retry returns that id and changes nothing.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {"role": "user", "content": [{"type": "input_text", "text": "yes"}]},
+            "response_id": "resp_yes",
+            "source_id": "claude:yes:0",
+        },
+    )
+
+    try:
+        first_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+        assert [item.type for item in store.appended_items] == ["message"]
+        # Meanwhile the person queues a message still on its way, then "yes" again.
+        in_flight = pending_inputs.record(sid, [{"type": "input_text", "text": "continue"}])
+        again = pending_inputs.record(sid, [{"type": "input_text", "text": "yes"}])
+
+        retried_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert retried_id == first_id
+        assert [item.type for item in store.appended_items] == ["message"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            in_flight,
+            again,
+        ]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_state", ["plain", "uncertain", "interrupted"])
+async def test_claude_native_mirrored_slash_command_drains_its_queued_entry(
+    prior_state: str,
+) -> None:
+    """A web-typed command mirrored as a slash_command clears its own queued entry.
+
+    Without this the entry outlives the executed command and the next ordinary
+    message would skip it, persisting a false "not delivered" error for a
+    command Claude ran. Older entries are left in place.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    older = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
+    if prior_state == "uncertain":
+        pending_inputs.mark_uncertain(sid)
+    elif prior_state == "interrupted":
+        pending_inputs.mark_interrupted(sid, [older])
+    pending_inputs.record(sid, [{"type": "input_text", "text": "/model sonnet"}])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "slash_command",
+            "item_data": {
+                "agent": "claude-native-ui",
+                "kind": "command",
+                "name": "model",
+                "arguments": "sonnet",
+            },
+            "response_id": "resp_model",
+            "source_id": "claude:model:0",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["slash_command"]
+        assert pending_inputs.pending_ids(sid) == [older]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == (
+            [] if prior_state == "interrupted" else [older]
+        )
+        delayed = pending_inputs.resolve_matching_text(sid, "still on its way")
+        assert delayed.matched is not None and delayed.matched.pending_id == older
+        assert delayed.matched.interrupted == (prior_state == "interrupted")
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_overlapping_retries_persist_nothing_extra() -> None:
+    """Two overlapping posts of one mirror persist it once and skip nothing.
+
+    The store probe alone cannot catch a retry that arrives while the first
+    append is still in flight. The per-conversation lock makes probe, drain and
+    append one critical section, so the retry observes the first commit and
+    returns its id even though messages were queued in between — none of which
+    may be marked undelivered.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _BlockingStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {"role": "user", "content": [{"type": "input_text", "text": "yes"}]},
+            "response_id": "resp_yes",
+            "source_id": "claude:yes:0",
+        },
+    )
+
+    async def persist() -> str:
+        return await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+    try:
+        first = asyncio.create_task(persist())
+        await asyncio.to_thread(store.first_append_started.wait, 5)
+        # While the first append is in flight the person queues a message that
+        # is still on its way, then "yes" again — and the forwarder retries.
+        in_flight = pending_inputs.record(sid, [{"type": "input_text", "text": "continue"}])
+        again = pending_inputs.record(sid, [{"type": "input_text", "text": "yes"}])
+        second = asyncio.create_task(persist())
+        await asyncio.sleep(0.05)
+        assert not second.done(), "the retry must wait for the first attempt"
+        store.release_first_append.set()
+
+        first_id = await first
+        second_id = await second
+
+        assert second_id == first_id
+        assert store.append_count == 1
+        assert [item.type for item in store.appended_items] == ["message"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            in_flight,
+            again,
+        ]
+    finally:
+        store.release_first_append.set()
+        pending_inputs.reset_for_tests()
+
+
+class _BlockingStore(_ConversationStore):
+    """Store whose first append parks until the test releases it, then optionally raises."""
+
+    def __init__(self, *, fail_first_append: bool = False) -> None:
+        super().__init__()
+        self.fail_first_append = fail_first_append
+        self.first_append_started = threading.Event()
+        self.release_first_append = threading.Event()
+        self.append_count = 0
+
+    def append(self, conversation_id: str, items: list[Any]) -> list[Any]:
+        self.append_count += 1
+        if self.append_count == 1:
+            self.first_append_started.set()
+            assert self.release_first_append.wait(timeout=5)
+            if self.fail_first_append:
+                raise RuntimeError("database unavailable")
+        return super().append(conversation_id, items)
+
+
+class _FailOnceStore(_ConversationStore):
+    """Store whose first append raises; later appends behave normally."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.failures_left = 1
+
+    def append(self, conversation_id: str, items: list[Any]) -> list[Any]:
+        if self.failures_left:
+            self.failures_left -= 1
+            raise RuntimeError("database unavailable")
+        return super().append(conversation_id, items)
+
+
+@pytest.mark.asyncio
+async def test_claude_native_failed_append_restores_the_queue_for_the_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mirror whose append fails leaves the queue as it was, so the retry lands right.
+
+    Text matching removes the matched entry and the skipped older ones before
+    the append. If the append raises, they must go back in their original
+    order; otherwise the retry matches nothing, drains whatever is oldest, and
+    the lost message's undelivered pair is never written.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        session_stream,
+        "publish",
+        lambda conversation_id, event: published.append((conversation_id, event)),
+    )
+    pending_inputs.reset_for_tests()
+    store = _FailOnceStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    lost = pending_inputs.record(sid, [{"type": "input_text", "text": "lost in the reconnect"}])
+    matched = pending_inputs.record(sid, [{"type": "input_text", "text": "still here?"}])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "still here?"}],
+            },
+            "response_id": "resp_still_here",
+            "source_id": "claude:still-here:0",
+        },
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            await _persist_external_conversation_item(
+                sid,
+                conv,
+                body,
+                store,  # type: ignore[arg-type]
+            )
+        assert store.appended_items == []
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            lost,
+            matched,
+        ]
+
+        # The forwarder retries the same mirror once the store is back.
+        item_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        assert item_id == store.appended_items[-1].id
+        assert pending_inputs.snapshot_for(sid) == []
+        receipts = [
+            event["data"]["cleared_pending_id"]
+            for _conversation_id, event in published
+            if event.get("type") == "session.input.consumed"
+        ]
+        assert receipts == [lost, matched]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_kiro_prompt_with_literal_attachment_text_matches_its_entry() -> None:
+    """A marker-like phrase the person typed is not stripped, so Kiro's exact match holds."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "823dbd1aab969b5a813fac59bb977a77"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    text = "explain [Attached: example]"
+    pending_inputs.record(sid, [{"type": "input_text", "text": text}], created_by="a@example.com")
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+            "response_id": "kiro:prompt-literal",
+            "source_id": "kiro:prompt-literal:0",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["message"]
+        assert store.appended_items[0].created_by == "a@example.com"
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_state", ["plain", "uncertain", "interrupted"])
+async def test_claude_native_failed_slash_command_append_restores_its_entry(
+    prior_state: str,
+) -> None:
+    """A slash-command mirror whose append fails puts its queued entry back, in order."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _FailOnceStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    older = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
+    if prior_state == "uncertain":
+        pending_inputs.mark_uncertain(sid)
+    elif prior_state == "interrupted":
+        pending_inputs.mark_interrupted(sid, [older])
+    command = pending_inputs.record(sid, [{"type": "input_text", "text": "/model sonnet"}])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "slash_command",
+            "item_data": {
+                "agent": "claude-native-ui",
+                "kind": "command",
+                "name": "model",
+                "arguments": "sonnet",
+            },
+            "response_id": "resp_model",
+            "source_id": "claude:model:0",
+        },
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            await _persist_external_conversation_item(
+                sid,
+                conv,
+                body,
+                store,  # type: ignore[arg-type]
+            )
+        assert store.appended_items == []
+        assert pending_inputs.pending_ids(sid) == [older, command]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == (
+            [command] if prior_state == "interrupted" else [older, command]
+        )
+
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["slash_command"]
+        assert pending_inputs.pending_ids(sid) == [older]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == (
+            [] if prior_state == "interrupted" else [older]
+        )
+        delayed = pending_inputs.resolve_matching_text(sid, "still on its way")
+        assert delayed.matched is not None and delayed.matched.pending_id == older
+        assert delayed.matched.interrupted == (prior_state == "interrupted")
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_failed_append_keeps_held_entries_when_the_queue_refills(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Entries a persist has drained survive a refill of the queue during a failed append.
+
+    Full queue: a lost message A at the head, B behind it, then filler. Mirror B
+    (A skipped, B matched). While the append is in flight three new messages
+    arrive, then the append fails. Only unheld entries count against the cap,
+    so the refill evicts the oldest filler once it overflows, never A or B; the
+    retry then persists A as undelivered, matches B, and the receipts name A
+    then B.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        session_stream,
+        "publish",
+        lambda conversation_id, event: published.append((conversation_id, event)),
+    )
+    pending_inputs.reset_for_tests()
+    store = _BlockingStore(fail_first_append=True)
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    cap = pending_inputs._MAX_ENTRIES_PER_CONVERSATION
+    lost = pending_inputs.record(sid, [{"type": "input_text", "text": "lost in the reconnect"}])
+    matched = pending_inputs.record(sid, [{"type": "input_text", "text": "still here?"}])
+    filler = [
+        pending_inputs.record(sid, [{"type": "input_text", "text": f"filler {i}"}])
+        for i in range(cap - 2)
+    ]
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "still here?"}],
+            },
+            "response_id": "resp_still_here",
+            "source_id": "claude:still-here:0",
+        },
+    )
+
+    async def persist() -> str:
+        return await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+    try:
+        first = asyncio.create_task(persist())
+        await asyncio.to_thread(store.first_append_started.wait, 5)
+        newer = [
+            pending_inputs.record(sid, [{"type": "input_text", "text": f"new {i}"}])
+            for i in range(3)
+        ]
+        store.release_first_append.set()
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            await first
+
+        # The refill evicted the oldest filler entry, not the held ones.
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            lost,
+            matched,
+            *filler[1:],
+            *newer,
+        ]
+        assert store.appended_items == []
+
+        item_id = await persist()
+
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        assert item_id == store.appended_items[-1].id
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            *filler[1:],
+            *newer,
+        ]
+        receipts = [
+            event["data"]["cleared_pending_id"]
+            for _conversation_id, event in published
+            if event.get("type") == "session.input.consumed"
+        ]
+        assert receipts == [lost, matched]
+    finally:
+        store.release_first_append.set()
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_cancelled_mirror_still_settles_its_held_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request cancelled mid-append still releases its held entries and publishes.
+
+    The persist is shielded from the caller's cancellation: the append thread
+    runs to completion, the held entries are released (or unheld on failure),
+    and the receipts go out. Without that they would stay held until the TTL
+    and a retry, finding the item persisted, would return without ever
+    acknowledging them.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        session_stream,
+        "publish",
+        lambda conversation_id, event: published.append((conversation_id, event)),
+    )
+    pending_inputs.reset_for_tests()
+    store = _BlockingStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    lost = pending_inputs.record(sid, [{"type": "input_text", "text": "lost in the reconnect"}])
+    matched = pending_inputs.record(sid, [{"type": "input_text", "text": "still here?"}])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "still here?"}],
+            },
+            "response_id": "resp_still_here",
+            "source_id": "claude:still-here:0",
+        },
+    )
+
+    async def persist() -> str:
+        return await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+    try:
+        request = asyncio.create_task(persist())
+        assert await asyncio.to_thread(store.first_append_started.wait, budget(5))
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        # Still in flight: the entries stay held, so nothing else can drain them.
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            lost,
+            matched,
+        ]
+        assert pending_inputs.resolve_matching_text(sid, "still here?").matched is None
+
+        store.release_first_append.set()
+        # Settlement precedes title seeding and publication of the final receipt.
+        await poll_until_async(
+            lambda: any(
+                event.get("type") == "session.input.consumed"
+                and event["data"]["cleared_pending_id"] == matched
+                for _conversation_id, event in published
+            ),
+            timeout_s=budget(5),
+        )
+
+        assert pending_inputs.snapshot_for(sid) == []
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        receipts = [
+            event["data"]["cleared_pending_id"]
+            for _conversation_id, event in published
+            if event.get("type") == "session.input.consumed"
+        ]
+        assert receipts == [lost, matched]
+        # The forwarder's retry is a no-op.
+        assert await persist() == store.appended_items[-1].id
+        assert len(store.appended_items) == 3
+    finally:
+        store.release_first_append.set()
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_attachment_message_is_not_confused_with_a_typed_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An image message's mirror settles its own entry, not an older typed look-alike.
+
+    Queue a lost plain message ``[Attached: literal] same`` and then an image
+    with the text ``same``. The executor pastes the image behind a generated
+    marker line, so the mirror reads ``[Attached: <path>]\\n\\nsame``: it must
+    match the image message (persisting its image block and naming its entry
+    in the receipt) and surface the older lost message as undelivered.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        session_stream,
+        "publish",
+        lambda conversation_id, event: published.append((conversation_id, event)),
+    )
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    typed = pending_inputs.record(
+        sid, [{"type": "input_text", "text": "[Attached: literal] same"}]
+    )
+    image = {"type": "input_image", "file_id": "file_x", "filename": "shot.png"}
+    with_image = pending_inputs.record(sid, [image, {"type": "input_text", "text": "same"}])
+    mirrored_text = "[Attached: /tmp/omnigent/shot.png]\n\nsame"
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": mirrored_text}],
+            },
+            "response_id": "resp_same",
+            "source_id": "claude:same:0",
+        },
+    )
+
+    try:
+        item_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        lost_user, _lost_error, matched_user = store.appended_items
+        assert lost_user.data.content == [
+            {"type": "input_text", "text": "[Attached: literal] same"}
+        ]
+        assert image in matched_user.data.content
+        assert item_id == matched_user.id
+        assert pending_inputs.snapshot_for(sid) == []
+        receipts = [
+            event["data"]["cleared_pending_id"]
+            for _conversation_id, event in published
+            if event.get("type") == "session.input.consumed"
+        ]
+        assert receipts == [typed, with_image]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_source_less_mirror_never_marks_older_entries_undelivered() -> None:
+    """A mirror with no source id cannot be told from a retry, so it surfaces nothing.
+
+    Forwarders that omit ``source_id`` retry a POST whose response was lost.
+    Such a retry may text-match a newer identical queued message; branding the
+    entries in between undelivered would be a false failure. Without a
+    retry-safe identity the older entries stay queued for their own mirrors.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+
+    def mirror(text: str, response_id: str) -> SessionEventInput:
+        return SessionEventInput(
+            type="external_conversation_item",
+            data={
+                "item_type": "message",
+                "item_data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+                "response_id": response_id,
+            },
+        )
+
+    try:
+        # A's mirror lands, but its response is lost on the way back.
+        pending_inputs.record(sid, [{"type": "input_text", "text": "yes"}])
+        await _persist_external_conversation_item(sid, conv, mirror("yes", "resp_a"), store)  # type: ignore[arg-type]
+        in_flight = pending_inputs.record(sid, [{"type": "input_text", "text": "continue"}])
+        again = pending_inputs.record(sid, [{"type": "input_text", "text": "yes"}])
+
+        # The forwarder retries A; the text matches the newer "yes".
+        await _persist_external_conversation_item(sid, conv, mirror("yes", "resp_a"), store)  # type: ignore[arg-type]
+
+        assert [item.type for item in store.appended_items] == ["message", "message"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [in_flight]
+        assert again not in [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)]
+
+        # B's own mirror still finds its entry.
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            mirror("continue", "resp_b"),
+            store,  # type: ignore[arg-type]
+        )
+        assert [item.type for item in store.appended_items] == ["message", "message", "message"]
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_append_stays_bounded_after_a_rolled_back_overflow() -> None:
+    """A hold, refill, fail cycle cannot make the next append exceed its row bound.
+
+    Hold the whole cap for an append, record another cap's worth while it is
+    parked, fail the append (everything unheld: twice the cap queued), then
+    mirror the newest message. The drain surfaces at most a cap of skipped
+    entries, so the append writes at most ``2 * cap + 1`` rows and the rest
+    stays queued for later drains.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _BlockingStore(fail_first_append=True)
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    cap = pending_inputs._MAX_ENTRIES_PER_CONVERSATION
+    first_wave = [
+        pending_inputs.record(sid, [{"type": "input_text", "text": f"a{i}"}]) for i in range(cap)
+    ]
+
+    def mirror(text: str) -> SessionEventInput:
+        return SessionEventInput(
+            type="external_conversation_item",
+            data={
+                "item_type": "message",
+                "item_data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+                "response_id": f"resp_{text}",
+                "source_id": f"claude:{text}:0",
+            },
+        )
+
+    try:
+        first = asyncio.create_task(
+            _persist_external_conversation_item(sid, conv, mirror(f"a{cap - 1}"), store)  # type: ignore[arg-type]
+        )
+        await asyncio.to_thread(store.first_append_started.wait, 5)
+        second_wave = [
+            pending_inputs.record(sid, [{"type": "input_text", "text": f"b{i}"}])
+            for i in range(cap)
+        ]
+        store.release_first_append.set()
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            await first
+        assert len(pending_inputs.snapshot_for(sid)) == 2 * cap
+
+        await _persist_external_conversation_item(sid, conv, mirror(f"b{cap - 1}"), store)  # type: ignore[arg-type]
+
+        assert len(store.appended_items) == 2 * cap + 1
+        assert [item.type for item in store.appended_items[-3:]] == ["message", "error", "message"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == second_wave[
+            :-1
+        ]
+        assert first_wave[0] not in [
+            entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)
+        ]
+    finally:
+        store.release_first_append.set()
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_reformatted_mirror_never_brands_later_messages_undelivered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A positional drain leaves no entry that a later match could call undelivered.
+
+    Lost A sits ahead of B. B's mirror comes back reformatted beyond what
+    matching normalizes, so it drains A by position and B's own entry stays
+    queued although B was delivered. When C's exact mirror jumps over B, B
+    must not be persisted a second time as undelivered; it is drained quietly.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        session_stream,
+        "publish",
+        lambda conversation_id, event: published.append((conversation_id, event)),
+    )
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+
+    def mirror(text: str, key: str) -> SessionEventInput:
+        return SessionEventInput(
+            type="external_conversation_item",
+            data={
+                "item_type": "message",
+                "item_data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+                "response_id": f"resp_{key}",
+                "source_id": f"claude:{key}:0",
+            },
+        )
+
+    try:
+        lost = pending_inputs.record(
+            sid, [{"type": "input_text", "text": "lost in the reconnect"}]
+        )
+        pending_inputs.record(
+            sid, [{"type": "input_text", "text": "> quoted\n\nwhat about this?"}]
+        )
+        # B is delivered, but its mirror is reformatted: no match, so A drains by position.
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            mirror("quoted -- what about this?", "b"),
+            store,  # type: ignore[arg-type]
+        )
+        assert [item.type for item in store.appended_items] == ["message"]
+        assert len(pending_inputs.snapshot_for(sid)) == 1
+
+        third = pending_inputs.record(sid, [{"type": "input_text", "text": "and now?"}])
+        await _persist_external_conversation_item(sid, conv, mirror("and now?", "c"), store)  # type: ignore[arg-type]
+
+        assert [item.type for item in store.appended_items] == ["message", "message"]
+        assert pending_inputs.snapshot_for(sid) == []
+        receipts = [
+            event["data"]["cleared_pending_id"]
+            for _conversation_id, event in published
+            if event.get("type") == "session.input.consumed"
+        ]
+        assert receipts == [lost, third]
     finally:
         pending_inputs.reset_for_tests()
 
@@ -5154,6 +6718,9 @@ class _ReconnectWaitRouter:
     def __init__(self, *, reconnects: bool) -> None:
         self._reconnects = reconnects
         self.waits: list[tuple[str, float]] = []
+
+    def require_mcp_registry_support(self, conversation: Conversation) -> None:
+        """These reconnect fixtures have no registry MCPs."""
 
     async def wait_for_runner(self, runner_id: str, *, timeout_s: float) -> bool:
         self.waits.append((runner_id, timeout_s))
@@ -5374,6 +6941,232 @@ async def test_native_dispatch_tunnel_drop_retry_failure_is_durable_after_one_at
         errors[0].data.message
         == "Native Claude terminal ensure request failed. runner 'runner_one' is offline"
     )
+
+
+_RUNNER_UNREACHABLE = "The runner is unreachable. Reconnect the host and retry your message."
+
+
+@pytest.fixture
+def published_stream_events(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Capture what the server publishes to a session's live stream."""
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, event: published.append(event),
+    )
+    return published
+
+
+def _host_bound_native_conv(store: _ConversationStore) -> Conversation:
+    """The canned native session row, bound to a host and to a runner on it."""
+    import dataclasses
+
+    conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
+    assert conv is not None
+    return dataclasses.replace(conv, runner_id="runner_one", host_id="host_x")
+
+
+def _tunnel_loss(kind: str, terminals_path: str) -> Exception:
+    """A tunnel-loss failure: a drop under the request, or a runner already offline."""
+    if kind == "tunnel_closed":
+        return ConnectionError(_TUNNEL_CLOSED)
+    return httpx.ConnectError(
+        "runner 'runner_one' is offline", request=_ensure_request(terminals_path)
+    )
+
+
+async def _send_native_message(
+    store: _ConversationStore,
+    conv: Conversation,
+    client: _FailingEnsureRunnerClient,
+    router: _ReconnectWaitRouter,
+) -> Any:
+    """Send a user message to the native session through the event dispatch."""
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "retry"}]},
+    )
+    return await _dispatch_session_event_to_runner(
+        conv.id,
+        conv,
+        body,
+        store,  # type: ignore[arg-type]
+        client,  # type: ignore[arg-type]
+        agent_name="claude-native-ui",
+        file_store=None,
+        artifact_store=None,
+        created_by=None,
+        runner_router=router,  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drop_kind", ["tunnel_closed", "runner_offline"])
+async def test_native_dispatch_host_bound_tunnel_drop_refuses_send_when_runner_stays_gone(
+    drop_kind: str,
+    published_stream_events: list[dict[str, Any]],
+) -> None:
+    """A host-bound send whose runner never re-registers is refused with the input kept.
+
+    The ensure never reached the runner, so nothing shows the terminal failed
+    to boot. Recording a failed turn would consume the message and leave the
+    session failed after the host returns.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions import orchestration as orchestration_module
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    conv = _host_bound_native_conv(store)
+    terminals_path = f"/v1/sessions/{conv.id}/resources/terminals"
+    drop = _tunnel_loss(drop_kind, terminals_path)
+    client = _FailingEnsureRunnerClient(terminals_path, [drop])
+    router = _ReconnectWaitRouter(reconnects=False)
+
+    with pytest.raises(OmnigentError) as exc:
+        await _send_native_message(store, conv, client, router)
+
+    assert exc.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    assert exc.value.message == _RUNNER_UNREACHABLE
+    assert exc.value.__cause__ is drop
+    assert router.waits == [
+        ("runner_one", orchestration_module._NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S)
+    ]
+    # No second ensure attempt and no message forward.
+    assert [call for call in client.calls if call[0] == "POST"] == [("POST", terminals_path)]
+    # Nothing consumed: no user or error item, no failed status, no optimistic bubble.
+    assert store.appended_items == []
+    assert published_stream_events == []
+    assert not pending_inputs.has_pending(conv.id)
+
+
+@pytest.mark.asyncio
+async def test_native_dispatch_host_bound_retry_failure_refuses_send_after_one_attempt(
+    published_stream_events: list[dict[str, Any]],
+) -> None:
+    """A repeat ensure that loses the tunnel again stops there and keeps the message."""
+    from omnigent.runtime import pending_inputs
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    conv = _host_bound_native_conv(store)
+    terminals_path = f"/v1/sessions/{conv.id}/resources/terminals"
+    retry_drop = _tunnel_loss("runner_offline", terminals_path)
+    client = _FailingEnsureRunnerClient(
+        terminals_path, [_tunnel_loss("tunnel_closed", terminals_path), retry_drop]
+    )
+    router = _ReconnectWaitRouter(reconnects=True)
+
+    with pytest.raises(OmnigentError) as exc:
+        await _send_native_message(store, conv, client, router)
+
+    assert exc.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    assert exc.value.message == _RUNNER_UNREACHABLE
+    assert exc.value.__cause__ is retry_drop
+    # One wait, two ensure attempts, no third; the message is not forwarded.
+    assert len(router.waits) == 1
+    assert [call for call in client.calls if call[0] == "POST"] == [
+        ("POST", terminals_path),
+        ("POST", terminals_path),
+    ]
+    assert store.appended_items == []
+    assert published_stream_events == []
+    assert not pending_inputs.has_pending(conv.id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drop_kind", ["tunnel_closed", "runner_offline"])
+async def test_native_dispatch_host_bound_tunnel_drop_forwards_after_runner_reconnects(
+    drop_kind: str,
+) -> None:
+    """A host-bound send still rides out a short drop: the repeat ensure succeeds."""
+    from omnigent.runtime import pending_inputs
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    conv = _host_bound_native_conv(store)
+    terminals_path = f"/v1/sessions/{conv.id}/resources/terminals"
+    client = _FailingEnsureRunnerClient(terminals_path, [_tunnel_loss(drop_kind, terminals_path)])
+    router = _ReconnectWaitRouter(reconnects=True)
+
+    try:
+        result = await _send_native_message(store, conv, client, router)
+
+        assert len(router.waits) == 1
+        assert [call for call in client.calls if call[0] == "POST"] == [
+            ("POST", terminals_path),
+            ("POST", terminals_path),
+            ("POST", f"/v1/sessions/{conv.id}/events"),
+        ]
+        assert result.pending_id is not None
+        assert [i for i in store.appended_items if i.type == "error"] == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drops_first", [False, True], ids=["timeout_first", "timeout_on_repeat"])
+async def test_native_dispatch_host_bound_non_tunnel_error_stays_durable(
+    drops_first: bool,
+) -> None:
+    """Only a lost tunnel is refused; any other transport error still fails the turn durably."""
+    store = _ConversationStore()
+    conv = _host_bound_native_conv(store)
+    terminals_path = f"/v1/sessions/{conv.id}/resources/terminals"
+    failures: list[Exception] = [
+        httpx.ReadTimeout("read timed out", request=_ensure_request(terminals_path))
+    ]
+    if drops_first:
+        failures.insert(0, _tunnel_loss("tunnel_closed", terminals_path))
+    client = _FailingEnsureRunnerClient(terminals_path, failures)
+    router = _ReconnectWaitRouter(reconnects=True)
+
+    result = await _send_native_message(store, conv, client, router)
+
+    # A tunnel drop waits and repeats the ensure once; a timeout does neither.
+    assert len(router.waits) == int(drops_first)
+    ensure_attempts = [("POST", terminals_path)] * len(failures)
+    assert [call for call in client.calls if call[0] == "POST"] == ensure_attempts
+    assert result.pending_id is None
+    assert [i.type for i in store.appended_items] == ["message", "error"]
+    error = store.appended_items[1]
+    assert error.data.code == "native_terminal_ensure_failed"
+    assert error.data.message == "Native Claude terminal ensure request failed. read timed out"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["router", "runner_id"])
+async def test_ensure_native_terminal_ready_host_bound_refuses_unwaitable_tunnel_loss(
+    missing: str,
+) -> None:
+    """With no router or runner id to wait on, a host-bound tunnel loss is still refused."""
+    import dataclasses
+
+    from omnigent.server.routes.sessions import _ensure_native_terminal_ready
+
+    store = _ConversationStore()
+    conv = _host_bound_native_conv(store)
+    terminals_path = f"/v1/sessions/{conv.id}/resources/terminals"
+    client = _FailingEnsureRunnerClient(
+        terminals_path, [_tunnel_loss("tunnel_closed", terminals_path)]
+    )
+    router = _ReconnectWaitRouter(reconnects=True)
+    if missing == "runner_id":
+        conv = dataclasses.replace(conv, runner_id=None)
+
+    with pytest.raises(OmnigentError) as exc:
+        await _ensure_native_terminal_ready(
+            client,  # type: ignore[arg-type]
+            conv.id,
+            conv,
+            runner_router=None if missing == "router" else router,  # type: ignore[arg-type]
+        )
+
+    assert exc.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    assert router.waits == []
+    assert len(client.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -5959,6 +7752,613 @@ async def test_relay_fences_cancelled_turn_and_resumes_on_next_turn(
         f"cancelled-turn delta must not be forwarded; got {published_deltas}"
     )
     assert "REAL REPLY" in published_deltas
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_first_append", [False, True])
+async def test_relay_settles_queued_native_message_on_failed_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fail_first_append: bool,
+) -> None:
+    """A failed native turn commits the queued web message ahead of its error item.
+
+    Native sessions do not persist a web message at POST time; the transcript
+    forwarder mirrors it back and drains its queued entry. When the runner
+    reports the turn failed, the harness never received the message, so the
+    relay commits the queued entry as the user message (sender intact),
+    publishes the consumed event that swaps the optimistic bubble, and leaves
+    nothing queued for a later mirrored message to drain by mistake.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions.orchestration import (
+        _settle_undelivered_native_input,
+    )
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    pending_inputs.reset_for_tests()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    store = _FailOnceStore() if fail_first_append else _ConversationStore()
+    content = [{"type": "input_text", "text": "set up the worktree"}]
+    pending_id = pending_inputs.record(
+        sid,
+        content,
+        created_by="alice@example.com",
+        stable_id="7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+    )
+    original = pending_inputs.delivery_attributes_for(sid, pending_id)
+    caplog.set_level(logging.INFO)
+    # A second message the runner is still holding for the next turn.
+    queued_next = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "then run the tests"}],
+        created_by="alice@example.com",
+        stable_id="8a4b0d2f6c3e5a7b9d1f2e3c4b5a6d7e",
+    )
+    published: list[dict[str, Any]] = []
+    real_publish = session_stream.publish
+
+    def _capture(session_id: str, event: dict[str, Any]) -> None:
+        published.append(event)
+        real_publish(session_id, event)
+
+    monkeypatch.setattr("omnigent.server.routes.sessions.session_stream.publish", _capture)
+    client = _ScriptedStreamingRunnerClient(
+        [
+            _sse_frame(
+                {"type": "response.in_progress", "response": {"id": "resp_fail", "model": "codex"}}
+            ),
+            _sse_frame(
+                {
+                    "type": "response.failed",
+                    # The runner names the message this turn carried.
+                    "input_stable_id": "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+                    "response": {
+                        "id": "resp_fail",
+                        "model": "codex",
+                        "error": {
+                            "code": "databricks_sign_in_pending",
+                            "message": "Codex is waiting for a sign-in in the terminal.",
+                            # The harness says the message never reached it.
+                            "undelivered": True,
+                        },
+                    },
+                }
+            ),
+            _sse_frame(
+                {
+                    "type": "session.status",
+                    "status": "failed",
+                    "response_id": "resp_fail",
+                    "error": {
+                        "code": "databricks_sign_in_pending",
+                        "message": "Codex is waiting for a sign-in in the terminal.",
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    try:
+        if fail_first_append:
+            await _settle_undelivered_native_input(
+                store,  # type: ignore[arg-type]
+                sid,
+                "resp_fail",
+                "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+            )
+            assert store.appended_items == []
+            assert [e["pending_id"] for e in pending_inputs.snapshot_for(sid)] == [
+                pending_id,
+                queued_next,
+            ]
+            restored = pending_inputs.delivery_attributes_for(sid, pending_id)
+            assert restored["delivery_attempt_id"] == original["delivery_attempt_id"]
+            assert restored["input_enqueued_at_ms"] == original["input_enqueued_at_ms"]
+            assert not any(
+                getattr(record, "event_name", None) == "native_input_settled"
+                for record in caplog.records
+            )
+            assert not any(e.get("type") == "session.input.consumed" for e in published)
+        await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+
+        types = [i.type for i in store.appended_items]
+        assert types == ["message", "error"], types
+        # The runner's failed edge names its turn; the relay keeps that id so the
+        # web folds the edge into the response's own error card.
+        failed_edges = [
+            e
+            for e in published
+            if e.get("type") == "session.status" and e.get("status") == "failed"
+        ]
+        assert [e.get("response_id") for e in failed_edges] == ["resp_fail"]
+        message, error = store.appended_items
+        assert message.data.user_authored is True
+        assert message.data.role == "user"
+        assert "".join(b["text"] for b in message.data.content) == "set up the worktree"
+        assert message.created_by == "alice@example.com"
+        # Both items share the failed turn's id so they group in one bubble.
+        assert message.response_id == "resp_fail"
+        assert error.response_id == "resp_fail"
+        assert error.data.code == "databricks_sign_in_pending"
+        # Only the failed turn's own message settled; the next one stays queued.
+        assert [e["pending_id"] for e in pending_inputs.snapshot_for(sid)] == [queued_next]
+        consumed = [e for e in published if e.get("type") == "session.input.consumed"]
+        assert len(consumed) == 1
+        assert consumed[0]["data"]["cleared_pending_id"] == pending_id
+        assert consumed[0]["data"]["created_by"] == "alice@example.com"
+        [record] = [
+            record
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "native_input_settled"
+        ]
+        attrs = record.attributes
+        assert attrs["outcome"] == "reported_undelivered"
+        assert attrs["pending_id"] == pending_id
+        assert attrs["input_stable_id"] == "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+        assert attrs["delivery_attempt_id"] == original["delivery_attempt_id"]
+        assert attrs["input_enqueued_at_ms"] == original["input_enqueued_at_ms"]
+        assert attrs["item_id"] == consumed[0]["data"]["item_id"]
+        assert attrs["response_id"] == message.response_id == "resp_fail"
+        assert attrs["match_method"] == "input_stable_id"
+        assert attrs["cause_class"] == "rejected_before_handoff"
+        assert attrs["reason_code"] == "databricks_sign_in_pending"
+        assert attrs["lifecycle_response_id"] == "resp_fail"
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_turnless_setup_failure_settles_by_stable_id_without_a_second_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    pending_inputs.reset_for_tests()
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    pending_id = pending_inputs.record(
+        session_id,
+        [{"type": "input_text", "text": "set up the worktree"}],
+        created_by="alice@example.com",
+        stable_id=stable_id,
+    )
+    next_pending = pending_inputs.record(
+        session_id,
+        [{"type": "input_text", "text": "then run the tests"}],
+        stable_id="8a4b0d2f6c3e5a7b9d1f2e3c4b5a6d7e",
+    )
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        session_stream, "publish", lambda _session_id, event: published.append(event)
+    )
+    store = _ConversationStore()
+    client = _ScriptedStreamingRunnerClient(
+        [
+            _sse_frame(
+                {
+                    "type": "response.failed",
+                    "input_stable_id": stable_id,
+                    "response": {
+                        "status": "failed",
+                        "error": {
+                            "code": "runner_error",
+                            "message": "turn setup failed",
+                            "undelivered": True,
+                        },
+                    },
+                    "error": {
+                        "code": "runner_error",
+                        "message": "turn setup failed",
+                        "undelivered": True,
+                    },
+                }
+            ),
+            _sse_frame(
+                {
+                    "type": "session.status",
+                    "status": "failed",
+                    "error": {"code": "runner_error", "message": "turn setup failed"},
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+
+    try:
+        await _relay_runner_stream(session_id, client, store)  # type: ignore[arg-type]
+
+        assert [item.type for item in store.appended_items] == ["message"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == [
+            next_pending
+        ]
+        consumed = [event for event in published if event.get("type") == "session.input.consumed"]
+        assert [event["data"]["cleared_pending_id"] for event in consumed] == [pending_id]
+        assert not [event for event in published if event.get("type") == "response.failed"]
+        failed = [
+            event
+            for event in published
+            if event.get("type") == "session.status" and event.get("status") == "failed"
+        ]
+        assert [(event["error"]["code"], event.get("response_id")) for event in failed] == [
+            ("runner_error", None)
+        ]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("undelivered", [True, False])
+async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
+    undelivered: bool,
+) -> None:
+    """Preserve one real error without a second missing-transcript error on the next turn."""
+    from omnigent.inner.executor import ExecutorError, MockExecutor
+    from omnigent.runtime import pending_inputs
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.routes.sessions import (
+        _persist_external_conversation_item,
+        _relay_runner_stream,
+    )
+    from omnigent.server.schemas import CreateResponseRequest
+
+    pending_inputs.reset_for_tests()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    store = _ConversationStore()
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    first_stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    first_content = [{"type": "input_text", "text": "set up the worktree"}]
+    next_content = [{"type": "input_text", "text": "then run the tests"}]
+    first_pending = pending_inputs.record(
+        sid, first_content, created_by="alice@example.com", stable_id=first_stable_id
+    )
+    next_pending = pending_inputs.record(sid, next_content, created_by="alice@example.com")
+    # Script only the executor boundary; the real adapter must transport its evidence.
+    executor = MockExecutor()
+    executor.enqueue_events(
+        [ExecutorError(message="Terminal is not ready", undelivered=undelivered)]
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    ctx = TurnContext(
+        response_id="resp_not_ready", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            await adapter.run_turn(
+                CreateResponseRequest(model="test-agent", input=first_content), ctx
+            )
+        error = adapter._build_error_detail(raised.value).model_dump(exclude_none=True)
+        client = _ScriptedStreamingRunnerClient(
+            [
+                _sse_frame(
+                    {
+                        "type": "response.in_progress",
+                        "response": {"id": "resp_not_ready", "model": "claude"},
+                    }
+                ),
+                _sse_frame(
+                    {
+                        "type": "response.failed",
+                        "input_stable_id": first_stable_id,
+                        "response": {
+                            "id": "resp_not_ready",
+                            "model": "claude",
+                            "error": error,
+                        },
+                    }
+                ),
+                "data: [DONE]\n\n",
+            ]
+        )
+        await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+        if not undelivered:
+            assert [item.type for item in store.appended_items] == ["error"]
+            assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+                first_pending,
+                next_pending,
+            ]
+            return
+
+        assert [item.type for item in store.appended_items] == ["message", "error"]
+        first, failure = store.appended_items
+        assert first.data.content == first_content
+        assert first.created_by == "alice@example.com"
+        assert first.response_id == failure.response_id == "resp_not_ready"
+        assert failure.data.code == "RuntimeError"
+        assert failure.data.message == "inner executor error: Terminal is not ready"
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            next_pending
+        ]
+
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            SessionEventInput(
+                type="external_conversation_item",
+                data={
+                    "item_type": "message",
+                    "item_data": {"role": "user", "content": next_content},
+                    "response_id": "resp_next",
+                    "source_id": "claude:next-input:0",
+                },
+            ),
+            store,  # type: ignore[arg-type]
+        )
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        assert store.appended_items[-1].data.content == next_content
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        await adapter.on_shutdown()
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirror(
+    tmp_path: Path,
+) -> None:
+    """A pre-delivery refusal must not be reported again as a missing message.
+
+    Claude refuses web ``/login`` before touching the terminal. If that failure
+    is not marked undelivered, the input stays pending. The next successful
+    message's transcript mirror skips it and persists a second error with code
+    ``native_prompt_not_recorded``.
+    """
+    from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
+    from omnigent.runtime import pending_inputs
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.routes.sessions import (
+        _persist_external_conversation_item,
+        _relay_runner_stream,
+    )
+    from omnigent.server.schemas import CreateResponseRequest
+
+    pending_inputs.reset_for_tests()
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    store = _ConversationStore()
+    conversation = store.get_conversation(session_id)
+    assert conversation is not None
+    first_stable_id = "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"
+    later_stable_id = "2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b"
+    auth_content = [{"type": "input_text", "text": "/login"}]
+    later_content = [{"type": "input_text", "text": "continue after login"}]
+    first_pending = pending_inputs.record(
+        session_id,
+        auth_content,
+        created_by="alice@example.com",
+        stable_id=first_stable_id,
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: ClaudeNativeExecutor(tmp_path))
+    context = TurnContext(
+        response_id="resp_login_refused",
+        event_queue=asyncio.Queue(),
+        cancelled=asyncio.Event(),
+    )
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            await adapter.run_turn(
+                CreateResponseRequest(model="claude", input=auth_content),
+                context,
+            )
+        refusal = adapter._build_error_detail(raised.value).model_dump(exclude_none=True)
+        failed_turn = _ScriptedStreamingRunnerClient(
+            [
+                _sse_frame(
+                    {
+                        "type": "response.in_progress",
+                        "response": {"id": "resp_login_refused", "model": "claude"},
+                    }
+                ),
+                _sse_frame(
+                    {
+                        "type": "response.failed",
+                        "input_stable_id": first_stable_id,
+                        "response": {
+                            "id": "resp_login_refused",
+                            "model": "claude",
+                            "error": refusal,
+                        },
+                    }
+                ),
+                "data: [DONE]\n\n",
+            ]
+        )
+        await _relay_runner_stream(session_id, failed_turn, store)  # type: ignore[arg-type]
+
+        later_pending = pending_inputs.record(
+            session_id,
+            later_content,
+            created_by="alice@example.com",
+            stable_id=later_stable_id,
+        )
+        await _persist_external_conversation_item(
+            session_id,
+            conversation,
+            SessionEventInput(
+                type="external_conversation_item",
+                data={
+                    "item_type": "message",
+                    "item_data": {"role": "user", "content": later_content},
+                    "response_id": "native_later_turn",
+                    "source_id": "claude:later:0",
+                },
+            ),
+            store,  # type: ignore[arg-type]
+        )
+
+        missing_errors = [
+            (item.data.code, item.data.message)
+            for item in store.appended_items
+            if item.type == "error" and item.data.code == "native_prompt_not_recorded"
+        ]
+        assert missing_errors == [], (
+            "generated 'Web message missing from native transcript': the refused input "
+            f"{first_pending} stayed pending and was reported missing when the later mirror "
+            f"settled {later_pending}; persisted={missing_errors}"
+        )
+        assert refusal.get("undelivered") is True
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == []
+        assert later_pending not in pending_inputs.pending_ids(session_id)
+    finally:
+        await adapter.on_shutdown()
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_relay_leaves_the_queue_alone_when_the_harness_may_have_the_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A failure the harness does not mark undelivered settles nothing, even with the id.
+
+    Codex can accept a turn and fail before its mirror arrives. The stamped id
+    says which message the turn carried, not that it never got through; if the
+    relay settled it, the late mirror would drain the next queued entry and
+    give this message that entry's identity and attachments. So the message
+    stays queued for its own mirror, and the entry behind it is untouched.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    pending_inputs.reset_for_tests()
+    sid = "86c9a6e5cc129f3996166535768169e8"
+    store = _ConversationStore()
+    a_stable = "4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d"
+    a_pending = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "A"}],
+        created_by="alice@example.com",
+        stable_id=a_stable,
+    )
+    b_pending = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "B"}],
+        created_by="alice@example.com",
+        stable_id="5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e",
+    )
+    published: list[dict[str, Any]] = []
+    real_publish = session_stream.publish
+
+    def _capture(session_id: str, event: dict[str, Any]) -> None:
+        published.append(event)
+        real_publish(session_id, event)
+
+    monkeypatch.setattr("omnigent.server.routes.sessions.session_stream.publish", _capture)
+    client = _ScriptedStreamingRunnerClient(
+        [
+            _sse_frame(
+                {"type": "response.in_progress", "response": {"id": "resp_a", "model": "codex"}}
+            ),
+            _sse_frame(
+                {
+                    "type": "response.failed",
+                    "input_stable_id": a_stable,
+                    "response": {
+                        "id": "resp_a",
+                        "model": "codex",
+                        "error": {
+                            "code": "codex_turn_error",
+                            "message": "Codex native executor error: connection reset.",
+                        },
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+    try:
+        await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+        assert [i.type for i in store.appended_items] == ["error"]
+        assert [e["pending_id"] for e in pending_inputs.snapshot_for(sid)] == [
+            a_pending,
+            b_pending,
+        ]
+        assert not any(e.get("type") == "session.input.consumed" for e in published)
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_relay_leaves_later_queued_messages_when_a_delivered_turn_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A turn that fails after its message was mirrored settles nothing.
+
+    Message A reached the harness and was mirrored back (its entry drained);
+    B and C are still queued because the runner holds them for later turns.
+    When A then fails mid-turn, settling by queue order would commit B under
+    A's response and let B's own mirror consume C. Settlement is by the id
+    the runner stamps on the failure, so B and C stay queued, in order.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    pending_inputs.reset_for_tests()
+    sid = "75b895d4bb018e2885055424657058d7"
+    store = _ConversationStore()
+    a_stable = "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"
+    a_pending = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "A"}],
+        created_by="alice@example.com",
+        stable_id=a_stable,
+    )
+    b_pending = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "B"}],
+        created_by="alice@example.com",
+        stable_id="2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b",
+    )
+    c_pending = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "C"}],
+        created_by="alice@example.com",
+        stable_id="3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c",
+    )
+    # A's mirror already drained its entry before the turn failed.
+    assert pending_inputs.resolve(sid, a_pending) is not None
+    published: list[dict[str, Any]] = []
+    real_publish = session_stream.publish
+
+    def _capture(session_id: str, event: dict[str, Any]) -> None:
+        published.append(event)
+        real_publish(session_id, event)
+
+    monkeypatch.setattr("omnigent.server.routes.sessions.session_stream.publish", _capture)
+    client = _ScriptedStreamingRunnerClient(
+        [
+            _sse_frame(
+                {"type": "response.in_progress", "response": {"id": "resp_a", "model": "codex"}}
+            ),
+            _sse_frame(
+                {
+                    "type": "response.failed",
+                    "input_stable_id": a_stable,
+                    "response": {
+                        "id": "resp_a",
+                        "model": "codex",
+                        "error": {"code": "codex_turn_error", "message": "Codex crashed."},
+                    },
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+    try:
+        await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
+        assert [i.type for i in store.appended_items] == ["error"]
+        assert [e["pending_id"] for e in pending_inputs.snapshot_for(sid)] == [
+            b_pending,
+            c_pending,
+        ]
+        assert not any(e.get("type") == "session.input.consumed" for e in published)
+    finally:
+        pending_inputs.reset_for_tests()
 
 
 @pytest.mark.asyncio
@@ -6792,9 +9192,22 @@ async def test_github_info_falls_back_to_host_when_runner_offline(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("previous_path", "status"),
+    [
+        (None, 200),
+        ("old/%2F #?.py", 200),
+        ("folder/../old.py", 400),
+        ("folder//old.py", 400),
+        ("", 400),
+        ("/old.py", 400),
+    ],
+)
 async def test_github_diff_falls_back_to_host_when_runner_offline(
     offline_env_client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    previous_path: str | None,
+    status: int,
 ) -> None:
     """The GitHub diff (gzip route) also falls back to the host tunnel offline.
 
@@ -6826,14 +9239,20 @@ async def test_github_diff_falls_back_to_host_when_runner_offline(
 
     monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", _fake_read)
 
+    params = {"base": "main"}
+    if previous_path is not None:
+        params["previous_path"] = previous_path
     resp = await offline_env_client.get(
-        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github/diff/app.py?base=main"
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github/diff/app.py", params=params
     )
 
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == status, resp.text
+    if status == 400:
+        assert captured == {}
+        return
     assert resp.json()["after"] == "changed"
     assert captured["op"] == "github_diff"
-    assert captured["params"] == {"base": "main", "path": "app.py"}
+    assert captured["params"] == {"path": "app.py", **params}
 
 
 @pytest.mark.asyncio
@@ -7241,6 +9660,7 @@ async def test_sibling_environment_routes_are_not_gzipped(
         ("/changes", "github_changes"),
         ("/diff", "github_pr_diff"),
         ("/diff/new.py", "github_diff"),
+        ("/labels", "github_labels"),
     ],
 )
 async def test_selected_pr_reaches_offline_host(
@@ -7289,6 +9709,32 @@ async def test_pr_attachment_uses_bound_session_when_runner_offline(
     assert response.status_code == 200, response.text
     assert captured["op"] == "github_prs_update"
     assert captured["params"] == {"url": url, "action": "attach", "session_id": _OFFLINE_SESSION}
+
+
+async def test_pr_label_edit_reaches_offline_host(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes import _host_filesystem
+
+    captured: dict[str, Any] = {}
+    labels = {"object": "session.github.pr_labels", "labels": []}
+
+    async def write(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return labels
+
+    monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", write)
+    url = "https://github.com/example/second/pull/42"
+    response = await offline_env_client.post(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github/labels",
+        json={"pr_url": url, "remove": ["bug"]},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == labels
+    assert captured["op"] == "github_labels_update"
+    assert captured["session_id"] == _OFFLINE_SESSION
+    assert captured["params"] == {"pr_url": url, "add": [], "remove": ["bug"]}
 
 
 @pytest.mark.asyncio
@@ -7361,3 +9807,334 @@ async def test_native_send_rechecks_runtime_after_upload(
     assert "Update Omnigent" in response.text
     assert runner.post_json_calls == []
     assert len(file_conv_store.appended_items) == 1 + int(retained_history)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("typed", "kind", "recorded_name", "arguments"),
+    [
+        # A skill typed /simplify is recorded under its plugin-qualified name.
+        ("/simplify the parser", "skill", "dev-productivity:simplify", "the parser"),
+        (
+            "/dev-productivity:simplify the parser",
+            "skill",
+            "dev-productivity:simplify",
+            "the parser",
+        ),
+        ("/compact", "command", "compact", ""),
+    ],
+    ids=["plugin-short-name", "plugin-qualified-name", "builtin"],
+)
+async def test_claude_native_slash_command_drains_its_queued_entry_under_either_name(
+    typed: str,
+    kind: str,
+    recorded_name: str,
+    arguments: str,
+) -> None:
+    """A web-typed command drains its entry whether Claude records it plugin-qualified or bare.
+
+    The older entry still waits for its own mirror.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    older = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
+    pending_inputs.record(sid, [{"type": "input_text", "text": typed}])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "slash_command",
+            "item_data": {
+                "agent": "claude-native-ui",
+                "kind": kind,
+                "name": recorded_name,
+                "arguments": arguments,
+            },
+            "response_id": "resp_command",
+            "source_id": "claude:command:0",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["slash_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [older]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_claude_native_top_level_local_command_echo_drains_its_queued_entry(
+    tmp_path: Path,
+) -> None:
+    """A ``/model`` Claude records as a top-level ``local_command`` settles its web entry.
+
+    Only the matching entry drains: an older message and a different queued
+    command keep waiting for their own mirrors.
+    """
+    from omnigent.harnesses.claude_native.bridge import read_transcript_items_since
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "system",
+                "subtype": "local_command",
+                "uuid": "model-echo",
+                "content": (
+                    "<command-name>/model</command-name>"
+                    "<command-message>model</command-message>"
+                    "<command-args>example-model</command-args>"
+                ),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _cursor, _response_id, items = read_transcript_items_since(
+        transcript_path, 0, agent_name="claude-native-ui"
+    )
+    assert len(items) == 1
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    older = pending_inputs.record(sid, [{"type": "input_text", "text": "still on its way"}])
+    pending_inputs.record(sid, [{"type": "input_text", "text": "/model example-model"}])
+    later = pending_inputs.record(sid, [{"type": "input_text", "text": "/effort high"}])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": items[0].item_type,
+            "item_data": items[0].data,
+            "response_id": items[0].response_id,
+            "source_id": items[0].source_id,
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["slash_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
+            older,
+            later,
+        ]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("typed", ["/simplify the lexer", "/review the parser"])
+async def test_claude_native_plugin_slash_command_leaves_a_different_queued_command(
+    typed: str,
+) -> None:
+    """Trying the bare name never settles an entry with other arguments or another command."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    other = pending_inputs.record(sid, [{"type": "input_text", "text": typed}])
+    body = SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "slash_command",
+            "item_data": {
+                "agent": "claude-native-ui",
+                "kind": "skill",
+                "name": "dev-productivity:simplify",
+                "arguments": "the parser",
+            },
+            "response_id": "resp_simplify",
+            "source_id": "claude:simplify:0",
+        },
+    )
+
+    try:
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+        )
+
+        assert [item.type for item in store.appended_items] == ["slash_command"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [other]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness_override", "text"),
+    [
+        (None, "/btw what is a monad"),
+        (None, "/btw"),
+        # A forced-auto pane has not routed yet, but its terminal is already Claude.
+        ("auto", "/btw what is a monad"),
+    ],
+    ids=["question", "bare", "forced-auto-pane"],
+)
+async def test_claude_native_btw_message_is_forwarded_without_a_queued_entry(
+    harness_override: str | None,
+    text: str,
+) -> None:
+    """A /btw never reaches the transcript, so it must not leave a skippable entry."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    conv.harness_override = harness_override
+    client = _FakeRunnerClient()
+    content = [{"type": "input_text", "text": text}]
+    body = SessionEventInput(type="message", data={"role": "user", "content": content})
+
+    try:
+        result = await _dispatch_session_event_to_runner(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+            client,  # type: ignore[arg-type]
+            agent_name="claude-native-ui",
+            file_store=None,
+            artifact_store=None,
+            created_by="alice@example.com",
+        )
+
+        assert result.pending_id is None
+        assert pending_inputs.snapshot_for(sid) == []
+        # The text still reaches Claude's terminal, which answers it in its own overlay.
+        url, forwarded = client.post_json_calls[-1]
+        assert url == f"/v1/sessions/{sid}/events"
+        assert forwarded["content"] == content
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("wrapper", "agent_name", "text", "attachments"),
+    [
+        ("claude-code-native-ui", "claude-native-ui", "/btwx foo", []),
+        ("claude-code-native-ui", "claude-native-ui", "does /btw answer in an overlay?", []),
+        ("codex-native-ui", "codex-native-ui", "/btw what is a monad", []),
+        # An attachment is pasted ahead of the text, so Claude sees an ordinary prompt.
+        (
+            "claude-code-native-ui",
+            "claude-native-ui",
+            "/btw what is this?",
+            [{"type": "input_image", "file_id": "file_x", "filename": "a.png"}],
+        ),
+    ],
+    ids=["longer-command-name", "mentioned-mid-sentence", "codex-pane", "with-attachment"],
+)
+async def test_native_message_that_is_not_a_claude_btw_is_still_queued(
+    wrapper: str,
+    agent_name: str,
+    text: str,
+    attachments: list[dict[str, str]],
+) -> None:
+    """Only a text-only /btw on a Claude pane skips the queue; anything else keeps its entry."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _dispatch_session_event_to_runner
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = Conversation(
+        id=sid,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=sid,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        labels={"omnigent.ui": "terminal", "omnigent.wrapper": wrapper},
+    )
+    client = _FakeRunnerClient()
+    content = [*attachments, {"type": "input_text", "text": text}]
+    body = SessionEventInput(type="message", data={"role": "user", "content": content})
+
+    try:
+        result = await _dispatch_session_event_to_runner(
+            sid,
+            conv,
+            body,
+            store,  # type: ignore[arg-type]
+            client,  # type: ignore[arg-type]
+            agent_name=agent_name,
+            file_store=None,
+            artifact_store=None,
+            created_by="alice@example.com",
+        )
+
+        assert result.pending_id is not None
+        assert [entry["content"] for entry in pending_inputs.snapshot_for(sid)] == [content]
+        assert client.post_json_calls[-1][0] == f"/v1/sessions/{sid}/events"
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "",
+        "/filesystem",
+        "/filesystem/file.txt",
+        "/changes",
+        "/diff/file.txt",
+        "/search",
+        "/search/folder",
+    ],
+)
+@pytest.mark.parametrize("environment_id", ["default", "env?draft#one%two", ".", ".."])
+async def test_environment_id_is_one_runner_url_segment(
+    client: httpx.AsyncClient, suffix: str, environment_id: str
+) -> None:
+    from urllib.parse import quote
+
+    fake_runner = _FakeRunnerClient(payload={"data": []})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    encoded = quote(environment_id, safe="").replace(".", "%2E")
+    base = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/"
+    response = await client.get(base + encoded + suffix, params={"q": "file"})
+    if environment_id in {".", ".."}:
+        assert response.status_code == 400, response.text
+        assert fake_runner.calls == []
+    else:
+        assert response.status_code == 200, response.text
+        assert fake_runner.calls
+        forwarded = httpx.URL(fake_runner.calls[-1][1])
+        assert (
+            forwarded.raw_path.split(b"?", 1)[0]
+            == (base + quote(environment_id, safe="") + suffix).encode()
+        )
+        assert forwarded.fragment == ""

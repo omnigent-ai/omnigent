@@ -74,6 +74,35 @@ describe("BlockStream — response_start", () => {
 });
 
 describe("BlockStream — block ctx carries response_id and item_id", () => {
+  it("does not adopt lifecycle notice ids as the parent stream identity", () => {
+    const blocks = reduce([
+      {
+        type: "native_tool_call",
+        toolType: "subagent_activity",
+        data: {},
+        itemId: "notice_1",
+        responseId: "subagent_returned",
+      },
+      { type: "text_delta", delta: "Before identity\n" },
+      {
+        type: "tool_call",
+        name: "Read",
+        arguments: {},
+        callId: "call_1",
+        status: "completed",
+        agentName: "parent",
+        itemId: "tool_1",
+        responseId: "parent_turn",
+      },
+      { type: "text_delta", delta: "After identity\n" },
+    ]);
+
+    expect(blocks[0]?.ctx.responseId).toBe("subagent_returned");
+    expect(
+      blocks.filter((block) => block.type === "text_chunk").map((block) => block.ctx.responseId),
+    ).toEqual(["", "parent_turn"]);
+  });
+
   it("every block ctx.responseId is the active response id from response.created", () => {
     const blocks = reduce([
       { type: "response_created", response: makeResponse({ responseId: "resp_xyz" }) },

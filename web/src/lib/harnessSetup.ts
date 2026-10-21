@@ -54,6 +54,19 @@ export interface HarnessReadinessExplanation {
   description: string;
 }
 
+export type HarnessCredentialKind = "isaac" | "personal";
+
+export const HARNESS_CREDENTIAL_COPY: Record<HarnessCredentialKind, HarnessReadinessExplanation> = {
+  isaac: {
+    label: "Isaac",
+    description: "Databricks-managed credential via the Unity Gateway",
+  },
+  personal: {
+    label: "Personal subscription",
+    description: "Your own plan (e.g. Claude Pro/Max, ChatGPT Plus)",
+  },
+};
+
 export interface HarnessReadiness {
   state: HarnessReadinessState;
   reason: HarnessReadinessReason;
@@ -176,6 +189,11 @@ export function isSdkHarness(harness: string): boolean {
  *  so the message helper gates on this. */
 export function isCodexHarness(harness: string): boolean {
   return harness === "codex" || harness === "codex-native" || harness === "native-codex";
+}
+
+/** Sigil used to invoke a skill in *harness*: `$` for codex-native, `/` for all others. */
+export function skillInvocationPrefix(harness: string | null | undefined): "$" | "/" {
+  return harness === "codex-native" ? "$" : "/";
 }
 
 export function isNativeCursorHarness(harness: string): boolean {

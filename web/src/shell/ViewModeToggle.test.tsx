@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { DropdownMenu, DropdownMenuContent } from "@/components/ui/dropdown-menu";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
@@ -149,10 +150,15 @@ describe("ViewModeToggle", () => {
 
   it("names each segment on hover so the icon-only control is legible", async () => {
     renderToggle(makeCtx({ view: "chat" }));
+    expect(chatSegment()).toHaveAttribute("aria-keyshortcuts", `${ARIA_MOD_KEY}+Alt+\\`);
     // Radix opens on a real pointer move over the trigger (the wrapper span),
     // so a bare pointerEnter on the button wouldn't surface the tooltip.
     fireEvent.pointerMove(chatSegment().parentElement!, { pointerType: "mouse" });
-    expect(await screen.findByRole("tooltip")).toHaveTextContent("Chat view");
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("Chat view");
+    expect(
+      Array.from(tooltip.querySelectorAll('[data-slot="kbd"]'), (key) => key.textContent),
+    ).toEqual([MOD_KEY, ALT_KEY, "\\"]);
   });
 
   it("keeps the Terminal segment usable and shows a spinner while the terminal is coming up", () => {

@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
-import threading
-from collections.abc import Coroutine
 from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
+
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
 
 _HOST_ID = "host_e2e_windows"
 _WINDOWS_NATIVE_HARNESS_AVAILABLE: bool = False
@@ -54,22 +53,6 @@ def _claude_native_agents_body() -> str:
 
 def _info_body() -> str:
     return json.dumps({"version": "0.0.0", "features": [], "installable_harnesses": []})
-
-
-def _run_in_fresh_loop(coro: Coroutine[Any, Any, None]) -> None:
-    captured: dict[str, Exception] = {}
-
-    def _worker() -> None:
-        try:
-            asyncio.run(coro)
-        except Exception as exc:
-            captured["error"] = exc
-
-    thread = threading.Thread(target=_worker)
-    thread.start()
-    thread.join()
-    if "error" in captured:
-        raise captured["error"]
 
 
 _SESSIONS_RE = re.compile(r"/v1/sessions(\?.*)?$")

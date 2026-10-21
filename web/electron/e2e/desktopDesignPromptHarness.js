@@ -165,18 +165,22 @@ async function startDesignBackend(tmpDir) {
       env: { ...process.env, COPYFILE_DISABLE: "1" },
     });
     assert.equal(archive.status, 0, archive.stderr?.toString());
-    const form = new FormData();
-    form.set("metadata", JSON.stringify({}));
-    form.set("bundle", new Blob([archive.stdout], { type: "application/gzip" }), "agent.tar.gz");
-    const created = await jsonRequest(`${serverUrl}/v1/sessions`, { method: "POST", body: form });
-    const sessionId = created.session_id;
-    assert.equal(typeof sessionId, "string");
-    await jsonRequest(`${serverUrl}/v1/sessions/${sessionId}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ runner_id: runnerId }),
-    });
-    return { serverUrl, sessionId, mockUrl, close };
+    const createSession = async () => {
+      const form = new FormData();
+      form.set("metadata", JSON.stringify({}));
+      form.set("bundle", new Blob([archive.stdout], { type: "application/gzip" }), "agent.tar.gz");
+      const created = await jsonRequest(`${serverUrl}/v1/sessions`, { method: "POST", body: form });
+      assert.equal(typeof created.session_id, "string");
+      await jsonRequest(`${serverUrl}/v1/sessions/${created.session_id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ runner_id: runnerId }),
+      });
+      return created.session_id;
+    };
+    const otherSessionId = await createSession();
+    const sessionId = await createSession();
+    return { serverUrl, sessionId, otherSessionId, mockUrl, close };
   } catch (error) {
     await close();
     throw error;

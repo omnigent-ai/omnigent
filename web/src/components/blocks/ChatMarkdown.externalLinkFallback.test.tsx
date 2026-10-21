@@ -155,16 +155,19 @@ describe("external chat link clicks", () => {
     expect(followedLinks).toEqual([]);
   });
 
-  it.each(["javascript:invalid", "data:text/plain,invalid", "vbscript:invalid"])(
-    "never follows a sanitized %s URL",
-    (href) => {
-      const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+  it.each([
+    "javascript:invalid",
+    "javascript:12",
+    "javascript:example.md:12",
+    "data:text/plain,invalid",
+    "vbscript:invalid",
+  ])("never follows a sanitized %s URL", (href) => {
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
 
-      click(renderExternalLink(href));
+    click(renderExternalLink(href));
 
-      expect(screen.queryByRole("link")).not.toBeInTheDocument();
-      expect(openSpy).not.toHaveBeenCalled();
-      expect(followedLinks).toEqual([]);
-    },
-  );
+    expect(screen.queryByRole("link")).not.toBeInTheDocument();
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(followedLinks).toEqual([]);
+  });
 });

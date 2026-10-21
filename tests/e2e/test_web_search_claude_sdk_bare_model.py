@@ -26,15 +26,13 @@ Usage::
 
 from __future__ import annotations
 
-import io
-import json
-import tarfile
 import uuid
 
 import httpx
 import yaml
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from tests._helpers.session import bundle_files, post_session_bundle
 from tests.e2e.conftest import (
     configure_mock_llm,
     create_runner_bound_session,
@@ -91,17 +89,10 @@ def _register_web_search_agent(
             ]
         },
     }
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml.safe_dump(config).encode()
-        info = tarfile.TarInfo("config.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-    resp = client.post(
-        "/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
-        headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN},
+    data = yaml.safe_dump(config).encode()
+    bundle_bytes = bundle_files({"config.yaml": data})
+    resp = post_session_bundle(
+        client.post, "/v1/sessions", bundle_bytes, headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
     )
     if resp.status_code not in (200, 201, 409):
         raise RuntimeError(f"agent register failed: {resp.status_code} {resp.text[:500]}")

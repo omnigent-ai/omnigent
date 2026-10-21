@@ -45,8 +45,8 @@ directly instead of going through `data_dir()`.
 | `telemetry.json` | Telemetry state, including the persistent `installation_id`. | `omnigent/telemetry/installation_id.py` |
 | `.update_check.json` **†** | Cached result of the (potentially slow) update check. | `omnigent/update_check.py` |
 | `install_ledger.json` | Record of what the installer wrote, used by uninstall/purge. | `omnigent/install_ledger.py` |
-| `admins`, `allowed_domains` | OSS server operator state: admin list and OIDC allowed-domains, co-located so operator-editable files live together. Operator-managed input files — the cited modules read them. | Read by `omnigent/server/admin_list.py`, `omnigent/server/oidc_access.py` |
-| `sharing_mode`, `public_sharing` | Server-side sharing settings. | `omnigent/server/sharing_settings.py` |
+| `admins`, `allowed_domains` | OSS server operator state: admin list and OIDC allowed-domains, co-located so operator-editable files live together. Operator-managed input files — the cited modules read them. A listed identity is promoted to the database admin flag on login (OIDC, accounts) or on first page load (header auth); removing it from `admins` does not revoke that flag, which must be cleared separately. | Read by `omnigent/server/admin_list.py`, `omnigent/server/oidc_access.py` |
+| `sharing_mode`, `public_sharing`, `default_public_sessions` | Server-side sharing settings, written from Settings > Sharing. Each overrides its boot default: `OMNIGENT_SHARING_MODE`, `OMNIGENT_PUBLIC_SHARING` and `OMNIGENT_DEFAULT_PUBLIC_SESSIONS` (`off` / `sandbox` / `all`, which new sessions start with public read access). | `omnigent/server/sharing_settings.py` |
 
 ## Directories
 
@@ -128,10 +128,18 @@ for filename-based limits and their scope.
 
 ### Native harness state
 
-Some native (TUI) harnesses keep resumable session state under `~/.omnigent`:
-`claude-native/`, `codex-native/`, `opencode-native/` (all via `data_dir()`),
-and `pi-native/` **†** and `antigravity-native/` **†** (pinned to
-`~/.omnigent`).
+Native TUI harnesses keep resumable session state in these roots:
+`claude-native/` and `opencode-native/` via `data_dir()`, `codex-native/`
+**†** via `bridge_root()` (pinned to `~/.omnigent`), and `pi-native/` **†**
+and `antigravity-native/` **†** (also pinned to `~/.omnigent`).
+The Codex bridge root is producer-owned and is not relocated by
+`OMNIGENT_DATA_DIR` or `OMNIGENT_CONFIG_HOME`.
+
+Each Codex-native session directory also contains a private `codex-home/` with
+its `sessions/` and `archived_sessions/` rollout JSONL. Local session import
+reads those transcript trees plus the matching home's `session_index.jsonl` and
+`state_*.sqlite` for thread metadata; it does not scan the surrounding data
+directory or read Codex credential files.
 
 Within each, session state lives in a subdirectory named by a digest of the
 conversation id (a leading `conv_` is normalized before hashing, and a legacy
@@ -152,7 +160,8 @@ data dir. See e.g. `omnigent/harnesses/qwen_native/bridge.py`.
 ## Notes
 
 - The canonical source of truth is the code, not this document. Start at
-  `data_dir()` in `omnigent/process_logging.py` and follow its callers; each
+  `data_dir()` in `omnigent/process_logging.py` and `bridge_root()` in
+  `omnigent/harnesses/codex_native/bridge.py`, then follow their callers; each
   subsystem documents its own path in a docstring.
 - An existing `~/.omnigent` may also contain files this document doesn't list:
   backups you created by hand (e.g. `chat.db.bak*`, `chat1.db`) and leftovers

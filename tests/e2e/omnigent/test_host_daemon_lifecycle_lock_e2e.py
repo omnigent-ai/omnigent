@@ -32,6 +32,7 @@ from pathlib import Path
 
 import pexpect
 
+from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
 from tests.e2e.omnigent.test_host_ctrl_c_stop_server import (
     _BOOT_TIMEOUT,
     _EXIT_TIMEOUT,
@@ -60,12 +61,25 @@ _FAST_LIFECYCLE_POLL_S = "1"
 _SELF_TERMINATE_TIMEOUT = 30.0
 _PROMPT_TIMEOUT = 30.0
 
+# Logged by the lifecycle monitor loop (omnigent/host/connect.py) the first
+# time it confirms record ownership — the earliest point a mutation can
+# trigger self-termination. Waiting on this instead of a fixed sleep avoids
+# racing the monitor's own poll cadence on a loaded box.
+_OWNERSHIP_CONFIRMED_MARKER = "Host daemon confirmed registry ownership of"
+_OWNERSHIP_CONFIRM_TIMEOUT_S = 30.0
+# Foreground host log destination. ``run_host_process`` honors this env var
+# (via ``configure_process_logging``) same as a detached daemon, giving the
+# foreground flavor a known log path to poll without parsing PTY output.
+_FOREGROUND_HOST_LOG = "host.log"
+
 
 def _lifecycle_env(base_env: dict[str, str], home: Path) -> dict[str, str]:
     """Isolated subprocess env with the lifecycle monitor polling fast.
 
     ``OMNIGENT_HOST_LIFECYCLE_POLL_S`` is on the daemon env allowlist (the
     ``OMNIGENT_`` prefix), so it reaches the detached background daemon too.
+    ``OMNIGENT_LOG_LEVEL=DEBUG`` surfaces the ownership-confirmed diagnostic
+    the tests below wait on.
 
     :param base_env: Fixture credential environment.
     :param home: Isolated HOME for this run.
@@ -73,6 +87,11 @@ def _lifecycle_env(base_env: dict[str, str], home: Path) -> dict[str, str]:
     """
     env = _connect_env(base_env, home)
     env["OMNIGENT_HOST_LIFECYCLE_POLL_S"] = _FAST_LIFECYCLE_POLL_S
+    env["OMNIGENT_LOG_LEVEL"] = "DEBUG"
+    # A detached daemon picks its own log path (recorded as ``log_path`` in its
+    # registry record) regardless of this var; only the foreground flavor,
+    # which has no such record field, relies on it.
+    env[PROCESS_LOG_FILE_ENV_VAR] = str(home / _FOREGROUND_HOST_LOG)
     return env
 
 
@@ -92,6 +111,23 @@ def _wait_for_daemon_record(daemons_dir: Path, *, timeout: float) -> Path:
         _POLL_PAUSE.wait(0.25)
         elapsed += 0.25
     raise AssertionError(f"daemon record never appeared under {daemons_dir}")
+
+
+def _wait_for_marker_in_log(log_path: Path, marker: str, *, timeout: float) -> None:
+    """Poll *log_path* until it contains *marker*.
+
+    :param log_path: The daemon's captured process log file.
+    :param marker: Substring proving the awaited event fired.
+    :param timeout: Max seconds to poll.
+    :raises AssertionError: If the marker never appears within *timeout*.
+    """
+    elapsed = 0.0
+    while elapsed < timeout:
+        if log_path.is_file() and marker in log_path.read_text(errors="replace"):
+            return
+        _POLL_PAUSE.wait(0.25)
+        elapsed += 0.25
+    raise AssertionError(f"{marker!r} never appeared in {log_path}")
 
 
 def _lock_is_held(record_path: Path) -> bool:
@@ -148,8 +184,13 @@ def _drive_self_termination(
     _assert_daemon_owns_record(record, child.pid)
 
     # The monitor self-terminates only after it has confirmed ownership at
-    # least once (the startup-grace latch). One poll cycle guarantees that.
-    _POLL_PAUSE.wait(6.0)
+    # least once (the startup-grace latch). Wait for the daemon's own proof
+    # of that instead of guessing how long one poll cycle takes on this box.
+    _wait_for_marker_in_log(
+        home / _FOREGROUND_HOST_LOG,
+        _OWNERSHIP_CONFIRMED_MARKER,
+        timeout=_OWNERSHIP_CONFIRM_TIMEOUT_S,
+    )
 
     if mutate == "delete":
         record.unlink()
@@ -279,13 +320,18 @@ def _drive_background_self_termination(home: Path, mutate: str) -> None:
     """
     daemons = home / ".omnigent" / "daemons"
     record = _wait_for_daemon_record(daemons, timeout=_BOOT_TIMEOUT)
-    daemon_pid = json.loads(record.read_text())["pid"]
+    payload = json.loads(record.read_text())
+    daemon_pid = payload["pid"]
+    daemon_log = Path(payload["log_path"])
 
     assert _pid_alive(daemon_pid), "background daemon should be alive after spawn"
     _assert_daemon_owns_record(record, daemon_pid)
 
-    # Confirm-ownership latch: one poll cycle before the guard will act.
-    _POLL_PAUSE.wait(6.0)
+    # Confirm-ownership latch: wait for the daemon's own proof that at least
+    # one poll cycle has confirmed ownership, instead of guessing a duration.
+    _wait_for_marker_in_log(
+        daemon_log, _OWNERSHIP_CONFIRMED_MARKER, timeout=_OWNERSHIP_CONFIRM_TIMEOUT_S
+    )
 
     if mutate == "delete":
         record.unlink()

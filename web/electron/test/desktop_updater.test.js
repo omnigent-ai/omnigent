@@ -31,6 +31,7 @@ const PINNED_ORIGIN = "https://server.example";
  * @param {Record<string, unknown>} [opts.settings] Initial persisted settings.
  * @param {boolean} [opts.isPackaged] Simulate a packaged build.
  * @param {boolean} [opts.forceDevUpdateConfig] Enable the development update config.
+ * @param {boolean} [opts.updatesEnabled] Whether this build may use the update feed.
  * @param {boolean} [opts.pinnedSender] Whether IPC calls count as trusted.
  * @param {Array<{response: number}>} [opts.dialogResponses] Queued dialog answers.
  * @param {() => string} [opts.getCurrentVersion] Display-version override.
@@ -39,6 +40,7 @@ function makeUpdater({
   settings = {},
   isPackaged = false,
   forceDevUpdateConfig = false,
+  updatesEnabled = true,
   pinnedSender = true,
   dialogResponses = [{ response: 1 }],
   getCurrentVersion,
@@ -110,6 +112,7 @@ function makeUpdater({
     pinnedOrigin: () => PINNED_ORIGIN,
     iconPath: "/icons/icon.png",
     forceDevUpdateConfig,
+    updatesEnabled,
     getCurrentVersion,
   };
 
@@ -359,6 +362,13 @@ describe("desktop_updater — downloads", () => {
 });
 
 describe("desktop_updater — development update config gating", () => {
+  it("does not offer production updates to a packaged dev build", async () => {
+    const h = makeUpdater({ isPackaged: true, updatesEnabled: false });
+    h.updater.init();
+    assert.equal(h.calls.checkForUpdates ?? 0, 0);
+    await assert.rejects(h.updater.checkForUpdates({ manual: true }), /unavailable in development/);
+  });
+
   it("blocks manual paths when the feed is unavailable in development", async () => {
     const h = makeUpdater({ settings: { update_mode: "manual" } });
     h.updater.registerIpc();

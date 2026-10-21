@@ -103,7 +103,7 @@ async def host_setup() -> AsyncIterator[tuple[HostRegistry, _FakeWebSocket, asyn
             frame_text = await conn.outbound_queue.get()
             if frame_text is None:
                 return
-            frame = decode_host_frame(frame_text)
+            frame = decode_host_frame(frame_text.data)
             if not isinstance(frame, HostStatFrame):
                 continue
             reply = stat_replies.get(frame.path)

@@ -14,6 +14,8 @@ app-rejects-token failure, and non-interference with accounts mode.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,7 +57,15 @@ class _FakeHttpx:
         """
         headers = kwargs.get("headers")
         auth = headers.get("Authorization") if isinstance(headers, dict) else None
-        self.requests.append({"url": url, "authorization": auth, "params": kwargs.get("params")})
+        verifier = headers.get("X-Omnigent-Code-Verifier") if isinstance(headers, dict) else None
+        self.requests.append(
+            {
+                "url": url,
+                "authorization": auth,
+                "params": kwargs.get("params"),
+                "verifier": verifier,
+            }
+        )
         return self.responses.pop(0)
 
 
@@ -419,6 +429,34 @@ def test_login_apps_fails_loud_without_databricks_extra(
     assert load_databricks_workspace_host(_APPS_URL) is None
 
 
+def test_login_apps_fails_loud_without_databricks_cli(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The Python extra alone cannot complete a fresh workspace browser login."""
+    from omnigent.cli_auth import load_databricks_workspace_host
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+
+    fake = _FakeHttpx(responses=[_response(302, headers={"location": _APPS_REDIRECT})])
+    login_calls = _patch_login_env(monkeypatch, fake_httpx=fake, cached_tokens=[None])
+    monkeypatch.setattr(cli_mod.shutil, "which", lambda name: None)
+
+    result = CliRunner().invoke(cli_group, ["login", _APPS_URL], standalone_mode=False)
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, click.ClickException), result.output
+    assert suppresses_recovery_hint(result.exception)
+    result.exception.show()
+    error_output = capsys.readouterr().err
+    assert "Databricks CLI not found on PATH" in error_output
+    assert "Install it, then retry this command." in error_output
+    assert "https://docs.databricks.com/dev-tools/cli/install.html" in error_output
+    error_lines = error_output.splitlines()
+    assert len(error_lines) == 2
+    assert all(len(line) <= 80 for line in error_lines)
+    assert login_calls == []
+    assert load_databricks_workspace_host(_APPS_URL) is None
+
+
 def test_login_runs_databricks_auth_login_when_no_cached_grant(
     monkeypatch: pytest.MonkeyPatch, token_dir: Path
 ) -> None:
@@ -767,11 +805,16 @@ def test_login_oidc_mode_sets_default_server(
         ]
     )
     _patch_login_env(monkeypatch, fake_httpx=fake)
-    monkeypatch.setattr(
-        httpx,
-        "post",
-        lambda url, **kw: _response(200, body={"ticket": "t", "login_url": "/auth/go"}),
-    )
+    post_calls: list[dict[str, object]] = []
+
+    def _post(url: str, **kwargs: object) -> httpx.Response:
+        post_calls.append(kwargs)
+        return _response(
+            200,
+            body={"ticket": "t", "login_url": "/auth/go", "user_code": "ABCD-2345"},
+        )
+
+    monkeypatch.setattr(httpx, "post", _post)
     monkeypatch.setattr(webbrowser, "open", lambda url: True)
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
 
@@ -779,6 +822,52 @@ def test_login_oidc_mode_sets_default_server(
 
     assert result.exit_code == 0, result.output
     assert cli_mod._load_global_config().get("server") == server
+    body = post_calls[0]["json"]
+    assert isinstance(body, dict)
+    challenge = body["code_challenge"]
+    assert body["code_challenge_method"] == "S256"
+    params = fake.requests[-1]["params"]
+    assert params == {"ticket": "t"}
+    verifier = fake.requests[-1]["verifier"]
+    assert isinstance(verifier, str)
+    expected = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    assert challenge == expected
+
+
+@pytest.mark.parametrize("stage,status", [("create", 400), ("poll", 403), ("poll", 410)])
+def test_login_oidc_failure_leaves_default_server_unchanged(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path, stage: str, status: int
+) -> None:
+    import time
+    import webbrowser
+
+    server = "http://omni-oidc.internal:6767"
+    cli_mod._save_global_config({"server": "https://existing.example.com"})
+    error = "Login request rejected"
+    responses = [_response(401, body={"login_url": "/auth/login"})]
+    if stage == "poll":
+        responses.append(_response(status, body={"error": error}))
+    fake = _FakeHttpx(responses=responses)
+    _patch_login_env(monkeypatch, fake_httpx=fake)
+    creation = (
+        _response(status, body={"error": error})
+        if stage == "create"
+        else _response(200, body={"ticket": "t", "login_url": "/auth/go"})
+    )
+    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: creation)
+    monkeypatch.setattr(webbrowser, "open", lambda url: True)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+    result = CliRunner().invoke(cli_group, ["login", server])
+
+    assert result.exit_code != 0
+    assert error in result.output
+    assert cli_mod._load_global_config().get("server") == "https://existing.example.com"
+    assert len(fake.requests) == (1 if stage == "create" else 2)
 
 
 def test_login_failure_leaves_default_server_unchanged(
@@ -955,6 +1044,25 @@ def test_workspace_url_leaves_oss_server_alone(
     assert (
         cli_mod._workspace_api_server_url("https://omni.example.com") == "https://omni.example.com"
     )
+
+
+@pytest.mark.parametrize("suffix", ["", "/omnigent"])
+@pytest.mark.parametrize(
+    "failure",
+    [httpx.ConnectError("connection refused"), httpx.InvalidURL("invalid proxy")],
+    ids=["connection-error", "invalid-proxy"],
+)
+def test_workspace_url_keeps_input_when_probe_cannot_connect(
+    suffix: str,
+    failure: Exception,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An optional workspace probe leaves connection errors to the requesting command."""
+    server = f"https://omni.example.com{suffix}"
+    probed = _scripted_normalizer_httpx(monkeypatch, {"https://omni.example.com/v1/me": failure})
+
+    assert cli_mod._workspace_api_server_url(server) == server
+    assert probed == ["https://omni.example.com/v1/me"]
 
 
 def test_workspace_url_leaves_apps_edge_alone(

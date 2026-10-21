@@ -17,7 +17,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.runner import github_resource
+from omnigent.errors import OmnigentError
+from omnigent.runner import github_resource, pr_resource
 from omnigent.runner.github_resource import (
     _summarize_checks,
     github_changed_files,
@@ -25,6 +26,7 @@ from omnigent.runner.github_resource import (
     github_info,
     github_pr_diff,
 )
+from omnigent.runner.session_prs import PullRequestRef
 
 
 def _stub_gh(
@@ -153,16 +155,22 @@ def test_github_info_pr_via_pr_view(repo: Path, monkeypatch: pytest.MonkeyPatch)
     assert info["pr"]["head_ref"] == "alice/feature"
     assert info["pr"]["is_draft"] is True
     assert info["base_ref"] == "main"
-    assert any(c[:2] == ("pr", "view") for c in calls)
+    assert info["pr"]["checks_supported"] is True
+    assert sum(c[:2] == ("pr", "view") for c in calls) == 1
     assert not any(c[:2] == ("pr", "list") for c in calls)
 
 
 def test_github_info_no_pr(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A branch with no PR yields ``pr``/``base_ref`` null (bare ``gh pr view`` empty)."""
+    """A branch with no PR yields ``pr``/``base_ref`` null (bare ``gh pr view`` empty).
+
+    gh's "no pull requests" failure names no refused field, so it is not retried.
+    """
+    calls: list[tuple[str, ...]] = []
 
     def fake_gh(
         argv: Sequence[str], *, cwd: str, token: str | None = None
     ) -> tuple[int, str, str]:
+        calls.append(tuple(argv))
         head = tuple(argv[:2])
         if head == ("auth", "status"):
             return (0, "", "")
@@ -178,6 +186,7 @@ def test_github_info_no_pr(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     info = github_info(str(repo))
     assert info["pr"] is None
     assert info["base_ref"] is None
+    assert sum(c[:2] == ("pr", "view") for c in calls) == 1
 
 
 def test_github_info_pr_via_commit_fork_fallback(
@@ -545,6 +554,188 @@ def test_github_file_diff_deleted(repo: Path) -> None:
     assert diff["after"] is None
 
 
+@pytest.fixture
+def diverged_repo(tmp_path: Path) -> Path:
+    """Two branch tips share a base with an older parent for shallow-clone tests."""
+    source = tmp_path / "source"
+    source.mkdir()
+    _run(["git", "init", "-b", "main"], source)
+    for content in ("A old", "A base"):
+        (source / "fileA.py").write_text(content)
+        _run(["git", "add", "fileA.py"], source)
+        _run(["git", "commit", "-m", content], source)
+    _run(["git", "checkout", "-b", "feature"], source)
+    (source / "fileA.py").write_text("A changed")
+    _run(["git", "commit", "-am", "feature"], source)
+    _run(["git", "checkout", "main"], source)
+    (source / "fileA.py").write_text("A main advanced")
+    _run(["git", "commit", "-am", "main advanced"], source)
+    _run(["git", "checkout", "feature"], source)
+    return source
+
+
+@pytest.mark.parametrize("recovery", ["--deepen=1", "--unshallow"])
+def test_github_file_diff_shallow_missing_merge_base(
+    diverged_repo: Path, tmp_path: Path, recovery: str
+) -> None:
+    """Missing shallow ancestry raises with recovery advice instead of comparing tips."""
+    clone = tmp_path / "clone"
+    _run(
+        [
+            "git",
+            "clone",
+            "--depth=1",
+            "--no-single-branch",
+            diverged_repo.as_uri(),
+            str(clone),
+        ],
+        tmp_path,
+    )
+
+    with pytest.raises(OmnigentError, match="shallow") as exc:
+        github_file_diff(str(clone), "main", "fileA.py")
+    assert "origin/main" in str(exc.value)
+    assert "git fetch --deepen=" in str(exc.value)
+    assert "git fetch --unshallow" in str(exc.value)
+
+    _run(["git", "fetch", recovery, "origin"], clone)
+    diff = github_file_diff(str(clone), "main", "fileA.py")
+    assert diff["before"] == "A base"
+    assert diff["after"] == "A changed"
+
+
+def test_github_file_diff_shallow_with_merge_base(diverged_repo: Path, tmp_path: Path) -> None:
+    """A shallow clone with the shared ancestor available still gives the correct diff."""
+    clone = tmp_path / "clone"
+    _run(
+        [
+            "git",
+            "clone",
+            "--depth=2",
+            "--no-single-branch",
+            diverged_repo.as_uri(),
+            str(clone),
+        ],
+        tmp_path,
+    )
+    assert (
+        github_resource._git(["rev-parse", "--is-shallow-repository"], cwd=str(clone))[1].strip()
+        == "true"
+    )
+
+    diff = github_file_diff(str(clone), "main", "fileA.py")
+    assert diff["before"] == "A base"
+    assert diff["after"] == "A changed"
+
+
+def test_github_file_diff_full_history_without_merge_base(repo: Path) -> None:
+    """Unrelated full-history branches retain the existing base-tip fallback."""
+    _run(["git", "checkout", "--orphan", "unrelated"], repo)
+    _run(["git", "rm", "-rf", "."], repo)
+    (repo / "fileA.py").write_text("A unrelated")
+    _run(["git", "add", "fileA.py"], repo)
+    _run(["git", "commit", "-m", "unrelated root"], repo)
+    _run(["git", "checkout", "feature"], repo)
+
+    diff = github_file_diff(str(repo), "unrelated", "fileA.py")
+    assert diff["before"] == "A unrelated"
+    assert diff["after"] == "A changed"
+
+
+@pytest.mark.parametrize("shallow", [False, True])
+def test_github_file_diff_missing_base_in_single_branch_clone(
+    diverged_repo: Path, tmp_path: Path, shallow: bool
+) -> None:
+    """An unfetched base is not an absent file, with or without shallow history."""
+    clone = tmp_path / "clone"
+    _run(
+        [
+            "git",
+            "clone",
+            "--single-branch",
+            "--branch=feature",
+            *(["--depth=1"] if shallow else []),
+            diverged_repo.as_uri(),
+            str(clone),
+        ],
+        tmp_path,
+    )
+    with pytest.raises(OmnigentError, match=r"base.*not available locally") as exc:
+        github_file_diff(str(clone), "main", "fileA.py")
+    assert "fetch" in str(exc.value)
+    assert "main" in str(exc.value)
+
+    _run(
+        [
+            "git",
+            "fetch",
+            *(["--unshallow"] if shallow else []),
+            "origin",
+            "refs/heads/main:refs/remotes/origin/main",
+            "refs/heads/feature:refs/remotes/origin/feature",
+        ],
+        clone,
+    )
+    diff = github_file_diff(str(clone), "main", "fileA.py")
+    assert diff["before"] == "A base"
+    assert diff["after"] == "A changed"
+
+
+def test_github_file_diff_partial_blob_fetch_failure(repo: Path) -> None:
+    """An unavailable promised blob must not turn a modification into an addition."""
+    _run(["git", "config", "uploadpack.allowFilter", "true"], repo)
+    clone = repo / "partial-clone"
+    _run(["git", "clone", "--filter=blob:none", repo.as_uri(), str(clone)], repo)
+    old_blob = github_resource._git(["rev-parse", "origin/main:fileA.py"], cwd=str(clone))[
+        1
+    ].strip()
+    missing = github_resource._git(
+        ["rev-list", "--objects", "--all", "--missing=print"], cwd=str(clone)
+    )[1].splitlines()
+    assert f"?{old_blob}" in missing
+    _run(["git", "remote", "set-url", "origin", (repo / "unavailable").as_uri()], clone)
+
+    with pytest.raises(OmnigentError, match="content") as exc:
+        github_file_diff(str(clone), "main", "fileA.py")
+    assert "partial clone" in str(exc.value)
+    assert "access" in str(exc.value)
+    # A genuinely absent base path remains valid even while the remote is unavailable.
+    added = github_file_diff(str(clone), "main", "newfile.py")
+    assert added["before"] is None
+    assert added["after"] == "new content"
+
+    _run(["git", "remote", "set-url", "origin", repo.as_uri()], clone)
+    diff = github_file_diff(str(clone), "main", "fileA.py")
+    assert diff["before"] == "A base"
+    assert diff["after"] == "A changed"
+
+
+@pytest.mark.parametrize("side", ["before", "after"])
+@pytest.mark.parametrize("returncode", [None, 128], ids=["timeout", "git-error"])
+def test_github_file_diff_content_failure(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, side: str, returncode: int | None
+) -> None:
+    """Timeouts and read failures on either side cannot masquerade as absent paths."""
+    git = github_resource._git
+    ref = git(["rev-parse", "main"], cwd=str(repo))[1].strip() if side == "before" else "HEAD"
+
+    def fail_show(args: list[str], *, cwd: str) -> tuple[int | None, str, str]:
+        if args == ["show", f"{ref}:fileA.py"]:
+            return returncode, "", "timed out" if returncode is None else "authentication failed"
+        return git(args, cwd=cwd)
+
+    monkeypatch.setattr(github_resource, "_git", fail_show)
+    with pytest.raises(OmnigentError, match="content"):
+        github_file_diff(str(repo), "main", "fileA.py")
+
+
+def test_github_file_diff_missing_path(repo: Path) -> None:
+    """A path absent from both trees remains a valid empty diff."""
+    diff = github_file_diff(str(repo), "main", "missing.py")
+    assert diff["before"] is None
+    assert diff["after"] is None
+
+
 def test_github_changed_files_no_pr(monkeypatch: pytest.MonkeyPatch) -> None:
     """With no PR for the branch, the list is empty (no local git fallback)."""
     _stub_gh(monkeypatch, {("pr", "view"): (1, "", "no pull requests found")})
@@ -568,6 +759,28 @@ def test_github_pr_diff_no_pr(monkeypatch: pytest.MonkeyPatch) -> None:
     """With no PR for the branch, the patch is empty rather than an error."""
     _stub_gh(monkeypatch, {("pr", "view"): (1, "", "no pull requests found")})
     assert github_pr_diff("/root") == {"object": "session.github.pr_diff", "patch": ""}
+
+
+@pytest.mark.parametrize(
+    ("command", "response", "load", "message"),
+    [
+        (("pr", "diff"), (1, "", "timeout"), github_pr_diff, "could not load the PR diff"),
+        (
+            ("api",),
+            (1, "", "denied"),
+            github_changed_files,
+            "could not load the PR's changed files",
+        ),
+        (("api",), (0, "invalid", ""), github_changed_files, "invalid changed-file list"),
+        (("api",), (0, "{}", ""), github_changed_files, "invalid changed-file list"),
+    ],
+)
+def test_github_diff_failures_are_not_empty_successes(
+    monkeypatch: pytest.MonkeyPatch, command, response, load, message: str
+) -> None:
+    _stub_gh(monkeypatch, {("pr", "view"): (0, '{"number":7}', ""), command: response})
+    with pytest.raises(ValueError, match=message):
+        load("/root")
 
 
 def test_github_pr_diff_resolves_number_then_diffs(
@@ -688,7 +901,7 @@ def test_set_github_preference_sets_default_and_account(
         "set_github_account_preference",
         lambda key, login, *a, **k: saved.update({"key": key, "login": login}),
     )
-    monkeypatch.setattr(github_resource, "github_info", lambda _root, **_kwargs: {"stub": True})
+    monkeypatch.setattr(pr_resource, "pr_info", lambda _root, **_kwargs: {"stub": True})
 
     def fake_gh(
         argv: Sequence[str], *, cwd: str, token: str | None = None
@@ -931,3 +1144,130 @@ def test_gh_applies_account_token(monkeypatch: pytest.MonkeyPatch) -> None:
     assert isinstance(env, dict)
     assert env["GH_TOKEN"] == "chosen-tok"
     assert "GITHUB_TOKEN" not in env
+
+
+_CHECKS_FORBIDDEN = (
+    "GraphQL: Resource not accessible by personal access token "
+    "(repository.pullRequests.nodes.0.statusCheckRollup.nodes.0.commit.statusCheckRollup)"
+)
+
+_PR_WITHOUT_CHECKS = {
+    "number": 42,
+    "title": "Add thing",
+    "state": "OPEN",
+    "url": "https://github.com/acme/repo/pull/42",
+    "isDraft": False,
+    "author": {"login": "contributor"},
+    "baseRefName": "main",
+    "headRefName": "feature",
+    "headRefOid": "a" * 40,
+    "baseRefOid": "b" * 40,
+    "body": "Description",
+    "comments": [],
+}
+
+
+def _gh_without_checks_permission(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, ...]]:
+    """Stub ``gh`` signed in with a fine-grained PAT.
+
+    GitHub refuses ``statusCheckRollup`` to such a token, so only a ``pr view``
+    that asks for it fails; every other read succeeds.
+    """
+    calls: list[tuple[str, ...]] = []
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        calls.append(tuple(argv))
+        if list(argv[:2]) == ["auth", "status"]:
+            me = {"login": "contributor", "active": True, "state": "success"}
+            return (0, json.dumps({"hosts": {"github.com": [me]}}), "")
+        if list(argv[:2]) == ["repo", "view"]:
+            return (0, json.dumps({"nameWithOwner": "acme/repo"}), "")
+        if list(argv[:3]) == ["repo", "set-default", "--view"]:
+            return (0, "acme/repo\n", "")
+        if list(argv[:2]) == ["pr", "view"]:
+            fields = argv[argv.index("--json") + 1].split(",")
+            if "statusCheckRollup" in fields:
+                return (1, "", _CHECKS_FORBIDDEN)
+            data = {
+                name: _PR_WITHOUT_CHECKS[name] for name in fields if name in _PR_WITHOUT_CHECKS
+            }
+            return (0, json.dumps(data), "")
+        if argv[0] == "api" and "/commits/" in argv[1] and argv[1].endswith("/pulls"):
+            row = {"number": 42, "state": "open", "base": {"repo": {"full_name": "acme/repo"}}}
+            return (0, json.dumps([row]), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
+    monkeypatch.delenv("IS_SANDBOX", raising=False)
+    return calls
+
+
+def test_github_info_resolves_pr_when_checks_field_is_forbidden(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The branch's PR still resolves when only its check runs are unreadable."""
+    _run(["git", "remote", "add", "origin", "https://github.com/acme/repo.git"], repo)
+    calls = _gh_without_checks_permission(monkeypatch)
+
+    info = github_info(str(repo))
+    assert info["authenticated"] is True
+    assert info["pr"] is not None, calls
+    assert info["pr"]["number"] == 42
+    assert info["pr"]["title"] == "Add thing"
+    assert info["base_ref"] == "main"
+    assert not (info["pr"].get("checks") or {}).get("total")
+    assert info["pr"]["checks_supported"] is False
+    # The refused call is retried once without the field; no commit fallback runs.
+    assert [c[-1] for c in calls if c[:2] == ("pr", "view")] == [
+        github_resource._PR_VIEW_FIELDS,
+        github_resource._PR_VIEW_FIELDS.replace("statusCheckRollup,", ""),
+    ]
+    assert not any(c[0] == "api" for c in calls)
+
+
+def test_reference_info_keeps_auth_when_checks_field_is_forbidden(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A linked PR whose checks are unreadable renders instead of reporting a sign-in problem."""
+    monkeypatch.setattr(github_resource._config, "github_account_preference", lambda _key: None)
+    calls = _gh_without_checks_permission(monkeypatch)
+    reference = PullRequestRef.from_url("https://github.com/acme/repo/pull/42")
+
+    info = github_resource._reference_info(str(repo), reference)
+    assert info["authenticated"] is True
+    assert info["pr"] is not None, calls
+    assert info["pr"]["title"] == "Add thing"
+    assert info["pr"]["head_sha"] == "a" * 40
+    assert not (info["pr"].get("checks") or {}).get("total")
+    assert info["pr"]["checks_supported"] is False
+    assert info["pr"]["body"] == "Description"
+
+
+def test_commit_fallback_fetch_retries_without_forbidden_checks_field(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The explicit ``-R`` fetch after a commit lookup gets the same retry."""
+    _run(["git", "remote", "add", "origin", "https://github.com/acme/repo.git"], repo)
+    calls = _gh_without_checks_permission(monkeypatch)
+    gh = github_resource._gh
+
+    def branch_lookup_misses(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        if list(argv[:3]) == ["pr", "view", "--json"]:
+            calls.append(tuple(argv))
+            return (1, "", 'no pull requests found for branch "feature"')
+        return gh(argv, cwd=cwd, token=token)
+
+    monkeypatch.setattr(github_resource, "_gh", branch_lookup_misses)
+
+    info = github_info(str(repo))
+    assert info["pr"]["number"] == 42
+    assert info["pr"]["checks_supported"] is False
+    assert [c[-1] for c in calls if c[:3] == ("pr", "view", "42")] == [
+        github_resource._PR_VIEW_FIELDS,
+        github_resource._PR_VIEW_FIELDS.replace("statusCheckRollup,", ""),
+    ]

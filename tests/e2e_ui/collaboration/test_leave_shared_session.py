@@ -35,6 +35,7 @@ import httpx
 import pytest
 from playwright.sync_api import Browser, Locator, Page, expect
 
+from tests._helpers.browser import user_page
 from tests.e2e_ui.collaboration._multi_user_server import (
     ADMIN_EMAIL,
     MultiUserServer,
@@ -118,9 +119,7 @@ def test_shared_viewer_leaves_session_and_row_disappears(
     viewer_email = f"leaver-{uuid.uuid4().hex[:6]}@ui.test"
     _grant(server, viewer_email, _LEVEL_READ)
 
-    ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": viewer_email})
-    try:
-        page = ctx.new_page()
+    with user_page(browser, headers={"X-Forwarded-Email": viewer_email}) as page:
         page.goto(f"{server.public_url}/c/{sid}")
 
         # The shared session is hidden under the default "My sessions" filter
@@ -165,8 +164,6 @@ def test_shared_viewer_leaves_session_and_row_disappears(
         assert owner_view.status_code == 200, (
             f"owner lost access after a grantee left: {owner_view.status_code}"
         )
-    finally:
-        ctx.close()
 
 
 def test_owner_gets_delete_in_the_slot_not_leave(
@@ -180,9 +177,7 @@ def test_owner_gets_delete_in_the_slot_not_leave(
     """
     server = multi_user_server
     sid = server.session_id
-    ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": ADMIN_EMAIL})
-    try:
-        page = ctx.new_page()
+    with user_page(browser, headers={"X-Forwarded-Email": ADMIN_EMAIL}) as page:
         page.goto(f"{server.public_url}/c/{sid}")
 
         expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
@@ -193,5 +188,3 @@ def test_owner_gets_delete_in_the_slot_not_leave(
         # the missing Leave is the ownership branch and not a mis-timed assertion.
         expect(page.get_by_test_id("delete-conversation")).to_be_visible(timeout=15_000)
         expect(page.get_by_test_id("leave-conversation")).to_have_count(0)
-    finally:
-        ctx.close()

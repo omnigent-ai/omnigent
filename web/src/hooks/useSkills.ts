@@ -1,5 +1,6 @@
 import { skipToken, useQuery } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
+import { ApiError } from "@/lib/sessionsApi";
 import type { Session, SkillSummary, SkillsStatus } from "@/lib/types";
 
 export type SkillsTarget =
@@ -22,17 +23,27 @@ export type SkillsTarget =
     };
 
 /** Both composers receive complete catalogs directly from host-backed requests. */
-async function fetchSkills(target: SkillsTarget, signal: AbortSignal): Promise<SkillSummary[]> {
+export async function fetchSkills(
+  target: SkillsTarget,
+  signal: AbortSignal,
+): Promise<SkillSummary[]> {
   const params =
     target.sessionId !== undefined
       ? new URLSearchParams({ session_id: target.sessionId })
       : new URLSearchParams({ host_id: target.hostId, harness: target.harness, path: target.path });
   if (target.agentId !== undefined) params.set("agent_id", target.agentId);
   const response = await authenticatedFetch(`/v1/skills?${params}`, { signal });
-  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  if (!response.ok) {
+    throw new ApiError(`${response.status} ${response.statusText}`, response.status, null);
+  }
   const body = (await response.json()) as { skills?: SkillSummary[] };
   if (!Array.isArray(body.skills)) throw new Error("Invalid host skills response");
   return body.skills;
+}
+
+/** Shared cache key, so other host-scoped readers reuse the composer's catalogs. */
+export function skillsQueryKey(target: SkillsTarget | null) {
+  return ["skills", target?.sessionId, target] as const;
 }
 
 interface SkillsOptions {
@@ -46,7 +57,7 @@ interface SkillsOptions {
 export function useSkills({ target, enabled = true, starting = false }: SkillsOptions) {
   const available = enabled && target !== null;
   const query = useQuery({
-    queryKey: ["skills", target?.sessionId, target],
+    queryKey: skillsQueryKey(target),
     queryFn: available ? ({ signal }) => fetchSkills(target, signal) : skipToken,
     enabled: available,
     staleTime: 30_000,

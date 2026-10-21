@@ -1,38 +1,47 @@
-"""E2E: the embedded terminal reconnects after a code-less bridge close.
+"""Browser terminals recover after transport errors and temporary routing misses.
 
-A server redeploy behind the Databricks Apps ingress tears the terminal
-attach WebSocket down without a clean app close code reaching the browser,
-which reports ``1005`` ("no status"). The client must treat that transport
-drop like the ``1006`` it already handled — show a "Reconnecting…" overlay
-and re-attach — instead of dead-ending on "Bridge closed: code 1005"
-(``isUnexpectedTerminalClose`` in
-``web/src/components/blocks/TerminalSession.ts``; the retry budget in
-``TerminalView.tsx``).
-
-The attach WebSocket is proxied through ``page.route_web_socket`` so the test
-holds a handle to the live connection; once the terminal is connected, the
-test closes that connection with ``1011`` (server internal error) and the
-next dial is proxied straight back to the real bridge — so the terminal
-recovers on its own. 1011 stands in for the whole newly-reconnectable set
-(1005/1011/1014): it is a real on-the-wire code the browser reports verbatim,
-whereas the reported ``1005`` is a reserved sentinel a proxy synthesizes that
-Playwright cannot reproduce end to end (its classification is pinned by the
-``TerminalSession`` unit test). Before the fix every one of these was
-classified deliberate and the terminal dead-ended; the
-``data-state="connected"`` assertion AFTER the drop is what that regression
-would fail. Closing from the test body (not the route handler) avoids the
-sync-API deadlock of a blocking call inside the handler.
+Proxy a real terminal WebSocket and close it twice, letting the browser
+reconnect each time. Repeated 4400 (wrong replica) responses can occur while
+a rollout changes the destination for a host. An OSS browser must keep
+retrying instead of taking the Databricks-only fallback that drops the key.
 """
 
 from __future__ import annotations
 
 import re
+import time
 
+import httpx
+import pytest
 from playwright.sync_api import Page, WebSocketRoute, expect
 
 from tests.e2e_ui.conftest import open_right_rail
+from tests.e2e_ui.shells.test_terminal_direct_attach import _BLOCK_LOOPBACK_DIALS
 
 _ATTACH_WS = re.compile(r"/resources/terminals/.*/attach")
+# xterm answers tmux's colour queries (OSC 10/11) on the input stream, so a
+# reply can land between typed characters.
+_OSC_REPLY = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+# Latch status-overlay states on the terminal view's element so short-lived
+# overlays are observed even if they render and unmount between polls.
+_WATCH_OVERLAY_JS = """(view) => {
+  view.__overlayObserver?.disconnect();
+  delete view.dataset.sawReconnecting;
+  delete view.dataset.sawBridgeClosed;
+  const check = () => {
+    if (view.querySelector('[data-testid="terminal-reconnecting"]')) {
+      view.dataset.sawReconnecting = "1";
+    }
+    // The dead-end text can flash for one render before the retry is scheduled;
+    // only a dead end after the retry overlay means the browser gave up.
+    if (view.dataset.sawReconnecting && /Bridge closed/.test(view.textContent || "")) {
+      view.dataset.sawBridgeClosed = "1";
+    }
+  };
+  view.__overlayObserver = new MutationObserver(check);
+  view.__overlayObserver.observe(view, { childList: true, subtree: true, characterData: true });
+}"""
 
 
 def _open_new_shell(page: Page) -> None:
@@ -43,59 +52,81 @@ def _open_new_shell(page: Page) -> None:
     page.get_by_role("menuitem", name=re.compile("Shell")).click()
 
 
+@pytest.mark.parametrize("close_code", [1011, 4400], ids=["transport-error", "wrong-replica"])
+@pytest.mark.parametrize("surface", ["shell", "agent-terminal"])
 def test_embedded_terminal_reconnects_after_transport_close(
-    page: Page, terminal_session: tuple[str, str]
+    page: Page, terminal_session: tuple[str, str], close_code: int, surface: str
 ) -> None:
-    """A transport-level attach close (1011) recovers instead of dead-ending.
-
-    Proxy the attach WebSocket, let the terminal connect, then close that
-    connection with ``1011`` — a newly-reconnectable transport code (same
-    class as the reported ``1005`` a redeploy behind the ingress produces).
-    The overlay must read "Reconnecting…" (never the dead-end "Bridge
-    closed"), and the proxied retry must re-attach the terminal back to
-    ``connected``.
-
-    :param page: Playwright page fixture.
-    :param terminal_session: ``(base_url, session_id)`` with the terminal agent.
-    :returns: None.
-    """
+    """Both terminal surfaces reconnect and accept input after two transient closes."""
     base_url, session_id = terminal_session
     live: dict[str, object] = {"ws": None, "dials": 0}
+    # Browser->server text per dial. Other terminals on the page stay attached
+    # and send their own frames (e.g. xterm's OSC 11 reply to a tmux query).
+    inputs: dict[int, str] = {}
 
     def _handle(ws: WebSocketRoute) -> None:
-        live["dials"] = int(live["dials"]) + 1
+        dial = int(live["dials"]) + 1
+        live["dials"] = dial
         live["ws"] = ws
+        inputs[dial] = ""
         # Transparent proxy to the real terminal bridge (binary frames pass
         # through unchanged); the test drives the drop from outside.
         server = ws.connect_to_server()
-        ws.on_message(lambda message: server.send(message))
+
+        def forward_input(message: str | bytes) -> None:
+            text = message.decode(errors="replace") if isinstance(message, bytes) else message
+            inputs[dial] += text
+            server.send(message)
+
+        ws.on_message(forward_input)
         server.on_message(lambda message: ws.send(message))
 
+    # Stay on the relay: a background relay->loopback upgrade would retire the
+    # socket this test is about to close, and 4400 only comes from the relay.
+    page.add_init_script(_BLOCK_LOOPBACK_DIALS)
     page.route_web_socket(_ATTACH_WS, _handle)
 
-    page.goto(f"{base_url}/c/{session_id}")
-    _open_new_shell(page)
-
-    rail = page.get_by_role("complementary", name="Workspace")
-    terminal_view = rail.get_by_test_id("terminal-view").last
+    if surface == "agent-terminal":
+        response = httpx.patch(
+            f"{base_url}/v1/sessions/{session_id}",
+            json={"labels": {"omnigent.ui": "terminal"}},
+            timeout=10,
+        )
+        response.raise_for_status()
+        page.goto(f"{base_url}/c/{session_id}")
+        page.get_by_test_id("view-mode-terminal").click()
+        terminal_view = page.get_by_test_id("main-terminal-view").get_by_test_id("terminal-view")
+    else:
+        page.goto(f"{base_url}/c/{session_id}")
+        _open_new_shell(page)
+        rail = page.get_by_role("complementary", name="Workspace")
+        terminal_view = rail.get_by_test_id("terminal-view").last
     expect(terminal_view).to_be_visible(timeout=60_000)
     # The live terminal attaches through the proxy.
     expect(terminal_view).to_have_attribute("data-state", "connected", timeout=30_000)
-    dials_before = int(live["dials"])
+    for attempt in range(2):
+        dials_before = int(live["dials"])
+        # The "Reconnecting…" overlay can live for only the first backoff step
+        # (500ms), so latch it from the DOM instead of polling for visibility.
+        terminal_view.evaluate(_WATCH_OVERLAY_JS)
+        # Closing in the route handler would block Playwright's sync API.
+        assert isinstance(live["ws"], WebSocketRoute)
+        live["ws"].close(code=close_code)
 
-    # Simulate the redeploy: drop the attach socket with a server-error code
-    # from the test body (a blocking close inside the route handler deadlocks
-    # the sync API). 1011 is a real on-the-wire code in the newly-reconnectable
-    # set — the browser reports it verbatim, unlike the reserved 1005/1006
-    # sentinels a proxy synthesizes (covered by the TerminalSession unit test).
-    assert isinstance(live["ws"], WebSocketRoute)
-    live["ws"].close(code=1011)
+        expect(terminal_view).to_have_attribute("data-saw-reconnecting", "1", timeout=20_000)
+        expect(terminal_view).to_have_attribute("data-state", "connected", timeout=60_000)
+        expect(terminal_view).not_to_have_attribute("data-saw-bridge-closed", "1")
+        assert int(live["dials"]) > dials_before, "terminal did not reconnect"
 
-    # Recovery is presented AS recovery, and the dead-end message never shows.
-    # Before the fix, a 1005 close was terminal and this overlay never appeared.
-    expect(page.get_by_test_id("terminal-reconnecting")).to_be_visible(timeout=20_000)
-    expect(page.get_by_text(re.compile("Bridge closed"))).to_have_count(0)
-
-    # The proxied retry re-attaches the terminal on its own — no manual refresh.
-    expect(terminal_view).to_have_attribute("data-state", "connected", timeout=60_000)
-    assert int(live["dials"]) > dials_before, "terminal did not re-dial after the code-less drop"
+        probe = f"reconnect-{attempt}"
+        dial = int(live["dials"])
+        inputs[dial] = ""
+        terminal_view.locator("textarea.xterm-helper-textarea").focus()
+        page.keyboard.type(probe)
+        deadline = time.monotonic() + 10
+        while probe not in _OSC_REPLY.sub("", inputs[dial]) and time.monotonic() < deadline:
+            page.wait_for_timeout(50)
+        assert probe in _OSC_REPLY.sub("", inputs[dial]), (
+            f"terminal did not forward input after reconnecting: {inputs[dial]!r}"
+        )
+        page.keyboard.press("Control+U")

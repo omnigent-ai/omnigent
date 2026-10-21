@@ -581,7 +581,7 @@ def login_databricks_workspace(workspace_url: str, *, console: Console | None = 
     spec = ProfileSpec(
         name=profile,
         host=workspace_url,
-        purpose="Databricks model serving (Unity AI Gateway)",
+        purpose="Databricks model serving (Unity Gateway)",
         # The user is adding this workspace specifically for model serving, so
         # it's a gateway workspace.
         is_model_gateway=True,

@@ -47,6 +47,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from tests.debug_log_helpers import capture_debug_rows
 from tests.server.helpers import build_agent_bundle
 
 pytestmark = pytest.mark.asyncio
@@ -164,7 +165,7 @@ async def register_host(
                 frame_text = await conn.outbound_queue.get()
                 if frame_text is None:
                     return
-                frame = decode_host_frame(frame_text)
+                frame = decode_host_frame(frame_text.data)
                 if isinstance(frame, HostStatFrame):
                     cap.stats.append(frame)
                     fut = conn.pending_stats.pop(frame.request_id, None)
@@ -242,9 +243,12 @@ async def test_multipart_create_with_host_id_binds_and_launches(
     """
     cap = register_host()
 
-    resp = await _multipart_create(client, {"host_id": _HOST_ID, "workspace": _WORKSPACE})
+    with capture_debug_rows("server") as rows:
+        resp = await _multipart_create(client, {"host_id": _HOST_ID, "workspace": _WORKSPACE})
     assert resp.status_code == 201, resp.text
     session_id = resp.json()["session_id"]
+    accepted = next(row for row in rows if row["event_name"] == "session_creation_accepted")
+    assert float(accepted["attributes"]["create_acl_ms"]) >= 0
 
     conv = conv_store.get_conversation(session_id)
     assert conv is not None
@@ -328,7 +332,7 @@ async def test_multipart_create_rejects_workspace_missing_on_host(
             frame_text = await conn.outbound_queue.get()
             if frame_text is None:
                 return
-            frame = decode_host_frame(frame_text)
+            frame = decode_host_frame(frame_text.data)
             if isinstance(frame, HostStatFrame):
                 fut = conn.pending_stats.pop(frame.request_id, None)
                 if fut is not None and not fut.done():

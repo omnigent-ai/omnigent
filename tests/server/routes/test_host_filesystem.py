@@ -80,7 +80,7 @@ async def host_setup() -> AsyncIterator[HostRegistry]:
             frame_text = await conn.outbound_queue.get()
             if frame_text is None:
                 return
-            frame = decode_host_frame(frame_text)
+            frame = decode_host_frame(frame_text.data)
             sent_frames.append(frame)
             if isinstance(frame, HostFsRequestFrame):
                 fut = conn.pending_fs_requests.pop(frame.request_id, None)

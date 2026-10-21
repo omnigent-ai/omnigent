@@ -1,3 +1,4 @@
+import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Mirrors sdks/python-client/omnigent_client/_events.py.
 //
 // Hand-ported. When _events.py changes, update this file and the
@@ -10,6 +11,7 @@
 
 import type { RoutingDecisionExtras } from "./routingDecision";
 import type {
+  AgyPermission,
   BackgroundTaskInfo,
   CodexPersistMode,
   ErrorInfo,
@@ -179,6 +181,7 @@ export interface PolicyDenied {
 }
 
 export interface ElicitationRequest {
+  nativeDelivery?: NativePermissionDelivery;
   type: "elicitation_request";
   elicitationId: string;
   /**
@@ -280,6 +283,8 @@ export interface ElicitationRequest {
   rememberScope?: RememberScope | null;
   /** Codex-native MCP approval persistence modes advertised by the request. */
   codexPersistModes?: CodexPersistMode[];
+  /** Optional Antigravity action description and advertised persist pattern. */
+  agyPermission?: AgyPermission | null;
 }
 
 /**
@@ -647,8 +652,8 @@ export interface SessionCodexApprovalModeEvent {
 }
 
 /**
- * `session.agent_changed` — the session's bound agent was switched in
- * place (switch-agent route).
+ * `session.agent_changed`: the session's bound agent changed (e.g. its
+ * MCP servers were edited).
  *
  * The harness may have changed family (e.g. claude-sdk → claude-native),
  * which flips the session's message lifecycle: native sessions defer
@@ -714,6 +719,8 @@ export interface SessionSandboxStatusEvent {
   stage: SandboxLaunchStage;
   /** Failure detail when `stage === "failed"`; `null` otherwise. */
   error: string | null;
+  /** Sandbox provider being launched, e.g. `"arclet"`, when the server reports it. */
+  provider?: string;
 }
 
 /** Startup state of one harness MCP server (Codex's `McpServerStartupState`). */

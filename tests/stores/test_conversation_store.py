@@ -33,6 +33,7 @@ from omnigent.session_import import (
     IMPORT_SOURCE_LABEL_KEY,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store import ConversationUpdateResult
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -95,23 +96,28 @@ def test_fork_drops_import_provenance_labels(
 def test_fork_drops_sandbox_repo_label(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """A fork must not inherit the repository the source's sandbox was built
-    from: the label is what a sandbox RELAUNCH re-clones, so a clone that
-    asked for an empty sandbox would get the source's repo re-cloned into it
-    on the first relaunch. The fork's own launch re-stamps whatever it
-    resolves."""
-    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
+    """A fork must not inherit the source sandbox's labels: the repository is
+    what a sandbox RELAUNCH re-clones, so a clone that asked for an empty
+    sandbox would get the source's repo re-cloned into it on the first
+    relaunch; the host id routes requests to the source's host, while the fork
+    launches its own. The fork's own launch re-stamps whatever it resolves."""
+    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY, REQUESTED_HOST_ID_LABEL_KEY
 
     source = conversation_store.create_conversation()
     conversation_store.set_labels(
         source.id,
-        {MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo#main", "kept": "yes"},
+        {
+            MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo#main",
+            REQUESTED_HOST_ID_LABEL_KEY: "0123456789abcdef0123456789abcdef",
+            "kept": "yes",
+        },
     )
 
     fork = conversation_store.fork_conversation(source.id)
 
     assert fork.labels["kept"] == "yes"
     assert MANAGED_REPO_LABEL_KEY not in fork.labels
+    assert REQUESTED_HOST_ID_LABEL_KEY not in fork.labels
 
 
 def test_fork_drops_per_repo_sandbox_labels(
@@ -171,6 +177,44 @@ def test_create_and_get(conversation_store: SqlAlchemyConversationStore) -> None
     fetched = conversation_store.get_conversation(conv.id)
     assert fetched is not None
     assert fetched.id == conv.id
+
+
+def test_create_persists_initial_labels_and_overrides(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Create returns the initial session state without a follow-up update."""
+    created = conversation_store.create_conversation(
+        labels={
+            "omnigent.ui": "terminal",
+            "custom": "value",
+            "long": "x" * 257,
+        },
+        reasoning_effort="high",
+        model_override="model-a",
+        cost_control_mode_override="on",
+        subagent_routing_override="off",
+        harness_override="codex-native",
+    )
+
+    assert created.labels == {
+        "omnigent.ui": "terminal",
+        "custom": "value",
+        "long": "x" * 256,
+    }
+    assert created.reasoning_effort == "high"
+    assert created.model_override == "model-a"
+    assert created.cost_control_mode_override == "on"
+    assert created.subagent_routing_override == "off"
+    assert created.harness_override == "codex-native"
+
+    fetched = conversation_store.get_conversation(created.id)
+    assert fetched is not None
+    assert fetched.labels == created.labels
+    assert fetched.reasoning_effort == "high"
+    assert fetched.model_override == "model-a"
+    assert fetched.cost_control_mode_override == "on"
+    assert fetched.subagent_routing_override == "off"
+    assert fetched.harness_override == "codex-native"
 
 
 def test_create_with_existing_caller_supplied_id_raises(db_uri: str) -> None:
@@ -448,6 +492,121 @@ def test_update_title(conversation_store: SqlAlchemyConversationStore) -> None:
         conversation_store.update_conversation("c55a64c3f6f954fe0fc8738ba3f45f26", title="x")
         is None
     )
+
+
+def test_update_conversation_with_changes_reports_effort_changes(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+
+    first = conversation_store.update_conversation_with_changes(conv.id, reasoning_effort="high")
+    assert isinstance(first, ConversationUpdateResult)
+    assert first.conversation.reasoning_effort == "high"
+    assert first.reasoning_effort_changed is True
+    assert first.model_override_changed is False
+
+    no_op = conversation_store.update_conversation_with_changes(conv.id, reasoning_effort="high")
+    assert no_op is not None
+    assert no_op.reasoning_effort_changed is False
+    assert no_op.model_override_changed is False
+
+    changed = conversation_store.update_conversation_with_changes(conv.id, reasoning_effort="low")
+    assert changed is not None
+    assert changed.conversation.reasoning_effort == "low"
+    assert changed.reasoning_effort_changed is True
+
+    cleared = conversation_store.update_conversation_with_changes(
+        conv.id, _unset_reasoning_effort=True
+    )
+    assert cleared is not None
+    assert cleared.conversation.reasoning_effort is None
+    assert cleared.reasoning_effort_changed is True
+
+    clear_no_op = conversation_store.update_conversation_with_changes(
+        conv.id, _unset_reasoning_effort=True
+    )
+    assert clear_no_op is not None
+    assert clear_no_op.reasoning_effort_changed is False
+
+    unrelated = conversation_store.update_conversation_with_changes(conv.id, title="Renamed")
+    assert unrelated is not None
+    assert unrelated.reasoning_effort_changed is False
+    assert unrelated.model_override_changed is False
+
+
+def test_update_conversation_with_changes_reports_model_changes(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+
+    first = conversation_store.update_conversation_with_changes(conv.id, model_override="model-a")
+    assert first is not None
+    assert first.conversation.model_override == "model-a"
+    assert first.reasoning_effort_changed is False
+    assert first.model_override_changed is True
+
+    no_op = conversation_store.update_conversation_with_changes(conv.id, model_override="model-a")
+    assert no_op is not None
+    assert no_op.model_override_changed is False
+
+    changed = conversation_store.update_conversation_with_changes(
+        conv.id, model_override="model-b"
+    )
+    assert changed is not None
+    assert changed.conversation.model_override == "model-b"
+    assert changed.model_override_changed is True
+
+    cleared = conversation_store.update_conversation_with_changes(
+        conv.id, _unset_model_override=True
+    )
+    assert cleared is not None
+    assert cleared.conversation.model_override is None
+    assert cleared.model_override_changed is True
+
+    clear_no_op = conversation_store.update_conversation_with_changes(
+        conv.id, _unset_model_override=True
+    )
+    assert clear_no_op is not None
+    assert clear_no_op.model_override_changed is False
+
+
+def test_update_conversation_with_changes_missing_conversation(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    assert (
+        conversation_store.update_conversation_with_changes(
+            "c55a64c3f6f954fe0fc8738ba3f45f26",
+            reasoning_effort="high",
+            model_override="model-a",
+        )
+        is None
+    )
+
+
+def test_update_conversation_with_changes_retries_commit(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    conv = conversation_store.create_conversation()
+    retrying_maker = _RetryOnceMaker(conversation_store._conv_session_immediate)
+    conversation_store._conv_session_immediate = retrying_maker
+
+    result = conversation_store.update_conversation_with_changes(
+        conv.id,
+        reasoning_effort="high",
+        model_override="model-a",
+    )
+
+    assert retrying_maker.attempts == 2
+    assert result is not None
+    assert result.reasoning_effort_changed is True
+    assert result.model_override_changed is True
+    assert result.conversation.reasoning_effort == "high"
+    assert result.conversation.model_override == "model-a"
+
+    committed = conversation_store.get_conversation(conv.id)
+    assert committed is not None
+    assert committed.reasoning_effort == "high"
+    assert committed.model_override == "model-a"
 
 
 def test_reported_model_round_trips_beside_the_request(
@@ -2535,6 +2694,90 @@ def test_append_bumps_updated_at(
     )
 
 
+def _deleted_terminal_event(conversation_id: str) -> NewConversationItem:
+    return NewConversationItem(
+        type="resource_event",
+        response_id=conversation_id,
+        data=ResourceEventData(
+            event_type="session.resource.deleted",
+            resource_id="terminal_codex_main",
+            resource_type="terminal",
+        ),
+    )
+
+
+def test_resource_event_only_append_preserves_updated_at(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operational resource cleanup must not look like new conversation activity."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+
+    appended = conversation_store.append(conv.id, [_deleted_terminal_event(conv.id)])
+
+    assert [item.type for item in appended] == ["resource_event"]
+    assert [item.type for item in conversation_store.list_items(conv.id).data] == [
+        "resource_event"
+    ]
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.updated_at == 1000
+
+
+def test_mixed_resource_and_message_append_bumps_updated_at(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mixed batch remains real activity when it contains a new message."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+    message = NewConversationItem(
+        type="message",
+        response_id="resp_mixed",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+    )
+
+    conversation_store.append(conv.id, [_deleted_terminal_event(conv.id), message])
+
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.updated_at == 2000
+
+
+def test_resource_event_with_duplicate_message_preserves_updated_at(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resource event plus a deduplicated message contains no new activity."""
+    import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
+
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
+    conv = conversation_store.create_conversation()
+    message = NewConversationItem(
+        type="message",
+        response_id="resp_duplicate",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id="ab" * 16,
+    )
+    conversation_store.append(conv.id, [message])
+    monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+
+    appended = conversation_store.append(conv.id, [message, _deleted_terminal_event(conv.id)])
+
+    assert appended[0].deduplicated is True
+    assert [item.type for item in appended] == ["message", "resource_event"]
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.updated_at == 1000
+
+
 def test_update_title_bumps_updated_at(
     conversation_store: SqlAlchemyConversationStore,
     monkeypatch: pytest.MonkeyPatch,
@@ -2908,6 +3151,65 @@ def test_list_child_conversation_ids_by_parent_groups_direct_subagents(
     nested_result = conversation_store.list_child_conversation_ids_by_parent([child_a1.id])
     assert nested_result[child_a1.id] == [nested.id]
 
+    pages: list[tuple[str, int]] = []
+    while True:
+        cursor = (pages[-1][1], pages[-1][0]) if pages else None
+        page = conversation_store.list_child_conversation_ids_page(
+            parent_a.id, after=cursor, limit=1
+        )
+        if not page:
+            break
+        pages.extend(page)
+    assert pages == sorted(
+        [(child_a1.id, child_a1.created_at), (child_a2.id, child_a2.created_at)],
+        key=lambda row: (row[1], row[0]),
+        reverse=True,
+    )
+    assert conversation_store.list_child_conversation_ids_page(parent_b.id) == [
+        (child_b.id, child_b.created_at)
+    ]
+    assert conversation_store.list_child_conversation_ids_page(child_a1.id) == [
+        (nested.id, nested.created_at)
+    ]
+
+
+def test_child_conversation_page_uses_parent_index_for_first_and_next_page(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    if conversation_store._engine.dialect.name != "sqlite":
+        pytest.skip("SQLite query-plan assertion")
+    parent = conversation_store.create_conversation()
+    children = [
+        conversation_store.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
+        for _ in range(3)
+    ]
+    queries = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(conversation_store._engine, "before_cursor_execute", capture)
+    try:
+        first = conversation_store.list_child_conversation_ids_page(parent.id, limit=1)
+        following = conversation_store.list_child_conversation_ids_page(
+            parent.id, after=(first[0][1], first[0][0]), limit=1
+        )
+    finally:
+        event.remove(conversation_store._engine, "before_cursor_execute", capture)
+    assert len(first) == len(following) == 1
+    assert {first[0][0], following[0][0]} <= {child.id for child in children}
+    assert len(queries) == 2
+    with conversation_store._engine.connect() as conn:
+        plans = [
+            str(conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all())
+            for statement, parameters in queries
+        ]
+    for plan in plans:
+        assert "idx_conversations_parent" in plan, plan
+        assert "TEMP B-TREE" not in plan, plan
+    assert "(created_at,id)<(?,?)" in "".join(plans[1].split()), plans[1]
+
 
 # ── agent_id filter on list_conversations ──────────────
 
@@ -3126,6 +3428,132 @@ def test_replace_runner_id_allows_internal_non_session_conversation(
     fetched = conversation_store.get_conversation(conv.id)
     assert fetched is not None
     assert fetched.runner_id == "runner-uuid-1"
+
+
+@pytest.mark.parametrize("limit", [1, 4])
+def test_list_runner_session_statuses_pages(
+    conversation_store: SqlAlchemyConversationStore, limit: int
+) -> None:
+    from omnigent.db.db_models import (
+        SqlConversationMetadata,
+        current_workspace_id,
+        workspace_scope,
+    )
+
+    expected = []
+    for status in (None, "running", "waiting", "idle", "failed"):
+        row = conversation_store.create_conversation(runner_id="runner-target")
+        if status is not None:
+            conversation_store.set_session_live_status(row.id, status)
+        if status == "running":
+            conversation_store.update_conversation(row.id, archived=True)
+        expected.append((row.id, status))
+    unknown = conversation_store.create_conversation(runner_id="runner-target")
+    with conversation_store._session_immediate("test_future_live_status") as session:
+        meta = session.get(SqlConversationMetadata, (current_workspace_id(), unknown.id))
+        assert meta is not None
+        meta.live_status = 32767
+    expected.append((unknown.id, None))
+    conversation_store.create_conversation(runner_id="runner-other")
+    conversation_store.create_conversation()
+    with workspace_scope(424242):
+        conversation_store.create_conversation(runner_id="runner-target")
+
+    actual = []
+    after = None
+    while True:
+        page = conversation_store.list_runner_session_statuses(
+            "runner-target", after=after, limit=limit
+        )
+        assert len(page) <= limit
+        actual.extend(page)
+        if len(page) < limit:
+            break
+        assert after is None or page[-1][0] > after
+        after = page[-1][0]
+    assert actual == sorted(expected)
+    for invalid_limit in (0, 1001):
+        with pytest.raises(ValueError, match="limit must be between 1 and 1000"):
+            conversation_store.list_runner_session_statuses("runner-target", limit=invalid_limit)
+
+
+@pytest.mark.parametrize("status", [None, "idle", "running", "waiting", "failed"])
+def test_settle_intentionally_stopped_session_requires_current_runner(
+    conversation_store: SqlAlchemyConversationStore,
+    status: str | None,
+) -> None:
+    from omnigent.db.db_models import workspace_scope
+
+    conv = conversation_store.create_conversation(runner_id="runner-stopped")
+    if status is not None:
+        conversation_store.set_session_live_status(conv.id, status)
+    conversation_store.set_labels(conv.id, {"omnigent.last_task_error_code": "preserved"})
+    before = conversation_store.get_conversation(conv.id)
+    with workspace_scope(424242):
+        assert not conversation_store.settle_intentionally_stopped_session(
+            conv.id, "runner-stopped"
+        )
+    assert not conversation_store.settle_intentionally_stopped_session(conv.id, "runner-other")
+    assert conversation_store.get_conversation(conv.id).live_status == status
+    settled = conversation_store.settle_intentionally_stopped_session(conv.id, "runner-stopped")
+    assert settled is (status != "failed")
+    after = conversation_store.get_conversation(conv.id)
+    assert after.live_status == ("failed" if status == "failed" else "idle")
+    assert after.labels == before.labels
+    assert after.updated_at == before.updated_at
+    assert not conversation_store.settle_intentionally_stopped_session("0" * 32, "runner-stopped")
+
+
+def test_intentional_stop_preserves_unknown_live_status(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
+
+    conv = conversation_store.create_conversation(runner_id="runner-stopped")
+    metadata_key = (current_workspace_id(), conv.id)
+    with conversation_store._session_immediate("test_future_live_status") as session:
+        meta = session.get(SqlConversationMetadata, metadata_key)
+        assert meta is not None
+        meta.live_status = 32767
+
+    assert not conversation_store.settle_intentionally_stopped_session(conv.id, "runner-stopped")
+    with conversation_store._session("check_future_live_status") as session:
+        meta = session.get(SqlConversationMetadata, metadata_key)
+        assert meta is not None
+        assert meta.live_status == 32767
+
+
+def test_runner_session_status_page_uses_runner_index(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    if conversation_store._engine.dialect.name != "sqlite":
+        pytest.skip("SQLite query-plan assertion")
+    rows = [conversation_store.create_conversation(runner_id="runner-target") for _ in range(5)]
+    cursor = sorted(row.id for row in rows)[1]
+    queries = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(conversation_store._engine, "before_cursor_execute", capture)
+    try:
+        page = conversation_store.list_runner_session_statuses(
+            "runner-target", after=cursor, limit=2
+        )
+    finally:
+        event.remove(conversation_store._engine, "before_cursor_execute", capture)
+    assert len(page) == 2
+    assert len(queries) == 1, "Teardown needs only the bounded metadata read"
+    statement, parameters = queries[0]
+    with conversation_store._engine.connect() as conn:
+        plan = conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+    description = str(plan)
+    assert "ix_conversation_metadata_runner_id" in description, description
+    # SQLite's textual plan must show a cursor seek, not only use the index:
+    # scanning earlier pages through that index would still do unbounded work.
+    assert "id>?" in "".join(description.split()), description
+    assert "TEMP B-TREE" not in description, description
 
 
 def test_list_conversations_by_runner_id_filters(
@@ -3360,6 +3788,51 @@ def test_set_host_id_with_workspace_satisfies_constraint(
     assert updated.workspace == "/Users/corey/projects/myapp"
 
 
+@pytest.mark.parametrize(
+    ("move_host", "workspace", "git_branch", "expected_branch"),
+    [
+        pytest.param(True, "/repo/worktree", None, None, id="different-host-same-path"),
+        pytest.param(True, None, None, None, id="different-host-omitted-workspace"),
+        pytest.param(False, "/repo/other", None, None, id="different-workspace"),
+        pytest.param(False, "/repo/worktree", None, "feature/source", id="same-binding"),
+        pytest.param(False, None, None, "feature/source", id="same-host-omitted-workspace"),
+        pytest.param(True, "/repo/other", "feature/new", "feature/new", id="move-with-branch"),
+        pytest.param(False, "/repo/worktree", "feature/new", "feature/new", id="replace-branch"),
+    ],
+)
+def test_set_host_id_keeps_git_branch_with_its_workspace(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+    move_host: bool,
+    workspace: str | None,
+    git_branch: str | None,
+    expected_branch: str | None,
+) -> None:
+    """A moved session must not reuse its former worktree branch for side chats."""
+    original_host = "292dfcdf8a31f1319b469f4fa179ac6b"
+    other_host = "8f48061706cb92d5e7cd7c4aadc56ef0"
+    _register_host(db_uri, original_host)
+    _register_host(db_uri, other_host)
+    conv = conversation_store.create_conversation(
+        host_id=original_host,
+        workspace="/repo/worktree",
+        git_branch="feature/source",
+    )
+    target_host = other_host if move_host else original_host
+
+    updated = conversation_store.set_host_id(
+        conv.id, target_host, workspace=workspace, git_branch=git_branch
+    )
+
+    assert updated.git_branch == expected_branch
+    fetched = conversation_store.get_conversation(conv.id)
+    assert fetched is not None
+    assert fetched.host_id == target_host
+    assert fetched.workspace == (workspace or "/repo/worktree")
+    assert fetched.git_branch == expected_branch
+    assert fetched.updated_at == conv.updated_at
+
+
 def test_clear_host_binding_nulls_all_binding_fields(
     conversation_store: SqlAlchemyConversationStore,
     db_uri: str,
@@ -3369,8 +3842,7 @@ def test_clear_host_binding_nulls_all_binding_fields(
 
     This is the failed-bind rollback primitive: after a worktree launch
     fails and the worktree is removed, the session must not keep pointing
-    at the deleted worktree/branch or stay runner-bound. Unlike set_host_id
-    (None = leave untouched, so it can't clear git_branch), this fully
+    at the deleted worktree/branch or stay runner-bound. This fully
     reverts to unbound. A leftover git_branch here would wrongly satisfy
     worktree-cleanup paths (git_branch IS NOT NULL); a leftover runner_id
     would block the picker's retry on the atomic set_runner_id CAS.
@@ -4115,6 +4587,146 @@ def test_fork_conversation_copies_items(
         assert fork_item.response_id == src_item.response_id
         # Data content is identical.
         assert fork_item.data == src_item.data
+
+
+@pytest.mark.parametrize("last_error_code", ["workspace_missing", "runner_disconnected"])
+def test_fork_marks_source_workspace_failures_as_notices(
+    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    last_error_code: str,
+) -> None:
+    """A new unbound fork leaves the source's missing-workspace diagnosis behind."""
+    host_id = "1" * 32
+    _register_host(db_uri, host_id)
+    source = conversation_store.create_conversation(
+        workspace="/missing-workspace", host_id=host_id, runner_id="source-runner"
+    )
+    source_labels = {
+        "omnigent.last_task_error_code": last_error_code,
+        "omnigent.last_task_error_message": "Source launch failed",
+        "omnigent.last_task_error_item_id": "source-error",
+        "omnigent.last_task_error_title": "Source failure",
+        "kept": "yes",
+    }
+    conversation_store.set_labels(source.id, source_labels)
+    missing = NewConversationItem(
+        type="error",
+        response_id="failed_launch",
+        data=ErrorData(
+            source="execution",
+            code="workspace_missing",
+            message="workspace path does not exist: /missing-workspace",
+            title="Workspace missing",
+            cause="The source working directory was deleted.",
+            remediation="Restore the original directory.",
+        ),
+    )
+    source_items = conversation_store.append(
+        source.id,
+        [
+            _user_message("Earlier context", "earlier"),
+            NewConversationItem(
+                type="error",
+                response_id="earlier",
+                data=ErrorData(source="llm", code="rate_limit_exceeded", message="Retry later"),
+            ),
+            missing,
+            _user_message("Please continue", "failed_launch"),
+            missing,
+        ],
+    )
+    calls = _count_encode_hooks(conversation_store, monkeypatch)
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    assert calls == {"item": 0, "batch": 1, "decode_batch": 1}
+    assert fork.workspace is None and fork.host_id is None and fork.runner_id is None
+    assert fork.labels["kept"] == "yes"
+    if last_error_code == "workspace_missing":
+        assert not any(key.startswith("omnigent.last_task_error_") for key in fork.labels)
+    else:
+        assert all(fork.labels[key] == value for key, value in source_labels.items())
+    fork_items = conversation_store.list_items(fork.id).data
+    for original_item, fork_item in zip(source_items, fork_items, strict=True):
+        assert original_item.id != fork_item.id
+        assert original_item.response_id == fork_item.response_id
+        if original_item.data == missing.data:
+            assert isinstance(fork_item.data, ErrorData)
+            assert fork_item.data.code == "source_workspace_missing"
+            assert fork_item.data.level == "info"
+            assert fork_item.data.title == "The original session’s workspace was unavailable."
+            assert fork_item.data.message == missing.data.message
+            assert fork_item.data.cause is None and fork_item.data.remediation is None
+        else:
+            assert fork_item.data == original_item.data
+    assert _stored_positions(conversation_store, fork.id) == list(range(5))
+    assert conversation_store.list_items(source.id).data == source_items
+    original = conversation_store.get_conversation(source.id)
+    assert original is not None
+    assert original.workspace == "/missing-workspace" and original.host_id == host_id
+    assert original.labels == source_labels
+    assert len(conversation_store.search("source_workspace_missing", conversation_id=fork.id)) == 2
+    assert conversation_store.search("source_workspace_missing", conversation_id=source.id) == []
+
+    [new_failure] = conversation_store.append(fork.id, [missing])
+    assert conversation_store.list_items(fork.id).data[-1] == new_failure
+    assert isinstance(new_failure.data, ErrorData)
+    assert new_failure.data.code == "workspace_missing" and new_failure.data.level is None
+    assert _stored_positions(conversation_store, fork.id) == list(range(6))
+
+
+@pytest.mark.parametrize("has_prior_item", [False, True])
+def test_fork_preserves_compaction_boundary_at_workspace_error(
+    conversation_store: SqlAlchemyConversationStore,
+    has_prior_item: bool,
+) -> None:
+    """A historical workspace notice keeps later, unsummarized messages after its cursor."""
+    source = conversation_store.create_conversation()
+    if has_prior_item:
+        conversation_store.append(source.id, [_user_message("Earlier context", "earlier")])
+    [boundary] = conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="error",
+                response_id="failed_launch",
+                data=ErrorData(
+                    source="execution", code="workspace_missing", message="Directory missing"
+                ),
+            ),
+        ],
+    )
+    conversation_store.append(
+        source.id,
+        [
+            _user_message("Intervening message", "between"),
+            NewConversationItem(
+                type="compaction",
+                response_id="compacted",
+                data=CompactionData(
+                    summary="Prior context", last_item_id=boundary.id, token_count=3
+                ),
+            ),
+            _user_message("Continue", "latest"),
+        ],
+    )
+    original_items = conversation_store.list_items(source.id).data
+
+    fork = conversation_store.fork_conversation(source.id)
+
+    items = conversation_store.list_items(fork.id).data
+    compaction = next(item for item in items if item.type == "compaction")
+    assert isinstance(compaction.data, CompactionData)
+    fork_boundary = next(item for item in items if item.type == "error")
+    assert compaction.data.last_item_id == fork_boundary.id
+    assert isinstance(fork_boundary.data, ErrorData)
+    assert fork_boundary.data.code == "source_workspace_missing"
+    recent_items = conversation_store.list_items(fork.id, after=compaction.data.last_item_id).data
+    assert [
+        item.data.content[0]["text"] for item in recent_items if isinstance(item.data, MessageData)
+    ] == ["Intervening message", "Continue"]
+    assert conversation_store.list_items(source.id).data == original_items
 
 
 def test_fork_conversation_remaps_file_references(
@@ -5221,6 +5833,43 @@ def test_fork_clone_agent_is_session_scoped(
     assert "2f9e296b0ecfc976c94f8630a80881f8" in builtin_ids
 
 
+def test_cross_user_fork_copy_persists_as_the_forkers_agent(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """A cross-user fork's copy row keeps the source's name and description, points
+    at its own bundle, and is owned by the forker (not the source's owner)."""
+    source = conversation_store.create_session_with_agent(
+        agent_id="5c3f6b0e2a7d4e11b9a0c8d7e6f5a4b3",
+        agent_name="orion",
+        agent_bundle_location="5c3f6b0e2a7d4e11b9a0c8d7e6f5a4b3/hash",
+        agent_description="coordinator",
+        title="alice's session",
+        created_by="alice@example.com",
+    )
+
+    fork = conversation_store.fork_conversation(
+        source.conversation.id,
+        agent_id="9d8c7b6a5f4e43d2a1b0c9d8e7f6a5b4",
+        cloned_agent_name="orion",
+        cloned_agent_bundle_location="9d8c7b6a5f4e43d2a1b0c9d8e7f6a5b4/hash",
+        cloned_agent_description="coordinator",
+        created_by="bob@example.com",
+    )
+
+    copy = agent_store.get(fork.agent_id or "")
+    assert copy is not None
+    assert (copy.name, copy.description, copy.bundle_location, copy.created_by) == (
+        "orion",
+        "coordinator",
+        "9d8c7b6a5f4e43d2a1b0c9d8e7f6a5b4/hash",
+        "bob@example.com",
+    )
+    assert copy.session_id == fork.id
+    original = agent_store.get("5c3f6b0e2a7d4e11b9a0c8d7e6f5a4b3")
+    assert original is not None and original.created_by == "alice@example.com"
+
+
 def test_fork_clone_agent_failure_leaves_no_orphan(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,
@@ -5291,10 +5940,11 @@ def test_fork_only_dropped_label_keys_match_sandbox_repo_constant() -> None:
     the first relaunch. Importing the real constant here makes that rename
     fail loudly at test time.
     """
-    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
+    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY, REQUESTED_HOST_ID_LABEL_KEY
     from omnigent.stores.conversation_store import _FORK_ONLY_DROPPED_LABEL_KEYS
 
     assert MANAGED_REPO_LABEL_KEY in _FORK_ONLY_DROPPED_LABEL_KEYS
+    assert REQUESTED_HOST_ID_LABEL_KEY in _FORK_ONLY_DROPPED_LABEL_KEYS
 
 
 def test_fork_conversation_copies_reasoning_effort(
@@ -5449,181 +6099,6 @@ def test_fork_conversation_agent_id_override(
     assert fork.agent_id == "ef45a1fbab40c51165f0fe615492ef91", (
         "Fork should use the overridden agent_id, not the source's"
     )
-
-
-def test_switch_conversation_agent_cross_family_resets_and_relabels(
-    conversation_store: SqlAlchemyConversationStore,
-    agent_store: SqlAlchemyAgentStore,
-) -> None:
-    """In-place switch deletes the old agent, binds the new, and on a
-    cross-family switch resets model settings, clears the native session
-    id, and replaces the harness-presentation labels.
-    """
-    from omnigent._wrapper_labels import (
-        CODEX_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
-    )
-    from omnigent.stores.conversation_store import (
-        FORK_CARRY_HISTORY_LABEL_KEY,
-        SWITCH_PREVIOUS_BUILTIN_LABEL_KEY,
-    )
-
-    # An instance-scoped label (belongs to the running instance, dropped on a
-    # switch). Uses a literal still in _INSTANCE_SCOPED_LABEL_KEYS — the old
-    # omnigent.stopped marker was retired upstream.
-    instance_label = "omnigent.last_context_tokens"
-
-    # A real session binds a session-scoped agent (agent.session_id == conv).
-    created = conversation_store.create_session_with_agent(
-        agent_id="af75a9579488e3520ba6842699e43323",
-        agent_name="claude (switch src)",
-        agent_bundle_location="af75a9579488e3520ba6842699e43323/hash",
-        agent_description="old",
-    )
-    conv_id = created.conversation.id
-    # Give the session model settings, a native session id, and labels that a
-    # switch must touch (instance-scoped stopped marker + the old harness's
-    # ui/wrapper) so we can assert they're handled correctly.
-    conversation_store.update_conversation(
-        conv_id, model_override="claude-opus-4-7", reasoning_effort="high"
-    )
-    conversation_store.set_external_session_id(conv_id, "old-native-uuid")
-    conversation_store.set_session_todos(
-        conv_id, [{"content": "switch", "status": "pending", "activeForm": "switching"}]
-    )
-    conversation_store.set_labels(
-        conv_id,
-        {
-            instance_label: "1",
-            # DANGEROUS codex bypass opt-in: in the instance-scoped set so a
-            # switch (a new agent/harness context) drops it rather than
-            # silently re-arming bypass without a fresh typed confirmation.
-            "omnigent.codex_native.bypass_sandbox": "1",
-            UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-            WRAPPER_LABEL_KEY: "claude-code-native-ui",
-        },
-    )
-    conversation_store.append(
-        conv_id,
-        [
-            NewConversationItem(
-                type="message",
-                response_id="resp_1",
-                data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
-            )
-        ],
-    )
-
-    target_labels = {
-        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY: CODEX_NATIVE_WRAPPER_VALUE,
-    }
-    updated = conversation_store.switch_conversation_agent(
-        conv_id,
-        new_agent_id="9d2c8d5e342b7da390dc38351c49fb72",
-        new_agent_name="codex (switch new)",
-        new_agent_bundle_location="9d2c8d5e342b7da390dc38351c49fb72/hash",
-        new_agent_description="new",
-        copy_model_settings=False,  # cross-family
-        carry_history_into_native=True,  # native target
-        presentation_labels=target_labels,
-        previous_builtin_id="52adb39f0c5ea92b5563da5327dac08f",
-    )
-
-    # New agent bound; old session-scoped agent deleted (unique session_id
-    # index would otherwise be violated by leaving both).
-    assert updated.agent_id == "9d2c8d5e342b7da390dc38351c49fb72"
-    assert agent_store.get("af75a9579488e3520ba6842699e43323") is None, (
-        "old session-scoped agent must be deleted on switch"
-    )
-    new_agent = agent_store.get("9d2c8d5e342b7da390dc38351c49fb72")
-    assert new_agent is not None and new_agent.session_id == conv_id, (
-        "new agent must be session-scoped to this conversation"
-    )
-    # Cross-family → provider-bound model id is meaningless, so both reset.
-    assert updated.model_override is None
-    assert updated.reasoning_effort is None
-    # Native runtime state belongs to the old harness → cleared so the next
-    # turn cold-starts and rebuilds from items.
-    assert updated.external_session_id is None
-    assert updated.session_todos == []
-    # Labels: target ui/wrapper applied, carry-history + previous-builtin
-    # stamped, and the old instance-scoped stopped marker dropped.
-    assert updated.labels[UI_MODE_LABEL_KEY] == UI_MODE_TERMINAL_VALUE
-    assert updated.labels[WRAPPER_LABEL_KEY] == CODEX_NATIVE_WRAPPER_VALUE
-    assert updated.labels[FORK_CARRY_HISTORY_LABEL_KEY] == "1"
-    assert updated.labels[SWITCH_PREVIOUS_BUILTIN_LABEL_KEY] == "52adb39f0c5ea92b5563da5327dac08f"
-    assert instance_label not in updated.labels, "instance-scoped labels must not survive a switch"
-    assert "omnigent.codex_native.bypass_sandbox" not in updated.labels, (
-        "the dangerous bypass opt-in must not survive a switch (re-confirm per context)"
-    )
-    # Transcript is untouched (in place, not copied).
-    assert len(conversation_store.list_items(conv_id).data) == 1
-
-
-def test_switch_conversation_agent_same_family_keeps_model_settings(
-    conversation_store: SqlAlchemyConversationStore,
-    agent_store: SqlAlchemyAgentStore,
-) -> None:
-    """A same-family switch keeps model settings; an SDK target (empty
-    presentation labels) drops the old ui/wrapper labels and does not stamp
-    the carry-history directive.
-    """
-    from omnigent._wrapper_labels import (
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
-    )
-    from omnigent.stores.conversation_store import (
-        FORK_CARRY_HISTORY_LABEL_KEY,
-        SWITCH_PREVIOUS_BUILTIN_LABEL_KEY,
-    )
-
-    created = conversation_store.create_session_with_agent(
-        agent_id="06efca8dd5c2e87b8cfed1aae99cc239",
-        agent_name="claude-native-ui",
-        agent_bundle_location="06efca8dd5c2e87b8cfed1aae99cc239/hash",
-        agent_description=None,
-    )
-    conv_id = created.conversation.id
-    conversation_store.update_conversation(
-        conv_id, model_override="claude-opus-4-7", reasoning_effort="high"
-    )
-    conversation_store.set_labels(
-        conv_id,
-        {
-            UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-            WRAPPER_LABEL_KEY: "claude-code-native-ui",
-            # A stale previous-builtin pointer from an earlier switch.
-            SWITCH_PREVIOUS_BUILTIN_LABEL_KEY: "a8361389acc16b7721305a16d0ec739e",
-        },
-    )
-
-    updated = conversation_store.switch_conversation_agent(
-        conv_id,
-        new_agent_id="6b49de4c1bc8cb4d4c02a933f68bd3b1",
-        new_agent_name="claude (switch new)",
-        new_agent_bundle_location="6b49de4c1bc8cb4d4c02a933f68bd3b1/hash",
-        new_agent_description=None,
-        copy_model_settings=True,  # same family (anthropic native → sdk)
-        carry_history_into_native=False,  # SDK target rebuilds nothing
-        presentation_labels={},  # SDK → chat mode (drop ui/wrapper)
-        previous_builtin_id=None,
-    )
-
-    # Same family → model settings carry over unchanged.
-    assert updated.model_override == "claude-opus-4-7"
-    assert updated.reasoning_effort == "high"
-    # SDK target → terminal-first ui/wrapper labels removed (chat mode).
-    assert UI_MODE_LABEL_KEY not in updated.labels
-    assert WRAPPER_LABEL_KEY not in updated.labels
-    # No native rebuild for an SDK target.
-    assert FORK_CARRY_HISTORY_LABEL_KEY not in updated.labels
-    # Stale previous-builtin pointer dropped (None passed → not re-stamped),
-    # so a later "switch back" can't offer a wrong target.
-    assert SWITCH_PREVIOUS_BUILTIN_LABEL_KEY not in updated.labels
 
 
 def test_get_session_connectivity_batches_runner_and_host(
@@ -6721,6 +7196,60 @@ def test_live_state_columns_round_trip_without_bumping_updated_at(
     conversation_store.touch_runner_liveness([], now=1)
 
 
+def test_clear_runner_liveness_not_after_spares_a_newer_stamp(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    A ``not_after`` guard keeps a stamp another replica wrote after ours.
+
+    The cross-replica disconnect check compares against THIS replica's own
+    last stamp, so a clear scheduled before it learns of a reconnect
+    elsewhere must never erase that replica's fresher write.
+    """
+    conv = conversation_store.create_conversation(title="newer-elsewhere")
+    assert conversation_store.set_runner_id(conv.id, "runner_newer_elsewhere")
+
+    conversation_store.touch_runner_liveness(["runner_newer_elsewhere"], now=2_000_000)
+    conversation_store.clear_runner_liveness("runner_newer_elsewhere", not_after=1_000_000)
+
+    connectivity = conversation_store.get_session_connectivity([conv.id])
+    assert connectivity[conv.id].runner_last_seen == 2_000_000
+
+
+def test_clear_runner_liveness_not_after_clears_an_equal_or_older_stamp(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A stamp at or before ``not_after`` still clears — the runner is really gone."""
+    equal = conversation_store.create_conversation(title="equal-stamp")
+    older = conversation_store.create_conversation(title="older-stamp")
+    assert conversation_store.set_runner_id(equal.id, "runner_equal_stamp")
+    assert conversation_store.set_runner_id(older.id, "runner_older_stamp")
+
+    conversation_store.touch_runner_liveness(["runner_equal_stamp"], now=1_000_000)
+    conversation_store.clear_runner_liveness("runner_equal_stamp", not_after=1_000_000)
+
+    conversation_store.touch_runner_liveness(["runner_older_stamp"], now=999_000)
+    conversation_store.clear_runner_liveness("runner_older_stamp", not_after=1_000_000)
+
+    connectivity = conversation_store.get_session_connectivity([equal.id, older.id])
+    assert connectivity[equal.id].runner_last_seen is None
+    assert connectivity[older.id].runner_last_seen is None
+
+
+def test_clear_runner_liveness_without_not_after_still_clears_unconditionally(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Omitting ``not_after`` preserves the pre-cross-replica unconditional clear."""
+    conv = conversation_store.create_conversation(title="unconditional-clear")
+    assert conversation_store.set_runner_id(conv.id, "runner_unconditional_clear")
+
+    conversation_store.touch_runner_liveness(["runner_unconditional_clear"], now=2_000_000)
+    conversation_store.clear_runner_liveness("runner_unconditional_clear")
+
+    connectivity = conversation_store.get_session_connectivity([conv.id])
+    assert connectivity[conv.id].runner_last_seen is None
+
+
 def test_live_state_writes_via_chokepoint_land_in_scoped_workspace(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -7561,6 +8090,31 @@ def test_append_with_stable_id_is_idempotent(
 
     page = conversation_store.list_items(conv.id)
     assert [i.id for i in page.data if i.id == stable] == [stable]
+
+
+def test_get_item_returns_the_persisted_item_or_none(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``get_item`` is the point lookup the native mirror path uses to spot a retry."""
+    conv = conversation_store.create_conversation()
+    stable = "cd" * 16
+    item = NewConversationItem(
+        type="message",
+        response_id="resp_y",
+        data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+        stable_id=stable,
+    )
+    assert conversation_store.get_item(conv.id, stable) is None
+
+    [persisted] = conversation_store.append(conv.id, [item])
+
+    found = conversation_store.get_item(conv.id, stable)
+    assert found is not None
+    assert found.id == persisted.id
+    assert isinstance(found.data, MessageData)
+    assert found.data.content == [{"type": "input_text", "text": "hi"}]
+    other = conversation_store.create_conversation()
+    assert conversation_store.get_item(other.id, stable) is None
 
 
 def test_append_without_stable_id_still_duplicates(

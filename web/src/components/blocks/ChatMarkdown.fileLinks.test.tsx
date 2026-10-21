@@ -28,7 +28,11 @@ beforeEach(() => {
   vi.stubGlobal("fetch", fetchMock);
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 
 function jsonResponse(body: unknown, status = 200): Response {
   return {
@@ -102,6 +106,45 @@ function renderMarkdown(
 }
 
 describe("markdown links to workspace files", () => {
+  it("plays an existing root-level recording outside the changed-file list", async () => {
+    fetchMock.mockResolvedValue(dirListing(["demo.webm"]));
+    renderMarkdown("[Screen recording](demo.webm)", [], FILE_VIEWER_WITH_SESSION);
+
+    expect(
+      await screen.findByRole("button", { name: "Play video: Screen recording" }),
+    ).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Screen recording" }));
+    expect(openFile).toHaveBeenCalledWith("demo.webm");
+  });
+
+  it("renders a workspace recording inline and keeps its file-viewer link", () => {
+    renderMarkdown("[Screen recording](demo.webm)", ["demo.webm"], FILE_VIEWER_WITH_SESSION);
+    expect(screen.getByRole("button", { name: "Play video: Screen recording" })).toBeVisible();
+    expect(screen.getAllByText("Screen recording")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Screen recording" }));
+    expect(openFile).toHaveBeenCalledWith("demo.webm");
+  });
+
+  it("renders direct remote video links but leaves ordinary links alone", () => {
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => {});
+    renderMarkdown(
+      "[Demo](https://example.com/demo.mp4?signature=abc) and [docs](https://example.com/page)",
+    );
+    expect(document.querySelectorAll("video")).toHaveLength(0);
+    const docs = screen.getByRole("link", { name: "docs" });
+    expect(docs).toHaveAttribute("href", "https://example.com/page");
+    expect(docs).toHaveAttribute("target", "_blank");
+    fireEvent.click(screen.getByRole("button", { name: "Play video: Demo" }));
+    expect(document.querySelectorAll("video")).toHaveLength(1);
+    expect(document.querySelector("video")).toHaveAttribute(
+      "src",
+      "https://example.com/demo.mp4?signature=abc",
+    );
+    expect(screen.getByRole("link", { name: "docs" })).toBe(docs);
+    expect(openFile).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("opens the FileViewer for an absolute path instead of navigating", () => {
     renderMarkdown(`[proposal.md](${WORKSPACE}/docs/proposal.md)`, ["docs/proposal.md"]);
 
@@ -129,11 +172,60 @@ describe("markdown links to workspace files", () => {
     expect(openFile).toHaveBeenCalledWith("docs/notes.md");
   });
 
+  it("preserves a root-level filename with a cited line through sanitization", () => {
+    renderMarkdown("[README.md](README.md:12:3)", ["README.md"]);
+
+    expect(screen.queryByText(/\[blocked\]/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "README.md" }));
+    expect(openFile).toHaveBeenCalledWith("README.md", { line: 12, column: 3 });
+  });
+
   it("leaves an external link as a real anchor", () => {
     renderMarkdown("[docs](https://example.com/page)");
 
     const link = screen.getByRole("link", { name: "docs" });
     expect(link).toHaveAttribute("href", "https://example.com/page");
+  });
+
+  it("adds a PR icon while preserving descriptive link text and its destination", () => {
+    const href = "https://github.com/acme/app/pull/42#discussion_r123";
+    renderMarkdown(`[Fix rendering](${href})`);
+
+    const link = screen.getByRole("link", { name: "Fix rendering" });
+    expect(link).toHaveAttribute("href", href);
+    expect(link).toHaveAttribute("title", href);
+    expect(link.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
+  });
+
+  it("shortens an autolinked PR URL without changing its destination", () => {
+    const href = "https://github.com/acme/app/pull/42";
+    renderMarkdown(href);
+
+    expect(screen.getByRole("link", { name: "app#42" })).toHaveAttribute("href", href);
+  });
+
+  it("preserves formatting and surrounding prose in a descriptive PR link", () => {
+    const href = "https://github.com/acme/app/pull/42";
+    renderMarkdown(`See [**Fix** rendering on narrow screens](${href}) before merging.`);
+
+    const link = screen.getByRole("link", { name: "Fix rendering on narrow screens" });
+    expect(link).toHaveAttribute("href", href);
+    expect(link.querySelector('[data-streamdown="strong"]')).toHaveTextContent("Fix");
+    expect(link.parentElement).toHaveTextContent(
+      "See Fix rendering on narrow screens before merging.",
+    );
+  });
+
+  it.each([
+    "https://github.com/acme/app/pull/42/files",
+    "https://github.com.example.com/acme/app/pull/42",
+    "https://example.com/acme/app/pull/42",
+  ])("preserves ordinary URL labels for %s", (href) => {
+    renderMarkdown(href);
+
+    const link = screen.getByRole("link", { name: href });
+    expect(link).toHaveAttribute("href", href);
+    expect(link.querySelector("svg")).toBeNull();
   });
 
   // Overriding the `a` slot replaces Streamdown's link component, so its
@@ -148,7 +240,7 @@ describe("markdown links to workspace files", () => {
 
     const link = screen.getByText(name).closest("a");
     expect(link).toHaveAttribute("data-streamdown", "link");
-    expect(link).toHaveClass("wrap-anywhere", "font-medium", "text-primary", "underline");
+    expect(link).toHaveClass("wrap-anywhere", "font-medium", "text-link", "underline");
   });
 
   it("keeps the source hast node out of the DOM", () => {
@@ -176,6 +268,39 @@ describe("markdown links to workspace files", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "docs/notes.md" }));
     expect(openFile).toHaveBeenCalledWith("docs/notes.md");
+  });
+});
+
+// A markdown link destination is a URL, so a filename with spaces arrives
+// percent-encoded (`My%20Notes.md`). The stored path must be the real filename
+// — but an encoded `#` or `:` in a filename must never be decoded into citation
+// syntax, or the opener would open the sibling `report.md` at line 12 instead.
+describe("percent-encoded file links", () => {
+  it("opens a link whose filename has spaces", () => {
+    renderMarkdown("[notes](docs/My%20Notes.md)", ["docs/My Notes.md"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "notes" }));
+    expect(openFile).toHaveBeenCalledWith("docs/My Notes.md");
+  });
+
+  it("opens a link whose filename has spaces at its cited line", () => {
+    renderMarkdown("[notes](docs/My%20Notes.md#L12)", ["docs/My Notes.md"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "notes" }));
+    expect(openFile).toHaveBeenCalledWith("docs/My Notes.md", { line: 12 });
+  });
+
+  it.each([
+    ["docs/report.md%23L12", "docs/report.md#L12"],
+    ["docs/report.md%3A12", "docs/report.md:12"],
+  ])("never opens the sibling of a literal filename linked as %s", (href, literal) => {
+    // Both the literal filename and the file a decoded citation would point at
+    // exist. Opening `docs/report.md` at line 12 here would be the wrong file.
+    renderMarkdown(`[report](${href})`, ["docs/report.md", literal]);
+
+    expect(screen.queryByRole("button", { name: "report" })).toBeNull();
+    expect(screen.getByText("report")).toBeInTheDocument();
+    expect(openFile).not.toHaveBeenCalled();
   });
 });
 
@@ -355,17 +480,18 @@ describe("dead file links give feedback instead of a silent no-op", () => {
     expect(toastMock).not.toHaveBeenCalled();
   });
 
-  it("keeps a bare-basename link inert — a skipped check is not proof of absence", () => {
-    // `[README.md](README.md)` in a live session: the path-shape heuristic
-    // skips the listing (bare basename, untrusted resolution), so nothing
-    // was ever verified. The link must stay plain text — not grow the
-    // dead-link affordance and toast a false "not found" about a real,
-    // openable root-level file.
-    renderMarkdown("[README.md](README.md)", [], FILE_VIEWER_WITH_SESSION);
+  it("verifies and opens an explicit root-level file citation", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        object: "list",
+        data: [{ name: "README.md", path: "README.md", type: "file", bytes: 5 }],
+        has_more: false,
+      }),
+    );
+    renderMarkdown("[README.md](README.md:12)", [], FILE_VIEWER_WITH_SESSION);
 
-    expect(fetchMock).not.toHaveBeenCalled();
-    expect(screen.queryByRole("button", { name: "README.md" })).toBeNull();
-    expect(screen.getByText("README.md")).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "README.md" }));
+    expect(openFile).toHaveBeenCalledWith("README.md", { line: 12 });
     expect(toastMock).not.toHaveBeenCalled();
   });
 

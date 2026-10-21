@@ -1,7 +1,7 @@
 """Browser e2e for the sidebar's owner-vs-not row gating and scope filters.
 
-This is the end-to-end companion to the mocked ``Sidebar`` unit tests, and the
-coverage the ``E2E UI Required`` gate asks for: the sidebar derives ownership
+This is the end-to-end companion to the mocked ``Sidebar`` unit tests.
+The sidebar derives ownership
 (and every owner-only row action) from the session's ``owner`` — the creator's
 user id carried on each list row — NOT from an effective ``permission_level``.
 The behavior under test:
@@ -40,6 +40,7 @@ import httpx
 import pytest
 from playwright.sync_api import Browser, Locator, Page, expect
 
+from tests._helpers.browser import user_page
 from tests.e2e_ui.collaboration._multi_user_server import (
     ADMIN_EMAIL,
     MultiUserServer,
@@ -106,9 +107,7 @@ def test_owner_sees_session_under_my_sessions_with_enabled_actions(
     """
     server = multi_user_server
     sid = server.session_id
-    ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": ADMIN_EMAIL})
-    try:
-        page = ctx.new_page()
+    with user_page(browser, headers={"X-Forwarded-Email": ADMIN_EMAIL}) as page:
         page.goto(f"{server.public_url}/c/{sid}")
 
         # Owned → shows under the default "My sessions" filter.
@@ -128,8 +127,6 @@ def test_owner_sees_session_under_my_sessions_with_enabled_actions(
         # not just cosmetic), exactly as the context-menu test asserts.
         page.get_by_test_id("rename-conversation").click()
         expect(page.get_by_test_id("rename-conversation-input")).to_be_visible(timeout=15_000)
-    finally:
-        ctx.close()
 
 
 @pytest.mark.flaky(reruns=2, reruns_delay=5)
@@ -149,9 +146,7 @@ def test_shared_viewer_sees_session_under_shared_filter_with_owner_only_actions(
     viewer_email = f"viewer-{uuid.uuid4().hex[:6]}@ui.test"
     _grant(server, viewer_email, _LEVEL_EDIT)
 
-    ctx = browser.new_context(extra_http_headers={"X-Forwarded-Email": viewer_email})
-    try:
-        page = ctx.new_page()
+    with user_page(browser, headers={"X-Forwarded-Email": viewer_email}) as page:
         page.goto(f"{server.public_url}/c/{sid}")
 
         # The shared session is not the viewer's own, so the default "My
@@ -170,5 +165,3 @@ def test_shared_viewer_sees_session_under_shared_filter_with_owner_only_actions(
         expect(page.get_by_test_id("share-conversation")).to_have_attribute(
             "data-disabled", re.compile(r".*")
         )
-    finally:
-        ctx.close()

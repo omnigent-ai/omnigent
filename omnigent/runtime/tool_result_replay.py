@@ -8,8 +8,8 @@ one affected session produced ~2.17M tokens against Claude's 1M-token maximum.
 
 Handles text, single or mixed MCP image blocks, newline-joined results, error
 prefixes, and malformed or store-truncated images. Valid images are preserved;
-unsafe partial payloads become bounded placeholders. Kept stdlib-only so replay
-and compaction paths can import it safely.
+unsafe partial payloads become bounded placeholders. Image container validation
+loads Pillow lazily for recognized managed MCP envelopes.
 """
 
 from __future__ import annotations
@@ -21,6 +21,12 @@ import logging
 import re
 from dataclasses import dataclass
 
+from omnigent.runtime.mcp_tool_result import _MIN_IMAGE_BYTES as _MIN_IMAGE_BYTES
+from omnigent.runtime.mcp_tool_result import (
+    canonical_image_payload,
+    decode_mcp_image_result,
+    encode_mcp_image_result,
+)
 from omnigent.util.json_types import JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -99,6 +105,9 @@ def strip_unparseable_image_output(output: str) -> str:
     :returns: The original string, or a placeholder JSON array when the output
         is an unparseable image payload.
     """
+    clipped = _clipped_image_envelope(output)
+    if clipped is not None and clipped.blocks is not None:
+        return json.dumps(clipped.blocks, separators=(",", ":"))
     body = output
     prefix = ""
     if output.startswith(_MCP_ERROR_PREFIX):
@@ -180,10 +189,10 @@ def _rehydrate_tool_result_shape(output: str) -> RehydratedContent:
 
     Image tool results persist as a JSON *string*; passing that straight into a
     ``tool_result`` block makes ``claude --resume`` send the base64 as plain
-    text, ~250K tokens per screenshot instead of ~1.5K. Three shapes are
-    recognized — a JSON block array, a lone MCP ``ImageContent`` object, and
-    newline-joined mixed text + image-object lines — and only ``text``/``image``
-    blocks are rehydrated, since those are what the API accepts inside a
+    text, ~250K tokens per screenshot instead of ~1.5K. Four shapes are
+    recognized — a tagged image envelope, a JSON block array, a lone MCP
+    ``ImageContent`` object, and newline-joined mixed text + image-object lines.
+    Only ``text``/``image`` blocks are rehydrated, since those are what the API accepts inside a
     ``tool_result``. Anything else stays a raw string.
 
     Called (not recursed into) by :func:`tool_result_content_blocks`, so
@@ -200,6 +209,29 @@ def _rehydrate_tool_result_shape(output: str) -> RehydratedContent:
     if isinstance(parsed, list):
         return blocks_from_parsed_list(parsed)
     if isinstance(parsed, dict):
+        image_result = decode_mcp_image_result(parsed)
+        if image_result is not None:
+            normalized = image_result.native_content()
+            dropped = False
+            for index, (original, block) in enumerate(
+                zip(image_result.content, normalized, strict=True)
+            ):
+                if original["type"] == "image" and block["type"] == "text":
+                    placeholder = _oversized_invalid_image_placeholder(original)
+                    if placeholder is not None:
+                        normalized[index] = placeholder
+                        dropped = True
+            rehydrated = blocks_from_parsed_list(list(normalized))
+            rehydrated = RehydratedContent(
+                rehydrated.blocks,
+                dropped_oversized_image=dropped or rehydrated.dropped_oversized_image,
+            )
+            if image_result.is_error and rehydrated.blocks is not None:
+                return RehydratedContent(
+                    [{"type": "text", "text": "Error:"}, *rehydrated.blocks],
+                    dropped_oversized_image=rehydrated.dropped_oversized_image,
+                )
+            return rehydrated
         block = _image_block_from_object(parsed)
         if block is not None:
             return RehydratedContent([block])
@@ -210,10 +242,44 @@ def _rehydrate_tool_result_shape(output: str) -> RehydratedContent:
         if placeholder is None:
             return RehydratedContent(None)
         return RehydratedContent([placeholder], dropped_oversized_image=True)
+    clipped = _clipped_image_envelope(output)
+    if clipped is not None:
+        return clipped
     if parsed is not None:
         # A JSON scalar (number, string, bool) — not block content.
         return RehydratedContent(None)
     return _blocks_from_newline_joined(output)
+
+
+def _clipped_image_envelope(output: str) -> RehydratedContent | None:
+    """Recover complete blocks and the error flag before a store-clipped image."""
+    for is_error in (False, True):
+        prefix = encode_mcp_image_result([], is_error=is_error)[:-2]
+        if output.startswith(prefix):
+            break
+    else:
+        return None
+    remaining = output[len(prefix) :].lstrip()
+    parsed_blocks: list[object] = []
+    decoder = json.JSONDecoder()
+    while remaining:
+        try:
+            block, end = decoder.raw_decode(remaining)
+        except (json.JSONDecodeError, ValueError):
+            if not _holds_clipped_image_payload(remaining):
+                return None
+            recovered = blocks_from_parsed_list(parsed_blocks)
+            blocks = recovered.blocks or []
+            if is_error:
+                blocks.insert(0, {"type": "text", "text": "Error:"})
+            blocks.append({"type": "text", "text": image_omitted_placeholder(None)})
+            return RehydratedContent(blocks, dropped_oversized_image=True)
+        parsed_blocks.append(block)
+        remaining = remaining[end:].lstrip()
+        if not remaining.startswith(","):
+            return None
+        remaining = remaining[1:].lstrip()
+    return None
 
 
 def blocks_from_parsed_list(parsed: list[object]) -> RehydratedContent:
@@ -256,64 +322,11 @@ def blocks_from_parsed_list(parsed: list[object]) -> RehydratedContent:
     return RehydratedContent(blocks, dropped_oversized_image=dropped)
 
 
-#: Magic-byte prefixes for the image types Claude accepts, keyed by the media
-#: type the caller declares. A payload must match its own declared type —
-#: Claude is told that type, so a mismatch fails the resume.
-_IMAGE_MAGIC_BY_MEDIA_TYPE: dict[str, tuple[bytes, ...]] = {
-    "image/png": (b"\x89PNG\r\n\x1a\n",),
-    "image/jpeg": (b"\xff\xd8\xff",),
-    "image/gif": (b"GIF87a", b"GIF89a"),
-    "image/webp": (b"RIFF",),  # plus b"WEBP" at offset 8, checked below
-}
-
-#: Floor below which a payload cannot be a real image of any accepted type.
-#: Measured from fixtures, not guessed: the smallest real image here is a
-#: 37-byte 1x1 GIF, while the largest non-image shape that still matches a
-#: magic prefix is a bare 12-byte ``RIFF``+``WEBP`` header.
-_MIN_IMAGE_BYTES = 16
-
 #: Base64 length above which an image-shaped payload that fails validation is
 #: collapsed rather than replayed as text — rejecting must not cost more than
 #: accepting. 8 KiB: under every real screenshot (the smallest in the reported
 #: incident was 32,432 chars), over the snippets docs and tests embed.
 _MAX_INVALID_IMAGE_REPLAY_CHARS = 8 * 1024
-
-
-def canonical_image_payload(data: str, media_type: str) -> str | None:
-    """
-    Return *data* as canonical base64 when it is plausibly a *media_type* image.
-
-    Producers legitimately emit line-wrapped or unpadded base64, which strict
-    decoding rejects, so ASCII whitespace is dropped and ``=`` padding restored
-    before validating. The canonical form is returned rather than the original
-    because a provider may reject the noncanonical spelling.
-
-    Validation is a declared-type magic-byte match. An invalid image block makes
-    Claude reject the resume on every launch, so the bytes must match the type we
-    declare to it. Container validation is unnecessary: a store-truncated payload
-    never parses as JSON and so never reaches here, which means a magic-valid but
-    internally corrupt payload is accepted by design.
-
-    :param data: Candidate base64 payload, possibly wrapped or unpadded.
-    :param media_type: Declared MIME type, e.g. ``"image/png"``.
-    :returns: Canonical base64, or ``None`` when the payload is unusable.
-    """
-    magic = _IMAGE_MAGIC_BY_MEDIA_TYPE.get(media_type)
-    if magic is None:
-        return None
-    compact = "".join(data.split())
-    if not compact:
-        return None
-    padded = compact + "=" * (-len(compact) % 4)
-    try:
-        decoded = base64.b64decode(padded, validate=True)
-    except (binascii.Error, ValueError):
-        return None
-    if len(decoded) < _MIN_IMAGE_BYTES or not decoded.startswith(magic):
-        return None
-    if media_type == "image/webp" and decoded[8:12] != b"WEBP":
-        return None
-    return padded
 
 
 def _is_supported_image_payload(data: str, media_type: str) -> bool:

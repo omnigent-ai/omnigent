@@ -69,7 +69,11 @@ from rich.console import RenderableType
 from rich.markup import escape
 from rich.text import Text
 
+from omnigent.cli_diagnostics import printable
 from omnigent.cli_invocation import cli_invocation
+from omnigent.harness_aliases import canonicalize_harness
+from omnigent.remote_launch import no_online_runner_message, resolve_remote_launch_host
+from omnigent.session_host import set_session_host
 from omnigent.spec.types import SkillSpec
 
 if TYPE_CHECKING:
@@ -1299,6 +1303,7 @@ class _SessionsChatReplAdapter:
         field_input_state: _FieldInputState | None = None,
         host: TerminalHost | None = None,
         fmt: RichBlockFormatter | None = None,
+        registered_agent: RegisteredAgent | None = None,
     ) -> None:
         """
         Wire the adapter; do NOT issue any HTTP calls.
@@ -1345,9 +1350,11 @@ class _SessionsChatReplAdapter:
             field values interactively via the main input loop.
         :param host: Terminal output channel for rendering field prompts.
         :param fmt: Formatter for styling field prompts.
+        :param registered_agent: Catalog identity selected for a new remote session.
         """
         self._client = client
         self._agent_id: str | None = None
+        self._registered_agent = registered_agent
         self._agent_name = agent_name
         self._tool_callables = tool_callables
         self._hooks = hooks or StreamHooks()
@@ -1656,6 +1663,8 @@ class _SessionsChatReplAdapter:
             attributes.
         :returns: None.
         """
+        if self._session_id is not None:
+            set_session_host(self._session_id, getattr(session, "host_id", None))
         self._agent_id = session.agent_id
         # The agent name changes when the session is switched in place
         # to a different agent (web UI "Switch agent"). Don't clobber
@@ -1731,11 +1740,11 @@ class _SessionsChatReplAdapter:
         """
         Create a session bound to an agent already registered server-side.
 
-        The remote-URL path: there is no local bundle to upload, so
-        resolve the picked name to its id and use the JSON create route.
-        A remote client also has no runner of its own, so adopt one the
-        server already has online — otherwise the first turn fails the
-        runner-binding precondition.
+        The remote-URL path: there is no local bundle to upload, so use
+        the selected catalog identity or resolve the name for direct callers.
+        Adopt a matching online runner, or ask the server to launch one
+        on this machine's connected host. Host-launched runners arrive
+        bound to the session and remain owned by the host lifecycle.
 
         :param pending_debug: Whether to emit adapter debug lines.
         :returns: None.
@@ -1746,22 +1755,35 @@ class _SessionsChatReplAdapter:
                 file=sys.stderr,
                 flush=True,
             )
-        # Skip the name lookup only when nothing needs it: we already know
-        # the id, and a bound runner means we don't need the harness either.
-        agent: RegisteredAgent | None = None
-        if self._agent_id is None or self._runner_id is None:
-            agent = await self._client.sessions.resolve_agent(self._agent_name)
-        agent_id = self._agent_id or (agent.id if agent is not None else None)
-        if agent_id is None:
-            raise RuntimeError(f"Could not resolve an agent id for {self._agent_name!r}")
+        # /new keeps the session's identity, including unnamed uploaded agents.
+        if self._agent_id is not None:
+            agent = RegisteredAgent(id=self._agent_id, harness=self._harness)
+            if self._runner_id is None and not agent.harness:
+                raise RuntimeError(
+                    "The previous session does not report its harness, so a compatible "
+                    "runner cannot be selected. Start a new session with --agent <name>."
+                )
+        else:
+            agent = self._registered_agent
+        if agent is None:
+            try:
+                agent = await self._client.sessions.resolve_agent(self._agent_name)
+            except LookupError as exc:
+                # The REPL renders this message; keep server-supplied names inert.
+                raise LookupError(printable(str(exc))) from exc
+        launch_host_id: str | None = None
         if self._runner_id is None:
-            from omnigent.harness_aliases import canonicalize_harness
-
             self._runner_id = await self._client.sessions.resolve_online_runner(
-                harness=agent.harness if agent is not None else None,
+                harness=agent.harness,
                 canonicalize=lambda name: canonicalize_harness(name) or name,
             )
-            if pending_debug:
+            if self._runner_id is None:
+                launch_host_id = await resolve_remote_launch_host(
+                    self._client.sessions, harness=agent.harness
+                )
+                if launch_host_id is None:
+                    raise RuntimeError(no_online_runner_message())
+            if pending_debug and self._runner_id is not None:
                 print(
                     f"[sessions-adapter] adopted server runner {self._runner_id!r}",
                     file=sys.stderr,
@@ -1771,12 +1793,15 @@ class _SessionsChatReplAdapter:
         # it; applied after create since create has no such field.
         pending_model_override = self._model_override
         session = await self._client.sessions.create_from_agent_id(
-            agent_id,
+            agent.id,
             reasoning_effort=self._reasoning_effort,
             workspace=os.getcwd(),
+            host_id=launch_host_id,
         )
         self._session_id = session.id
         self._hydrate_from_session_snapshot(session)
+        if launch_host_id is not None:
+            set_session_host(session.id, launch_host_id)
         await self._apply_pending_model_override(pending_model_override, session)
         if pending_debug:
             print(
@@ -1901,11 +1926,7 @@ class _SessionsChatReplAdapter:
                 if self._session_bundle is None:
                     # Remote target: we tried to adopt one of the server's
                     # online runners at create time and found none.
-                    raise RuntimeError(
-                        "This server has no online runner to run the turn. Start one "
-                        f"against it with `{cli_invocation()} host --server <url>` (or run the "
-                        f"agent locally with `{cli_invocation()} run <agent.yaml>`), then retry."
-                    )
+                    raise RuntimeError(no_online_runner_message())
                 raise RuntimeError(
                     "Sessions API dispatch requires a registered runner id. "
                     f"Start through `{cli_invocation()} run <agent>` or pass --server so the CLI "
@@ -3188,11 +3209,13 @@ async def run_repl(
     agent_description: str | None = None,
     used_families: list[str] | None = None,
     attach_only: bool = False,
+    registered_agent: RegisteredAgent | None = None,
 ) -> str | None:
     """The entire REPL — using the framework.
 
     :param client: Connected OmnigentClient.
     :param agent_name: Agent name (used for API calls).
+    :param registered_agent: Catalog identity selected for a new remote session.
     :param tool_handler: Optional client-side tool handler.
     :param initial_message: If set, auto-send this message on startup
         (e.g. a greeting prompt for onboarding).
@@ -3363,6 +3386,7 @@ async def run_repl(
     session = _SessionsChatReplAdapter(
         client=client,
         agent_name=agent_name,
+        registered_agent=registered_agent,
         tool_callables=tool_callables,
         hooks=hooks,
         session_id=resume_conversation_id,
@@ -3444,8 +3468,8 @@ async def run_repl(
         """
         Fire a background re-sync of session metadata from a snapshot.
 
-        Shared by the two triggers that can observe an in-place agent
-        switch: the ``session.agent_changed`` stream event (live, while
+        Shared by the two triggers that can observe an agent change: the
+        ``session.agent_changed`` stream event (live, while
         attached) and the turn-start catch-up in the ``running`` status
         branch. Both funnel into :func:`_refresh_session_metadata` so
         adapter state is always derived from a snapshot — never applied
@@ -5967,9 +5991,8 @@ async def _refresh_session_metadata(
     Fired in the background from two triggers. The session's bound
     agent — and with it ``llm_model`` / ``harness`` /
     ``context_window`` / ``model_override`` — can change between turns
-    when another client switches the agent in place
-    (``POST /v1/sessions/{id}/switch-agent``). The server publishes a
-    ``session.agent_changed`` stream event for the switch (the live
+    when another client edits it. The server publishes a
+    ``session.agent_changed`` stream event (the live
     trigger), but the event is transient SSE-only with no replay — one
     landing in a stream-pump reconnect gap or before this REPL attached
     is lost — so each turn start re-fires the refresh as the catch-up
@@ -6512,7 +6535,7 @@ async def _list_all_conversation_items(
             continue
         except Exception:  # noqa: BLE001 — overlay builder: any other per-page error falls back to whatever was already fetched; partial sidebar beats no sidebar
             break
-        page: list[dict[str, object]] = list(raw_page) if raw_page else []
+        page: list[dict[str, object]] = raw_page.data
         if not page:
             break
         all_items.extend(page)
@@ -8465,6 +8488,10 @@ _SLASH_COMMAND_ALIASES: frozenset[str] = frozenset({"/?", "/exit"})
 # SLASH_COMMAND_RE so the terminal and the menu agree on what is a command.
 _SKILL_COMMAND_NAME_RE = re.compile(r"^[A-Za-z0-9][\w:-]*$")
 
+# Registered skill commands' display names, e.g. ``{"/asd-ste100": "Simplified
+# Technical English"}``; the completer matches these as well as the command.
+_SKILL_DISPLAY_NAMES: dict[str, str] = {}
+
 
 def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
     """
@@ -8536,7 +8563,11 @@ def register_skill_commands(skills: list[SkillSpec]) -> list[str]:
             return _skill_handler
 
         handler = _make_handler(skill)
-        COMMANDS[cmd_name] = (skill.description, handler)
+        # Label the command with its display name, matching the web menu.
+        description = " — ".join(filter(None, (skill.display_name, skill.description)))
+        COMMANDS[cmd_name] = (description, handler)
+        if skill.display_name:
+            _SKILL_DISPLAY_NAMES[cmd_name] = skill.display_name
         registered.append(cmd_name)
         _log.debug("Registered skill slash command: %s", cmd_name)
 
@@ -8547,6 +8578,7 @@ def unregister_skill_commands(names: list[str]) -> None:
     """Remove previously registered skill commands from the global registry."""
     for name in names:
         COMMANDS.pop(name, None)
+        _SKILL_DISPLAY_NAMES.pop(name, None)
 
 
 class _SlashCommandCompleter(Completer):
@@ -8592,9 +8624,8 @@ class _SlashCommandCompleter(Completer):
         # SlashCommandMenu.tsx): a case-insensitive substring of the
         # command name (sans the leading "/"), so a namespaced skill is
         # reachable by its leaf name (``/using-superpowers`` ->
-        # ``/superpowers:using-superpowers``). Name only, not the
-        # description — kept identical to the web menu, which never shows
-        # descriptions inline.
+        # ``/superpowers:using-superpowers``). A skill's display name also
+        # matches, ranked after name hits; the description never does.
         #
         # Prefix matches rank ahead of mid-string matches (mirrors the web
         # menu's ``rankedSlashCommandNames``): ``/e`` surfaces ``/effort``
@@ -8605,6 +8636,7 @@ class _SlashCommandCompleter(Completer):
         query = text_before[1:].lower()
         prefix_hits: list[tuple[str, str]] = []
         substring_hits: list[tuple[str, str]] = []
+        label_hits: list[tuple[str, str]] = []
         for name, (desc, _) in COMMANDS.items():
             if name in _SLASH_COMMAND_ALIASES:
                 continue
@@ -8613,7 +8645,9 @@ class _SlashCommandCompleter(Completer):
                 prefix_hits.append((name, desc))
             elif query in body:
                 substring_hits.append((name, desc))
-        for name, desc in (*prefix_hits, *substring_hits):
+            elif query in _SKILL_DISPLAY_NAMES.get(name, "").lower():
+                label_hits.append((name, desc))
+        for name, desc in (*prefix_hits, *substring_hits, *label_hits):
             yield Completion(
                 text=name,
                 # Replace everything typed so far so the splice

@@ -70,6 +70,7 @@ from omnigent.tools.builtins.timer import (
     SysTimerSetTool,
 )
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
+from omnigent.tools.builtins.web_read import WebReadTool
 from omnigent.tools.builtins.web_search import WebSearchTool
 
 __all__ = [
@@ -103,6 +104,7 @@ __all__ = [
     "SysTimerCancelTool",
     "SysTimerSetTool",
     "UpdateCommentTool",
+    "WebReadTool",
     "WebSearchTool",
     "any_skill_has_resources",
     "find_skill_by_name",
@@ -250,6 +252,7 @@ def _create_hindsight_reflect(config: dict[str, str]) -> Tool:
 _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # User-enablable tools (factory present).
     "web_search": lambda config: WebSearchTool(config=config),
+    "web_read": lambda config: WebReadTool(config=config),
     "nimble_research": lambda config: NimbleResearchTool(config=config),
     "nimble_extract": lambda config: NimbleExtractTool(config=config),
     "upload_file": _create_upload_file,

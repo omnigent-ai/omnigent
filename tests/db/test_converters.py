@@ -15,8 +15,8 @@ from omnigent.db.enum_codecs import encode_agent_kind
 from omnigent.db.utils import get_or_create_engine, make_managed_session_maker
 from omnigent.entities import Agent
 
-AGENT_KIND_TEMPLATE = encode_agent_kind("template")
-AGENT_KIND_SESSION = encode_agent_kind("session")
+AGENT_KIND_SERVER = encode_agent_kind("server")
+AGENT_KIND_USER = encode_agent_kind("user")
 
 
 def _now() -> int:
@@ -34,7 +34,7 @@ class TestSqlAgentToEntity:
             name="research-agent",
             bundle_location="ag_abc123/sha256hash",
             version=3,
-            kind=AGENT_KIND_TEMPLATE,
+            kind=AGENT_KIND_SERVER,
             description="Does research",
             updated_at=1700001000,
         )
@@ -58,7 +58,7 @@ class TestSqlAgentToEntity:
             name="session-agent",
             bundle_location="ag_sess/hash",
             version=1,
-            kind=AGENT_KIND_SESSION,
+            kind=AGENT_KIND_USER,
         )
         entity = sql_agent_to_entity(row, session_id="12b8fd5b4413ededb99560e847b32b0e")
         assert entity.session_id == "12b8fd5b4413ededb99560e847b32b0e"
@@ -71,7 +71,7 @@ class TestSqlAgentToEntity:
             name="minimal-agent",
             bundle_location="ag_minimal/hash",
             version=1,
-            kind=AGENT_KIND_TEMPLATE,
+            kind=AGENT_KIND_SERVER,
             description=None,
             updated_at=None,
         )
@@ -89,7 +89,7 @@ class TestSqlAgentToEntity:
             name="agent-with-emoji-\u2603",
             bundle_location="ag_unicode/hash",
             version=1,
-            kind=AGENT_KIND_TEMPLATE,
+            kind=AGENT_KIND_SERVER,
             description="Handles \u00e9\u00e0\u00fc and newlines\nand tabs\t",
         )
         entity = sql_agent_to_entity(row)
@@ -118,7 +118,7 @@ class TestSqlAgentToEntity:
             name=original.name,
             bundle_location=original.bundle_location,
             version=original.version,
-            kind=AGENT_KIND_TEMPLATE,
+            kind=AGENT_KIND_SERVER,
             description=original.description,
             updated_at=original.updated_at,
         )
@@ -156,7 +156,7 @@ class TestSqlAgentToEntity:
             name=original.name,
             bundle_location=original.bundle_location,
             version=original.version,
-            kind=AGENT_KIND_TEMPLATE,
+            kind=AGENT_KIND_SERVER,
             description=original.description,
             updated_at=original.updated_at,
         )
@@ -187,7 +187,7 @@ class TestSqlAgentToEntity:
             created_at=1700000000,
             name="default-version",
             bundle_location="ag_defver/hash",
-            kind=AGENT_KIND_TEMPLATE,
+            kind=AGENT_KIND_SERVER,
         )
         with managed() as session:
             session.add(row)
@@ -206,7 +206,7 @@ class TestSqlAgentToEntity:
             name="empty-desc",
             bundle_location="ag_empty/hash",
             version=1,
-            kind=AGENT_KIND_TEMPLATE,
+            kind=AGENT_KIND_SERVER,
             description="",
         )
         entity = sql_agent_to_entity(row)

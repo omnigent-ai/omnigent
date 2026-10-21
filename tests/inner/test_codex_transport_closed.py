@@ -581,6 +581,8 @@ async def test_cancelled_native_close_kills_and_reaps_sigterm_ignoring_child(
     session._proc = child
     session._codex_home_dir = tmp_path / "codex-home"
     session._codex_home_dir.mkdir()
+    home_stat = session._codex_home_dir.stat()
+    session._codex_home_identity = (home_stat.st_dev, home_stat.st_ino)
     try:
         assert child.stdout is not None
         async with asyncio.timeout(5):

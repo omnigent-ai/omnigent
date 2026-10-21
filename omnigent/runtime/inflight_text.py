@@ -60,9 +60,9 @@ The text is never written to the conversation store; the final
 assistant message still persists on ``response.completed`` exactly as
 before, and the index is cleared at that point. Nothing here pollutes
 the durable transcript. The index lives only in the Omnigent process, so it
-does not survive an AP-server restart mid-turn — acceptable, because
-the relay's in-memory accumulator does not survive a restart either,
-and the only loss is the in-flight prefix of a single turn.
+does not survive an AP-server restart mid-turn. A browser that saw the
+in-flight prefix can retain its preview when the stream epoch changes;
+a fresh browser must wait for the final persisted item.
 
 Lifecycle correctness (no gap, no duplicate)
 --------------------------------------------
@@ -82,7 +82,9 @@ BOTH the snapshot and the queue and render twice.
 from __future__ import annotations
 
 import copy
+import os
 import threading
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
@@ -145,6 +147,13 @@ class _InFlightTurn:
 # by ``snapshot_for`` from ``subscribe``'s ``pre_ready_snapshot`` hook.
 _inflight: WorkspaceScopedCache[str, _InFlightTurn] = WorkspaceScopedCache()
 _lock = threading.Lock()
+# The replay index is process-local; a new process cannot reconstruct its prefix.
+_STREAM_EPOCH = uuid.uuid4().hex
+
+
+def stream_epoch() -> str:
+    """Identify the process that owns the in-flight replay index."""
+    return f"{os.getpid()}-{_STREAM_EPOCH}"
 
 
 @dataclass
@@ -576,6 +585,24 @@ def snapshot_for(conversation_id: str) -> list[dict[str, Any]]:
             )
         events.append({"type": "response.output_text.delta", "delta": text})
         return events
+
+
+def retire_native_previews(conversation_id: str) -> None:
+    """Stop replaying finalized native previews after an assistant item commits."""
+    with _lock:
+        messages = _native_inflight.get(conversation_id)
+        if not messages:
+            return
+        finalized = [message_id for message_id, message in messages.items() if message.final_seen]
+        if not finalized:
+            # A provider may commit without reporting a final chunk. Without
+            # an item-to-preview id, prefer the authoritative item to a ghost.
+            _native_inflight.pop(conversation_id, None)
+            return
+        for message_id in finalized:
+            messages.pop(message_id, None)
+        if not messages:
+            _native_inflight.pop(conversation_id, None)
 
 
 def discard(conversation_id: str) -> None:

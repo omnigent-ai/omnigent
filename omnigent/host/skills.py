@@ -92,7 +92,11 @@ class HostSkillDiscovery:
                     if frame.sub_agent_name:
                         spec, directory = _subagent_bundle(spec, directory, frame.sub_agent_name)
                     skills = resolve_session_skills(spec, (root, directory), directory)
-            result = [{"name": skill.name, "description": skill.description} for skill in skills]
+            result = [
+                {"name": skill.name, "description": skill.description}
+                | ({"display_name": skill.display_name} if skill.display_name else {})
+                for skill in skills
+            ]
             self._cache[key] = (time.monotonic() + SKILLS_CACHE_TTL_SECONDS, result)
             self._cache.move_to_end(key)
             while len(self._cache) > _MAX_CACHED_CATALOGS:

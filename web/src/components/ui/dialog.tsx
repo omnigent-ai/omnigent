@@ -77,10 +77,12 @@ function DialogContent({
   return (
     <DialogPortal>
       <DialogOverlay />
+      {/* A single minmax(0,1fr) column keeps unbreakable content, such as a
+          long URL in a field, from widening the grid past the panel. */}
       <DialogPrimitive.Content
         data-slot="dialog-content"
         className={cn(
-          "fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-[30px] bg-popover p-6 text-ui text-popover-foreground duration-150 ease-[cubic-bezier(0.16,1,0.3,1)] outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95 shadow-dialog",
+          "fixed top-1/2 left-1/2 z-50 grid w-full max-w-[calc(100%-2rem)] grid-cols-[minmax(0,1fr)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-[30px] bg-popover p-6 text-ui text-popover-foreground duration-150 ease-[cubic-bezier(0.16,1,0.3,1)] outline-none sm:max-w-sm data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95 shadow-dialog",
           className,
         )}
         style={{ ...iosViewportStyle, ...style }}
@@ -121,7 +123,7 @@ function DialogFooter({
     <div
       data-slot="dialog-footer"
       className={cn(
-        "-mx-6 -mb-6 flex flex-col-reverse gap-2 rounded-b-xl border-t bg-muted/50 p-6 sm:flex-row sm:justify-end",
+        "-mx-6 -mb-6 flex flex-col-reverse gap-2 rounded-b-xl p-6 pt-4 sm:flex-row sm:justify-end",
         className,
       )}
       {...props}

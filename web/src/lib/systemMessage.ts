@@ -9,6 +9,45 @@
 import type { MessageContentBlock } from "@/lib/blocks";
 import { isTextBlock } from "@/lib/blocks";
 
+const TEAMMATE_MESSAGE_RE =
+  /^<teammate-message\s+[^>]*\bteammate_id="[^"]+"[^>]*>[\s\S]*?<\/teammate-message>/;
+const AGENT_MESSAGE_RE = /^<agent-message\s+[^>]*\bfrom="[^"]+"[^>]*>[\s\S]*?<\/agent-message>/;
+const TEAMMATE_MESSAGE_PREFIXES = [
+  "Another Claude session sent a message:\n",
+  "Another Claude session sent a message while you were working:\n",
+  "A peer session sent a message while you were working:\n",
+];
+const TEAMMATE_DELIVERY_GUIDANCE = [
+  "This came from another Claude session — not typed by your user,",
+  'That "other Claude session" is an agent working inside this same session —',
+];
+
+/** Recognize older Claude task/team context that was persisted without is_meta. */
+export function isClaudeAgentMessageContent(content: MessageContentBlock[]): boolean {
+  if (content.some((block) => block.type !== "input_text")) return false;
+  const texts = content.map((block) => ("text" in block ? block.text.trim() : "")).filter(Boolean);
+  return texts.length > 0 && texts.every(isClaudeAgentMessageText);
+}
+
+function isClaudeAgentMessageText(text: string): boolean {
+  if (isClaudeTaskNotificationText(text)) {
+    return /<summary>\s*Agent\b/.test(text) || /<result>[\s\S]*<\/result>/.test(text);
+  }
+  const prefix = TEAMMATE_MESSAGE_PREFIXES.find((candidate) => text.startsWith(candidate));
+  let remaining = prefix ? text.slice(prefix.length).trimStart() : text;
+  let match = TEAMMATE_MESSAGE_RE.exec(remaining) ?? AGENT_MESSAGE_RE.exec(remaining);
+  if (!match) return false;
+  while (match) {
+    remaining = remaining.slice(match[0].length).trimStart();
+    if (!remaining) return true;
+    match = TEAMMATE_MESSAGE_RE.exec(remaining) ?? AGENT_MESSAGE_RE.exec(remaining);
+  }
+  // Peer wrappers can append native delivery instructions after the envelopes.
+  return Boolean(
+    prefix && TEAMMATE_DELIVERY_GUIDANCE.some((guidance) => remaining.startsWith(guidance)),
+  );
+}
+
 export type SystemMessageKind =
   | "task_completed"
   | "task_failed"
@@ -169,9 +208,9 @@ export function isSystemUserContent(content: MessageContentBlock[]): boolean {
  * :returns: ``true`` for a task notification, ``false`` otherwise.
  */
 export function isClaudeTaskNotificationText(text: string): boolean {
-  const trimmed = text.trimStart();
+  const trimmed = text.trim();
   return (
-    trimmed.startsWith("<task-notification>") &&
+    /^<task-notification>[\s\S]*<\/task-notification>$/.test(trimmed) &&
     TASK_NOTIFICATION_MARKERS.every((marker) => trimmed.includes(marker))
   );
 }
@@ -212,6 +251,11 @@ export function claudeTaskNotificationMarker(text: string): string | null {
 export function taskNotificationMarkerContent(
   content: MessageContentBlock[],
 ): MessageContentBlock[] | null {
+  if (content.some((block) => !isTextBlock(block))) return null;
+  if (isClaudeAgentMessageContent(content)) return null;
+  if (content.some((block) => isTextBlock(block) && !isClaudeTaskNotificationText(block.text))) {
+    return null;
+  }
   for (const block of content) {
     if (!isTextBlock(block)) continue;
     const marker = claudeTaskNotificationMarker(block.text);

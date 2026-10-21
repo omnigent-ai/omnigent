@@ -34,6 +34,17 @@ export function nativeModelLabel(option: NativeModelLabelFields): string {
   return label;
 }
 
+/** Hover text for a picker row: the exact model id it launches, which a family
+ *  label such as "Opus" leaves out. None when the label already shows that id,
+ *  or for a Fusion row, which launches the combo picked in its own selectors. */
+export function nativeModelTooltip(
+  option: NativeModelLabelFields & Pick<NativeModelOption, "fusion">,
+): string | undefined {
+  if (option.fusion !== undefined) return undefined;
+  const id = option.model ?? option.id;
+  return id === nativeModelLabel(option) ? undefined : id;
+}
+
 export function defaultModelLabel(options: readonly NativeModelLabelFields[]): string {
   const defaultOption = options.find((option) => option.isDefault);
   return defaultOption ? `Default (${nativeModelLabel(defaultOption)})` : "Default";

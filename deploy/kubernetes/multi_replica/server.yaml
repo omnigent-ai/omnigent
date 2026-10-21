@@ -1,0 +1,82 @@
+# Two real servers sharing Postgres and an artifact volume on one kind node.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: artifacts
+  namespace: omnigent-prototype
+spec:
+  # ReadWriteOnce works here because all pods share one kind node; use shared storage on multiple nodes.
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: omnigent
+  namespace: omnigent-prototype
+spec:
+  replicas: 2
+  minReadySeconds: 10
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: omnigent
+  template:
+    metadata:
+      labels:
+        app: omnigent
+    spec:
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: omnigent
+          image: omnigent-server:nginx-prototype
+          imagePullPolicy: Never
+          envFrom:
+            - secretRef:
+                name: database
+          env:
+            - name: OMNIGENT_AUTH_ENABLED
+              value: "0"
+            - name: OMNIGENT_LOCAL_SINGLE_USER
+              value: "1"
+          ports:
+            - name: http
+              containerPort: 8000
+          volumeMounts:
+            - name: artifacts
+              mountPath: /data/artifacts
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 1
+            timeoutSeconds: 2
+          lifecycle:
+            preStop:
+              exec:
+                command: [python, -c, "import time; time.sleep(3)"]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+      volumes:
+        - name: artifacts
+          persistentVolumeClaim:
+            claimName: artifacts
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: omnigent
+  namespace: omnigent-prototype
+spec:
+  selector:
+    app: omnigent
+  ports:
+    - port: 8000
+      targetPort: http

@@ -25,6 +25,7 @@ import {
   useStoreCredential,
   type DetectedCredential,
   type Host,
+  type StoreCredentialResult,
   type StoreCredentialInput,
 } from "@/hooks/useHosts";
 import { harnessCredentialAdoptFamilies } from "@/lib/harnessSetup";
@@ -45,7 +46,7 @@ export function HarnessCredentialForm({
   /** The server's subscription-login command (e.g. `codex login`), shown as a
    *  copy signpost — the UI can't drive browser OAuth. `null` for Pi. */
   command: string | null;
-  onDone: () => void;
+  onDone: (result: StoreCredentialResult) => void;
 }) {
   // What the user sees in toasts — the friendly name, not the canonical id.
   const display = label ?? harness;
@@ -86,7 +87,7 @@ export function HarnessCredentialForm({
         setGatewayKey("");
         if (ready) {
           showToast(`${display} is ready on ${host.name}.`);
-          onDone();
+          onDone(result);
         } else {
           showToast(
             `Saved, but ${display} still needs setup on ${host.name}. Try another option.`,

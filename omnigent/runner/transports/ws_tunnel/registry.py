@@ -38,11 +38,13 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
+from itertools import count
 from typing import Protocol
 
 import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
+from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
     Frame,
     HelloFrame,
@@ -54,6 +56,7 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 )
 
 _logger = logging.getLogger(__name__)
+_connection_generations = count(1)
 
 
 class WebSocketLike(Protocol):
@@ -87,31 +90,45 @@ class RunnerSession:
         directly.
     :param connected_at: Unix epoch float of connect time.
     :param last_frame_at: Unix epoch float of the most recent frame
-        from this runner. Updated on every receive — feeds the
-        watchdog inactivity check.
+        from this runner, retained for diagnostics.
+    :param last_frame_monotonic: Monotonic timestamp of the last frame,
+        used for watchdog inactivity checks across wall-clock corrections.
     :param owner: Authenticated user who established the tunnel,
         e.g. ``"alice@example.com"``. ``None`` when auth is
         disabled (single-user mode). Used to enforce runner
         ownership: only the owner (or an admin) may bind sessions
         to this runner.
+    :param generation: Process-unique connection generation for initialization readiness.
     :param in_flight: Per-req_id reassembly state. Each entry holds
         a head Future + body queue + end Event so the transport can
         await heads, iterate body chunks, and detect end.
+    :param close_code: First server-requested close code, recorded under
+        the registry lock before helpers can observe retirement.
+    :param close_reason: Reason accompanying ``close_code``.
+    :param peer_close_reason: Reason in the runner's own close frame, e.g.
+        ``RUNNER_IDLE_SHUTDOWN_CLOSE_REASON``; ``None`` until the runner closes.
+    :param diagnostics: Timing observations owned by this connection's socket loop.
     """
 
     runner_id: str
     ws: WebSocketLike
     hello: HelloFrame
     loop: asyncio.AbstractEventLoop
-    outbound_queue: asyncio.Queue[str | None]
+    outbound_queue: asyncio.Queue[OutboundFrame | None]
     connected_at: float
     last_frame_at: float
     owner: str | None
+    last_frame_monotonic: float = field(default_factory=time.monotonic, kw_only=True)
+    generation: int = field(default_factory=lambda: next(_connection_generations))
     in_flight: dict[str, RequestState] = field(default_factory=dict)
     # Per-channel state for tunneled WebSocket attaches.  Keys are
     # 8-char hex channel ids; values hold the inbound queue consumed
     # by whichever side terminated the attach.
     ws_channels: dict[str, WSChannelState] = field(default_factory=dict)
+    close_code: int | None = None
+    close_reason: str | None = None
+    peer_close_reason: str | None = None
+    diagnostics: TunnelDiagnostics = field(default_factory=TunnelDiagnostics)
 
 
 @dataclass
@@ -214,6 +231,7 @@ class TunnelRegistry:
         *,
         max_connect_waiters_per_runner: int = 1024,
         max_connect_waiters_total: int = 8192,
+        on_retire: Callable[[str], None] | None = None,
     ) -> None:
         """
         Create an empty runner tunnel registry.
@@ -228,6 +246,9 @@ class TunnelRegistry:
             ``wait_for_runner`` futures allowed across all runner ids,
             e.g. ``8192``. Additional callers use the same bounded
             overflow path as the per-runner cap.
+        :param on_retire: Called with the runner id whenever this server
+            retires a live tunnel on purpose (:meth:`deregister` with
+            ``retire=True``), before the close reaches the runner.
         :raises ValueError: If either waiter limit is less than one.
         """
         if max_connect_waiters_per_runner < 1:
@@ -239,6 +260,7 @@ class TunnelRegistry:
         self._max_connect_waiters_per_runner = max_connect_waiters_per_runner
         self._max_connect_waiters_total = max_connect_waiters_total
         self._connect_waiter_total = 0
+        self._on_retire = on_retire
         self._lock = threading.RLock()
 
     # ── Session lifecycle ────────────────────────────────
@@ -279,10 +301,12 @@ class TunnelRegistry:
             connected_at=now,
             last_frame_at=now,
             owner=owner,
+            last_frame_monotonic=time.monotonic(),
         )
         with self._lock:
             old = self._sessions.pop(runner_id, None)
             if old is not None:
+                self.record_close(old, code=4000, reason="tunnel replaced")
                 self._abort_session_inflight(
                     old,
                     ConnectionError(
@@ -304,13 +328,17 @@ class TunnelRegistry:
         self,
         runner_id: str,
         session: RunnerSession | None = None,
+        *,
+        retire: bool = True,
     ) -> RunnerSession | None:
         """Remove a session and abort all its in-flight requests.
 
         Called by the WS route handler when the tunnel closes for
-        any reason (clean shutdown, network error, etc.). The abort
-        ensures awaiters of in-flight requests don't hang — they
-        get a ConnectionError and propagate it up.
+        any reason (clean shutdown, network error, etc.), and by
+        server-side callers that retire a live tunnel so the runner
+        reconnects, usually to another replica. The abort ensures
+        awaiters of in-flight requests don't hang — they get a
+        ConnectionError and propagate it up.
 
         :param runner_id: Runner id to remove, e.g.
             ``"runner_0123456789abcdef"``.
@@ -318,6 +346,10 @@ class TunnelRegistry:
             deregistration only removes the registry entry if the
             current entry is this exact session object. This prevents
             stale route handlers from deleting a newer tunnel.
+        :param retire: ``True`` when this server retires a live tunnel on
+            purpose and expects the runner to reconnect, which the
+            ``on_retire`` callback reports. The tunnel route passes
+            ``False`` for its own cleanup after the socket closed.
         :returns: The removed session, or ``None`` when the runner is
             already offline or the guard did not match.
         """
@@ -326,6 +358,7 @@ class TunnelRegistry:
             if current is None or (session is not None and current is not session):
                 return None
             removed = self._sessions.pop(runner_id)
+            self.record_close(removed, code=1001, reason="tunnel retired by server; reconnect")
             in_flight_count = len(removed.in_flight)
             if in_flight_count:
                 _logger.warning(
@@ -344,8 +377,33 @@ class TunnelRegistry:
                 removed,
                 ConnectionError("tunnel closed before request completed"),
             )
-        _retire_session_writer(removed, code=4003, reason="tunnel closed")
+        # Report the deliberate retire before the close reaches the route's
+        # disconnect hook, which reads it when deciding what the loss means.
+        if retire and self._on_retire is not None:
+            self._on_retire(runner_id)
+        # 1001 ("going away"), not 4003: it lands in the runner's existing
+        # tunnel-recycle path (serve.py's ``_TUNNEL_RECYCLE_CLOSE_CODES``) for a
+        # prompt, spread reconnect instead of an escalating backoff. Avoid 1012
+        # too — the server's own shutdown_state treats an observed 1012 as
+        # "this server is shutting down".
+        _retire_session_writer(removed, code=1001, reason="tunnel retired by server; reconnect")
         return removed
+
+    def record_close(self, session: RunnerSession, *, code: int, reason: str) -> None:
+        """Retain the first server-requested close for one connection.
+
+        Retirement callers hold the registry lock across removal and this
+        update so stale-session helpers cannot finish before it is visible.
+
+        :param session: Connection being closed, including a retired generation.
+        :param code: Requested WebSocket close code.
+        :param reason: Requested WebSocket close reason.
+        :returns: None.
+        """
+        with self._lock:
+            if session.close_code is None:
+                session.close_code = code
+                session.close_reason = reason
 
     @staticmethod
     def _abort_session_inflight(session: RunnerSession, error: BaseException) -> None:
@@ -509,6 +567,7 @@ class TunnelRegistry:
             if self._sessions.get(session.runner_id) is not session:
                 return False
             session.last_frame_at = time.time()
+            session.last_frame_monotonic = time.monotonic()
             return True
 
     def seconds_since_last_frame(self, session: RunnerSession) -> float | None:
@@ -521,14 +580,17 @@ class TunnelRegistry:
         with self._lock:
             if self._sessions.get(session.runner_id) is not session:
                 return None
-            return time.time() - session.last_frame_at
+            return time.monotonic() - session.last_frame_monotonic
 
     # ── Per-request lifecycle ────────────────────────────
 
-    def open_request(self, runner_id: str, req_id: str) -> RequestState:
+    def open_request(
+        self, runner_id: str, req_id: str, *, generation: int | None = None
+    ) -> RequestState:
         """Allocate reassembly state for a new outgoing request.
 
         :raises KeyError: If the runner isn't online.
+        :raises ConnectionError: If the requested connection has been replaced.
         :raises ValueError: If a request with this ``req_id`` is
             already in flight on this runner. req_ids must be unique
             per session.
@@ -538,6 +600,8 @@ class TunnelRegistry:
             session = self._sessions.get(runner_id)
             if session is None:
                 raise KeyError(runner_id)
+            if generation is not None and session.generation != generation:
+                raise ConnectionError("runner tunnel changed before request was sent")
             if req_id in session.in_flight:
                 raise ValueError(f"req_id {req_id!r} already in flight on runner {runner_id!r}")
             state = RequestState(
@@ -650,7 +714,7 @@ class TunnelRegistry:
             current = self._sessions.get(runner_id)
             if current is None or (session is not None and current is not session):
                 return False
-            current.last_frame_at = time.time()
+            self.mark_frame_seen(current)
             if not isinstance(frame, (WSFrame, WSCloseFrame)):
                 return False
             channel = current.ws_channels.get(frame.ch_id)
@@ -687,28 +751,48 @@ class TunnelRegistry:
             channel, lambda: channel.inbound_queue.put_nowait(item)
         )
 
-    async def send_text(self, session: RunnerSession, data: str) -> None:
+    async def send_text(
+        self, session: RunnerSession, data: str, *, app_ping_ts: int | None = None
+    ) -> None:
         """Enqueue one outbound WebSocket frame on the session's owner loop.
 
         :param session: Current session generation that should send
             the frame.
         :param data: Encoded tunnel frame JSON.
+        :param app_ping_ts: Application ping token, only for heartbeat diagnostics.
         :returns: None after the frame has been accepted into the
             route-loop outbound queue.
         :raises ConnectionError: If ``session`` is no longer the
             registry's current generation for its runner id.
+        :raises Exception: Preparation or queue failures before frame acceptance
+            are forwarded from the owner loop.
         """
+        requested_at = session.diagnostics.timestamp()
         ack: concurrent.futures.Future[None] = concurrent.futures.Future()
 
         def _enqueue() -> None:
             """Run on ``session.loop`` and enqueue the outbound frame."""
-            error: ConnectionError | None = None
-            with self._lock:
-                if self._sessions.get(session.runner_id) is not session:
-                    error = ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
-                else:
-                    session.outbound_queue.put_nowait(data)
-            if error is not None:
+            try:
+                with self._lock:
+                    if self._sessions.get(session.runner_id) is not session:
+                        raise ConnectionError(f"runner {session.runner_id!r} tunnel was replaced")
+                    frame = OutboundFrame(
+                        data, queued_at=session.diagnostics.timestamp(), app_ping_ts=app_ping_ts
+                    )
+                    session.outbound_queue.put_nowait(frame)
+                    # Recording or logging failures cannot undo an accepted frame.
+                    with contextlib.suppress(Exception):
+                        try:
+                            session.diagnostics.enqueued(
+                                frame, session.outbound_queue.qsize(), requested_at
+                            )
+                        except Exception:  # noqa: BLE001 — recording failures are best-effort.
+                            _logger.debug(
+                                "Runner %s outbound queue diagnostics failed",
+                                session.runner_id,
+                                exc_info=True,
+                            )
+            except Exception as error:  # noqa: BLE001 — forward failures across loops.
                 if not ack.done():
                     ack.set_exception(error)
             else:
@@ -743,7 +827,7 @@ class TunnelRegistry:
             current = self._sessions.get(runner_id)
             if current is None or (session is not None and current is not session):
                 return False
-            current.last_frame_at = time.time()
+            self.mark_frame_seen(current)
             if not isinstance(frame, ResponseHeadFrame | ResponseBodyFrame | ResponseEndFrame):
                 return False
             req_id = frame.id
@@ -894,6 +978,17 @@ def _end_response_body(state: RequestState) -> None:
     :param state: Request state whose body iterator should stop.
     :returns: None.
     """
+    if not state.head_future.done():
+        # A response cannot complete before its head. Wake the head waiter so
+        # a malformed or truncated runner response cannot hold the request.
+        _abort_request_state(
+            state,
+            httpx.RemoteProtocolError(
+                "runner sent response.end before response.head",
+                request=None,  # type: ignore[arg-type]
+            ),
+        )
+        return
     state.end_event.set()
     # Push a sentinel so any pending body_queue.get() unblocks.
     state.body_queue.put_nowait(None)

@@ -2,8 +2,9 @@
 
 Workspace-hosted Omnigent uses native OAuth, Keychain credentials, and session-cookie
 bootstrap before loading its WebView. Each workspace context has an isolated,
-persistent WebKit data store. Databricks Apps keep inline platform sign-in, and
-generic OIDC is unchanged.
+persistent WebKit data store. Databricks Apps keep inline platform sign-in. Other
+servers follow [OIDC sign-in](../README.md#oidc-sign-in), which reuses the same
+sign-in sheet and "Sign in again?" prompt but never reads Databricks credentials.
 
 A workspace connection requires the build configuration and HTTPS callback
 association below. Missing configuration returns to setup with an error; it does
@@ -16,10 +17,10 @@ Set these user-defined build settings on the **Omnigent** target in Xcode, or
 pass them to `xcodebuild`. Both Debug and Release expose them in the processed
 Info.plist.
 
-| Build setting                   | Default                                        | Purpose                                                                                                           |
-| ------------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `DATABRICKS_OAUTH_CLIENT_ID`    | Empty                                          | Your registered public OAuth client ID. Empty or unresolved values are rejected when native sign-in is requested. |
-| `DATABRICKS_OAUTH_REDIRECT_URL` | `https://login.databricks.com/mobile-redirect` | The exact HTTPS callback registered with that client.                                                             |
+| Build setting                   | Default                                        | Purpose                                                                                                                 |
+| ------------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `DATABRICKS_OAUTH_CLIENT_ID`    | `omnigent`                                     | Public OAuth client ID. Override for a different registered client; empty or unresolved values are rejected at sign-in. |
+| `DATABRICKS_OAUTH_REDIRECT_URL` | `https://login.databricks.com/mobile-redirect` | The exact HTTPS callback registered with that client.                                                                   |
 
 These are public configuration, not secrets. Never configure a client secret in
 the app or borrow the Databricks CLI client ID. The redirect must have a path,
@@ -40,9 +41,10 @@ plutil -extract DatabricksOAuthRedirectURL raw \
   /tmp/omnigent-oauth-config-check/Build/Products/Debug-iphonesimulator/Omnigent.app/Info.plist
 ```
 
-A shell environment variable alone is not an Xcode build-setting override. Pass
-settings explicitly to the build command, or set them in the target's build
-configuration. This also applies when using a build wrapper such as Fastlane.
+The default client ID and redirect URL are set in the target's Debug and Release
+build configurations, including Fastlane archives. A shell environment variable
+alone is not an Xcode build-setting override. To use a different client, pass
+settings explicitly to the build command or change the target's build configuration.
 
 ## HTTPS callback association
 
@@ -305,7 +307,8 @@ are authorized to access:
 7. Sign out using the native menu, relaunch, and confirm setup remains visible.
    Explicitly reconnect and verify a fresh native sign-in occurs without old web
    state. Verify the other workspace still works.
-8. Check a Databricks Apps URL and a generic OIDC server for unchanged behavior.
+8. Check a Databricks Apps URL for unchanged behavior, and a generic OIDC server per
+   [OIDC sign-in](../README.md#oidc-sign-in).
 
 Do not put private hosts, IDs, tokens, cookies, callback URLs, or unredacted network
 captures in issues, PRs, screenshots, or maintained examples.

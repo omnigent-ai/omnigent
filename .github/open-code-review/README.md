@@ -9,17 +9,20 @@ comments. It does not approve PRs or request changes.
 
 ## Triggers
 
+- Automatically when a same-repository PR is opened, reopened, or marked ready
+  for review, matching Polly's lifecycle triggers. Draft and fork PRs are
+  skipped. OCR does not automatically run after maintainer approval of a fork PR.
 - Comment `/ocr` on its own line. The commenter needs repository write access
   or an entry in the existing `REVIEW_ALLOWLIST` JSON-array repository variable.
   Accepted commands receive an 👀 reaction before entering the review queue.
   A reaction API failure does not prevent the review from starting.
-  This also enables review of external/fork PRs.
+  Authorized commands can still review fork PRs.
 - Comment `/ocr force` to rerun a completed review of the same commit.
 - Actions → Open Code Review → Run workflow, using the default branch and a PR
   number. The optional `force` checkbox reruns an already-reviewed commit.
   Closed and draft PRs are skipped.
 
-Reviews are opt-in only; PR events and pushes do not start OCR.
+Pushes do not start OCR automatically, matching Polly.
 Use `/ocr` to review a new revision.
 Only eligible requests enter the per-PR queue, so unrelated comments cannot
 cancel or replace an active review.
@@ -28,8 +31,9 @@ Before calling the model, OCR checks for a completed review of the current head
 SHA. A duplicate request posts at most one skip notice per SHA. Completion
 receipts are uploaded only after a complete review of that exact commit, no
 finding-filter failures, and successful publication. Only receipts from
-successful runs of this workflow on the default branch count; generated
-comment text cannot suppress a review. Receipts expire after 90 days (or the
+successful runs of this workflow count: automatic runs use the trusted base
+workflow, and manual runs must use the default branch. Generated comment text
+cannot suppress a review. Receipts expire after 90 days (or the
 repository's shorter retention limit). Deleting or expiring a receipt makes
 the commit eligible for review again.
 Failed, partial, skipped, or filter-failed reviews remain retryable with `/ocr`.
@@ -55,6 +59,14 @@ exceed that threshold. The job has a 30-minute timeout.
 and our Python and frontend tests, while retaining its built-in language rules.
 OCR's other file filters and size limits still apply; inspect the coverage artifact.
 
+The workflow's shared `background` instructions review changed code comments:
+prefer one line, allow at most three lines per block, and explain the scenario
+or reasoning instead of restating code or PR history. Docstrings, API docs,
+license headers, generated comments, and required tool directives are exempt.
+Violations appear as low-severity findings in the summary and do not block
+merging. Keeping this policy in `background` applies it alongside every file's
+built-in or custom rule.
+
 OCR `1.12.0` ignores directory-only `.gitignore` exceptions such as `!.github/`.
 The root `.gitignore` also includes `!.github/**` so tracked automation reaches
 OCR's file selection. Generated-file exclusions follow that exception, and
@@ -63,8 +75,9 @@ editing the ignore rules.
 
 The workflow runs from trusted base/default-branch context. The upstream
 action reads the PR head through Git objects and does not run PR-authored code
-or install the PR's dependencies. External authors cannot trigger a
-secret-bearing review without an authorized `/ocr` request.
+or install the PR's dependencies. Automatic reviews use `pull_request_target`
+for trusted workflow configuration and accept only same-repository PRs. Fork
+PRs require an authorized `/ocr` command or manual workflow dispatch.
 
 Upstream artifact uploads are disabled. The workflow uploads separate copies
 of the result JSON and stderr with gateway credentials, URL, and origin
@@ -75,7 +88,19 @@ the upstream action publishes PR comments before it runs.
 
 ## Verify after merging
 
-1. Run `gh workflow run open-code-review.yml --repo omnigent-ai/omnigent -f pr=7878`
+To check comment quality, use a PR that adds a four-line comment block, a comment
+that merely restates code, a useful one-line comment, a useful three-line
+explanation, and a longer docstring. Run `/ocr force` and inspect the summary:
+only the first two should receive comment-quality findings. This is a model
+review; local workflow tests do not establish its detection accuracy.
+
+1. Open a non-draft, same-repository PR and confirm OCR starts without a
+   command. Open a fork PR and confirm OCR skips it; reopening or marking it
+   ready must also skip it. Open a draft and confirm no review starts until it is
+   marked ready for review. Reopen an already-reviewed PR and confirm OCR skips
+   the completed commit. Push a new commit and confirm OCR does not start.
+   For a manual run, use
+   `gh workflow run open-code-review.yml --repo omnigent-ai/omnigent -f pr=7878`
    for an open, non-draft PR, or comment `/ocr` on one.
    For comment triggers, confirm the bot adds 👀 after authorization.
 2. Use a PR with changed Python or frontend tests. Open the Actions run and

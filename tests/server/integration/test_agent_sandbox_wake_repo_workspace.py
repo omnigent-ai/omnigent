@@ -73,6 +73,7 @@ from tests.server.helpers import (
     HostStartInvocation,
     create_test_agent,
 )
+from tests.server.helpers import websocket_scope as _websocket_scope
 
 pytestmark = pytest.mark.asyncio
 
@@ -160,22 +161,6 @@ class _AgentSandboxFake(FakeSandboxLauncher):
         self.resume_count += 1
         self.live_dirs.clear()
         super().resume(sandbox_id)
-
-
-def _websocket_scope(path: str) -> dict[str, object]:
-    """Build a minimal ASGI WebSocket scope for the host tunnel."""
-    return {
-        "type": "websocket",
-        "asgi": {"version": "3.0"},
-        "scheme": "ws",
-        "path": path,
-        "raw_path": path.encode("ascii"),
-        "query_string": b"",
-        "headers": [],
-        "client": ("127.0.0.1", 50000),
-        "server": ("testserver", 80),
-        "subprotocols": [],
-    }
 
 
 def _make_hello(name: str) -> str:

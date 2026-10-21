@@ -59,6 +59,28 @@ def native_file_changes(payload: Mapping[str, object]) -> list[NativeFileChange]
     tool_input = payload.get("tool_input")
     if not isinstance(tool_name, str) or not isinstance(tool_input, dict):
         return []
+    if tool_name == "apply_patch":
+        changes = tool_input.get("changes")
+        if not isinstance(changes, list):
+            return []
+        observed: list[NativeFileChange] = []
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            path = change.get("path")
+            if not isinstance(path, str) or not path:
+                continue
+            kind = change.get("kind")
+            kind_type = kind.get("type") if isinstance(kind, dict) else kind
+            operation = (
+                "created"
+                if kind_type == "add"
+                else "deleted"
+                if kind_type == "delete"
+                else "modified"
+            )
+            observed.append(NativeFileChange(path=path, operation=operation, baseline=None))
+        return observed
     path_key = _FILE_PATH_KEYS.get(tool_name)
     if path_key is None:
         return []

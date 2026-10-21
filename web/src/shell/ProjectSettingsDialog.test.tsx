@@ -42,14 +42,13 @@ function pickerAgent(overrides: Record<string, unknown> = {}) {
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({ managed_sandboxes_enabled: false, sandbox_provider: null }),
 }));
-// The filesystem browser owns its own data-fetching; stub it to a marker plus
-// a button that reports a navigated path, so we can drive the disclosure and
-// the live workspace update without the host-filesystem plumbing.
+// The filesystem browser owns its own data-fetching; stub its explicit commit
+// action so this suite can drive the shared dialog without filesystem plumbing.
 vi.mock("./WorkspacePicker", () => ({
   isNavigablePath: (p: string) => p.startsWith("/"),
-  WorkspacePicker: ({ onNavigate }: { onNavigate: (p: string) => void }) => (
+  WorkspacePicker: ({ onSelect }: { onSelect: (p: string) => void }) => (
     <div data-testid="mock-workspace-picker">
-      <button type="button" onClick={() => onNavigate("/picked/dir")}>
+      <button type="button" onClick={() => onSelect("/picked/dir")}>
         pick dir
       </button>
     </div>
@@ -257,7 +256,7 @@ describe("ProjectSettingsDialog", () => {
     );
   });
 
-  it("opens the working-directory browser, updates the path, then closes on outside click", async () => {
+  it("opens the working-directory dialog and commits the confirmed path", async () => {
     getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { host_id: "h1" } });
     renderDialog();
     // A stored online host makes the working directory browsable — a compact
@@ -265,14 +264,11 @@ describe("ProjectSettingsDialog", () => {
     await waitFor(() => expect(screen.getByText("Browse…")).toBeInTheDocument());
     expect(screen.queryByTestId("mock-workspace-picker")).not.toBeInTheDocument();
 
-    // Expand → the browser mounts; navigating updates the trigger label live.
+    // Open the shared modal; confirming updates the trigger and closes it.
     fireEvent.click(screen.getByText("Browse…"));
     expect(screen.getByTestId("mock-workspace-picker")).toBeInTheDocument();
     fireEvent.click(screen.getByText("pick dir"));
     expect(screen.getByText("/picked/dir")).toBeInTheDocument();
-
-    // The click-away backdrop closes the browser, keeping the picked path.
-    fireEvent.click(screen.getByRole("button", { name: /close directory browser/i }));
     expect(screen.queryByTestId("mock-workspace-picker")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("project-settings-save"));

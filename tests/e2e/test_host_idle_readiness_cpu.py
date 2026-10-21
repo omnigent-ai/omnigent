@@ -33,20 +33,15 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
-import uuid
 from pathlib import Path
 
 import httpx
 import pytest
-import yaml
 
-from omnigent.process_logging import PROCESS_LOG_FILE_ENV_VAR
-from tests._helpers.compat import apply_runner_env, compat_runner_cwd, runner_executable
-from tests.e2e.test_host_e2e import _wait_for_host_online
+from tests._helpers.host import isolated_host
 
 pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux"),
@@ -121,58 +116,30 @@ def test_host_daemon_idle_cpu_with_expensive_path(
     """
     inflated_path, path_root = _make_expensive_path()
 
-    omni_dir = tmp_path / ".omnigent"
-    omni_dir.mkdir(parents=True)
-    host_id = uuid.uuid4().hex
-    (omni_dir / "config.yaml").write_text(
-        yaml.safe_dump(
-            {"host": {"host_id": host_id, "name": f"e2e-host-idle-cpu-{uuid.uuid4().hex[:12]}"}},
-            default_flow_style=False,
-            sort_keys=True,
-        )
-    )
-    daemon_log = tmp_path / "host-daemon.log"
-    env = apply_runner_env(
-        {
-            **os.environ,
-            "HOME": str(tmp_path),
-            "PATH": inflated_path,
-            PROCESS_LOG_FILE_ENV_VAR: str(daemon_log),
-        }
-    )
-    with open(daemon_log, "w") as log_fh:
-        proc = subprocess.Popen(
-            [runner_executable(), "-m", "omnigent.host._daemon_entry", "--server", live_server],
-            env=env,
-            cwd=compat_runner_cwd(),
-            stdout=subprocess.DEVNULL,
-            stderr=log_fh,
-        )
     try:
-        # Startup itself probes harnesses over the slow PATH, so give the
-        # online wait headroom beyond the default 30s.
-        _wait_for_host_online(http_client, host_id, timeout=90.0)
-        time.sleep(_POST_CONNECT_SETTLE_S)
+        # Startup probes the slow PATH; keep the existing 90-second allowance.
+        with isolated_host(
+            tmp_path,
+            live_server,
+            env={"PATH": inflated_path},
+            ready=lambda host: host.wait_online(http_client, timeout=90),
+        ) as host:
+            proc = host.proc
+            time.sleep(_POST_CONNECT_SETTLE_S)
 
-        cpu_start = _cpu_seconds(proc.pid)
-        wall_start = time.monotonic()
-        time.sleep(_MEASURE_WINDOW_S)
-        cpu_end = _cpu_seconds(proc.pid)
-        wall_end = time.monotonic()
+            cpu_start = _cpu_seconds(proc.pid)
+            wall_start = time.monotonic()
+            time.sleep(_MEASURE_WINDOW_S)
+            cpu_end = _cpu_seconds(proc.pid)
+            wall_end = time.monotonic()
 
-        assert proc.poll() is None, "host daemon died during the idle measurement window"
-        cores = (cpu_end - cpu_start) / (wall_end - wall_start)
-        assert cores < _MAX_IDLE_CORES, (
-            f"connected-but-idle host daemon consumed {cores:.3f} cores over "
-            f"{wall_end - wall_start:.0f}s (limit {_MAX_IDLE_CORES}). The harness "
-            "readiness quick probe is rescanning PATH via shutil.which for every "
-            "unavailable harness on each 5s wakeup."
-        )
+            assert proc.poll() is None, "host daemon died during the idle measurement window"
+            cores = (cpu_end - cpu_start) / (wall_end - wall_start)
+            assert cores < _MAX_IDLE_CORES, (
+                f"connected-but-idle host daemon consumed {cores:.3f} cores over "
+                f"{wall_end - wall_start:.0f}s (limit {_MAX_IDLE_CORES}). The harness "
+                "readiness quick probe is rescanning PATH via shutil.which for every "
+                "unavailable harness on each 5s wakeup."
+            )
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=10)
         shutil.rmtree(path_root, ignore_errors=True)

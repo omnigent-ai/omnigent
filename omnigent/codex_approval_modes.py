@@ -7,15 +7,11 @@ running-session switcher drives the popup by keystroke: type ``/permissions``,
 then the option's menu digit (position-independent, unlike arrow navigation),
 then confirm the sub-dialog for the ones that ask.
 
-These presets mirror the popup: their ``label`` is what the popup shows and
-their order/``menu_key`` is the popup's own.
+These presets use the popup's labels. Menu digits are discovered from the
+rendered popup because row positions vary by platform and configuration.
 
-Version caveat: the popup's contents are codex-version-dependent. 0.146.0 offers
-the first three (Ask for approval / Approve for me / Full Access); newer builds
-add Read Only as a 4th option. This list is the superset in popup order — the
-``menu_key`` digits are position-stable across the versions seen. On a build
-that lacks Read Only, selecting it keys a non-existent menu row (a no-op); the
-full-bypass launch flag has no ``/permissions`` row and is not represented here.
+Read Only is absent from the default macOS/Linux popup, but appears on Windows
+and with permission profiles. The full-bypass launch flag has no popup row.
 
 Kept dependency-free so the server routes, the runner, and the web contract can
 all agree on the same list.
@@ -23,6 +19,7 @@ all agree on the same list.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -34,7 +31,6 @@ class CodexPermissionPreset:
     :param value: Stable slug stored on the label / sent over the wire.
     :param label: Exact popup label, shown in the web picker too.
     :param description: The popup's own one-line explanation.
-    :param menu_key: The digit that selects this row directly in the popup.
     :param needs_confirm: Whether the row opens a "Yes, continue anyway"
         sub-dialog that must be accepted (Full Access does).
     """
@@ -42,40 +38,36 @@ class CodexPermissionPreset:
     value: str
     label: str
     description: str
-    menu_key: str
     needs_confirm: bool
 
 
-# Order and labels match Codex's ``/permissions`` popup (codex-cli 0.146.0).
+# Labels match Codex's ``/permissions`` popup. Row positions are discovered at
+# runtime because they vary by platform and configuration.
 CODEX_NATIVE_PERMISSION_PRESETS: tuple[CodexPermissionPreset, ...] = (
     CodexPermissionPreset(
         value="ask-for-approval",
         label="Ask for approval",
         description="Read/edit/run in the workspace; approval for the internet or external edits",
-        menu_key="1",
         needs_confirm=False,
     ),
     CodexPermissionPreset(
         value="approve-for-me",
         label="Approve for me",
         description="Only asks for actions detected as potentially unsafe",
-        menu_key="2",
         needs_confirm=False,
     ),
     CodexPermissionPreset(
         value="full-access",
         label="Full Access",
         description="Edit any file and access the internet without approval",
-        menu_key="3",
         needs_confirm=True,
     ),
-    # Newer Codex builds add Read Only as a 4th /permissions preset (older ones,
-    # e.g. 0.146, omit it — see the version caveat in the module docstring).
+    # Read Only is absent from the default macOS/Linux popup; it appears on
+    # Windows and in the permission-profiles popup variant.
     CodexPermissionPreset(
         value="read-only",
         label="Read Only",
         description="Read files only; approval required to edit files or access the internet",
-        menu_key="4",
         needs_confirm=False,
     ),
 )
@@ -88,6 +80,40 @@ CODEX_NATIVE_PERMISSION_VALUES: frozenset[str] = frozenset(
 def codex_permission_preset(value: str) -> CodexPermissionPreset | None:
     """:returns: The preset for *value*, or ``None`` when it is not a preset."""
     return next((p for p in CODEX_NATIVE_PERMISSION_PRESETS if p.value == value), None)
+
+
+_MENU_ROW_RE = re.compile(r"^\s*(?:›\s*)?(\d+)\.\s+(.*)$")
+_CURRENT_SUFFIX_RE = re.compile(r"\s*\(current\)\s*$", re.IGNORECASE)
+_CONFIRMATION_MARKERS = (
+    "Permissions updated to ",
+    "Permission selection requested: ",
+)
+
+
+def codex_permissions_menu(pane_text: str) -> dict[str, str]:
+    """Return ``{label: digit}`` for a captured ``/permissions`` popup."""
+    rows: dict[str, str] = {}
+    for line in pane_text.splitlines():
+        match = _MENU_ROW_RE.match(line)
+        if match is None:
+            continue
+        digit, remainder = match.groups()
+        label = re.split(r"\s{2,}", remainder, maxsplit=1)[0].strip()
+        label = _CURRENT_SUFFIX_RE.sub("", label).strip()
+        if label:
+            rows[label] = digit
+    return rows
+
+
+def codex_permission_switch_confirmed(pane_text: str, label: str) -> bool:
+    """Return whether Codex acknowledged the latest permission selection."""
+    confirmations = [
+        line.split(marker, 1)[1].strip()
+        for line in pane_text.splitlines()
+        for marker in _CONFIRMATION_MARKERS
+        if marker in line
+    ]
+    return bool(confirmations) and confirmations[-1] == label
 
 
 # Sandbox ``type`` spellings Codex uses (the app-server ``thread/settings/updated``

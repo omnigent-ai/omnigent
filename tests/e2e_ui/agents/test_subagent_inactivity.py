@@ -44,7 +44,7 @@ _INTERMEDIATE_TEXT = (
 )
 
 # Markers for the runner's sub-agent wake notice (see
-# ``omnigent.runner.app._format_subagent_wake_notice``).
+# ``omnigent.runner.subagent_work._format_subagent_wake_notice``).
 _FALSE_NOTICE_MARKER = "finished (completed)"
 _NOTICE_PREFIX = "[System: sub-agent"
 

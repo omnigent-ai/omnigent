@@ -17,7 +17,9 @@ def _configure(pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch) -> Pa
     monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
     monkeypatch.setenv("GITHUB_RUN_ID", "123")
     monkeypatch.setenv("GITHUB_RUN_ATTEMPT", "2")
-    pytester.makeconftest("from tests.e2e_ui.timings import pytest_addoption, pytest_configure")
+    pytester.makeconftest(
+        "from tests.helpers.ui_timings import pytest_addoption, pytest_configure"
+    )
     pytester.makeini("[pytest]\nmarkers = nightly: scheduled test\n")
     return pytester.path / "artifacts" / "timings.jsonl"
 
@@ -137,7 +139,7 @@ def test_plan_records_final_shard_selection(
     path = _configure(pytester, monkeypatch)
     pytester.makeconftest("""
 import pytest
-from tests.e2e_ui.timings import pytest_addoption as timing_options, pytest_configure
+from tests.helpers.ui_timings import pytest_addoption as timing_options, pytest_configure
 
 def pytest_addoption(parser):
     timing_options(parser)

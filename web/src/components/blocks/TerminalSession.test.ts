@@ -2,9 +2,9 @@
 //
 // The full TerminalSession constructor needs a real xterm + WebSocket
 // + DOM container, so it's exercised via manual REPL verification (see
-// TerminalView.test.ts). `openTerminalLink` is the one piece of our own
-// logic the WebLinksAddon delegates to — the click handler that makes
-// terminal URLs clickable — so we pin it here.
+// TerminalView.test.ts). `openTerminalLink` is the click handler the
+// terminal link provider delegates to — the piece that makes terminal URLs
+// open the right way — so we pin it here.
 
 import { Terminal } from "@xterm/xterm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -94,17 +94,16 @@ describe("openTerminalLink", () => {
     }
   });
 
-  it("prevents the addon's default in-place navigation", () => {
+  it("prevents the click's default in-place navigation", () => {
     vi.spyOn(window, "open").mockReturnValue(null);
     const event = new MouseEvent("click");
     const preventSpy = vi.spyOn(event, "preventDefault");
 
     openTerminalLink(event, "https://example.com/foo");
 
-    // The WebLinksAddon navigates the current document on click by
-    // default; without preventDefault the click would unload the SPA
-    // (and kill the WebSocket-attached terminal) before window.open's
-    // tab is usable. A failure here means that suppression was dropped.
+    // Without preventDefault the click's default navigation would unload the
+    // SPA (and kill the WebSocket-attached terminal) before window.open's
+    // tab is usable.
     expect(preventSpy).toHaveBeenCalledOnce();
   });
 

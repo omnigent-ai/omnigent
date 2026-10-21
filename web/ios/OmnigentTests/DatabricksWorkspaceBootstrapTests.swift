@@ -143,8 +143,12 @@ final class DatabricksWorkspaceBootstrapTests: XCTestCase {
       "https://test-\(UUID().uuidString.lowercased()).cloud.databricks.com/omnigent?o=123")
     let credentials = MemoryDatabricksCredentialStore()
     try credentials.save(credentialTokens(), for: context.scope)
+    let sessions = FakeWorkspaceSessions()
+    sessions.hold = true
+    let authenticating = expectation(description: "workspace session request")
+    sessions.onRequest = { authenticating.fulfill() }
     let bootstrap = makeBootstrap(
-      credentials, login: FakeWorkspaceLogin(), sessions: FakeWorkspaceSessions())
+      credentials, login: FakeWorkspaceLogin(), sessions: sessions)
     let model = WebViewModel()
     let suite = "omnigent-test-\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suite)!
@@ -166,6 +170,14 @@ final class DatabricksWorkspaceBootstrapTests: XCTestCase {
     webView.onLoad = { loaded.fulfill() }
     coordinator.load(context.pageURL, in: webView)
     XCTAssertTrue(webView.requests.isEmpty)
+    await fulfillment(of: [authenticating], timeout: 10)
+    let shell = WebShellView(
+      initialURL: context.pageURL, connectToNewServer: {}, switchToServer: { _ in },
+      loadFailed: { _, _ in }, loadSucceeded: {})
+    XCTAssertTrue(model.isAuthenticating)
+    XCTAssertFalse(model.serverSwitcherHidden)
+    XCTAssertTrue(shell.showsServerSwitcher(for: model))
+    sessions.release()
     await fulfillment(of: [loaded], timeout: 10)
     XCTAssertEqual(webView.requests.first?.url, context.pageURL)
     XCTAssertNil(webView.requests.first?.value(forHTTPHeaderField: "Authorization"))

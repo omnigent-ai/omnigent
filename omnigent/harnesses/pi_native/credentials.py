@@ -10,7 +10,7 @@ This module closes that gap. It resolves the provider configured for the Pi
 surface (``~/.omnigent/config.yaml``) and writes a per-session ``models.json``
 into a *managed* Pi config dir (selected via ``PI_CODING_AGENT_DIR``), so the
 runner-owned ``pi`` process authenticates exactly like the configured harness —
-mirroring how codex-native routes through the Databricks AI Gateway.
+mirroring how codex-native routes through the Databricks Unity Gateway.
 
 The managed config dir is per-session (like codex-native's managed
 ``CODEX_HOME``), so this never mutates the user's global ``~/.pi/agent``.
@@ -18,37 +18,46 @@ The managed config dir is per-session (like codex-native's managed
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import os
 import re
-import shlex
 import subprocess
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypeAlias, TypedDict, TypeGuard
 from urllib.parse import urlparse
 
+from omnigent._platform import default_shell_argv
 from omnigent.databricks_ai_gateway import (
     DATABRICKS_AI_GATEWAY_LABEL,
     DATABRICKS_TRUSTED_HOST_SUFFIXES,
+    PI_AGENT,
     is_databricks_ai_gateway_url,
+    with_gateway_attribution,
 )
+from omnigent.harnesses.pi_native.auth_command import (
+    AUTH_DIR_ENV,
+    AUTH_DIR_NAME,
+    wrap_auth_command,
+)
+from omnigent.harnesses.pi_native.model_scope import ScopableModel, scope_models
+from omnigent.inner._proc import kill_tree, spawn_kwargs
 from omnigent.models import model_catalog
 from omnigent.models.databricks_model_discovery import preferred_served_claude_model
 from omnigent.models.model_metadata import ModelWireAPI
 from omnigent.models.model_override import normalize_model_for_provider
 from omnigent.models.pi_model_compatibility import (
-    PI_CLAUDE_THINKING_MODEL_FRAGMENTS,
     SYSTEM_AI_RESPONSES_KEYWORDS,
     DatabricksPiSurface,
     PiModelEntry,
     databricks_pi_surface_for_model,
     enrich_databricks_model_catalog,
-    pi_model_is_reasoning,
+    pi_generic_model_json_entry,
     pi_model_json_entry,
     unsupported_in_pi,
 )
@@ -61,6 +70,7 @@ from omnigent.onboarding.provider_config import (
     KEY_KIND,
     LOCAL_KIND,
     PI_SURFACE,
+    FamilyConfig,
     ProviderEntry,
     default_provider_for_harness,
     load_config,
@@ -69,7 +79,6 @@ from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 from omnigent.util.reasoning_effort import (
     EFFORT_CLEAR_VALUES,
     PI_EFFORTS,
-    PI_THINKING_OFF,
     to_pi_thinking_level,
     validate_effort,
 )
@@ -112,19 +121,19 @@ _SURFACE_PROVIDER_IDS: dict[DatabricksPiSurface, str] = {
 }
 
 _PI_MANAGED_PROVIDER_IDS = frozenset({_PI_PROVIDER_ID, *_SURFACE_PROVIDER_IDS.values()})
-# Databricks AI Gateway Anthropic Messages surface. Pi speaks this protocol
+# Databricks Unity Gateway Anthropic Messages surface. Pi speaks this protocol
 # natively (``api: anthropic-messages``); the gateway authenticates with a
 # workspace bearer token, so we set ``authHeader`` (Authorization: Bearer).
 _DATABRICKS_ANTHROPIC_GATEWAY_PATH = "/ai-gateway/anthropic"
 
-# The Databricks AI Gateway exposes one surface per protocol under the same
+# The Databricks Unity Gateway exposes one surface per protocol under the same
 # workspace origin: Codex/OpenAI-Responses at ``/codex/v1`` and Anthropic
 # Messages at ``/anthropic``. ``isaac configure codex`` writes the Codex
 # base_url; pi-native rewrites it to the Anthropic surface Pi speaks natively.
 _DATABRICKS_GATEWAY_CODEX_SUFFIX = "/codex/v1"
 _DATABRICKS_GATEWAY_ANTHROPIC_SUFFIX = "/anthropic"
 
-# Aliases for the canonical Databricks AI Gateway predicate and its constants,
+# Aliases for the canonical Databricks Unity Gateway predicate and its constants,
 # which live in :mod:`omnigent.databricks_ai_gateway` so every surface that must
 # recognize the gateway agrees.
 _DATABRICKS_TRUSTED_HOST_SUFFIXES = DATABRICKS_TRUSTED_HOST_SUFFIXES
@@ -166,6 +175,7 @@ class _PiProviderPayload(TypedDict):
     models: list[_PiModelEntry]
     authHeader: NotRequired[bool]
     compat: NotRequired[_PiProviderCompat]
+    headers: NotRequired[dict[str, str]]
 
 
 class _PiModelsConfig(TypedDict):
@@ -189,7 +199,7 @@ def _databricks_workspace_url_for_gateway(
     *,
     profile: str | None = None,
 ) -> str | None:
-    """Resolve the workspace API origin behind a Databricks AI Gateway URL.
+    """Resolve the workspace API origin behind a Databricks Unity Gateway URL.
 
     Workspace-hosted gateways already expose the workspace hostname. Dedicated
     ``ai-gateway`` subdomains require the configured Databricks profile because
@@ -232,6 +242,10 @@ class PiProviderConfig:
         Databricks OAuth token). Pi still launches — its ``!command`` apiKey may
         recover at request time — but the caller surfaces this so a session that
         would otherwise fail silently tells the user how to re-authenticate.
+    :param model_notice: An informational notice about how the requested model
+        was routed (e.g. a pick qualified by another configured provider that is
+        requested from the serving provider instead). The session still works,
+        so the caller surfaces it as a neutral notice, not an error.
     :param databricks_surfaces: Base URLs of the Databricks gateway surfaces
         reachable with this provider's credential, keyed by surface. Set by the
         Databricks builders; lets a model the live catalog didn't list be routed
@@ -250,6 +264,7 @@ class PiProviderConfig:
     api_key: str
     auth_header: bool
     credential_warning: str | None = None
+    model_notice: str | None = None
     # Full model list for providers that expose multiple models (e.g. the
     # Databricks Anthropic gateway). Excluded from __hash__ so the frozen
     # dataclass stays hashable even though list[dict] is not hashable.
@@ -379,18 +394,35 @@ class PiProviderConfig:
             provider["compat"] = {"forceAdaptiveThinking": True}
         providers = {self.provider_id: provider}
         providers.update(additional)
+        for provider_id, payload in providers.items():
+            if is_databricks_ai_gateway_url(payload["baseUrl"]):
+                # Copy rather than mutate: additional payloads are shared across renders.
+                headers = with_gateway_attribution(
+                    payload.get("headers"), PI_AGENT, payload["baseUrl"]
+                )
+                providers[provider_id] = {**payload, "headers": headers}
         return {"providers": providers}
 
     def _register_on_surface(
-        self, additional: dict[str, _PiProviderPayload], surface: DatabricksPiSurface
+        self,
+        additional: dict[str, _PiProviderPayload],
+        surface: DatabricksPiSurface,
+        entry: _PiModelEntry | None = None,
     ) -> None:
-        """Add the selected model to *additional* under *surface*'s provider."""
+        """Add the selected model to *additional* under *surface*'s provider.
+
+        :param additional: The additional-provider payloads to update in place.
+        :param surface: The surface whose provider receives the model.
+        :param entry: A prebuilt entry for the model (e.g. carrying configured
+            limits); a bare entry is built when omitted.
+        """
         provider_id = _SURFACE_PROVIDER_IDS[surface]
-        entry: _PiModelEntry = {"id": self.model, "input": ["text", "image"]}
-        # DeepSeek streams on reasoning_content; Pi only reads that channel when
-        # the model entry declares reasoning.
-        if "deepseek" in self.model.lower():
-            entry["reasoning"] = True
+        if entry is None:
+            entry = {"id": self.model, "input": ["text", "image"]}
+            # DeepSeek streams on reasoning_content; Pi only reads that channel
+            # when the model entry declares reasoning.
+            if "deepseek" in self.model.lower():
+                entry["reasoning"] = True
         existing = additional.get(provider_id)
         if existing is not None:
             # Copy rather than mutate: the payload is shared with
@@ -431,27 +463,39 @@ def _read_json_object(path: Path) -> dict[str, object]:
     return raw if _is_str_object_dict(raw) else {}
 
 
-def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str, object]]:
-    """Enumerate the models Pi's own login can use (the unmanaged fallback).
+def _pi_enabled_model_patterns(root: Path) -> list[str]:
+    """Read Pi's own model curation (``settings.json`` ``enabledModels``).
 
-    When no omnigent-managed provider is configured, the launched Pi runs on
-    its own credentials, so the pre-launch picker must offer the models that
-    login can actually drive: Pi's ``models-store.json`` catalog filtered to
-    providers with an ``auth.json`` entry.
-
-    :param agent_dir: Pi agent dir override (tests); defaults to the host's
-        own Pi agent dir.
-    :returns: Picker options shaped like :func:`pi_native_model_options`,
-        qualified as ``provider/model`` — the reference form Pi's ``--model``
-        resolves natively against its own providers.
+    :param root: Pi agent dir whose settings to read.
+    :returns: The non-empty string patterns, ``[]`` when unset or malformed.
     """
-    root = agent_dir if agent_dir is not None else _global_pi_agent_dir()
-    logged_in = set(_read_json_object(root / "auth.json"))
-    if not logged_in:
+    raw = _read_json_object(root / "settings.json").get("enabledModels")
+    if not isinstance(raw, list):
         return []
-    options: dict[str, dict[str, object]] = {}
-    for provider_id, payload in _read_json_object(root / "models-store.json").items():
-        if provider_id not in logged_in or not _is_str_object_dict(payload):
+    return [pattern for pattern in raw if isinstance(pattern, str) and pattern.strip()]
+
+
+def _pi_own_login_models(root: Path) -> list[ScopableModel]:
+    """Read Pi's available model inventory before applying picker curation."""
+    logged_in = set(_read_json_object(root / "auth.json"))
+    catalogs: list[tuple[str, object]] = [
+        (provider_id, payload)
+        for provider_id, payload in _read_json_object(root / "models-store.json").items()
+        if provider_id in logged_in
+    ]
+    declared = _read_json_object(root / "models.json").get("providers")
+    for provider_id, payload in declared.items() if _is_str_object_dict(declared) else ():
+        api_key = payload.get("apiKey") if _is_str_object_dict(payload) else None
+        if provider_id in logged_in or (isinstance(api_key, str) and api_key):
+            # Declared models follow the cache so their names win on duplicate references.
+            catalogs.append((provider_id, payload))
+    catalog: dict[str, ScopableModel] = {}
+    for provider_id, payload in catalogs:
+        if not _is_str_object_dict(payload):
+            continue
+        if provider_id in _PI_MANAGED_PROVIDER_IDS:
+            # pi_own_login_model_arg() strips these ids as a stale managed pick,
+            # so the launch could not address such a row.
             continue
         models = payload.get("models")
         for model in models if isinstance(models, list) else []:
@@ -460,14 +504,42 @@ def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str, 
             model_id = model.get("id")
             if not isinstance(model_id, str) or not model_id:
                 continue
-            qualified = f"{provider_id}/{model_id}"
             name = model.get("name")
-            options[qualified] = {
-                "id": qualified,
-                "model": qualified,
-                "displayName": name if isinstance(name, str) and name else model_id,
-            }
-    return [options[model_id] for model_id in sorted(options)]
+            entry = ScopableModel(
+                provider=provider_id,
+                model_id=model_id,
+                name=name if isinstance(name, str) and name else None,
+            )
+            catalog[entry.reference] = entry
+    return list(catalog.values())
+
+
+def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str, object]]:
+    """List logged-in and keyed custom models with Pi's enabledModels curation.
+
+    Use the full inventory when curation is empty or unavailable.
+
+    :param agent_dir: Pi agent dir override (tests); defaults to the host's
+        own Pi agent dir.
+    :returns: Picker options shaped like :func:`pi_native_model_options`,
+        qualified as ``provider/model`` — the reference form Pi's ``--model``
+        resolves natively against its own providers.
+    """
+    root = agent_dir if agent_dir is not None else _global_pi_agent_dir()
+    entries = _pi_own_login_models(root)
+    patterns = _pi_enabled_model_patterns(root)
+    if patterns:
+        scoped = scope_models(patterns, entries)
+        if scoped:
+            entries = scoped
+    return [
+        {
+            "id": entry.reference,
+            "model": entry.reference,
+            "displayName": entry.name or entry.model_id,
+        }
+        for entry in sorted(entries, key=lambda entry: entry.reference)
+    ]
 
 
 def pi_own_login_model_arg(selection: str) -> str | None:
@@ -492,6 +564,30 @@ def pi_own_login_model_arg(selection: str) -> str | None:
     return None if "/" in split[1] else split[1]
 
 
+def _default_model_provider_id(provider: PiProviderConfig, rendered: _PiModelsConfig) -> str:
+    """Return the rendered provider Pi opens ``provider.model`` on without a selection.
+
+    Non-Claude models (GLM, GPT, Llama…) register on a secondary provider and
+    everything else on the primary. The launch and the pre-launch picker both
+    resolve the default here, so the picker's ``isDefault`` row is the model
+    Pi actually opens.
+    """
+    for provider_id, payload in rendered["providers"].items():
+        if provider_id == provider.provider_id:
+            continue
+        if any(model.get("id") == provider.model for model in payload["models"]):
+            return provider_id
+    return provider.provider_id
+
+
+def pi_own_login_serves_reference(reference: str | None, agent_dir: Path | None = None) -> bool:
+    """Check a saved Pi reference independently of the picker shortlist."""
+    if not reference:
+        return False
+    root = agent_dir if agent_dir is not None else _global_pi_agent_dir()
+    return any(model.reference == reference for model in _pi_own_login_models(root))
+
+
 def pi_native_model_options(
     *,
     config_loader: Callable[[], dict[str, object]] | None = None,
@@ -511,7 +607,8 @@ def pi_native_model_options(
         :func:`resolve_pi_native_provider`.
     :param transport: Optional httpx transport override for tests, forwarded to
         the live listing fetch.
-    :returns: One pre-launch option per model, sorted by qualified id.
+    :returns: One pre-launch option per model, sorted by qualified id. The row
+        Pi opens when no model is selected carries ``isDefault``.
     """
     # Forward only the config_loader seam: tests replace the module-level
     # resolver with a zero-argument callable, so a bare picker call must stay
@@ -527,8 +624,10 @@ def pi_native_model_options(
         provider, extra_models=_live_family_model_entries(provider, transport=transport)
     )
 
+    rendered = provider.to_models_config()
+    default_option = f"{_default_model_provider_id(provider, rendered)}/{provider.model}"
     options: dict[str, dict[str, object]] = {}
-    for provider_id, payload in provider.to_models_config()["providers"].items():
+    for provider_id, payload in rendered["providers"].items():
         for model in payload["models"]:
             model_id = model["id"]
             qualified = f"{provider_id}/{model_id}"
@@ -536,6 +635,7 @@ def pi_native_model_options(
                 "id": qualified,
                 "model": qualified,
                 "displayName": model.get("name") or model_id,
+                "isDefault": qualified == default_option,
             }
     return [options[model_id] for model_id in sorted(options)]
 
@@ -742,7 +842,7 @@ def _databricks_openai_provider(
 
     ``api_type`` selects the wire protocol:
 
-    * ``"openai-responses"`` — AI Gateway codex surface
+    * ``"openai-responses"`` — Unity Gateway codex surface
       (``/ai-gateway/codex/v1``). Required for newer GPT models (gpt-5.5,
       gpt-5.6-*) that reject function tool calls via ``/chat/completions``.
     * ``"openai-completions"`` — workspace serving-endpoints surface. Works
@@ -760,13 +860,15 @@ def _databricks_openai_provider(
             "supportsDeveloperRole": False,
             "supportsStore": False,
             "supportsStrictMode": False,
-            "supportsReasoningEffort": False,
             # stream_options is OpenAI-specific; Gemini and other non-OpenAI
             # models reject it with 400.
             "supportsUsageInStreaming": False,
         },
         "models": models,
     }
+
+
+_AUTH_COMMAND_REAP_TIMEOUT_S = 2.0
 
 
 def _run_auth_command(auth_command: str, *, timeout: float = 15.0) -> str | None:
@@ -776,24 +878,39 @@ def _run_auth_command(auth_command: str, *, timeout: float = 15.0) -> str | None
     one-shot model-catalog API call. Returns ``None`` on any failure so
     callers can fall back gracefully.
 
+    Runs through the host's default shell, as Pi runs a ``!command`` apiKey,
+    so pipelines, quoting and ``~`` behave here exactly as they do at request
+    time. The shell gets its own process group, so a stalled helper is torn
+    down with it on timeout instead of outliving this call.
+
     :param auth_command: Shell command string, e.g.
-        ``"jq -r .access_token /path/token.json"``.
+        ``"jq -r .access_token ~/token.json"``.
     :param timeout: Maximum seconds to wait for the command.
     :returns: Stripped stdout (the token), or ``None`` when the command
         fails, times out, or produces empty output.
     """
     try:
-        result = subprocess.run(
-            shlex.split(auth_command),
-            capture_output=True,
+        process = subprocess.Popen(
+            default_shell_argv(auth_command),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             text=True,
-            timeout=timeout,
+            **spawn_kwargs(),
         )
-        if result.returncode != 0:
-            return None
-        return result.stdout.strip() or None
-    except Exception:  # noqa: BLE001 — any subprocess failure should just return None
+    except Exception:  # noqa: BLE001 — a command that cannot start is a failed mint
         return None
+    try:
+        stdout, _ = process.communicate(timeout=timeout)
+    except Exception:  # noqa: BLE001 — a stalled or undecodable helper is a failed mint
+        kill_tree(process)
+        # Reap the shell, but never wait on a detached descendant that kept
+        # the pipe open; the mint has already failed.
+        with suppress(Exception):
+            process.communicate(timeout=_AUTH_COMMAND_REAP_TIMEOUT_S)
+        return None
+    if process.returncode != 0:
+        return None
+    return stdout.strip() or None
 
 
 # Entries at or below this need no probe: Pi's own default ceiling is lower, so
@@ -843,7 +960,7 @@ def _fetch_pi_model_lists(
     returns ``system.ai.*`` model ids with their supported API types:
 
     * ``openai/v1/responses`` in supported_api_types → ``openai-responses``
-      provider at the AI Gateway codex surface.
+      provider at the Unity Gateway codex surface.
     * Chat-capable models without Responses API support → ``openai-completions``
       provider at the serving-endpoints surface.
     * Claude models → ``anthropic-messages`` provider.
@@ -924,41 +1041,20 @@ def _fetch_pi_model_lists(
     return claude, gpt_responses, completions, gemini
 
 
-def _gateway_anthropic_base_url(codex_base_url: str) -> str:
-    """Rewrite a Codex gateway base URL to the Anthropic Messages surface.
-
-    The Databricks AI Gateway serves each protocol under the same workspace
-    origin: ``.../codex/v1`` (OpenAI Responses) and ``.../anthropic``
-    (Anthropic Messages). ``isaac configure codex`` records the Codex URL;
-    Pi speaks Anthropic Messages natively, so we point it at ``/anthropic``.
-
-    :param codex_base_url: The provider table's ``base_url``, e.g.
-        ``"https://<workspace>.ai-gateway.cloud.databricks.com/codex/v1"``.
-    :returns: The Anthropic-surface base URL, e.g.
-        ``"https://<workspace>.ai-gateway.cloud.databricks.com/anthropic"``.
-    """
-    trimmed = codex_base_url.rstrip("/")
-    if trimmed.endswith(_DATABRICKS_GATEWAY_CODEX_SUFFIX):
-        trimmed = trimmed[: -len(_DATABRICKS_GATEWAY_CODEX_SUFFIX)]
-    if trimmed.endswith(_DATABRICKS_GATEWAY_ANTHROPIC_SUFFIX):
-        return trimmed
-    return f"{trimmed}{_DATABRICKS_GATEWAY_ANTHROPIC_SUFFIX}"
-
-
 def _cli_config_databricks_transport(entry: ProviderEntry) -> CodexConfigTransport | None:
     """Return the codex transport for a pi-consumable Databricks cli-config entry.
 
     Shared core of :func:`_cli_config_pi_provider` and
     :func:`cli_config_pi_provider_capable`: validates that *entry* is a codex
     ``cli-config`` whose pinned ``[model_providers.X]`` table in
-    ``~/.codex/config.toml`` is a genuine Databricks AI Gateway carrying a
+    ``~/.codex/config.toml`` is a genuine Databricks Unity Gateway carrying a
     bearer-token command. Returns the resolved
     :class:`~omnigent.onboarding.ambient.CodexConfigTransport` when so, else
     ``None`` (logging the reason at INFO).
 
     :param entry: The provider entry (expected ``kind="cli-config"``).
     :returns: The codex transport when *entry* is a pi-consumable Databricks
-        AI Gateway, else ``None``.
+        Unity Gateway, else ``None``.
     """
     # Only codex cli-config providers are model_provider-shaped today; a
     # claude analog would be a different mechanism entirely.
@@ -998,7 +1094,7 @@ def _cli_config_databricks_transport(entry: ProviderEntry) -> CodexConfigTranspo
             entry.model_provider,
         )
         return None
-    # Identify the Databricks AI Gateway robustly (not by workspace id): parse
+    # Identify the Databricks Unity Gateway robustly (not by workspace id): parse
     # the codex base_url and validate its *hostname* against a trusted
     # Databricks domain suffix allowlist plus the ``ai-gateway`` DNS label — a
     # substring scan over the whole base_url would forward the workspace bearer
@@ -1006,7 +1102,7 @@ def _cli_config_databricks_transport(entry: ProviderEntry) -> CodexConfigTranspo
     if not _is_databricks_ai_gateway_url(transport.base_url):
         _LOGGER.info(
             "pi-native: cli-config provider %r (model_provider %r, base_url %r) is not a "
-            "recognized Databricks AI Gateway; Pi will use its own login.",
+            "recognized Databricks Unity Gateway; Pi will use its own login.",
             entry.name,
             entry.model_provider,
             transport.base_url,
@@ -1046,7 +1142,7 @@ def cli_config_pi_provider_capable(entry: ProviderEntry) -> bool:
 
     A codex ``cli-config`` provider IS reusable by Pi exactly when
     :func:`_cli_config_pi_provider` would resolve — i.e. its pinned
-    ``[model_providers.X]`` table is a genuine Databricks AI Gateway with a
+    ``[model_providers.X]`` table is a genuine Databricks Unity Gateway with a
     bearer-token command. This is the capability predicate the selection layer
     (:mod:`omnigent.onboarding.provider_config`) consults to decide whether a
     cli-config provider may serve / default the ``pi`` surface, keeping the
@@ -1058,6 +1154,186 @@ def cli_config_pi_provider_capable(entry: ProviderEntry) -> bool:
     :returns: ``True`` iff Pi can route through this cli-config provider.
     """
     return _cli_config_databricks_transport(entry) is not None
+
+
+def _databricks_gateway_pi_provider(
+    *,
+    gateway_base_url: str,
+    model: str | None,
+    auth_command: str | None = None,
+    static_api_key: str | None = None,
+    declared_surface: DatabricksPiSurface | None = None,
+    configured_context_window: int | None = None,
+    configured_max_output_tokens: int | None = None,
+) -> PiProviderConfig:
+    """Build a multi-surface Pi config from a Databricks Unity Gateway base URL.
+
+    Shared by the cli-config path (a codex ``config.toml`` gateway table) and
+    the inline key/gateway path (an ``~/.omnigent`` provider whose family
+    ``base_url`` is a Databricks Unity Gateway). Both front one workspace origin
+    serving Claude on the Anthropic surface plus GPT / Gemini / OSS on the
+    Responses / MLflow / serving-endpoints surfaces. Enumerating the workspace's
+    Unity Catalog model services lets Pi surface every family the gateway
+    serves, not just the family the entry declares.
+
+    :param gateway_base_url: A gateway URL for the workspace (any surface), e.g.
+        ``".../ai-gateway/codex/v1"`` or ``".../ai-gateway/anthropic"``.
+    :param model: Session model override, or ``None`` for the default.
+    :param auth_command: Bearer-token command; becomes Pi's ``!command`` apiKey
+        (refreshed per request) and mints the token used to list models.
+    :param static_api_key: A resolved literal/env key, used when no
+        ``auth_command`` is configured.
+    :param declared_surface: The surface *gateway_base_url* names when *model*
+        is a configured default. A default the listing omits is registered
+        there rather than classified by name, so it keeps its own endpoint.
+    :param configured_context_window: The provider entry's explicit context
+        limit for its configured default; applied to that default's entry,
+        listed or not, ahead of any catalog value.
+    :param configured_max_output_tokens: The provider entry's explicit output
+        limit for its configured default, applied like the context limit.
+    :returns: The Pi provider config — Anthropic base plus additional
+        OpenAI/Gemini/completions providers for what the workspace serves.
+    """
+    # Prefer a "!command" apiKey (Pi refreshes the gateway token per request);
+    # a static key is sent verbatim. Both go in the Authorization: Bearer header.
+    api_key = f"!{auth_command}" if auth_command else (static_api_key or "")
+    claude_models: list[_PiModelEntry] = []
+    gpt_models: list[_PiModelEntry] = []
+    completions_models: list[_PiModelEntry] = []
+    gemini_models: list[_PiModelEntry] = []
+    parsed_gateway = urlparse(gateway_base_url)
+    gateway_labels = (parsed_gateway.hostname or "").split(".")
+    workspace_url = _databricks_workspace_url_for_gateway(gateway_base_url)
+    if workspace_url is None:
+        _LOGGER.info(
+            "pi-native: could not resolve workspace URL for gateway model listing; "
+            "Pi will show only the selected model"
+        )
+    else:
+        # The auth_command token (or static key) is the credential the gateway
+        # uses; the SDK's minted token may lack serving-endpoints access.
+        list_token = _run_auth_command(auth_command) if auth_command else static_api_key
+        if list_token:
+            try:
+                claude_models, gpt_models, completions_models, gemini_models = (
+                    _fetch_pi_model_lists(workspace_url, list_token)
+                )
+            except Exception:  # noqa: BLE001 — network failure must not break launch
+                _LOGGER.info(
+                    "pi-native: could not fetch workspace model list; showing default model only",
+                    exc_info=True,
+                )
+        else:
+            _LOGGER.info(
+                "pi-native: no gateway token available; Pi will show only the selected model"
+            )
+    # Every surface hangs off one gateway origin. A dedicated ``ai-gateway``
+    # host carries the surface path on the host itself; a workspace-hosted
+    # gateway serves them under ``/ai-gateway``, whatever surface the input named.
+    if _DATABRICKS_AI_GATEWAY_LABEL in gateway_labels:
+        gateway_origin = gateway_base_url.rstrip("/")
+        for suffix in (_DATABRICKS_GATEWAY_CODEX_SUFFIX, _DATABRICKS_GATEWAY_ANTHROPIC_SUFFIX):
+            if gateway_origin.endswith(suffix):
+                gateway_origin = gateway_origin[: -len(suffix)]
+    else:
+        gateway_origin = f"https://{parsed_gateway.hostname}/ai-gateway"
+    codex_gateway_url = f"{gateway_origin}{_DATABRICKS_GATEWAY_CODEX_SUFFIX}"
+    workspace_completions_url = workspace_url + "/serving-endpoints" if workspace_url else None
+    workspace_mlflow_url = workspace_url + "/ai-gateway/mlflow/v1" if workspace_url else None
+    additional: dict[str, _PiProviderPayload] = {}
+    if gpt_models:
+        additional[_PI_OPENAI_PROVIDER_ID] = _databricks_openai_provider(
+            api_key, codex_gateway_url, gpt_models
+        )
+    if completions_models and workspace_completions_url:
+        additional[_PI_COMPLETIONS_PROVIDER_ID] = _databricks_openai_provider(
+            api_key, workspace_completions_url, completions_models, api_type="openai-completions"
+        )
+    if gemini_models and workspace_mlflow_url:
+        additional[_PI_MLFLOW_PROVIDER_ID] = _databricks_openai_provider(
+            api_key, workspace_mlflow_url, gemini_models, api_type="openai-completions"
+        )
+    surfaces = {DatabricksPiSurface.RESPONSES: codex_gateway_url}
+    if workspace_completions_url:
+        surfaces[DatabricksPiSurface.COMPLETIONS] = workspace_completions_url
+    if workspace_mlflow_url:
+        surfaces[DatabricksPiSurface.MLFLOW] = workspace_mlflow_url
+    config = PiProviderConfig(
+        provider_id=_PI_PROVIDER_ID,
+        base_url=f"{gateway_origin}{_DATABRICKS_GATEWAY_ANTHROPIC_SUFFIX}",
+        api="anthropic-messages",
+        model=_select_databricks_claude_model(model, claude_models),
+        api_key=api_key,
+        auth_header=True,
+        extra_models=claude_models,
+        additional_providers=additional,
+        databricks_surfaces=surfaces,
+    )
+    listed_anything = bool(claude_models or gpt_models or completions_models or gemini_models)
+    if declared_surface is None or not listed_anything:
+        return config
+    limits = {
+        "configured_context_window": configured_context_window,
+        "configured_max_output_tokens": configured_max_output_tokens,
+    }
+    listed = config._model_registered_in_additional() or any(
+        entry.get("id") == config.model for entry in config.extra_models
+    )
+    if listed:
+        return _with_configured_default_limits(config, **limits)
+    # The listing came back but omitted the configured default; keep it on the
+    # surface its provider entry declares instead of guessing one from its name.
+    entry = pi_generic_model_json_entry(config.model, **limits)
+    if declared_surface is DatabricksPiSurface.ANTHROPIC:
+        return replace(config, extra_models=[*config.extra_models, {**entry, "reasoning": True}])
+    if declared_surface not in config.databricks_surfaces:
+        return config
+    additional = dict(config.additional_providers)
+    config._register_on_surface(additional, declared_surface, entry)
+    return replace(config, additional_providers=additional)
+
+
+def _with_configured_default_limits(
+    config: PiProviderConfig,
+    *,
+    configured_context_window: int | None,
+    configured_max_output_tokens: int | None,
+) -> PiProviderConfig:
+    """Apply a provider entry's explicit limits to its listed configured default.
+
+    Explicit ``context_window`` / ``max_output_tokens`` outrank the listing's
+    metadata, matching the single-family path.
+
+    :param config: The enumerated config whose ``model`` is the configured default.
+    :param configured_context_window: Explicit context limit, or ``None``.
+    :param configured_max_output_tokens: Explicit output limit, or ``None``.
+    :returns: *config*, with the default's entry updated where a limit is set.
+    """
+    if configured_context_window is None and configured_max_output_tokens is None:
+        return config
+
+    def apply(models: list[_PiModelEntry]) -> list[_PiModelEntry]:
+        updated: list[_PiModelEntry] = []
+        for model in models:
+            if model.get("id") != config.model:
+                updated.append(model)
+                continue
+            entry: _PiModelEntry = {**model}
+            if configured_context_window is not None:
+                entry["contextWindow"] = configured_context_window
+            if configured_max_output_tokens is not None:
+                entry["maxTokens"] = configured_max_output_tokens
+            updated.append(entry)
+        return updated
+
+    return replace(
+        config,
+        extra_models=apply(config.extra_models),
+        additional_providers={
+            pid: {**payload, "models": apply(payload["models"])}
+            for pid, payload in config.additional_providers.items()
+        },
+    )
 
 
 def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiProviderConfig | None:
@@ -1087,91 +1363,54 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     transport = _cli_config_databricks_transport(entry)
     if transport is None:
         return None
-    api_key = f"!{transport.auth_command}"
-    # The AI Gateway hostname (e.g. ``<id>.ai-gateway.cloud.databricks.com``)
-    # is NOT the workspace hostname — stripping ``ai-gateway.`` produces an
-    # NXDOMAIN. Use resolve_databricks_workspace for the real workspace URL,
-    # but use the auth_command token (same credential the gateway uses) for
-    # the API call. The SDK's minted token may not have serving-endpoints
-    # access on workspaces where access is controlled via the auth command.
-    claude_models: list[_PiModelEntry] = []
-    gpt_models: list[_PiModelEntry] = []
-    completions_models: list[_PiModelEntry] = []
-    gemini_models: list[_PiModelEntry] = []
-    parsed_gateway = urlparse(transport.base_url)
-    gateway_labels = (parsed_gateway.hostname or "").split(".")
-    real_workspace_url = _databricks_workspace_url_for_gateway(transport.base_url)
-    if real_workspace_url is None:
-        _LOGGER.info(
-            "pi-native: cli-config path could not resolve workspace URL "
-            "for model listing; Pi will show only the selected model"
-        )
-    if real_workspace_url and transport.auth_command:
-        token = _run_auth_command(transport.auth_command)
-        if token:
-            try:
-                claude_models, gpt_models, completions_models, gemini_models = (
-                    _fetch_pi_model_lists(real_workspace_url, token)
-                )
-            except Exception:  # noqa: BLE001 — network failure must not break launch
-                _LOGGER.info(
-                    "pi-native: could not fetch workspace model list; showing default model only",
-                    exc_info=True,
-                )
-        else:
-            _LOGGER.info(
-                "pi-native: auth command produced no token; Pi will show only the selected model"
-            )
-    # Derive the AI Gateway codex URL for the openai-responses provider. For
-    # workspace-hosted URLs the transport base is already the codex path;
-    # for dedicated-subdomain URLs we build it from the workspace URL.
-    if _DATABRICKS_AI_GATEWAY_LABEL in gateway_labels:
-        # Dedicated subdomain: transport.base_url is the codex gateway URL.
-        # Strip trailing path suffixes to get the codex base, not /anthropic.
-        codex_gateway_url = transport.base_url.rstrip("/")
-        if codex_gateway_url.endswith(_DATABRICKS_GATEWAY_CODEX_SUFFIX):
-            codex_gateway_url = codex_gateway_url[: -len(_DATABRICKS_GATEWAY_CODEX_SUFFIX)]
-        codex_gateway_url = f"{codex_gateway_url}{_DATABRICKS_GATEWAY_CODEX_SUFFIX}"
-    else:
-        # Workspace-hosted gateway: build from workspace hostname.
-        codex_gateway_url = f"https://{parsed_gateway.hostname}/ai-gateway/codex/v1"
-    workspace_completions_url = (
-        real_workspace_url + "/serving-endpoints" if real_workspace_url else None
+    return _databricks_gateway_pi_provider(
+        gateway_base_url=transport.base_url,
+        model=model,
+        auth_command=transport.auth_command,
     )
-    workspace_mlflow_url = (
-        real_workspace_url + "/ai-gateway/mlflow/v1" if real_workspace_url else None
-    )
-    additional: dict[str, _PiProviderPayload] = {}
-    if gpt_models:
-        additional[_PI_OPENAI_PROVIDER_ID] = _databricks_openai_provider(
-            api_key, codex_gateway_url, gpt_models
+
+
+_WORKSPACE_GATEWAY_SURFACE_PATHS: dict[str, DatabricksPiSurface] = {
+    "/ai-gateway/anthropic": DatabricksPiSurface.ANTHROPIC,
+    "/ai-gateway/codex/v1": DatabricksPiSurface.RESPONSES,
+    "/ai-gateway/mlflow/v1": DatabricksPiSurface.MLFLOW,
+}
+
+
+def _databricks_workspace_gateway_surface(base_url: str) -> DatabricksPiSurface | None:
+    """Return the surface a workspace-hosted Databricks Unity Gateway URL names.
+
+    Only a workspace-hosted URL is classified: its hostname is the workspace, so
+    the inventory behind it can be listed with the same credential. A dedicated
+    ``ai-gateway`` host names no workspace, and an unknown path is not a surface
+    Pi can be pointed at.
+
+    :param base_url: A provider family's ``base_url``.
+    :returns: The surface, or ``None`` when *base_url* is not such a URL.
+    """
+    if not _is_databricks_ai_gateway_url(base_url):
+        return None
+    parsed = urlparse(base_url)
+    if _DATABRICKS_AI_GATEWAY_LABEL in (parsed.hostname or "").lower().split("."):
+        return None
+    return _WORKSPACE_GATEWAY_SURFACE_PATHS.get(parsed.path.rstrip("/"))
+
+
+def _family_tier_ids(family: FamilyConfig) -> list[str]:
+    """Return a family's configured tier models as deduplicated endpoint ids.
+
+    Aliases are resolved and bracket suffixes stripped so two tiers naming the
+    same endpoint count once.
+
+    :param family: A resolved provider family.
+    :returns: Ordered unique model ids, e.g. ``["gpt-5", "gpt-5-mini"]``.
+    """
+    return list(
+        dict.fromkeys(
+            re.sub(r"\[.*?\]$", "", family.resolve_model_tier(tier_model))
+            for tier_model in family.models.values()
+            if isinstance(tier_model, str) and tier_model
         )
-    if completions_models and workspace_completions_url:
-        additional[_PI_COMPLETIONS_PROVIDER_ID] = _databricks_openai_provider(
-            api_key, workspace_completions_url, completions_models, api_type="openai-completions"
-        )
-    if gemini_models and workspace_mlflow_url:
-        additional[_PI_MLFLOW_PROVIDER_ID] = _databricks_openai_provider(
-            api_key, workspace_mlflow_url, gemini_models, api_type="openai-completions"
-        )
-    surfaces = {DatabricksPiSurface.RESPONSES: codex_gateway_url}
-    if workspace_completions_url:
-        surfaces[DatabricksPiSurface.COMPLETIONS] = workspace_completions_url
-    if workspace_mlflow_url:
-        surfaces[DatabricksPiSurface.MLFLOW] = workspace_mlflow_url
-    return PiProviderConfig(
-        provider_id=_PI_PROVIDER_ID,
-        base_url=_gateway_anthropic_base_url(transport.base_url),
-        api="anthropic-messages",
-        model=_select_databricks_claude_model(model, claude_models),
-        # Pi resolves a "!command" apiKey at request time, so the gateway
-        # bearer token (the codex auth command prints it) is refreshed per
-        # request — matching codex-native's refresh semantics.
-        api_key=api_key,
-        auth_header=True,
-        extra_models=claude_models,
-        additional_providers=additional,
-        databricks_surfaces=surfaces,
     )
 
 
@@ -1226,97 +1465,6 @@ def _cross_family_routing_warning(
     )
 
 
-def _gateway_pi_model_entry(
-    model_id: str,
-    *,
-    configured_context_window: int | None = None,
-    configured_max_output_tokens: int | None = None,
-) -> _PiModelEntry:
-    """Build a Pi models.json entry for a generic gateway model.
-
-    Pi defaults a model entry with no ``contextWindow``/``maxTokens`` to
-    128k/16k, silently truncating large-context gateway models (e.g. a 1M-
-    context GLM).  This helper enriches the entry with real limits.
-
-    Resolution order (first value found wins per field):
-    1. Provider-config-supplied ``context_window``/``max_output_tokens``.
-    2. Best-effort catalog fuzzy match by normalised model id fragment
-       (``glm-5.2`` → ``databricks-glm-5-2`` carries 1M context/65k output).
-    3. No ``contextWindow``/``maxTokens`` key — Pi uses its own defaults;
-       still better than a completely bare entry because ``reasoning`` and
-       ``input`` are set correctly.
-
-    ``reasoning`` is set via :func:`pi_model_is_reasoning` so that DeepSeek
-    and similar chain-of-thought models surface their thinking channel in Pi.
-
-    :param model_id: The gateway model id as configured by the user,
-        e.g. ``"glm-5.2"`` or ``"deepseek-r2"``.
-    :param configured_context_window: User-supplied context limit from the
-        provider config's ``context_window`` field, or ``None``.
-    :param configured_max_output_tokens: User-supplied output limit from the
-        provider config's ``max_output_tokens`` field, or ``None``.
-    :returns: A Pi model entry with as many fields populated as possible.
-    """
-    entry: _PiModelEntry = {"id": model_id, "input": ["text", "image"]}
-    # Set reasoning for DeepSeek (reads reasoning_content channel) and for
-    # Claude (enables Pi's thinking level controls).
-    if pi_model_is_reasoning(model_id) or any(
-        fragment in model_id.lower() for fragment in PI_CLAUDE_THINKING_MODEL_FRAGMENTS
-    ):
-        entry["reasoning"] = True
-
-    # Determine context window and max output tokens.
-    context_window = configured_context_window
-    max_output_tokens = configured_max_output_tokens
-
-    # Fall back to a catalog fuzzy match when the user hasn't configured limits.
-    if context_window is None or max_output_tokens is None:
-        catalog_entry = _catalog_entry_for_model(model_id)
-        if catalog_entry is not None:
-            if context_window is None and catalog_entry.metadata.context_window is not None:
-                context_window = catalog_entry.metadata.context_window
-            if max_output_tokens is None and catalog_entry.metadata.max_output_tokens is not None:
-                max_output_tokens = catalog_entry.metadata.max_output_tokens
-
-    if context_window is not None:
-        entry["contextWindow"] = context_window
-    if max_output_tokens is not None:
-        entry["maxTokens"] = max_output_tokens
-    return entry
-
-
-def _catalog_entry_for_model(model_id: str) -> model_catalog.ModelEntry | None:
-    """Find the best catalog entry for *model_id* by normalised id fragment.
-
-    Tries an exact match first, then a prefix-aware substring match so that
-    user-facing ids like ``glm-5.2`` resolve against catalog entries like
-    ``databricks-glm-5-2``.  Normalises dots to dashes for version numbers.
-
-    :param model_id: A model id, e.g. ``"glm-5.2"`` or ``"gpt-4o-mini"``.
-    :returns: The best matching catalog :class:`ModelEntry`, or ``None``.
-    """
-    lower = model_id.lower()
-    # Normalise dots to dashes so "glm-5.2" matches "databricks-glm-5-2".
-    normalised = lower.replace(".", "-")
-
-    all_entries: list[model_catalog.ModelEntry] = []
-    for provider in ("openai", "anthropic", "databricks", "google"):
-        with contextlib.suppress(Exception):  # catalog failure must not break launch
-            all_entries.extend(model_catalog.catalog_model_entries(provider))
-
-    # 1. Exact match (covers common ids like "gpt-4o-mini").
-    for entry in all_entries:
-        if entry.id.lower() == lower:
-            return entry
-
-    # 2. Normalised substring match (covers "glm-5.2" → "databricks-glm-5-2").
-    for entry in all_entries:
-        if normalised in entry.id.lower().replace(".", "-"):
-            return entry
-
-    return None
-
-
 def _live_family_model_entries(
     provider: PiProviderConfig,
     *,
@@ -1366,7 +1514,7 @@ def _live_family_model_entries(
         if model_entry.id in seen:
             continue
         seen.add(model_entry.id)
-        entries.append(_gateway_pi_model_entry(model_entry.id))
+        entries.append(pi_generic_model_json_entry(model_entry.id))
     return entries
 
 
@@ -1379,7 +1527,11 @@ def _inline_family_pi_provider(
     both surfaces serves a GPT id from its OpenAI family rather than whichever
     family happens to be configured first. Falls back to the other family, which
     keeps protocol-translating proxies working: a LiteLLM ``/anthropic``
-    passthrough is the only configured family and still serves any model.
+    passthrough is the only configured family and still serves any model. When
+    the selected family's ``base_url`` is a workspace-hosted Databricks AI
+    Gateway, the whole workspace is enumerated instead (Claude, GPT and Gemini
+    surfaces) with the configured default kept as the launch model; see
+    :func:`_databricks_gateway_pi_provider`.
 
     :param entry: The resolved default provider entry.
     :param model: Session model override, or ``None`` to use the family default.
@@ -1426,34 +1578,55 @@ def _inline_family_pi_provider(
         if model is not None and not preserve_model_ids:
             resolved_model = normalize_model_for_provider(resolved_model, entry.kind)
         # Strip bracket suffixes (e.g. "[1m]") — accepted by the direct
-        # Anthropic API but rejected by the Databricks AI Gateway, and in a Pi
+        # Anthropic API but rejected by the Databricks Unity Gateway, and in a Pi
         # ``enabledModels`` ref the "[" would route the pattern through Pi's
         # glob matcher instead of its exact reference match.
         if not preserve_model_ids:
             resolved_model = re.sub(r"\[.*?\]$", "", resolved_model)
-        model_entry = _gateway_pi_model_entry(
+        tier_ids = _family_tier_ids(family)
+        # A session override must not turn a default-only setup into a shortlist.
+        curated_models = len(tier_ids) > 1
+        # A workspace-hosted Databricks Unity Gateway fronts Claude, GPT and Gemini
+        # together; list the workspace so Pi offers every family, not just this
+        # one. Inference bindings pin exact ids and a multi-model tier map is a
+        # deliberate shortlist, so both keep the single-family config below.
+        declared_surface = _databricks_workspace_gateway_surface(family.base_url)
+        if declared_surface is not None and not preserve_model_ids and not curated_models:
+            # The configured default keeps its declared surface and limits when
+            # it is picked explicitly too (the picker offers it by that surface).
+            default_tier = entry.family_default_model(family_name)
+            configured_default = (
+                re.sub(r"\[.*?\]$", "", family.resolve_model_tier(default_tier))
+                if default_tier
+                else None
+            )
+            is_configured_default = model is None or resolved_model == configured_default
+            enumerated = _databricks_gateway_pi_provider(
+                gateway_base_url=family.base_url,
+                model=resolved_model,
+                auth_command=family.auth_command,
+                static_api_key=family.api_key,
+                declared_surface=declared_surface if is_configured_default else None,
+                configured_context_window=family.context_window,
+                configured_max_output_tokens=family.max_output_tokens,
+            )
+            # An empty listing (unreachable workspace, a token without Unity
+            # Catalog access) keeps the configured model on its own surface.
+            if enumerated.extra_models or enumerated.additional_providers:
+                return enumerated
+        model_entry = pi_generic_model_json_entry(
             resolved_model,
             configured_context_window=family.context_window,
             configured_max_output_tokens=family.max_output_tokens,
         )
-        # Register the family's tiers alongside the selected model. Resolve
-        # aliases and strip bracket suffixes before deduplicating model ids.
-        tier_ids = list(
-            dict.fromkeys(
-                re.sub(r"\[.*?\]$", "", family.resolve_model_tier(tier_model))
-                for tier_model in family.models.values()
-                if isinstance(tier_model, str) and tier_model
-            )
-        )
+        # Register the family's tiers alongside the selected model.
         shortlist: list[_PiModelEntry] = [model_entry]
-        # A session override must not turn a default-only setup into a shortlist.
-        curated_models = len(tier_ids) > 1
         if curated_models:
             for tier_id in tier_ids:
                 if tier_id == resolved_model:
                     continue
                 shortlist.append(
-                    _gateway_pi_model_entry(
+                    pi_generic_model_json_entry(
                         tier_id,
                         configured_context_window=family.context_window,
                         configured_max_output_tokens=family.max_output_tokens,
@@ -1524,6 +1697,9 @@ def resolve_pi_native_provider(
         _LOGGER.warning("pi-native: failed to read provider configuration", exc_info=True)
         return None
     config = load_runtime_inference_config(base_config)
+    selection = _split_pi_native_model_selection(model)
+    if selection is not None:
+        _, model = selection
     binding = binding_for_harness(config, "pi-native")
     if binding is not None:
         entry = resolve_bound_provider(config, "pi-native", auth)
@@ -1568,17 +1744,35 @@ def resolve_pi_native_provider(
             )
         return replace(resolved, inference_bound=True)
 
-    selection = _split_pi_native_model_selection(model)
-    unmanaged_prefix_warning: str | None = None
-    if selection is not None:
-        _, model = selection
+    unmanaged_prefix_notice: str | None = None
+    # An unqualified slash id either names a configured provider or is the
+    # endpoint's (or Pi's own) model naming; both branches below need the split.
+    prefix = bare = ""
+    names_configured_provider = False
+    if selection is None and model and "/" in model:
+        prefix, _, bare = model.partition("/")
+        providers = config.get("providers")
+        names_configured_provider = (
+            bool(bare) and isinstance(providers, dict) and prefix in providers
+        )
     try:
+        # Preserve Pi-login references unless they name a configured provider.
+        if bare and not names_configured_provider and pi_own_login_serves_reference(model):
+            # Warn: the same id could also be served by the configured default
+            # provider, so this routes credentials/billing by host login state.
+            _LOGGER.warning(
+                "pi-native: model %r is served by Pi's own %r login; Pi will use that "
+                "login instead of the omnigent-configured default provider.",
+                model,
+                prefix,
+            )
+            return None
         # Pi is multi-family; ``omnigent setup`` marks defaults per family, not
         # for ``pi``. Use the shared house-pattern selection so pi resolves its
         # default exactly like the rest of the codebase — an explicit pi default
         # wins, else the anthropic (Pi's native surface) then openai family
         # default, skipping kinds that can't drive pi. Crucially this now lets a
-        # cli-config Databricks AI Gateway through (it is pi-consumable via
+        # cli-config Databricks Unity Gateway through (it is pi-consumable via
         # ``_cli_config_pi_provider``), so an unrelated anthropic-family default
         # no longer shadows it.
         entry = default_provider_for_harness(config, PI_SURFACE)
@@ -1598,30 +1792,22 @@ def resolve_pi_native_provider(
                 "surface; Pi will use its own login."
             )
             return None
-        if selection is None and model and "/" in model:
-            prefix, _, bare = model.partition("/")
-            providers = config.get("providers")
-            # A picker override can arrive qualified by the omnigent provider
-            # name ("rpw-fable/databricks-claude-fable-5-1"); registering it
-            # verbatim renders a slash id no endpoint serves. Split only when
-            # the prefix names a configured provider — any other slash id is
-            # the endpoint's own model naming (e.g. "openai/gpt-4o" on
-            # OpenRouter, "zai-org/GLM-4.7") and must stay verbatim.
-            if bare and isinstance(providers, dict) and prefix in providers:
-                if prefix != entry.name:
-                    unmanaged_prefix_warning = (
-                        f"The model override '{model}' names provider "
-                        f"'{prefix}', but this Pi session is served by "
-                        f"provider '{entry.name}'; the model '{bare}' was "
-                        f"requested from '{entry.name}' instead."
-                    )
-                    _LOGGER.warning("pi-native: %s", unmanaged_prefix_warning)
-                model = bare
+        # Only strip configured provider prefixes; endpoint IDs may contain slashes.
+        if names_configured_provider:
+            if prefix != entry.name:
+                unmanaged_prefix_notice = (
+                    f"The model override '{model}' names provider "
+                    f"'{prefix}', but this Pi session is served by "
+                    f"provider '{entry.name}'; the model '{bare}' was "
+                    f"requested from '{entry.name}' instead."
+                )
+                _LOGGER.info("pi-native: %s", unmanaged_prefix_notice)
+            model = bare
         if entry.kind == DATABRICKS_KIND:
             resolved = _databricks_pi_provider(entry, model=model)
         elif entry.kind == CLI_CONFIG_KIND:
             # A Codex cli-config provider whose [model_providers.X] table is the
-            # Databricks AI Gateway IS reusable by Pi (the gateway exposes an
+            # Databricks Unity Gateway IS reusable by Pi (the gateway exposes an
             # Anthropic surface Pi speaks). Translate it rather than dropping to
             # Pi's own login — the bug this module fixes.
             resolved = _cli_config_pi_provider(entry, model=model)
@@ -1666,15 +1852,8 @@ def resolve_pi_native_provider(
                 resolved = _databricks_pi_provider(db_entry, model=model)
             if resolved is None:
                 _LOGGER.warning("pi-native: no usable provider found; Pi will use its own login.")
-        if resolved is not None and unmanaged_prefix_warning is not None:
-            resolved = replace(
-                resolved,
-                credential_warning=(
-                    unmanaged_prefix_warning
-                    if resolved.credential_warning is None
-                    else f"{unmanaged_prefix_warning}\n\n{resolved.credential_warning}"
-                ),
-            )
+        if resolved is not None and unmanaged_prefix_notice is not None:
+            resolved = replace(resolved, model_notice=unmanaged_prefix_notice)
         return resolved
     except Exception:  # noqa: BLE001 — any resolution failure must not break launch
         # Any failure (malformed config, duplicate per-family default, or an
@@ -1705,6 +1884,12 @@ def write_pi_models_config(
         rendered = provider.to_models_config()
     agent_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(agent_dir, 0o700)
+    rendered = deepcopy(rendered)
+    for provider_id, config in rendered["providers"].items():
+        api_key = config.get("apiKey")
+        # Windows Pi can use a configured PowerShell; preserve its own resolver.
+        if os.name == "posix" and isinstance(api_key, str) and api_key.startswith("!"):
+            config["apiKey"] = wrap_auth_command(agent_dir, provider_id, api_key[1:])
     models_path = agent_dir / "models.json"
     # 0o600: the apiKey may be a literal token (key-kind providers).
     fd = os.open(models_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -1760,11 +1945,13 @@ def pi_native_provider_launch(
     :param agent_dir: The managed Pi config dir for this session.
     :param provider: The resolved provider config.
     :param reasoning_effort: Canonical omnigent effort for the session, e.g.
-        ``"high"``. Passed as ``--thinking`` on the primary provider; ignored
-        (with a warning) on a gateway-routed model, whose thinking must stay
-        off for text to surface.
-    :param selection: Optional picker value used to select a generated provider.
+        ``"high"``. Passed as ``--thinking`` on the selected provider; Pi
+        applies the model's reasoning capabilities.
+    :param selection: Optional picker value naming a generated provider and
+        model. When that provider no longer serves the model, the provider that
+        does is used instead.
     :returns: The launch env, CLI args and any effort warning.
+    :raises ValueError: If no generated provider serves the selected model.
     """
     # Render once and reuse: rendering logs how an uncataloged model was routed,
     # and this function both writes the config and reads it back for --provider.
@@ -1773,37 +1960,31 @@ def pi_native_provider_launch(
     # (GLM, GPT, Llama…) are in secondary providers; Claude models are in the
     # primary provider. Read the rendered config so family fallbacks agree.
     selected_model = provider.model
-    model_provider_id = provider.provider_id
     selection_parts = (
         None if provider.inference_bound else _split_pi_native_model_selection(selection)
     )
     if selection_parts is not None:
         candidate_provider, candidate_model = selection_parts
-        configured = rendered["providers"].get(candidate_provider)
-        if not configured or not any(
-            model.get("id") == candidate_model for model in configured.get("models", [])
-        ):
+        serving = [
+            provider_id
+            for provider_id, configured in rendered["providers"].items()
+            if any(model.get("id") == candidate_model for model in configured.get("models", []))
+        ]
+        if not serving:
             raise ValueError(
                 f"Pi model selection {selection!r} is not available in managed configuration"
             )
-        model_provider_id = candidate_provider
+        # A selection names the provider that served the model when it was
+        # picked. The workspace listing may since have routed the model to another
+        # surface, or discovery may have failed and folded it back into the
+        # primary; follow the model, which the rendered config already routed.
+        model_provider_id = candidate_provider if candidate_provider in serving else serving[0]
         selected_model = candidate_model
     else:
-        for extra_id, extra_cfg in rendered["providers"].items():
-            if extra_id == provider.provider_id:
-                continue
-            if any(m.get("id") == provider.model for m in extra_cfg.get("models", [])):
-                model_provider_id = extra_id
-                break
+        model_provider_id = _default_model_provider_id(provider, rendered)
     write_pi_models_config(agent_dir, provider, rendered)
-    # Copy the user's global Pi settings but suppress defaultThinkingLevel.
-    # In TUI mode Pi applies the setting from ~/.pi/agent/settings.json; for
-    # non-Claude models via openai-completions, any thinking level causes the
-    # Databricks gateway to return 400 (reasoning_effort is sent even when
-    # supportsReasoningEffort is false in the compat block, because TUI mode
-    # applies the session-level thinking before the compat check fires).
-    # Passing None in the overlay makes _deep_merge_settings write null for the
-    # key; Pi's getDefaultThinkingLevel() returns null (falsy) → no thinking.
+    # Session effort or Pi's default selects thinking; don't inherit a global
+    # thinking preference that may belong to a different provider.
     from omnigent.inner.pi_settings import prepare_managed_pi_agent_dir
 
     overlay: dict[str, object] = {"defaultThinkingLevel": None}
@@ -1814,6 +1995,10 @@ def pi_native_provider_launch(
         overlay["enabledModels"] = enabled_refs
     prepare_managed_pi_agent_dir(agent_dir, overlay=overlay)
     env = {PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
+    if os.name == "posix" and any(
+        config.get("apiKey", "").startswith("!") for config in rendered["providers"].values()
+    ):
+        env[AUTH_DIR_ENV] = str(agent_dir / AUTH_DIR_NAME)
     if provider.inference_bound:
         env["OMNIGENT_PI_INFERENCE_BOUND"] = "1"
     # When the model id contains a "/" Pi's arg parser splits on the first
@@ -1836,20 +2021,9 @@ def pi_native_provider_launch(
             _LOGGER.warning("pi-native: %s", exc)
         if effort is not None:
             thinking = to_pi_thinking_level(effort)
-    # For non-Claude models on openai-completions/responses, disable thinking.
-    # Gemini and other Databricks models return reasoning_tokens in their
-    # responses; Pi's TUI mode applies thinking even with defaultThinkingLevel:null
-    # in settings, causing the agent loop to complete without surfacing the text
-    # content to the extension. Explicitly passing --thinking off ensures the
-    # completions handler doesn't activate the thinking path.
-    if model_provider_id != provider.provider_id:
-        args.extend(["--thinking", PI_THINKING_OFF])
-        if thinking is not None and thinking != PI_THINKING_OFF:
-            effort_warning = (
-                f"effort ignored for gateway-routed model {provider.model}: "
-                "thinking disabled to keep text surfacing"
-            )
-            _LOGGER.warning("pi-native: %s", effort_warning)
-    elif thinking is not None:
+    if thinking is not None:
         args.extend(["--thinking", thinking])
+    from omnigent.inner.pi_gateway import pi_gateway_extension_args
+
+    args.extend(pi_gateway_extension_args(agent_dir, rendered))
     return PiNativeLaunch(env=env, args=args, effort_warning=effort_warning)

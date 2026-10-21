@@ -21,7 +21,7 @@ export function ExtensionPrimaryNavigation({
   onNavigate,
 }: {
   activePageId: string | null;
-  onNavigate: (event: MouseEvent<HTMLAnchorElement>) => void;
+  onNavigate?: (event: MouseEvent<HTMLAnchorElement>) => void;
 }) {
   // V1 owns one slot between Inbox and Usage. `order` is deterministic within
   // that extension-owned slot; it does not reorder core navigation rows.

@@ -24,7 +24,6 @@ from __future__ import annotations
 import os
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -38,6 +37,7 @@ import pytest
 import yaml
 
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
+from tests._helpers.live_server import find_free_port
 from tests.e2e.routing._helpers import POLL_INTERVAL_S, wait_for
 from tests.e2e.routing._mock_router import MockRouter, serve_mock_router
 
@@ -82,16 +82,6 @@ def _require_opt_in() -> None:
         )
 
 
-def _free_port() -> int:
-    """Return a free TCP port on loopback.
-
-    :returns: A port number nothing is currently listening on.
-    """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
 @pytest.fixture(scope="session")
 def mock_router() -> Iterator[MockRouter]:
     """Run the deterministic ``routes:select`` mock for the session.
@@ -117,7 +107,7 @@ def _provider_block() -> dict[str, Any]:
     """Read the ``providers:`` block the host needs for gateway-backed launches.
 
     Smart Routing's apply layer can only rewrite a launch's model when the
-    launch resolves through the Databricks AI Gateway, so the host has to see a
+    launch resolves through the Databricks Unity Gateway, so the host has to see a
     databricks provider. The routing worktree's isolated dev config is the
     canonical source (three canonical prompt classes: trivial, delegate-shaped, crosscutting).
 
@@ -159,7 +149,7 @@ def routing_server(
     :param tmp_path_factory: Pytest temp path factory.
     :yields: The server base URL, e.g. ``"http://127.0.0.1:54321"``.
     """
-    port = _free_port()
+    port = find_free_port()
     root = tmp_path_factory.mktemp("routing_e2e_server")
     db_path = root / "routing_e2e.db"
     config_path = root / "server.yaml"

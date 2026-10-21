@@ -1,21 +1,27 @@
 """
-Shared helpers for exposing an agent bundle's skills to a Claude harness.
+Expose bundle and portable skills to Claude harnesses.
 
-Both the Claude Agent SDK executor (in-process, ``claude_sdk_executor``)
-and the ``claude-native`` CLI launch path expose a bundle's
-``skills/<dir>/SKILL.md`` files to Claude Code through its plugin
-convention (``--plugin-dir <bundle>``). This module centralizes the two
-pieces that wiring needs so the SDK and native paths stay in lockstep:
-writing the bundle's ``.claude-plugin/plugin.json`` manifest, and
-translating the spec's ``skills_filter`` into the Claude Code CLI args
-(``--plugin-dir`` + ``--setting-sources``) that the native path passes
-to the real ``claude`` binary.
+Both SDK and native Claude load bundled skills as plugins. Native Claude
+also loads portable ``.agents`` skills through a session-owned additional
+directory, preserving their bare command names and supporting files.
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import os
+import shutil
+from dataclasses import replace
 from pathlib import Path
+
+from omnigent.spec.skill_sources import (
+    _claude_code_skills,
+    select_claude_portable_skills,
+    skill_source_context_from_env,
+)
+
+_log = logging.getLogger(__name__)
 
 
 def ensure_bundle_plugin_manifest(
@@ -112,3 +118,74 @@ def claude_native_skill_args(
         # skills ride --plugin-dir and are unaffected.
         args.extend(["--setting-sources", ""])
     return args
+
+
+def _remove_skill_overlay(path: Path) -> None:
+    """Remove owned copies, including read-only files, without following skill links."""
+    if path.is_symlink():
+        path.unlink()
+        return
+    if not path.exists():
+        return
+    path.chmod(path.stat().st_mode | 0o700)
+    for root, dirs, files in os.walk(path, followlinks=False):
+        for names, owner_permissions in ((dirs, 0o700), (files, 0o600)):
+            for name in names:
+                entry = Path(root) / name
+                if not entry.is_symlink():
+                    entry.chmod(entry.stat().st_mode | owner_permissions)
+    shutil.rmtree(path)
+
+
+def claude_agents_skill_args(
+    bridge_dir: Path,
+    roots: tuple[Path, ...],
+    skills_filter: str | list[str],
+) -> list[str]:
+    """Expose portable skills through Claude's additional-directory discovery.
+
+    :param bridge_dir: Session-owned directory for the skill links.
+    :param roots: Workspace and optional bundle discovery roots, in priority order.
+    :param skills_filter: Host skill selection from the agent spec.
+    :returns: Claude CLI arguments loading the selected portable skills.
+    """
+    overlay = bridge_dir / "agent-skills"
+    _remove_skill_overlay(overlay)
+    ctx = skill_source_context_from_env(
+        roots=roots,
+        harness="claude-native",
+        skills_filter=skills_filter,
+        bundle_dir=roots[1] if len(roots) > 1 else None,
+    )
+    skills = _claude_code_skills(ctx, ".agents")
+    if not skills:
+        return []
+    skills = select_claude_portable_skills(
+        skills, _claude_code_skills(replace(ctx, is_native=True, skills_filter="all"))
+    )
+    if not skills:
+        return []
+    target = overlay / ".claude" / "skills"
+    target.mkdir(parents=True)
+    staged = False
+    for skill in skills:
+        if skill.skill_dir is None:
+            continue
+        # Claude uses the link's directory basename as the command name.
+        destination = target / skill.name
+        try:
+            destination.symlink_to(skill.skill_dir.resolve(), target_is_directory=True)
+        except FileExistsError:
+            _log.warning("Skipping portable skill %s: destination already exists", skill.skill_dir)
+            continue
+        except OSError:
+            # Windows may require privileges to create directory symlinks.
+            try:
+                shutil.copytree(skill.skill_dir, destination, symlinks=True)
+            except OSError as exc:
+                if not isinstance(exc, FileExistsError):
+                    _remove_skill_overlay(destination)
+                _log.warning("Skipping portable skill %s: %s", skill.skill_dir, exc)
+                continue
+        staged = True
+    return ["--add-dir", str(overlay)] if staged else []

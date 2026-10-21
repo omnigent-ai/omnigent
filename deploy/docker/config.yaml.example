@@ -54,6 +54,7 @@ allowed_domains:
 # field keeps its built-in default. See deploy/README.md#branding-white-labeling.
 # branding:
 #   app_name: "Acme Agent"      # tab title, sidebar wordmark, login screen
+#   server_name: "Acme Engineering"  # this server's name in the desktop app's server list
 #   heading: "How can I help?"   # landing hero; "" hides it, omit for the default
 #   logo:                        # a bare string sets `main`; or per-variant:
 #     main: logo.png             # hero / primary mark

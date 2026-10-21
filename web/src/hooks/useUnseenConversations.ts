@@ -309,16 +309,18 @@ export function markConversationRead(conversationId: string, updatedAt: number):
  * Subscribes the caller to read-state mirror writes and returns the current
  * write version, so a component re-renders (and recomputes
  * `isConversationUnseen`) the instant the user marks a row read/unread — not
- * on the next conversations poll.
+ * on the next conversations poll. When disabled, returns 0 without subscribing.
  */
-export function useUnseenTick(): number {
+export function useUnseenTick(enabled = true): number {
+  const version = () => (enabled ? writeVersion : 0);
   return useSyncExternalStore(
     (onChange) => {
+      if (!enabled) return () => {};
       subscribers.add(onChange);
       return () => subscribers.delete(onChange);
     },
-    () => writeVersion,
-    () => writeVersion,
+    version,
+    version,
   );
 }
 

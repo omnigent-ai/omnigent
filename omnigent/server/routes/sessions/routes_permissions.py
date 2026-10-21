@@ -165,9 +165,14 @@ def register_permissions_routes(
                     "Public access has been disabled for this Omnigent server.",
                     code=ErrorCode.FORBIDDEN,
                 )
-            if body.level > LEVEL_READ:
+            from omnigent.server.sharing_settings import PublicSharingMaxLevel
+
+            ceiling = getattr(
+                request.app.state, "public_sharing_max_level", lambda: PublicSharingMaxLevel.READ
+            )()
+            if body.level > ceiling.level:
                 raise OmnigentError(
-                    "Public access is limited to read-only (level 1)",
+                    f"Public access is limited to {ceiling.value} (level {ceiling.level})",
                     code=ErrorCode.INVALID_INPUT,
                 )
         target = await asyncio.to_thread(permission_store.get_user, body.user_id)
@@ -379,7 +384,10 @@ def _to_agent_object(
     agent: Agent,
     cache: AgentCache | None,
     *,
+    mcp_servers_editable: bool,
     terminals_override: list[str] | None = None,
+    mcp_selection: dict[str, str] | None = None,
+    mcp_registry_editable: bool = False,
 ) -> AgentObject:
     """
     Convert a runtime :class:`Agent` entity to an API-layer
@@ -396,6 +404,10 @@ def _to_agent_object(
     :param cache: Agent cache, or ``None`` in test setups.
     :param terminals_override: Selected host's shell inventory. Applied only
         when the loaded spec is a recognized native wrapper.
+    :param mcp_selection: Session MCP selection labels, when called for a session.
+    :param mcp_registry_editable: Whether the caller can change session MCP selections.
+    :param mcp_servers_editable: Whether the authenticated caller may mutate
+        MCP configuration for the session serving this object.
     :returns: An :class:`AgentObject` for the API response.
     """
     mcp_servers: list[MCPServerSummary] = []
@@ -413,7 +425,7 @@ def _to_agent_object(
     if cache is not None:
         try:
             loaded = cache.load(
-                agent.id, agent.bundle_location, expand_env=agent.session_id is None
+                agent.id, agent.bundle_location, expand_env=agent.operator_authored
             )
             harness = loaded.spec.executor.harness_kind
             if description is None:
@@ -428,10 +440,12 @@ def _to_agent_object(
             )
             # Bundled suggestions stay available while the host catalog loads.
             skills = [
-                SkillSummary(name=s.name, description=s.description)
+                SkillSummary(name=s.name, description=s.description, display_name=s.display_name)
                 for s in loaded.spec.skills
                 if s.user_invocable
             ]
+            from omnigent.mcp_selection import selected_mcp_spec
+
             mcp_servers = [
                 MCPServerSummary(
                     name=srv.name,
@@ -442,7 +456,7 @@ def _to_agent_object(
                     command=srv.command,
                     args=srv.args,
                 )
-                for srv in loaded.spec.mcp_servers
+                for srv in selected_mcp_spec(loaded.spec, mcp_selection or {}).mcp_servers
             ]
             if loaded.spec.guardrails and loaded.spec.guardrails.policies:
                 policies = [
@@ -474,8 +488,11 @@ def _to_agent_object(
         updated_at=agent.updated_at,
         harness=harness,
         mcp_servers=mcp_servers,
+        mcp_registry_editable=mcp_registry_editable,
         mcp_servers_editable=(
-            agent.session_id is not None and not (harness or "").endswith("-native")
+            mcp_servers_editable
+            and agent.session_id is not None
+            and not (harness or "").endswith("-native")
         ),
         policies=policies,
         skills=skills,

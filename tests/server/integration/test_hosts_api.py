@@ -32,30 +32,15 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests.budgets import budget
+from tests.server.helpers import websocket_scope as _websocket_scope
 
 pytestmark = pytest.mark.asyncio
 
 _HOST_ID = "33296f9b15e02671c34e013dd711407e"
-
-
-def _websocket_scope(path: str) -> dict[str, object]:
-    """Build an ASGI WebSocket scope.
-
-    :param path: WebSocket path.
-    :returns: Minimal ASGI WebSocket scope.
-    """
-    return {
-        "type": "websocket",
-        "asgi": {"version": "3.0"},
-        "scheme": "ws",
-        "path": path,
-        "raw_path": path.encode("ascii"),
-        "query_string": b"",
-        "headers": [],
-        "client": ("127.0.0.1", 50000),
-        "server": ("testserver", 80),
-        "subprotocols": [],
-    }
+# Binding persistence can exceed two seconds under parallel CI load.
+# A receive timeout cancels the ASGI app and disconnects the fake host.
+_LAUNCH_FRAME_TIMEOUT_S = 10.0
 
 
 def _make_hello(
@@ -160,7 +145,7 @@ async def _connect_host(
     path = f"/v1/hosts/{host_id}/tunnel"
     comm = ApplicationCommunicator(app, _websocket_scope(path))
     await comm.send_input({"type": "websocket.connect"})
-    accepted = await comm.receive_output(timeout=1.0)
+    accepted = await comm.receive_output(timeout=budget(1.0))
     assert accepted["type"] == "websocket.accept"
 
     await comm.send_input(
@@ -584,7 +569,7 @@ async def test_launch_runner_happy_path(
         from omnigent.host.frames import HostLaunchRunnerFrame, decode_host_frame
 
         for _ in range(20):
-            output = await comm.receive_output(timeout=2.0)
+            output = await comm.receive_output(timeout=budget(_LAUNCH_FRAME_TIMEOUT_S))
             if output["type"] != "websocket.send":
                 continue
             frame = decode_host_frame(output["text"])
@@ -708,7 +693,7 @@ async def test_launch_runner_categorical_failure_returns_specific_status(
         from omnigent.host.frames import HostLaunchRunnerFrame, decode_host_frame
 
         for _ in range(20):
-            output = await comm.receive_output(timeout=2.0)
+            output = await comm.receive_output(timeout=budget(_LAUNCH_FRAME_TIMEOUT_S))
             if output["type"] != "websocket.send":
                 continue
             frame = decode_host_frame(output["text"])
@@ -1164,7 +1149,7 @@ async def test_tunnel_rejects_unauthenticated_when_auth_enabled(
 
     # Unauthenticated peers are refused BEFORE the WS upgrade, so the
     # first (and only) output is the close — no accept, no frame exchange.
-    closed = await comm.receive_output(timeout=1.0)
+    closed = await comm.receive_output(timeout=budget(1.0))
     assert closed["type"] == "websocket.close", (
         f"expected the tunnel to close on missing identity before accept, got {closed!r}"
     )
@@ -1192,7 +1177,7 @@ async def test_tunnel_accepts_authenticated_owner(
     scope["headers"] = [(b"x-test-user", b"alice@test.com")]
     comm = ApplicationCommunicator(app, scope)
     await comm.send_input({"type": "websocket.connect"})
-    accepted = await comm.receive_output(timeout=1.0)
+    accepted = await comm.receive_output(timeout=budget(1.0))
     assert accepted["type"] == "websocket.accept"
     await comm.send_input(
         {"type": "websocket.receive", "text": _make_hello()},
@@ -1382,11 +1367,11 @@ async def test_failed_connect_does_not_offline_another_users_host(
     await comm.send_input({"type": "websocket.connect"})
     # Refused before accept(); no denial extension in this scope, so the
     # server falls back to a pre-accept close (code 4009).
-    closed = await comm.receive_output(timeout=1.0)
+    closed = await comm.receive_output(timeout=budget(1.0))
     assert closed["type"] == "websocket.close"
     assert closed["code"] == 4009
     with contextlib.suppress(Exception):
-        await comm.wait(timeout=2.0)
+        await comm.wait(timeout=budget(2.0))
 
     after = host_store.get_host("be2a05c6f9530d33276f7c4b34bc39ad")
     assert after is not None
@@ -1402,6 +1387,7 @@ async def test_failed_connect_does_not_offline_another_users_host(
 
 async def test_runner_exited_report_surfaces_in_runner_status(
     db_uri: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A ``host.runner_exited`` frame from the daemon reaches the runner
@@ -1437,6 +1423,7 @@ async def test_runner_exited_report_surfaces_in_runner_status(
         "runner process exited with code 1 (log on host: ~/x.log)\n"
         "--- runner log tail ---\nModuleNotFoundError: No module named 'claude_agent_sdk'"
     )
+    caplog.set_level("WARNING", logger="omnigent.server.routes.host_tunnel")
     _comm = await _connect_host(app, registry)
     await _comm.send_input(
         {
@@ -1464,13 +1451,21 @@ async def test_runner_exited_report_surfaces_in_runner_status(
     # the actual failure — is surfaced verbatim for the waiting client.
     assert body["error"] == daemon_error
 
+    # No callback wired, so the tunnel itself logs the session-less event.
+    events = [r for r in caplog.records if getattr(r, "event_name", None) == "runner_exited"]
+    assert len(events) == 1
+    assert getattr(events[0], "session_id", None) is None
+    assert events[0].attributes["host_id"] == _HOST_ID
+    assert events[0].attributes["runner_id"] == "runner_dead"
+
 
 async def test_runner_exited_invokes_callback_with_runner_and_error(
     db_uri: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A ``host.runner_exited`` frame fires the ``on_runner_exited``
-    callback with ``(runner_id, error)``.
+    callback with ``(host_id, runner_id, error)``.
 
     This callback is how the server marks the crashed runner's
     session(s) failed and pushes the cause to the open view (the
@@ -1483,12 +1478,13 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
 
     registry = HostRegistry()
     host_store = HostStore(db_uri)
-    received: list[tuple[str, str]] = []
+    received: list[tuple[str, str, str]] = []
 
-    async def _record(runner_id: str, error: str) -> None:
-        received.append((runner_id, error))
+    async def _record(host_id: str, runner_id: str, error: str) -> None:
+        received.append((host_id, runner_id, error))
 
     app = FastAPI()
+    caplog.set_level("WARNING", logger="omnigent.server.routes.host_tunnel")
     app.include_router(
         create_host_tunnel_router(registry, host_store, on_runner_exited=_record),
         prefix="/v1",
@@ -1507,5 +1503,7 @@ async def test_runner_exited_invokes_callback_with_runner_and_error(
         while not received:
             await asyncio.sleep(0.01)
 
-    # The callback got the exact runner id and error string off the frame.
-    assert received == [("runner_x", "exited with code 1")]
+    # The callback got the reporting host plus the exact runner id and error.
+    assert received == [(_HOST_ID, "runner_x", "exited with code 1")]
+    # The callback owns the event; the tunnel must not log a session-less duplicate.
+    assert not [r for r in caplog.records if getattr(r, "event_name", None) == "runner_exited"]

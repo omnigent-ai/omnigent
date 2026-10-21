@@ -17,6 +17,7 @@ which is the standard pattern for always-ASK gates in agent YAML.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
 from typing import Any
 
 import httpx
@@ -24,8 +25,28 @@ import pytest
 
 from omnigent.runtime import pending_elicitations, session_stream
 from tests.server.helpers import create_test_agent
+from tests.server.helpers import policy_tool_call_request as _tool_call_request
 
 pytestmark = pytest.mark.asyncio
+
+
+POLICY_REGISTRY = [
+    {
+        "handler": "omnigent.policies.function.make_fixed_action_callable",
+        "kind": "factory",
+    }
+]
+
+
+@pytest.fixture(autouse=True)
+def _register_test_policy_handlers() -> Iterator[None]:
+    from omnigent.policies.registry import load_registry
+
+    # HTTP uploads accept custom policies only when the server registers them.
+    load_registry([__name__])
+    yield
+    load_registry()
+
 
 # ── Guardrails specs ─────────────────────────────────────
 
@@ -118,30 +139,6 @@ async def _drain_elicitation_id(
                 assert isinstance(eid, str) and eid, f"missing id: {event!r}"
                 return eid
     raise AssertionError("subscribe loop ended without an elicitation event")
-
-
-def _tool_call_request(
-    tool_name: str = "Bash",
-    arguments: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """
-    Build a ``PHASE_TOOL_CALL`` policy-evaluate request body.
-
-    :param tool_name: Tool name, e.g. ``"Bash"``.
-    :param arguments: Tool arguments dict.
-    :returns: JSON body for ``POST /policies/evaluate``.
-    """
-    return {
-        "event": {
-            "type": "PHASE_TOOL_CALL",
-            "target": "",
-            "data": {
-                "name": tool_name,
-                "arguments": arguments or {},
-            },
-            "context": {},
-        },
-    }
 
 
 # ── Test 1: ASK on INPUT from YAML -> approve ───────────

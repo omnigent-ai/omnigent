@@ -120,6 +120,42 @@ async def test_delete_session(
     assert body["deleted"] is True
 
 
+async def test_delete_session_survives_blob_delete_failure(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failing attachment blob delete is logged; the session is still deleted."""
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+
+    file_store = SqlAlchemyFileStore(db_uri)
+    file_ids = [
+        file_store.create(f"f{i}.txt", 1, "text/plain", session_id=session_id).id for i in range(3)
+    ]
+    attempted: list[str] = []
+
+    def flaky_delete(self: LocalArtifactStore, key: str) -> None:
+        del self
+        attempted.append(key)
+        if key == file_ids[0]:
+            raise RuntimeError("Barnacle 500")
+
+    with (
+        patch.object(LocalArtifactStore, "delete", flaky_delete),
+        caplog.at_level(logging.WARNING),
+    ):
+        resp = await client.delete(f"/v1/sessions/{session_id}")
+
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] is True
+    assert sorted(attempted) == sorted(file_ids)
+    assert (await client.get(f"/v1/sessions/{session_id}")).status_code == 404
+    assert f"Failed to delete attachment blob {file_ids[0]} for session" in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
 async def test_delete_session_not_found(client: httpx.AsyncClient) -> None:
     """Deleting a nonexistent session returns 404."""
     resp = await client.delete("/v1/sessions/4fe12335002377c209e501c3fe3bcffc")
@@ -788,3 +824,18 @@ async def test_list_sessions_pinned_filter(
     assert plain.id not in ids
     # A pin belonging to another user must not appear for the caller.
     assert other_user_pin.id not in ids
+
+
+async def test_patch_rejects_forged_worktree_identity(
+    client: httpx.AsyncClient, session_id: str, db_uri: str
+) -> None:
+    """The cleanup identity must remain server-owned after creation."""
+    from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+
+    response = await client.patch(
+        f"/v1/sessions/{session_id}", json={"labels": {WORKTREE_ROOT_LABEL_KEY: "forged"}}
+    )
+    assert response.status_code == 400, response.text
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None
+    assert WORKTREE_ROOT_LABEL_KEY not in conv.labels

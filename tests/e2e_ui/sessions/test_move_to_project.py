@@ -13,7 +13,6 @@ end state must be the server's.
 from __future__ import annotations
 
 import contextlib
-import json
 import re
 import time
 import uuid
@@ -21,16 +20,14 @@ import uuid
 import httpx
 from playwright.sync_api import Page, expect
 
+from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import _build_hello_world_bundle
 
 
 def _seed_session(base_url: str, *, title: str) -> str:
     """Create an unfiled session with a unique *title*; return its id."""
-    create_resp = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", _build_hello_world_bundle(), "application/gzip")},
-        timeout=30.0,
+    create_resp = post_session_bundle(
+        httpx.post, f"{base_url}/v1/sessions", _build_hello_world_bundle(), timeout=30.0
     )
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]

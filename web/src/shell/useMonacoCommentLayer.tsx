@@ -13,6 +13,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { ADD_COMMENT_BUTTON_CLASS_NAME } from "./addCommentButtonStyles";
 import { AtSignIcon, MessageSquarePlusIcon } from "lucide-react";
 import type { OnMount } from "@monaco-editor/react";
 import type { Comment } from "@/hooks/useComments";
@@ -328,7 +329,7 @@ export function useMonacoCommentLayer({
           e.preventDefault();
           handleAddComment();
         }}
-        className="flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-sm font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+        className={ADD_COMMENT_BUTTON_CLASS_NAME}
       >
         <MessageSquarePlusIcon className="size-3.5" />
         Add comment
@@ -341,7 +342,7 @@ export function useMonacoCommentLayer({
             e.preventDefault();
             handleAttachToAgent();
           }}
-          className="flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-sm font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+          className={ADD_COMMENT_BUTTON_CLASS_NAME}
         >
           <AtSignIcon className="size-3.5" />
           Attach to agent

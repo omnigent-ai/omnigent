@@ -1,6 +1,6 @@
 /**
  * Scheduled tasks page (`/tasks`) — the list of the user's recurring agent
- * tasks, a search + Active/Paused filter, a "New task" manual-create action,
+ * tasks, a search + Active/Paused filter, a "New automation" manual-create action,
  * and a static Suggestions section below.
  *
  * Data comes from `useScheduledTasks`. Pause/resume and delete go through the
@@ -58,7 +58,7 @@ export function TasksPage() {
   const [editingTask, setEditingTask] = useState<ScheduledTask | null>(null);
   // Prefill for the manual create dialog when opened from a "Suggestions" chip.
   // Null → the normal manual path (empty fields). Cleared on dialog close so a
-  // stale prefill never leaks into a subsequent plain "New task" open.
+  // stale prefill never leaks into a subsequent plain "New automation" open.
   const [prefill, setPrefill] = useState<ScheduledTaskSuggestion["prefill"] | null>(null);
 
   function openManual() {
@@ -149,7 +149,7 @@ export function TasksPage() {
   const hasAnyTasks = (tasks ?? []).length > 0;
 
   return (
-    <PageScroll contentClassName="px-6">
+    <PageScroll contentClassName="px-4 md:px-6">
       <div className="mb-6 flex items-start justify-between gap-4">
         <div className="flex flex-col gap-1">
           <h1 className="text-2xl font-semibold">Automations</h1>
@@ -163,7 +163,7 @@ export function TasksPage() {
           onClick={openManual}
           componentId="tasks.new"
         >
-          New task
+          New automation
         </Button>
       </div>
 
@@ -183,7 +183,7 @@ export function TasksPage() {
           />
         </div>
         {hasAnyTasks && (
-          <div aria-label="Filter tasks" className="flex items-center gap-1">
+          <div aria-label="Filter automations" className="flex items-center gap-1">
             {FILTER_TABS.map((tab) => (
               <button
                 key={tab.value}
@@ -294,7 +294,7 @@ function EmptyState({
           <ClockIcon className="size-8 text-muted-foreground/50" />
           <p className="text-ui font-medium">No automations yet</p>
           <p className="max-w-sm text-sm text-muted-foreground">
-            Create a task to run an agent session automatically on a recurring schedule.
+            Create an automation to run an agent session automatically on a recurring schedule.
           </p>
           {showSuggestions && (
             <SuggestionsSection

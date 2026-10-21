@@ -1,10 +1,11 @@
 <!--
 For AI-written descriptions:
-- Follow this template (Related issue, Summary, Test Plan, Demo, Type of change, Test coverage, Coverage notes).
+- Follow this template (Related issue, Summary, Test Plan, Demo, Type of change, Test coverage, Coverage notes, Release notes, Changelog).
 - Keep it concise; explain the cause, fix, and proof once, in plain language.
 - For non-trivial changes, open the Summary with a 1–2 sentence ELI5; add a diagram when it
   makes a relationship or sequence easier to follow.
-- Keep every section and checkbox row in place so reviewers can skim them.
+- Keep every section and checkbox row in place, except Changelog when instructed below.
+- Choose exactly one Release notes checkbox; if Yes, write the entry in Changelog.
 - For UI changes (the "UI / frontend change" box below), fill in the Demo
   section: attach a screenshot or screen recording of the new behaviour.
 -->
@@ -72,6 +73,24 @@ Optional — but required if you checked "Manual verification completed" or
 test coverage is not needed for this change.
 -->
 
+## Release notes
+
+Should this change be included in the release notes? Choose exactly one.
+
+- [ ] No — no noteworthy user-facing change.
+- [ ] Yes — include the entry in the Changelog section.
+
+<!--
+Choose Yes only for outstanding user-facing features, bug fixes, UX changes,
+and breaking changes. Breaking changes must choose Yes and explain the
+compatibility impact in Changelog. Features behind a feature flag are eligible
+only once the flag is enabled for users.
+Choose No for small fixes or improvements, features behind disabled flags, and
+internal changes such as CI, refactors, test-only changes, or dependency bumps
+with no user impact. Keep this section and both checkboxes.
+This records the author's recommendation; maintainers curate the release notes.
+-->
+
 ## Changelog
 
 <!--
@@ -80,13 +99,10 @@ is taken from the "Type of change" boxes above (e.g. UI / frontend change render
 as "[UI] <your line>"), so don't repeat it here — just describe the change. The
 PR link and author credit are added for you.
 
-Lower the bar than docs: DO keep this for small features and UX changes
-(moved/renamed buttons, new flags, copy tweaks).
-
-DELETE THIS WHOLE SECTION if the change isn't noteworthy (CI, refactors,
-test-only changes, dependency bumps with no user impact). The complete changelog
-will use the PR title and still credit the author. A Breaking change must always
-keep this section.
+If you chose Yes in Release notes, replace the placeholder with your entry.
+If you chose No, DELETE THIS WHOLE SECTION. The complete changelog will still
+use the PR title and credit the author. A Breaking change must always keep
+this section.
 
 Example:  `omnigent run --watch` reruns an agent when files change
 -->

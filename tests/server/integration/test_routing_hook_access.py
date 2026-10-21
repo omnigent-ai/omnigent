@@ -9,12 +9,10 @@ must require is the one ``POST /v1/sessions/{id}/events`` requires.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
 import pytest
-import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.runtime.agent_cache import AgentCache
@@ -25,7 +23,6 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
-from tests.server.conftest import ControllableMockClient
 
 pytestmark = pytest.mark.asyncio
 
@@ -68,33 +65,6 @@ def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         permission_store=SqlAlchemyPermissionStore(db_uri),
         auth_provider=UnifiedAuthProvider(source="header"),
     )
-
-
-@pytest_asyncio.fixture()
-async def auth_client(
-    auth_app: FastAPI,
-    mock_llm: ControllableMockClient,
-    tmp_path: Path,
-) -> AsyncIterator[httpx.AsyncClient]:
-    """Async client wired to the auth-enabled app.
-
-    :param auth_app: The auth-enabled app.
-    :param mock_llm: Controllable mock LLM, released on teardown.
-    :param tmp_path: Pytest temp dir for the harness process manager.
-    :yields: A ready-to-use client.
-    """
-    from omnigent.runtime import set_harness_process_manager
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-
-    pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
-    await pm.start()
-    set_harness_process_manager(pm)
-    transport = httpx.ASGITransport(app=auth_app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c
-    mock_llm.release_all()
-    set_harness_process_manager(None)
-    await pm.shutdown()
 
 
 @pytest.mark.parametrize(
