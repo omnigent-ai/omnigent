@@ -83,6 +83,7 @@ async def test_create_posts_payload() -> None:
                 "agent_id": "ag_1",
                 "workspace": "/repo",
                 "host_id": "host_1",
+                "reuse_conversation": True,
                 "base_branch": "main",
                 "unexpected": "dropped",
             }
@@ -98,6 +99,7 @@ async def test_create_posts_payload() -> None:
         "agent_id": "ag_1",
         "workspace": "/repo",
         "host_id": "host_1",
+        "reuse_conversation": True,
     }  # unknown fields filtered out
     assert json.loads(out)["id"] == "t1"
 
@@ -251,3 +253,22 @@ def test_tools_in_dispatch_and_relay_sets() -> None:
     assert _SCHEDULED_TASK_TOOLS == _ALL_NAMES
     assert _ALL_NAMES <= _ALL_LOCAL_TOOLS
     assert _ALL_NAMES <= _NATIVE_RELAY_BUILTIN_TOOLS
+
+
+@pytest.mark.asyncio
+async def test_update_forwards_conversation_reuse_fields() -> None:
+    """``reuse_conversation`` / ``reset_conversation`` reach the PATCH body."""
+    client = _RecordingClient(_Resp(body={"id": "t1"}))
+    await _execute_scheduled_task_tool(
+        "sys_scheduled_task_update",
+        json.dumps(
+            {
+                "scheduled_task_id": _TASK_ID,
+                "reuse_conversation": True,
+                "reset_conversation": True,
+            }
+        ),
+        server_client=client,
+    )
+    _, _, body = client.calls[0]
+    assert body == {"reuse_conversation": True, "reset_conversation": True}

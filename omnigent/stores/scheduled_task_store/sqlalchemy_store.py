@@ -59,6 +59,7 @@ def _to_entity(row: SqlScheduledTask) -> ScheduledTask:
         reasoning_effort=row.reasoning_effort,
         permission_mode=row.permission_mode,
         max_cost_usd=row.max_cost_usd,
+        reuse_conversation=row.reuse_conversation,
         workspace=row.workspace,
         base_branch=row.base_branch,
         execution_target=decode_scheduled_task_execution_target(row.execution_target),
@@ -140,6 +141,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         reasoning_effort: str | None = None,
         permission_mode: str | None = None,
         max_cost_usd: float | None = None,
+        reuse_conversation: bool = False,
         workspace: str | None = None,
         host_id: str | None = None,
         execution_target: str = "connected_host",
@@ -163,6 +165,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 reasoning_effort=reasoning_effort,
                 permission_mode=permission_mode,
                 max_cost_usd=max_cost_usd,
+                reuse_conversation=reuse_conversation,
                 workspace=workspace,
                 base_branch=None,
                 execution_target=encode_scheduled_task_execution_target(execution_target),
@@ -271,6 +274,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         reasoning_effort: str | None = _UNSET,
         permission_mode: str | None = _UNSET,
         max_cost_usd: float | None = _UNSET,
+        reuse_conversation: bool | None = None,
         workspace: str | None = _UNSET,
         host_id: str | None = _UNSET,
         execution_target: str | None = None,
@@ -328,6 +332,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 changed = True
             if max_cost_usd is not _UNSET and row.max_cost_usd != max_cost_usd:
                 row.max_cost_usd = max_cost_usd
+                changed = True
+            if reuse_conversation is not None and row.reuse_conversation != reuse_conversation:
+                row.reuse_conversation = reuse_conversation
                 changed = True
             if workspace is not _UNSET and row.workspace != workspace:
                 row.workspace = workspace

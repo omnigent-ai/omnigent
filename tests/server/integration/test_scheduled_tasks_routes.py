@@ -1794,3 +1794,47 @@ async def test_run_now_503_when_scheduler_not_running(
     auth_app.state.scheduled_task_run_now = None
     resp = await auth_client.post(f"/v1/scheduled-tasks/{created['id']}/run", headers=_headers())
     assert resp.status_code == 503, resp.text
+
+
+async def test_reuse_conversation_round_trips_and_reset_forgets_the_conversation(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Reuse is opt-in on create, and ``reset_conversation`` clears what it continues."""
+    _make_user(db_uri)
+    default = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    assert default["reuse_conversation"] is False
+
+    created = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(reuse_conversation=True),
+            headers=_headers(),
+        )
+    ).json()
+    assert created["reuse_conversation"] is True
+    task_id = created["id"]
+    SqlAlchemyScheduledTaskStore(db_uri).update(task_id, last_run_conversation_id="ab" * 16)
+
+    renamed = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}", json={"name": "renamed"}, headers=_headers()
+    )
+    assert renamed.json()["reuse_conversation"] is True
+    assert renamed.json()["last_run_conversation_id"] == "ab" * 16
+
+    reset = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}",
+        json={"reset_conversation": True},
+        headers=_headers(),
+    )
+    assert reset.status_code == 200, reset.text
+    assert reset.json()["last_run_conversation_id"] is None
+    assert reset.json()["reuse_conversation"] is True
+
+    disabled = await auth_client.patch(
+        f"/v1/scheduled-tasks/{task_id}",
+        json={"reuse_conversation": False},
+        headers=_headers(),
+    )
+    assert disabled.json()["reuse_conversation"] is False

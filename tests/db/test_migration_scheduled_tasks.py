@@ -62,6 +62,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "model_override",
         "reasoning_effort",
         "permission_mode",
+        "reuse_conversation",
         "max_cost_usd",
         "workspace",
         "base_branch",

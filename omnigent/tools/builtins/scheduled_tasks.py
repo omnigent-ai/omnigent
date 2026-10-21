@@ -112,6 +112,14 @@ class SysScheduledTaskCreateTool(Tool):
                                 "blocked once the limit is reached. Omit for no cap."
                             ),
                         },
+                        "reuse_conversation": {
+                            "type": "boolean",
+                            "description": (
+                                "Optional. When true, every run after the first sends the "
+                                "prompt into the previous run's conversation, keeping its "
+                                "context, instead of starting a new session. Default false."
+                            ),
+                        },
                         "workspace": {
                             "type": "string",
                             "description": (
@@ -241,6 +249,20 @@ class SysScheduledTaskUpdateTool(Tool):
                             "type": "number",
                             "description": (
                                 "New per-firing cost budget in USD. Null clears the cap."
+                            ),
+                        },
+                        "reuse_conversation": {
+                            "type": "boolean",
+                            "description": (
+                                "Continue the previous run's conversation on each run "
+                                "(true) or start a new session per run (false)."
+                            ),
+                        },
+                        "reset_conversation": {
+                            "type": "boolean",
+                            "description": (
+                                "True makes the next run of a reusing task start a new "
+                                "conversation, e.g. after the reused one was deleted."
                             ),
                         },
                         "workspace": {

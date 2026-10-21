@@ -52,6 +52,7 @@ class ScheduledTaskStore(ABC):
         reasoning_effort: str | None = None,
         permission_mode: str | None = None,
         max_cost_usd: float | None = None,
+        reuse_conversation: bool = False,
         workspace: str | None = None,
         host_id: str | None = None,
         execution_target: str = "connected_host",
@@ -74,6 +75,8 @@ class ScheduledTaskStore(ABC):
         :param permission_mode: Optional native-harness permission mode
             (Claude Code), e.g. ``"acceptEdits"``.
         :param max_cost_usd: Optional per-firing cost budget in USD.
+        :param reuse_conversation: Continue the last run's conversation on
+            each later firing instead of creating a new one.
         :param workspace: Runner start path (source repo / working dir).
         :param host_id: The connected host to pin the run to.
         :param execution_target: ``"connected_host"`` (default) or
@@ -142,6 +145,7 @@ class ScheduledTaskStore(ABC):
         reasoning_effort: str | None = _UNSET,
         permission_mode: str | None = _UNSET,
         max_cost_usd: float | None = _UNSET,
+        reuse_conversation: bool | None = None,
         workspace: str | None = _UNSET,
         host_id: str | None = _UNSET,
         execution_target: str | None = None,

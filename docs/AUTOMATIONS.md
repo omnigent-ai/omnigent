@@ -10,7 +10,7 @@ There are three surfaces, all writing the same rows.
 
 **Web UI.** Open the `/tasks` page (sidebar: *Automations*, or the command palette: *Go to Automations*). The create dialog takes the schedule, the agent, the prompt, and optionally a model and reasoning effort. When the server supports managed sandboxes, the host picker also offers a new sandbox for each run. Each row shows the schedule and, when armed, a live relative next-run time. The API exposes the last run's status as `last_run_status`; the row does not display it.
 
-**REST API.** `POST /v1/scheduled-tasks`. Required: `name`, `prompt`, `rrule`, `agent_id`. Optional: `timezone` (defaults to `UTC`), `model_override`, `reasoning_effort`, `permission_mode`, `max_cost_usd`, `workspace`, `host_id`, `execution_target` (defaults to `connected_host`). Unknown fields are rejected. For `connected_host`, the two optional targeting fields are not independent: sending a `workspace` without a `host_id` is a 400 (`host_id required when workspace is set`), because only a host can resolve a path. Sending neither is fine -- the fire resolves both. Existing managed sandbox hosts cannot be pinned or automatically selected for connected-host runs.
+**REST API.** `POST /v1/scheduled-tasks`. Required: `name`, `prompt`, `rrule`, `agent_id`. Optional: `timezone` (defaults to `UTC`), `model_override`, `reasoning_effort`, `permission_mode`, `max_cost_usd`, `reuse_conversation` (defaults to `false`), `workspace`, `host_id`, `execution_target` (defaults to `connected_host`). Unknown fields are rejected. For `connected_host`, the two optional targeting fields are not independent: sending a `workspace` without a `host_id` is a 400 (`host_id required when workspace is set`), because only a host can resolve a path. Sending neither is fine -- the fire resolves both. Existing managed sandbox hosts cannot be pinned or automatically selected for connected-host runs.
 
 To provision a fresh sandbox per firing, set `execution_target: "managed_sandbox"` and omit `host_id` and `workspace`. This requires managed sandboxes to be configured on the server; otherwise creation is rejected. Each sandbox uses the server's normal runner-idle and provider keepalive settings.
 
@@ -30,7 +30,18 @@ To provision a fresh sandbox per firing, set `execution_target: "managed_sandbox
 
 `max_cost_usd` is a positive per-firing budget. Each fired session gets its own cost-budget policy, which blocks subsequent requests and tool calls once recorded spend reaches the cap. It does not interrupt an in-progress model turn: spend can overshoot before the next check, and denying a native tool call does not terminate the turn. Omit the field to attach no automation-specific cap; other applicable policies still apply.
 
-**Agent tools.** An agent can manage automations itself with `sys_scheduled_task_create`, `sys_scheduled_task_list`, `sys_scheduled_task_update`, and `sys_scheduled_task_delete` -- so an agent can schedule its own follow-up work. The create and update tools expose the same `permission_mode`, `max_cost_usd`, and `execution_target` controls. Because they persist or change unattended work, every agent call to `sys_scheduled_task_create` or `sys_scheduled_task_update` parks on an approval prompt in the session, even when no other guardrails apply. The prompt lists the requested settings (agent, schedule, timezone, host, execution target, permission mode, cost cap) and the prompt's length, and the card's argument preview shows the request itself, truncated after 1,024 characters; review them before approving. This also holds inside an automation's own run: if its agent creates or updates another automation, that call waits for approval too and is denied when nobody answers before the approval timeout. `sys_scheduled_task_list` and `sys_scheduled_task_delete` are not gated this way, and changes you make directly in the UI or REST API keep their existing authorization rules.
+**Continuing one conversation.** By default every firing starts a new session. With `reuse_conversation: true`, the first firing creates a session as usual and each later firing sends the prompt into the session recorded in `last_run_conversation_id`, so the agent keeps the context of earlier runs. In the dialog this is **Continue the same conversation each run**. A reused session keeps the agent, host, workspace, model and permission mode it was created with; changes to those task settings apply only once a new session starts. `max_cost_usd` stays per firing: each firing caps the session at its spend so far plus the budget. The firing never silently starts a replacement session:
+
+| Situation | Run | `error_code` |
+| --- | --- | --- |
+| The previous run is still `running`, or the session is mid-turn or waiting on an approval | `skipped` | `reused_conversation_busy` |
+| The session was deleted | `failed` | `reused_conversation_missing` |
+| The session is archived | `failed` | `reused_conversation_archived` |
+| The task now uses a different agent, or pins a different host or workspace | `failed` | `reused_conversation_incompatible` |
+
+Unarchive the session, or send `reset_conversation: true` in a `PATCH` (**Start a new conversation on the next run** in the edit dialog), so the next firing creates a new session. A `running` run fired more than 10 minutes ago, on a session that is not mid-turn, lost its prompt or its completion (for example to a server restart). It is failed as `incomplete` and no longer blocks the session.
+
+**Agent tools.** An agent can manage automations itself with `sys_scheduled_task_create`, `sys_scheduled_task_list`, `sys_scheduled_task_update`, and `sys_scheduled_task_delete` -- so an agent can schedule its own follow-up work. The create and update tools expose the same `permission_mode`, `max_cost_usd`, `reuse_conversation`, and `execution_target` controls, and the update tool also takes `reset_conversation`. Because they persist or change unattended work, every agent call to `sys_scheduled_task_create` or `sys_scheduled_task_update` parks on an approval prompt in the session, even when no other guardrails apply. The prompt lists the requested settings (agent, schedule, timezone, host, execution target, permission mode, cost cap) and the prompt's length, and the card's argument preview shows the request itself, truncated after 1,024 characters; review them before approving. This also holds inside an automation's own run: if its agent creates or updates another automation, that call waits for approval too and is denied when nobody answers before the approval timeout. `sys_scheduled_task_list` and `sys_scheduled_task_delete` are not gated this way, and changes you make directly in the UI or REST API keep their existing authorization rules.
 
 Agent calls to `sys_scheduled_task_create` and `sys_scheduled_task_update`
 require interactive approval before persisting future work. Review the agent,
@@ -91,6 +102,8 @@ Two timing caveats are worth knowing:
 5. **The runner launches and the prompt is dispatched**, so the agent actually works. A seeded prompt with no launched runner would just sit in history.
 6. **The run is recorded** in `scheduled_task_runs`, and `last_run_at` and `last_run_conversation_id` are stamped on the task.
 
+For a task with `reuse_conversation` and a recorded `last_run_conversation_id`, steps 2 to 4 are replaced: the existing session is checked as described in [Continuing one conversation](#creating-an-automation), its runner is woken the way a user message would wake it, and the prompt is dispatched into it.
+
 Firing is fire-and-forget: the guard steps run synchronously so a dead fire costs nothing, then session creation and launch move to a background task and the scheduler re-arms immediately. A failure in that background work is logged and never crashes the scheduler.
 
 ## Run history
@@ -128,7 +141,7 @@ Switching to `execution_target: "managed_sandbox"` clears both stored pins. Omit
 | `POST` | `/v1/scheduled-tasks/{id}/run` | Run now (202). |
 | `GET` | `/v1/scheduled-tasks/{id}/runs` | Run history. |
 
-A task response carries `id`, `name`, `prompt`, `rrule`, `owner_user_id`, `agent_id`, `timezone`, `created_at`, `model_override`, `reasoning_effort`, `permission_mode`, `max_cost_usd`, `workspace`, `host_id`, `execution_target`, `state`, `last_run_at`, `last_run_status`, `last_run_conversation_id`, `next_run_at`, and `updated_at`.
+A task response carries `id`, `name`, `prompt`, `rrule`, `owner_user_id`, `agent_id`, `timezone`, `created_at`, `model_override`, `reasoning_effort`, `permission_mode`, `max_cost_usd`, `reuse_conversation`, `workspace`, `host_id`, `execution_target`, `state`, `last_run_at`, `last_run_status`, `last_run_conversation_id`, `next_run_at`, and `updated_at`.
 
 ## Current limits
 

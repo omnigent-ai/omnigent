@@ -55,6 +55,9 @@ class ScheduledTask:
         blocks all models once cumulative spend reaches this limit. ``None``
         means no per-firing cost cap (the session runs unconstrained unless the
         agent spec or server-wide defaults impose one).
+    :param reuse_conversation: When ``True``, each firing after the first sends
+        its prompt into ``last_run_conversation_id`` instead of creating a new
+        conversation. ``False`` (default) starts a fresh conversation per fire.
     :param workspace: Absolute existing path where a fired session's connected
         host runner should start. ``None`` only for legacy or invalid rows.
     :param base_branch: Reserved legacy column; scheduled tasks currently do
@@ -67,8 +70,9 @@ class ScheduledTask:
         ``"deleted"``. Defaults to ``"active"``.
     :param last_run_at: Unix epoch seconds of the most recent firing, or
         ``None`` if it has never fired.
-    :param last_run_conversation_id: Conversation created by the most recent
-        firing, or ``None``.
+    :param last_run_conversation_id: Conversation used by the most recent
+        firing, or ``None``. With ``reuse_conversation`` it is the conversation
+        the next firing continues.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
     """
@@ -86,6 +90,7 @@ class ScheduledTask:
     reasoning_effort: str | None = None
     permission_mode: str | None = None
     max_cost_usd: float | None = None
+    reuse_conversation: bool = False
     workspace: str | None = None
     base_branch: str | None = None
     execution_target: str = "connected_host"

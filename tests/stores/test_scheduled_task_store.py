@@ -53,6 +53,7 @@ def test_create_returns_scheduled_task_with_all_fields(
         model_override="claude-opus-4-7",
         reasoning_effort="high",
         permission_mode="acceptEdits",
+        reuse_conversation=True,
         workspace="/home/alice/repo",
         host_id=_uid("host_abc123"),
     )
@@ -67,6 +68,7 @@ def test_create_returns_scheduled_task_with_all_fields(
     assert task.model_override == "claude-opus-4-7"
     assert task.reasoning_effort == "high"
     assert task.permission_mode == "acceptEdits"
+    assert task.reuse_conversation is True
     assert task.workspace == "/home/alice/repo"
     assert task.base_branch is None
     assert task.execution_target == "connected_host"
@@ -92,6 +94,7 @@ def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
     assert task.model_override is None
     assert task.reasoning_effort is None
     assert task.permission_mode is None
+    assert task.reuse_conversation is False
     assert task.workspace is None
     assert task.base_branch is None
     assert task.execution_target == "connected_host"
@@ -1292,3 +1295,22 @@ def test_get_running_run_by_conversation_is_workspace_scoped(
     with workspace_scope(11):
         found = store.get_running_run_by_conversation(_uid("conv_ws"))
         assert found is not None and found.id == _uid("run_ws")
+
+
+def test_update_toggles_reuse_conversation(store: SqlAlchemyScheduledTaskStore) -> None:
+    """``reuse_conversation`` flips both ways; omitting it leaves it unchanged."""
+    task = store.create(
+        scheduled_task_id=_uid("st_reuse"),
+        name="reuse",
+        prompt="continue",
+        rrule="FREQ=DAILY",
+        user_id="bob@example.com",
+        agent_id=_uid("ag_reuse"),
+        timezone="UTC",
+    )
+    enabled = store.update(task.id, reuse_conversation=True)
+    assert enabled is not None and enabled.reuse_conversation is True
+    renamed = store.update(task.id, name="still reusing")
+    assert renamed is not None and renamed.reuse_conversation is True
+    disabled = store.update(task.id, reuse_conversation=False)
+    assert disabled is not None and disabled.reuse_conversation is False

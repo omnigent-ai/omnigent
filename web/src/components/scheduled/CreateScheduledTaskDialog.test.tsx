@@ -193,6 +193,7 @@ function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask>
     modelOverride: null,
     reasoningEffort: null,
     permissionMode: null,
+    reuseConversation: false,
     workspace: null,
     hostId: null,
     executionTarget: "connected_host",
@@ -1047,5 +1048,47 @@ describe("shouldGuardDialogDismiss (backdrop click closes; dropdown-dismiss guar
     expect(shouldGuardDialogDismiss(plain, { selectOpen: false, msSinceSelectClose: 500 })).toBe(
       false,
     );
+  });
+});
+
+describe("CreateScheduledTaskDialog conversation reuse", () => {
+  it("sends reuseConversation only when the box is ticked on create", async () => {
+    renderDialog();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Do it" } });
+    fireEvent.click(screen.getByTestId("task-reuse-conversation"));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).toMatchObject({ reuseConversation: true });
+  });
+
+  it("offers a reset only for a reusing task with a conversation, and sends it", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ reuseConversation: true, lastRunConversationId: "conv_1" })}
+      />,
+    );
+    expect(screen.getByTestId("task-reuse-conversation")).toBeChecked();
+    fireEvent.click(screen.getByTestId("task-reset-conversation"));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const { input } = updateMutateAsync.mock.calls[0][0];
+    expect(input.resetConversation).toBe(true);
+    expect(input).not.toHaveProperty("reuseConversation");
+  });
+
+  it("hides the reset when the task has no conversation to continue yet", () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ reuseConversation: true })}
+      />,
+    );
+    expect(screen.queryByTestId("task-reset-conversation")).toBeNull();
   });
 });

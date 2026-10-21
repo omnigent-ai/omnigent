@@ -51,6 +51,8 @@ export interface ScheduledTask {
    * `--permission-mode` launch arg from it at fire time.
    */
   permissionMode: string | null;
+  /** Each run after the first continues `lastRunConversationId` instead of a new session. */
+  reuseConversation: boolean;
   /** Pinned absolute workspace, or `null` (server defaults to the host home). */
   workspace: string | null;
   /** Pinned host, or `null` (server resolves the connected host at fire time). */
@@ -101,6 +103,8 @@ export interface CreateScheduledTaskInput {
   reasoningEffort?: string | null;
   /** Native-harness permission mode (Claude Code); omit for the agent default. */
   permissionMode?: string | null;
+  /** Continue the previous run's conversation on each later run. */
+  reuseConversation?: boolean;
   /** Optional pinned workspace; only valid together with `hostId`. */
   workspace?: string | null;
   /** Optional pinned host. */
@@ -133,6 +137,9 @@ export interface UpdateScheduledTaskInput {
   modelOverride?: string | null;
   reasoningEffort?: string | null;
   permissionMode?: string | null;
+  reuseConversation?: boolean;
+  /** `true` makes the next run of a reusing task start a new conversation. */
+  resetConversation?: boolean;
   workspace?: string;
   hostId?: string;
   /**
@@ -157,6 +164,7 @@ interface ScheduledTaskWire {
   model_override: string | null;
   reasoning_effort: string | null;
   permission_mode: string | null;
+  reuse_conversation?: boolean;
   workspace: string | null;
   host_id: string | null;
   execution_target: ScheduledTaskExecutionTarget;
@@ -233,6 +241,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     modelOverride: wire.model_override,
     reasoningEffort: wire.reasoning_effort,
     permissionMode: wire.permission_mode,
+    reuseConversation: wire.reuse_conversation ?? false,
     workspace: wire.workspace,
     hostId: wire.host_id,
     executionTarget: wire.execution_target,
@@ -294,6 +303,7 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.modelOverride != null) body.model_override = input.modelOverride;
   if (input.reasoningEffort != null) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode != null) body.permission_mode = input.permissionMode;
+  if (input.reuseConversation) body.reuse_conversation = true;
   if (input.workspace != null) body.workspace = input.workspace;
   if (input.hostId != null) body.host_id = input.hostId;
   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
@@ -323,6 +333,8 @@ export async function updateScheduledTask(
   if (input.modelOverride !== undefined) body.model_override = input.modelOverride;
   if (input.reasoningEffort !== undefined) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode !== undefined) body.permission_mode = input.permissionMode;
+  if (input.reuseConversation !== undefined) body.reuse_conversation = input.reuseConversation;
+  if (input.resetConversation) body.reset_conversation = true;
   if (input.workspace !== undefined) body.workspace = input.workspace;
   if (input.hostId !== undefined) body.host_id = input.hostId;
   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;

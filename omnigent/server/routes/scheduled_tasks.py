@@ -69,6 +69,8 @@ class CreateScheduledTaskRequest(BaseModel):
     # path derives the runner's --permission-mode launch arg from it.
     permission_mode: str | None = None
     max_cost_usd: float | None = Field(default=None, gt=0)
+    # Continue the previous run's conversation on each later fire.
+    reuse_conversation: bool = False
     # Optional: no PINNED host/workspace. When both are unset the fire path
     # resolves the owner's online host at fire time and defaults the workspace to
     # that host's home directory (a failed run is recorded if none is online) —
@@ -110,6 +112,10 @@ class UpdateScheduledTaskRequest(BaseModel):
     reasoning_effort: str | None = None
     permission_mode: str | None = None
     max_cost_usd: float | None = Field(default=None, gt=0)  # null clears the cap
+    reuse_conversation: bool | None = None
+    # Forget the conversation a reusing task continues, so the next fire starts
+    # a new one (e.g. after that conversation was deleted or archived).
+    reset_conversation: bool = False
     workspace: str | None = Field(default=None, min_length=1)
     host_id: str | None = Field(default=None, min_length=1)
     execution_target: str | None = Field(default=None, min_length=1)
@@ -170,6 +176,7 @@ def _to_response(
         "reasoning_effort": task.reasoning_effort,
         "permission_mode": task.permission_mode,
         "max_cost_usd": task.max_cost_usd,
+        "reuse_conversation": task.reuse_conversation,
         "workspace": task.workspace,
         "host_id": task.host_id,
         "execution_target": task.execution_target,
@@ -399,6 +406,7 @@ def create_scheduled_tasks_router(
                 reasoning_effort=reasoning_effort,
                 permission_mode=permission_mode,
                 max_cost_usd=body.max_cost_usd,
+                reuse_conversation=body.reuse_conversation,
                 workspace=workspace,
                 host_id=body.host_id,
                 execution_target=body.execution_target,
@@ -566,6 +574,10 @@ def create_scheduled_tasks_router(
         if body.timezone is not None:
             _validate_timezone_or_400(body.timezone)
         fields = body.model_dump(exclude_unset=True)
+        if "reuse_conversation" in fields and fields["reuse_conversation"] is None:
+            del fields["reuse_conversation"]
+        if fields.pop("reset_conversation", False):
+            fields["last_run_conversation_id"] = None
         target_agent_id = fields.get("agent_id") or existing.agent_id
         agent_changed = target_agent_id != existing.agent_id
         new_copy: Agent | None = None
