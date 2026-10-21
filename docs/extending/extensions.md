@@ -5,6 +5,9 @@ validated application metadata. V1 supports namespaced browser pages and links
 in the primary sidebar, portable agent packs, reusable policy presets, and
 operator-enabled server lifecycle observers.
 
+Start with the [team extension guide](team-extensions.md) for the architecture,
+package walkthrough, activation controls, and upgrade behavior.
+
 ## Trust model
 
 Installing a Python distribution is a full-code-trust operation: Python entry
