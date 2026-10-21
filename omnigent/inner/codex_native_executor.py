@@ -19,6 +19,7 @@ from websockets.exceptions import WebSocketException
 from omnigent.debug_logging import debug_event
 from omnigent.harnesses.codex_native import side_chat
 from omnigent.harnesses.codex_native.app_server import (
+    _MODEL_CATALOG_UNREAD,
     CodexAppServerClient,
     CodexAppServerResponseError,
     CodexMessage,
@@ -350,14 +351,19 @@ async def _start_codex_turn(
         or unmirrored.get("model")
         or await asyncio.to_thread(read_codex_config_model, bridge_dir)
     )
-    model_catalog: object = None
-    if isinstance(model, str):
+    model_catalog: object = _MODEL_CATALOG_UNREAD
+    requested_model = settings_overrides.get("model")
+    if isinstance(requested_model, str) and requested_model:
         account_model, model_catalog = await resolve_codex_chatgpt_model(
-            client, model, codex_home=Path(state.codex_home), transport=state.socket_path
+            client,
+            requested_model,
+            thread_id=state.thread_id,
+            codex_home=Path(state.codex_home),
+            transport=state.socket_path,
         )
-        if account_model != model:
-            model = account_model
+        if account_model != requested_model:
             settings_overrides["model"] = account_model
+        model = account_model
     effort = (
         settings_overrides.get("effort")
         or unmirrored.get("effort")

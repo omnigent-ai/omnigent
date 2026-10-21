@@ -845,6 +845,15 @@ def codex_chatgpt_model_id(
     """Use an account's catalog spelling only for its built-in OpenAI route."""
     if model is None or not model.startswith(("system.ai.", "databricks-")):
         return model
+    # An unpinned resume can retain a different provider from its saved thread.
+    launch = NativeCodexLaunch(list(reversed(config_overrides)), model, None)
+    try:
+        if not native_codex_launch_pins_model_provider(launch) or (
+            codex_session_meta_model_provider(launch) != "openai"
+        ):
+            return model
+    except ValueError:
+        return model
     if not _codex_uses_chatgpt_models(codex_home, config_overrides, env=env):
         return model
     models = catalog.get("models") if isinstance(catalog, dict) else catalog
@@ -901,10 +910,12 @@ async def resolve_codex_chatgpt_model(
     client: CodexAppServerClient,
     model: str,
     *,
+    thread_id: str,
     codex_home: Path,
     transport: str | None = None,
+    deadline: float | None = None,
 ) -> tuple[str, object]:
-    """Translate an account alias and share its capability read with effort validation."""
+    """Confirm the loaded account thread before translating an explicit gateway alias."""
     if not model.startswith(("system.ai.", "databricks-")):
         return model, _MODEL_CATALOG_UNREAD
     from omnigent.onboarding.ambient import codex_auth_effective_mode
@@ -915,18 +926,34 @@ async def resolve_codex_chatgpt_model(
         return model, _MODEL_CATALOG_UNREAD
     if mode != "chatgpt":
         return model, _MODEL_CATALOG_UNREAD
+    loop = asyncio.get_running_loop()
+    remaining = (
+        min(deadline - loop.time(), _EFFORT_CATALOG_TIMEOUT_SECONDS)
+        if deadline is not None
+        else _EFFORT_CATALOG_TIMEOUT_SECONDS
+    )
+    if remaining <= 0:
+        return model, _MODEL_CATALOG_UNREAD
+    catalog_attempted = False
     try:
-        config = await asyncio.wait_for(
-            _read_codex_effective_config(client), timeout=_EFFORT_CATALOG_TIMEOUT_SECONDS
-        )
+        async with asyncio.timeout(remaining):
+            config = await _read_codex_effective_config(client)
+            if config is None or not await asyncio.to_thread(
+                _codex_uses_chatgpt_models, codex_home, config=config
+            ):
+                return model, _MODEL_CATALOG_UNREAD
+            response = await client.request(
+                "thread/read", {"threadId": thread_id, "includeTurns": False}
+            )
+            result = response.get("result")
+            thread = result.get("thread") if isinstance(result, dict) else None
+            if not isinstance(thread, dict) or thread.get("modelProvider") != "openai":
+                return model, _MODEL_CATALOG_UNREAD
+            catalog_attempted = True
+            catalog = await _codex_model_capabilities(client, model, transport=transport)
+            return codex_reachable_model_slug(model, catalog or []) or model, catalog
     except Exception:  # noqa: BLE001 - missing route evidence leaves the model unchanged
-        return model, _MODEL_CATALOG_UNREAD
-    if config is None or not await asyncio.to_thread(
-        _codex_uses_chatgpt_models, codex_home, config=config
-    ):
-        return model, _MODEL_CATALOG_UNREAD
-    catalog = await _codex_model_capabilities(client, model, transport=transport)
-    return codex_reachable_model_slug(model, catalog or []) or model, catalog
+        return model, None if catalog_attempted else _MODEL_CATALOG_UNREAD
 
 
 async def resolve_codex_effort_for_model(

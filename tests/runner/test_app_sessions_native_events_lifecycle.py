@@ -86,6 +86,11 @@ class _RecordingCodexAppServerClient:
         self.requests: list[tuple[str, dict[str, Any]]] = []
         self.model_list_responses: list[dict[str, Any]] = []
         self.model_config: dict[str, Any] | None = None
+        self.thread_provider: str | None = None
+        self.thread_model: str | None = None
+        self.thread_read_error: Exception | None = None
+        self.settings_error_once: Exception | None = None
+        self.resume_provider: str | None = None
 
     async def connect(self) -> None:
         """
@@ -104,9 +109,22 @@ class _RecordingCodexAppServerClient:
             ``{"threadId": "thread_123", "turnId": "turn_123"}``.
         :returns: Empty successful JSON-RPC result.
         """
-        self.requests.append((method, params))
+        self.requests.append((method, dict(params)))
+        if method == "thread/read" and self.thread_read_error is not None:
+            raise self.thread_read_error
+        if method == "thread/settings/update" and self.settings_error_once is not None:
+            error, self.settings_error_once = self.settings_error_once, None
+            raise error
+        if method == "thread/resume":
+            self.thread_read_error = None
+            if self.resume_provider is not None:
+                self.thread_provider = self.resume_provider
+        if method == "thread/settings/update" and isinstance(params.get("model"), str):
+            self.thread_model = params["model"]
         if method == "config/read" and self.model_config is not None:
             return {"result": {"config": self.model_config}}
+        if method == "thread/read" and self.thread_provider is not None:
+            return {"result": {"thread": {"modelProvider": self.thread_provider}}}
         if method == "model/list" and self.model_list_responses:
             return self.model_list_responses.pop(0)
         return {"result": {}}
@@ -521,6 +539,7 @@ async def test_codex_native_model_switch_inherits_an_effort_whose_config_write_f
     )
     fake = _RecordingCodexAppServerClient(transport, "effort-test")
     fake.model_config = {"model_provider": "openai"}
+    fake.thread_provider = "openai"
     fake.model_list_responses = [
         {
             "result": {
@@ -590,9 +609,25 @@ async def test_codex_native_model_switch_inherits_an_effort_whose_config_write_f
             "system.ai.gpt-5-4",
             "high",
             {"type": "effort_change", "effort": "high"},
-            "gpt-5.4",
+            "system.ai.gpt-5-4",
             "high",
             id="inherited_account_alias",
+        ),
+        pytest.param(
+            "gpt-6-sol",
+            "high",
+            {"type": "model_change", "model": "system.ai.gpt-5-4", "_resume_provider": "openai"},
+            "gpt-5.4",
+            "high",
+            id="unloaded_account_thread",
+        ),
+        pytest.param(
+            "gpt-6-sol",
+            "high",
+            {"type": "model_change", "model": "system.ai.gpt-5-4", "_resume_provider": "gateway"},
+            "system.ai.gpt-5-4",
+            "high",
+            id="resume_restores_gateway_thread",
         ),
         pytest.param(
             "gpt-5.4",
@@ -657,6 +692,18 @@ async def test_codex_native_settings_change_clamps_and_mirrors_effort(
     )
     fake = _RecordingCodexAppServerClient(transport, "effort-test")
     fake.model_config = {"model_provider": "openai"}
+    fake.thread_provider = "openai"
+    event = dict(event)
+    fake.thread_model = "gpt-6-sol"
+    resume_provider = event.pop("_resume_provider", None)
+    if resume_provider is not None:
+        missing_thread = codex_native_app_server.CodexAppServerResponseError(
+            {"code": -32600, "message": "thread not found: thread_codex"}
+        )
+        fake.settings_error_once = missing_thread
+        fake.resume_provider = resume_provider
+        if resume_provider == "openai":
+            fake.thread_read_error = missing_thread
     fake.model_list_responses = [
         {
             "result": {
@@ -708,12 +755,20 @@ async def test_codex_native_settings_change_clamps_and_mirrors_effort(
                 result = await controls.handle_codex_native_settings_update(conv_id, event)
                 assert result.status_code == 204
     updates = [params for method, params in fake.requests if method == "thread/settings/update"]
-    assert len(updates) == repetitions
+    assert len(updates) == repetitions + int(resume_provider is not None)
     assert all(params["effort"] == expected_effort for params in updates)
     assert sum(method == "model/list" for method, _ in fake.requests) == 1
     assert codex_native_bridge.read_codex_config_model(bridge_dir) == expected_model
     assert codex_native_bridge.read_codex_config_effort(bridge_dir) == expected_effort
     assert remembered_efforts.get(conv_id) == expected_effort
+    if initial_model == "system.ai.gpt-5-4":
+        assert "model" not in updates[0]
+        assert fake.thread_model == "gpt-6-sol"
+    if resume_provider is not None:
+        assert updates[0]["model"] == (
+            "system.ai.gpt-5-4" if resume_provider == "openai" else "gpt-5.4"
+        )
+        assert updates[-1]["model"] == expected_model
 
 
 @pytest.mark.asyncio
@@ -767,6 +822,7 @@ async def test_codex_native_effort_uses_the_applied_model_after_a_failed_mirror(
     )
     fake = _RecordingCodexAppServerClient(transport, "effort-test")
     fake.model_config = {"model_provider": "openai"}
+    fake.thread_provider = "openai"
     fake.model_list_responses = [
         {
             "result": {

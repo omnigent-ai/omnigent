@@ -2225,24 +2225,31 @@ def test_model_settings_update_mirrors_model_into_config_toml(
 
 
 @pytest.mark.parametrize("source", ["explicit", "inherited"])
-@pytest.mark.parametrize("provider", ["openai", "gateway", "null", "omitted"])
+@pytest.mark.parametrize("provider", ["openai", "gateway", "null", "omitted", "gateway-thread"])
 def test_dispatch_uses_account_model_ids_without_an_effort_setting(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: str, provider: str
 ) -> None:
-    """Both direct picks and saved gateway aliases use the account's own outbound model ID."""
+    """Explicit picks use account IDs; inherited config never changes a live model."""
     config = (
         {}
         if provider == "omitted"
         else {"model_provider": None if provider == "null" else provider}
     )
-    client = _catalog_client([], config=config)
+    if provider == "gateway-thread":
+        config = {"model_provider": "openai"}
+    client = _catalog_client(
+        [],
+        config=config,
+        thread_provider="gateway" if provider == "gateway-thread" else "openai",
+        thread_model="gpt-5.6-terra",
+    )
     monkeypatch.setattr("omnigent.harnesses.codex_native.app_server.CodexAppServerClient", client)
     _start_state(tmp_path)
     home = tmp_path / "codex-home"
     home.mkdir()
     alias = "system.ai.gpt-5-6-sol"
     initial = alias if source == "inherited" else "gpt-5.6-sol"
-    uses_account = provider != "gateway"
+    uses_account = provider not in {"gateway", "gateway-thread"}
     copied_provider = "gateway" if uses_account else "openai"
     (home / "config.toml").write_text(
         f'model_provider = "{copied_provider}"\nmodel = "{initial}"\n'
@@ -2255,6 +2262,11 @@ def test_dispatch_uses_account_model_ids_without_an_effort_setting(
         ExecutorConfig(model=alias if source == "explicit" else None),
     )
 
+    if source == "inherited":
+        assert [method for method, _params in client.requests] == ["turn/start"]
+        assert read_codex_config_model(tmp_path) == alias
+        assert client.current_model == "gpt-5.6-terra"
+        return
     assert client.requests[0] == ("config/read", {"includeLayers": False})
     expected = "gpt-5.6-sol" if uses_account else alias
     updates = [params for method, params in client.requests if method == "thread/settings/update"]
@@ -2269,7 +2281,11 @@ def test_dispatch_uses_account_model_ids_without_an_effort_setting(
 
 
 def _catalog_client(
-    supported: list[str], *, config: dict[str, object] | None = None
+    supported: list[str],
+    *,
+    config: dict[str, object] | None = None,
+    thread_provider: str | None = "openai",
+    thread_model: str | None = None,
 ) -> type[_FakeCodexNativeClient]:
     """Return a fresh fake whose catalog lists ``gpt-5.6-sol`` with *supported* efforts."""
 
@@ -2277,11 +2293,24 @@ def _catalog_client(
         requests: list[tuple[str, dict[str, Any]]] = []
         created = []
         next_turn = 1
+        current_model = thread_model
 
         async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
             if method == "config/read" and config is not None:
                 type(self).requests.append((method, params))
                 return {"result": {"config": config}}
+            if method == "thread/read":
+                type(self).requests.append((method, params))
+                return {
+                    "result": {
+                        "thread": {
+                            "modelProvider": thread_provider,
+                            "model": type(self).current_model,
+                        }
+                    }
+                }
+            if method == "thread/settings/update" and isinstance(params.get("model"), str):
+                type(self).current_model = params["model"]
             if method == "model/list":
                 type(self).requests.append((method, params))
                 return {

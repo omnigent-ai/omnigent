@@ -440,6 +440,8 @@ def build_native_controls(
     ) -> tuple[Response, _JsonObject]:
         """Apply *settings* and return the response with the settings as resolved."""
         from omnigent.harnesses.codex_native.app_server import (
+            _EFFORT_CATALOG_TIMEOUT_SECONDS,
+            _MODEL_CATALOG_UNREAD,
             CodexAppServerResponseError,
             client_for_transport,
             resolve_codex_chatgpt_model,
@@ -546,14 +548,18 @@ def build_native_controls(
                     ready_deadline=ready_deadline,
                     retry_unreachable=False,
                 )
+            account_deadline = asyncio.get_running_loop().time() + _EFFORT_CATALOG_TIMEOUT_SECONDS
+            requested_account_model = settings.get("model")
             if "model" in settings or "effort" in settings:
-                model_catalog: object = None
-                if isinstance(model, str):
+                model_catalog: object = _MODEL_CATALOG_UNREAD
+                if isinstance(requested_account_model, str) and requested_account_model:
                     account_model, model_catalog = await resolve_codex_chatgpt_model(
                         codex_client,
-                        model,
+                        requested_account_model,
+                        thread_id=state.thread_id,
                         codex_home=Path(state.codex_home),
                         transport=state.socket_path,
+                        deadline=account_deadline,
                     )
                     if account_model != model:
                         model = account_model
@@ -605,6 +611,18 @@ def build_native_controls(
                         await codex_client.request(
                             "thread/resume", {"threadId": state.thread_id, "excludeTurns": True}
                         )
+                        if isinstance(requested_account_model, str) and requested_account_model:
+                            account_model, _retry_catalog = await resolve_codex_chatgpt_model(
+                                codex_client,
+                                requested_account_model,
+                                thread_id=state.thread_id,
+                                codex_home=Path(state.codex_home),
+                                transport=state.socket_path,
+                                deadline=account_deadline,
+                            )
+                            if "model" in settings or account_model != requested_account_model:
+                                settings["model"] = account_model
+                                params["model"] = account_model
                         update_pending = True
                         await codex_client.request("thread/settings/update", params)
             except TimeoutError:

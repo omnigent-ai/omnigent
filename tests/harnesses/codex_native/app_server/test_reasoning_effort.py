@@ -180,32 +180,95 @@ async def test_account_alias_uses_the_live_provider_config(
     client = AsyncMock(spec=app_server.CodexAppServerClient)
     client.request.side_effect = [
         {"result": {"config": config}},
+        {"result": {"thread": {"modelProvider": "openai"}}},
         {"result": {"data": [{"id": "gpt-5.4"}]}},
     ]
     model, _catalog = await app_server.resolve_codex_chatgpt_model(
-        client, "system.ai.gpt-5-4", codex_home=tmp_path
+        client, "system.ai.gpt-5-4", thread_id="thread-account", codex_home=tmp_path
     )
     assert model == expected
-    assert client.request.call_count == (2 if expected == "gpt-5.4" else 1)
+    assert client.request.call_count == (3 if expected == "gpt-5.4" else 1)
 
 
+@pytest.mark.parametrize("stalled_method", ["config/read", "thread/read", "model/list"])
 async def test_account_alias_route_discovery_is_bounded(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stalled_method: str
 ) -> None:
     """An unresponsive config/read leaves the requested model unchanged."""
     (tmp_path / "auth.json").write_text('{"tokens":{"refresh_token":"test-refresh-token"}}')
     client = AsyncMock(spec=app_server.CodexAppServerClient)
 
-    async def stalled(*_args: object) -> None:
-        await asyncio.Event().wait()
+    async def stalled(method: str, _params: object) -> dict[str, object]:
+        if method == stalled_method:
+            await asyncio.Event().wait()
+        if method == "config/read":
+            return {"result": {"config": {"model_provider": "openai"}}}
+        return {"result": {"thread": {"modelProvider": "openai"}}}
 
     client.request.side_effect = stalled
-    monkeypatch.setattr(app_server, "_EFFORT_CATALOG_TIMEOUT_SECONDS", 0.01)
-    model, _catalog = await app_server.resolve_codex_chatgpt_model(
-        client, "system.ai.gpt-5-4", codex_home=tmp_path
+    monkeypatch.setattr(app_server, "_EFFORT_CATALOG_TIMEOUT_SECONDS", 0.05)
+    model, catalog = await app_server.resolve_codex_chatgpt_model(
+        client, "system.ai.gpt-5-4", thread_id="thread-account", codex_home=tmp_path
     )
     assert model == "system.ai.gpt-5-4"
-    assert client.request.await_args_list == [call("config/read", {"includeLayers": False})]
+    methods = ["config/read", "thread/read", "model/list"]
+    assert [item.args[0] for item in client.request.await_args_list] == methods[
+        : methods.index(stalled_method) + 1
+    ]
+    if stalled_method == "model/list":
+        await app_server.resolve_codex_effort_for_model(client, "max", model, catalog=catalog)
+        assert client.request.call_count == 3
+
+
+@pytest.mark.parametrize("thread", [{"modelProvider": "gateway"}, {}, None])
+async def test_account_alias_requires_the_loaded_threads_provider(
+    tmp_path: Path, thread: object
+) -> None:
+    (tmp_path / "auth.json").write_text('{"tokens":{"refresh_token":"test-refresh-token"}}')
+    client = AsyncMock(spec=app_server.CodexAppServerClient)
+    client.request.side_effect = [
+        {"result": {"config": {"model_provider": "openai"}}},
+        {"result": {"thread": thread}},
+    ]
+    model, _catalog = await app_server.resolve_codex_chatgpt_model(
+        client, "system.ai.gpt-5-4", thread_id="thread-account", codex_home=tmp_path
+    )
+    assert model == "system.ai.gpt-5-4"
+    assert client.request.call_count == 2
+
+
+async def test_account_alias_metadata_shares_one_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "auth.json").write_text('{"tokens":{"refresh_token":"test-refresh-token"}}')
+    client = AsyncMock(spec=app_server.CodexAppServerClient)
+
+    async def delayed(method: str, _params: object) -> dict[str, object]:
+        await asyncio.sleep(0.03)
+        if method == "config/read":
+            return {"result": {"config": {"model_provider": "openai"}}}
+        return {"result": {"thread": {"modelProvider": "openai"}}}
+
+    client.request.side_effect = delayed
+    monkeypatch.setattr(app_server, "_EFFORT_CATALOG_TIMEOUT_SECONDS", 0.05)
+    model, _catalog = await app_server.resolve_codex_chatgpt_model(
+        client, "system.ai.gpt-5-4", thread_id="thread-account", codex_home=tmp_path
+    )
+    assert model == "system.ai.gpt-5-4"
+    assert all(item.args[0] != "model/list" for item in client.request.await_args_list)
+
+
+async def test_account_alias_metadata_preserves_cancellation(tmp_path: Path) -> None:
+    (tmp_path / "auth.json").write_text('{"tokens":{"refresh_token":"test-refresh-token"}}')
+    client = AsyncMock(spec=app_server.CodexAppServerClient)
+    client.request.side_effect = [
+        {"result": {"config": {"model_provider": "openai"}}},
+        asyncio.CancelledError(),
+    ]
+    with pytest.raises(asyncio.CancelledError):
+        await app_server.resolve_codex_chatgpt_model(
+            client, "system.ai.gpt-5-4", thread_id="thread-account", codex_home=tmp_path
+        )
 
 
 @pytest.mark.parametrize("catalog_failure", [False, True], ids=["empty", "failed"])
@@ -217,15 +280,17 @@ async def test_alias_and_effort_share_unavailable_capabilities(
     client = AsyncMock(spec=app_server.CodexAppServerClient)
     client.request.side_effect = [
         {"result": {"config": {"model_provider": "openai"}}},
+        {"result": {"thread": {"modelProvider": "openai"}}},
         RuntimeError("discovery unavailable") if catalog_failure else {"result": {"data": []}},
     ]
     model, catalog = await app_server.resolve_codex_chatgpt_model(
-        client, "system.ai.gpt-5-4", codex_home=tmp_path
+        client, "system.ai.gpt-5-4", thread_id="thread-account", codex_home=tmp_path
     )
     effort = await app_server.resolve_codex_effort_for_model(client, "max", model, catalog=catalog)
     assert (model, effort) == ("system.ai.gpt-5-4", "max")
     assert client.request.await_args_list == [
         call("config/read", {"includeLayers": False}),
+        call("thread/read", {"threadId": "thread-account", "includeTurns": False}),
         call("model/list", {"includeHidden": True}),
     ]
 

@@ -497,6 +497,7 @@ async def test_start_clamps_effort_to_catalog(
         "environment",
         "override-custom",
         "override-base-url",
+        "provider-free-resume",
     ],
 )
 async def test_start_uses_chatgpt_catalog_model_ids(
@@ -528,7 +529,9 @@ async def test_start_uses_chatgpt_catalog_model_ids(
     selected = "system.ai.gpt-5-4"
     server.pinned_model = selected
     server.config_overrides = [f"model={json.dumps(selected)}"]
-    if route == "environment":
+    if route == "chatgpt":
+        server.config_overrides.append('model_provider="openai"')
+    elif route == "environment":
         server.env["OPENAI_BASE_URL"] = "https://gateway.example.test/v1"
     elif route == "override-custom":
         server.config_overrides.append('model_provider="gateway"')
@@ -557,7 +560,7 @@ async def test_start_uses_chatgpt_catalog_model_ids(
         assert f"model={json.dumps(expected)}" in argv
         terminal_args = app_server.build_codex_remote_args(
             codex_args=(),
-            thread_id=None,
+            thread_id="native-existing-thread" if route == "provider-free-resume" else None,
             remote_url="ws://127.0.0.1:1",
             config_overrides=server.config_overrides,
         )
