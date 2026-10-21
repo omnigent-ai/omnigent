@@ -228,3 +228,50 @@ def test_service_entry_maps_fatal_host_exit(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(cli, "main", _fatal)
 
     assert service_entry.main() == 0
+
+
+def test_service_entry_waits_while_another_daemon_serves_the_workspace(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A service host next to another URL's daemon for its workspace waits.
+
+    Starting would be refused, and the service manager would restart the host
+    every few seconds; it starts once the other daemon is gone instead.
+    """
+    from types import SimpleNamespace
+
+    from omnigent import cli as cli_module
+    from omnigent.host import service_entry
+
+    monkeypatch.setattr(sys, "argv", ["service-entry", "--server", "https://ws.example.com"])
+    monkeypatch.setattr(cli_module, "_resolve_host_server", lambda server: server)
+    sibling = SimpleNamespace(pid=4242, target="https://other.example.com/api/2.0/omnigent")
+    answers = [sibling, sibling, None]
+    monkeypatch.setattr(cli_module, "_same_workspace_daemon", lambda _url: answers.pop(0))
+    sleeps: list[float] = []
+    monkeypatch.setattr(service_entry.time, "sleep", sleeps.append)
+    hosts: list[list[str]] = []
+    monkeypatch.setattr(cli_module.cli, "main", lambda **kwargs: hosts.append(kwargs["args"]))
+
+    assert service_entry.main() == 0
+
+    assert sleeps == [service_entry._STANDBY_POLL_S] * 2
+    assert hosts == [["host", "--server", "https://ws.example.com", "--non-interactive"]]
+    assert capsys.readouterr().err.count("waiting until it stops") == 1
+
+
+def test_service_entry_local_mode_does_not_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent import cli as cli_module
+    from omnigent.host import service_entry
+
+    monkeypatch.setattr(sys, "argv", ["service-entry", "--local"])
+
+    def _unexpected(_url: str) -> None:
+        raise AssertionError("local mode has no workspace to wait for")
+
+    monkeypatch.setattr(cli_module, "_same_workspace_daemon", _unexpected)
+    hosts: list[list[str]] = []
+    monkeypatch.setattr(cli_module.cli, "main", lambda **kwargs: hosts.append(kwargs["args"]))
+
+    assert service_entry.main() == 0
+    assert hosts == [["host", "--server", "", "--non-interactive"]]

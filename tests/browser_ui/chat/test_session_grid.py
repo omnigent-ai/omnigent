@@ -7,7 +7,7 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, WebSocketRoute, expect
 
 from tests.browser_ui.chat.session_contract import chat_session_handle, list_payload, message_item
 from tests.browser_ui.conftest import BrowserContract
@@ -76,6 +76,24 @@ def test_session_grid_drag_persist_live_updates_and_close(
                 ]
             )
         for index, session in enumerate(sessions[:2]):
+            session.update_session(labels={"omnigent.ui": "terminal"})
+            browser_contract.json(
+                f"/v1/sessions/{session.session_id}/resources/terminals",
+                list_payload(
+                    [
+                        {
+                            "id": "terminal_tui_main",
+                            "object": "terminal",
+                            "name": "tui",
+                            "metadata": {
+                                "terminal_name": "tui",
+                                "session_key": "main",
+                                "running": True,
+                            },
+                        }
+                    ]
+                ),
+            )
             path = f"notes-{index}.md"
             _mock_markdown_files(
                 page,
@@ -89,6 +107,25 @@ def test_session_grid_drag_persist_live_updates_and_close(
                 list_payload([{"path": path, "name": path, "type": "file", "bytes": 20}]),
             )
             browser_contract.json(f"/v1/sessions/{session.session_id}/comments", [])
+        terminal_inputs: dict[str, list[bytes]] = {}
+        terminal_connections: dict[str, int] = {}
+
+        def attach_terminal(socket: WebSocketRoute) -> None:
+            session_id = socket.url.split("/sessions/")[1].split("/")[0]
+            terminal_connections[session_id] = terminal_connections.get(session_id, 0) + 1
+            terminal_inputs.setdefault(session_id, [])
+            socket.send(f"Terminal for {session_id}\r\n$ ".encode())
+
+            def record_input(message: str | bytes) -> None:
+                if isinstance(message, bytes):
+                    terminal_inputs[session_id].append(message)
+                    socket.send(message)
+
+            socket.on_message(record_input)
+
+        browser_contract.websocket(
+            "**/resources/terminals/terminal_tui_main/attach*", attach_terminal
+        )
         sessions[3].update_session(permission_level=1)
         browser_contract.json(
             "/v1/info", {"single_user": True, "features": {"grid_sessions_display_ui": True}}
@@ -115,6 +152,13 @@ def test_session_grid_drag_persist_live_updates_and_close(
             re.compile(r"bg-\[var\(--sidebar-active\)\]")
         )
         grid_url = page.url
+        active_style = re.compile(r"bg-\[var\(--sidebar-active\)\]")
+        for index in range(5):
+            link = page.locator(f'aside [data-sidebar-session-id="grid-{index}"] a')
+            if index < 2:
+                expect(link).to_have_class(active_style)
+            else:
+                expect(link).not_to_have_class(active_style)
         expect(page.get_by_role("region", name="Grids")).to_be_visible()
         grid_nav = page.get_by_role("region", name="Grids")
         # dnd-kit suppresses click propagation for 50 ms after a drop.
@@ -173,7 +217,39 @@ def test_session_grid_drag_persist_live_updates_and_close(
         other_area = other_cell.evaluate("node => node.style.gridArea")
         first_cell.evaluate("node => node.dataset.instance = 'preserved'")
         assert first_cell.locator("header").bounding_box()["height"] == 32
-        expect(first_cell.locator('header [data-size="icon-xs"]')).to_have_count(2)
+        expect(first_cell.locator('header [data-size="icon-xs"]')).to_have_count(4)
+        # Both cells use real xterm attaches, with independent input and view selection.
+        first_cell.get_by_test_id("side-chat-input").fill("Keep this chat draft")
+        for cell in (first_cell, other_cell):
+            cell.get_by_role("button", name="Terminal view", exact=True).click()
+            expect(cell.get_by_test_id("terminal-view")).to_have_attribute(
+                "data-state", "connected"
+            )
+        connections = dict(terminal_connections)
+        first_cell.locator(".xterm-helper-textarea").click()
+        page.keyboard.type("first")
+        expect(first_cell).to_have_attribute("data-active", "true")
+        other_cell.locator(".xterm-helper-textarea").click()
+        page.keyboard.type("second")
+        expect(other_cell).to_have_attribute("data-active", "true")
+        page.wait_for_function(
+            "() => document.activeElement?.classList.contains('xterm-helper-textarea')"
+        )
+        assert b"first" in b"".join(terminal_inputs["grid-0"])
+        assert b"second" in b"".join(terminal_inputs["grid-1"])
+        assert b"second" not in b"".join(terminal_inputs["grid-0"])
+        page.screenshot(path=str(artifacts / "grid-terminals.png"))
+        page.keyboard.press("ControlOrMeta+Alt+Backslash")
+        expect(other_cell.get_by_test_id("side-chat-input")).to_be_visible()
+        expect(first_cell.get_by_test_id("main-terminal-view")).to_have_attribute(
+            "data-visible", "true"
+        )
+        first_cell.get_by_role("button", name="Chat view", exact=True).click()
+        expect(first_cell.get_by_test_id("side-chat-input")).to_have_value("Keep this chat draft")
+        first_cell.get_by_role("button", name="Terminal view", exact=True).click()
+        assert terminal_connections == connections
+        first_cell.get_by_role("button", name="Chat view", exact=True).click()
+        first_cell.get_by_test_id("side-chat-input").fill("")
         _move_cell(page, "grid-0", "grid-1")
         assert first_cell.evaluate("node => node.style.gridArea") == other_area
         assert other_cell.evaluate("node => node.style.gridArea") == original_area
@@ -222,6 +298,11 @@ def test_session_grid_drag_persist_live_updates_and_close(
         assert workspace.bounding_box()["width"] == saved_width
         page.get_by_role("button", name="Collapse grid workspace").click()
         _drag_session(page, "grid-2", "grid-0", "bottom")
+        for index in range(3):
+            expect(
+                page.locator(f'aside [data-sidebar-session-id="grid-{index}"] a')
+            ).to_have_class(active_style)
+        page.screenshot(path=str(artifacts / "grid-members-highlighted.png"))
         _drag_session(page, "grid-3", "grid-1", "bottom")
         expect(page.locator("[data-grid-session]")).to_have_count(4)
         expect(page.locator('[data-grid-session="grid-3"]').get_by_role("textbox")).to_have_count(
@@ -325,12 +406,15 @@ def test_session_grid_drag_persist_live_updates_and_close(
             expect(page.get_by_text(f"Transcript {index}", exact=True)).to_be_visible()
         for index in (3, 2, 1):
             page.get_by_role("button", name=f"Remove Grid session {index} from grid").click()
+            expect(
+                page.locator(f'aside [data-sidebar-session-id="grid-{index}"] a')
+            ).not_to_have_class(active_style)
             if index != 1:
                 expect(page.locator('[data-grid-session][data-active="true"]')).to_have_count(1)
                 expect(workspace).to_have_count(1)
         expect(page).to_have_url(sessions[0].url)
         expect(page.get_by_role("region", name="Grids")).to_have_count(0)
-        # The row context menu is the keyboard/touch alternative to dragging.
+        # The row context menu is the keyboard alternative to dragging.
         page.locator('aside [data-sidebar-session-id="grid-1"]').click(button="right")
         page.get_by_role("menuitem", name="Open in grid", exact=True).focus()
         page.keyboard.press("ArrowRight")
@@ -339,21 +423,38 @@ def test_session_grid_drag_persist_live_updates_and_close(
         reopened_url = page.url
         page.get_by_role("link", name="Open Grid session 0 full screen").click()
         expect(page).to_have_url(sessions[0].url)
+        expect(page.locator('aside [data-sidebar-session-id="grid-0"] a')).to_have_class(
+            active_style
+        )
+        expect(page.locator('aside [data-sidebar-session-id="grid-1"] a')).not_to_have_class(
+            active_style
+        )
         page.get_by_role("region", name="Grids").get_by_role("link").click()
         expect(page).to_have_url(reopened_url)
         expect(page.locator("[data-grid-session]")).to_have_count(2)
-        page.set_viewport_size({"width": 700, "height": 900})
-        page.get_by_role("region", name="Grids").get_by_role("link").click()
-        expect(page.get_by_role("button", name="Open sidebar", exact=True)).to_have_attribute(
-            "data-size", "icon-sm"
+        saved_grids = page.evaluate(
+            "localStorage.getItem(`omnigent:session-grids:${location.origin}:local`)"
         )
-        page.get_by_role("button", name="Expand grid workspace").click()
-        narrow_workspace = workspace
-        expect(narrow_workspace).to_be_visible()
-        narrow_workspace.get_by_role("button", name="Full screen", exact=True).click()
-        assert narrow_workspace.bounding_box()["width"] <= 700
-        page.screenshot(path=str(artifacts / "narrow-grid-workspace.png"))
+        page.set_viewport_size({"width": 700, "height": 900})
+        expect(
+            page.get_by_text("Grids are available on desktop only.", exact=False)
+        ).to_be_visible()
+        expect(page.locator("[data-grid-session]")).to_have_count(0)
+        expect(page.get_by_role("region", name="Grids")).to_have_count(0)
+        expect(page.get_by_role("button", name="Expand grid workspace")).to_have_count(0)
+        page.screenshot(path=str(artifacts / "mobile-grid-blocked.png"))
+        page.reload()
+        expect(
+            page.get_by_text("Grids are available on desktop only.", exact=False)
+        ).to_be_visible()
+        assert (
+            page.evaluate(
+                "localStorage.getItem(`omnigent:session-grids:${location.origin}:local`)"
+            )
+            == saved_grids
+        )
         page.set_viewport_size({"width": 2000, "height": 1000})
+        expect(page.locator("[data-grid-session]")).to_have_count(2)
         page.get_by_role("button", name="Open sidebar", exact=True).click()
         page.get_by_role("region", name="Grids").get_by_role("link").click(button="right")
         with page.expect_response(f"**{host_filesystem_api}?*") as home_listing:
@@ -420,3 +521,73 @@ def test_grid_flag_off_and_unknown_local_grid(
             expect(
                 page.get_by_text("This grid isn’t saved on this device.", exact=False)
             ).to_be_visible()
+
+
+@pytest.mark.parametrize("width,touch", [(390, False), (1024, True), (1280, False)])
+def test_grid_mobile_entry_points(
+    page: Page, browser_contract: BrowserContract, width: int, touch: bool
+) -> None:
+    page.set_viewport_size({"width": width, "height": 900})
+    if touch:
+        page.context.new_cdp_session(page).send(
+            "Emulation.setTouchEmulationEnabled", {"enabled": True}
+        )
+    assert page.evaluate("matchMedia('(pointer: coarse)').matches") == touch
+    desktop = width >= 768 and not touch
+    with ExitStack() as stack:
+        sessions = [
+            stack.enter_context(
+                contextmanager(chat_session_handle)(
+                    page, browser_contract, session_id=f"entry-{index}"
+                )
+            )
+            for index in range(2)
+        ]
+        browser_contract.json(
+            "/v1/info", {"single_user": True, "features": {"grid_sessions_display_ui": True}}
+        )
+        browser_contract.json(
+            "/v1/sessions", lambda _: list_payload([s.session_snapshot() for s in sessions])
+        )
+        page.goto(sessions[0].url)
+        page.evaluate(
+            """ids => localStorage.setItem(
+            `omnigent:session-grids:${location.origin}:local`,
+            JSON.stringify([{id: 'saved', layout: {axis: 'columns', children: ids}}]))""",
+            [s.session_id for s in sessions],
+        )
+        page.reload()
+        if width < 768:
+            page.get_by_role("button", name="Open sidebar", exact=True).click()
+        row = page.locator(f'aside [data-sidebar-session-id="{sessions[1].session_id}"]')
+        expect(row).to_be_visible()
+        expect(page.get_by_role("region", name="Grids")).to_have_count(int(desktop))
+        expect(page.locator("[data-grid-session]")).to_have_count(int(desktop))
+        if width < 768:
+            row.click(button="right")
+        else:
+            row.get_by_test_id("conversation-actions").click()
+        expect(page.get_by_role("menu")).to_be_visible()
+        expect(page.get_by_role("menuitem", name="Open in grid", exact=True)).to_have_count(
+            int(desktop)
+        )
+        page.keyboard.press("Escape")
+        box = row.bounding_box()
+        assert box
+        page.mouse.move(box["x"] + 30, box["y"] + box["height"] / 2)
+        page.mouse.down()
+        page.mouse.move(box["x"] + 45, box["y"] + box["height"] / 2, steps=3)
+        expect(row).to_have_class(re.compile("opacity-40"))
+        expect(page.get_by_test_id("grid-drop-targets")).to_have_count(int(desktop))
+        page.keyboard.press("Escape")
+        page.mouse.up()
+        page.goto(f"{sessions[0].base_url}/grid/saved")
+        if desktop:
+            expect(page.get_by_test_id("session-grid")).to_be_visible()
+            expect(page.locator("[data-grid-session]")).to_have_count(2)
+        else:
+            expect(
+                page.get_by_text("Grids are available on desktop only.", exact=False)
+            ).to_be_visible()
+            expect(page.locator("[data-grid-session]")).to_have_count(0)
+            expect(page.get_by_role("link", name="Back to sessions")).to_be_visible()

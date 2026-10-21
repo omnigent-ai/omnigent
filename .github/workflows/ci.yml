@@ -51,9 +51,12 @@ jobs:
   # scan; trusted authors / non-PR events pass through.
   gate:
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
 
   scope:
-    name: CI scope
+    name: CI coverage scope
     needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -127,7 +130,21 @@ jobs:
       - name: Install dependencies
         # matrix.extra (e.g. "databricks") adds an extra for lanes that need it;
         # empty for the default lanes.
-        run: uv sync --locked --extra all --group test ${{ matrix.extra && format('--extra {0}', matrix.extra) || '' }}
+        run: uv sync --locked --extra all --extra openshell --extra kubernetes --group test ${{ matrix.extra && format('--extra {0}', matrix.extra) || '' }}
+
+      - name: Check installed sandbox SDK consumers
+        if: matrix.group == 'server-rest'
+        run: |
+          uv run python - <<'PYTHON'
+          from openshell import ExecChunk, ExecResult, SandboxClient, SandboxError
+          from openshell._proto import openshell_pb2, openshell_pb2_grpc
+          from kubernetes import client, config
+          from kubernetes.stream import stream
+          from omnigent.onboarding.sandboxes import kubernetes, openshell
+
+          openshell._ensure_sdk()
+          kubernetes._ensure_sdk()
+          PYTHON
 
       - name: Run pytest
         shell: bash
@@ -380,16 +397,13 @@ jobs:
         id: rustc
         run: echo "version=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
 
-      # The sidecar source is frozen and its deps are rev-pinned, so the binary is
-      # a pure function of sidecar/** + the toolchain. Cache the built binary (not
-      # the 1.6 GB target dir) and skip the ~3 min compile below on a hit; the key
-      # self-invalidates when the source, Cargo.lock, or rustc changes.
-      - name: Cache parity sidecar binary
+      # Cache compiled dependencies and test binaries, but execute tests on every run.
+      - name: Cache parity sidecar build
         id: sidecar-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: .tmp-codex-parity-target/debug/codex-parity-sidecar
-          key: codex-parity-bin-locked-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
+          path: .tmp-codex-parity-target
+          key: codex-parity-tests-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
 
       - name: Set up pnpm
         # This job never runs pnpm install, so caching the (empty) pnpm store
@@ -399,7 +413,7 @@ jobs:
           cache: ""
 
       - name: Install codex CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@395b8b175c17c1d8f393f82dddd15222c6200e74
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@72e41e11b0489294045d9164d5c26d6c9a239d56
         with:
           harness: codex
 
@@ -411,6 +425,12 @@ jobs:
 
       - name: Install dependencies
         run: uv sync --locked --extra all --group test
+
+      - name: Test parity sidecar
+        run: |
+          cargo test --locked \
+            --manifest-path tests/codex_parity/sidecar/Cargo.toml \
+            --target-dir .tmp-codex-parity-target
 
       - name: Build parity sidecar
         if: steps.sidecar-cache.outputs.cache-hit != 'true'

@@ -456,6 +456,8 @@ def build_native_controls(
 
         if ready_deadline is None:
             ready_deadline = asyncio.get_running_loop().time() + _CODEX_SETTINGS_READY_TIMEOUT_S
+        backend_before_ready = _AUTO_CODEX_APP_SERVERS.get(conv_id)
+        process_before_ready = getattr(backend_before_ready, "proc", None)
         try:
             state = await asyncio.wait_for(
                 _ready_codex_bridge_for_settings(conv_id),
@@ -479,6 +481,13 @@ def build_native_controls(
                     "detail": "Codex-native settings update requires a loaded Codex bridge.",
                 },
             ), settings
+
+        backend_after_ready = _AUTO_CODEX_APP_SERVERS.get(conv_id)
+        if backend_after_ready is not backend_before_ready or (
+            getattr(backend_after_ready, "proc", None) is not process_before_ready
+        ):
+            # Readiness already launched a replacement; keep one recovery per request.
+            retry_unreachable = False
 
         bridge_dir = bridge_dir_for_codex_home(Path(state.codex_home))
         settings = dict(settings)

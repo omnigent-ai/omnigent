@@ -11,7 +11,7 @@ import urllib.parse
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
-from typing import Annotated, Any, cast
+from typing import TYPE_CHECKING, Annotated, Any, cast
 
 import httpx
 from fastapi import (
@@ -81,6 +81,7 @@ from omnigent.server.routes._sessions.helpers import (
     _await_settled_managed_launch,
     _enforce_filesystem_attachment_policy,
     _file_content_etag,
+    _filesystem_attachment_policy,
     _get_runner_client_for_resource_access,
     _if_none_match_matches,
     _load_agent_spec_for_session,
@@ -109,6 +110,9 @@ from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore
 
+if TYPE_CHECKING:
+    from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
+
 
 class _RunnerStreamResponse(StreamingResponse):
     """Stream a runner response body and close it however the send ends.
@@ -132,6 +136,10 @@ class _RunnerStreamResponse(StreamingResponse):
         finally:
             await self._upstream.aclose()
 
+
+# Runner wait for a PR label request, above the runner's 15-second budget for all of
+# its ``gh`` calls, so a slow edit that GitHub applied is not reported as failed.
+_LABEL_PROXY_TIMEOUT_S = 20.0
 
 # Admission gate bounding how many image uploads hold their raw bytes in memory
 # and decode/re-encode at once. Created lazily on first use so it binds to the
@@ -167,6 +175,23 @@ def _attachment_upload_lock(session_id: str) -> asyncio.Lock:
     return lock
 
 
+def _unsupported_attachment_detail(content_type: str, policy: FilesystemAttachmentPolicy) -> str:
+    """Explain a refused upload in terms of the types this server accepts."""
+    from omnigent.inner.native_attachments import DEFAULT_FILESYSTEM_ATTACHMENT_POLICY
+
+    detail = (
+        f"Unsupported attachment type '{content_type}'. Attach images, PDF, or text/code files"
+    )
+    if policy == DEFAULT_FILESYSTEM_ATTACHMENT_POLICY:
+        return (
+            f"{detail}, or use Claude Code or Codex for archives, Office documents, and databases."
+        )
+    if policy.extensions:
+        extensions = ", ".join(sorted(policy.extensions))
+        return f"{detail}, or use Claude Code or Codex for {extensions} files."
+    return f"{detail}."
+
+
 def register_resources_routes(
     router: APIRouter,
     *,
@@ -183,7 +208,7 @@ def register_resources_routes(
     """Register the resources routes on router."""
 
     async def _require_filesystem_attachment_support(
-        request: Request, conv: Conversation, filename: str
+        request: Request, conv: Conversation, filename: str, capability: str
     ) -> None:
         await _require_filesystem_attachment_harness(conv, filename)
         tracker = getattr(request.app.state, "managed_launches", None)
@@ -224,6 +249,7 @@ def register_resources_routes(
             host_registry=host_registry,
             tunnel_registry=tunnel_registry,
             runner_router=runner_router,
+            capability=capability,
         )
 
     @router.get(
@@ -534,6 +560,7 @@ def register_resources_routes(
         runner_path: str,
         runner_params: dict[str, str] | None = None,
         host_workspace_resolver: Callable[[], Awaitable[str]] | None = None,
+        runner_timeout: float = 10.0,
     ) -> dict[str, Any]:
         """Serve a filesystem read, falling back to the host when offline.
 
@@ -549,7 +576,8 @@ def register_resources_routes(
         :param conversation: Conversation loaded during authorization.
         :param op: Host-side op name — ``"list_or_read"`` / ``"changes"``
             / ``"diff"`` / ``"search"`` / ``"github_info"`` /
-            ``"github_changes"`` / ``"github_diff"`` / ``"github_pr_diff"``.
+            ``"github_changes"`` / ``"github_diff"`` / ``"github_pr_diff"`` /
+            ``"github_labels"``.
             The ``github_*`` ops serve every git provider; their names are
             stable wire ids.
         :param host_params: Op-specific args for the host reader.
@@ -563,6 +591,7 @@ def register_resources_routes(
             has nothing for this to resolve against. Resolving it eagerly
             would refuse absolute browsing on exactly those sessions even
             though the online runner can serve them.
+        :param runner_timeout: Seconds to wait for the runner's response.
         :returns: The runner-shaped filesystem result.
         :raises OmnigentError: Re-raised runner-offline error when the
             host cannot serve the read either.
@@ -574,6 +603,7 @@ def register_resources_routes(
                 runner_path,
                 conversation,
                 params=runner_params,
+                timeout=runner_timeout,
             )
         except OmnigentError as exc:
             # Only the runner-offline case is a candidate for the host
@@ -959,7 +989,8 @@ def register_resources_routes(
         The write counterpart of :func:`_read_workspace_via_host`, for when the
         runner is offline but the host holding the workspace is connected.
 
-        :param op: Host-side write op — currently ``"github_set_preference"``.
+        :param op: Host-side write op — ``"github_set_preference"``,
+            ``"github_prs_update"``, or ``"github_labels_update"``.
         :param host_params: Op-specific args for the host writer.
         :returns: The refreshed payload, or ``None`` when no host is bound /
             connected / reachable (caller re-raises the runner-offline error).
@@ -1000,6 +1031,8 @@ def register_resources_routes(
         path: str,
         body: dict[str, Any],
         conversation: Conversation,
+        *,
+        timeout: float = 10.0,
     ) -> tuple[int, dict[str, Any]]:
         """Proxy a POST request to the runner and return status + JSON.
 
@@ -1007,6 +1040,7 @@ def register_resources_routes(
         :param path: Runner-relative URL path.
         :param body: JSON body to forward.
         :param conversation: Conversation loaded during authorization.
+        :param timeout: Seconds to wait for the runner's response.
         :returns: Tuple of (status_code, parsed_json_body).
         :raises HTTPException: 502 on transport failure.
         """
@@ -1023,7 +1057,7 @@ def register_resources_routes(
             resp = await runner_client.post(
                 path,
                 json=body,
-                timeout=10.0,
+                timeout=timeout,
             )
         except (httpx.HTTPError, ConnectionError) as exc:
             raise HTTPException(
@@ -1760,12 +1794,18 @@ def register_resources_routes(
                 "filename is required",
                 code=ErrorCode.INVALID_INPUT,
             )
-        from omnigent.inner.native_attachments import requires_filesystem
+        from omnigent.inner.native_attachments import (
+            DELIVERY_KEY,
+            FILESYSTEM_DELIVERY,
+            filesystem_attachment_capability,
+            requires_filesystem,
+        )
         from omnigent.runtime.content_resolver import (
             _COMPRESSIBLE_IMAGE_MIMES,
             MAX_ATTACHMENT_UPLOAD_BYTES,
             ImageCompressionError,
             _resolve_content_type,
+            attachment_delivery,
             attachment_text_type_for_extension,
             attachment_upload_limit,
             compress_image_attachment,
@@ -1778,17 +1818,26 @@ def register_resources_routes(
             file.content_type,
             file.filename,
         )
-        # Check the filename first so a misleading MIME cannot skip the
-        # harness requirement or the quotas for files that need local tools.
-        filesystem_required = requires_filesystem(file.filename)
-        if filesystem_required:
-            # Drop the declared type so the file is never stored as text.
+        # Listed extensions are checked by name first so a misleading MIME cannot
+        # skip the harness requirement or the quotas for files that need local tools.
+        policy = _filesystem_attachment_policy(request.app.state)
+        delivery = attachment_delivery(file.filename, file.content_type, policy)
+        filesystem_required = delivery == "filesystem"
+        if filesystem_required or requires_filesystem(file.filename):
+            # Drop the declared type so the file is never stored as text, even
+            # when the policy leaves its extension out.
             content_type = _resolve_content_type("application/octet-stream", file.filename)
+        if filesystem_required:
             if initial_input:
                 # The host does not exist yet; dispatch validates its runtime after provisioning.
                 await _require_filesystem_attachment_harness(conv, file.filename)
             else:
-                await _require_filesystem_attachment_support(request, conv, file.filename)
+                await _require_filesystem_attachment_support(
+                    request,
+                    conv,
+                    file.filename,
+                    filesystem_attachment_capability([file.filename]),
+                )
         # Hold the quota check through the store below, so parallel uploads can't
         # all spend the same remaining allowance.
         attachment_lock = (
@@ -1817,17 +1866,14 @@ def register_resources_routes(
                 if type_limit is None:
                     raise HTTPException(
                         status_code=415,
-                        detail=(
-                            f"Unsupported attachment type '{content_type}'. Attach images, PDF, "
-                            "or text/code files, or use Claude Code or Codex for archives, "
-                            "Office documents, and databases."
-                        ),
+                        detail=_unsupported_attachment_detail(content_type, policy),
                     )
                 read_limit = min(type_limit, MAX_ATTACHMENT_UPLOAD_BYTES)
             filename = file.filename
             # Persist original dimensions only after a downscale.
             source_dims: tuple[int, int] | None = None
-            if content_type in _COMPRESSIBLE_IMAGE_MIMES:
+            # An image delivered as a file keeps its original bytes.
+            if content_type in _COMPRESSIBLE_IMAGE_MIMES and not filesystem_required:
                 # Compressible images carry the large cap and the decode, so they are
                 # the server's peak upload memory. The body is already spooled to
                 # disk by the multipart parser, so gate the in-memory read + the
@@ -1856,14 +1902,18 @@ def register_resources_routes(
                 # PDF/text/SVG and other non-compressed types use their smaller
                 # per-type caps and aren't decoded, so they read outside the gate.
                 content = await _read_upload_capped(file, read_limit)
+            source_metadata: dict[str, Any] | None = (
+                {"width": source_dims[0], "height": source_dims[1]} if source_dims else None
+            )
+            # Record the decision so delivery doesn't change if the policy does.
+            if filesystem_required:
+                source_metadata = {DELIVERY_KEY: FILESYSTEM_DELIVERY}
             stored = file_store.create(
                 session_id=session_id,
                 filename=filename,
                 bytes=len(content),
                 content_type=content_type,
-                source_metadata=(
-                    {"width": source_dims[0], "height": source_dims[1]} if source_dims else None
-                ),
+                source_metadata=source_metadata,
             )
             try:
                 artifact_store.put(stored.id, content)
@@ -2165,16 +2215,23 @@ def register_resources_routes(
 
         # Files requiring filesystem tools entering a session pass the same checks as an upload,
         # held under the same lock, so a copy can't skip the harness or quotas.
-        from omnigent.inner.native_attachments import requires_filesystem
+        from omnigent.inner.native_attachments import (
+            filesystem_attachment_capability,
+            uses_filesystem_delivery,
+        )
 
         filesystem_sources = [
             stored
             for stored in sources
-            if stored.filename and requires_filesystem(stored.filename)
+            if stored.filename
+            and uses_filesystem_delivery(stored.filename, stored.source_metadata)
         ]
         if filesystem_sources:
             await _require_filesystem_attachment_support(
-                request, conv, filesystem_sources[0].filename or ""
+                request,
+                conv,
+                filesystem_sources[0].filename or "",
+                filesystem_attachment_capability(stored.filename for stored in filesystem_sources),
             )
         attachment_lock = (
             _attachment_upload_lock(session_id) if filesystem_sources else contextlib.nullcontext()
@@ -3180,6 +3237,84 @@ def register_resources_routes(
             raise OmnigentError(
                 error.get("message", f"GitHub preference update failed (HTTP {status})"),
                 code=error.get("code", ErrorCode.INTERNAL_ERROR),
+            )
+        return result
+
+    @router.get(
+        "/sessions/{session_id}/resources/github/labels",
+        response_model=None,
+    )
+    async def list_session_github_labels(
+        request: Request,
+        session_id: str,
+        pr_url: str,
+    ) -> dict[str, Any]:
+        """
+        List the labels the selected PR's repository offers, for the label picker.
+
+        Requires edit access, like the label edit it feeds. Falls back to the
+        host tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param pr_url: The selected PR, which must be tracked by the session.
+        :returns: A list of ``{name, color, description}`` with ``has_more``.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_labels",
+            host_params={"pr_url": pr_url},
+            runner_params={"pr_url": pr_url},
+            runner_path=f"/v1/sessions/{session_id}/resources/github/labels",
+            runner_timeout=_LABEL_PROXY_TIMEOUT_S,
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/labels",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def update_session_github_labels(request: Request, session_id: str) -> dict[str, Any]:
+        """
+        Add and remove labels on the selected PR with the host's provider account.
+
+        Served by the runner when it's online, else by the host over its tunnel.
+
+        :param request: JSON body with ``pr_url`` and ``add`` / ``remove`` name lists.
+        :param session_id: Session/conversation identifier.
+        :returns: A ``session.github.pr_labels`` with the PR's resulting labels.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        params = {
+            "pr_url": body["pr_url"],
+            "add": body.get("add", []),
+            "remove": body.get("remove", []),
+        }
+        try:
+            status, result = await _proxy_post_to_runner(
+                session_id,
+                f"/v1/sessions/{session_id}/resources/github/labels",
+                params,
+                conv,
+                timeout=_LABEL_PROXY_TIMEOUT_S,
+            )
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            payload = await _write_workspace_via_host(
+                session_id, conv, op="github_labels_update", host_params=params
+            )
+            if payload is None:
+                raise
+            return payload
+        if status >= 400:
+            raise HTTPException(
+                status_code=status, detail=result.get("detail", "Cannot update labels")
             )
         return result
 

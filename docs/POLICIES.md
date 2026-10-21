@@ -69,8 +69,9 @@ After starting, you can also add or remove policies at runtime through the REST 
 
 ### Attachment admission controls
 
-The upload, copy, and fork routes apply additional server settings to `.zip`, `.docx`,
-`.xlsx`, `.pptx`, `.db`, `.sqlite`, and `.sqlite3` files. These formats require
+The upload, copy, and fork routes apply additional server settings to files
+delivered through the harness's filesystem tools: by default `.zip`, `.docx`,
+`.xlsx`, `.pptx`, `.db`, `.sqlite`, and `.sqlite3` files. These files require
 Claude Code or Codex and an updated execution host/runner that supports their
 delivery and restoration. They are stored without extraction; the harness
 reads a local copy outside the working checkout. See
@@ -78,10 +79,35 @@ reads a local copy outside the working checkout. See
 
 | Server config key | Default | Scope |
 |-------------------|---------|-------|
+| `filesystem_attachment_allowed_extensions` | the seven extensions above | Which files are delivered as files (see below) |
 | `filesystem_attachment_max_bytes` | `52428800` (50 MiB) | Bytes per file |
 | `filesystem_attachment_max_files` | `20` | Stored files of these types per session |
 | `filesystem_attachment_max_total_bytes` | `209715200` (200 MiB) | Combined bytes of these types per session |
 | `filesystem_attachment_denied_extensions` | `[]` | Further restrict the allowlist, e.g. `[".zip", ".db"]` |
+
+`filesystem_attachment_allowed_extensions` accepts:
+
+- a list of extensions, which replaces the defaults, e.g. `[".zip", ".gz", ".har"]`.
+  Files match on their last extension, so list `.gz` for `.tar.gz` files; a
+  compound entry such as `.tar.gz` is skipped with a warning.
+  A listed text or image type, such as `.log` or `.png`, is delivered as a file,
+  with its original bytes, instead of inline. It then needs a Claude Code or
+  Codex session, like any other file delivered as a file.
+  A default extension left off the list is refused, even when the browser
+  labels it as text.
+- `[]`, which turns filesystem attachments off.
+- `"*"` (or a list containing `"*"`), which keeps the defaults and also delivers
+  every other file that can't be inlined, such as `.gz`, `.tar`, `.har`, or video.
+  Images, PDFs, and text/code files stay inline, except for extensions listed
+  beside `"*"`: `["*", ".log"]` also delivers `.log` files as files.
+
+The server reads this key at startup. Each upload records how it is delivered,
+so changing the setting does not change files a session already holds. Types
+outside the default extensions need a host and runner that advertise
+`filesystem_attachment_delivery`; older builds refuse them with an update
+message. `GET /v1/info` reports the effective setting as
+`filesystem_attachments`, which the web composer uses to accept files before
+uploading them.
 
 These are filename-based admission and storage limits, not content inspection.
 Classification uses the stored filename's extension, even when the browser
@@ -89,7 +115,7 @@ reports a different MIME type. It does not identify file formats from their
 bytes, inspect archive entries, or detect renamed binary content. The denylist
 does not restrict files the agent creates or downloads through other tools.
 Images, PDFs, and text/code uploads retain their separate existing limits;
-the web composer also has a fixed 50 MiB ceiling for the formats listed above.
+the web composer also has a fixed 50 MiB ceiling for files delivered as files.
 
 Request-phase policies receive the filename and content type for these files,
 with an empty `text` value. Their document, archive, and database contents are

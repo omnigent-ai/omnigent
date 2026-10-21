@@ -32,33 +32,13 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from omnigent.db.compression import CompressedText
 from omnigent.util.uuid import InvalidUuidError as InvalidUuidError
+from omnigent.util.uuid import normalize_uuid as normalize_uuid
 from omnigent.util.uuid import uuid_to_bytes as uuid_to_bytes
 
 # 32-byte sha256 digest column. LargeBinary → BYTEA (Postgres) / BLOB (SQLite),
 # but MySQL cannot index a BLOB without a key-prefix length, so use fixed-length
 # BINARY(32) there — an exact fit for the digest and fully indexable.
 _CKSUM32 = LargeBinary(32).with_variant(MySQLBinary(32), "mysql")
-
-
-def normalize_uuid(value: str | None) -> str | None:
-    """Return the bare 32-char hex form of *value*, or *value* unchanged.
-
-    The forgiving companion to :func:`uuid_to_bytes` for **Python-side** id
-    comparisons (e.g. a store's scope check against an ORM attribute, which
-    always reads back bare hex). A legacy-prefixed or dashed input normalises
-    to bare hex; a malformed input is returned as-is so the comparison simply
-    mismatches — preserving the pre-migration "unknown id = not found"
-    behaviour instead of raising. ``None`` passes through.
-
-    :param value: Any caller-supplied id string, or ``None``.
-    :returns: The bare 32-char hex form, or *value* verbatim if not a uuid.
-    """
-    if value is None:
-        return None
-    try:
-        return uuid_to_bytes(value).hex()
-    except InvalidUuidError:
-        return value
 
 
 class Uuid16(TypeDecorator[str]):

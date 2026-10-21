@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   ATTACHMENT_SIZE_LIMITS_MB,
+  attachmentAccept,
   attachmentFilename,
   attachmentKey,
   classifyAttachment,
@@ -81,6 +82,37 @@ describe("classifyAttachment", () => {
     // .csv tagged as an office MIME still uses the text size limit.
     expect(classifyAttachment(makeFile("data.csv", "application/vnd.ms-excel"))).toBe("text");
   });
+
+  it("follows the server's filesystem attachment policy", () => {
+    const allTypes = { extensions: [".zip"], all_types: true };
+    // Inline types stay inline; anything else becomes a file.
+    expect(classifyAttachment(makeFile("notes.txt", "text/plain"), allTypes)).toBe("text");
+    expect(classifyAttachment(makeFile("a.png", "image/png"), allTypes)).toBe("image");
+    expect(classifyAttachment(makeFile("trace.gz", "application/gzip"), allTypes)).toBe("file");
+    expect(classifyAttachment(makeFile("site.har", ""), allTypes)).toBe("file");
+
+    // A listed extension is a file even when it would otherwise be text.
+    const logs = { extensions: [".log"], all_types: false };
+    expect(classifyAttachment(makeFile("big.log", "text/plain"), logs)).toBe("file");
+    // A list replaces the defaults.
+    expect(classifyAttachment(makeFile("a.zip", "application/zip"), logs)).toBeNull();
+    // An excluded default type stays refused when the browser labels it as text.
+    expect(classifyAttachment(makeFile("a.zip", "text/plain"), logs)).toBeNull();
+    const none = { extensions: [], all_types: false };
+    expect(classifyAttachment(makeFile("a.zip", "text/plain"), none)).toBeNull();
+  });
+});
+
+describe("attachmentAccept", () => {
+  it("lists inline types plus the policy's filesystem extensions", () => {
+    expect(attachmentAccept()).toBe(
+      "image/*,application/pdf,text/*,application/json,.zip,.docx,.xlsx,.pptx,.db,.sqlite,.sqlite3",
+    );
+    expect(attachmentAccept({ extensions: [".gz"], all_types: false })).toBe(
+      "image/*,application/pdf,text/*,application/json,.gz",
+    );
+    expect(attachmentAccept({ extensions: [".zip"], all_types: true })).toBeUndefined();
+  });
 });
 
 describe("validateAttachments", () => {
@@ -96,6 +128,28 @@ describe("validateAttachments", () => {
     expect(accepted).toHaveLength(0);
     expect(errors).toHaveLength(1);
     expect(errors[0]).toContain("clip.mp4");
+  });
+
+  it("names the types the server accepts when rejecting", () => {
+    const clip = [makeFile("clip.mp4", "video/mp4")];
+    expect(validateAttachments(clip).errors[0]).toContain("archives, office documents");
+    expect(
+      validateAttachments(clip, { extensions: [".har", ".gz"], all_types: false }).errors[0],
+    ).toContain("only images, PDF, text/code, and .gz, .har files are supported");
+    expect(validateAttachments(clip, { extensions: [], all_types: false }).errors[0]).toContain(
+      "only images, PDF, and text/code files are supported",
+    );
+  });
+
+  it("accepts other files under the file limit when the server allows all types", () => {
+    const trace = makeFile("trace.gz", "application/gzip", 30 * MB);
+    expect(validateAttachments([trace]).accepted).toHaveLength(0);
+    const { accepted, errors } = validateAttachments([trace], {
+      extensions: [".zip"],
+      all_types: true,
+    });
+    expect(accepted).toEqual([trace]);
+    expect(errors).toHaveLength(0);
   });
 
   it("accepts an archive up to its larger limit", () => {

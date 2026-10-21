@@ -37,6 +37,9 @@ jobs:
   # (security-gate.yml); trusted authors and non-PR events pass through.
   gate:
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
 
   pre-commit:
     name: Pre-commit checks

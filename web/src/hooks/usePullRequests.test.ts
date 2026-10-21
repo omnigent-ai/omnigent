@@ -1,10 +1,9 @@
-// Tests for the pure helpers in usePullRequests — the 404 → reason classifier that
-// steers an outdated host to the "update your host" panel state, the payload
-// normalizer (and that the info fetch applies it), and the panel's
-// poll-interval decision.
+// Tests for usePullRequests' pure helpers: the 404 → "update your host" classifier, the
+// payload normalizer (and that the info fetch applies it), the poll interval, and label edits.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  applyPullRequestLabelChange,
   computePullRequestPollInterval,
   fetchPullRequestInfo,
   normalizePullRequestInfo,
@@ -22,6 +21,31 @@ const FORGE_DISPLAY = {
   request_name: "pull request",
   number_prefix: "!",
 };
+
+describe("applyPullRequestLabelChange", () => {
+  const label = (name: string, color: string | null = null) => ({
+    name,
+    color,
+    description: null,
+  });
+
+  it("removes labels case-insensitively and appends added ones", () => {
+    const labels = [label("Bug"), label("docs"), label("size/XS")];
+
+    expect(
+      applyPullRequestLabelChange(labels, { add: [label("ready")], remove: [label("bug")] }),
+    ).toEqual([label("docs"), label("size/XS"), label("ready")]);
+    expect(labels).toHaveLength(3);
+  });
+
+  it("replaces a label it re-adds, so a repeated edit changes nothing more", () => {
+    const change = { add: [label("Ready", "0e8a16")], remove: [] };
+    const once = applyPullRequestLabelChange([label("ready"), label("docs")], change);
+
+    expect(once).toEqual([label("docs"), label("Ready", "0e8a16")]);
+    expect(applyPullRequestLabelChange(once, change)).toEqual(once);
+  });
+});
 
 describe("pullRequestNotFoundReason", () => {
   it("flags an outdated host from its 'resource not found' message", () => {

@@ -231,8 +231,31 @@ export interface ServerInfo {
   agent_detail?: boolean;
   /** Owner-only configuration reads and conditional PATCH updates. */
   agent_config_edit?: boolean;
+  /**
+   * Which uploads Claude Code and Codex sessions receive as files. Null on
+   * older servers, whose policy is the default extension list.
+   */
+  filesystem_attachments?: FilesystemAttachmentsInfo | null;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
+}
+
+/** The server's filesystem attachment policy, as reported by ``/v1/info``. */
+export interface FilesystemAttachmentsInfo {
+  /** Lowercase extensions always delivered as files, e.g. ``".zip"``. */
+  extensions: string[];
+  /** Whether every other file that can't be inlined is delivered as a file. */
+  all_types: boolean;
+}
+
+function parseFilesystemAttachments(raw: unknown): FilesystemAttachmentsInfo | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const value = raw as Record<string, unknown>;
+  if (!Array.isArray(value.extensions)) return null;
+  return {
+    extensions: value.extensions.filter((ext): ext is string => typeof ext === "string"),
+    all_types: value.all_types === true,
+  };
 }
 
 function parseBranding(raw: unknown): Branding | null {
@@ -408,6 +431,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           agent_install: data.agent_install === true,
           agent_detail: data.agent_detail === true,
           agent_config_edit: data.agent_config_edit === true,
+          filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           branding: parseBranding(data.branding),
         };
         return cachedServerInfo;
