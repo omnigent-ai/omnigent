@@ -341,6 +341,7 @@ lint = [
 ]
 test = [
     "pytest>=7.0",
+    "markdown-it-py>=3.0",
     # PEP 517 frontend used by the standalone-package artifact checks.
     "build>=1.2",
     # These clients are optional product capabilities, but their tests import

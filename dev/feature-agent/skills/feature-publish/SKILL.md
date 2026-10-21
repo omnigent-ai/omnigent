@@ -91,7 +91,7 @@ in a PR comment, then copy their returned URLs into the description:
    use `gh pr comment <pr> --body-file <file> --attach <clip> …` with the supplied
    credential. If uploading is unavailable, report the recording blocker and
    manual test steps; do not change credentials.
-   Read the uploaded asset URLs from the posted comment using
+   In direct mode, read the uploaded asset URLs from the posted comment using
    `gh pr view <pr> --comments` or the comment URL printed by `gh`.
 3. Put those URLs under the matching `### CUJ-n` headings in the Demo section,
    each on its own line so videos play inline. Update the description with
@@ -101,7 +101,8 @@ Only these uploaded URLs count as recordings: they must be
 `https://github.com/user-attachments/assets/…` URLs. Local `recordings/` paths
 and CI artifact links do not.
 
-The checked helper's CLI and upload contract live in `omnigent-internal`:
+For maintainers, the checked helper's CLI and upload contract live in the private
+`omnigent-internal` repository:
 `.github/scripts/resolve_pr_client.py` and `.github/scripts/resolve_pr_gate.py`;
 regressions are covered by `agents/repro-agent/tests/unit/test_pr_attachments.py`.
 
