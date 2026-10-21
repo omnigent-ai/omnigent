@@ -121,6 +121,42 @@ def test_root_wins_over_generic_auth_when_both_markers_present() -> None:
     assert diagnosis.title == "Claude Code can't run as root"
 
 
+@pytest.mark.parametrize(
+    "output",
+    [
+        "RuntimeError: Direct API access authentication failed: No teams found in your "
+        "certificate. Please run 'dbcert' to refresh your certificate and try again.",
+        "FileNotFoundError: Missing required credential files in directory: "
+        "/home/dev/.dbcert. Missing: cert (/home/dev/.dbcert/cert.pem).",
+        # Pane wrapping and borders can split the marker mid-word.
+        "│ Direct API access authentication failed: No teams found in your cert │\n"
+        "│ ificate. Please run 'dbcert' and try again.                           │",
+    ],
+)
+def test_classifies_missing_dbcert_certificate(output: str) -> None:
+    diagnosis = classify_terminal_failure(command="isaac", exit_status=1, output=output)
+    assert diagnosis is not None
+    assert diagnosis.title == "Client certificate missing"
+    assert diagnosis.remediation is not None
+    assert "`dbcert`" in diagnosis.remediation
+
+
+def test_dbcert_wins_over_missing_binary_and_auth_markers() -> None:
+    # Ordering guard: the launcher's traceback can also mention a missing file
+    # or a failed sign-in, but the certificate is the actionable cause.
+    diagnosis = classify_terminal_failure(
+        command="claude",
+        exit_status=1,
+        output=(
+            "warning: [Errno 2] No such file or directory: '/home/dev/.dbcert'\n"
+            "not authenticated\n"
+            "Missing required credential files in directory: /home/dev/.dbcert"
+        ),
+    )
+    assert diagnosis is not None
+    assert diagnosis.title == "Client certificate missing"
+
+
 def test_unclassified_failure_returns_none() -> None:
     assert (
         classify_terminal_failure(
