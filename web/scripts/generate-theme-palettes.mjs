@@ -30,6 +30,9 @@ const androidRoles = {
   brand_border: "border",
   brand_primary: "primary",
   brand_on_primary: "primaryForeground",
+  brand_secondary: "secondary",
+  brand_on_secondary: "secondaryForeground",
+  brand_accent: "brandAccent",
 };
 
 function androidColor(value, role) {

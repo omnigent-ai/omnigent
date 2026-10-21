@@ -2,6 +2,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- Runtime-requested on API 33+; see notification flow. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Runtime-requested when the web UI first asks for the mic (voice input). -->
@@ -32,6 +33,7 @@
 
         <activity
             android:name=".MainActivity"
+            android:theme="@style/Theme.Omnigent.Launch"
             android:configChanges="orientation|screenSize|keyboardHidden|uiMode|smallestScreenSize|screenLayout|density"
             android:exported="true"
             android:launchMode="singleTop"
