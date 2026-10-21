@@ -80,6 +80,10 @@ are kept, and authors can comment `/reopen` to resume work after an automated
 closure. This policy also applies to older PRs that predate the review-state
 labels below.
 
+The stale automation runs daily as two jobs (issues and pull requests) with
+separate budgets, and each run's log ends with statistics on how many items it
+evaluated, marked, and closed; check those if the backlog looks untouched.
+
 If a bug is labeled `needs-info`, the automation asks its author for the
 specific missing information and gives them 7 days to respond. An author reply
 triggers another triage pass; the label clears only when the new information is

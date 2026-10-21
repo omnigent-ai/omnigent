@@ -1,5 +1,11 @@
 name: Close stale issues and pull requests
 
+# Issues and PRs run as two jobs with independent budgets so a long PR queue
+# cannot starve issue processing (or vice versa). Each job disables the other
+# kind with days-before-*-stale: -1. The budget is sized so one run evaluates
+# the whole open set: at ~4 API operations per PR, 300/run covered ~75 items a
+# day against ~2,400 open and never reached most of the queue (#11186).
+
 on:
   schedule:
     - cron: "0 0 * * *" # Run daily at midnight UTC
@@ -11,18 +17,25 @@ permissions:
   pull-requests: write
 
 jobs:
-  stale:
+  stale-issues:
+    name: Close stale issues
     runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      issues: write
     steps:
       - uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93 # v11.0.0
         with:
-          operations-per-run: 300
+          operations-per-run: 1000
+          enable-statistics: true
           # Least recently updated first, so the budget reaches stale candidates
           # before it is spent paging through active items.
           sort-by: updated
           ascending: true
-          days-before-stale: 30
-          days-before-close: 14
+          days-before-issue-stale: 30
+          days-before-issue-close: 14
+          days-before-pr-stale: -1 # PRs are handled by the stale-prs job
+          days-before-pr-close: -1
           stale-issue-label: stale
           stale-issue-message: >
             This issue has been automatically marked as stale because it has not
@@ -31,7 +44,28 @@ jobs:
           close-issue-message: >
             This issue was closed because it has been stale for 14 days with no
             activity.
+          # `bug` stays exempt: bug reports age out through the separate
+          # needs-info lifecycle in CONTRIBUTING, not the stale policy.
           exempt-issue-labels: pinned,security,bug
+
+  stale-prs:
+    name: Close stale pull requests
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93 # v11.0.0
+        with:
+          operations-per-run: 1000
+          enable-statistics: true
+          sort-by: updated
+          ascending: true
+          days-before-issue-stale: -1 # issues are handled by the stale-issues job
+          days-before-issue-close: -1
+          days-before-pr-stale: 60
+          days-before-pr-close: 14
           stale-pr-label: stale
           stale-pr-message: >
             This PR has been automatically marked as stale because it has had no
@@ -42,8 +76,6 @@ jobs:
             This PR was closed because it has been stale for 14 days with no
             activity. If you are ready to continue, comment `/reopen` to reopen it,
             as long as its source branch still exists.
-          days-before-pr-stale: 60
-          days-before-pr-close: 14
           remove-pr-stale-when-updated: true
           exempt-pr-labels: pinned,security
           delete-branch: false
