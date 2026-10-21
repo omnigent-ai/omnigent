@@ -7,4 +7,7 @@
     <color name="brand_border">#e4e4e7</color>
     <color name="brand_primary">#df3c85</color>
     <color name="brand_on_primary">#ffffff</color>
+    <color name="brand_secondary">#eceef1</color>
+    <color name="brand_on_secondary">#27272a</color>
+    <color name="brand_accent">#df3c85</color>
 </resources>

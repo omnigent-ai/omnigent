@@ -19,6 +19,42 @@ import org.robolectric.annotation.Config
 @Config(sdk = [35])
 class ThemeTest {
     @Test
+    @Config(sdk = [35], qualifiers = "night")
+    fun nightLaunchKeepsPlatformSplashAttributes() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        context.setTheme(R.style.Theme_Omnigent_Launch)
+        val attributes =
+            context.obtainStyledAttributes(
+                intArrayOf(
+                    android.R.attr.windowSplashScreenBackground,
+                    android.R.attr.windowSplashScreenAnimatedIcon,
+                    android.R.attr.windowBackground,
+                ),
+            )
+        try {
+            assertEquals(R.color.brand_background, attributes.getResourceId(0, 0))
+            assertEquals(R.drawable.splash_mark, attributes.getResourceId(1, 0))
+            assertEquals(R.color.brand_background, attributes.getResourceId(2, 0))
+        } finally {
+            attributes.recycle()
+        }
+    }
+
+    @Test
+    @Config(sdk = [28])
+    fun pre31LaunchUsesStaticMarkThenActivityThemeUsesBrandBackground() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        context.setTheme(R.style.Theme_Omnigent_Launch)
+        val launch = context.obtainStyledAttributes(intArrayOf(android.R.attr.windowBackground))
+        assertEquals(R.drawable.launch_background, launch.getResourceId(0, 0))
+        launch.recycle()
+        context.setTheme(R.style.Theme_Omnigent)
+        val activity = context.obtainStyledAttributes(intArrayOf(android.R.attr.windowBackground))
+        assertEquals(R.color.brand_background, activity.getResourceId(0, 0))
+        activity.recycle()
+    }
+
+    @Test
     @Config(qualifiers = "night")
     fun connectScreenUsesWebPaletteInSystemDarkMode() {
         val context = ApplicationProvider.getApplicationContext<Context>()
