@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -25,6 +26,7 @@ from omnigent.harnesses.qwen_native import bridge as qwen_native_bridge
 from omnigent.runner import create_runner_app, native_controls
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
+from tests._helpers.polling import poll_until_async
 from tests.runner.conftest import (
     _build_app_for_spec,
     _drain_session_event_queue,
@@ -2178,6 +2180,453 @@ async def test_events_model_change_mid_turn_defers_instead_of_failing(
         pane_status="running",
     )
     assert resp.status_code == 204, resp.text
+
+
+_PROMPT_SESSION_ID = "68c7c1acc5eeec3978c5e62043da51a5"
+
+
+def _patch_settings_behind_prompt(
+    monkeypatch: pytest.MonkeyPatch, prompt_open: list[bool], *, wait_refuses: bool = True
+) -> list[str]:
+    """Script a Claude pane whose question or permission prompt is open while ``prompt_open[0]``.
+
+    Like the bridge, the prompt wait (unless ``wait_refuses`` is false) and the
+    injection refuse while it is open, before any key is typed.
+
+    :returns: Every command the runner typed into the pane.
+    """
+    commands: list[str] = []
+
+    def _refuse_while_open() -> None:
+        if prompt_open[0]:
+            raise claude_native_bridge.ClaudeUserPromptPending(
+                "Answer the pending Claude question before changing settings.",
+                nothing_typed=True,
+            )
+
+    def _fake_wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
+        del bridge_dir, ready_timeout_s, timeout_s
+        if wait_refuses:
+            _refuse_while_open()
+
+    def _fake_inject(bridge_dir: Any, *, command: str, **kwargs: Any) -> None:
+        del bridge_dir, kwargs
+        # The bridge stops before its first key once the caller's budget is spent.
+        claude_native_bridge._check_injection_cancelled()
+        _refuse_while_open()
+        commands.append(command)
+
+    monkeypatch.setattr(claude_native_bridge, "wait_for_input_ready", _fake_wait)
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    monkeypatch.setattr(
+        claude_native_bridge, "has_pending_user_prompt", lambda _bridge_dir: prompt_open[0]
+    )
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "read_model_env",
+        lambda _bridge_dir: {"ANTHROPIC_CUSTOM_MODEL_OPTION": "claude-opus-4-7"},
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.resolve_native_claude_config",
+        lambda *, spec: None,
+    )
+    monkeypatch.setattr(claude_native_bridge, "read_model_picker_values", lambda _: [])
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.stored_claude_picker_values",
+        lambda _config, _rows=None: [],
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.stored_claude_catalog_rows", lambda _config: None
+    )
+    monkeypatch.setattr(
+        claude_native_bridge, "read_claude_status_model", lambda _bridge_dir: "claude-opus-4-6"
+    )
+    monkeypatch.setattr(claude_native_bridge, "confirm_dialog_if_open", lambda _b, *, hint: False)
+    monkeypatch.setattr(native_controls, "_CLAUDE_SETTINGS_AFTER_PROMPT_POLL_S", 0.01)
+    monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_LATE_DIALOG_BUDGET_S", 0.05)
+    monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_LATE_DIALOG_POLL_S", 0.01)
+    return commands
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event", "command", "wait_refuses"),
+    [
+        ({"type": "model_change", "model": "claude-opus-4-7"}, "/model claude-opus-4-7", True),
+        ({"type": "model_change", "model": "claude-opus-4-7"}, "/model claude-opus-4-7", False),
+        ({"type": "effort_change", "effort": "high"}, "/effort high", True),
+    ],
+    ids=["model", "model-refused-at-injection", "effort"],
+)
+async def test_events_settings_change_waits_for_a_pending_prompt_then_applies(
+    monkeypatch: pytest.MonkeyPatch, event: dict[str, str], command: str, wait_refuses: bool
+) -> None:
+    """A switch refused by an open question or permission prompt applies once it is answered."""
+    prompt_open = [True]
+    commands = _patch_settings_behind_prompt(monkeypatch, prompt_open, wait_refuses=wait_refuses)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": _PROMPT_SESSION_ID,
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(f"/v1/sessions/{_PROMPT_SESSION_ID}/events", json=event)
+        # Not a failure: the person is answering Claude, and the switch follows.
+        assert resp.status_code == 204, resp.text
+        await asyncio.sleep(0.05)
+        assert commands == []
+        prompt_open[0] = False
+        await poll_until_async(lambda: commands, timeout_s=3)
+        await asyncio.sleep(0.05)
+    assert commands == [command]
+
+
+@pytest.mark.asyncio
+async def test_events_settings_change_behind_an_unanswered_prompt_is_dropped(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A prompt left open past the budget drops the queued switch instead of typing later."""
+    commands = _patch_settings_behind_prompt(monkeypatch, [True])
+    monkeypatch.setattr(native_controls, "_CLAUDE_SETTINGS_AFTER_PROMPT_BUDGET_S", 0.05)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    with caplog.at_level(logging.WARNING):
+        async with _runner_client(app) as client:
+            create_resp = await client.post(
+                "/v1/sessions",
+                json={
+                    "session_id": _PROMPT_SESSION_ID,
+                    "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+                },
+            )
+            assert create_resp.status_code == 201, create_resp.text
+            resp = await client.post(
+                f"/v1/sessions/{_PROMPT_SESSION_ID}/events",
+                json={"type": "model_change", "model": "claude-opus-4-7"},
+            )
+            assert resp.status_code == 204, resp.text
+            await asyncio.sleep(0.3)
+    assert commands == []
+    assert any("dropped" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_events_newer_model_pick_replaces_one_waiting_for_a_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the latest pick applies after the prompt is answered."""
+    prompt_open = [True]
+    commands = _patch_settings_behind_prompt(monkeypatch, prompt_open)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "read_model_env",
+        lambda _bridge_dir: {
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-7",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6",
+        },
+    )
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": _PROMPT_SESSION_ID,
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        for model in ("opus", "sonnet"):
+            resp = await client.post(
+                f"/v1/sessions/{_PROMPT_SESSION_ID}/events",
+                json={"type": "model_change", "model": model},
+            )
+            assert resp.status_code == 204, resp.text
+        prompt_open[0] = False
+        await poll_until_async(lambda: commands, timeout_s=3)
+        await asyncio.sleep(0.05)
+    assert commands == ["/model sonnet"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("queued", "cleared"),
+    [
+        ({"type": "model_change", "model": "claude-opus-4-7"}, {"type": "model_change"}),
+        (
+            {"type": "model_change", "model": "claude-opus-4-7"},
+            {"type": "model_change", "model": " "},
+        ),
+        ({"type": "effort_change", "effort": "high"}, {"type": "effort_change"}),
+        (
+            {"type": "effort_change", "effort": "high"},
+            {"type": "effort_change", "effort": "not-an-effort"},
+        ),
+    ],
+    ids=["model-cleared", "model-blank", "effort-cleared", "effort-unknown"],
+)
+async def test_events_cleared_pick_cancels_one_waiting_for_a_prompt(
+    monkeypatch: pytest.MonkeyPatch, queued: dict[str, str], cleared: dict[str, str]
+) -> None:
+    """Clearing the selection drops a queued switch, so answering the prompt types nothing."""
+    prompt_open = [True]
+    commands = _patch_settings_behind_prompt(monkeypatch, prompt_open)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    url = f"/v1/sessions/{_PROMPT_SESSION_ID}/events"
+    async with _runner_client(app) as client:
+        await _create_prompt_session(client)
+        for event in (queued, cleared):
+            resp = await client.post(url, json=event)
+            assert resp.status_code == 204, resp.text
+        prompt_open[0] = False
+        await asyncio.sleep(0.2)
+    assert commands == []
+
+
+async def _create_prompt_session(client: httpx.AsyncClient) -> None:
+    resp = await client.post(
+        "/v1/sessions",
+        json={"session_id": _PROMPT_SESSION_ID, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+    )
+    assert resp.status_code == 201, resp.text
+
+
+@pytest.mark.asyncio
+async def test_events_newer_pick_lands_after_a_queued_switch_that_is_typing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pick made while a queued switch types after the answer waits for it, so it lands last."""
+    prompt_open = [True]
+    commands = _patch_settings_behind_prompt(monkeypatch, prompt_open)
+    queued_typing, release = threading.Event(), threading.Event()
+    inject = claude_native_bridge.inject_slash_command
+
+    def _slow_queued_inject(bridge_dir: Any, *, command: str, **kwargs: Any) -> None:
+        if command == "/effort high" and not prompt_open[0]:
+            queued_typing.set()
+            release.wait(5)
+        inject(bridge_dir, command=command, **kwargs)
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _slow_queued_inject)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    url = f"/v1/sessions/{_PROMPT_SESSION_ID}/events"
+    async with _runner_client(app) as client:
+        await _create_prompt_session(client)
+        resp = await client.post(url, json={"type": "effort_change", "effort": "high"})
+        assert resp.status_code == 204, resp.text
+        prompt_open[0] = False
+        assert await asyncio.to_thread(queued_typing.wait, 5)
+        asyncio.get_running_loop().call_later(0.2, release.set)
+        resp = await client.post(url, json={"type": "effort_change", "effort": "low"})
+        assert resp.status_code == 204, resp.text
+    assert commands == ["/effort high", "/effort low"]
+
+
+@pytest.mark.asyncio
+async def test_events_settings_change_waits_again_when_a_second_prompt_opens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prompt that opens as the queued switch starts is waited out, then the switch applies."""
+    prompt_open = [True]
+    commands = _patch_settings_behind_prompt(monkeypatch, prompt_open)
+    second_prompt = [True]
+    inject = claude_native_bridge.inject_slash_command
+
+    def _inject_into_a_second_prompt(bridge_dir: Any, *, command: str, **kwargs: Any) -> None:
+        if not prompt_open[0] and second_prompt[0]:
+            # Back-to-back permissions: the next one opens before the switch is typed.
+            second_prompt[0] = False
+            prompt_open[0] = True
+        inject(bridge_dir, command=command, **kwargs)
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _inject_into_a_second_prompt)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    url = f"/v1/sessions/{_PROMPT_SESSION_ID}/events"
+    async with _runner_client(app) as client:
+        await _create_prompt_session(client)
+        resp = await client.post(url, json={"type": "effort_change", "effort": "high"})
+        assert resp.status_code == 204, resp.text
+        prompt_open[0] = False
+        await poll_until_async(lambda: not second_prompt[0], timeout_s=3)
+        await asyncio.sleep(0.05)
+        assert prompt_open[0], "the second prompt should be open"
+        assert commands == []
+        prompt_open[0] = False
+        await poll_until_async(lambda: commands, timeout_s=3)
+    assert commands == ["/effort high"]
+
+
+@pytest.mark.asyncio
+async def test_events_newer_pick_stops_waiting_when_the_queued_switch_meets_a_second_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newer pick waiting on a typing switch is queued, not failed, when it waits again."""
+    prompt_open = [True]
+    commands = _patch_settings_behind_prompt(monkeypatch, prompt_open)
+    # A short budget makes a newer pick that waits it out fail fast.
+    monkeypatch.setattr(native_controls, "_CLAUDE_CONTROL_BUDGET_S", 3.0)
+    queued_typing, release = threading.Event(), threading.Event()
+    inject = claude_native_bridge.inject_slash_command
+
+    def _second_prompt_while_queued_types(bridge_dir: Any, *, command: str, **kwargs: Any) -> None:
+        if command == "/effort high" and not prompt_open[0]:
+            queued_typing.set()
+            release.wait(5)
+            prompt_open[0] = True  # the next permission opens before the switch lands
+        inject(bridge_dir, command=command, **kwargs)
+
+    monkeypatch.setattr(
+        claude_native_bridge, "inject_slash_command", _second_prompt_while_queued_types
+    )
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    url = f"/v1/sessions/{_PROMPT_SESSION_ID}/events"
+    async with _runner_client(app) as client:
+        await _create_prompt_session(client)
+        resp = await client.post(url, json={"type": "effort_change", "effort": "high"})
+        assert resp.status_code == 204, resp.text
+        prompt_open[0] = False
+        assert await asyncio.to_thread(queued_typing.wait, 5)
+        asyncio.get_running_loop().call_later(0.2, release.set)
+        resp = await client.post(url, json={"type": "effort_change", "effort": "low"})
+        # Queued behind the second prompt rather than failed after waiting out its budget.
+        assert resp.status_code == 204, resp.text
+        assert commands == []
+        prompt_open[0] = False
+        await poll_until_async(lambda: commands, timeout_s=3)
+        await asyncio.sleep(0.05)
+    assert commands == ["/effort low"]
+
+
+@pytest.mark.asyncio
+async def test_events_unsupported_model_pick_keeps_the_queued_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newer pick the pane can't take is refused without dropping the queued switch."""
+    prompt_open = [True]
+    commands = _patch_settings_behind_prompt(monkeypatch, prompt_open)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "read_model_env",
+        lambda _bridge_dir: {"ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-7"},
+    )
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    url = f"/v1/sessions/{_PROMPT_SESSION_ID}/events"
+    async with _runner_client(app) as client:
+        await _create_prompt_session(client)
+        resp = await client.post(url, json={"type": "model_change", "model": "opus"})
+        assert resp.status_code == 204, resp.text
+        resp = await client.post(url, json={"type": "model_change", "model": "gpt-5.4"})
+        assert resp.status_code == 503, resp.text
+        assert resp.json()["error"] == "claude_native_model_unsupported"
+        prompt_open[0] = False
+        await poll_until_async(lambda: commands, timeout_s=3)
+    assert commands == ["/model opus"]
+
+
+@pytest.mark.asyncio
+async def test_events_settings_change_survives_a_failed_prompt_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A prompt check that errors keeps the switch waiting instead of ending it."""
+    prompt_open = [True]
+    commands = _patch_settings_behind_prompt(monkeypatch, prompt_open)
+    failures = [1]
+
+    def _flaky_pending(_bridge_dir: Any) -> bool:
+        if failures[0]:
+            failures[0] -= 1
+            raise RuntimeError("tmux capture failed")
+        return prompt_open[0]
+
+    monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", _flaky_pending)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    async with _runner_client(app) as client:
+        await _create_prompt_session(client)
+        resp = await client.post(
+            f"/v1/sessions/{_PROMPT_SESSION_ID}/events",
+            json={"type": "effort_change", "effort": "high"},
+        )
+        assert resp.status_code == 204, resp.text
+        await asyncio.sleep(0.05)
+        assert failures == [0]
+        prompt_open[0] = False
+        await poll_until_async(lambda: commands, timeout_s=3)
+    assert commands == ["/effort high"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        ("DELETE", "/v1/sessions/{sid}/resources", None),
+        ("POST", "/v1/sessions/{sid}/reset-state", None),
+        ("POST", "/v1/sessions/{sid}/events", {"type": "stop_session"}),
+        ("DELETE", "/v1/sessions/{sid}", None),
+    ],
+    ids=["cleanup", "reset", "stop", "delete"],
+)
+async def test_events_settings_change_queued_behind_a_prompt_ends_with_its_session(
+    monkeypatch: pytest.MonkeyPatch, method: str, path: str, body: dict[str, str] | None
+) -> None:
+    """Teardown drops a queued switch: it stops waiting, so it never prepares a pane or types."""
+    prompt_open = [True]
+    commands = _patch_settings_behind_prompt(monkeypatch, prompt_open)
+    polls: list[float] = []
+
+    def _pending(_bridge_dir: Any) -> bool:
+        polls.append(time.monotonic())
+        return prompt_open[0]
+
+    monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", _pending)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    async with _runner_client(app) as client:
+        await _create_prompt_session(client)
+        resp = await client.post(
+            f"/v1/sessions/{_PROMPT_SESSION_ID}/events",
+            json={"type": "effort_change", "effort": "high"},
+        )
+        assert resp.status_code == 204, resp.text
+        await asyncio.sleep(0.05)
+        assert polls, "the switch should be waiting on the prompt"
+        await client.request(method, path.format(sid=_PROMPT_SESSION_ID), json=body)
+        polled = len(polls)
+        prompt_open[0] = False
+        await asyncio.sleep(0.1)
+    assert len(polls) == polled
+    assert commands == []
+
+
+@pytest.mark.asyncio
+async def test_events_settings_change_answered_after_the_request_budget_still_applies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The switch typed after the answer has a budget of its own, not the lapsed request's."""
+    prompt_open = [True]
+    commands = _patch_settings_behind_prompt(monkeypatch, prompt_open)
+    clock = _VirtualClock()
+    monkeypatch.setattr(native_controls, "time", clock)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": _PROMPT_SESSION_ID,
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            f"/v1/sessions/{_PROMPT_SESSION_ID}/events",
+            json={"type": "effort_change", "effort": "high"},
+        )
+        assert resp.status_code == 204, resp.text
+        # The person takes longer to answer than the whole request was allowed.
+        clock.sleep(native_controls._CLAUDE_CONTROL_BUDGET_S + 1)
+        prompt_open[0] = False
+        await poll_until_async(lambda: commands, timeout_s=3)
+    assert commands == ["/effort high"]
 
 
 _BOOT_SESSION_ID = "68c7c1acc5eeec3978c5e62043da51a6"

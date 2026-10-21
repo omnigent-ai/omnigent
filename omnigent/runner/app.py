@@ -3360,6 +3360,7 @@ def create_runner_app(
     async def delete_session(session_id: str) -> JSONResponse:
         resource_registry.note_terminal_control_request(session_id, "delete_session")
         _cancel_claude_prompt_waiter(session_id)
+        await _cancel_claude_settings_after_prompt(session_id)
         _session_message_buffers.pop(session_id, None)
         # Stop initialization before it can recreate resources during teardown.
         init_tasks = [
@@ -6814,6 +6815,7 @@ def create_runner_app(
         if body_type == "stop_session":
             resource_registry.note_terminal_control_request(conversation_id, "stop_session")
             _cancel_claude_prompt_waiter(conversation_id)
+            await _cancel_claude_settings_after_prompt(conversation_id)
             _harness = _session_harness_name(conversation_id)
             _stop_resp = await _native_interrupt_runner.stop(_harness, conversation_id)
             if _stop_resp is not None:
@@ -7331,6 +7333,7 @@ def create_runner_app(
         resource_registry=resource_registry,
         server_client=server_client,
     )
+    _cancel_claude_settings_after_prompt = _native_controls.cancel_claude_settings_after_prompt
     _codex_native_model_options = _native_controls.codex_native_model_options
     _handle_claude_native_btw_dismiss = _native_controls.handle_claude_native_btw_dismiss
     _handle_claude_native_compact = _native_controls.handle_claude_native_compact
@@ -7544,6 +7547,8 @@ def create_runner_app(
     async def cleanup_session_resources(
         session_id: str,
     ) -> JSONResponse:
+        # A model or effort switch queued behind a prompt would recreate the pane.
+        await _cancel_claude_settings_after_prompt(session_id)
         _required_terminal_exit_errors.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
@@ -7574,6 +7579,7 @@ def create_runner_app(
 
     @app.post("/v1/sessions/{session_id}/reset-state")
     async def reset_session_state(session_id: str) -> JSONResponse:
+        await _cancel_claude_settings_after_prompt(session_id)
         _required_terminal_exit_errors.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
