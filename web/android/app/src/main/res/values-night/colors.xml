@@ -2,6 +2,6 @@
 <resources>
     <color name="ic_launcher_background">#1E2742</color>
 
-    <!-- Not generated: keep in sync with --destructive in web/src/index.css. -->
+    <!-- Not generated: keep in sync with the CSS destructive colour in web/src/index.css. -->
     <color name="brand_error">#e65b77</color>
 </resources>
