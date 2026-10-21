@@ -4552,7 +4552,7 @@ async def _auto_create_kimi_terminal(
     # a safe no-op for local unauthenticated runs.
     server_url = os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/")
     _auth_factory = _make_auth_token_factory()
-    _auth_token = _auth_factory() if _auth_factory is not None else None
+    _auth_token = await asyncio.to_thread(_auth_factory) if _auth_factory is not None else None
     # The hook subprocess replays these static headers from its config (no
     # refresh-capable httpx.Auth of its own); the helper pairs the bearer with
     # the workspace-routing header so neither is dropped.
