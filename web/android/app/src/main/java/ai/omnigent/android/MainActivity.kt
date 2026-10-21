@@ -3,9 +3,12 @@ package ai.omnigent.android
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.DownloadManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -24,9 +27,7 @@ import android.webkit.ValueCallback
 import android.webkit.WebView
 import android.widget.Button
 import android.widget.FrameLayout
-import android.widget.LinearLayout
 import android.widget.PopupMenu
-import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
@@ -34,6 +35,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.VisibleForTesting
 import androidx.appcompat.app.AppCompatActivity
 import androidx.browser.auth.AuthTabIntent
+import androidx.browser.customtabs.CustomTabsIntent
 import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
 import androidx.core.graphics.Insets
@@ -107,10 +109,13 @@ class MainActivity : AppCompatActivity() {
     private var workspaceSession: DatabricksWebSession? = null
     private var workspaceFuture: CompletableFuture<DatabricksWebSession>? = null
     private var workspaceGeneration = 0
-    private lateinit var connectionOverlay: LinearLayout
-    private lateinit var connectionMessage: TextView
-    private lateinit var connectionAction: Button
-    private lateinit var connectionCancel: Button
+    private lateinit var connectionOverlay: ConnectionStatusView
+    private var connectionStatus: ConnectionStatus? = null
+    private var retryRoute: String? = null
+    private var slowGeneration = 0
+    private var navigationFailed = false
+    private var navigationCommitted = false
+    private var slowConnection: Runnable? = null
     private var pinnedOrigin: String? = null
 
     // Bridge-dependent work deferred until the page (and its injected emit
@@ -171,6 +176,7 @@ class MainActivity : AppCompatActivity() {
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        setTheme(R.style.Theme_Omnigent)
         super.onCreate(savedInstanceState)
 
         // Edge-to-edge: the WebView spans system bars; insets are pushed to CSS
@@ -260,8 +266,8 @@ class MainActivity : AppCompatActivity() {
                     topMargin = (8 * dp).toInt()
                 }
         container.addView(switchButton)
-        connectionOverlay = buildConnectionOverlay()
-        if (workspaceContext == null) connectionOverlay.visibility = View.GONE
+        connectionOverlay = ConnectionStatusView(this, ::handleStatusAction)
+        connectionOverlay.visibility = View.GONE
         container.addView(connectionOverlay)
         container.addOnLayoutChangeListener { _, left, _, right, _, oldLeft, _, oldRight, _ ->
             if (right - left != oldRight - oldLeft) updateServerSwitcherWidth(right - left)
@@ -275,6 +281,10 @@ class MainActivity : AppCompatActivity() {
             this,
             object : OnBackPressedCallback(true) {
                 override fun handleOnBackPressed() {
+                    connectionStatus?.let { status ->
+                        if (status.presentation().cancel) cancelConnection() else finish()
+                        return
+                    }
                     // Ask the page to dismiss an open overlay first (drawer/dialog);
                     // only navigate WebView history / leave the app if there was
                     // nothing to dismiss. evaluateJavascript's result is JSON, so a
@@ -345,8 +355,9 @@ class MainActivity : AppCompatActivity() {
     ) {
         if (serverAuthentication(originOf(serverUrl)) != ServerAuthentication.OIDC) {
             oidcSession?.stop()
-            connectionOverlay.visibility = View.GONE
-            webView.loadUrl(serverUrl)
+            showStatus(ConnectionStatus.Connecting(statusHost()))
+            webView.loadUrl(retryRoute?.takeIf { originOf(it) == pinnedOrigin } ?: serverUrl)
+            retryRoute = null
             return
         }
         // A page left running under the cover keeps calling its server and could start a
@@ -406,46 +417,54 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** Presents the native OIDC session's progress and outcomes in the connection overlay. */
+    /** Presents the native OIDC session's progress and outcomes. */
     private inner class OidcHost : OidcSessionController.Host {
         override fun showProgress(progress: OidcSessionController.Progress) {
-            connectionOverlay.visibility = View.VISIBLE
-            connectionMessage.text =
-                getString(
-                    when (progress) {
-                        OidcSessionController.Progress.CONNECTING -> R.string.oidc_connecting
-                        OidcSessionController.Progress.SIGNING_IN -> R.string.oidc_signing_in
-                        OidcSessionController.Progress.COMPLETING -> R.string.oidc_completing
-                    },
-                )
-            connectionAction.visibility = View.GONE
-            connectionCancel.visibility = View.VISIBLE
+            showStatus(
+                when (progress) {
+                    OidcSessionController.Progress.CONNECTING -> {
+                        ConnectionStatus.Connecting(
+                            statusHost(),
+                        )
+                    }
+
+                    OidcSessionController.Progress.SIGNING_IN -> {
+                        ConnectionStatus.SigningIn(
+                            statusHost(),
+                        )
+                    }
+
+                    OidcSessionController.Progress.COMPLETING -> {
+                        ConnectionStatus.CompletingSignIn(
+                            statusHost(),
+                            false,
+                        )
+                    }
+                },
+            )
         }
 
         override fun showSignInRequired(message: String) {
             // The signed-out page under the prompt would keep asking to sign in.
             webView.loadUrl(BLANK_PAGE)
-            connectionOverlay.visibility = View.VISIBLE
-            connectionMessage.text = message
-            connectionAction.apply {
-                text = getString(R.string.oauth_sign_in)
-                visibility = View.VISIBLE
-                setOnClickListener { oidcSession?.signIn() }
-            }
-            connectionCancel.visibility = View.VISIBLE
+            showStatus(ConnectionStatus.SignInRequired(statusHost(), message, false))
+        }
+
+        override fun showServerUnreachable(error: Throwable) {
+            showUnreachable(error.message ?: error.javaClass.simpleName)
         }
 
         override fun loadWithoutNativeSignIn(url: String) = loadPage(url)
 
         override fun loadPage(url: String) {
-            connectionOverlay.visibility = View.GONE
             // Back must not walk into the blank or signed-out pages before this one.
             historyCleared = false
-            webView.loadUrl(url)
+            val destination = retryRoute?.takeIf { originOf(it) == pinnedOrigin } ?: url
+            retryRoute = null
+            webView.loadUrl(destination)
         }
 
         override fun reloadPage(url: String) {
-            connectionOverlay.visibility = View.GONE
             webView.loadUrl(url)
         }
 
@@ -506,10 +525,7 @@ class MainActivity : AppCompatActivity() {
                     return
                 }
                 val generation = ++workspaceGeneration
-                connectionOverlay.visibility = View.VISIBLE
-                connectionMessage.text = getString(R.string.oauth_completing)
-                connectionAction.visibility = View.GONE
-                connectionCancel.visibility = View.VISIBLE
+                showStatus(ConnectionStatus.CompletingSignIn(statusHost(), true))
                 databricksAuthExecutor.execute {
                     val error = runCatching { manager.complete(callback) }.exceptionOrNull()
                     runOnUiThread {
@@ -546,53 +562,13 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun buildConnectionOverlay(): LinearLayout {
-        val dp = resources.displayMetrics.density
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setPadding((32 * dp).toInt(), (32 * dp).toInt(), (32 * dp).toInt(), (32 * dp).toInt())
-            setBackgroundColor(ContextCompat.getColor(this@MainActivity, R.color.brand_background))
-            layoutParams =
-                FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.MATCH_PARENT,
-                    FrameLayout.LayoutParams.MATCH_PARENT,
-                )
-            addView(ProgressBar(this@MainActivity))
-            connectionMessage =
-                TextView(this@MainActivity).apply {
-                    text = getString(R.string.oauth_connecting)
-                    gravity = Gravity.CENTER
-                    setTextColor(
-                        ContextCompat.getColor(this@MainActivity, R.color.brand_foreground),
-                    )
-                    setPadding(0, (16 * dp).toInt(), 0, (16 * dp).toInt())
-                }
-            addView(connectionMessage)
-            connectionAction =
-                Button(this@MainActivity).apply {
-                    visibility = View.GONE
-                }
-            addView(connectionAction)
-            connectionCancel =
-                Button(this@MainActivity).apply {
-                    text = getString(R.string.oauth_cancel)
-                    setOnClickListener { cancelConnection() }
-                }
-            addView(connectionCancel)
-        }
-    }
-
     private fun beginWorkspaceConnection(
         context: DatabricksWebContext,
         profile: DatabricksWebProfile,
         allowInteractive: Boolean,
     ) {
         val generation = ++workspaceGeneration
-        connectionOverlay.visibility = View.VISIBLE
-        connectionMessage.text = getString(R.string.oauth_connecting)
-        connectionAction.visibility = View.GONE
-        connectionCancel.visibility = View.VISIBLE
+        showStatus(ConnectionStatus.WorkspaceConnecting(statusHost()))
         val future = workspaceCoordinator!!.prepare(context, profile)
         workspaceFuture = future
         future.whenComplete { session, rawError ->
@@ -610,7 +586,6 @@ class MainActivity : AppCompatActivity() {
                     pinnedOrigin = originOf(session.pageUri.toString())
                     removeBridge()
                     installBridge()
-                    connectionOverlay.visibility = View.GONE
                     webView.loadUrl(session.pageUri.toString())
                     return@runOnUiThread
                 }
@@ -618,16 +593,27 @@ class MainActivity : AppCompatActivity() {
                     if (allowInteractive) {
                         beginInteractiveWorkspaceSignIn(context, profile)
                     } else {
-                        connectionMessage.text = getString(R.string.oauth_sign_in_required)
-                        connectionAction.apply {
-                            text = getString(R.string.oauth_sign_in)
-                            visibility = View.VISIBLE
-                            setOnClickListener { beginInteractiveWorkspaceSignIn(context, profile) }
-                        }
+                        showStatus(ConnectionStatus.SignInRequired(statusHost(), null, true))
                     }
                     return@runOnUiThread
                 }
-                returnToSetup(context.pageUri.toString(), error?.message)
+                when (error) {
+                    is DatabricksSessionException.NetworkUnavailable -> {
+                        showUnreachable(
+                            error.message.orEmpty(),
+                        )
+                    }
+
+                    else -> {
+                        showStatus(
+                            ConnectionStatus.WorkspaceFailure(
+                                statusHost(),
+                                error?.message.orEmpty(),
+                                failureDetails(error?.message.orEmpty()),
+                            ),
+                        )
+                    }
+                }
             }
         }
     }
@@ -638,8 +624,7 @@ class MainActivity : AppCompatActivity() {
     ) {
         val generation = ++workspaceGeneration
         pendingRecoveryContext = context
-        connectionMessage.text = getString(R.string.oauth_opening_browser)
-        connectionAction.visibility = View.GONE
+        showStatus(ConnectionStatus.AuthTabHandoff(statusHost()))
         profile.clear().whenComplete { _, rawError ->
             runOnUiThread {
                 if (generation != workspaceGeneration || isFinishing ||
@@ -664,6 +649,118 @@ class MainActivity : AppCompatActivity() {
                 } catch (failure: Throwable) {
                     returnToSetup(context.pageUri.toString(), failure.message)
                 }
+            }
+        }
+    }
+
+    private fun statusHost(): String = pinnedOrigin?.let(::hostLabelOf).orEmpty()
+
+    private fun failureDetails(error: String): ConnectionFailureDetails =
+        ConnectionFailureDetails(pinnedOrigin.orEmpty(), error, System.currentTimeMillis())
+
+    private fun showStatus(status: ConnectionStatus) {
+        connectionStatus = status
+        connectionOverlay.show(status)
+        webView.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+        slowConnection?.let(mainHandler::removeCallbacks)
+        slowConnection = null
+        val generation = ++slowGeneration
+        if (status is ConnectionStatus.Connecting) {
+            val runnable =
+                Runnable {
+                    if (slowGeneration == generation && connectionStatus == status &&
+                        !navigationCommitted && !navigationFailed
+                    ) {
+                        showStatus(ConnectionStatus.ConnectingSlow(status.host))
+                    }
+                }
+            slowConnection = runnable
+            mainHandler.postDelayed(runnable, 10_000L)
+        }
+    }
+
+    private fun hideStatus() {
+        slowConnection?.let(mainHandler::removeCallbacks)
+        slowConnection = null
+        slowGeneration++
+        connectionStatus = null
+        connectionOverlay.hide()
+        webView.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_AUTO
+    }
+
+    private fun showUnreachable(
+        error: String,
+        tls: Boolean = false,
+    ) {
+        if (isFinishing || isDestroyed) return
+        val network = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        val validated =
+            network
+                ?.activeNetwork
+                ?.let(network::getNetworkCapabilities)
+                ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
+        val kind = unreachableKind(validated, tls)
+        showStatus(ConnectionStatus.ServerUnreachable(statusHost(), kind, failureDetails(error)))
+    }
+
+    private fun handleStatusAction(action: StatusAction) {
+        when (action) {
+            StatusAction.CANCEL -> {
+                cancelConnection()
+            }
+
+            StatusAction.SIGN_IN -> {
+                val context = workspaceContext
+                val profile = workspaceProfile
+                if (context != null &&
+                    profile != null
+                ) {
+                    beginInteractiveWorkspaceSignIn(context, profile)
+                } else {
+                    oidcSession?.signIn()
+                }
+            }
+
+            StatusAction.RETRY -> {
+                retryRoute = webView.url?.takeIf { originOf(it) == pinnedOrigin }
+                    ?: lastWorkspacePageUri?.toString()?.takeIf { originOf(it) == pinnedOrigin }
+                navigationFailed = false
+                navigationCommitted = false
+                rendererCrashes = 0
+                val context = workspaceContext
+                val profile = workspaceProfile
+                if (context != null && profile != null) {
+                    val destination =
+                        retryRoute?.let {
+                            runCatching {
+                                context.navigatingTo(
+                                    URI(it),
+                                )
+                            }.getOrNull()
+                        }
+                            ?: context
+                    beginWorkspaceConnection(destination, profile, allowInteractive = true)
+                } else {
+                    connectServer(ServerStore(this).currentServerUrl(), interactive = true)
+                }
+            }
+
+            StatusAction.CHANGE_SERVER -> {
+                returnToSetup(ServerStore(this).currentServerUrl(), null)
+            }
+
+            StatusAction.HOW_TO_UPDATE -> {
+                val origin = pinnedOrigin ?: return
+                runCatching {
+                    CustomTabsIntent.Builder().build().launchUrl(
+                        this,
+                        Uri.parse("$origin/auth/cli-upgrade"),
+                    )
+                }
+            }
+
+            StatusAction.NONE -> {
+                Unit
             }
         }
     }
@@ -728,10 +825,7 @@ class MainActivity : AppCompatActivity() {
         workspaceSession = null
         webView.stopLoading()
         removeBridge()
-        connectionOverlay.visibility = View.VISIBLE
-        connectionMessage.text = getString(R.string.oauth_signing_out)
-        connectionAction.visibility = View.GONE
-        connectionCancel.visibility = View.GONE
+        showStatus(ConnectionStatus.SigningOut(statusHost()))
         val cleanup = signOuts.begin(context, profile)
         val notStarted = runCatching { cleanup.getNow(null) }.exceptionOrNull()
         if (unwrapCompletionError(notStarted) is SignOutNotStartedException) {
@@ -902,6 +996,7 @@ class MainActivity : AppCompatActivity() {
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
             settings.mediaPlaybackRequiresUserGesture = false
+            setBackgroundColor(ContextCompat.getColor(this@MainActivity, R.color.brand_background))
 
             webViewClient =
                 OmnigentWebViewClient(
@@ -910,7 +1005,29 @@ class MainActivity : AppCompatActivity() {
                         bridgeTransportInstalled && bridgeScriptHandler == null
                     },
                     onPageReady = ::onPageReady,
-                    onNavigationStarted = ::armServerSwitcherWatchdog,
+                    onNavigationStarted = {
+                        navigationFailed = false
+                        navigationCommitted = false
+                        armServerSwitcherWatchdog()
+                    },
+                    onMainFrameCommitted = { view ->
+                        if (view === webView && !navigationFailed) {
+                            navigationCommitted = true
+                            hideStatus()
+                        }
+                    },
+                    onMainFrameUnreachable = { view, code, description ->
+                        if (view === webView && !navigationFailed) {
+                            navigationFailed = true
+                            showUnreachable("$description (${connectionErrorName(code)})")
+                        }
+                    },
+                    onMainFrameSslError = { view, description ->
+                        if (view === webView && !navigationFailed) {
+                            navigationFailed = true
+                            showUnreachable(description, tls = true)
+                        }
+                    },
                     onLoginRequired = ::startLogin,
                     handlesNavigation = { url -> oidcSession?.handlesNavigation(url) == true },
                     onHistoryUpdated = { url -> oidcSession?.onPageVisited(url) },
@@ -1019,6 +1136,9 @@ class MainActivity : AppCompatActivity() {
 
         webView = buildWebView(workspaceProfile)
         parent?.addView(webView, index)
+        if (connectionStatus != null) {
+            webView.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+        }
         attachInsetsListener(webView)
         installBridge()
         // A rebuilt view may miss the first inset dispatch; request one so the
@@ -1026,16 +1146,9 @@ class MainActivity : AppCompatActivity() {
         ViewCompat.requestApplyInsets(webView)
 
         if (loopExhausted) {
-            // The local recovery page has no bridge — surface the pill straight
-            // away as the recovery affordance.
             revealServerSwitcherNow()
-            // Offline page (no network) so it can't re-trigger the crash.
-            webView.loadDataWithBaseURL(
-                null,
-                recoveryErrorHtml(serverUrl),
-                "text/html",
-                "utf-8",
-                null,
+            showStatus(
+                ConnectionStatus.CrashRecovery(statusHost(), failureDetails("Renderer crash loop")),
             )
             return
         }
@@ -1063,30 +1176,6 @@ class MainActivity : AppCompatActivity() {
         return rendererCrashes <= MAX_RENDERER_CRASHES
     }
 
-    /**
-     * Self-contained recovery page for a crash loop. No network/assets so it
-     * can't reproduce the crash; its link returns to the server root.
-     */
-    private fun recoveryErrorHtml(serverUrl: String): String {
-        val escaped = serverUrl.replace("&", "&amp;").replace("\"", "&quot;")
-        return """
-            <!DOCTYPE html>
-            <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
-            <style>
-              body { font-family: system-ui, sans-serif; margin: 0; min-height: 100vh;
-                     display: flex; flex-direction: column; align-items: center;
-                     justify-content: center; gap: 16px; padding: 24px; text-align: center; }
-              a.retry { padding: 12px 20px; border-radius: 8px; text-decoration: none;
-                        background: #2f6feb; color: #fff; font-weight: 600; }
-            </style></head>
-            <body>
-              <h2>Something went wrong</h2>
-              <p>The app hit a repeated display problem and stopped reloading on its own.</p>
-              <a class="retry" href="$escaped">Reload</a>
-            </body></html>
-            """.trimIndent()
-    }
-
     override fun onResume() {
         super.onResume()
         oidcSession?.onForeground()
@@ -1110,8 +1199,25 @@ class MainActivity : AppCompatActivity() {
         super.onConfigurationChanged(newConfig)
         applySystemBarContrast(newConfig)
         if (::webView.isInitialized) {
+            webView.setBackgroundColor(ContextCompat.getColor(this, R.color.brand_background))
             // Notify matchMedia listeners without reloading the SPA.
             webView.dispatchConfigurationChanged(newConfig)
+        }
+        if (::connectionOverlay.isInitialized) {
+            val parent = connectionOverlay.parent as? ViewGroup
+            val index = parent?.indexOfChild(connectionOverlay) ?: -1
+            val expanded = connectionOverlay.detailsExpanded
+            parent?.removeView(connectionOverlay)
+            connectionOverlay = ConnectionStatusView(this, ::handleStatusAction)
+            if (parent != null && index >= 0) parent.addView(connectionOverlay, index)
+            connectionStatus?.let {
+                connectionOverlay.show(
+                    it,
+                    immediate = true,
+                    retainDetails = expanded,
+                )
+            }
+                ?: run { connectionOverlay.visibility = View.GONE }
         }
     }
 
@@ -1202,7 +1308,12 @@ class MainActivity : AppCompatActivity() {
         // Count (and re-arm the history clear for) only a call that actually
         // launches a flow, so re-entrant redirects can't burn the retry budget
         // without ever relaunching and suppress a legitimate later retry.
-        if (!oidcLoginManager.start(this, origin, ::onSessionToken)) return
+        if (!oidcLoginManager.start(this, origin, ::onSessionToken, onUpdateRequired = {
+                showStatus(ConnectionStatus.UpdateRequired(statusHost()))
+            })
+        ) {
+            return
+        }
         loginAttempts++
         // A re-login (session expired mid-use) bounces through the IdP again,
         // leaving a stopped off-origin entry + stale pre-expiry pages on the back
@@ -1324,6 +1435,7 @@ class MainActivity : AppCompatActivity() {
         pendingMicRequest?.deny()
         pendingMicRequest = null
         oidcLoginManager.shutdown()
+        slowConnection?.let(mainHandler::removeCallbacks)
         oidcSession?.stop()
         oidcExecutor.shutdownNow()
         databricksAuthExecutor.shutdownNow()
