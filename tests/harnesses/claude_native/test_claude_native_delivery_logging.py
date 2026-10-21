@@ -24,7 +24,7 @@ from omnigent.native.input_diagnostics import input_delivery_scope
         ("blank_line", "unverified", "returned"),
         ("retry", "draft_absent", "returned"),
         ("timeout", "draft_still_present", "error"),
-        ("empty_capture", "inconclusive_capture", "returned"),
+        ("empty_capture", "inconclusive_capture", "error"),
         ("missing_glyph", "inconclusive_capture", "returned"),
         ("transport_error", "not_started", "error"),
         ("observation_error", "not_started", "returned"),
@@ -141,7 +141,8 @@ def test_delivery_diagnostics(
             expected = bridge.ClaudeInjectionCancelled if scenario == "cancelled" else RuntimeError
             if scenario.startswith("pending_"):
                 expected = bridge.ClaudeUserPromptPending
-            with pytest.raises(expected):
+            match = "capture is unavailable" if scenario == "empty_capture" else None
+            with pytest.raises(expected, match=match):
                 bridge.inject_user_message(tmp_path, content=content)
 
     records = [
@@ -191,13 +192,17 @@ def test_delivery_diagnostics(
         assert attrs["draft_wait_ms"] == 0
         assert attrs["draft_pane_rows"] == 1
         assert attrs["draft_pane_max_columns"] == len("❯ " + secret)
-        assert attrs["submit_polls"] == 1
-        assert attrs["submit_wait_ms"] == 10
+        assert attrs["submit_polls"] == (6 if scenario == "empty_capture" else 1)
+        assert attrs["submit_wait_ms"] == (60 if scenario == "empty_capture" else 10)
         assert attrs["submit_pane_rows"] == (0 if scenario == "empty_capture" else 1)
         assert attrs["submit_pane_max_columns"] == (0 if scenario == "empty_capture" else 2)
         assert attrs["submit_capture_empty"] == (scenario == "empty_capture")
-        assert attrs["stage_verifying_submit_ms"] == 10
-        assert attrs["elapsed_ms"] == 30
+        assert attrs["stage_verifying_submit_ms"] == (60 if scenario == "empty_capture" else 10)
+        assert attrs["elapsed_ms"] == (80 if scenario == "empty_capture" else 30)
+        if scenario == "empty_capture":
+            assert attrs["submit_sent"] is True
+            assert attrs["error_type"] == "RuntimeError"
+            assert enters == 1
 
     if scenario == "blank_line":
         assert attrs["draft_seen"] is False
