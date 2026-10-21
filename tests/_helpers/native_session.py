@@ -11,6 +11,7 @@ from typing import Any, Literal
 import httpx
 
 from omnigent._wrapper_labels import (
+    ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
     CURSOR_NATIVE_WRAPPER_VALUE,
@@ -23,7 +24,7 @@ from omnigent._wrapper_labels import (
 )
 from tests._helpers.session import bundle_files, post_session_bundle
 
-NativeHarness = Literal["claude", "codex", "cursor", "goose", "kiro", "hermes"]
+NativeHarness = Literal["antigravity", "claude", "codex", "cursor", "goose", "kiro", "hermes"]
 
 
 def create_native_session(
@@ -43,7 +44,14 @@ def create_native_session(
     if model is not None and harness not in {"codex", "kiro"}:
         raise ValueError(f"The {harness} wrapper materializer does not accept a model")
     with tempfile.TemporaryDirectory() as tmp:
-        if harness == "claude":
+        if harness == "antigravity":
+            from omnigent.harnesses.antigravity_native.main import (
+                _materialize_antigravity_agent_spec,
+            )
+
+            spec = _materialize_antigravity_agent_spec(Path(tmp))
+            wrapper = ANTIGRAVITY_NATIVE_WRAPPER_VALUE
+        elif harness == "claude":
             from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
 
             spec = _materialize_claude_agent_spec(Path(tmp))

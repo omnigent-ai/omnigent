@@ -2735,9 +2735,11 @@ async def test_auto_create_antigravity_forwards_launch_args_to_agy_argv(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("authenticated", [False, True])
 async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    authenticated: bool,
 ) -> None:
     """
     Snapshot ``terminal_launch_args`` reach the launched kimi argv.
@@ -2762,7 +2764,20 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
     workspace.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(kimi_bridge_mod, "_BRIDGE_ROOT", tmp_path / "kimi-native")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
-    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    loop = asyncio.get_running_loop()
+    auth_started = asyncio.Event()
+    auth_release = threading.Event()
+    loop_progressed: list[bool] = []
+
+    def auth_factory() -> str:
+        loop.call_soon_threadsafe(auth_started.set)
+        loop_progressed.append(auth_release.wait(timeout=1.0))
+        return "mock-hook-token"
+
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda: auth_factory if authenticated else None,
+    )
     monkeypatch.setattr(kimi_mod, "resolve_kimi_executable", lambda: "/fake/bin/kimi")
     # Keep the session-home build off the user's real kimi config.
     monkeypatch.setattr(
@@ -2813,17 +2828,32 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
                 name="Kimi",
             )
 
-    try:
-        await _auto_create_kimi_terminal(
+    task = asyncio.create_task(
+        _auto_create_kimi_terminal(
             session_id,
             cast(SessionResourceRegistry, _FakeResourceRegistry()),
             lambda _sid, _event: None,
             server_client=cast(httpx.AsyncClient, _SnapshotServerClient()),
         )
+    )
+    try:
+        if authenticated:
+            await asyncio.wait_for(auth_started.wait(), timeout=2.0)
+        auth_release.set()
+        await task
         await asyncio.sleep(0)
     finally:
+        auth_release.set()
+        await asyncio.gather(task, return_exceptions=True)
         await runner_app_mod._cancel_auto_forwarder_task(session_id)
 
+    assert loop_progressed == ([True] if authenticated else [])
+    hook_config = kimi_bridge_mod.read_hook_config(
+        kimi_bridge_mod.bridge_dir_for_session_id(session_id)
+    )
+    headers = hook_config["ap_auth_headers"]
+    assert isinstance(headers, dict)
+    assert headers.get("Authorization") == ("Bearer mock-hook-token" if authenticated else None)
     assert len(launched_specs) == 1
     spec = launched_specs[0]
     # Bare ``kimi`` plus the persisted pass-through args, verbatim.

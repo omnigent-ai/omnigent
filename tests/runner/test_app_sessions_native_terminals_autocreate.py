@@ -76,6 +76,7 @@ from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
 from tests._helpers.pi_native import seed_pi_own_login_catalog
+from tests._helpers.providers import isolate_provider_resolution
 from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
@@ -5043,10 +5044,16 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
 
+    isolate_provider_resolution(monkeypatch, tmp_path / "config")
     token_calls: list[int] = []
+    loop = asyncio.get_running_loop()
+    loop_progressed: list[bool] = []
 
     def _shared_auth_factory() -> str:
         token_calls.append(1)
+        released = threading.Event()
+        loop.call_soon_threadsafe(released.set)
+        loop_progressed.append(released.wait(timeout=1.0))
         return "shared-runner-token"
 
     def _unexpected_auth_resolution(*args: Any, **kwargs: Any) -> None:
@@ -5133,6 +5140,7 @@ async def test_auto_create_claude_terminal_registers_permission_hook(
     assert config["ap_server_url"] == "http://127.0.0.1:8000"
     assert config["ap_auth_headers"]["Authorization"] == "Bearer shared-runner-token"
     assert token_calls == [1]
+    assert loop_progressed == [True], "Claude hook token refresh blocked the runner event loop"
 
     # The forwarder must get a refresh-capable httpx.Auth (not just a
     # one-shot Authorization header) so a long-running host-spawned

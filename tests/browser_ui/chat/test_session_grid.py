@@ -7,7 +7,7 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, WebSocketRoute, expect
 
 from tests.browser_ui.chat.session_contract import chat_session_handle, list_payload, message_item
 from tests.browser_ui.conftest import BrowserContract
@@ -76,6 +76,24 @@ def test_session_grid_drag_persist_live_updates_and_close(
                 ]
             )
         for index, session in enumerate(sessions[:2]):
+            session.update_session(labels={"omnigent.ui": "terminal"})
+            browser_contract.json(
+                f"/v1/sessions/{session.session_id}/resources/terminals",
+                list_payload(
+                    [
+                        {
+                            "id": "terminal_tui_main",
+                            "object": "terminal",
+                            "name": "tui",
+                            "metadata": {
+                                "terminal_name": "tui",
+                                "session_key": "main",
+                                "running": True,
+                            },
+                        }
+                    ]
+                ),
+            )
             path = f"notes-{index}.md"
             _mock_markdown_files(
                 page,
@@ -89,6 +107,25 @@ def test_session_grid_drag_persist_live_updates_and_close(
                 list_payload([{"path": path, "name": path, "type": "file", "bytes": 20}]),
             )
             browser_contract.json(f"/v1/sessions/{session.session_id}/comments", [])
+        terminal_inputs: dict[str, list[bytes]] = {}
+        terminal_connections: dict[str, int] = {}
+
+        def attach_terminal(socket: WebSocketRoute) -> None:
+            session_id = socket.url.split("/sessions/")[1].split("/")[0]
+            terminal_connections[session_id] = terminal_connections.get(session_id, 0) + 1
+            terminal_inputs.setdefault(session_id, [])
+            socket.send(f"Terminal for {session_id}\r\n$ ".encode())
+
+            def record_input(message: str | bytes) -> None:
+                if isinstance(message, bytes):
+                    terminal_inputs[session_id].append(message)
+                    socket.send(message)
+
+            socket.on_message(record_input)
+
+        browser_contract.websocket(
+            "**/resources/terminals/terminal_tui_main/attach*", attach_terminal
+        )
         sessions[3].update_session(permission_level=1)
         browser_contract.json(
             "/v1/info", {"single_user": True, "features": {"grid_sessions_display_ui": True}}
@@ -173,7 +210,44 @@ def test_session_grid_drag_persist_live_updates_and_close(
         other_area = other_cell.evaluate("node => node.style.gridArea")
         first_cell.evaluate("node => node.dataset.instance = 'preserved'")
         assert first_cell.locator("header").bounding_box()["height"] == 32
-        expect(first_cell.locator('header [data-size="icon-xs"]')).to_have_count(2)
+        expect(first_cell.locator('header [data-size="icon-xs"]')).to_have_count(4)
+        # Both cells use real xterm attaches, with independent input and view selection.
+        first_cell.get_by_test_id("side-chat-input").fill("Keep this chat draft")
+        for cell in (first_cell, other_cell):
+            cell.get_by_role("button", name="Terminal view", exact=True).click()
+            expect(cell.get_by_test_id("terminal-view")).to_have_attribute(
+                "data-state", "connected"
+            )
+        connections = dict(terminal_connections)
+        first_cell.locator(".xterm-helper-textarea").click()
+        page.keyboard.type("first")
+        expect(first_cell).to_have_attribute("data-active", "true")
+        other_cell.locator(".xterm-helper-textarea").click()
+        page.keyboard.type("second")
+        expect(other_cell).to_have_attribute("data-active", "true")
+        page.wait_for_function(
+            "() => document.activeElement?.classList.contains('xterm-helper-textarea')"
+        )
+        assert b"first" in b"".join(terminal_inputs["grid-0"])
+        assert b"second" in b"".join(terminal_inputs["grid-1"])
+        assert b"second" not in b"".join(terminal_inputs["grid-0"])
+        page.screenshot(path=str(artifacts / "grid-terminals.png"))
+        page.keyboard.press("ControlOrMeta+Alt+Backslash")
+        expect(other_cell.get_by_test_id("side-chat-input")).to_be_visible()
+        expect(first_cell.get_by_test_id("main-terminal-view")).to_have_attribute(
+            "data-visible", "true"
+        )
+        first_cell.get_by_role("button", name="Chat view", exact=True).click()
+        expect(first_cell.get_by_test_id("side-chat-input")).to_have_value("Keep this chat draft")
+        first_cell.get_by_role("button", name="Terminal view", exact=True).click()
+        assert terminal_connections == connections
+        # Compact headers retain the switch at phone widths; reconnecting a background
+        # terminal must not focus another cell.
+        page.set_viewport_size({"width": 700, "height": 900})
+        expect(other_cell.get_by_role("button", name="Terminal view", exact=True)).to_be_visible()
+        page.set_viewport_size({"width": 2000, "height": 1000})
+        first_cell.get_by_role("button", name="Chat view", exact=True).click()
+        first_cell.get_by_test_id("side-chat-input").fill("")
         _move_cell(page, "grid-0", "grid-1")
         assert first_cell.evaluate("node => node.style.gridArea") == other_area
         assert other_cell.evaluate("node => node.style.gridArea") == original_area
