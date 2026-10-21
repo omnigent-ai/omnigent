@@ -86,6 +86,12 @@ beforeEach(() => {
   localStorage.clear();
 });
 
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
+
 it.each(["mobile", "touch", "ios", "android"] as const)(
   "blocks creation and saved grids on %s without touching storage",
   (kind) => {
@@ -111,11 +117,6 @@ it.each(["mobile", "touch", "ios", "android"] as const)(
     expect(localStorage.getItem(key)).toBe(saved);
   },
 );
-afterEach(() => {
-  cleanup();
-  vi.restoreAllMocks();
-  vi.unstubAllGlobals();
-});
 
 it.each([true, false])("persists and scopes grids (secure context: %s)", (secureContext) => {
   if (!secureContext)

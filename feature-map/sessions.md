@@ -148,7 +148,11 @@ one pane returns to `/c/<id>`. Reopen saved grids in **Grids**, above Projects a
 their `/grid/<id>` URL on the same desktop browser. All sessions in the open grid
 are highlighted in the sidebar. Mobile-width viewports, touch-primary devices, and
 the iOS/Android apps hide grid menus and saved entries; grid URLs show a desktop-only
-message without changing saved grids. Double-click a grid title or use
+message without changing saved grids. Narrowing an open grid unmounts its cells
+and disconnects terminal views; widening it restores the saved layout and reconnects.
+The coarse-primary-pointer check also blocks tablets with attached keyboards;
+touch-capable desktops whose primary pointer is fine remain eligible.
+Double-click a grid title or use
 its Rename menu action to edit it inline.
 Enter or blur saves; Escape cancels. Grid names persist locally. Click anywhere
 in a cell (or focus its controls) to activate it: its outline and inverted header

@@ -523,7 +523,7 @@ def test_grid_flag_off_and_unknown_local_grid(
             ).to_be_visible()
 
 
-@pytest.mark.parametrize("width,touch", [(390, False), (1024, True)])
+@pytest.mark.parametrize("width,touch", [(390, False), (1024, True), (1280, False)])
 def test_grid_mobile_entry_points(
     page: Page, browser_contract: BrowserContract, width: int, touch: bool
 ) -> None:
@@ -532,37 +532,62 @@ def test_grid_mobile_entry_points(
         page.context.new_cdp_session(page).send(
             "Emulation.setTouchEmulationEnabled", {"enabled": True}
         )
-    with contextmanager(chat_session_handle)(page, browser_contract) as session:
+    assert page.evaluate("matchMedia('(pointer: coarse)').matches") == touch
+    desktop = width >= 768 and not touch
+    with ExitStack() as stack:
+        sessions = [
+            stack.enter_context(
+                contextmanager(chat_session_handle)(
+                    page, browser_contract, session_id=f"entry-{index}"
+                )
+            )
+            for index in range(2)
+        ]
         browser_contract.json(
             "/v1/info", {"single_user": True, "features": {"grid_sessions_display_ui": True}}
         )
-        page.goto(session.url)
-        page.evaluate("""() => localStorage.setItem(
+        browser_contract.json(
+            "/v1/sessions", lambda _: list_payload([s.session_snapshot() for s in sessions])
+        )
+        page.goto(sessions[0].url)
+        page.evaluate(
+            """ids => localStorage.setItem(
             `omnigent:session-grids:${location.origin}:local`,
-            JSON.stringify([{id: 'saved', layout: {
-                axis: 'columns', children: ['first', 'second']}}]))""")
+            JSON.stringify([{id: 'saved', layout: {axis: 'columns', children: ids}}]))""",
+            [s.session_id for s in sessions],
+        )
         page.reload()
         if width < 768:
             page.get_by_role("button", name="Open sidebar", exact=True).click()
-        row = page.locator(f'aside [data-sidebar-session-id="{session.session_id}"]')
+        row = page.locator(f'aside [data-sidebar-session-id="{sessions[1].session_id}"]')
         expect(row).to_be_visible()
-        expect(page.get_by_role("region", name="Grids")).to_have_count(0)
-        expect(page.locator("[data-grid-session]")).to_have_count(0)
+        expect(page.get_by_role("region", name="Grids")).to_have_count(int(desktop))
+        expect(page.locator("[data-grid-session]")).to_have_count(int(desktop))
         if width < 768:
             row.click(button="right")
         else:
             row.get_by_test_id("conversation-actions").click()
         expect(page.get_by_role("menu")).to_be_visible()
-        expect(page.get_by_role("menuitem", name="Open in grid", exact=True)).to_have_count(0)
+        expect(page.get_by_role("menuitem", name="Open in grid", exact=True)).to_have_count(
+            int(desktop)
+        )
         page.keyboard.press("Escape")
-        row.hover()
+        box = row.bounding_box()
+        assert box
+        page.mouse.move(box["x"] + 30, box["y"] + box["height"] / 2)
         page.mouse.down()
-        page.mouse.move(width - 20, 300, steps=10)
-        expect(page.get_by_test_id("grid-drop-targets")).to_have_count(0)
+        page.mouse.move(box["x"] + 45, box["y"] + box["height"] / 2, steps=3)
+        expect(row).to_have_class(re.compile("opacity-40"))
+        expect(page.get_by_test_id("grid-drop-targets")).to_have_count(int(desktop))
+        page.keyboard.press("Escape")
         page.mouse.up()
-        page.goto(f"{session.base_url}/grid/saved")
-        expect(
-            page.get_by_text("Grids are available on desktop only.", exact=False)
-        ).to_be_visible()
-        expect(page.locator("[data-grid-session]")).to_have_count(0)
-        expect(page.get_by_role("link", name="Back to sessions")).to_be_visible()
+        page.goto(f"{sessions[0].base_url}/grid/saved")
+        if desktop:
+            expect(page.get_by_test_id("session-grid")).to_be_visible()
+            expect(page.locator("[data-grid-session]")).to_have_count(2)
+        else:
+            expect(
+                page.get_by_text("Grids are available on desktop only.", exact=False)
+            ).to_be_visible()
+            expect(page.locator("[data-grid-session]")).to_have_count(0)
+            expect(page.get_by_role("link", name="Back to sessions")).to_be_visible()
