@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
+from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
 from tests.e2e._stub_databricks_workspace import (
     AI_GATEWAY_PATH,
@@ -46,6 +47,10 @@ _ENV_TO_CLEAR = (
     "OMNIGENT_ANTHROPIC_BASE_URL",
     "OMNIGENT_ANTHROPIC_MODEL",
     "CLAUDE_CONFIG_DIR",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
     "HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL",
     "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND",
     "HARNESS_CLAUDE_SDK_GATEWAY_HOST",
@@ -82,22 +87,15 @@ def _stage_workspace_login(home: Path, workspace_url: str) -> None:
     )
     cache_dir = home / ".databricks"
     cache_dir.mkdir()
+    entry = {
+        "access_token": _STAGED_TOKEN,
+        "token_type": "Bearer",
+        "refresh_token": "stub-refresh-token",
+        "expiry": (datetime.now(UTC) + timedelta(days=365)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    # CLI 0.x keys the cache by host; 1.x by profile name.
     (cache_dir / "token-cache.json").write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "tokens": {
-                    workspace_url: {
-                        "access_token": _STAGED_TOKEN,
-                        "token_type": "Bearer",
-                        "refresh_token": "stub-refresh-token",
-                        "expiry": (datetime.now(UTC) + timedelta(days=365)).strftime(
-                            "%Y-%m-%dT%H:%M:%SZ"
-                        ),
-                    }
-                },
-            }
-        )
+        json.dumps({"version": 1, "tokens": {workspace_url: entry, "DEFAULT": entry}})
     )
 
 
@@ -110,6 +108,8 @@ def _journey_env(home: Path, exported_base_url: str) -> dict[str, str]:
             "OMNIGENT_DATA_DIR": str(home / ".omnigent"),
             "OMNIGENT_CONFIG_HOME": str(home / ".omnigent"),
             "DATABRICKS_CONFIG_FILE": str(home / ".databrickscfg"),
+            # CLI 1.x reads the OS keyring by default and ignores the staged file cache.
+            "DATABRICKS_AUTH_STORAGE": "plaintext",
             "ANTHROPIC_BASE_URL": exported_base_url,
             "NO_PROXY": "127.0.0.1,localhost",
             "no_proxy": "127.0.0.1,localhost",
@@ -135,25 +135,31 @@ def test_databricks_model_run_uses_exported_same_workspace_base_url(
     home.mkdir()
     with stub_workspace() as workspace:
         _stage_workspace_login(home, workspace.base_url)
-        proc = subprocess.run(
-            [
-                str(omnigent_python),
-                "-m",
-                "omnigent.cli",
-                "run",
-                "--harness",
-                "claude-sdk",
-                "--model",
-                _MODEL,
-                "-p",
-                "hi",
-            ],
-            env=_journey_env(home, workspace.serving_endpoints_url),
-            cwd=str(omnigent_repo_root),
-            capture_output=True,
-            text=True,
-            timeout=_RUN_TIMEOUT_SEC,
-        )
+        try:
+            proc = subprocess.run(
+                [
+                    str(omnigent_python),
+                    "-m",
+                    "omnigent.cli",
+                    "run",
+                    "--harness",
+                    "claude-sdk",
+                    "--model",
+                    _MODEL,
+                    "-p",
+                    "hi",
+                ],
+                env=_journey_env(home, workspace.serving_endpoints_url),
+                cwd=str(omnigent_repo_root),
+                capture_output=True,
+                text=True,
+                timeout=_RUN_TIMEOUT_SEC,
+            )
+        finally:
+            # The session reaper only attributes the shared test data dir, so the daemon,
+            # local server (port 6767) and runner spawned under this HOME are reaped here.
+            _, survivors = reap_leaked_omnigent_processes(home / ".omnigent")
+            assert not survivors, f"Test runtime processes survived cleanup: {survivors}"
 
     # Read the journal after the run and the stub server shut down; only POST /v1/messages
     # entries are asserted, so a straggling handler from the CLI's keep-alive socket cannot
