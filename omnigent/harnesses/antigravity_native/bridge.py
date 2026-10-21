@@ -183,9 +183,8 @@ class AntigravityNativeBridgeState:
         There is intentionally no durable read cursor. The retired transcript
         forwarder persisted a ``forwarded_steps`` set (+ a ``forwarded_step_index``
         mirror) so a tail (re)start did not re-mirror the whole JSONL. The RPC read
-        driver that superseded it (:mod:`omnigent.harnesses.antigravity_native.reader`) keeps
-        an *in-memory* seen-set only and is recreated per session by the runner, so
-        no on-disk cursor is needed. Legacy ``forwarded_step_index`` /
+        driver uses an in-memory seen-set within a run and stable item source ids
+        for server-side deduplication across restarts. Legacy ``forwarded_step_index`` /
         ``forwarded_steps`` keys in an on-disk ``state.json`` are tolerated and
         ignored on read.
 

@@ -183,7 +183,15 @@ Ask: **Read gateway-smoke.txt using the file tool and quote its contents.**
 Confirm a tool call occurs and the reply contains the file's actual text.
 Then ask a follow-up question about the content. Exit and use
 `omni agy --resume` to resume that conversation and verify continuity.
+In the web UI, stop the test session's terminal, click **Resume session**, and
+ask another question about the file without using tools. Earlier messages and
+the original tool result should appear once, followed by the new turn.
 Repeat in a fresh conversation after switching to another credential.
+
+Resume deduplication applies to transcript items recorded with stable source
+IDs. Older items recorded before this fix retain their original IDs and may be
+replayed once when first resumed after upgrading; existing duplicate history is
+not removed.
 
 For a 404, check both the API route and the availability of the requested model;
 changing `/model` cannot repair an incompatible API protocol. For a 401/403,

@@ -22,7 +22,7 @@ import psutil
 import pytest
 import yaml
 
-from omnigent.harnesses.antigravity_native.bridge import bridge_dir_for_bridge_id
+from omnigent.harnesses.antigravity_native.bridge import bridge_dir_for_bridge_id, read_tmux_info
 from tests._helpers.https_server import enable_https
 from tests._helpers.native_session import create_native_session
 
@@ -344,6 +344,50 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
             expect(replies.filter(has_text="GATEWAY_SETUP_OK")).to_have_count(1)
             expect(page.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
             expect(page.get_by_test_id("error-pill")).to_have_count(0)
+            response = client.get(f"/v1/sessions/{session_id}")
+            response.raise_for_status()
+            assert response.json()["status"] == "idle"
+
+            def transcript():
+                response = client.get(f"/v1/sessions/{session_id}/items")
+                response.raise_for_status()
+                return [
+                    item
+                    for item in response.json()["data"]
+                    if item["type"] in {"message", "function_call", "function_call_output"}
+                ]
+
+            before_resume = transcript()
+            page.get_by_test_id("view-mode-terminal").click()
+            terminal_view = page.get_by_test_id("main-terminal-view")
+            terminal = terminal_view.get_by_test_id("terminal-view")
+            expect(terminal).to_have_attribute("data-state", "connected", timeout=30_000)
+            tmux = read_tmux_info(bridge_dir_for_bridge_id(session_id))
+            assert tmux is not None
+            subprocess.run(
+                ["tmux", "-S", tmux["socket_path"], "kill-session", "-t", tmux["tmux_target"]],
+                check=True,
+                capture_output=True,
+            )
+            resume = terminal_view.get_by_role("button", name="Resume session", exact=True)
+            expect(resume).to_be_enabled(timeout=30_000)
+            resume.click()
+            expect(terminal).to_have_attribute("data-state", "connected", timeout=60_000)
+            page.get_by_test_id("view-mode-chat").click()
+            composer.fill("Without tools, recall the file again. Prefix with GATEWAY_RECALL_OK.")
+            page.get_by_role("button", name="Send", exact=True).click()
+            expect(
+                replies.filter(has_text="GATEWAY_RECALL_OK: GATEWAY_TOOL_RESULT")
+            ).to_have_count(2, timeout=90_000)
+            expect(page.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
+            expect(page.get_by_test_id("error-pill")).to_have_count(0)
+            expect(replies).to_have_count(3)
+            after_resume = transcript()
+            assert after_resume[: len(before_resume)] == before_resume
+            assert [item["type"] for item in after_resume[len(before_resume) :]] == [
+                "message",
+                "message",
+            ]
             response = client.get(f"/v1/sessions/{session_id}")
             response.raise_for_status()
             assert response.json()["status"] == "idle"

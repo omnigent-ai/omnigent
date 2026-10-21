@@ -210,7 +210,12 @@ processes and a fake Gemini upstream. With agy and tmux installed, run
 The journeys check setup, browser replies, a file tool, recall after reload, and repair guidance
 when saved credentials become invalid after host connection. They do not prove
 compatibility with a live external gateway. See [the gateway guide](../docs/native-agy-gateways.md)
-for live setup, tool, and resume smoke steps.
+for live setup, tool, and resume smoke steps. The gateway browser journey also
+stops its own agy terminal, clicks **Resume session**, and sends another recall
+turn. It checks that prior message and tool IDs remain unchanged and only the
+new turn is appended. The reader/server regression
+`tests/server/integration/test_sessions_external_item_idempotency.py::test_agy_reader_restart_preserves_messages_and_tool_pairs`
+covers replay, repeated user text and distinct cascades without a live model.
 
 Cross-harness journeys:
 
