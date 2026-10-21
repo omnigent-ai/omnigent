@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import sys
 import threading
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -25,6 +28,7 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
+from tests._helpers.polling import poll_until_async
 from tests.runner.conftest import (
     _build_app_for_spec,
     _FakeProcessManager,
@@ -32,6 +36,7 @@ from tests.runner.conftest import (
     _ScriptedHarnessClient,
 )
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
+from tests.runner.native_helpers import _harness_spec
 
 
 @dataclass
@@ -357,6 +362,7 @@ class _EnsureCodexTerminalCase:
 async def test_create_session_terminal_ensure_routes_codex_native(
     case: _EnsureCodexTerminalCase,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """
     ``POST /resources/terminals`` routes a codex/main ensure request.
@@ -373,6 +379,17 @@ async def test_create_session_terminal_ensure_routes_codex_native(
     :returns: None.
     """
     sid = "ad2c1855c982b13e9c4df55b75d26ef8"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    bridge_dir = codex_native_bridge.prepare_bridge_dir(sid)
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=sid,
+            thread_id="thread_existing",
+            socket_path="ws://127.0.0.1:1",
+            codex_home=str(bridge_dir / "codex-home"),
+        ),
+    )
     auto_create_calls: list[str] = []
     auto_create_kwargs: list[dict[str, object]] = []
     launch_calls: list[str] = []
@@ -1047,6 +1064,89 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
     assert auto_create_calls == [sid], (
         f"Expected _auto_create_claude_terminal to be called; got {auto_create_calls}"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("backend_state", "recreated"),
+    [
+        ("missing", True),
+        ("failed_startup", True),
+        ("starting", False),
+        ("ready", False),
+        ("detached", False),
+    ],
+)
+async def test_message_recovers_a_live_codex_pane_with_no_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    backend_state: str,
+    recreated: bool,
+) -> None:
+    """An API message checks the backend even when the auxiliary TUI is alive."""
+    from omnigent.runner.native import orchestration
+
+    session_id = uuid.uuid4().hex
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    bridge_dir = codex_native_bridge.prepare_bridge_dir(session_id)
+    if backend_state in ("ready", "detached"):
+        codex_native_bridge.write_bridge_state(
+            bridge_dir,
+            codex_native_bridge.CodexNativeBridgeState(
+                session_id=session_id,
+                thread_id="thread_retained",
+                socket_path="ws://127.0.0.1:1",
+                codex_home=str(bridge_dir / "codex-home"),
+            ),
+        )
+    if backend_state == "failed_startup":
+        codex_native_bridge.record_app_server_stopped(bridge_dir)
+    if backend_state in ("starting", "ready"):
+        monkeypatch.setitem(
+            orchestration._AUTO_CODEX_APP_SERVERS,
+            session_id,
+            SimpleNamespace(proc=SimpleNamespace(returncode=None)),
+        )
+
+    registry = TerminalRegistry()
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
+    close = AsyncMock()
+    monkeypatch.setattr(instance, "close", close)
+    with registry._lock:
+        registry._by_conversation[session_id] = {("codex", "main"): instance}
+        registry._instance_locks[(session_id, "codex", "main")] = threading.Lock()
+    app, manager = await _build_app_for_spec(
+        _harness_spec("codex-native"), terminal_registry=registry
+    )
+    resources = app.state.session_resource_registry
+    resources._terminal_roles[(session_id, "terminal_codex_main")] = CODEX_NATIVE_TERMINAL_ROLE
+    launches: list[str] = []
+
+    async def launch(
+        session_id: str, resource_registry: object, publish_event: object, **kwargs: object
+    ) -> SessionResourceView:
+        launches.append(session_id)
+        return SessionResourceView(
+            id="terminal_codex_main", type="terminal", session_id=session_id, name="recovered"
+        )
+
+    monkeypatch.setattr(orchestration, "_auto_create_codex_terminal", launch)
+    async with _runner_client(app) as client:
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+                "harness": "codex-native",
+                "content": [{"type": "input_text", "text": "Continue the task"}],
+            },
+        )
+        assert response.status_code == 202, response.text
+        await poll_until_async(lambda: bool(manager._client.posted_bodies), timeout_s=5.0)
+
+    assert launches == ([session_id] if recreated else [])
+    assert close.await_count == int(recreated)
 
 
 @pytest.mark.asyncio

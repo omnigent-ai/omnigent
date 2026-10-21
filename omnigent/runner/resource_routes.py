@@ -62,6 +62,7 @@ from omnigent.runner.native import (
 )
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
+    CODEX_NATIVE_TERMINAL_ROLE,
     OMNIGENT_REPL_TERMINAL_ROLE,
     QWEN_NATIVE_TERMINAL_ROLE,
     SessionResourceRegistry,
@@ -667,38 +668,49 @@ def register_resource_routes(
         instance = terminal_registry.get(conv_id, terminal_name, "main")
         if instance is not None:
             if await instance.is_alive():
-                return  # pane is registered and alive — nothing to heal
-            _logger.info(
-                "native pane registered but dead for conv=%s harness=%s; closing stale entry",
-                conv_id,
-                harness_name,
-                extra={"session_id": conv_id},
-            )
-            # Re-check the registry before closing: a concurrent ensure/recreate
-            # path may have already replaced this entry with a live pane between
-            # our get() and now.  Only close if the registry still points at the
-            # same dead instance we just probed.
-            current = terminal_registry.get(conv_id, terminal_name, "main")
-            if current is instance:
-                try:
-                    await terminal_registry.close(conv_id, terminal_name, "main")
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # noqa: BLE001 — cleanup is best-effort
-                    _logger.warning(
-                        "failed to close stale native pane for conv=%s; proceeding to re-create",
-                        conv_id,
-                        exc_info=True,
-                        extra={"session_id": conv_id},
+                if (
+                    terminal_name != "codex"
+                    or resource_registry.terminal_resource_role(
+                        conv_id, terminal_resource_id(terminal_name, "main")
                     )
+                    != CODEX_NATIVE_TERMINAL_ROLE
+                ):
+                    return
+                # Codex's auxiliary TUI can outlive its backend and bridge.
+                view = await resource_registry.get_terminal_resource(
+                    conv_id, terminal_resource_id(terminal_name, "main")
+                )
+                if view is not None and _is_runner_owned_codex_terminal(resource_registry, view):
+                    return
             else:
                 _logger.info(
-                    "stale entry already replaced for conv=%s; skipping close",
+                    "native pane registered but dead for conv=%s harness=%s; closing stale entry",
                     conv_id,
+                    harness_name,
                     extra={"session_id": conv_id},
                 )
+                # Only retire the dead instance we probed, preserving a replacement.
+                current = terminal_registry.get(conv_id, terminal_name, "main")
+                if current is instance:
+                    try:
+                        await terminal_registry.close(conv_id, terminal_name, "main")
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001 — cleanup is best-effort
+                        _logger.warning(
+                            "failed to close stale native pane for conv=%s; re-creating",
+                            conv_id,
+                            exc_info=True,
+                            extra={"session_id": conv_id},
+                        )
+                else:
+                    _logger.info(
+                        "stale entry already replaced for conv=%s; skipping close",
+                        conv_id,
+                        extra={"session_id": conv_id},
+                    )
         _logger.info(
-            "native pane missing for conv=%s harness=%s; re-ensuring before turn (#1349)",
+            "native runtime unavailable for conv=%s harness=%s; re-ensuring before turn",
             conv_id,
             harness_name,
             extra={"session_id": conv_id},

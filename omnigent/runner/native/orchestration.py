@@ -7546,13 +7546,11 @@ def _is_runner_owned_codex_terminal(
     ``_auto_create_codex_terminal`` without leaking launch argv in public
     metadata.
 
-    A runner-owned pane is still not reusable once its launch has failed and
-    its app-server is gone: the pane cannot carry chat turns, so every send
-    would fail fast on the saved startup error until the terminal is recreated.
-    Reporting it as not owned makes the ensure close it and launch again,
-    which also clears the saved error. A pane whose backend is alive (for
-    example one still waiting on a sign-in prompt) stays reusable. The saved
-    error is read from the bridge directory the session's last launch used.
+    Once its backend is gone, a pane needs usable bridge state to carry chat
+    turns. A missing bridge or saved startup failure requires a new launch.
+    A registered backend can still be starting or waiting for sign-in, so it
+    keeps its pane while it publishes state. Read the bridge directory the
+    session's last launch used, including a rotated session's shared bridge.
 
     :param resource_registry: Runner resource registry that owns private
         terminal role markers.
@@ -7560,16 +7558,23 @@ def _is_runner_owned_codex_terminal(
     :returns: ``True`` when the resource is marked as Codex native and can
         still carry chat turns.
     """
-    from omnigent.harnesses.codex_native.bridge import read_bridge_startup_error
+    from omnigent.harnesses.codex_native.bridge import read_bridge_startup_error, read_bridge_state
 
     if (
         resource_registry.terminal_resource_role(resource.session_id, resource.id)
         != CODEX_NATIVE_TERMINAL_ROLE
     ):
         return False
-    if resource.session_id in _AUTO_CODEX_APP_SERVERS:
+    backend = _AUTO_CODEX_APP_SERVERS.get(resource.session_id)
+    if backend is not None:
         return True
-    return read_bridge_startup_error(codex_native_bridge_dir(resource.session_id)) is None
+    bridge_dir = codex_native_bridge_dir(resource.session_id)
+    state = read_bridge_state(bridge_dir)
+    return (
+        state is not None
+        and state.session_id == resource.session_id
+        and read_bridge_startup_error(bridge_dir) is None
+    )
 
 
 def _is_runner_owned_antigravity_terminal(

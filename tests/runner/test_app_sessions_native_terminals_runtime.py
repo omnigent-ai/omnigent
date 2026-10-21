@@ -3864,6 +3864,15 @@ async def test_codex_known_thread_forwarder_marks_its_pane_for_replacement(
     session_id = "6f2e1d0c9b8a47f6a5e4d3c2b1a09f8e"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     bridge_dir = codex_native_bridge.prepare_bridge_dir(session_id)
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=session_id,
+            thread_id="thread_test",
+            socket_path="ws://127.0.0.1:9876",
+            codex_home=str(bridge_dir / "codex-home"),
+        ),
+    )
     monkeypatch.setattr(orchestration, "_required_runner_env", server_url)
     monkeypatch.setattr(_entry, "_make_auth_token_factory", lambda: None)
     monkeypatch.setattr(codex_forwarder, "supervise_forwarder", forward)
@@ -4437,6 +4446,16 @@ def test_codex_terminal_reuse_requires_a_live_backend_after_a_startup_failure(
     if startup_error:
         codex_native_bridge.write_bridge_startup_error(
             bridge_dir, "Codex stopped before it could start.", code="codex_thread_not_started"
+        )
+    else:
+        codex_native_bridge.write_bridge_state(
+            bridge_dir,
+            codex_native_bridge.CodexNativeBridgeState(
+                session_id=session_id,
+                thread_id="thread_test",
+                socket_path="ws://127.0.0.1:9876",
+                codex_home=str(bridge_dir / "codex-home"),
+            ),
         )
 
     class _Registry:
