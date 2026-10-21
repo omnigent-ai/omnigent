@@ -1,9 +1,8 @@
 // Serves every git provider. Runtime names (query keys, routes, test ids) keep
 // the `github` prefix because they are stable wire ids.
 //
-// PullRequestPanel — the right-rail "Pull Requests" tab. Read-only view of the
-// session branch's relationship to its git provider: the associated PR (number,
-// title, state, CI summary, link out) and the branch-vs-base diff.
+// PullRequestPanel — the right-rail "Pull Requests" tab: the session branch's PR
+// (number, title, state, CI summary, labels, link out) and the branch-vs-base diff.
 // Provider-visible text comes from lib/gitProviders.ts.
 //
 // Layout is GitHub's "Files changed": every file's diff stacked in one scroll
@@ -75,6 +74,7 @@ import {
 } from "@/components/ui/select";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useCanEdit } from "@/hooks/usePermissions";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import { RunnerOfflineError, useWorkspaceAsleep } from "@/hooks/useWorkspaceChangedFiles";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
@@ -98,6 +98,7 @@ import {
   type PullRequestInfo,
   type PullRequestReviewer,
 } from "@/hooks/usePullRequests";
+import { PullRequestLabels } from "./PullRequestLabels";
 
 // Shiki bundled themes matching the app's editor look; the concrete side is
 // chosen by `themeType` from the app's resolved light/dark mode.
@@ -773,16 +774,18 @@ function PullRequestCommentCard({
   );
 }
 
-/** The Summary tab body: reviewers, CI checks, then the PR description. When the token
- *  can't read check runs, the Checks area says so instead of counts. */
+/** The Summary tab body: reviewers, labels, CI checks, then the PR description. When the
+ *  token can't read check runs, the Checks area says so instead of counts. */
 function PullRequestSummaryTab({
   reviewers,
+  labels,
   checks,
   checksSupported,
   checksUnavailableHint,
   body,
 }: {
   reviewers: PullRequestReviewer[] | undefined;
+  labels: React.ReactNode;
   checks: PullRequestChecks;
   checksSupported: boolean;
   checksUnavailableHint?: string;
@@ -793,6 +796,7 @@ function PullRequestSummaryTab({
     // of the very bottom edge, where it's awkward to read.
     <div className="space-y-4 p-3 pb-16">
       {reviewers !== undefined && <PullRequestReviewers reviewers={reviewers} />}
+      {labels}
       {/* CI status checks (from the PR's statusCheckRollup) as pills; hover a
           pill to see the job names in that bucket. */}
       {(checks.total > 0 || checks.partial || !checksSupported) && (
@@ -1362,6 +1366,7 @@ function PullRequestPanelDetails({
   const changes = usePullRequestChangedFiles(conversationId, hasPr, prUrl, revision);
   const prDiff = usePullRequestDiff(conversationId, hasPr, prUrl, revision);
   const sandboxAsleep = useWorkspaceAsleep(conversationId);
+  const canEdit = useCanEdit(conversationId);
 
   // Summary (checks + PR body), Comments, and Changes (the stacked diff).
   // Summary is the landing tab — like GitHub's PR page opening on the
@@ -1753,6 +1758,17 @@ function PullRequestPanelDetails({
         <TabsContent value="summary" className="min-h-0 flex-1 overflow-y-auto">
           <PullRequestSummaryTab
             reviewers={pr.reviewers}
+            labels={
+              pr.labels !== undefined &&
+              data.selected_pr_url && (
+                <PullRequestLabels
+                  conversationId={conversationId}
+                  prUrl={data.selected_pr_url}
+                  labels={pr.labels}
+                  editable={canEdit && !!data.capabilities.label_editing}
+                />
+              )
+            }
             checks={checks}
             checksSupported={pr.checks_supported !== false}
             checksUnavailableHint={copy.checksUnavailableHint}

@@ -216,12 +216,12 @@ def test_slow_title_lookups_preserve_metadata_and_leave_queued_prs_for_next_poll
     def run(argv: list[str], *, timeout: float, **_kwargs: object) -> tuple[int | None, str, str]:
         nonlocal clock
         if argv[-1] != "title":
-            assert github._pr_title_deadline.get() is None
+            assert github._gh_deadline.get() is None
             assert timeout == github._gh_timeout_seconds()
             return 0, '{"title": "Selected PR"}', ""
         assert 0 < timeout <= 0.2
         attempted.append(argv[3])
-        deadline = github._pr_title_deadline.get()
+        deadline = github._gh_deadline.get()
         assert deadline is not None
         title_lookups.wait()
         # Concurrent timeouts expire at the same deadline, regardless of scheduling.
@@ -308,18 +308,18 @@ def test_title_deadline_is_shared_across_enterprise_auth_and_view(
         return 0, '{"title": "Enterprise PR"}', ""
 
     monkeypatch.setattr(github, "_run", run)
-    token = github._pr_title_deadline.set(12.0)
-    timeout_token = github._pr_title_timed_out.set(False)
+    token = github._gh_deadline.set(12.0)
+    timeout_token = github._gh_timed_out.set(False)
     try:
         result = github._pr_json(
             str(tmp_path),
             PullRequestRef.from_url(A.replace("github.com", "github.example.org")),
             "title",
         )
-        timed_out = github._pr_title_timed_out.get()
+        timed_out = github._gh_timed_out.get()
     finally:
-        github._pr_title_timed_out.reset(timeout_token)
-        github._pr_title_deadline.reset(token)
+        github._gh_timed_out.reset(timeout_token)
+        github._gh_deadline.reset(token)
     if command_seconds == 0.6:
         assert timeouts == pytest.approx([2.0, 1.4, 0.8])
         assert result == {"title": "Enterprise PR"}
@@ -328,7 +328,7 @@ def test_title_deadline_is_shared_across_enterprise_auth_and_view(
         assert timeouts == [2.0]
         assert result is None
         assert timed_out is True
-    assert github._pr_title_deadline.get() is None
+    assert github._gh_deadline.get() is None
 
 
 def test_slow_selected_metadata_does_not_get_extra_title_work(
@@ -379,7 +379,7 @@ def test_title_timeout_at_request_deadline_retries_after_short_backoff(
     entry = next(entry for entry in registry.list() if entry.url == A)
     assert entry.title_checked_at == wall_clock
     assert entry.title_lookup_timed_out
-    assert github._pr_title_timed_out.get() is False
+    assert github._gh_timed_out.get() is False
 
     wall_clock += pr_resource._PR_TITLE_TIMEOUT_RETRY_SECONDS - 0.1
     github.github_info(tracked, session_id="session", pr_url=B)

@@ -12,6 +12,10 @@
 //   fetchPullRequestFileContents — GET /resources/github/diff/{path}?base=<ref>
 //                                  before/after full content for one file, fetched on
 //                                  demand to expand unchanged context (not a hook).
+//   usePullRequestRepoLabels     — GET /resources/github/labels
+//                                  the labels the selected PR's repository offers.
+//   useUpdatePullRequestLabels   — POST /resources/github/labels
+//                                  add / remove labels on the selected PR.
 //
 // Runner-offline (503 runner_unavailable) and no-os_env (404) are handled the
 // same way as the workspace filesystem hooks — reusing their helpers.
@@ -75,6 +79,14 @@ export interface PullRequestReviewer {
   state: PullRequestReviewerState;
 }
 
+/** A label on a PR or in its repository. */
+export interface PullRequestLabel {
+  name: string;
+  /** Six lowercase hex digits without `#`, or null when the provider sent none. */
+  color: string | null;
+  description: string | null;
+}
+
 export interface PullRequest {
   number: number;
   title: string;
@@ -102,6 +114,8 @@ export interface PullRequest {
   comments_partial?: boolean;
   /** Assigned reviewers and their current review state; absent from older hosts. */
   reviewers?: PullRequestReviewer[];
+  /** The PR's labels; absent from older hosts and providers that don't report them. */
+  labels?: PullRequestLabel[];
 }
 
 export interface PullRequestRepo {
@@ -137,6 +151,8 @@ export interface PullRequestCapabilities {
   base_remote_selection: boolean;
   line_counts: boolean;
   linked_pr_diff: boolean;
+  /** The PR's labels can be added and removed; absent from older hosts. */
+  label_editing?: boolean;
 }
 
 /** Why the panel can't show pull request content.
@@ -281,8 +297,9 @@ export interface PullRequestFileDiffResponse {
 async function errorFromResponse(res: Response): Promise<Error> {
   let message = `${res.status} ${res.statusText}`;
   try {
-    const body = (await res.json()) as { error?: { message?: string } };
+    const body = (await res.json()) as { error?: { message?: string }; detail?: unknown };
     if (body?.error?.message) message = body.error.message;
+    else if (typeof body?.detail === "string" && body.detail) message = body.detail;
   } catch {
     // Non-JSON body (gateway/front-door error) — keep the status line.
   }
@@ -633,5 +650,101 @@ export function useUpdateSessionPr(conversationId: string) {
         predicate: (query) => body.action !== "remove" || query.queryKey[2] !== body.url,
       });
     },
+  });
+}
+
+export interface PullRequestRepoLabels {
+  object: "list";
+  /** Sorted by name. */
+  data: PullRequestLabel[];
+  /** The repository has more labels than the host lists. */
+  has_more: boolean;
+}
+
+/** The labels the selected PR's repository offers, for the label picker. */
+export function usePullRequestRepoLabels(conversationId: string, prUrl: string, enabled: boolean) {
+  return useQuery({
+    queryKey: ["github-labels", conversationId, prUrl],
+    queryFn: async (): Promise<PullRequestRepoLabels> => {
+      const response = await authenticatedFetch(
+        `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/labels${prQuery(prUrl)}`,
+      );
+      if (response.status === 503 && (await isRunnerUnavailable503(response))) {
+        throw new RunnerOfflineError();
+      }
+      if (!response.ok) throw await errorFromResponse(response);
+      return (await response.json()) as PullRequestRepoLabels;
+    },
+    enabled,
+    retry: false,
+    // A repository's label set rarely changes while the picker is in use.
+    staleTime: 5 * 60_000,
+  });
+}
+
+/** One label edit; the full labels let the panel show the change before it lands. */
+export interface PullRequestLabelChange {
+  prUrl: string;
+  add: PullRequestLabel[];
+  remove: PullRequestLabel[];
+}
+
+/** Mutation key of {@link useUpdatePullRequestLabels}, for reading pending edits. */
+export function pullRequestLabelsMutationKey(conversationId: string) {
+  return ["github-labels-update", conversationId] as const;
+}
+
+/** Apply a label edit to a PR's labels. GitHub label names are case-insensitive. */
+export function applyPullRequestLabelChange(
+  labels: readonly PullRequestLabel[],
+  change: Pick<PullRequestLabelChange, "add" | "remove">,
+): PullRequestLabel[] {
+  const key = (label: PullRequestLabel) => label.name.toLowerCase();
+  const dropped = new Set([...change.add, ...change.remove].map(key));
+  return [...labels.filter((label) => !dropped.has(key(label))), ...change.add];
+}
+
+/**
+ * Add and remove labels on the selected PR through the runner or host fallback.
+ * Edits run one at a time; pending and queued ones are read with
+ * {@link pullRequestLabelsMutationKey}. A success writes the PR's resulting
+ * labels into the info cache, and a failure refetches it.
+ */
+export function useUpdatePullRequestLabels(conversationId: string) {
+  const queryClient = useQueryClient();
+  const infoKey = ["github-info", conversationId];
+  return useMutation({
+    mutationKey: pullRequestLabelsMutationKey(conversationId),
+    // One edit at a time, in click order, so GitHub and the cache end in the last state shown.
+    scope: { id: `github-labels-${conversationId}` },
+    mutationFn: async (change: PullRequestLabelChange) => {
+      const response = await authenticatedFetch(
+        `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/labels`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            pr_url: change.prUrl,
+            add: change.add.map((label) => label.name),
+            remove: change.remove.map((label) => label.name),
+          }),
+        },
+      );
+      if (response.status === 503 && (await isRunnerUnavailable503(response))) {
+        throw new RunnerOfflineError();
+      }
+      if (!response.ok) throw await errorFromResponse(response);
+      return (await response.json()) as { labels: PullRequestLabel[] };
+    },
+    onSuccess: async ({ labels }, change) => {
+      // A poll that started before the edit landed would bring the old labels back.
+      await queryClient.cancelQueries({ queryKey: infoKey });
+      queryClient.setQueriesData<NormalizedPullRequestInfo>({ queryKey: infoKey }, (info) =>
+        info?.pr && info.selected_pr_url === change.prUrl
+          ? { ...info, pr: { ...info.pr, labels } }
+          : info,
+      );
+    },
+    onError: () => queryClient.invalidateQueries({ queryKey: infoKey }),
   });
 }

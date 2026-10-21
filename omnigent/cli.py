@@ -16,6 +16,7 @@ import re
 import secrets
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -4105,33 +4106,32 @@ def _adopt_cli_runner_process(proc: subprocess.Popen[bytes]) -> None:
             proc.send_signal(RUNNER_ADOPT_SIGNAL)
 
 
-def _assert_server_port_bindable(host: str, port: int) -> None:
+@contextlib.contextmanager
+def _bind_server_listener(host: str, port: int) -> Iterator[socket.socket]:
     """
-    Fail before app startup when the requested TCP listener cannot bind.
+    Bind before app startup and retain the socket until the server exits.
 
     Mirrors uvicorn's TCP bind shape closely enough for CLI preflight:
     IPv6 is selected when the host contains ``":"``, and
-    ``SO_REUSEADDR`` is set before bind. This is intentionally a bind
-    probe, not a connect probe, so a failed client connection to the
-    port does not make us report the port as occupied.
+    ``SO_REUSEADDR`` is set before bind. Passing this socket to uvicorn
+    avoids releasing the port during database and app initialization.
 
     :param host: Interface to bind, e.g. ``"127.0.0.1"``.
     :param port: TCP port to bind, e.g. ``6767``.
-    :returns: None.
+    :returns: The bound listener owned by this context manager.
     :raises click.ClickException: If the host/port cannot be bound.
     """
-    import socket
-
     family = socket.AF_INET6 if ":" in host else socket.AF_INET
-    with socket.socket(family=family, type=socket.SOCK_STREAM) as probe:
-        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    with socket.socket(family=family, type=socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            probe.bind((host, port))
+            listener.bind((host, port))
         except OSError as exc:
             reason = exc.strerror or str(exc)
             raise click.ClickException(
                 f"Cannot start server on {host}:{port}: port is unavailable ({reason})."
             ) from exc
+        yield listener
 
 
 @cli.group("server", invoke_without_command=True)
@@ -4314,8 +4314,11 @@ def server(
 
     port_source = ctx.get_parameter_source("port")
     port_was_explicit = port_source is click.core.ParameterSource.COMMANDLINE
+    listener = None
     if port_was_explicit:
-        _assert_server_port_bindable(host, port)
+        listener = ctx.with_resource(_bind_server_listener(host, port))
+        if port == 0:
+            port = int(listener.getsockname()[1])
 
     # --admin-password is sugar for the INIT_ADMIN_PASSWORD env var that
     # bootstrap_admin already consumes — fold it in here so the rest of
@@ -4731,7 +4734,11 @@ def server(
         timeout_graceful_shutdown=SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
     )
     try:
-        ShutdownSignalingServer(_config).run()
+        server_instance = ShutdownSignalingServer(_config)
+        if listener is not None:
+            server_instance.run(sockets=[listener])
+        else:
+            server_instance.run()
     except KeyboardInterrupt:
         # uvicorn.run() swallows KeyboardInterrupt; match that behaviour so
         # a Ctrl-C exit doesn't print Click's "Aborted!" or exit non-zero.
