@@ -15,4 +15,5 @@
     <color name="brand_primary">#11171C</color>
     <color name="brand_on_primary">#FFFFFF</color>
     <color name="brand_error">#C8324C</color>
+    <color name="omnigents_wordmark">#000000</color>
 </resources>
