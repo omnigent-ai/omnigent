@@ -132,6 +132,11 @@ class OidcLoginManager {
                         authLog(
                             "poll -> ${if (token != null) "token (len=${token.length})" else "no token"}",
                         )
+                        if (token == null && !Thread.currentThread().isInterrupted) {
+                            postCurrent {
+                                onTicketFailure(IllegalStateException("Ticket poll ended"))
+                            }
+                        }
                     }
                 } catch (_: InterruptedException) {
                     // shutdown() interrupted the poll — the host is going away; drop.

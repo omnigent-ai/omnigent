@@ -376,6 +376,28 @@ class OmnigentWebViewClientTest {
     }
 
     @Test
+    fun `foreign main-frame commit clears only an in-WebView-auth server`() {
+        val appView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val oidcView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        var appCommits = 0
+        var oidcCommits = 0
+        val appClient =
+            client(
+                pinnedOrigin = DATABRICKS_APP_ORIGIN,
+                onMainFrameCommitted = { appCommits++ },
+            )
+        val oidcClient = client(onMainFrameCommitted = { oidcCommits++ })
+
+        appClient.onPageStarted(appView, IDP_URL, null)
+        appClient.onPageCommitVisible(appView, IDP_URL)
+        oidcClient.onPageStarted(oidcView, IDP_URL, null)
+        oidcClient.onPageCommitVisible(oidcView, IDP_URL)
+
+        assertEquals(1, appCommits)
+        assertEquals(0, oidcCommits)
+    }
+
+    @Test
     fun `idp redirect goes to the system browser for other servers`() {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         var logins = 0
