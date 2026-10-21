@@ -30,6 +30,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
 )
+from omnigent.db.db_models import normalize_uuid
 from omnigent.db.utils import generate_agent_id, generate_file_id
 from omnigent.debug_logging import add_audit_attrs, debug_event, set_current_runner_id
 from omnigent.entities import (
@@ -2001,20 +2002,28 @@ def register_core_routes(
         if not accessible:
             return []
 
-        def _load_sessions(ids: list[str]) -> list[Conversation]:
+        def _load_sessions(ids: list[str]) -> list[tuple[str, Conversation]]:
             """Bulk-load the accessible conversations that are sessions
             (non-null ``agent_id``) in one batched store call, preserving
-            the caller's id order for deterministic output."""
+            the caller's id order for deterministic output. Each session is
+            paired with the first watched spelling that found it: entity ids
+            read back bare hex, while ``perms_by_conv`` is keyed by the
+            watched spelling, so grants must be looked up by the latter."""
             by_id = conversation_store.get_conversations(ids)
-            return [
-                conv
-                for cid in ids
-                if (conv := by_id.get(cid)) is not None and conv.agent_id is not None
-            ]
+            sessions: list[tuple[str, Conversation]] = []
+            loaded: set[str] = set()
+            for cid in ids:
+                conv = by_id.get(cid)
+                if conv is None or conv.agent_id is None or conv.id in loaded:
+                    continue
+                loaded.add(conv.id)
+                sessions.append((cid, conv))
+            return sessions
 
-        convs = await asyncio.to_thread(_load_sessions, accessible)
-        if not convs:
+        watched_convs = await asyncio.to_thread(_load_sessions, accessible)
+        if not watched_convs:
             return []
+        convs = [conv for _, conv in watched_convs]
         unique_agent_ids = list({c.agent_id for c in convs if c.agent_id is not None})
         conv_ids = [c.id for c in convs]
         agent_names_by_id, child_ids_by_parent, comments_fingerprints = await asyncio.gather(
@@ -2030,7 +2039,7 @@ def register_core_routes(
             _build_session_list_item(
                 conv,
                 agent_names_by_id=agent_names_by_id,
-                grants=perms_by_conv.get(conv.id, []),
+                grants=perms_by_conv.get(watched_id, []),
                 user_id=user_id,
                 user_is_admin=user_is_admin,
                 permissions_enabled=permission_store is not None,
@@ -2038,7 +2047,7 @@ def register_core_routes(
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
             )
-            for conv in convs
+            for watched_id, conv in watched_convs
         ]
         await _apply_liveness_to_items(items, liveness_lookup)
         # Full-row dumps (every field, nulls included) — NOT exclude_none. The
@@ -2157,9 +2166,10 @@ def register_core_routes(
                 current = {item["id"]: item for item in items}
                 changed = [dump for cid, dump in current.items() if last_sent.get(cid) != dump]
                 # Removed = a still-watched id that no longer resolves (lost
-                # access or deleted). De-watched ids are pruned silently
-                # below, not reported as removed.
-                removed = [cid for cid in watched if cid not in current and cid in last_sent]
+                # access or deleted); de-watched ids are pruned below instead.
+                # Items are keyed by bare id, so match the watch-set canonically.
+                watched_ids = {normalize_uuid(cid) for cid in watched}
+                removed = [cid for cid in last_sent if cid not in current and cid in watched_ids]
                 last_sent.clear()
                 last_sent.update(current)
                 if changed:
@@ -2211,9 +2221,9 @@ def register_core_routes(
                         user_id,
                     )
                     deduped = deduped[: _sf._SESSION_UPDATES_MAX_WATCHED]
-                # The watched set after capping — used to prune baselines for ids
-                # the client no longer watches (including any just truncated).
-                watched_set = set(deduped)
+                # The watched set after capping, as bare ids like the baseline's
+                # keys — used to prune baselines the client no longer watches.
+                watched_set = {normalize_uuid(cid) for cid in deduped}
                 # Handle the watch under a span parented on any trace
                 # context the browser stamped into the frame, so the
                 # snapshot read (and its DB spans) nest under the
@@ -2338,9 +2348,11 @@ def register_core_routes(
                 # A client disconnect is the normal terminal condition; any
                 # other exception is a real bug worth surfacing in logs.
                 if exc is not None and not isinstance(exc, WebSocketDisconnect):
+                    # The repr alone does not name the frame that raised.
                     _logger.warning(
                         "session-updates stream task crashed: %r",
                         exc,
+                        exc_info=exc,
                         extra=debug_event("session_updates", phase="error"),
                     )
         finally:

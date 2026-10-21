@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -316,6 +317,65 @@ def test_get_conversations_empty_input_skips_query(
 ) -> None:
     """Empty id list returns an empty map without a database round-trip."""
     assert conversation_store.get_conversations([]) == {}
+
+
+@pytest.mark.parametrize(
+    "templates",
+    [
+        pytest.param(["{dashed}"], id="dashed"),
+        pytest.param(["conv_{hex}"], id="legacy_prefix"),
+        pytest.param(["{hex}", "conv_{hex}"], id="bare_then_prefixed"),
+        pytest.param(["conv_{hex}", "{hex}"], id="prefixed_then_bare"),
+        pytest.param(["{dashed}", "conv_{hex}"], id="dashed_then_prefixed"),
+    ],
+)
+def test_bulk_readers_key_rows_under_every_caller_spelling(
+    conversation_store: SqlAlchemyConversationStore, templates: list[str]
+) -> None:
+    """
+    ``get_conversations``, ``list_child_conversation_ids_by_parent`` and
+    ``list_latest_message_items_for_conversations`` file rows under every id
+    spelling the caller passed, including two spellings of one id: ``Uuid16``
+    reads back bare hex, and the updates stream indexes each result with the
+    spelling the client watched.
+    """
+    parent = conversation_store.create_conversation(title="parent")
+    other = conversation_store.create_conversation(title="other")
+    child = conversation_store.create_conversation(
+        kind="sub_agent", title="child", parent_conversation_id=parent.id
+    )
+    conversation_store.append(
+        parent.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_parent",
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": "hello"}],
+                    agent="worker",
+                ),
+            )
+        ],
+    )
+    dashed = str(uuid.UUID(parent.id))
+    asked = [template.format(hex=parent.id, dashed=dashed) for template in templates]
+
+    conversations = conversation_store.get_conversations([*asked, other.id])
+    assert set(conversations) == {*asked, other.id}
+    assert [conversations[key].title for key in asked] == ["parent"] * len(asked)
+    assert conversations[other.id].title == "other"
+
+    children = conversation_store.list_child_conversation_ids_by_parent([*asked, other.id])
+    assert children == {**{key: [child.id] for key in asked}, other.id: []}
+
+    latest = conversation_store.list_latest_message_items_for_conversations(
+        [*asked, other.id], per_conversation_limit=1
+    )
+    assert set(latest) == {*asked, other.id}
+    for key in asked:
+        assert [item.data.content[0]["text"] for item in latest[key]] == ["hello"]  # type: ignore[union-attr]
+    assert latest[other.id] == []
 
 
 def test_list_latest_message_items_for_conversations(

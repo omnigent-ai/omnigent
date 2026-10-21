@@ -18,7 +18,12 @@ from sqlalchemy.orm import Session
 from sqlalchemy.sql.dml import Insert
 
 from omnigent.db.account_authority import account_generation, require_active_account
-from omnigent.db.db_models import SqlSessionPermission, SqlUser, current_workspace_id
+from omnigent.db.db_models import (
+    SqlSessionPermission,
+    SqlUser,
+    current_workspace_id,
+    spellings_by_normalized_uuid,
+)
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -398,8 +403,11 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 .all()
             ]
         result: dict[str, list[SessionPermission]] = {cid: [] for cid in conversation_ids}
+        # File each grant under every caller spelling of its session.
+        spellings = spellings_by_normalized_uuid(conversation_ids)
         for entity in entities:
-            result[entity.conversation_id].append(entity)
+            for conversation_id in spellings[entity.conversation_id]:
+                result[conversation_id].append(entity)
         return result
 
     def list_for_user(self, user_id: str, *, limit: int = 1000) -> list[SessionPermission]:
