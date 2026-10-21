@@ -8,6 +8,7 @@ import android.content.res.Configuration
 import android.graphics.Rect
 import android.os.Looper
 import android.view.View
+import android.widget.Button
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.test.core.app.ApplicationProvider
@@ -61,7 +62,7 @@ class ConnectionStatusViewTest {
                 UnreachableKind.GENERIC,
                 ConnectionFailureDetails(
                     "https://example.com/oauth/callback?code=private-code&state=private-state",
-                    "net::ERR_CONNECTION_REFUSED at https://example.com/oauth/callback?code=private-code&state=private-state",
+                    "https://example.com/oauth/callback?code=private-code&state=ERR_PRIVATESTATE",
                     1234L,
                 ),
             ),
@@ -81,11 +82,67 @@ class ConnectionStatusViewTest {
 
         for (text in listOf(rendered, copied)) {
             assertTrue(text.contains("https://example.com"))
-            assertTrue(text.contains("net::ERR_CONNECTION_REFUSED"))
+            assertTrue(text.contains("ERROR_UNKNOWN"))
             assertFalse(text.contains("/oauth/callback"))
             assertFalse(text.contains("private-code"))
             assertFalse(text.contains("private-state"))
+            assertFalse(text.contains("ERR_PRIVATESTATE"))
         }
+    }
+
+    @Test
+    fun `deferred hide disables actions and show rearms them`() {
+        val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
+        val selected = mutableListOf<StatusAction>()
+        val view = ConnectionStatusView(activity) { selected.add(it) }
+        activity.setContentView(view)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(1))
+        val status =
+            ConnectionStatus.ServerUnreachable(
+                "example.com",
+                UnreachableKind.GENERIC,
+                null,
+            )
+        view.show(status, immediate = true)
+        val retry = view.findViewById<Button>(R.id.status_primary)
+        val changeServer = view.findViewById<Button>(R.id.status_secondary)
+        view.hide()
+        assertEquals(View.VISIBLE, view.visibility)
+        assertFalse(retry.isEnabled)
+        assertFalse(changeServer.isEnabled)
+        retry.performClick()
+        changeServer.performClick()
+        assertTrue(selected.isEmpty())
+        view.show(status, immediate = true)
+        assertTrue(retry.isEnabled)
+        retry.performClick()
+        assertEquals(listOf(StatusAction.RETRY), selected)
+    }
+
+    @Test
+    fun `actions fade with content and stay disabled during the old state fade`() {
+        val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
+        val view = ConnectionStatusView(activity) {}
+        activity.setContentView(view)
+        layout(view, 1080, 1920)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(1))
+        view.show(
+            ConnectionStatus.ServerUnreachable("example.com", UnreachableKind.GENERIC, null),
+            immediate = true,
+        )
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(501))
+        val actions = view.findViewById<View>(R.id.status_actions)
+        val retry = view.findViewById<Button>(R.id.status_primary)
+        assertTrue(ValueAnimator.areAnimatorsEnabled())
+        view.show(ConnectionStatus.SignInRequired("example.com", null, false))
+        shadowOf(Looper.getMainLooper()).runOneTask()
+        shadowOf(Looper.getMainLooper()).runOneTask()
+        assertTrue(actions.alpha < 1f)
+        assertEquals(view.findViewById<View>(R.id.status_content).alpha, actions.alpha)
+        assertFalse(retry.isEnabled)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(250))
+        assertEquals(1f, actions.alpha)
+        assertTrue(retry.isEnabled)
     }
 
     @Test
