@@ -359,7 +359,7 @@ def test_sqlite_page_scan_excludes_receipt_history(tmp_path):
     assert after == before
     assert steps <= baseline + 100, (baseline, steps, plans)
     assert any("key>? AND key<?" in row[-1] for row in plans), plans
-    assert all("SEARCH preferences USING INDEX" in row[-1] for row in plans), plans
+    assert not any(row[-1].startswith("SCAN preferences") for row in plans), plans
 
 
 def test_page_never_labels_concurrent_rows_with_an_old_revision(store):

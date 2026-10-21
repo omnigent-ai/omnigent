@@ -31,8 +31,8 @@ history; work per page is O(limit), independent of receipt count.
 
 Every cursor binds the authenticated namespace and revision. If any edit commits
 between pages, the server returns 409: discard all collected pages and restart
-from page one. Each page also detects writes between its own range reads (or
-uses the database's consistent transaction snapshot). Only publish a complete
+from page one. Each page is one SQL statement combining a metadata point lookup with two
+independently limited index ranges, so its rows come from one consistent view. Only publish a complete
 snapshot from one revision; never adopt a partial page. Malformed or foreign
 cursors return 400. A cursor is not an authorization credential.
 

@@ -11,7 +11,7 @@ import base64
 from typing import Annotated, TypeVar
 
 from pydantic import BaseModel, Field
-from sqlalchemy import LargeBinary, delete, select, type_coerce, update
+from sqlalchemy import LargeBinary, delete, select, type_coerce, union_all, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -134,45 +134,35 @@ class SqlAlchemyPreferenceStore:
                     "Preference cursor identity mismatch", code=ErrorCode.INVALID_INPUT
                 )
         scope = self._scope(user_id)
-        metadata_query = select(type_coerce(SqlPreference.value, LargeBinary)).where(
-            *scope, SqlPreference.key == _META
-        )
-        with self._session("read_shared_preferences") as session:
-            raw = session.scalar(metadata_query)
-            metadata = (
-                _Metadata(authority_id=self._authority) if raw is None else _decode(raw, _Metadata)
+        columns = (SqlPreference.key, type_coerce(SqlPreference.value, LargeBinary).label("value"))
+        queries = [select(*columns).where(*scope, SqlPreference.key == _META)]
+        for prefix in (_CONFLICT, _VALUE):
+            if (
+                continuation is not None
+                and continuation.after.startswith(_VALUE)
+                and prefix == _CONFLICT
+            ):
+                continue
+            query = select(*columns).where(
+                *scope, SqlPreference.key >= prefix + "0", SqlPreference.key < prefix + "g"
             )
-            self._check_authority(metadata)
-            if continuation is not None and continuation.revision != metadata.revision:
-                raise OmnigentError(
-                    "Preference revision changed; restart pagination", code=ErrorCode.CONFLICT
-                )
-            rows = []
-            for prefix in (_CONFLICT, _VALUE):
-                if (
-                    continuation is not None
-                    and continuation.after.startswith(_VALUE)
-                    and prefix == _CONFLICT
-                ):
-                    continue
-                remaining = limit + 1 - len(rows)
-                if remaining == 0:
-                    break
-                query = select(
-                    SqlPreference.key, type_coerce(SqlPreference.value, LargeBinary)
-                ).where(
-                    *scope, SqlPreference.key >= prefix + "0", SqlPreference.key < prefix + "g"
-                )
-                if continuation is not None and continuation.after.startswith(prefix):
-                    query = query.where(SqlPreference.key > continuation.after)
-                rows.extend(
-                    session.execute(query.order_by(SqlPreference.key).limit(remaining)).all()
-                )
-            # READ COMMITTED may see a write between range reads; never label a mixed page.
-            if session.scalar(metadata_query) != raw:
-                raise OmnigentError(
-                    "Preference revision changed; restart pagination", code=ErrorCode.CONFLICT
-                )
+            if continuation is not None and continuation.after.startswith(prefix):
+                query = query.where(SqlPreference.key > continuation.after)
+            bounded = query.order_by(SqlPreference.key).limit(limit + 1).subquery()
+            queries.append(select(bounded.c.key, bounded.c.value))
+        # One statement gives each page a consistent view; every range is independently bounded.
+        with self._session("read_shared_preferences") as session:
+            records = session.execute(union_all(*queries)).all()
+        metadata = next(
+            (_decode(raw, _Metadata) for key, raw in records if key == _META),
+            _Metadata(authority_id=self._authority),
+        )
+        self._check_authority(metadata)
+        if continuation is not None and continuation.revision != metadata.revision:
+            raise OmnigentError(
+                "Preference revision changed; restart pagination", code=ErrorCode.CONFLICT
+            )
+        rows = sorted((key, raw) for key, raw in records if key != _META)
         next_cursor = None
         if len(rows) > limit:
             rows = rows[:limit]
