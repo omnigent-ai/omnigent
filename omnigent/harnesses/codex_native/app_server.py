@@ -3317,6 +3317,15 @@ def _resolve_databricks_codex_model(
     workspace does not serve passes through untouched, because the gateway's
     error beats a silent substitution.
 
+    An implicit default is additionally validated against the Codex Responses
+    route itself: some workspaces (Azure) advertise GPT models in the listing
+    that the route rejects with ``404 RESOURCE_DOES_NOT_EXIST``, so trusting
+    the listing alone pins a model whose first turn dies at the gateway. The
+    ranked candidates are probed in order and the first one the route
+    confirms wins, ahead of any higher-ranked candidate the route rejected or
+    left unconfirmed; when nothing is confirmed (route unreachable, every
+    candidate rejected, probe budget spent) the ranked default stands.
+
     :param host: Workspace origin, e.g. ``"https://example.com"``.
     :param profile: Databricks CLI profile backing the launch.
     :param requested: Explicit model id, or ``None`` to take the newest
@@ -3327,6 +3336,7 @@ def _resolve_databricks_codex_model(
     from omnigent.models import model_catalog_store
     from omnigent.models.databricks_model_discovery import (
         discover_databricks_codex_models,
+        first_served_codex_model,
         select_servable_model,
     )
 
@@ -3344,6 +3354,7 @@ def _resolve_databricks_codex_model(
                     return model.strip()
 
     servable: tuple[str, ...] = ()
+    token: str | None = None
     try:
         from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
@@ -3356,6 +3367,9 @@ def _resolve_databricks_codex_model(
         # simply fails the listing and drops to the ucode-state fallback below,
         # which is already keyed by ``host``.
         servable = discover_databricks_codex_models(host, creds.token)
+        # Expose the token to the route probe only after the listing proved it
+        # works for this host; a failed listing leaves ``token`` unset.
+        token = creds.token
     except Exception as exc:  # noqa: BLE001 — cached ucode state is the launch fallback
         # Recoverable fallback; frames are debug-only so a TTY-mirrored
         # host console stays concise.
@@ -3380,6 +3394,28 @@ def _resolve_databricks_codex_model(
     if requested:
         return select_servable_model(requested, servable) or requested
     if servable:
+        if token is not None and len(servable) > 1:
+            try:
+                served = first_served_codex_model(host, token, servable)
+            except Exception:  # noqa: BLE001 — the ranked default is the fallback
+                # Frames are debug-only so a TTY-mirrored host console stays
+                # concise, matching the discovery-failure warning above.
+                _logger.warning(
+                    "native-codex: codex-route servability probe failed for "
+                    "profile %r; keeping the ranked default",
+                    profile,
+                    exc_info=_logger.isEnabledFor(logging.DEBUG),
+                )
+                served = None
+            if served is not None and served != servable[0]:
+                _logger.warning(
+                    "native-codex: listing ranks %r first but the codex route "
+                    "did not confirm it; launching on %r instead",
+                    servable[0],
+                    served,
+                )
+            if served is not None:
+                return served
         return servable[0]
     return model_catalog.resolve_catalog_model("databricks", family="openai").model_id
 

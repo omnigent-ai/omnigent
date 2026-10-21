@@ -419,3 +419,105 @@ def test_select_servable_model_matches_legacy_spelling() -> None:
     assert select_servable_model("databricks-gpt-5-6-luna", servable) == "system.ai.gpt-5-6-luna"
     # A model the workspace does not serve is left for the caller to pass through.
     assert select_servable_model("databricks-gpt-9-9", servable) is None
+
+
+_SLOW_PROBE_S = 0.1
+
+
+def _probe_first_served(
+    candidates: tuple[str, ...],
+    served: set[str],
+    *,
+    erroring: set[str] | None = None,
+    timing_out: set[str] | None = None,
+    connect_timing_out: set[str] | None = None,
+    not_found_as_400: set[str] | None = None,
+    not_found_code: str = "RESOURCE_DOES_NOT_EXIST",
+    not_found_status: int = 400,
+    served_status: int = 400,
+    slow: set[str] | None = None,
+    seen: list[str] | None = None,
+    route_error: bool = False,
+) -> str | None:
+    """Probe *candidates* against a codex route that serves only *served*.
+
+    Ids in *erroring* answer with a transient ``500``, ids in *timing_out*
+    never answer (a read timeout), ids in *connect_timing_out* never complete
+    the handshake (a connect timeout), ids in *not_found_as_400* report
+    *not_found_code* with HTTP *not_found_status*, served ids answer with
+    *served_status* (a bodyless validation error), and ids in *slow* answer
+    after a short delay.
+    """
+    from omnigent.models.databricks_model_discovery import first_served_codex_model
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/ai-gateway/codex/v1/responses"
+        assert request.headers["authorization"] == "Bearer token"
+        if route_error:
+            raise httpx.ConnectError("route unreachable", request=request)
+        import json
+        import time
+
+        model = json.loads(request.content).get("model", "")
+        if seen is not None:
+            seen.append(model)
+        if slow and model in slow:
+            time.sleep(_SLOW_PROBE_S)
+        if timing_out and model in timing_out:
+            raise httpx.ReadTimeout("no answer", request=request)
+        if connect_timing_out and model in connect_timing_out:
+            raise httpx.ConnectTimeout("slow handshake", request=request)
+        if erroring and model in erroring:
+            return httpx.Response(500, json={"error": "upstream hiccup"}, request=request)
+        if not_found_as_400 and model in not_found_as_400:
+            return httpx.Response(
+                not_found_status,
+                json={
+                    "error_code": not_found_code,
+                    "message": f"Endpoint with name '{model}' does not exist.",
+                },
+                request=request,
+            )
+        if model in served:
+            # A validation 400/422 for the minimal probe body still proves the
+            # model resource exists on the route.
+            return httpx.Response(
+                served_status, json={"error": "invalid request"}, request=request
+            )
+        return httpx.Response(404, json={"error_code": "RESOURCE_DOES_NOT_EXIST"}, request=request)
+
+    return first_served_codex_model(
+        "https://workspace.example.com",
+        "token",
+        candidates,
+        transport=httpx.MockTransport(_handler),
+    )
+
+
+def test_first_served_codex_model_skips_unserved_listing_entries() -> None:
+    """Advertised-but-unserved ids are skipped for the first id the route serves.
+
+    The Azure listing advertises GPT ids the codex route 404s; the probe must
+    walk the ranked candidates in order and stop on the first served one.
+    """
+    seen: list[str] = []
+    picked = _probe_first_served(
+        ("system.ai.gpt-5-6-sol", "system.ai.gpt-5-5", "system.ai.glm-5-2"),
+        served={"system.ai.glm-5-2"},
+        seen=seen,
+    )
+    assert picked == "system.ai.glm-5-2"
+    assert seen == ["system.ai.gpt-5-6-sol", "system.ai.gpt-5-5", "system.ai.glm-5-2"]
+
+
+def test_first_served_codex_model_rejects_a_not_found_validation_error() -> None:
+    """A 400 naming the gateway's not-found code is a rejection, not a confirmation."""
+    seen: list[str] = []
+    picked = _probe_first_served(
+        ("system.ai.gpt-5-6-sol", "system.ai.glm-5-2"),
+        served={"system.ai.gpt-5-6-sol", "system.ai.glm-5-2"},
+        not_found_as_400={"system.ai.gpt-5-6-sol"},
+        seen=seen,
+    )
+    assert picked == "system.ai.glm-5-2"
+    assert seen == ["system.ai.gpt-5-6-sol", "system.ai.glm-5-2"]
