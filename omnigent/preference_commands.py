@@ -209,3 +209,12 @@ def initialize_empty() -> None:
         raise ValueError("This workspace already has shared preference history; inspect it first")
     workspace.client.enqueue(SharedPreferenceKey(kind="harness", name="default"), None)
     _print(asyncio.run(_sync(connection)))
+
+
+@preferences.command("prepare-launch")
+@click.pass_obj
+def prepare_launch(server: str) -> None:
+    """Refresh once and return a portable handoff for a local launcher."""
+    from omnigent.preference_wrapper import prepare_wrapper_preferences
+
+    _print(asyncio.run(prepare_wrapper_preferences(server)).model_dump(mode="json"))

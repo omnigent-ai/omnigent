@@ -53,7 +53,14 @@ def resolve_cli_preferences(
     cache_key = f"preferences:{server}"
     if cache_key not in context.meta:
         try:
-            launch = asyncio.run(prepare_server_preferences(server))
+            from omnigent.preference_wrapper import consume_wrapper_preferences
+
+            prepared = consume_wrapper_preferences(server)
+            launch = (
+                prepared.launch
+                if prepared is not None
+                else asyncio.run(prepare_server_preferences(server))
+            )
         except Exception as exc:
             raise click.ClickException(
                 f"{exc}\nRetry, or use `omnigent --temporary-preferences COMMAND` for this launch."

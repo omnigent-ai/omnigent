@@ -265,6 +265,15 @@ explanations, project precedence, and unchanged files. CLI and host launches ado
 these layers through the startup recipe above. Before activation, complete browser,
 managed-startup and per-harness availability journeys for each user entry point.
 
+**Local wrapper handoff:** `preferences --server URL prepare-launch` freezes the
+same startup choice and reports its default harness before a wrapper configures
+local tools. Pass its JSON through the inherited descriptor documented in the
+[startup guide](../docs/shared-preferences-startup.md#local-launcher-handoff).
+The startup component matrix checks one-use closure and server/login rejection;
+the CLI variant of the shared-operations process recipe below covers command
+output → inherited descriptor → configuration/session snapshot without a second
+refresh. It does not prove Isaac setup or native tool launch.
+
 **Embedded rollout and request lifetime (component coverage):**
 
 ```sh

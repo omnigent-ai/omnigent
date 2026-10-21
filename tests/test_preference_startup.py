@@ -162,7 +162,8 @@ async def test_discovery_budget_and_gate_off(monkeypatch):
         await prepare_server_preferences("http://test", timeout=0.02)
 
 
-def test_cli_resolves_once_and_skips_resume_and_temporary(startup, monkeypatch):
+@pytest.mark.parametrize("wrapper", [False, True])
+def test_cli_resolves_once_and_skips_resume_and_temporary(startup, monkeypatch, wrapper):
     from omnigent.preference_cli_startup import resolve_cli_preferences
     from omnigent.preference_startup import PreferenceLaunch
     from omnigent.preference_sync import PreferenceSnapshot, SharedPreferenceEntry
@@ -184,6 +185,22 @@ def test_cli_resolves_once_and_skips_resume_and_temporary(startup, monkeypatch):
 
     monkeypatch.setattr("omnigent.preference_cli_startup.prepare_server_preferences", prepare)
     config = {"server": "http://test", "model": "legacy"}
+    if wrapper:
+        import os
+        import tempfile
+
+        from omnigent.preference_wrapper import (
+            PREFERENCE_HANDOFF_FD_ENV,
+            prepare_wrapper_preferences,
+        )
+
+        monkeypatch.setattr("omnigent.preference_wrapper.prepare_server_preferences", prepare)
+        prepared = asyncio.run(prepare_wrapper_preferences("http://test"))
+        with tempfile.TemporaryFile() as handoff:
+            handoff.write(prepared.model_dump_json().encode())
+            handoff.seek(0)
+            descriptor = os.dup(handoff.fileno())
+        monkeypatch.setenv(PREFERENCE_HANDOFF_FD_ENV, str(descriptor))
     with click.Context(click.Command("run"), info_name="run") as context:
         assert resolve_cli_preferences(config, {}).config["model"] == "shared"
         assert resolve_cli_preferences(config, {"model": "project"}).config["model"] == "project"
@@ -194,6 +211,47 @@ def test_cli_resolves_once_and_skips_resume_and_temporary(startup, monkeypatch):
         context.meta["temporary_preferences"] = True
         assert resolve_cli_preferences(config, {}).config["model"] == "legacy"
         assert calls == ["http://test"]
+    if wrapper:
+        assert PREFERENCE_HANDOFF_FD_ENV not in os.environ
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+@pytest.mark.parametrize("fault", ["server", "account", "invalid", "oversized"])
+def test_wrapper_handoff_rejects_invalid_context_and_closes_descriptor(monkeypatch, fault):
+    import os
+    import tempfile
+
+    from omnigent.preference_connection import account_context
+    from omnigent.preference_wrapper import (
+        MAX_HANDOFF_BYTES,
+        PREFERENCE_HANDOFF_FD_ENV,
+        PreparedPreferences,
+        consume_wrapper_preferences,
+    )
+
+    prepared = PreparedPreferences(
+        server_url="http://test", account_context=account_context("http://test"), launch=None
+    )
+    if fault == "server":
+        prepared = prepared.model_copy(update={"server_url": "http://other"})
+    elif fault == "account":
+        prepared = prepared.model_copy(update={"account_context": "0" * 64})
+    payload = prepared.model_dump_json().encode()
+    if fault == "invalid":
+        payload = b"not json"
+    elif fault == "oversized":
+        payload = b"x" * (MAX_HANDOFF_BYTES + 1)
+    with tempfile.TemporaryFile() as handoff:
+        handoff.write(payload)
+        handoff.seek(0)
+        descriptor = os.dup(handoff.fileno())
+    monkeypatch.setenv(PREFERENCE_HANDOFF_FD_ENV, str(descriptor))
+    with pytest.raises(ValueError):
+        consume_wrapper_preferences("http://test")
+    assert PREFERENCE_HANDOFF_FD_ENV not in os.environ
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
 
 
 def test_login_change_cannot_borrow_offline_cache(tmp_path, monkeypatch):

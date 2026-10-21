@@ -475,6 +475,49 @@ main()
         shown = json.loads(cli("show"))
         assert shown["machine"][0]["value"] == "experiment"
         assert "imported-model" in json.dumps(shown["shared"])
+        if surface == "cli":
+            import tempfile
+
+            from omnigent.preference_wrapper import PREFERENCE_HANDOFF_FD_ENV
+
+            prepared = cli("prepare-launch")
+            assert json.loads(prepared)["harness"] == "pi-native"
+            assert "private-command" not in prepared
+            with tempfile.TemporaryFile() as handoff:
+                handoff.write(prepared.encode())
+                handoff.seek(0)
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        """
+import json, sys
+import click
+from omnigent.config import load_global_config
+from omnigent import preference_cli_startup as startup
+from omnigent.preference_session import session_preference_snapshot
+async def unexpected_refresh(_server):
+    raise AssertionError("the wrapper already refreshed")
+startup.prepare_server_preferences = unexpected_refresh
+config = load_global_config()
+config["server"] = sys.argv[1]
+with click.Context(click.Command("run"), info_name="run"):
+    resolved = startup.resolve_cli_preferences(config, {})
+    output = {"model": resolved.config["model"], "snapshot": session_preference_snapshot()}
+    print(json.dumps(output))
+""",
+                        server,
+                    ],
+                    env={**environment, PREFERENCE_HANDOFF_FD_ENV: str(handoff.fileno())},
+                    pass_fds=(handoff.fileno(),),
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            assert result.returncode == 0, result.stdout + result.stderr
+            adopted = json.loads(result.stdout)
+            assert adopted["model"] == "experiment"
+            assert adopted["snapshot"] == json.loads(prepared)["launch"]
         cli("set", "--scope", "machine", "model", "null")
         assert json.loads(cli("show"))["machine"] == []
         restore = tmp_path / "restore.json"

@@ -50,6 +50,25 @@ Legacy unprepared host launches retain their frozen resume files and the 2,048
 snapshot cap; these are never pruned automatically. Reusing a session keeps its
 saved shared and machine values; project and session choices retain precedence.
 
+## Local launcher handoff
+
+A wrapper that prepares native tools before starting the CLI can run
+`omnigent preferences --server URL prepare-launch`. It returns a versioned JSON
+handoff containing the frozen launch and effective default harness. Credentials,
+commands and installation settings are omitted. A disconnected, non-enrolled
+machine returns a null launch without making a preference request; initial
+adoption and recovery use the same rules as ordinary CLI startup.
+
+Write that JSON to an unlinked temporary file, seek to offset zero, and inherit
+its descriptor (at least 3) into the new CLI process through
+`OMNIGENT_PREFERENCE_HANDOFF_FD`. The CLI closes the descriptor after consuming
+it, verifies the server and selected login, and uses that snapshot without a
+second refresh. Wrapper failures should close their descriptor. Do not include
+this variable in runner passthrough; runners receive the ordinary session snapshot.
+Use this only for a new session. Resume, fork, management commands and explicit
+temporary-default launches must skip preparation. The wrapper still owns local
+tool setup; a selected unavailable harness must remain visible as an error.
+
 ## Verification and remaining integration
 
 Follow `shared-startup` in the [feature map](../feature-map/preferences.md).
