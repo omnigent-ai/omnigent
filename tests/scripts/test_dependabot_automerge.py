@@ -236,7 +236,7 @@ elif args[0] == 'api':
         if endpoint.endswith('/pulls/123') and 'pull_after' in data:
             count = sum(json.loads(line) == args
                         for line in (root / 'calls.jsonl').read_text().splitlines())
-            if count > 1:
+            if count > data.get('pull_after_reads', 1):
                 value = data['pull_after']
         print(json.dumps(value))
 else:
@@ -380,15 +380,21 @@ def test_merge_mode_never_falls_back_to_workflow_token(tmp_path, api):
 
 
 @pytest.mark.parametrize("change", ["head", "hold"])
-def test_candidate_changed_during_scanning_is_not_merged(tmp_path, api, change):
+@pytest.mark.parametrize("entry", ["merge", "approval"])
+def test_candidate_changed_during_scanning_is_not_merged(tmp_path, api, change, entry):
     api["pull_after"] = copy.deepcopy(api["routes"][f"{PREFIX}/pulls/123"])
+    api["pull_after_reads"] = 2 if entry == "approval" else 1
     if change == "head":
         api["pull_after"]["head"]["sha"] = "c" * 40
     else:
         api["pull_after"]["labels"] = [{"name": "hold-automerge"}]
-    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
-    assert process.returncode == 0, process.stderr
-    assert "human review or retry required" in process.stdout
+    process, calls = run_cli(
+        tmp_path, api, mode="merge", sweep=entry == "merge", approval=entry == "approval"
+    )
+    assert process.returncode == (1 if entry == "approval" else 0), process.stderr
+    assert (
+        "requires human review" if entry == "approval" else "human review or retry required"
+    ) in process.stdout
     assert not any(call[:2] == ["pr", "merge"] for call in calls)
 
 
@@ -406,6 +412,8 @@ def test_candidate_changed_during_scanning_is_not_merged(tmp_path, api, change):
 def test_real_approval_entry_point_preserves_review_unless_pilot_enabled(
     tmp_path, api, mode, fault, expected
 ):
+    # The approval gate must validate reports without waiting on itself.
+    api["routes"]["Maintainer Approval"]["check_runs"][0]["conclusion"] = "failure"
     if fault == "hold":
         api["routes"][f"{PREFIX}/pulls/123"]["labels"] = [{"name": "hold-automerge"}]
     elif fault == "ghost":
@@ -493,20 +501,25 @@ def test_ineligible_changes_keep_human_review(tmp_path, api, fault):
 
 
 @pytest.mark.parametrize(
-    "fault",
+    "entry,fault",
     [
-        "failed_scan",
-        "pending_scan",
-        "missing_scan",
-        "newer_scan",
-        "missing_inventory",
-        "wrong_inventory",
-        "severe",
-        "pending_ci",
-        "merge_blocked",
-    ],
+        (entry, fault)
+        for entry in ("merge", "approval")
+        for fault in (
+            "failed_scan",
+            "pending_scan",
+            "missing_scan",
+            "newer_scan",
+            "missing_inventory",
+            "wrong_inventory",
+            "severe",
+            "pending_ci",
+            "old_coverage",
+        )
+    ]
+    + [("merge", "merge_blocked")],
 )
-def test_no_merge_without_reports_and_required_checks(tmp_path, api, fault):
+def test_no_merge_without_reports_and_required_checks(tmp_path, api, entry, fault):
     scan = api["routes"]["Trivy CVE Scan (repository)"]
     if fault == "failed_scan":
         scan["check_runs"][0]["conclusion"] = "failure"
@@ -537,10 +550,17 @@ def test_no_merge_without_reports_and_required_checks(tmp_path, api, fault):
         api["routes"][
             f"{PREFIX}/actions/workflows/ci.yml/runs?head_sha={HEAD}&event=pull_request&per_page=100"
         ]["workflow_runs"][0]["status"] = "in_progress"
-    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
-    assert process.returncode == 0, process.stderr
+    elif fault == "old_coverage":
+        jobs = api["routes"][f"{PREFIX}/actions/runs/12/jobs?per_page=100&page=1"]["jobs"]
+        jobs[:] = [job for job in jobs if job["name"] != "CI coverage scope"]
+    process, calls = run_cli(
+        tmp_path, api, mode="merge", sweep=entry == "merge", approval=entry == "approval"
+    )
+    assert process.returncode == (1 if entry == "approval" else 0), process.stderr
     assert "Merged after policy" not in process.stdout
-    assert "human review or retry required" in process.stdout
+    assert (
+        "requires human review" if entry == "approval" else "human review or retry required"
+    ) in process.stdout
     if fault != "merge_blocked":
         assert not any(call[:2] == ["pr", "merge"] for call in calls)
 
@@ -1231,7 +1251,8 @@ def test_skipped_label_run_does_not_hide_real_e2e_result(tmp_path, api, newest):
 
 
 @pytest.mark.parametrize(
-    "condition", ["eligible", "report", "held", "pending", "limit", "wrong_workflow"]
+    "condition",
+    ["eligible", "report", "held", "pending", "limit", "wrong_workflow", "reports_pending"],
 )
 def test_worker_refreshes_stale_approval_without_merging(tmp_path, api, condition):
     check = api["routes"]["Maintainer Approval"]["check_runs"][0]
@@ -1254,6 +1275,10 @@ def test_worker_refreshes_stale_approval_without_merging(tmp_path, api, conditio
         run["run_attempt"] = 3
     elif condition == "wrong_workflow":
         run["path"] = ".github/workflows/release.yml"
+    elif condition == "reports_pending":
+        api["routes"][
+            f"{PREFIX}/actions/workflows/ci.yml/runs?head_sha={HEAD}&event=pull_request&per_page=100"
+        ]["workflow_runs"][0]["status"] = "in_progress"
     process, calls = run_cli(
         tmp_path, api, mode="report" if condition == "report" else "merge", sweep=True
     )

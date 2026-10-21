@@ -354,6 +354,29 @@ def refresh_failed_gates(repository: str, candidate: dict, mode: str) -> None:
     require(not refreshed, f"Refreshed blocked CI: {', '.join(refreshed)}; waiting for next sweep")
 
 
+def require_current_candidate(repository: str, number: int, candidate: dict) -> None:
+    current = gh_json(["api", f"repos/{repository}/pulls/{number}"])
+    require(
+        current["head"]["sha"] == candidate["head"]
+        and current["base"]["sha"] == candidate["base"],
+        "PR changed during evaluation",
+    )
+    require(
+        not current["draft"] and current["state"] == "open",
+        "PR is now closed or draft",
+    )
+    require(
+        not {label["name"] for label in current["labels"]}
+        & {"hold-automerge", "skip-security-scan"},
+        "PR was put on hold",
+    )
+    reviews = paginated(f"repos/{repository}/pulls/{number}/reviews")
+    require(
+        all(r["state"] != "CHANGES_REQUESTED" for r in latest_decisive_reviews(reviews).values()),
+        "A reviewer has requested changes",
+    )
+
+
 def sweep(repository: str, mode: str) -> None:
     if mode == "merge":
         require(
@@ -384,33 +407,11 @@ def sweep(repository: str, mode: str) -> None:
             decision = evaluate(repository, number)
             packages = ", ".join(decision["packages"])
             rows.append(f"- #{number}: eligible ({packages})")
-            require_approval(repository, decision, mode)
             refresh_failed_gates(repository, decision, mode)
             require_reports(repository, decision)
+            require_approval(repository, decision, mode)
             if mode == "merge":
-                current = gh_json(["api", f"repos/{repository}/pulls/{number}"])
-                require(
-                    current["head"]["sha"] == decision["head"]
-                    and current["base"]["sha"] == decision["base"],
-                    "PR changed during evaluation",
-                )
-                require(
-                    not current["draft"] and current["state"] == "open",
-                    "PR is now closed or draft",
-                )
-                require(
-                    not {label["name"] for label in current["labels"]}
-                    & {"hold-automerge", "skip-security-scan"},
-                    "PR was put on hold",
-                )
-                reviews = paginated(f"repos/{repository}/pulls/{number}/reviews")
-                require(
-                    all(
-                        r["state"] != "CHANGES_REQUESTED"
-                        for r in latest_decisive_reviews(reviews).values()
-                    ),
-                    "A reviewer has requested changes",
-                )
+                require_current_candidate(repository, number, decision)
                 # No --admin or queued --auto: GitHub enforces required checks
                 # now, against precisely the head whose policy/report we read.
                 subprocess.run(

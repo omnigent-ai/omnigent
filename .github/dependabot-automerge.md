@@ -77,6 +77,12 @@ assessed head. `hold-automerge`, `skip-security-scan` and changes-requested revi
 prevent unattended merges. Existing human approval remains independent of registry
 availability.
 
+The automatic Dependabot exception in `Maintainer Approval` requires the same
+CI and advisory evidence as the worker. Native GitHub auto-merge therefore cannot
+use structural eligibility alone to satisfy that required check. Label changes
+reevaluate approval so a hold also withdraws the automatic exception. Otto still
+requires an actual maintainer review; no internal workflow change is needed.
+
 Maintainers can still apply `skip-security-scan` for a manual merge. That waiver
 does not make the PR eligible for the unattended worker.
 
@@ -87,8 +93,9 @@ Policy changes apply to existing PRs on the next sweep because the worker reads
 those PRs after workflow changes; rerunning an old workflow retains its original
 YAML and cannot manufacture the new coverage contract.
 
-The worker refreshes stale failed approval checks for eligible candidates. It can
-rerun workflows blocked only by failed Security Gates after the scan becomes
+The worker refreshes stale failed approval checks only after the candidate's CI
+and advisory evidence passes. Approval does not consume retries while CI is
+pending. It can rerun workflows blocked only by failed Security Gates after the scan becomes
 green. Recovery stops at three attempts and does not retry real test failures.
 Report mode never refreshes or merges.
 
