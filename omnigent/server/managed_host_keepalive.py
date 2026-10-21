@@ -22,6 +22,11 @@ Rate-limited per runner at a provider-scoped cadence
 ``keep_alive`` is a provider API call — on Kubernetes-style backends an apiserver
 write that wakes a controller reconcile — so agent_sandbox refreshes fast (short
 window) while other providers stay on the cheap default.
+
+Refreshes run on an eight-worker pool with at most one queued or running attempt
+per runner, and the tunnel loop wakes from the remaining due time
+(:func:`next_keepalive_delay_s`). ``managed_keepalive`` outcome records carry
+identifiers and error types, never provider exception payloads.
 """
 
 from __future__ import annotations
@@ -31,8 +36,11 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from enum import StrEnum
+from functools import partial
 from typing import TYPE_CHECKING
 
+from omnigent.debug_logging import debug_event
 from omnigent.onboarding.sandboxes.base import (
     SandboxCapabilityError,
     resolve_managed_keepalive_interval_s,
@@ -44,6 +52,27 @@ if TYPE_CHECKING:
     from omnigent.stores.host_store import HostStore
 
 _logger = logging.getLogger(__name__)
+
+# Keep provider I/O off the tunnel event loop without letting one stalled
+# provider call serialize every active runner's refresh.
+_KEEPALIVE_MAX_WORKERS = 8
+# Wake delay once a runner is due but its previous attempt is still outstanding.
+_KEEPALIVE_RETRY_DELAY_S = 1.0
+
+
+class _KeepAliveOutcome(StrEnum):
+    """Bounded outcomes emitted by one managed-sandbox refresh attempt."""
+
+    EXTENDED = "extended"
+    SOFT_FAILED = "soft_failed"
+    UNSUPPORTED = "unsupported"
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
+    NO_SANDBOX = "no_sandbox"
+    NO_HOST = "no_host"
+    PROVIDER_ERROR = "provider_error"
+    RESOLUTION_ERROR = "resolution_error"
+    SUBMISSION_FAILED = "submission_failed"
+
 
 # runner_id -> its provider's keepalive cadence (seconds), filled by
 # _keep_alive_for_runner once the runner's provider is resolved. Until then the
@@ -64,7 +93,7 @@ _host_store: HostStore | None = None
 _sandbox_config: ManagedSandboxDeployment | None = None
 _executor: ThreadPoolExecutor | None = None
 
-# runner_id -> monotonic seconds of its last keep_alive attempt.
+# runner_id -> monotonic seconds of its last keep_alive attempt (its submission).
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by runner_id
 _last_kept: dict[str, float] = {}
 
@@ -73,7 +102,15 @@ _last_kept: dict[str, float] = {}
 # provider from stacking a second job for the same runner behind the first.
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by runner_id
 _inflight: set[str] = set()
-_inflight_lock = threading.Lock()
+# Guards the per-runner maps (_runner_interval_s, _last_kept) and _inflight; the
+# store, config and executor globals are set once in configure() and read unlocked.
+_state_lock = threading.Lock()
+
+# Queue delay of the attempt a worker is running, for its outcome record. Carried
+# as a ContextVar so _keep_alive_for_runner keeps its one-argument signature.
+_queue_delay_s: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "managed_keepalive_queue_delay_s", default=None
+)
 
 
 def configure(
@@ -97,25 +134,75 @@ def configure(
     _conversation_store = conversation_store
     _host_store = host_store
     _sandbox_config = sandbox_config
-    if sandbox_config is not None and host_store is not None and _executor is None:
-        _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="managed-keepalive")
+    with _state_lock:
+        if sandbox_config is not None and host_store is not None and _executor is None:
+            _executor = ThreadPoolExecutor(
+                max_workers=_KEEPALIVE_MAX_WORKERS,
+                thread_name_prefix="managed-keepalive",
+            )
 
 
 def _interval_for(runner_id: str) -> float:
     """The keepalive cadence for *runner_id*: its provider's, once cached, else
     the fast agent_sandbox cadence so a short-window sandbox is never under-refreshed."""
-    return _runner_interval_s.get(runner_id, resolve_managed_keepalive_interval_s("agent_sandbox"))
+    with _state_lock:
+        interval = _runner_interval_s.get(runner_id)
+    if interval is not None:
+        return interval
+    return resolve_managed_keepalive_interval_s("agent_sandbox")
 
 
 def keepalive_interval_s(runner_id: str) -> float:
-    """Seconds the runner tunnel's keepalive loop sleeps between refreshes for
-    *runner_id* (and the per-runner throttle in :func:`touch`).
+    """Seconds between keep_alive attempts for *runner_id*: the per-runner throttle
+    window in :func:`touch`, and the cadence :func:`next_keepalive_delay_s` paces
+    the runner tunnel's loop by.
 
     Provider-scoped: agent_sandbox refreshes fast because its window is short;
-    other providers keep the cheaper default so they are not over-called. The loop
-    sleep and the throttle read the same value, so they cannot disagree.
+    other providers keep the cheaper default so they are not over-called.
     """
     return _interval_for(runner_id)
+
+
+def next_keepalive_delay_s(runner_id: str, *, now: float | None = None) -> float:
+    """Seconds the runner tunnel's loop should sleep before its next :func:`touch`.
+
+    The remainder of the runner's interval since its last attempt, so a tick that
+    arrived early or was declined does not push the refresh out a whole cadence.
+    Once the interval has elapsed, the only reason the tick did not submit is an
+    attempt still queued or running, so retry after a short bounded delay rather
+    than spinning or sleeping a full interval.
+
+    :param runner_id: Runner whose refresh schedule is being advanced.
+    :param now: Monotonic timestamp to schedule from; defaults to the clock.
+    :returns: Non-negative seconds until the next ``touch`` call.
+    """
+    current = time.monotonic() if now is None else now
+    interval = _interval_for(runner_id)
+    if _sandbox_config is None or _host_store is None or _executor is None:
+        # touch() is a no-op, so stale throttle state must not make the loop spin.
+        return interval
+    with _state_lock:
+        last = _last_kept.get(runner_id)
+        inflight = runner_id in _inflight
+    if last is None:
+        delay = interval
+    else:
+        remaining = interval - (current - last)
+        delay = remaining if remaining > 0 else _KEEPALIVE_RETRY_DELAY_S
+    _logger.debug(
+        "managed sandbox keepalive scheduled in %.3fs for runner %s",
+        delay,
+        runner_id,
+        extra=debug_event(
+            "managed_keepalive_schedule",
+            runner_id=runner_id,
+            interval_s=round(interval, 3),
+            delay_s=round(max(0.0, delay), 3),
+            inflight=inflight,
+            last_attempt_age_s=(round(max(0.0, current - last), 3) if last is not None else None),
+        ),
+    )
+    return max(0.0, delay)
 
 
 def touch(runner_id: str) -> None:
@@ -123,7 +210,9 @@ def touch(runner_id: str) -> None:
 
     Non-blocking and fail-safe: the provider call runs on a worker thread so a
     slow backend cannot delay the tunnel ping loop that calls this, and every
-    failure is logged and swallowed. Safe to call on every ping.
+    failure is logged and swallowed. Safe to call on every ping. A runner has at
+    most one queued or running attempt; a tick that finds one outstanding is
+    declined and retried by the loop once it clears.
 
     The worker runs inside a snapshot of THIS caller's ``contextvars``
     (``copy_context().run``), which is load-bearing rather than tidiness: the
@@ -138,36 +227,121 @@ def touch(runner_id: str) -> None:
 
     :param runner_id: Runner with a live tunnel, e.g. ``"runner_token_abc"``.
     """
-    if _sandbox_config is None or _host_store is None or _executor is None:
+    executor = _executor
+    if _sandbox_config is None or _host_store is None or executor is None:
         return
     now = time.monotonic()
-    last = _last_kept.get(runner_id)
-    if last is not None and now - last < _interval_for(runner_id):
-        return
-    with _inflight_lock:
+    interval = _interval_for(runner_id)
+    with _state_lock:
+        last = _last_kept.get(runner_id)
+        if last is not None and now - last < interval:
+            return
         if runner_id in _inflight:
-            # Previous attempt for this runner has not finished; skip rather than
-            # queue a duplicate. Deliberately leaves _last_kept untouched so the
-            # next tick retries as soon as the in-flight one clears.
+            # One outstanding attempt per runner; _last_kept stays untouched so
+            # the loop keeps the runner due and retries once this one clears.
             return
         _inflight.add(runner_id)
-    _last_kept[runner_id] = now
-    if len(_last_kept) > _THROTTLE_MAX_ENTRIES:
+        _last_kept[runner_id] = now
+        should_prune = len(_last_kept) > _THROTTLE_MAX_ENTRIES
+    if should_prune:
         _prune_throttle(now)
     ctx = contextvars.copy_context()
-    _executor.submit(ctx.run, _keep_alive_for_runner, runner_id)
+    try:
+        executor.submit(ctx.run, partial(_run_keepalive_job, queued_at=now), runner_id)
+    except Exception as exc:  # noqa: BLE001 - a rejecting pool must not wedge the runner
+        # The stamp above stands as the attempt, so the retry is paced by the
+        # interval instead of hammering a shut-down or broken pool.
+        with _state_lock:
+            _inflight.discard(runner_id)
+        _emit_outcome(
+            runner_id,
+            _KeepAliveOutcome.SUBMISSION_FAILED,
+            error_type=_bounded_error_type(exc),
+        )
 
 
 def _prune_throttle(now: float) -> None:
-    """Drop throttle entries older than two slow intervals (their runners are gone)."""
+    """Drop throttle entries older than two slow intervals (their runners are gone),
+    keeping a runner whose attempt is still outstanding so the loop still sees it as due."""
     cutoff = now - 2 * resolve_managed_keepalive_interval_s()
-    for runner_id in [rid for rid, seen in _last_kept.items() if seen < cutoff]:
-        _last_kept.pop(runner_id, None)
-        _runner_interval_s.pop(runner_id, None)
+    with _state_lock:
+        stale = [rid for rid, seen in _last_kept.items() if seen < cutoff and rid not in _inflight]
+        for runner_id in stale:
+            _last_kept.pop(runner_id, None)
+            _runner_interval_s.pop(runner_id, None)
+
+
+def _run_keepalive_job(runner_id: str, *, queued_at: float) -> None:
+    """Worker entry: refresh, recording how long the attempt waited for a worker."""
+    token = _queue_delay_s.set(max(0.0, time.monotonic() - queued_at))
+    try:
+        _keep_alive_for_runner(runner_id)
+    finally:
+        _queue_delay_s.reset(token)
+
+
+def _bounded_error_type(exc: BaseException) -> str:
+    """Return exception class evidence without carrying exception details."""
+    name = type(exc).__name__
+    if name and len(name) <= 64 and name.isidentifier():
+        return name
+    return "Exception"
+
+
+def _emit_outcome(
+    runner_id: str,
+    outcome: _KeepAliveOutcome,
+    *,
+    host_id: str | None = None,
+    provider: str | None = None,
+    sandbox_id: str | None = None,
+    provider_duration_s: float | None = None,
+    queue_delay_s: float | None = None,
+    error_type: str | None = None,
+    message: str | None = None,
+) -> None:
+    """Emit one bounded, identifier-only record for one refresh attempt."""
+    if outcome == _KeepAliveOutcome.EXTENDED:
+        level = logging.INFO
+    elif outcome in {
+        _KeepAliveOutcome.SOFT_FAILED,
+        _KeepAliveOutcome.PROVIDER_ERROR,
+        _KeepAliveOutcome.RESOLUTION_ERROR,
+        _KeepAliveOutcome.SUBMISSION_FAILED,
+    }:
+        level = logging.WARNING
+    else:
+        level = logging.DEBUG
+    extra = debug_event(
+        "managed_keepalive",
+        runner_id=runner_id,
+        host_id=host_id,
+        provider=provider,
+        sandbox_id=sandbox_id,
+        outcome=outcome.value,
+        error_type=error_type,
+        provider_duration_s=(
+            round(max(0.0, provider_duration_s), 3) if provider_duration_s is not None else None
+        ),
+        queue_delay_s=(round(max(0.0, queue_delay_s), 3) if queue_delay_s is not None else None),
+    )
+    if message is not None:
+        _logger.log(level, message, extra=extra)
+    else:
+        _logger.log(
+            level,
+            "managed sandbox keepalive outcome=%s runner=%s host=%s provider=%s",
+            outcome.value,
+            runner_id,
+            host_id or "unknown",
+            provider or "unknown",
+            extra=extra,
+        )
 
 
 def _keep_alive_for_runner(runner_id: str) -> None:
     """Resolve *runner_id* to its managed sandbox and extend it. Never raises."""
+    queue_delay_s = _queue_delay_s.get()
     try:
         conversation_store, host_store, deployment = (
             _conversation_store,
@@ -182,10 +356,35 @@ def _keep_alive_for_runner(runner_id: str) -> None:
             if conv.host_id
         }
         for host_id in host_ids:
-            host = host_store.get_host(host_id)
+            try:
+                host = host_store.get_host(host_id)
+            except Exception as exc:  # noqa: BLE001 - one host must not block others
+                _emit_outcome(
+                    runner_id,
+                    _KeepAliveOutcome.RESOLUTION_ERROR,
+                    host_id=host_id,
+                    error_type=_bounded_error_type(exc),
+                    queue_delay_s=queue_delay_s,
+                )
+                continue
             # Only a server-provisioned sandbox has one to extend; a CLI host has
             # no sandbox_id / provider and is left alone.
-            if host is None or not host.sandbox_id or not host.sandbox_provider:
+            if host is None:
+                _emit_outcome(
+                    runner_id,
+                    _KeepAliveOutcome.NO_HOST,
+                    host_id=host_id,
+                    queue_delay_s=queue_delay_s,
+                )
+                continue
+            if not host.sandbox_id or not host.sandbox_provider:
+                _emit_outcome(
+                    runner_id,
+                    _KeepAliveOutcome.NO_SANDBOX,
+                    host_id=host_id,
+                    provider=host.sandbox_provider,
+                    queue_delay_s=queue_delay_s,
+                )
                 continue
             # for_provider, NOT recorded: recorded() falls back to the deployment
             # default when the host's provider is no longer offered, which is safe
@@ -193,44 +392,97 @@ def _keep_alive_for_runner(runner_id: str) -> None:
             # (see _launcher_for_teardown). Extending is best-effort with nothing
             # to fall back to, so a config for some OTHER provider would push a
             # deadline on the wrong backend using a foreign sandbox id. Skip.
-            config = deployment.for_provider(host.sandbox_provider)
+            try:
+                config = deployment.for_provider(host.sandbox_provider)
+            except Exception as exc:  # noqa: BLE001 - one provider must not block others
+                _emit_outcome(
+                    runner_id,
+                    _KeepAliveOutcome.PROVIDER_ERROR,
+                    host_id=host_id,
+                    provider=host.sandbox_provider,
+                    sandbox_id=host.sandbox_id,
+                    error_type=_bounded_error_type(exc),
+                    queue_delay_s=queue_delay_s,
+                )
+                continue
             if config is None:
-                _logger.debug(
-                    "provider %s no longer offered; skipping sandbox %s",
-                    host.sandbox_provider,
-                    host.sandbox_id,
+                _emit_outcome(
+                    runner_id,
+                    _KeepAliveOutcome.PROVIDER_UNAVAILABLE,
+                    host_id=host_id,
+                    provider=host.sandbox_provider,
+                    sandbox_id=host.sandbox_id,
+                    queue_delay_s=queue_delay_s,
                 )
                 continue
             # Cache the provider's cadence so the loop sleep and throttle settle
             # onto it (agent_sandbox stays fast; others fall back to the default).
-            _runner_interval_s[runner_id] = resolve_managed_keepalive_interval_s(
-                host.sandbox_provider
-            )
+            with _state_lock:
+                _runner_interval_s[runner_id] = resolve_managed_keepalive_interval_s(
+                    host.sandbox_provider
+                )
+            provider_started = time.monotonic()
             try:
                 extended = config.launcher_factory().keep_alive(host.sandbox_id)
-                # INFO from the server layer so the keepalive is visible in the
-                # server log (onboarding-layer loggers do not surface there); the
-                # provider logs the new deadline at debug. A provider returns
-                # False when it attempted but could not confirm the extension (and
-                # logged its own warning); skip the success line so the log is not
-                # self-contradictory.
-                if extended is not False:
-                    _logger.info(
-                        "kept managed sandbox %s alive (provider %s)",
-                        host.sandbox_id,
-                        host.sandbox_provider,
-                    )
-            except SandboxCapabilityError:
+                # INFO so the keepalive is visible in the server log (onboarding
+                # loggers do not surface there). False means the provider attempted
+                # but could not confirm the extension, so record a soft failure.
+                outcome = (
+                    _KeepAliveOutcome.SOFT_FAILED
+                    if extended is False
+                    else _KeepAliveOutcome.EXTENDED
+                )
+                provider_duration_s = time.monotonic() - provider_started
+                _emit_outcome(
+                    runner_id,
+                    outcome,
+                    host_id=host_id,
+                    provider=host.sandbox_provider,
+                    sandbox_id=host.sandbox_id,
+                    provider_duration_s=provider_duration_s,
+                    error_type=("soft_failure" if extended is False else None),
+                    message=(
+                        f"kept managed sandbox {host.sandbox_id} alive "
+                        f"(provider {host.sandbox_provider})"
+                        if extended is not False
+                        else None
+                    ),
+                    queue_delay_s=queue_delay_s,
+                )
+            except SandboxCapabilityError as exc:
                 # Provider cannot extend a sandbox (e.g. kubernetes): today's
                 # behaviour, nothing to log every 10 minutes.
-                _logger.debug(
-                    "keep_alive unsupported by provider %s; skipping sandbox %s",
-                    host.sandbox_provider,
-                    host.sandbox_id,
+                provider_duration_s = time.monotonic() - provider_started
+                _emit_outcome(
+                    runner_id,
+                    _KeepAliveOutcome.UNSUPPORTED,
+                    host_id=host_id,
+                    provider=host.sandbox_provider,
+                    sandbox_id=host.sandbox_id,
+                    provider_duration_s=provider_duration_s,
+                    error_type=_bounded_error_type(exc),
+                    queue_delay_s=queue_delay_s,
+                )
+            except Exception as exc:  # noqa: BLE001 - one provider must not block others
+                provider_duration_s = time.monotonic() - provider_started
+                _emit_outcome(
+                    runner_id,
+                    _KeepAliveOutcome.PROVIDER_ERROR,
+                    host_id=host_id,
+                    provider=host.sandbox_provider,
+                    sandbox_id=host.sandbox_id,
+                    provider_duration_s=provider_duration_s,
+                    error_type=_bounded_error_type(exc),
+                    queue_delay_s=queue_delay_s,
                 )
     # Keepalive is best effort: it must never disrupt the runner tunnel.
-    except Exception:  # noqa: BLE001
-        _logger.warning("managed sandbox keepalive failed for runner %s", runner_id, exc_info=True)
+    except Exception as exc:  # noqa: BLE001
+        _emit_outcome(
+            runner_id,
+            _KeepAliveOutcome.RESOLUTION_ERROR,
+            error_type=_bounded_error_type(exc),
+            queue_delay_s=queue_delay_s,
+        )
     finally:
-        with _inflight_lock:
+        with _state_lock:
             _inflight.discard(runner_id)
