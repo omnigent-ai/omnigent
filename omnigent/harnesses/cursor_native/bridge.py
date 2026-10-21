@@ -645,8 +645,8 @@ def _paste_payload_bytes(text: str) -> bytes:
     return bytes(body)
 
 
-def _session_alive(socket_path: str, tmux_target: str) -> bool:
-    """Return whether the tmux session/pane still exists (the TUI is running)."""
+def _session_alive(socket_path: str, tmux_target: str) -> bool | None:
+    """Return tmux liveness, or ``None`` when the probe is inconclusive."""
     try:
         proc = subprocess.run(
             ["tmux", "-S", socket_path, "has-session", "-t", tmux_target],
@@ -656,7 +656,7 @@ def _session_alive(socket_path: str, tmux_target: str) -> bool:
             timeout=_TMUX_SEND_TIMEOUT_S,
         )
     except (subprocess.TimeoutExpired, OSError):
-        return False
+        return None
     return proc.returncode == 0
 
 
@@ -666,9 +666,9 @@ def capture_cursor_pane(bridge_dir: Path) -> str | None:
 
     Reused by the runner-side approval mirror
     (:mod:`omnigent.harnesses.cursor_native.permissions`) to detect cursor-agent's native
-    tool-approval prompts. ``None`` (no advertised tmux target, or a dead pane)
-    is distinct from ``""`` (a live but empty capture) so the caller can skip
-    polling a TUI that has not started yet or has exited.
+    tool-approval prompts. ``None`` means no advertised target or a confirmed
+    dead pane. ``""`` means a live empty pane or an inconclusive probe, which
+    lets callers retry temporary process-start failures.
 
     :param bridge_dir: The cursor-native bridge dir holding ``tmux.json``.
     :returns: The captured pane text, or ``None`` when no live pane exists.
@@ -677,8 +677,11 @@ def capture_cursor_pane(bridge_dir: Path) -> str | None:
     if info is None:
         return None
     socket_path, tmux_target = info["socket_path"], info["tmux_target"]
-    if not _session_alive(socket_path, tmux_target):
+    alive = _session_alive(socket_path, tmux_target)
+    if alive is False:
         return None
+    if alive is None:
+        return ""
     return _capture_pane(socket_path, tmux_target)
 
 

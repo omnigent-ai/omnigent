@@ -27,6 +27,7 @@ import asyncio
 import contextlib
 import json as _json
 import sqlite3 as _sqlite3
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -146,8 +147,25 @@ def test_capture_cursor_pane_returns_pane_or_none(
     monkeypatch.setattr(cnb, "_session_alive", lambda _s, _t: False)
     assert cnb.capture_cursor_pane(tmp_path) is None  # dead pane
 
+    monkeypatch.setattr(cnb, "_session_alive", lambda _s, _t: None)
+    assert cnb.capture_cursor_pane(tmp_path) == ""
+
     monkeypatch.setattr(cnb, "read_tmux_info", lambda _d: None)
     assert cnb.capture_cursor_pane(tmp_path) is None  # no tmux target advertised
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [subprocess.TimeoutExpired(["tmux"], 10.0), OSError("process table unavailable")],
+)
+def test_session_alive_treats_probe_start_failure_as_inconclusive(
+    monkeypatch: pytest.MonkeyPatch, failure: BaseException
+) -> None:
+    def fail_probe(*_args: object, **_kwargs: object) -> None:
+        raise failure
+
+    monkeypatch.setattr(cnb.subprocess, "run", fail_probe)
+    assert cnb._session_alive("socket", "main") is None
 
 
 def test_send_cursor_pane_keys_invokes_tmux_send_keys(
@@ -641,6 +659,9 @@ def _install_supervisor_fakes(
         def json(self) -> dict:
             return {}
 
+        def raise_for_status(self) -> None:
+            return None
+
     class _Client:
         async def post(self, url: str, json: dict | None = None, **_k):
             posts.append((url, json or {}))
@@ -758,10 +779,10 @@ async def test_supervise_transcript_yolo_waits_through_stale_pending_burst(
     assert keys_sent == [("y",)] * (3 if delay == "backoff" else 1)
 
 
-async def test_supervise_transcript_yolo_times_out_then_surfaces_card(
+async def test_supervise_transcript_yolo_times_out_then_fails_turn(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A visible gate that never clears falls back once its retry time expires."""
+    """A visible gate that never clears fails without an unattended card."""
     # Stays pending no matter how many times we accept it.
     pending_now = [_SHELL_CALL]
     posts, keys_sent = _install_supervisor_fakes(
@@ -789,37 +810,34 @@ async def test_supervise_transcript_yolo_times_out_then_surfaces_card(
     monkeypatch.setattr(cnp, "_send_cursor_keys", send_with_clock)
 
     task = _start_supervisor(tmp_path, session_id="conv_yolo_cap", auto_accept_approvals=True)
-    assert await _wait_for(lambda: bool(_hook_posts(posts)))
-    sent_before_card = list(keys_sent)
-    # Give the loop several more polls: the card is parked, so nothing more
-    # should be sent and the card must not be re-posted.
-    await asyncio.sleep(0.1)
-    await _stop(task)
+    assert await _wait_for(task.done)
+    await task
 
     assert sent_at == [0, 2, 6, 11, 16, 21, 26]
-    assert keys_sent == sent_before_card
-    assert len(_hook_posts(posts)) == 1, posts
+    assert keys_sent == [("y",)] * 7
+    assert _hook_posts(posts) == []
+    assert posts[-1][1]["data"]["status"] == "failed"
+    assert "accept did not clear Shell" in posts[-1][1]["data"]["output"]
 
 
 @pytest.mark.parametrize(
-    ("capture_gap", "expected"),
+    "capture_gap",
     [
-        pytest.param("", cnp._YoloAccept.SURFACE_CARD, id="capture-failure"),
-        pytest.param(" \n ", cnp._YoloAccept.SURFACE_CARD, id="blank-frame"),
-        pytest.param(_IDLE_PANE, cnp._YoloAccept.SENT, id="confirmed-idle"),
+        pytest.param(None, id="pane-unavailable"),
+        pytest.param("", id="capture-failure"),
+        pytest.param(" \n ", id="blank-frame"),
     ],
 )
-async def test_yolo_auto_accept_capture_gap_preserves_retry_deadline(
+async def test_yolo_auto_accept_recovers_after_transient_capture_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    capture_gap: str,
-    expected: cnp._YoloAccept,
+    capture_gap: str | None,
 ) -> None:
-    """Failed captures cannot restart the deadline; a confirmed idle pane can."""
+    """A temporary pane lookup or capture failure is retried without a card."""
     _, keys_sent = _install_supervisor_fakes(
         monkeypatch, tmp_path, pending=[_SHELL_CALL], pane=_ACCEPT_PANE
     )
-    panes = iter([_ACCEPT_PANE, capture_gap, _ACCEPT_PANE])
+    panes = iter([capture_gap, _ACCEPT_PANE])
     monkeypatch.setattr(cnp, "capture_cursor_pane", lambda _bridge: next(panes))
     attempts: dict[str, cnp._YoloAcceptRetry] = {}
     outcomes = [
@@ -831,10 +849,10 @@ async def test_yolo_auto_accept_capture_gap_preserves_retry_deadline(
             attempts_by_call=attempts,
             allow_send=True,
         )
-        for now in (0.0, 2.0, 30.0)
+        for now in (0.0, 2.0)
     ]
-    assert outcomes == [cnp._YoloAccept.SENT, cnp._YoloAccept.SKIP, expected]
-    assert keys_sent == [("y",)] * (2 if expected is cnp._YoloAccept.SENT else 1)
+    assert outcomes == [cnp._YoloAccept.SKIP, cnp._YoloAccept.SENT]
+    assert keys_sent == [("y",)]
 
 
 async def test_supervise_transcript_yolo_never_types_when_no_prompt_on_screen(
@@ -860,32 +878,34 @@ async def test_supervise_transcript_yolo_never_types_when_no_prompt_on_screen(
     assert _hook_posts(posts) == []
 
 
-async def test_supervise_transcript_yolo_surfaces_card_when_pane_is_gone(
+async def test_supervise_transcript_yolo_fails_when_pane_stays_unavailable(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A dead pane stops the accept immediately instead of spinning on it.
-
-    ``capture_cursor_pane`` returns ``None`` when the tmux target was never
-    advertised or the TUI has exited. A keystroke cannot land, and recording it
-    as delivered would retry forever against a pane that is gone.
-    """
+    """An unavailable pane exhausts a bounded retry and fails the YOLO turn."""
+    monkeypatch.setattr(cnp, "_YOLO_ACCEPT_TIMEOUT_S", 0.02)
+    monkeypatch.setattr(cnp, "_YOLO_ACCEPT_RETRY_S", 0.0)
+    monkeypatch.setattr(cnp, "_YOLO_ACCEPT_MAX_RETRY_S", 0.0)
     posts, keys_sent = _install_supervisor_fakes(
         monkeypatch, tmp_path, pending=[_SHELL_CALL], pane=None
     )
 
     task = _start_supervisor(tmp_path, session_id="conv_yolo_dead", auto_accept_approvals=True)
-    assert await _wait_for(lambda: bool(_hook_posts(posts)))
-    await _stop(task)
+    assert await _wait_for(task.done)
+    await task
 
     assert keys_sent == []
-    assert len(_hook_posts(posts)) == 1, posts
+    assert _hook_posts(posts) == []
+    assert posts[-1][1]["data"]["status"] == "failed"
+    assert "tmux target was not advertised" in posts[-1][1]["data"]["output"]
 
 
-async def test_supervise_transcript_yolo_surfaces_card_when_keystroke_undelivered(
+async def test_supervise_transcript_yolo_fails_when_keystroke_stays_undelivered(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A send tmux rejects is not counted as an accept that landed."""
+    """A rejected send is retried, then fails without surfacing a card."""
+    monkeypatch.setattr(cnp, "_YOLO_ACCEPT_TIMEOUT_S", 0.02)
     monkeypatch.setattr(cnp, "_YOLO_ACCEPT_RETRY_S", 0.0)
+    monkeypatch.setattr(cnp, "_YOLO_ACCEPT_MAX_RETRY_S", 0.0)
     posts, keys_sent = _install_supervisor_fakes(
         monkeypatch,
         tmp_path,
@@ -897,12 +917,13 @@ async def test_supervise_transcript_yolo_surfaces_card_when_keystroke_undelivere
     task = _start_supervisor(
         tmp_path, session_id="conv_yolo_undelivered", auto_accept_approvals=True
     )
-    assert await _wait_for(lambda: bool(_hook_posts(posts)))
-    await _stop(task)
+    assert await _wait_for(task.done)
+    await task
 
-    # One rejected send is enough to give up — no point retrying a broken pipe.
-    assert keys_sent == [("y",)]
-    assert len(_hook_posts(posts)) == 1, posts
+    assert len(keys_sent) >= 2
+    assert _hook_posts(posts) == []
+    assert posts[-1][1]["data"]["status"] == "failed"
+    assert "tmux rejected the accept keystroke" in posts[-1][1]["data"]["output"]
 
 
 async def test_supervise_transcript_without_yolo_never_auto_accepts(

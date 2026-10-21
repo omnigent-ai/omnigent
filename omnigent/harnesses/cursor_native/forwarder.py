@@ -760,7 +760,12 @@ async def _patch_external_session_id(
 
 
 async def _post_external_session_status(
-    client: httpx.AsyncClient, *, session_id: str, status: str, turn_outcome: str
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    status: str,
+    turn_outcome: str,
+    output: str | None = None,
 ) -> None:
     """POST one ``external_session_status`` event to the Sessions API.
 
@@ -776,11 +781,14 @@ async def _post_external_session_status(
 
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
+    data = {"status": status, "turn_outcome": turn_outcome}
+    if output is not None:
+        data["output"] = output
     resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={
             "type": "external_session_status",
-            "data": {"status": status, "turn_outcome": turn_outcome},
+            "data": data,
         },
     )
     resp.raise_for_status()
