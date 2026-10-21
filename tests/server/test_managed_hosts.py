@@ -26,6 +26,7 @@ from omnigent.entities.agent import Agent
 from omnigent.onboarding.sandboxes.base import (
     SandboxGoneError,
     SandboxHostLauncher,
+    SandboxRecoveryRefusedError,
     render_host_config_write_command,
 )
 from omnigent.onboarding.sandboxes.blaxel import managed_token_ttl_s as blaxel_managed_token_ttl_s
@@ -36,6 +37,7 @@ from omnigent.onboarding.sandboxes.registry import (
     SandboxProviderMetadata,
     reset_plugin_state_for_tests,
 )
+from omnigent.onboarding.sandboxes.types import HostStartup, RestoredState, ResumeOutcome
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.interrupted_session_recovery import InterruptedSessionRecoverer
@@ -64,6 +66,7 @@ from omnigent.server.managed_hosts import (
     read_managed_repo_workspaces,
     relaunch_managed_host,
     resolve_managed_agent_label,
+    resolve_managed_host_launcher,
     resume_managed_host,
     terminate_managed_host,
 )
@@ -3687,7 +3690,17 @@ async def test_host_resume_supported_requires_resumable_matching_launcher(db_uri
     assert host_resume_supported(no_sandbox, _injected_config(resumable)) is False
 
 
-async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri: str) -> None:
+@pytest.mark.parametrize(
+    "resume_outcome",
+    [None, ResumeOutcome(workspace=RestoredState("restored", "/workspace", 123))],
+)
+@pytest.mark.parametrize("failure", [None, "start", "callback"])
+async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    resume_outcome: ResumeOutcome | None,
+    failure: str | None,
+) -> None:
     """A resumable managed host wakes in place under the same sandbox id."""
     host_store = HostStore(db_uri)
 
@@ -3721,13 +3734,52 @@ async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri
     host_store.set_offline(first.host_id)
     assert host_resume_supported(host_store.get_host(first.host_id), config) is True
 
-    await resume_managed_host(
+    original_resume = fake.resume
+
+    def resume(sandbox_id: str) -> ResumeOutcome | None:
+        original_resume(sandbox_id)
+        return resume_outcome
+
+    def unavailable() -> SandboxHostLauncher:
+        raise AssertionError("selected launcher must not be rebuilt")
+
+    monkeypatch.setattr(fake, "resume", resume)
+    config.configs[0].launcher_factory = unavailable
+    recorded: list[ResumeOutcome] = []
+
+    async def on_resumed(value: ResumeOutcome) -> None:
+        assert fake.resumed == ["sb-fake-1"]
+        assert len(fake.host_starts) == 1
+        assert not host_store.is_online(first.host_id)
+        assert host_store.resolve_launch_token(first.host_id, first_token) is not None
+        recorded.append(value)
+        if failure == "callback":
+            raise RuntimeError("outcome persistence failed")
+
+    fake.fail_on_host_start = failure == "start"
+    wake = resume_managed_host(
         first.host_id,
         host_store,
         config,
         repos=[parse_repo_workspace("https://github.com/org/repo.git#main")],
+        launcher=fake,
+        expected_sandbox_id="sb-fake-1",
+        on_resumed=on_resumed,
     )
+    if failure:
+        with pytest.raises(HTTPException, match="managed host wake failed"):
+            await wake
+        assert recorded == [resume_outcome or ResumeOutcome()]
+        assert fake.terminated == []
+        assert not host_store.is_online(first.host_id)
+        assert (host_store.resolve_launch_token(first.host_id, first_token) is not None) == (
+            failure == "callback"
+        )
+        return
+    outcome = await wake
 
+    assert recorded == [outcome]
+    assert outcome == (resume_outcome or ResumeOutcome())
     assert fake.resumed == ["sb-fake-1"]
     assert fake.started_workspaces == ["/root/workspace", "/root/workspace"]
     assert len(fake.provisioned_names) == 1
@@ -3741,6 +3793,130 @@ async def test_resume_managed_host_wakes_same_sandbox_and_refreshes_token(db_uri
     assert host_store.resolve_launch_token(fake.host_starts[0].host_id, first_token) is None
     resolved = host_store.resolve_launch_token(fake.host_starts[1].host_id, second_token)
     assert resolved is not None and resolved.host_id == first.host_id
+
+
+@pytest.mark.parametrize("force", [False, True])
+async def test_self_registering_provider_launches_and_resumes_without_launch_token(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, force: bool
+) -> None:
+    host_store = HostStore(db_uri)
+    host_id = "b3c21c5cad7e4ff3b0a1b197477891bd"
+    outcome = ResumeOutcome(RestoredState("preserved", "/workspace"), RestoredState("fresh"))
+
+    class SelfRegisteringLauncher(SandboxHostLauncher):
+        provider = "self-registering-test"
+        can_resume = True
+        host_startup = HostStartup("provider_identity", False, "/workspace")
+
+        def prepare(self) -> None:
+            pass
+
+        def provision(self, name: str) -> str:
+            reserved = host_store.get_host(host_id)
+            assert reserved is not None and reserved.sandbox_provider == self.provider
+            assert reserved.sandbox_id is None
+            host_store.upsert_on_connect(host_id=host_id, name=name, user_id=_OWNER)
+            return "self-registering-sandbox"
+
+        def resume(self, sandbox_id: str) -> ResumeOutcome:
+            host = host_store.get_host(host_id)
+            assert host is not None and host.sandbox_id == sandbox_id
+            assert not host_store.is_online(host_id)
+            host_store.upsert_on_connect(host_id=host_id, name=host.name, user_id=_OWNER)
+            return outcome
+
+    def unexpected(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("provider identity must not mint or rearm a launch token")
+
+    monkeypatch.setattr(host_store, "register_managed_host", unexpected)
+    monkeypatch.setattr(host_store, "rearm_managed_host", unexpected)
+    launcher = SelfRegisteringLauncher()
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig("https://srv.example.com", lambda: launcher, 3600)
+    )
+    launched = await launch_managed_host(
+        config=config, owner=_OWNER, host_store=host_store, host_id=host_id
+    )
+    assert launched == ManagedHostLaunch(host_id, "/workspace")
+    assert host_store.get_host(host_id).sandbox_id == "self-registering-sandbox"
+    if not force:
+        host_store.set_offline(host_id)
+    # Force also proves a stale online row is cleared before provider startup.
+    assert await resume_managed_host(host_id, host_store, config, force=force) == outcome
+    assert host_store.is_online(host_id)
+
+
+@pytest.mark.parametrize(
+    "change", ["generation", "generation_online", "deleted", "provider", "refused", "invalid"]
+)
+async def test_resume_rejects_stale_target_and_propagates_provider_refusal(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    host_store = HostStore(db_uri)
+    host = host_store.register_managed_host(
+        host_id="9bbbe30b8d2b4e508d775b82c9d80277",
+        name="recovery-refusal",
+        user_id=_OWNER,
+        token="original-token",
+        provider="islo",
+        sandbox_id="current-sandbox",
+        token_expires_at=now_epoch() + 3600,
+    )
+    fake = _IsloFakeLauncher(can_resume=True)
+    if change == "generation_online":
+        host_store.upsert_on_connect(host_id=host.host_id, name=host.name, user_id=_OWNER)
+    elif change == "deleted":
+        host_store.delete_host(host.host_id)
+
+    def refuse(sandbox_id: str) -> None:
+        raise SandboxRecoveryRefusedError("provider requires authentication")
+
+    if change == "refused":
+        monkeypatch.setattr(fake, "resume", refuse)
+    elif change == "invalid":
+        monkeypatch.setattr(fake, "resume", lambda _: {"workspace": "preserved"})
+    selected = FakeSandboxLauncher(can_resume=True) if change == "provider" else fake
+    expected_error = HTTPException if change == "invalid" else SandboxRecoveryRefusedError
+    with pytest.raises(expected_error):
+        await resume_managed_host(
+            host.host_id,
+            host_store,
+            _injected_config(fake),
+            launcher=selected,
+            expected_sandbox_id="old-sandbox"
+            if change.startswith("generation")
+            else "current-sandbox",
+        )
+    assert fake.resumed == []
+    assert fake.host_starts == []
+    assert fake.terminated == []
+    assert (host_store.resolve_launch_token(host.host_id, "original-token") is None) == (
+        change == "deleted"
+    )
+
+
+def test_resolve_managed_host_launcher_does_not_discover_unrelated_provider() -> None:
+    fake = _IsloFakeLauncher(can_resume=True)
+    host = Host("host", "managed-host", _OWNER, "offline", 0, 0, sandbox_provider="islo")
+    config = _injected_config(fake)
+    assert resolve_managed_host_launcher(host, config) is fake
+
+    def unavailable() -> SandboxHostLauncher:
+        raise AssertionError("unrelated provider must not be constructed")
+
+    config.configs[0].provider = "other"
+    config.configs[0].launcher_factory = unavailable
+    assert resolve_managed_host_launcher(host, config) is None
+    assert resolve_managed_host_launcher(replace(host, sandbox_provider=None), config) is None
+
+
+def test_managed_launch_begin_exposes_task_ownership() -> None:
+    tracker = ManagedLaunchTracker()
+    launch = tracker.begin("session")
+    assert tracker.get("session") is launch
+    assert launch.task is None
+    tracker.finish("session")
+    assert launch.settled.is_set()
 
 
 async def test_resume_managed_host_forwards_on_stage(db_uri: str) -> None:
@@ -5889,7 +6065,8 @@ def test_parse_auto_resume_defaults_disabled() -> None:
     assert config.auto_resume_interrupted.sweep_interval_s == 60
     assert config.auto_resume_interrupted.max_attempts == 3
     assert config.auto_resume_interrupted.max_interrupted_age_s == 86400
-    assert "host machine restarted" in config.auto_resume_interrupted.recovery_prompt
+    assert "actually available" in config.auto_resume_interrupted.recovery_prompt
+    assert "same workspace" not in config.auto_resume_interrupted.recovery_prompt
 
 
 @pytest.mark.parametrize("multi", [False, True])

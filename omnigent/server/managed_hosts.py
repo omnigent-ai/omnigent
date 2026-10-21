@@ -194,12 +194,13 @@ from fastapi import HTTPException
 
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.db.utils import builtin_agent_id, now_epoch
-from omnigent.onboarding.sandboxes.base import SandboxGoneError
+from omnigent.onboarding.sandboxes.base import SandboxGoneError, SandboxRecoveryRefusedError
 
 # RepoWorkspace lives in the launcher's own package so a launcher can accept it
 # without importing omnigent.server; re-exported here (its parser is here) so
 # existing `from omnigent.server.managed_hosts import RepoWorkspace` keeps working.
-from omnigent.onboarding.sandboxes.types import GitCloneOptions, RepoWorkspace
+from omnigent.onboarding.sandboxes.types import GitCloneOptions, RepoWorkspace, ResumeOutcome
+from omnigent.runtime.recovery import DEFAULT_AUTO_RESUME_RECOVERY_PROMPT
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
@@ -566,6 +567,7 @@ class ManagedLaunch:
 
     settled: asyncio.Event
     error: str | None = None
+    task: asyncio.Task[None] | None = None
 
 
 class ManagedLaunchTracker:
@@ -590,7 +592,7 @@ class ManagedLaunchTracker:
         """Initialize the empty session-id → launch index."""
         self._by_session: dict[str, ManagedLaunch] = {}
 
-    def begin(self, session_id: str) -> None:
+    def begin(self, session_id: str) -> ManagedLaunch:
         """
         Register a new in-flight launch for *session_id*.
 
@@ -600,7 +602,9 @@ class ManagedLaunchTracker:
         :param session_id: Session/conversation identifier,
             e.g. ``"conv_abc123"``.
         """
-        self._by_session[session_id] = ManagedLaunch(settled=asyncio.Event())
+        launch = ManagedLaunch(settled=asyncio.Event())
+        self._by_session[session_id] = launch
+        return launch
 
     def get(self, session_id: str) -> ManagedLaunch | None:
         """
@@ -736,16 +740,6 @@ class ManagedSandboxReaperConfig:
 
 _SHUTDOWN_DRAIN_ERROR = (
     "server config 'sandbox.shutdown_drain_s' must be a non-negative number of seconds"
-)
-
-
-DEFAULT_AUTO_RESUME_RECOVERY_PROMPT = (
-    "The host machine restarted while you were working and this session was resumed "
-    "on the same workspace. Background processes you started (background shells, dev "
-    "servers, watchers, monitors) were stopped. Check `git status` and the workspace "
-    "to see how far the task got, restart any background processes it still needs, "
-    "then continue the existing task from its current state. Check any interrupted "
-    "operation's outcome before repeating it."
 )
 
 
@@ -3729,6 +3723,16 @@ async def launch_managed_host(
     slice_key_enabled = host_id is not None
     host_id = host_id or uuid.uuid4().hex
     host_name = managed_host_name(host_id)
+    if not launcher.host_startup.call_start_host:
+        reserved = await asyncio.to_thread(
+            host_store.reserve_sandbox_host,
+            host_id=host_id,
+            name=host_name,
+            user_id=owner,
+            provider=launcher.provider,
+        )
+        if reserved is None:
+            raise HTTPException(status_code=409, detail="managed host reservation conflicted")
     try:
         await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
         await asyncio.to_thread(launcher.prepare)
@@ -4012,9 +4016,22 @@ async def _register_and_start_host(
     :raises HTTPException: 502 when cloning, host startup, or
         registration fails.
     """
-    token = secrets.token_urlsafe(32)
+    startup = launcher.host_startup
     record = None
     try:
+        if not startup.call_start_host:
+            record = await asyncio.to_thread(
+                host_store.bind_sandbox,
+                host_id,
+                provider=launcher.provider,
+                sandbox_id=sandbox_id,
+            )
+            if record is None:
+                raise ValueError(f"managed host {host_id!r} sandbox binding conflicted")
+            await _wait_for_host_online(host_store, host_id)
+            assert startup.workspace is not None
+            return startup.workspace
+        token = secrets.token_urlsafe(32)
         if keep_host_on_failure:
             record = await asyncio.to_thread(
                 host_store.replace_managed_host_sandbox,
@@ -4129,12 +4146,12 @@ async def _wait_for_host_online(host_store: HostStore, host_id: str) -> None:
     )
 
 
-def _launcher_for_teardown(
+def resolve_managed_host_launcher(
     host: Host,
     config: ManagedSandboxDeployment | None,
 ) -> SandboxHostLauncher | None:
     """
-    Resolve the launcher that can terminate a managed host's sandbox.
+    Resolve a recorded provider without request-scoped catalog discovery.
 
     The deployment's CURRENT launcher factory is only usable when its
     provider matches the provider recorded on the host row at launch —
@@ -4151,9 +4168,14 @@ def _launcher_for_teardown(
     :returns: A launcher whose provider matches the row, or ``None``
         when no matching launcher is available.
     """
-    if config is None:
+    if config is None or host.sandbox_provider is None:
         return None
-    entry = config.recorded(host.sandbox_provider)
+    entry = config.for_provider(host.sandbox_provider)
+    if entry is None:
+        # Legacy embedding configs omit provider and supply a single factory.
+        if len(config.configs) != 1 or config.configs[0].provider is not None:
+            return None
+        entry = config.configs[0]
     try:
         launcher = entry.launcher_factory()
     except HTTPException:
@@ -4163,6 +4185,9 @@ def _launcher_for_teardown(
     if launcher.provider != host.sandbox_provider:
         return None
     return launcher
+
+
+_launcher_for_teardown = resolve_managed_host_launcher
 
 
 def host_resume_supported(
@@ -4233,7 +4258,10 @@ async def resume_managed_host(
     on_stage: Callable[[str], None] | None = None,
     agent_name: str | None = None,
     slice_key_enabled: bool = False,
-) -> None:
+    launcher: SandboxHostLauncher | None = None,
+    expected_sandbox_id: str | None = None,
+    on_resumed: Callable[[ResumeOutcome], Awaitable[None]] | None = None,
+) -> ResumeOutcome:
     """
     Wake a dormant managed host so a session bound to it can run again.
 
@@ -4276,31 +4304,47 @@ async def resume_managed_host(
         caller re-derives it through the same built-in gate a launch uses.
     :param slice_key_enabled: Whether the host routes by its own id, as at its
         first launch (see :func:`host_slice_key_enabled`).
+    :param launcher: Recorded provider already selected inside a recovery context.
+        Passing it avoids rebuilding a request-bound launcher.
+    :param expected_sandbox_id: Recovery scan's generation; reject replacement
+        or detachment before calling the provider.
+    :returns: Provider-confirmed state after the host is online; unknown for
+        legacy providers and no-op wakes.
     :raises SandboxGoneError: When the sandbox generation definitively no
         longer exists, allowing the caller to create a fresh one.
     :raises HTTPException: 502 when the resume or host restart otherwise fails.
     """
     if config is None:
-        return
+        return ResumeOutcome()
     # Cross-replica DB liveness (freshness-gated): never trust the per-replica
     # registry alone. Cheap gate before taking the lock.
-    if not force and await asyncio.to_thread(host_store.is_online, host_id):
-        return
+    if (
+        expected_sandbox_id is None
+        and not force
+        and await asyncio.to_thread(host_store.is_online, host_id)
+    ):
+        return ResumeOutcome()
     # Single-flight per host (see _resume_locks).
     resume_lock = _resume_locks.setdefault(host_id, asyncio.Lock())
     async with resume_lock:
         # Re-check under the lock: a concurrent waker may have brought the host
         # online while we waited.
-        if not force and await asyncio.to_thread(host_store.is_online, host_id):
-            return
         host = await asyncio.to_thread(host_store.get_host, host_id)
         if host is None:
-            return
+            if expected_sandbox_id is not None:
+                raise SandboxRecoveryRefusedError("managed host was deleted before recovery")
+            return ResumeOutcome()
+        if expected_sandbox_id is not None and host.sandbox_id != expected_sandbox_id:
+            raise SandboxRecoveryRefusedError("sandbox binding changed before recovery")
+        if launcher is not None and launcher.provider != host.sandbox_provider:
+            raise SandboxRecoveryRefusedError("recovery launcher does not match host provider")
+        if not force and await asyncio.to_thread(host_store.is_online, host_id):
+            return ResumeOutcome()
         # Provider-matched launcher (None if config dropped / provider changed).
         # Non-resumable providers (e.g. Modal) fall through to a fresh relaunch.
-        launcher = _launcher_for_teardown(host, config)
+        launcher = launcher or resolve_managed_host_launcher(host, config)
         if launcher is None or not launcher.capabilities.resume_stopped or host.sandbox_id is None:
-            return
+            return ResumeOutcome()
         # Agent-sandbox recreates its Pod and may lose HOME. Other resumable
         # providers retain their filesystem and do not need workspace prep.
         workspace_repos = repos if launcher.provider == "agent_sandbox" else ()
@@ -4314,17 +4358,42 @@ async def resume_managed_host(
             launcher.provider,
         )
         try:
+            startup = launcher.host_startup
             await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
-            await asyncio.to_thread(launcher.resume, sandbox_id)
-            token = secrets.token_urlsafe(32)
-            armed = await asyncio.to_thread(
-                host_store.rearm_managed_host,
-                host.host_id,
-                sandbox_id=sandbox_id,
-                expected_updated_at=host.updated_at,
-                token=token,
-                token_expires_at=now_epoch() + entry.token_ttl_s,
-            )
+            if not startup.call_start_host:
+                reserved = await asyncio.to_thread(
+                    host_store.reserve_sandbox_host,
+                    host_id=host.host_id,
+                    name=host.name,
+                    user_id=host.user_id,
+                    provider=launcher.provider,
+                )
+                if reserved is None or reserved.sandbox_id != sandbox_id:
+                    raise ValueError(f"managed host {host.host_id!r} changed before resume")
+                if force:
+                    await asyncio.to_thread(host_store.set_offline, host.host_id)
+            outcome = await asyncio.to_thread(launcher.resume, sandbox_id)
+            if outcome is None:
+                outcome = ResumeOutcome()
+            if not isinstance(outcome, ResumeOutcome):
+                raise ValueError("provider resume must return ResumeOutcome or None")
+            if on_resumed is not None:
+                await on_resumed(outcome)
+            token = ""
+            if startup.call_start_host:
+                token = secrets.token_urlsafe(32)
+                armed = await asyncio.to_thread(
+                    host_store.rearm_managed_host,
+                    host.host_id,
+                    sandbox_id=sandbox_id,
+                    expected_updated_at=host.updated_at,
+                    token=token,
+                    token_expires_at=now_epoch() + entry.token_ttl_s,
+                )
+            else:
+                armed = await asyncio.to_thread(host_store.get_host, host.host_id)
+                if armed is not None and armed.sandbox_id != sandbox_id:
+                    armed = None
             if armed is None:
                 current = await asyncio.to_thread(host_store.get_host, host.host_id)
                 if current is None:
@@ -4348,23 +4417,25 @@ async def resume_managed_host(
                             host.host_id,
                             sandbox_id=sandbox_id,
                         )
-                return
-            await _start_sandbox_host(
-                launcher,
-                sandbox_id,
-                token=token,
-                host_id=host.host_id,
-                host_name=host.name,
-                server_url=entry.server_url,
-                repos=workspace_repos,
-                host_config=_with_host_slice_key(
-                    entry.host_config, slice_key_enabled, entry.server_url
-                ),
-                on_stage=on_stage,
-                agent_name=agent_name,
-            )
+                return ResumeOutcome()
+            if startup.call_start_host:
+                await _start_sandbox_host(
+                    launcher,
+                    sandbox_id,
+                    token=token,
+                    host_id=host.host_id,
+                    host_name=host.name,
+                    server_url=entry.server_url,
+                    repos=workspace_repos,
+                    host_config=_with_host_slice_key(
+                        entry.host_config, slice_key_enabled, entry.server_url
+                    ),
+                    on_stage=on_stage,
+                    agent_name=agent_name,
+                )
             await _wait_for_host_online(host_store, host.host_id)
-        except SandboxGoneError:
+            return outcome
+        except (SandboxGoneError, SandboxRecoveryRefusedError):
             raise
         except Exception as exc:
             # An ordinary failed wake must NOT tear the sandbox down (the volume

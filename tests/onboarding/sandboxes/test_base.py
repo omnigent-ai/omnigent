@@ -29,7 +29,7 @@ from omnigent.onboarding.sandboxes.base import (
     render_host_config_write_command,
     supervise_host_command,
 )
-from omnigent.onboarding.sandboxes.types import RepoWorkspace
+from omnigent.onboarding.sandboxes.types import HostStartup, RecoveryTarget, RepoWorkspace
 
 _HOST_LAUNCH = "FOO=bar omnigent host --server https://srv"
 
@@ -63,6 +63,15 @@ class _RecordingLauncher(SandboxLauncher):
         # honors its env prefix, independent of the setsid/nohup wrapper.
         self.backgrounded.append(command)
         return super().run_background(sandbox_id, command, log_path=log_path)
+
+
+def test_background_recovery_requires_provider_opt_in() -> None:
+    launcher = _RecordingLauncher()
+    assert (
+        launcher.background_recovery_context(RecoveryTarget(1, "owner", "session", "host", "sb"))
+        is None
+    )
+    assert launcher.host_startup == HostStartup()
 
 
 def test_run_background_wraps_command_in_sh_c() -> None:

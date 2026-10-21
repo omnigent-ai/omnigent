@@ -69,14 +69,19 @@ from omnigent.onboarding.sandboxes.base import (
     SandboxHostLauncher,
     render_host_config_write_command,
 )
-from omnigent.onboarding.sandboxes.types import SandboxCapabilities, clone_dir_names
+from omnigent.onboarding.sandboxes.types import (
+    RestoredState,
+    ResumeOutcome,
+    SandboxCapabilities,
+    clone_dir_names,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from kubernetes import client as k8s_client
 
-    from omnigent.onboarding.sandboxes.types import RepoWorkspace
+    from omnigent.onboarding.sandboxes.types import RecoveryTarget, RepoWorkspace
 
 
 _logger = logging.getLogger(__name__)
@@ -2036,7 +2041,13 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         if first_error is not None:
             raise first_error
 
-    def resume(self, sandbox_id: str) -> None:
+    def background_recovery_context(
+        self, target: RecoveryTarget
+    ) -> contextlib.AbstractAsyncContextManager[None]:
+        """Kubernetes uses deployment credentials, independent of the requesting user."""
+        return contextlib.nullcontext()
+
+    def resume(self, sandbox_id: str) -> ResumeOutcome | None:
         """
         Prepare a dormant Kubernetes sandbox for recreation in place.
 
@@ -2052,6 +2063,14 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         """
         click.echo(f"▸ Resuming Kubernetes sandbox '{sandbox_id}'")
         self.terminate(sandbox_id)
+        return ResumeOutcome(
+            workspace=RestoredState(
+                status="partial" if self._pvc_mounts else "fresh",
+                scope="Configured PVC mounts only; HOME is ephemeral"
+                if self._pvc_mounts
+                else "HOME is ephemeral; no PVC mounts configured",
+            ),
+        )
 
     def _delete_with_retry(self, kind: str, name: str, delete: Callable[[], object]) -> None:
         """

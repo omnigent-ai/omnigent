@@ -135,6 +135,82 @@ class SandboxInfo:
 
 
 @dataclass(frozen=True)
+class RestoredState:
+    """Provider-confirmed state; scope limits the claim, checkpoint_at is epoch seconds."""
+
+    status: Literal["preserved", "partial", "restored", "fresh", "unknown"] = "unknown"
+    scope: str | None = None
+    checkpoint_at: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.status not in ("preserved", "partial", "restored", "fresh", "unknown"):
+            raise ValueError("invalid restored-state status")
+        if self.scope is not None and (
+            not isinstance(self.scope, str)
+            or not self.scope.strip()
+            or len(self.scope) > 1024
+            or not self.scope.isprintable()
+        ):
+            raise ValueError("restored-state scope must be a nonempty single line (max 1024)")
+        if self.checkpoint_at is not None and (
+            type(self.checkpoint_at) is not int or not 0 <= self.checkpoint_at <= 253402300799
+        ):
+            raise ValueError("checkpoint_at must be epoch seconds within years 1970–9999")
+
+
+@dataclass(frozen=True)
+class ResumeOutcome:
+    """Independent workspace and harness facts, unknown for legacy providers."""
+
+    workspace: RestoredState = field(default_factory=RestoredState)
+    harness: RestoredState = field(default_factory=RestoredState)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.workspace, RestoredState) or not isinstance(
+            self.harness, RestoredState
+        ):
+            raise ValueError("resume outcome requires workspace and harness RestoredState values")
+
+
+@dataclass(frozen=True)
+class HostStartup:
+    """Declare host authentication and startup before provisioning or resuming compute."""
+
+    authentication: Literal["launch_token", "provider_identity"] = "launch_token"
+    call_start_host: bool = True
+    workspace: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.authentication not in ("launch_token", "provider_identity"):
+            raise ValueError("invalid host startup authentication")
+        if type(self.call_start_host) is not bool or self.call_start_host != (
+            self.authentication == "launch_token"
+        ):
+            raise ValueError(
+                "provider identity requires self registration; launch tokens require start_host"
+            )
+        if self.workspace is not None and (
+            not isinstance(self.workspace, str)
+            or not self.workspace.startswith("/")
+            or not self.workspace.isprintable()
+        ):
+            raise ValueError("host startup workspace must be an absolute single-line path")
+        if not self.call_start_host and self.workspace is None:
+            raise ValueError("self-registering hosts must declare their workspace")
+
+
+@dataclass(frozen=True)
+class RecoveryTarget:
+    """Recorded identity supplied to a provider's background recovery context."""
+
+    workspace_id: int
+    owner_id: str
+    session_id: str
+    host_id: str
+    sandbox_id: str | None
+
+
+@dataclass(frozen=True)
 class GitCloneOptions:
     """Admin policy for new checkouts; defaults preserve existing Git behavior."""
 

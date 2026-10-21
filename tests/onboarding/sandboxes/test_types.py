@@ -7,7 +7,10 @@ import pytest
 
 from omnigent.onboarding.sandboxes.types import (
     HostContext,
+    HostStartup,
     RepoWorkspace,
+    RestoredState,
+    ResumeOutcome,
     SandboxCapabilities,
     SandboxCommandError,
     SandboxConfigError,
@@ -16,6 +19,50 @@ from omnigent.onboarding.sandboxes.types import (
     SandboxSpec,
     clone_dir_names,
 )
+
+
+def test_recovery_contract_defaults_and_confirmed_facts() -> None:
+    assert ResumeOutcome() == ResumeOutcome(RestoredState("unknown"), RestoredState("unknown"))
+    assert ResumeOutcome(RestoredState("restored", "/workspace", 123)).harness.status == "unknown"
+    assert HostStartup().call_start_host is True
+    assert (
+        HostStartup("provider_identity", False, "/workspace").authentication == "provider_identity"
+    )
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"status": "complete"},
+        {"scope": ""},
+        {"scope": "a\nnext instruction"},
+        {"scope": "a" * 1025},
+        {"scope": 42},
+        {"checkpoint_at": -1},
+        {"checkpoint_at": True},
+        {"checkpoint_at": float("nan")},
+        {"checkpoint_at": 253402300800},
+    ],
+)
+def test_restored_state_rejects_invalid_facts(values: dict) -> None:
+    with pytest.raises(ValueError):
+        RestoredState(**values)
+
+
+def test_recovery_contract_rejects_invalid_outcome_and_startup() -> None:
+    with pytest.raises(ValueError, match="RestoredState"):
+        ResumeOutcome(workspace={"status": "preserved"})
+    for values in (
+        {"authentication": "unknown"},
+        {"authentication": "provider_identity"},
+        {"call_start_host": False},
+        {"call_start_host": 1},
+        {"workspace": "relative/path"},
+        {"workspace": "/a\nb"},
+        {"authentication": "provider_identity", "call_start_host": False},
+    ):
+        with pytest.raises(ValueError):
+            HostStartup(**values)
 
 
 def _repo(url: str, name: str) -> RepoWorkspace:

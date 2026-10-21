@@ -36,7 +36,7 @@ from omnigent.onboarding.sandboxes.kubernetes import (
     build_job_manifest,
     build_token_secret_manifest,
 )
-from omnigent.onboarding.sandboxes.types import RepoWorkspace
+from omnigent.onboarding.sandboxes.types import RecoveryTarget, RepoWorkspace
 
 _TOKEN = "launch-token-xyz"
 _MANIFEST_KW = {
@@ -1841,22 +1841,44 @@ def test_terminate_deletes_job_and_secret(
     assert core.deleted_secrets == ["omnigent-job-6-token"]
 
 
+@pytest.mark.parametrize("persistent", [False, True])
 def test_resume_recycles_job_and_token_secret(
     fake_clients: tuple[_FakeCore, _FakeBatch],
+    persistent: bool,
 ) -> None:
     """Resume clears stale launch resources so start_host can recreate the same id."""
     core, batch = fake_clients
-    launcher = _launcher()
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        env=(),
+        pvc_mounts=[{"claim_name": "workspace", "mount_path": "/workspace"}]
+        if persistent
+        else None,
+    )
 
     assert launcher.can_resume is True
     assert launcher.capabilities.resume_stopped is True
 
-    launcher.resume("omnigent-job-resume")
+    outcome = launcher.resume("omnigent-job-resume")
+
+    assert outcome is not None
+    assert outcome.workspace.status == ("partial" if persistent else "fresh")
+    assert "HOME is ephemeral" in outcome.workspace.scope
+    assert outcome.harness.status == "unknown"
 
     assert batch.deleted_jobs == ["omnigent-job-resume"]
     assert batch.last_delete_body.propagation_policy == "Foreground"
     assert core.deleted_pods == ["omnigent-job-resume"]
     assert core.deleted_secrets == ["omnigent-job-resume-token"]
+
+
+async def test_kubernetes_background_recovery_uses_deployment_credentials() -> None:
+    context = _launcher().background_recovery_context(
+        RecoveryTarget(1, "owner", "session", "host", "sandbox")
+    )
+    async with context as value:
+        assert value is None
 
 
 def test_terminate_is_idempotent_on_404(

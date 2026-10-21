@@ -26,7 +26,7 @@ import os
 import secrets
 import shlex
 from abc import ABC, abstractmethod
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractAsyncContextManager, AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, ClassVar
@@ -392,6 +392,10 @@ class SandboxCapabilityError(click.ClickException, _sandbox_types.SandboxError):
     """
 
 
+class SandboxRecoveryRefusedError(SandboxCapabilityError):
+    """Recovery needs user action or violates provider policy; do not retry automatically."""
+
+
 class SandboxGoneError(click.ClickException, _sandbox_types.SandboxError):
     """Raised when a sandbox generation definitively no longer exists.
 
@@ -668,7 +672,7 @@ class SandboxLifecycle(ABC):
             "own tooling."
         )
 
-    def resume(self, sandbox_id: str) -> None:
+    def resume(self, sandbox_id: str) -> _sandbox_types.ResumeOutcome | None:
         """
         Resume a stopped sandbox in place, reattaching its persistent
         volume, so a dormant managed host can be revived under the SAME
@@ -678,11 +682,12 @@ class SandboxLifecycle(ABC):
         :class:`SandboxCapabilityError`. Providers whose backend has a
         stop/resume lifecycle with a persistent volume override it AND set
         :attr:`can_resume` to ``True``. Used by the server's managed-host
-        wake path; the host process itself is restarted separately (resume
-        only brings the compute + volume back).
+        wake path. ``host_startup`` declares whether core must restart the
+        host separately or the provider self-registers it during resume.
 
         :param sandbox_id: The stopped sandbox to resume, e.g.
             ``"sb-a1b2c3"``.
+        :returns: Confirmed restored-state facts. Legacy ``None`` means unknown.
         :raises SandboxCapabilityError: When the provider cannot resume a
             stopped sandbox (ephemeral sandboxes / no persistent volume).
         :raises SandboxGoneError: When the sandbox generation definitively no
@@ -909,12 +914,26 @@ class SandboxHostLauncher(SandboxLifecycle):
     Lifecycle + host-launch contract for a sandbox provider.
 
     Every managed-host provider — exec-model or entrypoint-as-host — implements
-    this. :meth:`start_host` is abstract here; the exec-model default lives on
+    this. The exec-model :meth:`start_host` default lives on
     :class:`ExecModelHostLauncher`. Entrypoint-as-host providers (e.g.
     Kubernetes) and provider-native host launchers (e.g. Gensee) inherit this
     class directly and override :meth:`start_host` without needing any exec
     transport.
     """
+
+    host_startup: ClassVar[_sandbox_types.HostStartup] = _sandbox_types.HostStartup()
+
+    def background_recovery_context(
+        self, target: _sandbox_types.RecoveryTarget
+    ) -> AbstractAsyncContextManager[None] | None:
+        """Opt into recovery without a request; hold provider credentials until exit.
+
+        ``None`` declines background recovery. Providers with server credentials
+        may return ``nullcontext()``; request-bound providers must validate
+        background authority for the target, bind scoped credentials and reset
+        them on exit, including cancellation.
+        """
+        return None
 
     def prepare_for_launch(self, *, agent_name: str | None = None) -> None:
         """Set request context before provider preparation, allocation, or resume.
@@ -927,7 +946,6 @@ class SandboxHostLauncher(SandboxLifecycle):
         """Bind credentials needed for background cleanup in one workspace."""
         return nullcontext()
 
-    @abstractmethod
     def start_host(
         self,
         sandbox_id: str,
@@ -963,6 +981,7 @@ class SandboxHostLauncher(SandboxLifecycle):
         :returns: The absolute in-sandbox workspace path — the working
             directory the host starts the agent in.
         """
+        raise self._capability_error("start a host explicitly")
 
 
 class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
