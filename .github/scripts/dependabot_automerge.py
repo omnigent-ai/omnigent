@@ -195,7 +195,10 @@ def require_reports(repository: str, candidate: dict) -> None:
     # path-filtered check as skippable while its workflow is being created.
     completed_runs = {}
     policy = json.loads(POLICY.read_text())
-    for workflow in sorted(set(candidate["workflows"]) | {"ci.yml", "lint.yml", "trivy.yml"}):
+    workflows = set(candidate["workflows"]) | {"ci.yml", "lint.yml", "trivy.yml"}
+    if candidate["ecosystem"] in {"python", "github-actions"}:
+        workflows.add("windows.yml")
+    for workflow in sorted(workflows):
         latest, jobs = latest_workflow(repository, head, workflow)
         require(
             latest["head_sha"] == head
@@ -203,18 +206,50 @@ def require_reports(repository: str, candidate: dict) -> None:
             and latest["conclusion"] == "success",
             f"Latest {workflow} run did not succeed",
         )
-        required_jobs = (
+        target_jobs = (
+            policy.get("cargo", {})
+            .get("targets", {})
+            .get(candidate["target"], {})
+            .get("workflow_test_jobs", {})
+            if candidate["ecosystem"] == "cargo"
+            else {}
+        )
+        required_jobs = target_jobs.get(workflow) or (
             policy["dependency_workflow_test_jobs"]
             .get(candidate["ecosystem"], {})
             .get(workflow, policy["workflow_test_jobs"][workflow])
         )
-        # Older heads ran the full Python matrix before scope selection existed.
-        if required_jobs == ["CI scope"] and not any(job["name"] == "CI scope" for job in jobs):
-            required_jobs = policy["workflow_test_jobs"][workflow]
+        # Ordinary updates need the full consumer-suite contract, not older
+        # successful runs that used dependency smoke selection.
+        coverage_marker = {
+            "ci.yml": "CI coverage scope",
+            "e2e.yml": "E2E coverage scope",
+            "e2e-ui.yml": "UI coverage scope",
+            "web-tests.yml": "Web coverage scope",
+        }.get(workflow)
+        if coverage_marker and candidate["ecosystem"] in {
+            "python",
+            "npm",
+            "cargo",
+            "github-actions",
+        }:
+            require(
+                any(
+                    job["name"] == coverage_marker and job["conclusion"] == "success"
+                    for job in jobs
+                ),
+                f"{workflow}: waiting for successful {coverage_marker}",
+            )
         for pattern in required_jobs:
             matching = [job for job in jobs if fnmatch.fnmatchcase(job["name"], pattern)]
+            # The CI aggregate checks every selected matrix leg; unrelated
+            # Rust/parity jobs may intentionally skip on a Python update.
+            aggregate_matrix = workflow == "ci.yml" and pattern == "Pytest (*)"
+            allowed = {"success", "skipped"} if aggregate_matrix else {"success"}
             require(
-                bool(matching) and all(job["conclusion"] == "success" for job in matching),
+                bool(matching)
+                and any(job["conclusion"] == "success" for job in matching)
+                and all(job["conclusion"] in allowed for job in matching),
                 f"{workflow}: waiting for successful {pattern} jobs",
             )
         completed_runs[workflow] = latest

@@ -121,7 +121,6 @@ jobs:
           -p no:cacheprovider -q
 
       - name: Broader unit sweep (non-blocking)
-        if: needs.scope.outputs.dependency != 'true'
         continue-on-error: true
         run: >-
           uv run pytest tests/inner tests/runtime/harnesses

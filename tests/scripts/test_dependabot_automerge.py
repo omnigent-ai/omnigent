@@ -122,12 +122,16 @@ def api():
             "web-tests.yml",
             "e2e-ui.yml",
             "docker-build.yml",
+            "windows.yml",
         ),
         start=11,
     ):
         routes[f"{PREFIX}/actions/runs/{run_id}/jobs?per_page=100&page=1"] = {
             "jobs": [
-                {"name": name.replace("*", "1/1"), "conclusion": "success"}
+                {
+                    "name": name.replace("*", "runtime-core" if name == "Pytest (*)" else "1/1"),
+                    "conclusion": "success",
+                }
                 for name in workflow_jobs[workflow]
             ]
         }
@@ -897,10 +901,14 @@ def test_scoped_dependency_ci_requires_executed_consumer_jobs(tmp_path, expanded
         ]
         api["routes"][f"{PREFIX}/actions/runs/17/jobs?per_page=100&page=1"]["jobs"] = jobs
         api["routes"]["Browser Contract UI"]["check_runs"][0]["conclusion"] = "skipped"
+        jobs.extend(
+            {"name": name, "conclusion": "success"}
+            for name in ("UI coverage scope", "E2E UI result")
+        )
         required = jobs[0]
     else:
         jobs = ci_jobs
-        required = next(job for job in jobs if job["name"] == "CI scope")
+        required = next(job for job in jobs if job["name"] == "CI coverage scope")
     if result == "missing":
         jobs.remove(required)
         if ecosystem == "cargo":
@@ -915,13 +923,13 @@ def test_scoped_dependency_ci_requires_executed_consumer_jobs(tmp_path, expanded
 
 
 @pytest.mark.parametrize("expanded_update", ["npm", "pre-commit"], indirect=True)
-def test_pre_selection_heads_can_finish_their_full_ci(tmp_path, expanded_update):
+def test_pre_selection_heads_cannot_use_old_smoke_ci(tmp_path, expanded_update):
     _ecosystem, api = expanded_update
     route = api["routes"][f"{PREFIX}/actions/runs/12/jobs?per_page=100&page=1"]
-    route["jobs"] = [job for job in route["jobs"] if job["name"] != "CI scope"]
+    route["jobs"] = [job for job in route["jobs"] if job["name"] != "CI coverage scope"]
     process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
     assert process.returncode == 0, process.stderr
-    assert any(call[:2] == ["pr", "merge"] for call in calls), process.stdout
+    assert not any(call[:2] == ["pr", "merge"] for call in calls), process.stdout
 
 
 def test_lockfile_guards_are_in_the_required_lint_job():
@@ -1317,3 +1325,34 @@ def test_report_mode_checks_advisories_without_automatic_approval(tmp_path, api)
     assert "CVE-changed-version requires human review" in process.stdout
     assert not any(call[:3] == ["api", "--method", "POST"] for call in calls)
     assert not any(call[:2] == ["pr", "merge"] for call in calls)
+
+
+@pytest.mark.parametrize(
+    "expanded_update", ["python", "npm", "cargo", "github-actions"], indirect=True
+)
+@pytest.mark.parametrize("result", ["missing", "skipped", "failure"])
+def test_full_dependency_coverage_marker_blocks_older_runs(tmp_path, expanded_update, result):
+    _ecosystem, api = expanded_update
+    jobs = api["routes"][f"{PREFIX}/actions/runs/12/jobs?per_page=100&page=1"]["jobs"]
+    for job in list(jobs):
+        if job["name"] == "CI coverage scope":
+            if result == "missing":
+                jobs.remove(job)
+            else:
+                job["conclusion"] = result
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert not any(call[:2] == ["pr", "merge"] for call in calls), process.stdout
+
+
+@pytest.mark.parametrize("expanded_update", ["python", "github-actions"], indirect=True)
+@pytest.mark.parametrize("result", ["success", "skipped", "failure"])
+def test_dependency_automerge_requires_windows_hard_checks(tmp_path, expanded_update, result):
+    _ecosystem, api = expanded_update
+    jobs = api["routes"][f"{PREFIX}/actions/runs/19/jobs?per_page=100&page=1"]["jobs"]
+    jobs[0]["conclusion"] = result
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert any(call[:2] == ["pr", "merge"] for call in calls) == (result == "success"), (
+        process.stdout
+    )
