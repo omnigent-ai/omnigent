@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextvars import Context, copy_context
 from dataclasses import dataclass, field
+from typing import Literal, cast
 
 from omnigent.errors import OmnigentError
 from omnigent.preference_broker import PreferenceRead, PreferenceReply, PreferenceRequest
@@ -35,6 +36,7 @@ class PreferenceBrokerGrant:
                     user_id=self.user_id,
                     limit=request.limit,
                     cursor=request.cursor,
+                    protocol_version=cast(Literal[1, 2], request.protocol_version),
                 )
                 return PreferenceReply(status=200, page=page)
             operation = request.operation
@@ -44,10 +46,23 @@ class PreferenceBrokerGrant:
                 or operation.installation_id != self.installation_id
             ):
                 return PreferenceReply(status=403)
-            if isinstance(self.control, PreferenceApply) and operation not in [
-                change.operation for change in self.control.preview.changes
-            ]:
-                return PreferenceReply(status=403)
+            if isinstance(self.control, PreferenceApply):
+                reviewed = next(
+                    (
+                        change.operation
+                        for change in self.control.preview.changes
+                        if change.operation.operation_id == operation.operation_id
+                    ),
+                    None,
+                )
+                if (
+                    reviewed is None
+                    or operation.model_copy(
+                        update={"observed_revision": reviewed.observed_revision}
+                    )
+                    != reviewed
+                ):
+                    return PreferenceReply(status=403)
             result = await asyncio.to_thread(self.store.apply, operation, user_id=self.user_id)
             return PreferenceReply(status=200, result=result)
         except OmnigentError as exc:

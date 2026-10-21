@@ -13,6 +13,10 @@ from omnigent.preference_sync import MAX_VALUE_BYTES, PreferenceMutation, Shared
     [
         {"protocol_version": 2},
         {"protocol_version": True},
+        {"protocol_version": 3},
+        {"observed_revision": 0},
+        {"protocol_version": 2, "observed_revision": True},
+        {"protocol_version": 2, "observed_revision": -1},
         {"expected_version": True},
         {"expected_version": -1},
         {"identity": {"authority_id": "a", "user_id": "u", "workspace_id": " "}},

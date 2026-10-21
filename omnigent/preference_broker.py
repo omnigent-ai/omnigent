@@ -21,6 +21,7 @@ from omnigent.preference_sync import (
 
 class PreferenceRead(ProtocolModel):
     action: Literal["read"] = "read"
+    protocol_version: int = Field(default=1, ge=1, le=2)
     limit: int = Field(default=PREFERENCE_PAGE_SIZE, ge=1, le=PREFERENCE_PAGE_SIZE)
     cursor: str | None = Field(default=None, max_length=4096)
 

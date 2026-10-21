@@ -29,13 +29,16 @@ def peers(tmp_path, db_uri):
     return store, clients
 
 
-def transport(store, *, user="alice", after_write=None):
+def transport(store, *, user="alice", after_write=None, protocol_version=2):
     def handle(request):
         if request.method == "GET":
             result = store.read(
                 user_id=user,
                 limit=int(request.url.params.get("limit", 100)),
                 cursor=request.url.params.get("cursor"),
+                protocol_version=min(
+                    protocol_version, int(request.url.params.get("protocol_version", 1))
+                ),
             )
         else:
             operation = PreferenceMutation.model_validate_json(request.content)
@@ -319,6 +322,7 @@ async def test_paginated_refresh_is_atomic_and_retry_preserves_outbox(peers):
     [
         "identity",
         "revision",
+        "protocol",
         "duplicate",
         "cursor",
         "empty",
@@ -352,6 +356,8 @@ async def test_bad_later_page_never_replaces_cache_or_sends_edits(peers, fault):
             page["identity"]["user_id"] = "bob"
         elif fault == "revision":
             page["revision"] += 1
+        elif fault == "protocol":
+            page["protocol_version"] = 2
         elif fault == "duplicate":
             page["entries"][0]["key"] = MODEL.model_dump(mode="json")
         elif fault == "cursor":
@@ -443,7 +449,7 @@ async def test_cache_schema_permissions_bounds_and_incomplete_refresh(peers):
     # An ack isn't a complete snapshot; offline startup retains the last complete read.
     assert local.cached() == before
     with local._transaction() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         with pytest.raises(sqlite3.IntegrityError):
             connection.execute("UPDATE entries SET payload = ?", (b"x" * 16001,))
         connection.execute("PRAGMA user_version = 999")
@@ -453,3 +459,67 @@ async def test_cache_schema_permissions_bounds_and_incomplete_refresh(peers):
         connection.execute("PRAGMA user_version = 0")
     with pytest.raises(ValueError, match="Unversioned preference cache"):
         PreferenceClient(local.path, identity=store.identity("alice"), installation_id="laptop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attempted", [False, True])
+async def test_compacted_retry_requires_review_only_after_first_send(
+    peers, monkeypatch, attempted
+):
+    import omnigent.stores.preference_store.sqlalchemy_store as module
+    from omnigent.errors import OmnigentError
+
+    monkeypatch.setattr(module, "MAX_OPERATIONS", 2)
+    store, (local, remote) = peers
+    async with httpx.AsyncClient(base_url="http://test", transport=transport(store)) as http:
+        await local.sync(http)
+        local.enqueue(MODEL, "offline")
+        before = local.pending()[0]
+        if attempted:
+
+            def drop(request, _result):
+                raise httpx.ReadError("lost response", request=request)
+
+            async with httpx.AsyncClient(
+                base_url="http://test", transport=transport(store, after_write=drop)
+            ) as lossy:
+                with pytest.raises(httpx.ReadError):
+                    await local.sync(lossy)
+        await remote.sync(http)
+        for value in ("remote-a", "remote-b", "remote-c"):
+            remote.enqueue(MODEL, value)
+            await remote.sync(http)
+        reopened = PreferenceClient(
+            local.path, identity=store.identity("alice"), installation_id="laptop"
+        )
+        if attempted:
+            with pytest.raises(OmnigentError, match="older than retained retry history"):
+                await reopened.sync(http)
+            assert reopened.pending() == [before]
+            assert reopened.cached().entries[0].value == "remote-c"
+            assert not reopened.cached().conflicts
+            reopened.discard(before.operation_id)
+            reopened.enqueue(MODEL, "reviewed")
+            result = await reopened.sync(http)
+            assert result.entries[0].value == "reviewed"
+        else:
+            result = await reopened.sync(http)
+            assert not reopened.pending()
+            assert result.entries[0].value == "remote-c"
+            conflict = result.conflicts[0]
+            assert conflict.observed_revision == 3
+            assert conflict.model_copy(update={"observed_revision": 0}) == before
+
+
+@pytest.mark.asyncio
+async def test_legacy_server_keeps_v1_writes(peers):
+    store, (local, _) = peers
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=transport(store, protocol_version=1)
+    ) as http:
+        snapshot = await local.sync(http)
+        assert snapshot.protocol_version == 1
+        local.enqueue(MODEL, "legacy")
+        assert "observed_revision" not in local.pending()[0].model_dump(mode="json")
+        result = await local.sync(http)
+        assert result.entries[0].value == "legacy" and result.protocol_version == 1

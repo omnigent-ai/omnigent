@@ -213,7 +213,8 @@ function PreferenceControls({ host }: { host?: Host }) {
       (entry) => preferenceKeyId(entry.key) === preferenceKeyId(target),
     );
     await publish({
-      protocol_version: 1,
+      protocol_version: snapshot.protocol_version,
+      ...(snapshot.protocol_version === 2 ? { observed_revision: snapshot.revision } : {}),
       identity: snapshot.identity,
       installation_id: host?.host_id ?? "browser",
       operation_id: crypto.randomUUID(),
@@ -325,7 +326,10 @@ function PreferenceControls({ host }: { host?: Host }) {
                   onClick={() =>
                     void perform(async () => {
                       await publish({
-                        protocol_version: 1,
+                        protocol_version: snapshot.protocol_version,
+                        ...(snapshot.protocol_version === 2
+                          ? { observed_revision: snapshot.revision }
+                          : {}),
                         identity: snapshot.identity,
                         operation_id: crypto.randomUUID(),
                         installation_id: host.host_id,

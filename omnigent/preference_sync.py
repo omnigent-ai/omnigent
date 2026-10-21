@@ -92,7 +92,8 @@ class SharedPreferenceKey(ProtocolModel):
 
 
 class PreferenceMutation(ProtocolModel):
-    protocol_version: Literal[1]
+    protocol_version: Literal[1, 2]
+    observed_revision: Version | None = Field(default=None, exclude_if=lambda value: value is None)
     identity: PreferenceNamespace
     operation_id: UUID
     installation_id: Name
@@ -110,6 +111,8 @@ class PreferenceMutation(ProtocolModel):
 
     @model_validator(mode="after")
     def validate_value(self) -> Self:
+        if (self.protocol_version == 2) != (self.observed_revision is not None):
+            raise ValueError("Protocol v2 requires an observed revision; v1 must omit it")
         if len(self.model_dump_json(include={"value"}).encode()) > MAX_VALUE_BYTES:
             raise ValueError("encoded preference value envelope exceeds 8192 bytes")
         if self.value is not None:
@@ -130,7 +133,7 @@ class SharedPreferenceEntry(ProtocolModel):
 
 
 class PreferenceResult(ProtocolModel):
-    protocol_version: Literal[1] = 1
+    protocol_version: Literal[1, 2] = 1
     operation_id: UUID
     status: Literal["applied", "unchanged", "conflict"]
     revision: Version
@@ -138,7 +141,7 @@ class PreferenceResult(ProtocolModel):
 
 
 class PreferenceSnapshot(ProtocolModel):
-    protocol_version: Literal[1] = 1
+    protocol_version: Literal[1, 2] = 1
     identity: PreferenceNamespace
     revision: Version = 0
     entries: list[SharedPreferenceEntry] = Field(default_factory=list)
@@ -162,7 +165,7 @@ class PreferenceSnapshot(ProtocolModel):
 class PreferencePage(ProtocolModel):
     """One revision-bound page; only a complete traversal forms a snapshot."""
 
-    protocol_version: Literal[1] = 1
+    protocol_version: Literal[1, 2] = 1
     identity: PreferenceNamespace
     revision: Version = 0
     entries: list[SharedPreferenceEntry] = Field(

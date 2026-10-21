@@ -172,6 +172,8 @@ def test_settings_import_scopes_conflicts_and_restore(
             retry.click()
             expect(retry).not_to_be_visible()
             assert deliveries[0] == deliveries[1]
+            assert deliveries[0]["protocol_version"] == 2
+            assert deliveries[0]["observed_revision"] < committed_revision
             assert client.get("/v1/preferences/shared").json()["revision"] == committed_revision
             page.unroute("**/v1/preferences/shared/operations", lose_first_reply)
 

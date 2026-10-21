@@ -17,7 +17,8 @@ export interface PreferenceEntry {
   value: PreferenceValue;
 }
 export interface PreferenceOperation {
-  protocol_version: 1;
+  protocol_version: 1 | 2;
+  observed_revision?: number;
   identity: PreferenceIdentity;
   installation_id: string;
   operation_id: string;
@@ -27,6 +28,7 @@ export interface PreferenceOperation {
   resolves: string[];
 }
 export interface PreferenceSnapshot {
+  protocol_version: 1 | 2;
   identity: PreferenceIdentity;
   revision: number;
   entries: PreferenceEntry[];
@@ -101,7 +103,7 @@ export async function readSharedPreferences(signal?: AbortSignal): Promise<Prefe
   const conflicts = new Set<string>();
   do {
     const response = await authenticatedFetch(
-      `/v1/preferences/shared${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`,
+      `/v1/preferences/shared?protocol_version=2${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`,
       { signal },
     );
     if (!response.ok) throw await apiErrorFromResponse(response);
@@ -109,7 +111,8 @@ export async function readSharedPreferences(signal?: AbortSignal): Promise<Prefe
     if (!snapshot) snapshot = { ...page, entries: [], conflicts: [] };
     if (
       JSON.stringify(page.identity) !== JSON.stringify(snapshot.identity) ||
-      page.revision !== snapshot.revision
+      page.revision !== snapshot.revision ||
+      page.protocol_version !== snapshot.protocol_version
     ) {
       throw new Error("Preferences changed while loading. Retry to get a complete snapshot.");
     }

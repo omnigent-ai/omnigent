@@ -34,6 +34,7 @@ const prepared: HostPreferences = {
     warning: null,
     machine: [],
     shared: {
+      protocol_version: 2,
       identity: { authority_id: "server", user_id: "alice", workspace_id: "workspace" },
       revision: 1,
       entries: [],

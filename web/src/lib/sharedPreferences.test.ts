@@ -6,6 +6,7 @@ vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 const fetcher = vi.mocked(authenticatedFetch);
 const identity = { authority_id: "test", workspace_id: "workspace", user_id: "alice" };
 const first = {
+  protocol_version: 2,
   identity,
   revision: 2,
   entries: [{ key: { kind: "model", name: "model" }, value: "selected", version: 1 }],
@@ -25,11 +26,13 @@ describe("complete preference reads", () => {
     );
     const snapshot = await readSharedPreferences();
     expect(snapshot.entries.map((entry) => entry.value)).toEqual(["selected", "pi-native"]);
+    expect(fetcher.mock.calls[0][0]).toBe("/v1/preferences/shared?protocol_version=2");
     expect(fetcher.mock.calls[1][0]).toContain("cursor=page2");
   });
   it.each([
     { identity: { ...identity, user_id: "bob" } },
     { revision: 3 },
+    { protocol_version: 1 },
     { entries: first.entries },
     { next_cursor: "page2" },
   ])("rejects inconsistent continuation %j", async (fault) => {

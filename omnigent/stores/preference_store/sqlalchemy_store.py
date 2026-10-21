@@ -8,7 +8,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-from typing import Annotated, TypeVar
+from typing import Annotated, Literal, TypeVar
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 from sqlalchemy import LargeBinary, delete, select, type_coerce, union_all, update
@@ -47,6 +48,7 @@ _PREFIX = "shared.v1."
 _META = _PREFIX + "meta"
 _VALUE = _PREFIX + "value."
 _RECEIPT = _PREFIX + "receipt."
+_SLOT = _PREFIX + "slot."
 _CONFLICT = _PREFIX + "conflict."
 _Model = TypeVar("_Model", bound=BaseModel)
 
@@ -56,6 +58,8 @@ class _Metadata(ProtocolModel):
     revision: int = 0
     keys: int = 0
     conflicts: int = 0
+    receipt_sequence: int = 0
+    receipt_floor: int = 0
 
 
 class _Cursor(ProtocolModel):
@@ -71,6 +75,11 @@ class _Receipt(ProtocolModel):
     result: PreferenceResult
 
 
+class _ReceiptSlot(ProtocolModel):
+    operation_id: UUID
+    revision: Version
+
+
 def _fingerprint(operation: PreferenceMutation) -> str:
     payload = {
         "protocol_version": operation.protocol_version,
@@ -84,6 +93,8 @@ def _fingerprint(operation: PreferenceMutation) -> str:
         "value": operation.value,
         "resolves": [str(conflict) for conflict in operation.resolves],
     }
+    if operation.protocol_version == 2:
+        payload["observed_revision"] = operation.observed_revision
     canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
 
@@ -129,7 +140,12 @@ class SqlAlchemyPreferenceStore:
         )
 
     def read(
-        self, *, user_id: str | None, limit: int = PREFERENCE_PAGE_SIZE, cursor: str | None = None
+        self,
+        *,
+        user_id: str | None,
+        limit: int = PREFERENCE_PAGE_SIZE,
+        cursor: str | None = None,
+        protocol_version: Literal[1, 2] = 1,
     ) -> PreferencePage:
         if type(limit) is not int or not 1 <= limit <= PREFERENCE_PAGE_SIZE:
             raise OmnigentError("Invalid preference page size", code=ErrorCode.INVALID_INPUT)
@@ -189,6 +205,7 @@ class SqlAlchemyPreferenceStore:
                 .encode()
             ).decode()
         return PreferencePage(
+            protocol_version=protocol_version,
             identity=identity,
             revision=metadata.revision,
             next_cursor=next_cursor,
@@ -198,7 +215,11 @@ class SqlAlchemyPreferenceStore:
                 if key.startswith(_VALUE)
             ],
             conflicts=[
-                _decode(value, PreferenceMutation)
+                _decode(value, PreferenceMutation).model_copy(
+                    update={"protocol_version": 1, "observed_revision": None}
+                )
+                if protocol_version == 1
+                else _decode(value, PreferenceMutation)
                 for key, value in rows
                 if key.startswith(_CONFLICT)
             ],
@@ -271,11 +292,23 @@ class SqlAlchemyPreferenceStore:
                         "Operation ID already used for a different edit", code=ErrorCode.CONFLICT
                     )
                 return receipt.result
-            if metadata.revision >= MAX_OPERATIONS:
+            if operation.protocol_version == 1 and metadata.revision >= MAX_OPERATIONS:
                 raise OmnigentError(
-                    "Preference operation history is full; migration required",
+                    "Preference operation history is full for v1; update the client to v2",
                     code=ErrorCode.CONFLICT,
                 )
+            if operation.protocol_version == 2:
+                assert operation.observed_revision is not None
+                if operation.observed_revision < metadata.receipt_floor:
+                    raise OmnigentError(
+                        "Preference edit is older than retained retry history; "
+                        "review pending edits before resubmitting",
+                        code=ErrorCode.CONFLICT,
+                    )
+                if operation.observed_revision > metadata.revision:
+                    raise OmnigentError(
+                        "Observed revision is ahead of the server", code=ErrorCode.CONFLICT
+                    )
             value_key = _VALUE + operation.key.storage_key()
             previous = read_record(value_key, SharedPreferenceEntry)
             current = previous or SharedPreferenceEntry(key=operation.key, version=0, value=None)
@@ -337,11 +370,35 @@ class SqlAlchemyPreferenceStore:
                     )
             metadata = metadata.model_copy(update={"revision": metadata.revision + 1})
             result = PreferenceResult(
+                protocol_version=operation.protocol_version,
                 operation_id=operation.operation_id,
                 status=status,
                 revision=metadata.revision,
                 entry=current,
             )
+            if operation.protocol_version == 2:
+                slot_key = _SLOT + str(metadata.receipt_sequence % MAX_OPERATIONS)
+                old = read_record(slot_key, _ReceiptSlot)
+                slot = _ReceiptSlot(operation_id=operation.operation_id, revision=result.revision)
+                if old is not None:
+                    session.execute(
+                        delete(SqlPreference).where(
+                            *scope, SqlPreference.key == _RECEIPT + old.operation_id.hex
+                        )
+                    )
+                    session.execute(
+                        update(SqlPreference)
+                        .where(*scope, SqlPreference.key == slot_key)
+                        .values(value=_serialize(slot))
+                    )
+                else:
+                    add_record(slot_key, slot)
+                metadata = metadata.model_copy(
+                    update={
+                        "receipt_sequence": metadata.receipt_sequence + 1,
+                        "receipt_floor": max(metadata.receipt_floor, old.revision if old else 0),
+                    }
+                )
             add_record(receipt_key, _Receipt(fingerprint=_fingerprint(operation), result=result))
             session.execute(
                 update(SqlPreference)

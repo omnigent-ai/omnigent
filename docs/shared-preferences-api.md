@@ -23,7 +23,7 @@ the source of an edit; it is not an authorization grant.
 
 ## Read and edit
 
-`GET /v1/preferences/shared` returns protocol version `1`, the authenticated
+`GET /v1/preferences/shared?protocol_version=2` returns protocol version `2`, the authenticated
 `identity`, a namespace `revision`, `entries`, unresolved `conflicts`, and
 `next_cursor`. Pass `limit` (1–100, default 100) and the opaque `cursor` from the
 previous page until `next_cursor` is null. Conflicts precede values; each range
@@ -47,7 +47,8 @@ Copy the returned identity into each explicit edit. Submit one edit with
 
 ```json
 {
-  "protocol_version": 1,
+  "protocol_version": 2,
+  "observed_revision": 0,
   "identity": {
     "authority_id": "isolated-preference-test",
     "user_id": "local",
@@ -62,6 +63,8 @@ Copy the returned identity into each explicit edit. Submit one edit with
 }
 ```
 
+Set `observed_revision` to the complete snapshot revision before the first send.
+Keep it unchanged on retries, including after a lost reply.
 Use a new UUID for each deliberate edit and retain it for retries. Read the
 entry's version before editing it. The supplied identity must match the server's
 authenticated context; it does not select another user or workspace.
@@ -111,16 +114,31 @@ Values, conflicts and retry receipts commit atomically in the existing
 `preferences` table. See the [store](../omnigent/stores/preference_store/sqlalchemy_store.py)
 for locking and bounded-query details.
 
-Per user/workspace, version 1 allows 512 distinct keys including deletions,
-128 unresolved conflicts, and 10,000 consumed operations. Each JSON-encoded
-`{"value": ...}` is limited to 8,192 UTF-8 bytes. Names are at most 128 characters;
-the full-record cap above includes JSON escaping and request metadata.
+Per user/workspace, both protocols allow 512 distinct keys including deletions
+and 128 unresolved conflicts. Each JSON-encoded `{"value": ...}` is limited to
+8,192 UTF-8 bytes. Names are at most 128 characters; the full-record cap above
+includes JSON escaping and request metadata.
 
-Receipts and deletions do not expire. At 10,000 consumed operations, all new IDs
-are permanently blocked, including unchanged edits and conflict resolutions.
-Reads and identical retries still work; open conflicts remain visible but cannot
-be resolved. Retention/compaction and bounded account-deletion batches are
-prerequisites for broad activation; neither is implemented yet.
+Protocol 2 retains the latest 10,000 retry receipts in a fixed ring. Replacing a
+slot deletes its old receipt and advances a revision floor in the same
+transaction as the new edit. Reads skip both receipts and slots. A retry with a
+retained receipt returns its original result. If the receipt is gone and
+`observed_revision` predates the floor, the server returns 409 without changing
+anything. This prevents a forgotten retry from recreating a resolved conflict.
+Review the current state and the pending edit before deliberately submitting a
+new operation ID; never refresh an uncertain operation's revision automatically.
+
+Legacy reads omit the query or use `protocol_version=1`. They receive v1 conflict
+envelopes without the new field. Legacy writes and receipts remain supported;
+new v1 edits stop at namespace revision 10,000 with an upgrade message. Legacy
+receipts never expire. This also prevents legacy replay of a forgotten v2 edit.
+New clients can use a v1-only server, but keep v2 pending operations intact if a
+server is downgraded. Upgraded metadata is not readable by older server binaries:
+roll out matching server code to every replica before enabling v2 writers.
+
+There are at most 30,641 rows per namespace: 512 keys, 128 conflicts, metadata,
+10,000 legacy receipts, 10,000 v2 receipts and 10,000 ring slots. Account cleanup
+and route-specific request bounds remain separate activation prerequisites.
 
 The version-1 key encoding is explicit and pinned by digest tests. Changing its
 encoding, harness aliases, or stored-record validation requires a migration or a

@@ -300,6 +300,48 @@ def test_history_limit_preserves_receipts(store, monkeypatch):
     assert before.conflicts == [conflict]
 
 
+def test_v2_receipt_compaction_cannot_replay_a_resolved_conflict(store, monkeypatch, db_uri):
+    import omnigent.stores.preference_store.sqlalchemy_store as module
+
+    monkeypatch.setattr(module, "MAX_OPERATIONS", 2)
+    original = mutation(store)
+    original_receipt = store.apply(original, user_id="alice")
+
+    def edit(**kwargs):
+        return mutation(store, **kwargs).model_copy(
+            update={
+                "protocol_version": 2,
+                "observed_revision": store.read(user_id="alice").revision,
+            }
+        )
+
+    conflict = edit(value="alternative")
+    store.apply(conflict, user_id="alice")
+    assert store.read(user_id="alice", protocol_version=2).conflicts == [conflict]
+    legacy = store.read(user_id="alice").conflicts[0]
+    assert legacy.protocol_version == 1 and "observed_revision" not in legacy.model_dump()
+    resolve = edit(version=1, value="alternative", resolves=[conflict.operation_id])
+    store.apply(resolve, user_id="alice")
+    for version in range(2, 12):
+        latest = edit(version=version, value=f"selected-{version}")
+        receipt = store.apply(latest, user_id="alice")
+    reopened = SqlAlchemyPreferenceStore(db_uri, authority_id="test-authority")
+    before = reopened.read(user_id="alice", protocol_version=2)
+    assert before.conflicts == [] and before.entries[0].value == "selected-11"
+    assert reopened.apply(latest, user_id="alice") == receipt
+    assert reopened.apply(original, user_id="alice") == original_receipt
+    for expired in (conflict, resolve):
+        with pytest.raises(OmnigentError, match="older than retained"):
+            reopened.apply(expired, user_id="alice")
+    assert reopened.read(user_id="alice", protocol_version=2) == before
+    with store._session("count_retained_history") as session:
+        keys = list(
+            session.scalars(select(SqlPreference.key).where(SqlPreference.user_id == "alice"))
+        )
+    assert sum(key.startswith("shared.v1.receipt.") for key in keys) == 3
+    assert sum(key.startswith("shared.v1.slot.") for key in keys) == 2
+
+
 def test_key_and_conflict_limits_preserve_existing_values(store, monkeypatch):
     import omnigent.stores.preference_store.sqlalchemy_store as module
 
@@ -450,10 +492,11 @@ def test_sqlite_page_scan_excludes_receipt_history(tmp_path):
                 SqlPreference(
                     workspace_id=0,
                     user_id="alice",
-                    key=f"shared.v1.receipt.{index:032x}",
+                    key=f"shared.v1.{kind}.{index:032x}",
                     value="unused receipt payload",
                 )
                 for index in range(10000)
+                for kind in ("receipt", "slot")
             ]
         )
     after, steps = measured_read()
@@ -481,3 +524,15 @@ def test_page_never_labels_concurrent_rows_with_an_old_revision(store):
     finally:
         event.remove(store._engine, "after_cursor_execute", concurrent_write)
     assert store.read(user_id="alice").entries[0].value == "newer"
+
+
+def test_v2_observed_revision_is_validated_and_part_of_retry_identity(store):
+    operation = mutation(store).model_copy(update={"protocol_version": 2, "observed_revision": 1})
+    with pytest.raises(OmnigentError, match="ahead of the server"):
+        store.apply(operation, user_id="alice")
+    assert store.read(user_id="alice").revision == 0
+    operation = operation.model_copy(update={"observed_revision": 0})
+    result = store.apply(operation, user_id="alice")
+    assert store.apply(operation, user_id="alice") == result
+    with pytest.raises(OmnigentError, match="different edit"):
+        store.apply(operation.model_copy(update={"observed_revision": 1}), user_id="alice")

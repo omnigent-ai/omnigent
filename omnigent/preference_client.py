@@ -36,7 +36,7 @@ from omnigent.preference_sync import (
 )
 
 _PATH = "/v1/preferences/shared"
-_CACHE_VERSION = 3
+_CACHE_VERSION = 4
 MAX_PENDING_OPERATIONS = 512
 _Result = TypeVar("_Result")
 
@@ -83,8 +83,9 @@ async def read_preference_snapshot(
     entry_keys, conflict_ids, cursors = set(), set(), set()
     cursor = None
     revision = None
+    protocol_version = None
     for _ in range(MAX_KEYS + MAX_CONFLICTS + 1):
-        params = {"limit": str(page_size)}
+        params = {"limit": str(page_size), "protocol_version": "2"}
         if cursor is not None:
             params["cursor"] = cursor
         response = await client.get(_PATH, params=params)
@@ -96,7 +97,8 @@ async def read_preference_snapshot(
             raise ValueError("Preference snapshot belongs to another identity")
         if revision is None:
             revision = page.revision
-        if page.revision != revision:
+            protocol_version = page.protocol_version
+        if page.revision != revision or page.protocol_version != protocol_version:
             raise ValueError("Preference revision changed between pages")
         count = len(page.entries) + len(page.conflicts)
         if count > page_size or (page.next_cursor is not None and count == 0):
@@ -118,7 +120,11 @@ async def read_preference_snapshot(
             raise ValueError("Preference snapshot exceeds limits")
         if page.next_cursor is None:
             return PreferenceSnapshot(
-                identity=identity, revision=revision, entries=entries, conflicts=conflicts
+                protocol_version=page.protocol_version,
+                identity=identity,
+                revision=revision,
+                entries=entries,
+                conflicts=conflicts,
             )
         if page.next_cursor in cursors:
             raise ValueError("Preference cursor did not advance")
@@ -204,6 +210,13 @@ class PreferenceClient:
                     "CHECK(host_adopted IN (0, 1))"
                 )
                 connection.execute("PRAGMA user_version = 3")
+                version = 3
+            if version == 3:
+                connection.execute(
+                    "ALTER TABLE state ADD COLUMN protocol_version INTEGER NOT NULL DEFAULT 1 "
+                    "CHECK(protocol_version IN (1, 2))"
+                )
+                connection.execute("PRAGMA user_version = 4")
             elif version != _CACHE_VERSION:
                 raise ValueError(f"Unsupported preference cache version: {version}")
             binding = connection.execute("SELECT binding FROM state WHERE id = 1").fetchone()[0]
@@ -226,7 +239,9 @@ class PreferenceClient:
     def cached(self) -> PreferenceSnapshot | None:
         """Return the last complete server snapshot; pending edits stay separate."""
         with self._transaction(write=False) as connection:
-            revision = connection.execute("SELECT revision FROM state WHERE id = 1").fetchone()[0]
+            revision, protocol_version = connection.execute(
+                "SELECT revision, protocol_version FROM state WHERE id = 1"
+            ).fetchone()
             if revision is None:
                 return None
             entries = connection.execute(
@@ -238,6 +253,7 @@ class PreferenceClient:
         if len(entries) > MAX_KEYS or len(conflicts) > MAX_CONFLICTS:
             raise ValueError("Preference cache exceeds limits")
         return PreferenceSnapshot(
+            protocol_version=protocol_version,
             identity=self._binding.identity,
             revision=revision,
             entries=[
@@ -292,8 +308,8 @@ class PreferenceClient:
         unattempted successor may inherit its predecessor's acknowledged version.
         """
         with self._transaction() as connection:
-            revision, sequence = connection.execute(
-                "SELECT revision, next_sequence FROM state WHERE id = 1"
+            revision, sequence, protocol_version = connection.execute(
+                "SELECT revision, next_sequence, protocol_version FROM state WHERE id = 1"
             ).fetchone()
             if revision is None:
                 raise ValueError("Synchronize once to verify identity before queuing preferences")
@@ -314,7 +330,8 @@ class PreferenceClient:
             ).fetchone()
             version = SharedPreferenceEntry.model_validate_json(raw[0]).version if raw else 0
             operation = PreferenceMutation(
-                protocol_version=1,
+                protocol_version=protocol_version,
+                observed_revision=revision if protocol_version == 2 else None,
                 identity=self._binding.identity,
                 installation_id=self._binding.installation_id,
                 operation_id=uuid4(),
@@ -374,26 +391,41 @@ class PreferenceClient:
                 [(item.operation_id.bytes, _encode(item)) for item in snapshot.conflicts],
             )
             connection.execute(
-                "UPDATE state SET revision = ?, revision_floor = ? WHERE id = 1",
-                (snapshot.revision, snapshot.revision),
+                "UPDATE state SET revision = ?, revision_floor = ?, protocol_version = ? "
+                "WHERE id = 1",
+                (snapshot.revision, snapshot.revision, snapshot.protocol_version),
             )
 
     def _next(self) -> tuple[int, PreferenceMutation] | None:
         with self._transaction() as connection:
             row = connection.execute(
-                "SELECT sequence, operation, predecessor FROM outbox ORDER BY sequence LIMIT 1"
+                "SELECT sequence, operation, predecessor, sent FROM outbox "
+                "ORDER BY sequence LIMIT 1"
             ).fetchone()
             if row is None:
                 return None
             if row[2] is not None:
                 raise ValueError("Preference outbox has a missing predecessor")
-            connection.execute("UPDATE outbox SET sent = 1 WHERE sequence = ?", (row[0],))
-            return row[0], PreferenceMutation.model_validate_json(row[1])
+            operation = PreferenceMutation.model_validate_json(row[1])
+            if not row[3] and operation.protocol_version == 2:
+                revision = connection.execute(
+                    "SELECT revision_floor FROM state WHERE id = 1"
+                ).fetchone()[0]
+                operation = operation.model_copy(update={"observed_revision": revision})
+            connection.execute(
+                "UPDATE outbox SET sent = 1, operation = ? WHERE sequence = ?",
+                (_encode(operation), row[0]),
+            )
+            return row[0], operation
 
     def _acknowledge(
         self, sequence: int, operation: PreferenceMutation, result: PreferenceResult
     ) -> None:
-        if result.operation_id != operation.operation_id or result.entry.key != operation.key:
+        if (
+            result.operation_id != operation.operation_id
+            or result.entry.key != operation.key
+            or result.protocol_version != operation.protocol_version
+        ):
             raise ValueError("Preference receipt does not match the submitted operation")
         if result.status != "conflict" and result.entry.value != operation.value:
             raise ValueError("Preference receipt did not acknowledge the submitted value")

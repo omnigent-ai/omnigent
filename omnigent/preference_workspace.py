@@ -71,7 +71,10 @@ def preview_import(
             ImportChange(
                 previous=previous,
                 operation=PreferenceMutation(
-                    protocol_version=1,
+                    protocol_version=snapshot.protocol_version,
+                    observed_revision=snapshot.revision
+                    if snapshot.protocol_version == 2
+                    else None,
                     identity=snapshot.identity,
                     operation_id=uuid4(),
                     installation_id=installation_id,
@@ -234,6 +237,9 @@ class PreferenceWorkspace:
 
     def preview_restore(self) -> ImportPreview:
         """Undo only acknowledged imports, using their versions to expose later edits."""
+        snapshot = self.client.cached()
+        if snapshot is None:
+            raise ValueError("Synchronize before restoring preferences")
         with self.client._transaction(write=False) as connection:
             rows = connection.execute(
                 "SELECT previous, result FROM import_entries ORDER BY operation_id LIMIT ?",
@@ -255,7 +261,10 @@ class PreferenceWorkspace:
                 ImportChange(
                     previous=result.entry,
                     operation=PreferenceMutation(
-                        protocol_version=1,
+                        protocol_version=snapshot.protocol_version,
+                        observed_revision=snapshot.revision
+                        if snapshot.protocol_version == 2
+                        else None,
                         identity=self.identity,
                         installation_id=self.installation_id,
                         operation_id=uuid4(),

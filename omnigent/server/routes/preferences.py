@@ -1,7 +1,7 @@
 """Explicit shared-preference reads and versioned edits; no implicit adoption."""
 
 import asyncio
-from typing import Annotated
+from typing import Annotated, Literal, cast
 
 from fastapi import APIRouter, Query, Request
 from pydantic import TypeAdapter, ValidationError
@@ -43,9 +43,14 @@ def create_preferences_router(
         request: Request,
         limit: Annotated[int, Query(ge=1, le=PREFERENCE_PAGE_SIZE)] = PREFERENCE_PAGE_SIZE,
         cursor: Annotated[str | None, Query(max_length=4096)] = None,
+        protocol_version: Annotated[int, Query(ge=1, le=2)] = 1,
     ) -> PreferencePage:
         return await asyncio.to_thread(
-            store.read, user_id=user_id(request), limit=limit, cursor=cursor
+            store.read,
+            user_id=user_id(request),
+            limit=limit,
+            cursor=cursor,
+            protocol_version=cast(Literal[1, 2], protocol_version),
         )
 
     @router.post("/preferences/shared/operations", response_model=PreferenceResult)

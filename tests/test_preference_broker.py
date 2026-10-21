@@ -106,6 +106,8 @@ async def test_typed_broker_lost_receipt_keeps_causal_retry(tmp_path, db_uri):
         reopened = PreferenceClient(client.path, identity=identity, installation_id="host")
         result = await reopened.sync(http)
         assert sent[0] == sent[1]
+        assert sent[0].protocol_version == 2
+        assert sent[0].observed_revision == 0 and sent[2].observed_revision == 1
         assert result.revision == 2
         assert result.entries[0].value == "second" and result.entries[0].version == 2
         assert not reopened.pending()
@@ -119,3 +121,47 @@ async def test_broker_read_only_grant_can_page(db_uri):
     result = await grant.execute(PreferenceRead(limit=1))
     assert result.page.identity == store.identity("alice")
     assert result.page.entries == []
+
+
+@pytest.mark.parametrize("change", [None, "value", "expected_version", "operation_id"])
+async def test_import_grant_allows_only_unattempted_revision_refresh(db_uri, change):
+    from omnigent.preference_sync import SharedPreferenceEntry
+
+    store = SqlAlchemyPreferenceStore(db_uri, authority_id="broker")
+    reviewed = PreferenceMutation(
+        protocol_version=2,
+        observed_revision=0,
+        identity=store.identity("alice"),
+        installation_id="host",
+        operation_id=uuid4(),
+        key=SharedPreferenceKey(kind="model", name="model"),
+        expected_version=0,
+        value="chosen",
+    )
+    store.apply(reviewed.model_copy(update={"operation_id": uuid4()}), user_id="alice")
+    control = PreferenceApply(
+        action="apply_import",
+        preview=ImportPreview(
+            identity=reviewed.identity,
+            changes=[
+                ImportChange(
+                    previous=SharedPreferenceEntry(key=reviewed.key, version=0, value=None),
+                    operation=reviewed,
+                )
+            ],
+        ),
+    )
+    operation = reviewed.model_copy(update={"observed_revision": 1})
+    if change is not None:
+        operation = operation.model_copy(
+            update={
+                change: {
+                    "value": "unreviewed",
+                    "expected_version": 1,
+                    "operation_id": uuid4(),
+                }[change]
+            }
+        )
+    grant = PreferenceBrokerGrant(store, "alice", "host", control)
+    result = await grant.execute(PreferenceWrite(operation=operation))
+    assert result.status == (200 if change is None else 403)

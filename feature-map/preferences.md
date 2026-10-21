@@ -407,9 +407,13 @@ fresh retry can converge. These cases extend the same `shared-client` recipe.
 The component matrix also covers causal offline edits, malformed or stale replies,
 identity changes, cancellation, local writers, sync locking, and outbox limits.
 Its HTTP transport is simulated; the mapped process test covers real transport.
-Cache schema v3 adds namespace-bound host adoption without creating a CLI login
-profile. Existing v2 snapshots, receipts and queued edits survive upgrade; older
-clients reject the newer cache version instead of resetting it.
+Cache schema v4 records the negotiated protocol alongside namespace-bound host
+adoption without creating a CLI login profile. Existing v1–v3 snapshots, receipts
+and queued edits survive upgrade; older clients reject the newer cache version
+instead of resetting it. The client matrix covers v1 server fallback, unattempted
+edits after receipt compaction, and uncertain expired edits that remain queued
+for explicit review. Broker tests retain exact lost-reply retries through typed
+frames and allow only the observed revision to refresh on unattempted imports.
 
 For latency and contention use the existing
 [benchmark runner](../dev/benchmarks/omnigent/README.md#shared-preferences).
@@ -421,9 +425,11 @@ the correctness scenarios above.
 
 ## Gotchas
 
-- Before broad activation, design receipt retention/compaction and bounded
-  account-deletion batches. At 10,000 consumed operations, new edits and conflict
-  resolutions stop permanently; reads and identical retries still work.
+- Protocol v2 retains the latest 10,000 receipts. Expired uncertain edits are
+  rejected visibly; review the current value, discard the pending edit, then
+  explicitly save again if still needed. V1 clients require upgrade after 10,000
+  total revisions. All server replicas must support v2 before enabling writers.
+  Bounded account cleanup remains an activation prerequisite.
 - Request parsing currently has no route-specific body-size or rate limit.
   Add these before broad activation; the value cap applies after JSON parsing.
 - Managed deployment, Universe wiring, Arclet startup,

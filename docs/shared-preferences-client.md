@@ -107,7 +107,11 @@ applied. Discard and sync share the process lock. No rejection is silently dropp
 
 At most 512 local pending operations are allowed. The server still enforces its
 separate history/conflict/key limits. There is no automatic history compaction
-or cache reset. Existing server retention limits remain a pre-activation concern.
+or cache reset. Protocol v2 bounds server retry history; edits whose receipt has expired require
+explicit review. Unattempted edits may refresh only their observed namespace
+revision before first delivery; their reviewed key version and value stay fixed.
+Attempted edits retain their exact body. Cache schema v4 stores the negotiated
+protocol and upgrades v1–v3 caches without losing pending work.
 
 ## Verify
 

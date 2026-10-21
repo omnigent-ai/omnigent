@@ -101,17 +101,21 @@ async def test_import_preserves_absent_entries_and_refuses_pending_or_foreign_pl
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, 3])
 async def test_local_schema_upgrade_preserves_pending_identity_and_cache(peers, version):
     store, (local, _) = peers
-    async with httpx.AsyncClient(base_url="http://test", transport=transport(store)) as http:
+    async with httpx.AsyncClient(
+        base_url="http://test", transport=transport(store, protocol_version=1)
+    ) as http:
         snapshot = await local.sync(http)
     operation_id = local.enqueue(MODEL, "offline")
     with local._transaction() as connection:
         if version == 1:
             connection.execute("DROP TABLE machine")
             connection.execute("DROP TABLE import_entries")
-        connection.execute("ALTER TABLE state DROP COLUMN host_adopted")
+        connection.execute("ALTER TABLE state DROP COLUMN protocol_version")
+        if version < 3:
+            connection.execute("ALTER TABLE state DROP COLUMN host_adopted")
         connection.execute(f"PRAGMA user_version = {version}")
     reopened = PreferenceClient(
         local.path, identity=store.identity("alice"), installation_id="laptop"
