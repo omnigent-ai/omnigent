@@ -132,25 +132,37 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:orientation="vertical"
-                    android:paddingLeft="16dp"
-                    android:paddingRight="16dp"
                     android:visibility="gone">
 
                     <TextView
                         android:id="@+id/status_details_text"
                         android:layout_width="match_parent"
                         android:layout_height="wrap_content"
+                        android:paddingLeft="16dp"
                         android:paddingTop="8dp"
+                        android:paddingRight="16dp"
                         android:paddingBottom="12dp"
                         android:textColor="@color/brand_foreground"
                         android:textIsSelectable="true"
                         android:textSize="13sp" />
+
+                    <View
+                        android:id="@+id/status_details_divider"
+                        android:layout_width="match_parent"
+                        android:layout_height="1dp"
+                        android:background="@color/brand_border"
+                        android:importantForAccessibility="no" />
 
                     <Button
                         android:id="@+id/status_copy_details"
                         android:layout_width="match_parent"
                         android:layout_height="48dp"
                         android:background="?android:attr/selectableItemBackground"
+                        android:drawableStart="@drawable/ic_status_copy"
+                        android:drawablePadding="8dp"
+                        android:gravity="start|center_vertical"
+                        android:paddingLeft="16dp"
+                        android:paddingRight="16dp"
                         android:text="@string/status_copy_details"
                         android:textAllCaps="false"
                         android:textColor="@color/brand_foreground" />

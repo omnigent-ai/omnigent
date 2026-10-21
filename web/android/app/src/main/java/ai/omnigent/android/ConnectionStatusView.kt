@@ -7,7 +7,11 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.os.SystemClock
+import android.text.SpannableStringBuilder
+import android.text.Spanned
 import android.text.format.DateFormat
+import android.text.style.AbsoluteSizeSpan
+import android.text.style.ForegroundColorSpan
 import android.view.LayoutInflater
 import android.view.View
 import android.widget.Button
@@ -362,13 +366,34 @@ internal class ConnectionStatusView(
                 BuildConfig.VERSION_NAME,
                 BuildConfig.VERSION_CODE,
             )
-        detailsText.text =
+        val rows =
             listOf(
                 context.getString(R.string.status_server) to originOf(details.origin).orEmpty(),
                 context.getString(R.string.status_error) to safeErrorName(details.error),
                 context.getString(R.string.status_time) to localTime,
                 context.getString(R.string.status_app_version_label) to version,
-            ).joinToString("\n\n") { (label, value) -> "$label\n$value" }
+            )
+        val styled = SpannableStringBuilder()
+        val muted = ContextCompat.getColor(context, R.color.brand_muted_foreground)
+        rows.forEachIndexed { index, (label, value) ->
+            if (index > 0) styled.append("\n\n")
+            val labelStart = styled.length
+            styled.append(label)
+            styled.setSpan(
+                ForegroundColorSpan(muted),
+                labelStart,
+                styled.length,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+            styled.setSpan(
+                AbsoluteSizeSpan(12, true),
+                labelStart,
+                styled.length,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+            styled.append('\n').append(value)
+        }
+        detailsText.text = styled
         copyDetails.setOnClickListener {
             val clipboard = ContextCompat.getSystemService(context, ClipboardManager::class.java)
             clipboard?.setPrimaryClip(
