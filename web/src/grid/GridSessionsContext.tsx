@@ -49,6 +49,7 @@ export const useGridSessions = () => useContext(GridSessionsContext);
 
 export function GridSessionsProvider({ children }: { children: ReactNode }) {
   const enabled = isFeatureEnabled(useServerInfo(), "grid_sessions_display_ui");
+  console.log("enabled", enabled);
   return enabled ? <EnabledGridSessionsProvider>{children}</EnabledGridSessionsProvider> : children;
 }
 
@@ -154,5 +155,5 @@ function EnabledGridSessionsProvider({ children }: { children: ReactNode }) {
 }
 
 export function gridTitle(grid: SessionGrid): string {
-  return grid.name || `Grid · ${gridSessionIds(grid.layout).length} sessions`;
+  return `${grid.name || "Grid"} · ${gridSessionIds(grid.layout).length} sessions`;
 }

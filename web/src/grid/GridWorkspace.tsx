@@ -23,6 +23,7 @@ import {
   Grid2X2Icon,
   MoreHorizontalIcon,
   PanelRightCloseIcon,
+  PanelRightIcon,
   PanelRightOpenIcon,
   PencilIcon,
   Trash2Icon,
@@ -278,7 +279,7 @@ export function RearrangeableGrid({
         if (over) grids.swapPanes(String(active.id), String(over.id));
       }}
     >
-      <header className="flex h-9 shrink-0 items-center gap-2 px-2">
+      <header className="flex h-12 shrink-0 items-center gap-2 px-4 py-3">
         {onOpenSidebar && (
           <SidebarOpenButton
             size="icon-sm"
@@ -287,19 +288,20 @@ export function RearrangeableGrid({
           />
         )}
         <Grid2X2Icon className="size-4 shrink-0" />
-        <h1 className="truncate text-ui font-medium">{gridTitle(grid)}</h1>
+        <h1 className="truncate text-ui">{gridTitle(grid)}</h1>
         <span className="flex-1" />
         <Button
           variant="ghost"
-          size="icon-sm"
+          size="icon-xs"
           aria-label={`${workspace.open ? "Collapse" : "Expand"} grid workspace`}
           aria-expanded={workspace.open}
           onClick={() => {
             setMaximized(false);
             setWorkspace((previous) => ({ ...previous, open: !previous.open }));
           }}
+          className="text-muted-foreground hover:text-foreground border-none"
         >
-          {workspace.open ? <PanelRightCloseIcon /> : <PanelRightOpenIcon />}
+          {workspace.open ? <PanelRightCloseIcon /> : <PanelRightIcon />}
         </Button>
       </header>
       <div
