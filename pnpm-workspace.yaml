@@ -9,6 +9,10 @@ packages:
 
 # 7-day dependency cooldown, mirroring the Python-side exclude-newer = "P7D" in uv.toml.
 minimumReleaseAge: 10080
+# electron 42.11.16 distrusts the compromised eMudhra intermediate CAs.
+# Drop once aged past the cooldown (2026-10-27).
+minimumReleaseAgeExclude:
+  - electron@42.11.16
 
 settings:
   autoInstallPeers: false
