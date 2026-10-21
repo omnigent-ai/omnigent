@@ -197,6 +197,11 @@ class MainActivityTest {
         assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
         webView.webViewClient.onPageStarted(webView, url, null)
         webView.webViewClient.onPageCommitVisible(webView, url)
+        assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
+        assertEquals(
+            View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS,
+            webView.importantForAccessibility,
+        )
         shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(500))
         assertEquals(View.GONE, activity.declared<View>("connectionOverlay").visibility)
         assertEquals(View.IMPORTANT_FOR_ACCESSIBILITY_AUTO, webView.importantForAccessibility)
