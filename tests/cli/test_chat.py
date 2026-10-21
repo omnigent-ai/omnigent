@@ -5486,7 +5486,9 @@ _STOP = {"type": "stop_session", "data": {}}
 
 @pytest.mark.parametrize("online_runner", [None, "runner_existing"])
 def test_one_shot_uses_selected_catalog_id_without_resolving_the_name_again(
-    monkeypatch: pytest.MonkeyPatch, online_runner: str | None
+    monkeypatch: pytest.MonkeyPatch,
+    online_runner: str | None,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Both host launch and runner adoption use the selected identity and harness."""
     _local_host(monkeypatch, "host_local")
@@ -5523,6 +5525,11 @@ def test_one_shot_uses_selected_catalog_id_without_resolving_the_name_again(
 
     assert result == "pong"
     assert sessions.created["agent_id"] == "ag_selected"
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert ("Waiting for this machine to start your agent..." in output.err) == (
+        online_runner is None
+    )
     assert harnesses == ["openai-agents"]
     assert sessions.created.get("host_id") == ("host_local" if online_runner is None else None)
     assert sessions.bound == ([] if online_runner is None else [online_runner])
@@ -5658,6 +5665,9 @@ def test_one_shot_host_launch_timeout_is_a_clean_cli_error(
     output = capsys.readouterr()
     assert output.out == ""
     assert "Error: Timed out" in output.err and "host 'host_local'" in output.err
+    assert output.err.index("Waiting for this machine to start your agent...") < output.err.index(
+        "Error: Timed out"
+    )
     assert "POST /v1/sessions" in output.err
     if failure in (httpx.ConnectTimeout, httpx.PoolTimeout):
         assert "request was not sent" in output.err and "retry" in output.err

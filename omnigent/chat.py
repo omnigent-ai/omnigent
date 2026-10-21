@@ -46,6 +46,7 @@ from omnigent_client._http import is_loopback_url
 from omnigent_client._sessions import Session as SessionSnapshot
 from rich.console import Console
 
+from omnigent._runner_startup import runner_startup_progress
 from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE as _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
 )
@@ -76,6 +77,7 @@ from omnigent.process_logging import (
     open_process_log_file,
     process_log_dir_reference,
 )
+from omnigent.remote_launch import REMOTE_LAUNCH_MESSAGE
 from omnigent.session_host import get_session_host, route_session_request, set_session_host
 from omnigent.spec import load as load_spec
 from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
@@ -799,9 +801,8 @@ class _DatabricksTokenAuth(httpx.Auth):
         """
         :param server_url: Remote server URL for looking up stored
             OIDC tokens, e.g. ``"http://localhost:6767"``.
-        :param session_id: The single session this client drives; its
-            requests are pinned to that session's host replica. ``None``
-            for a hostless / local client.
+        :param session_id: Session whose traffic is pinned to its host replica.
+            Discovery requests use the default workspace routing.
         """
         self._server_url = server_url
         self._session_id = session_id
@@ -856,16 +857,15 @@ class _DatabricksTokenAuth(httpx.Auth):
         :param request: The outgoing httpx request.
         :yields: The request with auth header set.
         """
-        # Workspace routing (empty when none recorded); independent of the
-        # credential branch below. On a host-sharded deployment, also pin the
-        # turn/resource/stream traffic for this client's session to the replica
-        # holding its runner tunnel — the slice key is the session's host_id,
-        # from the session→host map. An unsharded server has no sharding layer,
-        # so no key.
         if self._server_url:
             from omnigent.cli_auth import databricks_request_headers
 
-            session_host = get_session_host(self._session_id) if self._session_id else None
+            session_path = f"{httpx.URL(self._server_url).path.rstrip('/')}/v1/sessions/"
+            session_host = (
+                get_session_host(self._session_id)
+                if self._session_id and request.url.path.startswith(session_path)
+                else None
+            )
             request.headers.update(
                 databricks_request_headers(
                     self._server_url,
@@ -2597,11 +2597,12 @@ async def _query_sessions_once(
     tool_callables = _sessions_tool_callables(tool_handler, agent_name)
     if launch_host_id is not None and agent is not None:
         # The server launches and binds the host's runner itself.
-        bound = await client.sessions.create_from_agent_id(
-            agent.id,
-            workspace=os.getcwd(),
-            host_id=launch_host_id,
-        )
+        with runner_startup_progress(initial_message=REMOTE_LAUNCH_MESSAGE):
+            bound = await client.sessions.create_from_agent_id(
+                agent.id,
+                workspace=os.getcwd(),
+                host_id=launch_host_id,
+            )
         set_session_host(bound.id, launch_host_id)
     elif runner_id is None:
         raise RuntimeError(

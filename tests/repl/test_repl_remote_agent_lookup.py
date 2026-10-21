@@ -10,8 +10,9 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from omnigent_client import RegisteredAgent, SessionsNamespace
+from omnigent_client import OmnigentError, RegisteredAgent, SessionsNamespace
 from omnigent_client._sessions import Session
+from rich.text import Text
 
 import omnigent.host.identity as identity
 from omnigent import session_host
@@ -106,7 +107,9 @@ async def _remote_adapter(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("scenario", ["online-runner", "mismatched-runner", "resume", "no-host"])
+@pytest.mark.parametrize(
+    "scenario", ["online-runner", "mismatched-runner", "resume", "no-host", "launch-error"]
+)
 async def test_remote_repl_runner_startup_uses_sdk_host_policy(
     monkeypatch: pytest.MonkeyPatch,
     scenario: str,
@@ -116,6 +119,7 @@ async def test_remote_repl_runner_startup_uses_sdk_host_policy(
         identity, "load_host_identity_if_present", lambda: SimpleNamespace(host_id="host_local")
     )
     requests: list[str] = []
+    output: list[Text] = []
     snapshot = {
         "id": "conv_remote",
         "agent_id": "ag_selected",
@@ -138,23 +142,30 @@ async def test_remote_repl_runner_startup_uses_sdk_host_policy(
                         "runner_id": "runner_existing",
                         "online": True,
                         "harnesses": [
-                            "codex" if scenario == "mismatched-runner" else "claude-sdk"
+                            "codex"
+                            if scenario in {"mismatched-runner", "launch-error"}
+                            else "claude-sdk"
                         ],
                     }
                 ]
             )
             return httpx.Response(200, json={"data": runners})
         if path == "/v1/hosts":
-            assert scenario in {"no-host", "mismatched-runner"}
+            assert scenario in {"no-host", "mismatched-runner", "launch-error"}
             hosts = (
                 [] if scenario == "no-host" else [{"host_id": "host_local", "status": "online"}]
             )
             return httpx.Response(200, json={"hosts": hosts})
         if path == "/v1/sessions" and request.method == "POST":
             expected = {"agent_id": "ag_selected", "workspace": os.getcwd()}
-            if scenario == "mismatched-runner":
+            if scenario in {"mismatched-runner", "launch-error"}:
                 expected["host_id"] = "host_local"
+                assert [text.plain for text in output] == [
+                    "Waiting for this machine to start your agent..."
+                ]
             assert json.loads(request.content) == expected
+            if scenario == "launch-error":
+                return httpx.Response(502, json={"error": {"message": "Host launch refused"}})
             return httpx.Response(201, json=snapshot)
         if path == "/v1/sessions/conv_remote":
             if request.method == "PATCH":
@@ -169,10 +180,15 @@ async def test_remote_repl_runner_startup_uses_sdk_host_policy(
     async with _remote_adapter(
         monkeypatch, handler, session_id="conv_remote" if scenario == "resume" else None
     ) as adapter:
+        monkeypatch.setattr(adapter, "_host", SimpleNamespace(output=output.append))
         if scenario == "no-host":
             with pytest.raises(RuntimeError, match="no online runner"):
                 await adapter._ensure_session()
             assert requests == ["GET /v1/runners", "GET /v1/hosts"]
+            assert adapter.session_id is None
+        elif scenario == "launch-error":
+            with pytest.raises(OmnigentError, match="Host launch refused"):
+                await adapter._ensure_session()
             assert adapter.session_id is None
         else:
             assert await adapter._ensure_session() == "conv_remote"
@@ -180,6 +196,8 @@ async def test_remote_repl_runner_startup_uses_sdk_host_policy(
             if scenario == "resume":
                 assert requests == ["GET /v1/sessions/conv_remote"]
                 assert adapter._agent_name == "uploaded-only"
+        if scenario not in {"mismatched-runner", "launch-error"}:
+            assert output == []
 
 
 @pytest.mark.asyncio

@@ -72,7 +72,11 @@ from rich.text import Text
 from omnigent.cli_diagnostics import printable
 from omnigent.cli_invocation import cli_invocation
 from omnigent.harness_aliases import canonicalize_harness
-from omnigent.remote_launch import no_online_runner_message, resolve_remote_launch_host
+from omnigent.remote_launch import (
+    REMOTE_LAUNCH_MESSAGE,
+    no_online_runner_message,
+    resolve_remote_launch_host,
+)
 from omnigent.session_host import set_session_host
 from omnigent.spec.types import SkillSpec
 
@@ -1792,6 +1796,8 @@ class _SessionsChatReplAdapter:
         # Snapshot the pre-create /model pick before hydration clobbers
         # it; applied after create since create has no such field.
         pending_model_override = self._model_override
+        if launch_host_id is not None and self._host is not None:
+            self._host.output(Text(REMOTE_LAUNCH_MESSAGE))
         session = await self._client.sessions.create_from_agent_id(
             agent.id,
             reasoning_effort=self._reasoning_effort,

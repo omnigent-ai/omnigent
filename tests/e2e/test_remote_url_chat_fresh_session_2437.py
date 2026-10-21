@@ -723,6 +723,7 @@ def test_run_launches_a_runner_on_this_machines_host(
                         try:
                             child.expect(r"Ctrl.C exit")
                             child.send("hi\r")
+                            child.expect_exact("Waiting for this machine to start your agent...")
                             child.expect(marker)
                             poll_until(
                                 lambda: any(
@@ -754,6 +755,8 @@ def test_run_launches_a_runner_on_this_machines_host(
                     output = proc.stdout + proc.stderr
                     assert proc.returncode == 0, output + host.log_path.read_text()
                     assert marker in proc.stdout, output
+                    assert "Waiting for this machine to start your agent..." in proc.stderr
+                    assert "Waiting for this machine" not in proc.stdout
 
                 sessions = client.get(
                     "/v1/sessions", params={"visibility": "all", "limit": 10}
