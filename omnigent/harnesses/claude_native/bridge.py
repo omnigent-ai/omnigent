@@ -4508,6 +4508,8 @@ def _verify_submit_accepted(
         ``False`` when it is still there after the full window.
     :raises ClaudeSubmitBlockedUnconfirmed: A fresh matching refusal appeared;
         ownership of the web input remains unconfirmed.
+    :raises RuntimeError: Pane capture remains unavailable after submitting;
+        delivery cannot be confirmed safely.
     """
     start = time.monotonic()
     last_enter = start
@@ -4540,6 +4542,10 @@ def _verify_submit_accepted(
                 "A hook blocked a matching prompt in Claude's terminal. Web message delivery "
                 "could not be confirmed; inspect the terminal before retrying."
             )
+        # An empty capture can be a repaint or failed tmux read. It proves
+        # neither that the draft cleared nor that another Enter is safe.
+        if not pane.strip():
+            continue
         if not _draft_in_input_box(pane, needle):
             delivery_diagnostics.record_verification(
                 draft_still_present=False,
@@ -4575,7 +4581,7 @@ def _verify_submit_accepted(
             last_enter = now
             retry_interval = min(retry_interval * 2, _SUBMIT_RETRY_MAX_INTERVAL_S)
     delivery_diagnostics.record_verification(
-        draft_still_present=True,
+        draft_still_present=_draft_in_input_box(pane, needle),
         pane=pane,
         needle=needle,
         prompt_glyph=_CLAUDE_PROMPT_GLYPH,
@@ -4583,6 +4589,12 @@ def _verify_submit_accepted(
         retries=retries,
         polls=polls,
     )
+    if not pane.strip():
+        raise RuntimeError(
+            f"Claude Code {what} delivery could not be confirmed within "
+            f"{_SUBMIT_VERIFY_TIMEOUT_S}s because terminal capture is unavailable. "
+            "Inspect the terminal before retrying; the message may already have been delivered."
+        )
     return False
 
 

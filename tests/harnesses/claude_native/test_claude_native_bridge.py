@@ -5019,22 +5019,20 @@ def test_inject_user_message_ignores_prompt_glyph_in_scrollback(
         inject_user_message(bridge_dir, content="hi", timeout_s=0.3)
 
 
-def test_inject_user_message_resends_enter_when_first_submit_swallowed(
+@pytest.mark.parametrize("submit_capture", ["ready", "empty", "whitespace", "failed"])
+@pytest.mark.parametrize("accept_first", [False, True], ids=["swallowed", "accepted"])
+def test_inject_user_message_verifies_submit_after_transient_capture_loss(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    submit_capture: str,
+    accept_first: bool,
 ) -> None:
     """
-    A submit Enter swallowed by the TUI's paste burst is retried.
+    Capture loss cannot confirm a submit or cause a blind retry.
 
-    Claude Code coalesces rapid stdin bursts into a paste; an Enter
-    that lands inside that window becomes a newline in the draft
-    instead of a submit, and the message sits unsent — the "typed but
-    never sent" bug. The helper must observe (via capture-pane) that
-    the draft is still in the input box after Enter and re-send Enter
-    until it clears. Here the fake TUI swallows the first Enter
-    (draft stays put) and submits on the second; a regression to
-    fire-and-forget Enter would send exactly one and return "success"
-    with the message undelivered.
+    If the first Enter is swallowed by Claude's paste burst, a readable
+    draft must return before another Enter. If it was accepted, capture
+    recovery shows the empty input box and no second Enter is sent.
     """
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     # Shrink the polling cadence so the retry happens in milliseconds —
@@ -5052,14 +5050,12 @@ def test_inject_user_message_resends_enter_when_first_submit_swallowed(
     )
 
     enters: list[list[str]] = []
-    # Input-box state machine: the paste deposits the draft; the FIRST
-    # Enter is swallowed (folded into the paste burst — draft stays);
-    # the second Enter submits and clears the box.
-    tui = {"pane": _composer_pane(), "swallowed_enters": 0}
+    # The first Enter may be swallowed; a later Enter clears the draft.
+    tui = {"pane": _composer_pane(), "missing_captures": 0}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """
-        Simulate a TUI that swallows the first submit Enter.
+        Simulate capture loss after a submit that may have been swallowed.
 
         :param cmd: Argv list passed to subprocess.run.
         :param kwargs: Subprocess kwargs (ignored).
@@ -5068,31 +5064,35 @@ def test_inject_user_message_resends_enter_when_first_submit_swallowed(
         """
         del kwargs
         if "capture-pane" in cmd:
+            if len(enters) == 1 and tui["missing_captures"] < 3:
+                tui["missing_captures"] += 1
+                if submit_capture != "ready":
+                    assert len(enters) == 1, "an unreadable pane must not draw another Enter"
+                    return SimpleNamespace(
+                        returncode=1 if submit_capture == "failed" else 0,
+                        stdout="  \n" if submit_capture == "whitespace" else "",
+                        stderr="capture unavailable" if submit_capture == "failed" else "",
+                    )
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
         if "paste-buffer" in cmd:
             tui["pane"] = _composer_pane("fix the flaky test")
         if cmd[-1] == "Enter":
             enters.append(cmd)
-            if tui["swallowed_enters"] == 0:
-                tui["swallowed_enters"] = 1  # folded into the paste — draft stays
-            else:
+            if accept_first or len(enters) > 1:
                 tui["pane"] = _composer_pane()  # submitted — input box clears
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
     inject_user_message(bridge_dir, content="fix the flaky test")
 
-    # Exactly two Enters: the swallowed one plus one retry. One means
-    # the verify-retry loop regressed to fire-and-forget (the bug);
-    # three+ means retries keep firing after the draft cleared.
-    assert len(enters) == 2, (
-        f"Expected the swallowed Enter to be retried exactly once, got {len(enters)} Enter(s)."
-    )
+    assert len(enters) == (1 if accept_first else 2)
 
 
+@pytest.mark.parametrize("capture_lost", [False, True], ids=["draft-remains", "capture-lost"])
 def test_inject_user_message_raises_when_draft_never_submits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capture_lost: bool,
 ) -> None:
     """
     Injection fails loud when the draft never leaves the input box.
@@ -5116,7 +5116,7 @@ def test_inject_user_message_raises_when_draft_never_submits(
         tmux_target="claude:0.0",
     )
 
-    tui = {"pane": _composer_pane()}
+    tui = {"pane": _composer_pane(), "enters": 0}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """
@@ -5132,15 +5132,23 @@ def test_inject_user_message_raises_when_draft_never_submits(
         """
         del kwargs
         if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+            pane = "" if capture_lost and tui["enters"] else tui["pane"]
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
         if "paste-buffer" in cmd:
             tui["pane"] = _composer_pane("fix the flaky test")
+        if cmd[-1] == "Enter":
+            tui["enters"] += 1
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(RuntimeError, match="message was not delivered") as caught:
+    error_message = "could not be confirmed" if capture_lost else "message was not delivered"
+    with pytest.raises(RuntimeError, match=error_message) as caught:
         inject_user_message(bridge_dir, content="fix the flaky test")
-    assert isinstance(caught.value, claude_native_bridge.ClaudeMessageNotAccepted)
+    assert (
+        isinstance(caught.value, claude_native_bridge.ClaudeMessageNotAccepted) is not capture_lost
+    )
+    if capture_lost:
+        assert tui["enters"] == 1
 
 
 def test_inject_user_message_backs_off_enter_retries_on_stalled_tui(
