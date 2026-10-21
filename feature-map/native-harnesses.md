@@ -17,6 +17,8 @@ implements them separately, so a fix for one harness does not reach the others.
   host has not configured can be hidden from the picker.
 - `model-and-effort`: the harness's own model catalog, and reasoning effort where
   the harness declares it. The web picker should offer what the CLI offers.
+- `smart-routing`: Pi applies the chosen route before inference from the
+  composer or native terminal; a tool turn and follow-up retain history.
 - `approvals`: tool calls the harness gates show an approval card in chat, and
   the answer reaches the harness.
 - `resume`: resume a previous conversation from the CLI (`--resume`, or a bare
@@ -75,6 +77,10 @@ Switch Terminal → Chat, close/reopen the viewer, and reload during quiet work.
 Repeat the Chat and header-menu Terminal paths at phone width. A locally
 launched `omnigent claude` session is a separate launch path; inspect its linked
 Chat session as well as the local terminal.
+
+**Pi Smart Routing:** enable Smart Routing for the session, then send a task
+from Chat or type it into the native Pi terminal. Follow a completed tool call
+with a question about its result; verify the routed model and retained history.
 
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
@@ -161,6 +167,15 @@ and record each harness's missing or blocked checks, not just its passing ones.
 verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   --output="$VERIFY_EVIDENCE/native-harnesses"
 ```
+
+**Pi Smart Routing (own environment):**
+`tests/e2e/test_pi_native_smart_routing.py::test_pi_native_smart_routing_applies_pick`
+starts the real CLI/server/runner/Pi with scripted routing and model replies.
+It covers composer API and session-owned TUI input, verifies the actual served
+model, then checks the follow-up request retains the tool result and first answer.
+Run with a real Pi CLI on PATH and retries disabled. Composer API evidence
+does not cover browser clicks; scripted routing does not establish live judge
+quality. Broader Smart Routing journeys remain outside this Pi-specific recipe.
 
 **Launch settings (own environment):** connect a host with Claude/Codex
 configured, and put a command and two args under
