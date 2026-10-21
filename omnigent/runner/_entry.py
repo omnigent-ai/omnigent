@@ -785,6 +785,35 @@ def _make_auth_token_factory(
     return None
 
 
+def _managed_mint_url(server_url: str, binding_token: str) -> str:
+    """Return the owner-token mint URL for the runner bound to *binding_token*."""
+    from omnigent.runner.identity import token_bound_runner_id
+
+    return f"{server_url.rstrip('/')}/v1/runners/{token_bound_runner_id(binding_token)}/token"
+
+
+def delegated_mint_rejects_credential(server_url: str, binding_token: str) -> bool:
+    """Whether a runner holding only *binding_token* is refused as unauthenticated.
+
+    Sends the bare owner-token mint a delegated runner makes first. Only a re-auth
+    signal (401/403 or an Apps login redirect) counts as a rejection; a mint, a
+    decline from a no-auth/header-mode or older server, or a transient failure does not.
+
+    :param server_url: Omnigent server base URL, e.g. ``"https://omnigent.example.com"``.
+    :param binding_token: The launch's tunnel binding token.
+    :returns: ``True`` when the server or a front door rejected the request's credentials.
+    """
+    try:
+        _mint_managed_owner_token(
+            _managed_mint_url(server_url, binding_token), server_url, binding_token
+        )
+    except httpx.HTTPStatusError as exc:
+        return _is_login_redirect_or_unauthorized(exc.response)
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, OSError):
+        return False
+    return False
+
+
 def _make_managed_mint_factory(
     server_url: str,
     binding_token: str,
@@ -830,10 +859,7 @@ def _make_managed_mint_factory(
         latches ``proxy_auth_failed`` instead, which
         :class:`_InitialAuthTokenFactory` answers by re-resolving SDK/OIDC.
     """
-    from omnigent.runner.identity import token_bound_runner_id
-
-    runner_id = token_bound_runner_id(binding_token)
-    mint_url = f"{server_url.rstrip('/')}/v1/runners/{runner_id}/token"
+    mint_url = _managed_mint_url(server_url, binding_token)
 
     # Construction probe. Decline to install the factory ONLY when the
     # server definitively will not mint for this runner — HTTP 400 (no auth

@@ -45,6 +45,7 @@ from omnigent.runner._entry import (
     _runner_workspace_from_env,
     _RunnerDatabricksAuth,
     _server_url_from_env,
+    delegated_mint_rejects_credential,
     main,
 )
 from omnigent.runner.identity import (
@@ -52,6 +53,7 @@ from omnigent.runner.identity import (
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
     RUNNER_TUNNEL_TOKEN_HEADER,
+    token_bound_runner_id,
 )
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -1480,6 +1482,64 @@ def test_mint_managed_owner_token_includes_proxy_bearer_when_provided(
 
     assert captured["authorization"] == "Bearer host-initial-bearer"
     assert captured["binding_token"] == "the-binding-token"
+
+
+_MINTED = b'{"token": "owner-jwt", "expires_at": 1234567890}'
+_APPS_LOGIN = "https://ws.example.com/oidc/oauth2/v2.0/authorize"
+
+
+@pytest.mark.parametrize(
+    ("status_code", "location", "body", "rejected"),
+    [
+        (200, None, _MINTED, False),
+        # No-auth and header-mode servers decline; older servers lack the route.
+        (400, None, b"", False),
+        (404, None, b"", False),
+        (502, None, b"", False),
+        (200, None, b"<html>not json</html>", False),
+        (200, None, b"null", False),
+        (None, None, b"", False),
+        (401, None, b"", True),
+        (403, None, b"", True),
+        (302, _APPS_LOGIN, b"", True),
+        (302, "https://s.example.com/elsewhere", b"", False),
+    ],
+)
+def test_delegated_mint_rejects_credential_only_on_a_reauth_signal(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int | None,
+    location: str | None,
+    body: bytes,
+    rejected: bool,
+) -> None:
+    """Only an auth rejection of the runner's bare mint counts as a rejected credential.
+
+    ``status_code=None`` models a connection failure.
+    """
+    requests: list[httpx.Request] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if status_code is None:
+            raise httpx.ConnectError("connection refused", request=request)
+        headers = {"Location": location} if location else {}
+        return httpx.Response(status_code, headers=headers, content=body)
+
+    real_client = httpx.Client
+
+    def _fake_client(**kwargs: Any) -> httpx.Client:
+        return real_client(transport=httpx.MockTransport(_handler), **kwargs)
+
+    monkeypatch.setattr("omnigent.runner._entry.httpx.Client", _fake_client)
+
+    assert delegated_mint_rejects_credential("https://s.example.com/", "bind-tok") is rejected
+    assert len(requests) == 1
+    assert requests[0].method == "POST"
+    assert str(requests[0].url) == (
+        f"https://s.example.com/v1/runners/{token_bound_runner_id('bind-tok')}/token"
+    )
+    assert requests[0].headers[RUNNER_TUNNEL_TOKEN_HEADER] == "bind-tok"
+    assert "authorization" not in requests[0].headers
 
 
 def test_managed_mint_factory_promotes_minted_jwt_to_proxy_bearer(

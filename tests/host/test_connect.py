@@ -38,6 +38,7 @@ from omnigent.host.connect import (
 )
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_LOGIN_EXPIRED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -83,7 +84,7 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
-from omnigent.host.identity import HostIdentity
+from omnigent.host.identity import HOST_TOKEN_ENV_VAR, HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteUnavailable
 from omnigent.runner.identity import (
@@ -1124,6 +1125,173 @@ async def test_handle_launch_refuses_unconfigured_harness(
     assert result.runner_id is None
     # No runner subprocess may exist after a refusal.
     assert host._runners == {}
+
+
+def _stub_delegated_mint(
+    monkeypatch: pytest.MonkeyPatch, *, rejected: bool
+) -> list[tuple[str, str]]:
+    """Answer the host's delegated-mint probe with *rejected*; return its calls."""
+    calls: list[tuple[str, str]] = []
+
+    def _probe(server_url: str, binding_token: str) -> bool:
+        calls.append((server_url, binding_token))
+        return rejected
+
+    monkeypatch.setattr("omnigent.runner._entry.delegated_mint_rejects_credential", _probe)
+    return calls
+
+
+async def test_handle_launch_refuses_when_host_login_expired(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refuse a launch up front when the lapsed login leaves the runner unauthenticated.
+
+    The control tunnel authenticates once and its heartbeat keeps the host
+    reporting online. With the stored login expired and unrefreshable, the
+    runner's only credential is its binding token; when the delegated mint for
+    that token is rejected, the runner would be refused (HTTP 401) and exit, so the
+    host emits ``host_login_expired`` for the server's 503 re-login hint instead.
+    """
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
+    monkeypatch.setattr(host, "_current_auth_token", lambda *, initialize: None)
+    monkeypatch.setattr("omnigent.cli_auth.stored_token_status", lambda server_url: "expired")
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", lambda server_url: None)
+    probes = _stub_delegated_mint(monkeypatch, rejected=True)
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_stale_login",
+        binding_token="token_stale",
+        workspace=str(workspace),
+        harness=None,
+    )
+    result = await host._handle_launch(frame)
+
+    assert isinstance(result, HostLaunchRunnerResultFrame)
+    assert result.status == "failed"
+    # The structured code is what the server's 503 mapping keys on.
+    assert result.error_code == HOST_LOGIN_EXPIRED_ERROR_CODE
+    message = result.error or ""
+    assert "test-laptop" in message
+    assert "login" in message.lower()
+    assert result.runner_id is None
+    # The probe used this launch's own binding token against the host's server.
+    assert probes == [(host._server_url, "token_stale")]
+    # No runner subprocess may exist after a refusal.
+    assert host._runners == {}
+
+
+@pytest.mark.parametrize(
+    ("bearer", "stored_status", "managed", "mint_rejected"),
+    [
+        # A warm bearer still works even if the on-disk login reads expired.
+        ("warm-bearer", "expired", False, True),
+        # No stored login at all (managed pointer / never logged in).
+        (None, "absent", False, True),
+        # A healthy stored login.
+        (None, "ok", False, True),
+        # Managed host: it launches via its delegated token, so `_current_auth_token`
+        # reads None by design and a stale local login entry must be ignored.
+        (None, "expired", True, True),
+        # Expired and unrefreshable, but the runner's binding token still gets it in:
+        # a directly reached accounts/OIDC server mints its owner token, and an
+        # auth-disabled or older server declines the mint and accepts it bare.
+        (None, "expired", False, False),
+    ],
+)
+async def test_handle_launch_proceeds_when_login_is_not_expired(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bearer: str | None,
+    stored_status: str,
+    managed: bool,
+    mint_rejected: bool,
+) -> None:
+    """Refuse only when the runner could authenticate neither by bearer nor by binding token.
+
+    Every other combination must get past the stored-login-expired guard to the
+    spawn (forced here to a benign OSError) instead of tripping the refusal.
+    """
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
+    if managed:
+        monkeypatch.setenv(HOST_TOKEN_ENV_VAR, "managed-launch-token")
+    monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: bearer)
+    monkeypatch.setattr(
+        "omnigent.cli_auth.stored_token_status",
+        lambda server_url: stored_status,
+    )
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", lambda server_url: None)
+    _stub_delegated_mint(monkeypatch, rejected=mint_rejected)
+
+    def _spawn_blocked(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
+        raise OSError(errno.EACCES, "spawn blocked for test")
+
+    monkeypatch.setattr(host, "_spawn_runner_proc", _spawn_blocked)
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_not_expired",
+        binding_token="token_live",
+        workspace=str(workspace),
+        harness=None,
+    )
+    result = await host._handle_launch(frame)
+
+    assert isinstance(result, HostLaunchRunnerResultFrame)
+    assert result.status == "failed"
+    # Reached the spawn (our injected OSError surfaces), not the login refusal.
+    assert "spawn blocked for test" in (result.error or "")
+    assert result.error_code != HOST_LOGIN_EXPIRED_ERROR_CODE
+
+
+async def test_handle_launch_delivers_refreshed_token_to_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An expired-but-refreshable login hands the renewed bearer to the runner.
+
+    Mirroring the runner's own auth factory, the host renews a login that still
+    refreshes rather than refusing or probing, and injects the fresh token so the
+    spawned runner authenticates with it instead of being rejected (HTTP 401).
+    """
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    monkeypatch.delenv(HOST_TOKEN_ENV_VAR, raising=False)
+    monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
+    monkeypatch.setattr("omnigent.cli_auth.stored_token_status", lambda server_url: "expired")
+    monkeypatch.setattr(
+        "omnigent.cli_auth.refresh_stored_token", lambda server_url: "refreshed-token"
+    )
+    probes = _stub_delegated_mint(monkeypatch, rejected=True)
+
+    captured: dict[str, str] = {}
+
+    def _capture_env(env: dict[str, str], *_args: object) -> tuple[object, Path]:
+        captured.update(env)
+        raise OSError(errno.EACCES, "spawn blocked for test")
+
+    monkeypatch.setattr(host, "_spawn_runner_proc", _capture_env)
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_refresh",
+        binding_token="token_refresh",
+        workspace=str(workspace),
+        harness=None,
+    )
+    result = await host._handle_launch(frame)
+
+    assert isinstance(result, HostLaunchRunnerResultFrame)
+    assert result.status == "failed"
+    # Reached the spawn, not the login refusal, and carried the renewed bearer.
+    assert result.error_code != HOST_LOGIN_EXPIRED_ERROR_CODE
+    assert captured.get(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR) == "refreshed-token"
+    assert probes == []
 
 
 async def test_handle_launch_native_cursor_message_points_at_cursor_installer(

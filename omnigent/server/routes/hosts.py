@@ -40,6 +40,7 @@ from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import (
     CAP_REFRESH_HARNESSES,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_LOGIN_EXPIRED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostCreateDirFrame,
     HostDetectCredentialsFrame,
@@ -50,6 +51,7 @@ from omnigent.host.frames import (
     HostStoreSecretFrame,
     classify_launch_refusal,
     encode_host_frame,
+    host_login_expired_message,
     optional_str_bool_map,
     workspace_missing_message,
 )
@@ -1215,6 +1217,14 @@ def create_hosts_router(
                 result.get("error"),
                 workspace,
             )
+            if refusal_code == HOST_LOGIN_EXPIRED_ERROR_CODE:
+                # Map to an actionable 503 (re-login on the host), not the generic
+                # 502. The message is authored server-side, not echoed from the
+                # host, so untrusted host log text cannot leak.
+                raise OmnigentError(
+                    host_login_expired_message(),
+                    code=ErrorCode.HOST_LOGIN_EXPIRED,
+                )
             if refusal_code == HARNESS_NOT_CONFIGURED_ERROR_CODE:
                 # Categorical refusal: the harness isn't configured on
                 # the host, so a retry can't succeed without user action

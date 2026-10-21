@@ -2067,13 +2067,24 @@ def test_session_id_from_request_parses_session_path() -> None:
     assert parse(_req("/v1/sessions")) is None  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    ("state_code", "state_message", "log_prefix", "log_phase"),
+    [
+        ("runner_unavailable", "runner 'r1' is offline", "Runner unavailable", "unavailable"),
+        ("host_login_expired", "host login expired", "Host login expired", "login_expired"),
+    ],
+)
 @pytest.mark.asyncio
 async def test_offline_runner_is_logged_as_state_while_real_faults_stay_errors(
     app: FastAPI,
     caplog: pytest.LogCaptureFixture,
+    state_code: str,
+    state_message: str,
+    log_prefix: str,
+    log_phase: str,
 ) -> None:
     """
-    ``RUNNER_UNAVAILABLE`` logs a stateful WARN; other 5xx keep ERROR.
+    Offline-runner and lapsed-host-login 503s log a stateful WARN; other 5xx keep ERROR.
 
     Both arms are asserted together because the point is the contrast:
     downgrading every 5xx would hide genuine faults just as effectively
@@ -2081,6 +2092,10 @@ async def test_offline_runner_is_logged_as_state_while_real_faults_stay_errors(
 
     :param app: The real application, for its registered handlers.
     :param caplog: Pytest log capture fixture.
+    :param state_code: The stateful error code, e.g. ``"runner_unavailable"``.
+    :param state_message: The raised error's message.
+    :param log_prefix: Expected start of the WARN message.
+    :param log_phase: Expected ``phase`` debug attribute.
     :returns: None.
     """
     from omnigent.errors import ErrorCode, OmnigentError
@@ -2098,13 +2113,7 @@ async def test_offline_runner_is_logged_as_state_while_real_faults_stay_errors(
     )
 
     with caplog.at_level(logging.WARNING, logger="omnigent.server.app"):
-        offline = await handler(
-            request,
-            OmnigentError(
-                "runner 'runner_token_x' is offline",
-                code=ErrorCode.RUNNER_UNAVAILABLE,
-            ),
-        )
+        offline = await handler(request, OmnigentError(state_message, code=state_code))
         fault = await handler(request, OmnigentError("boom", code=ErrorCode.INTERNAL_ERROR))
 
     # The wire contract is untouched: only the log level moves.
@@ -2117,7 +2126,9 @@ async def test_offline_runner_is_logged_as_state_while_real_faults_stay_errors(
     assert unavailable.levelno == logging.WARNING
     # Raised deliberately from a known site, so a stack adds no information.
     assert unavailable.exc_info is None
-    assert "Internal error" not in unavailable.getMessage()
+    assert unavailable.getMessage() == f"{log_prefix}: {state_message}"
+    assert unavailable.attributes["phase"] == log_phase  # type: ignore[attr-defined]
+    assert unavailable.attributes["http_status"] == "503"  # type: ignore[attr-defined]
     assert internal.levelno == logging.ERROR
     assert internal.exc_info is not None
 

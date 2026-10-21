@@ -88,6 +88,7 @@ def test_omnigent_error_with_harness_violation_code_returns_500() -> None:
         (ErrorCode.UPSTREAM_CANCELLED, 499),
         (ErrorCode.UPSTREAM_PERMISSION_DENIED, 403),
         (ErrorCode.STALE_CURSOR, 400),
+        (ErrorCode.HOST_LOGIN_EXPIRED, 503),
     ],
 )
 def test_all_error_codes_have_http_status_mapping(code: str, expected_status: int) -> None:
@@ -127,6 +128,7 @@ def test_every_error_code_has_a_concrete_category() -> None:
         (ErrorCode.HOST_OFFLINE, ErrorCategory.USER),
         (ErrorCode.HARNESS_NOT_CONFIGURED, ErrorCategory.CONFIG),
         (ErrorCode.RUNNER_CAPABILITY_MISMATCH, ErrorCategory.CONFIG),
+        (ErrorCode.HOST_LOGIN_EXPIRED, ErrorCategory.CONFIG),
         (ErrorCode.NOT_FOUND, ErrorCategory.USER),
         (ErrorCode.INVALID_INPUT, ErrorCategory.USER),
         (ErrorCode.UNAUTHORIZED, ErrorCategory.USER),
@@ -199,6 +201,7 @@ def test_every_error_code_has_an_impact() -> None:
         (ErrorCode.INTERNAL_ERROR, ErrorImpact.BLOCKING),
         (ErrorCode.HARNESS_NOT_CONFIGURED, ErrorImpact.BLOCKING),
         (ErrorCode.WORKSPACE_MISSING, ErrorImpact.BLOCKING),
+        (ErrorCode.HOST_LOGIN_EXPIRED, ErrorImpact.BLOCKING),
         (ErrorCode.UNAUTHORIZED, ErrorImpact.BLOCKING),
         # Transient: self-healing, no lost progress.
         (ErrorCode.RUNNER_UNAVAILABLE, ErrorImpact.TRANSIENT),
@@ -392,6 +395,13 @@ def test_is_permission_denied_rpc_error_requires_rpc_error_ancestry() -> None:
     assert is_permission_denied_rpc_error(ValueError("nope")) is False
 
 
+def test_host_login_expired_code_matches_the_host_frame_code() -> None:
+    """The host refusal's frame code and the API error code are one wire string."""
+    from omnigent.host.frames import HOST_LOGIN_EXPIRED_ERROR_CODE
+
+    assert ErrorCode.HOST_LOGIN_EXPIRED == HOST_LOGIN_EXPIRED_ERROR_CODE == "host_login_expired"
+
+
 def test_classify_exception_cancelled_rpc_is_transient_upstream() -> None:
     """A peer-cancelled RPC buckets as a transient upstream blip, and its wire
     code stays pinned (clients dispatch on the string)."""
@@ -436,6 +446,7 @@ def test_every_error_code_has_a_phase() -> None:
         (ErrorCode.UNAUTHORIZED, ErrorPhase.REQUEST, True),
         (ErrorCode.WRONG_REPLICA, ErrorPhase.ROUTING, True),
         (ErrorCode.RUNNER_UNAVAILABLE, ErrorPhase.RUNNER_LAUNCH, True),
+        (ErrorCode.HOST_LOGIN_EXPIRED, ErrorPhase.RUNNER_LAUNCH, True),
         (ErrorCode.HARNESS_NOT_CONFIGURED, ErrorPhase.HARNESS_SETUP, True),
         (ErrorCode.WORKSPACE_MISSING, ErrorPhase.HARNESS_SETUP, True),
         (ErrorCode.HARNESS_PROTOCOL_VIOLATION, ErrorPhase.TURN, False),

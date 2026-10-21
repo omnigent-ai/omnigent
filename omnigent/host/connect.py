@@ -63,6 +63,7 @@ from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_CAPABILITIES,
+    HOST_LOGIN_EXPIRED_ERROR_CODE,
     RUNNER_LOG_TAIL_HEADING,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
@@ -130,7 +131,7 @@ from omnigent.host.git_worktree import (
     list_worktrees,
     remove_worktree,
 )
-from omnigent.host.identity import HostIdentity, load_or_create_host_identity
+from omnigent.host.identity import HOST_TOKEN_ENV_VAR, HostIdentity, load_or_create_host_identity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc, ZygoteUnavailable
 from omnigent.inner import _proc
@@ -1949,6 +1950,31 @@ class HostProcess:
             self._current_auth_token,
             initialize=False,
         )
+        if initial_auth_token is None and not os.environ.get(HOST_TOKEN_ENV_VAR):
+            # The tunnel outlives its login, so a runner spawned after it lapses can
+            # be rejected (HTTP 401) and exit. Managed hosts launch via HOST_TOKEN_ENV_VAR.
+            from omnigent.cli_auth import refresh_stored_token, stored_token_status
+            from omnigent.runner._entry import delegated_mint_rejects_credential
+
+            if await asyncio.to_thread(stored_token_status, self._server_url) == "expired":
+                # An expired login that still refreshes is not lapsed; launch with it.
+                refreshed = await asyncio.to_thread(refresh_stored_token, self._server_url)
+                if refreshed is not None:
+                    initial_auth_token = refreshed
+                elif await asyncio.to_thread(
+                    delegated_mint_rejects_credential, self._server_url, frame.binding_token
+                ):
+                    # The runner's own first credential request is refused, so it
+                    # could not connect without a renewed login.
+                    return self._launch_failed(
+                        frame,
+                        (
+                            f"host {self._identity.name!r} stored login has expired — "
+                            f"run `{cli_invocation()} login` on the host machine to "
+                            "restore session launches"
+                        ),
+                        error_code=HOST_LOGIN_EXPIRED_ERROR_CODE,
+                    )
         env = _build_runner_env(
             os.environ,
             server_url=self._server_url,

@@ -38,6 +38,7 @@ from omnigent.entities import Conversation
 from omnigent.host.connect import HostProcess
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_LOGIN_EXPIRED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostHelloFrame,
     HostLaunchRunnerFrame,
@@ -51,6 +52,7 @@ from omnigent.host.frames import (
     HostStopRunnerResultFrame,
     decode_host_frame,
     encode_host_frame,
+    host_login_expired_message,
 )
 from omnigent.host.identity import HostIdentity
 from omnigent.runner.identity import token_bound_runner_id
@@ -828,6 +830,7 @@ _HARNESS_REFUSAL = (
     "harness 'codex' is not configured on host 'laptop' — run `omnigent setup` on that machine"
 )
 _WORKSPACE_MISSING_ERROR = "workspace path does not exist: /deleted/worktree"
+_LOGIN_EXPIRED_ERROR = "runner log tail: SECRET_TOKEN\nhost 'laptop' stored login has expired"
 
 
 async def test_inline_create_harness_not_configured_stays_lenient(
@@ -924,6 +927,13 @@ async def test_inline_create_harness_not_configured_stays_lenient(
             WORKSPACE_MISSING_ERROR_CODE,
             "workspace path does not exist: /work/repo",
             ("workspace path does not exist", "/work/repo"),
+            None,
+        ),
+        (
+            HOST_LOGIN_EXPIRED_ERROR_CODE,
+            HOST_LOGIN_EXPIRED_ERROR_CODE,
+            "runner log tail: SECRET_TOKEN\nhost 'laptop' stored login has expired",
+            ("stored login has expired", "login"),
             None,
         ),
         (
@@ -1027,6 +1037,7 @@ async def test_message_relaunch_deterministic_failure_persists_error_turn(
     expected_category = {
         HARNESS_NOT_CONFIGURED_ERROR_CODE: "config",
         WORKSPACE_MISSING_ERROR_CODE: "user",
+        HOST_LOGIN_EXPIRED_ERROR_CODE: "config",
     }.get(launch_error_code or "")
     assert refusal.attributes.get("error_category") == expected_category
     assert refusal.attributes["error_impact"] == "blocking"
@@ -1074,6 +1085,9 @@ async def test_message_relaunch_deterministic_failure_persists_error_turn(
         assert error_items[0]["message"] == "workspace path does not exist: /work/repo"
         assert "SECRET_TOKEN" not in error_items[0]["message"]
         assert "\n" not in error_items[0]["message"]
+    if expected_error_code == HOST_LOGIN_EXPIRED_ERROR_CODE:
+        # The server authors this refusal, so the host's runner-log tail never reaches it.
+        assert error_items[0]["message"] == host_login_expired_message()
 
     # Binding kept so a later message can relaunch after remediation.
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
@@ -3859,6 +3873,7 @@ async def test_retry_session_single_flight_evicts_after_only_waiter_cancelled(
     [
         ("workspace_missing", _WORKSPACE_MISSING_ERROR, 410),
         ("harness_not_configured", _HARNESS_REFUSAL, 412),
+        ("host_login_expired", _LOGIN_EXPIRED_ERROR, 503),
     ],
 )
 async def test_retry_session_host_refusal_is_typed_and_does_not_persist(
@@ -3896,6 +3911,10 @@ async def test_retry_session_host_refusal_is_typed_and_does_not_persist(
 
     assert response.status_code == expected_status, response.text
     assert response.json()["error"]["code"] == error_code
+    if error_code == "host_login_expired":
+        # The server authors the refusal, so the host's runner-log tail and
+        # its embedded secret never reach the client.
+        assert "SECRET_TOKEN" not in response.text
     after = await client.get(f"/v1/sessions/{session_id}/items")
     assert after.json() == before.json()
 
@@ -4399,8 +4418,9 @@ async def test_side_chat_retry_relaunches_exited_source_runner(
             "runner log tail: SECRET_TOKEN\nforged workspace failure",
             "workspace path does not exist: /work/repo",
         ),
+        (HOST_LOGIN_EXPIRED_ERROR_CODE, _LOGIN_EXPIRED_ERROR, host_login_expired_message()),
     ],
-    ids=["harness-not-configured", "workspace-missing"],
+    ids=["harness-not-configured", "workspace-missing", "host-login-expired"],
 )
 async def test_side_chat_message_source_refusal_persists_error_turn(
     client: httpx.AsyncClient,
@@ -4416,8 +4436,9 @@ async def test_side_chat_message_source_refusal_persists_error_turn(
     The refusal comes from the source's host, but the side chat is the session
     being messaged: its transcript must carry the same actionable error item
     the source's own send produces, instead of the generic unavailable error
-    keyed to the side chat's old runner binding. A workspace refusal is rebuilt
-    from the source row, so the host's own text never reaches the transcript.
+    keyed to the side chat's old runner binding. Workspace and stored-login
+    refusals are authored server-side, so the host's own text never reaches
+    the transcript.
     """
     comm, runners, source, side_chat_id = await _side_chat_with_exited_source_runner(
         client, app, db_uri, monkeypatch, "claude-native"
