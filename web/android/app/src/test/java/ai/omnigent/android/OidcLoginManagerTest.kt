@@ -26,6 +26,31 @@ import java.util.concurrent.TimeUnit
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class OidcLoginManagerTest {
+    @Test
+    fun `PKCE update notice opens no browser and asks the shell to show upgrade`() {
+        LocalHttpServer { request ->
+            if (request.path == "/auth/cli-login") {
+                LocalHttpServer.Response(
+                    400,
+                    """{"error":"code_challenge (S256) is required. Upgrade Omnigent to sign in"}""",
+                )
+            } else {
+                LocalHttpServer.Response(404)
+            }
+        }.use { server ->
+            val activity = this.activity
+            var updates = 0
+            assertTrue(manager.start(activity, server.origin, {}, onUpdateRequired = { updates++ }))
+            val deadline = System.currentTimeMillis() + 10_000
+            while (updates == 0 && System.currentTimeMillis() < deadline) {
+                drainMainLooper()
+                Thread.sleep(5)
+            }
+            assertEquals(1, updates)
+            assertNull(shadowOf(activity).nextStartedActivity)
+        }
+    }
+
     private val manager = OidcLoginManager()
     private val activity: Activity
         get() = Robolectric.buildActivity(Activity::class.java).setup().get()
