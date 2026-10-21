@@ -91,6 +91,37 @@ class ConnectionStatusViewTest {
     }
 
     @Test
+    fun `details accept only a bare net error beside a known WebView code`() {
+        val view = ConnectionStatusView(context) {}
+        val details =
+            ConnectionFailureDetails(
+                "https://example.com",
+                "net::ERR_CONNECTION_REFUSED (ERROR_CONNECT)",
+                1234L,
+            )
+        view.show(
+            ConnectionStatus.ServerUnreachable("example.com", UnreachableKind.GENERIC, details),
+            immediate = true,
+        )
+        view.findViewById<View>(R.id.status_details_toggle).performClick()
+        val rendered = view.findViewById<TextView>(R.id.status_details_text).text.toString()
+        assertTrue(rendered, rendered.contains("net::ERR_CONNECTION_REFUSED (ERROR_CONNECT)"))
+
+        view.show(
+            ConnectionStatus.ServerUnreachable(
+                "example.com",
+                UnreachableKind.GENERIC,
+                details.copy(error = "net::ERR_FOO?x=1 (ERROR_CONNECT)"),
+            ),
+            immediate = true,
+        )
+        view.findViewById<View>(R.id.status_details_toggle).performClick()
+        val rejected = view.findViewById<TextView>(R.id.status_details_text).text.toString()
+        assertTrue(rejected.contains("ERROR_UNKNOWN"))
+        assertFalse(rejected.contains("ERR_FOO"))
+    }
+
+    @Test
     fun `deferred hide disables actions and show rearms them`() {
         val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
         val selected = mutableListOf<StatusAction>()

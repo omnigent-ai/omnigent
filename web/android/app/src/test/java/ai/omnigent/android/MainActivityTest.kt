@@ -94,6 +94,11 @@ class MainActivityTest {
         )
         assertEquals(View.VISIBLE, activity.declared<View>("connectionOverlay").visibility)
         assertFalse(activity.isFinishing)
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(600))
+        activity.findViewById<Button>(R.id.status_details_toggle).performClick()
+        val details = activity.findViewById<TextView>(R.id.status_details_text).text.toString()
+        assertTrue(details, details.contains("NetworkUnavailable"))
+        assertFalse(details.contains("Couldn't reach"))
     }
 
     @Test
@@ -191,7 +196,17 @@ class MainActivityTest {
         activity.findViewById<Button>(R.id.status_details_toggle).performClick()
         val details = activity.findViewById<TextView>(R.id.status_details_text).text.toString()
         assertTrue(details.contains("https://example.com"))
+        assertTrue(details, details.contains("net::ERR_CONNECTION_REFUSED (ERROR_CONNECT)"))
         assertFalse(details.contains("/chat/123"))
+        activity.findViewById<Button>(R.id.status_copy_details).performClick()
+        val copied =
+            activity
+                .getSystemService(ClipboardManager::class.java)
+                .primaryClip!!
+                .getItemAt(0)
+                .text
+                .toString()
+        assertEquals(details, copied)
 
         activity.findViewById<Button>(R.id.status_primary).performClick()
         assertEquals(2, manifestReads)
@@ -236,6 +251,34 @@ class MainActivityTest {
         assertFalse(rendered.contains("ERR_PRIVATESTATE"))
         assertFalse(rendered.contains("private-code"))
         assertFalse(rendered.contains("/oauth/callback"))
+    }
+
+    @Test
+    fun `malformed WebView error description falls back to numeric code`() {
+        val activity = launch()
+        val webView = activity.webView()
+        val url = "https://example.com/"
+        webView.webViewClient.onPageStarted(webView, url, null)
+        webView.webViewClient.onReceivedError(
+            webView,
+            request(url),
+            FakeWebResourceError(-6, "net::ERR_FOO?x=1"),
+        )
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(600))
+        activity.findViewById<Button>(R.id.status_details_toggle).performClick()
+        val details = activity.findViewById<TextView>(R.id.status_details_text).text.toString()
+        assertTrue(details.contains("ERROR_CONNECT"))
+        assertFalse(details.contains("ERR_FOO"))
+        assertFalse(details.contains("x=1"))
+        activity.findViewById<Button>(R.id.status_copy_details).performClick()
+        val copied =
+            activity
+                .getSystemService(ClipboardManager::class.java)
+                .primaryClip!!
+                .getItemAt(0)
+                .text
+                .toString()
+        assertEquals(details, copied)
     }
 
     @Test
@@ -472,6 +515,11 @@ class MainActivityTest {
                 "connectionStatus",
             ) is ConnectionStatus.WorkspaceFailure,
         )
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(600))
+        activity.findViewById<Button>(R.id.status_details_toggle).performClick()
+        val details = activity.findViewById<TextView>(R.id.status_details_text).text.toString()
+        assertTrue(details, details.contains("Rejected"))
+        assertFalse(details.contains("HTTP 403"))
     }
 
     @Test

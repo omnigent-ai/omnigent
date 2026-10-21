@@ -29,6 +29,10 @@ internal class ConnectionStatusView(
     context: Context,
     private val onAction: (StatusAction) -> Unit,
 ) : FrameLayout(context) {
+    private val safeWebViewError =
+        Regex(
+            "^net::ERR_[A-Z0-9_]{1,64} \\((?:ERROR_HOST_LOOKUP|ERROR_CONNECT|ERROR_IO|ERROR_TIMEOUT|ERROR_FAILED_SSL_HANDSHAKE)\\)$",
+        )
     private val scroll =
         LayoutInflater
             .from(
@@ -363,8 +367,17 @@ internal class ConnectionStatusView(
                     "SocketTimeoutException",
                     "IOException",
                     "NetworkUnavailable",
+                    "InvalidResponse",
+                    "UnsafeRedirect",
+                    "WorkspaceChanged",
+                    "UnsafeCookie",
+                    "MissingCookie",
+                    "UnexpectedLanding",
+                    "Rejected",
+                    "WorkspaceRequired",
+                    "UnsupportedWebView",
                     "RENDERER_CRASH",
-                )
+                ) || safeWebViewError.matches(it)
         } ?: "ERROR_UNKNOWN"
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density + .5f).toInt()

@@ -210,13 +210,33 @@ internal fun connectionErrorName(code: Int): String =
         else -> "ERROR_UNKNOWN"
     }
 
+private val bareNetError = Regex("^net::ERR_[A-Z0-9_]{1,64}$")
+
+internal fun webViewErrorName(
+    code: Int,
+    description: String,
+): String {
+    val constant = connectionErrorName(code)
+    return if (bareNetError.matches(description)) "$description ($constant)" else constant
+}
+
 internal fun failureClassName(error: Throwable?): String =
     when (error) {
         is java.net.UnknownHostException -> "UnknownHostException"
         is java.net.ConnectException -> "ConnectException"
         is java.net.SocketTimeoutException -> "SocketTimeoutException"
         is java.io.IOException -> "IOException"
+        is OidcSignInException.Network -> "NetworkUnavailable"
         is DatabricksSessionException.NetworkUnavailable -> "NetworkUnavailable"
+        is DatabricksSessionException.InvalidResponse -> "InvalidResponse"
+        is DatabricksSessionException.UnsafeRedirect -> "UnsafeRedirect"
+        is DatabricksSessionException.WorkspaceChanged -> "WorkspaceChanged"
+        is DatabricksSessionException.UnsafeCookie -> "UnsafeCookie"
+        is DatabricksSessionException.MissingCookie -> "MissingCookie"
+        is DatabricksSessionException.UnexpectedLanding -> "UnexpectedLanding"
+        is DatabricksSessionException.Rejected -> "Rejected"
+        is DatabricksSessionException.WorkspaceRequired -> "WorkspaceRequired"
+        is DatabricksSessionException.UnsupportedWebView -> "UnsupportedWebView"
         else -> "ERROR_UNKNOWN"
     }
 

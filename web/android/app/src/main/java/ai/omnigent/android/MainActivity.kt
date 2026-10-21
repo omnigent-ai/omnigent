@@ -1003,9 +1003,9 @@ class MainActivity : AppCompatActivity() {
                     onMainFrameCommitted = { view ->
                         if (view === webView) hideStatus()
                     },
-                    onMainFrameUnreachable = { view, code, _ ->
+                    onMainFrameUnreachable = { view, code, description ->
                         if (view === webView) {
-                            showUnreachable(connectionErrorName(code))
+                            showUnreachable(webViewErrorName(code, description))
                         }
                     },
                     onMainFrameSslError = { view, description ->
