@@ -48,8 +48,10 @@ def _wait(check, message: str, timeout: float = 90):
 
 @pytest.mark.parametrize("databricks", [False, True], ids=["direct", "databricks"])
 def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
-    tmp_path: Path, databricks: bool
+    tmp_path: Path, databricks: bool, page, built_spa
 ) -> None:
+    from playwright.sync_api import expect
+
     assert shutil.which("agy") and shutil.which("tmux"), "install agy and tmux"
     captured: list[dict] = []
     tool_requested = threading.Event()
@@ -112,6 +114,11 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             captured.append(request)
             parts: list[dict] = [{"text": "GATEWAY_SETUP_OK"}]
+            has_tool_result = any(
+                "GATEWAY_TOOL_RESULT" in json.dumps(part.get("functionResponse", {}))
+                for content in request.get("contents", [])
+                for part in content.get("parts", [])
+            )
             if request.get("tools"):
                 if not tool_requested.is_set():
                     file_tool = next(
@@ -140,12 +147,23 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                             }
                         }
                     ]
-                elif any(
-                    "GATEWAY_TOOL_RESULT" in json.dumps(part.get("functionResponse", {}))
-                    for content in request.get("contents", [])
-                    for part in content.get("parts", [])
-                ):
+                elif has_tool_result:
                     tool_completed.set()
+            if any(
+                "GATEWAY_RECALL_OK" in part.get("text", "")
+                for content in request.get("contents", [])
+                if content.get("role") == "user"
+                for part in content.get("parts", [])
+            ):
+                parts = [
+                    {
+                        "text": (
+                            "GATEWAY_RECALL_OK: GATEWAY_TOOL_RESULT"
+                            if has_tool_result
+                            else "GATEWAY_HISTORY_MISSING"
+                        )
+                    }
+                ]
             response = {
                 "candidates": [
                     {
@@ -302,36 +320,28 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                 return response.json()["data"]
 
             _wait(terminals, "host did not start native agy")
-            response = client.post(
-                f"/v1/sessions/{session_id}/events",
-                json={
-                    "type": "message",
-                    "data": {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "input_text",
-                                "text": (
-                                    "Read gateway-tool-check.txt, then reply GATEWAY_SETUP_OK."
-                                ),
-                            }
-                        ],
-                    },
-                },
-            )
-            response.raise_for_status()
-
-            def reply():
-                response = client.get(f"/v1/sessions/{session_id}/items")
-                response.raise_for_status()
-                return any(
-                    item.get("role") == "assistant" and "GATEWAY_SETUP_OK" in json.dumps(item)
-                    for item in response.json()["data"]
-                )
-
-            _wait(reply, "no native reply through the configured gateway", timeout=90)
+            page.goto(f"{str(client.base_url).rstrip('/')}/c/{session_id}")
+            composer = page.get_by_role("textbox", name="Message the agent")
+            composer.fill("Read gateway-tool-check.txt, then reply GATEWAY_SETUP_OK.")
+            page.get_by_role("button", name="Send", exact=True).click()
+            replies = page.locator('[data-testid="message-bubble"][data-role="assistant"]')
+            expect(replies.filter(has_text="GATEWAY_SETUP_OK")).to_have_count(1, timeout=90_000)
+            expect(page.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
             assert tool_completed.is_set(), "gateway did not receive the real file tool result"
             assert any("GATEWAY_SETUP_OK" in json.dumps(r.get("contents")) for r in captured)
+
+            page.reload()
+            expect(replies.filter(has_text="GATEWAY_SETUP_OK")).to_have_count(1)
+            composer.fill(
+                "Without tools, recall the file's contents from earlier. "
+                "Prefix your reply with GATEWAY_RECALL_OK."
+            )
+            page.get_by_role("button", name="Send", exact=True).click()
+            expect(
+                replies.filter(has_text="GATEWAY_RECALL_OK: GATEWAY_TOOL_RESULT")
+            ).to_have_count(1, timeout=90_000)
+            expect(replies.filter(has_text="GATEWAY_SETUP_OK")).to_have_count(1)
+            expect(page.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
         finally:
             (tmp_path / "gateway-requests.json").write_text(json.dumps(captured, indent=2))
             if client is not None:

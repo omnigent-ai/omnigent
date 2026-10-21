@@ -207,7 +207,7 @@ OpenAI Responses and Chat Completions endpoints are not supported.
 `tests/e2e_ui/shells/test_antigravity_gateway_setup.py` owns fresh daemon/host
 processes and a fake Gemini upstream. With agy and tmux installed, run
 `OMNIGENT_E2E_ANTIGRAVITY=mock uv run pytest tests/e2e_ui/shells/test_antigravity_gateway_setup.py --ui-skip-build`.
-The journeys check setup, streaming, a file tool, and browser repair guidance
+The journeys check setup, browser replies, a file tool, recall after reload, and repair guidance
 when saved credentials become invalid after host connection. They do not prove
 compatibility with a live external gateway. See [the gateway guide](../docs/native-agy-gateways.md)
 for live setup, tool, and resume smoke steps.
