@@ -8,6 +8,8 @@ means a look-alike host is rejected identically everywhere.
 
 from __future__ import annotations
 
+import os
+import re
 from typing import Final
 from urllib.parse import urlparse
 
@@ -87,3 +89,87 @@ def is_databricks_ai_gateway_url(base_url: str) -> bool:
     # Shape 2: workspace hostname + /ai-gateway/ path prefix.
     path = parsed.path or ""
     return path.startswith("/ai-gateway/")
+
+
+# Unity Gateway routes a request to the model provider service (an external
+# provider such as Amazon Bedrock or Azure OpenAI) named in this header; the
+# request's ``model`` is then the provider's own model id, e.g.
+# ``us.anthropic.claude-sonnet-5``.
+MODEL_PROVIDER_SERVICE_HEADER: Final = "Databricks-Model-Provider-Service"
+
+# Spawn-env var carrying an agent's ``executor.config.model_provider_service``
+# from the runner to the SDK harness processes.
+MODEL_PROVIDER_SERVICE_ENV_VAR: Final = "HARNESS_DATABRICKS_MODEL_PROVIDER_SERVICE"
+
+# Harnesses that send the provider-service header on their gateway requests.
+MODEL_PROVIDER_SERVICE_HARNESSES: Final = frozenset({"claude-sdk", "openai-agents"})
+
+# Prefixes the Databricks catalog puts on the models it serves itself.
+_DATABRICKS_MODEL_PREFIXES: Final = ("databricks/", "system.ai.", "databricks-")
+
+# Three-part Unity Catalog name, e.g. ``main.ai.bedrock_prod``.
+# Restricted to safe identifier characters because the value is sent as an HTTP
+# header (and joined into Claude Code's newline-separated header list).
+_MODEL_PROVIDER_SERVICE_NAME = re.compile(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+
+
+def validate_model_provider_service(name: str) -> str:
+    """Return *name* stripped, or raise if it is not a three-part UC name.
+
+    :param name: The configured model provider service, e.g.
+        ``"main.ai.bedrock_prod"``.
+    :returns: The stripped name.
+    :raises ValueError: If *name* is not ``catalog.schema.service`` made of
+        letters, digits, ``_`` and ``-``.
+    """
+    stripped = name.strip()
+    if not _MODEL_PROVIDER_SERVICE_NAME.fullmatch(stripped):
+        raise ValueError(
+            f"model_provider_service must be a three-part Unity Catalog name "
+            f"(catalog.schema.service), got {name!r}"
+        )
+    return stripped
+
+
+def model_provider_service_headers() -> dict[str, str]:
+    """Return the provider-service routing header for this harness process.
+
+    :returns: ``{MODEL_PROVIDER_SERVICE_HEADER: name}`` when
+        :data:`MODEL_PROVIDER_SERVICE_ENV_VAR` holds a valid name, else ``{}``.
+    :raises ValueError: If the variable is set to an invalid name.
+    """
+    raw = os.environ.get(MODEL_PROVIDER_SERVICE_ENV_VAR, "")
+    if not raw.strip():
+        return {}
+    return {MODEL_PROVIDER_SERVICE_HEADER: validate_model_provider_service(raw)}
+
+
+def is_databricks_catalog_model(model: str) -> bool:
+    """Return whether *model* is a Databricks-served id, which no provider service serves.
+
+    :param model: A model id, e.g. ``"databricks-claude-sonnet-5"`` (``True``) or
+        ``"us.anthropic.claude-sonnet-5"`` (``False``).
+    :returns: ``True`` when *model* carries a Databricks catalog prefix.
+    """
+    return model.strip().lower().startswith(_DATABRICKS_MODEL_PREFIXES)
+
+
+def provider_pinned_override_ignored(provider_service: object, model_override: object) -> bool:
+    """Return whether a provider-pinned agent must ignore *model_override*.
+
+    An agent pinned to a model provider service keeps its own provider model: the
+    provider cannot serve a Databricks-hosted id, and sending one with the
+    provider header fails the turn (``NOT_FOUND`` / ``403``).
+
+    :param provider_service: The agent's ``executor.config.model_provider_service``,
+        e.g. ``"main.ai.bedrock_prod"``, or ``None``.
+    :param model_override: The session or dispatch model override, e.g.
+        ``"databricks-claude-opus-5"``, or ``None``.
+    :returns: ``True`` when both are set and the override is a Databricks-hosted id.
+    """
+    return (
+        bool(provider_service)
+        and isinstance(model_override, str)
+        and bool(model_override)
+        and is_databricks_catalog_model(model_override)
+    )

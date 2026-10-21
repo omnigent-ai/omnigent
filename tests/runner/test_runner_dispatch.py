@@ -13347,6 +13347,114 @@ async def test_failed_turn_event_names_the_web_message_it_carried() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_service", "override", "forwarded"),
+    [
+        # Pinned agent + Databricks-hosted override: dropped from the turn too.
+        ("main.ai.bedrock_prod", "databricks-claude-opus-5", None),
+        # Pinned agent + one of the provider's own models: still forwarded.
+        ("main.ai.bedrock_prod", "us.anthropic.claude-opus-5-5", "us.anthropic.claude-opus-5-5"),
+        # Unpinned agent: Databricks-hosted overrides are forwarded as before.
+        (None, "databricks-claude-opus-5", "databricks-claude-opus-5"),
+    ],
+)
+async def test_turn_model_override_respects_provider_pin(
+    provider_service: str | None, override: str, forwarded: str | None
+) -> None:
+    """A provider-pinned agent's turn never carries a Databricks-hosted model.
+
+    The spawn env drops such an override, but the turn body forwards it to the
+    executor separately; without the same check there, a sub-agent dispatch with
+    ``model_override=databricks-claude-opus-5`` reached the provider service and
+    failed with 403.
+    """
+    from omnigent.inference_config import inference_config_scope
+    from omnigent.spec.types import ApiKeyAuth
+
+    conv = f"conv_provider_pin_{provider_service is not None}_{override}"
+
+    def _server_handler(request: httpx.Request) -> httpx.Response:
+        """
+        Stub Omnigent server: session snapshot and an empty history.
+
+        :param request: Outbound request from the runner.
+        :returns: Snapshot for the session GET, empty ``/items``, else ``{}``.
+        """
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{conv}":
+            return httpx.Response(200, json={"id": conv, "agent_id": "ag_pinned"})
+        if request.url.path.endswith("/items"):
+            return httpx.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": [],
+                    "first_id": None,
+                    "last_id": None,
+                    "has_more": False,
+                },
+            )
+        return httpx.Response(200, json={})
+
+    server_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler),
+        base_url="http://server",
+    )
+
+    async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """
+        Resolve a claude-sdk spec, pinned to *provider_service* when set.
+
+        :param agent_id: Agent id resolved from the snapshot (unused).
+        :param session_id: Session id (unused).
+        :returns: The agent spec under test.
+        """
+        del agent_id, session_id
+        config: dict[str, str] = {"harness": "claude-sdk"}
+        if provider_service is not None:
+            config["model_provider_service"] = provider_service
+        return AgentSpec(
+            spec_version=1,
+            name="pinned-agent",
+            executor=ExecutorSpec(
+                type="omnigent",
+                config=config,
+                model="us.anthropic.claude-sonnet-5",
+                auth=ApiKeyAuth(api_key="synthetic-test-key", base_url="http://127.0.0.1:1"),
+            ),
+        )
+
+    captured: dict[str, Any] = {}
+    reached = asyncio.Event()
+    app = create_runner_app(
+        process_manager=cast(
+            HarnessProcessManager,
+            _ContentCapturingProcessManager(captured, reached),
+        ),
+        spec_resolver=_spec_resolver,
+        server_client=server_client,
+    )
+    try:
+        with inference_config_scope({}):
+            async with _runner_test_client(app) as http:
+                response = await http.post(
+                    f"/v1/sessions/{conv}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "model": "x",
+                        "model_override": override,
+                        "content": [{"type": "input_text", "text": "plan it"}],
+                    },
+                )
+                assert response.status_code == 202
+                await asyncio.wait_for(reached.wait(), timeout=10.0)
+    finally:
+        await server_client.aclose()
+
+    assert captured["body"].get("model_override") == forwarded
+
+
+@pytest.mark.asyncio
 async def test_turn_lifecycle_events_name_the_web_message_they_settle() -> None:
     conv = "conv_stable_id_on_lifecycle"
     stable_id = "8a4b0d2f6c3e5a7b9d1f2e3c4b5a6d7e"
