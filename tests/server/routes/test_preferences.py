@@ -3,6 +3,7 @@
 from uuid import uuid4
 
 import httpx
+import pytest
 
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
@@ -14,18 +15,26 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.preference_store.sqlalchemy_store import SqlAlchemyPreferenceStore
 
 
-async def test_authenticated_preference_operations(runtime_init, db_uri, tmp_path, monkeypatch):
+@pytest.mark.parametrize("positional_auth", [False, True])
+async def test_authenticated_preference_operations(
+    runtime_init, db_uri, tmp_path, monkeypatch, positional_auth
+):
     monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "0")
     store = SqlAlchemyPreferenceStore(db_uri, authority_id="test-authority")
     artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
-    app = create_app(
-        agent_store=SqlAlchemyAgentStore(db_uri),
-        file_store=SqlAlchemyFileStore(db_uri),
-        conversation_store=SqlAlchemyConversationStore(db_uri),
-        artifact_store=artifacts,
-        agent_cache=AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "cache"),
-        preference_store=store,
-        auth_provider=UnifiedAuthProvider(source="header"),
+    stores = [
+        SqlAlchemyAgentStore(db_uri),
+        SqlAlchemyFileStore(db_uri),
+        SqlAlchemyConversationStore(db_uri),
+        artifacts,
+        AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "cache"),
+    ]
+    provider = UnifiedAuthProvider(source="header")
+    # Existing embedders pass auth after six optional stores/tunnel arguments.
+    app = (
+        create_app(*stores, *([None] * 6), provider, preference_store=store)
+        if positional_auth
+        else create_app(*stores, auth_provider=provider, preference_store=store)
     )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -63,6 +72,37 @@ async def test_authenticated_preference_operations(runtime_init, db_uri, tmp_pat
             await client.post(
                 path + "/operations", json={**operation, "value": "claude-native"}, headers=alice
             )
+        ).status_code == 409
+        conflict = {**operation, "operation_id": str(uuid4()), "value": "codex-native"}
+        assert (await client.post(path + "/operations", json=conflict, headers=alice)).json()[
+            "status"
+        ] == "conflict"
+        first = (await client.get(path, params={"limit": 1}, headers=alice)).json()
+        assert first["next_cursor"] and len(first["conflicts"]) == 1
+        last = (
+            await client.get(
+                path, params={"limit": 1, "cursor": first["next_cursor"]}, headers=alice
+            )
+        ).json()
+        assert last["next_cursor"] is None and len(last["entries"]) == 1
+        assert first["revision"] == last["revision"]
+        for params, status in [
+            ({"limit": 0}, 422),
+            ({"limit": 101}, 422),
+            ({"cursor": "bad"}, 400),
+        ]:
+            assert (await client.get(path, params=params, headers=alice)).status_code == status
+        newer = {
+            **operation,
+            "operation_id": str(uuid4()),
+            "expected_version": 1,
+            "value": "claude-native",
+        }
+        assert (
+            await client.post(path + "/operations", json=newer, headers=alice)
+        ).status_code == 200
+        assert (
+            await client.get(path, params={"cursor": first["next_cursor"]}, headers=alice)
         ).status_code == 409
 
 

@@ -7,10 +7,11 @@ or deletion history. This API does not mark a workspace imported/adopted.
 
 from __future__ import annotations
 
-from typing import TypeVar
+import base64
+from typing import Annotated, TypeVar
 
-from pydantic import BaseModel
-from sqlalchemy import LargeBinary, delete, or_, select, type_coerce, update
+from pydantic import BaseModel, Field
+from sqlalchemy import LargeBinary, delete, select, type_coerce, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -30,13 +31,15 @@ from omnigent.preference_sync import (
     MAX_KEYS,
     MAX_OPERATIONS,
     MAX_RECORD_BYTES,
+    PREFERENCE_PAGE_SIZE,
     Name,
     PreferenceMutation,
     PreferenceNamespace,
+    PreferencePage,
     PreferenceResult,
-    PreferenceSnapshot,
     ProtocolModel,
     SharedPreferenceEntry,
+    Version,
 )
 from omnigent.server.auth import RESERVED_USER_LOCAL
 
@@ -53,6 +56,14 @@ class _Metadata(ProtocolModel):
     revision: int = 0
     keys: int = 0
     conflicts: int = 0
+
+
+class _Cursor(ProtocolModel):
+    identity: PreferenceNamespace
+    revision: Version
+    after: Annotated[
+        str, Field(pattern=r"^shared\.v1\.(?:conflict\.[0-9a-f]{32}|value\.[0-9a-f]{64})$")
+    ]
 
 
 class _Receipt(ProtocolModel):
@@ -100,35 +111,90 @@ class SqlAlchemyPreferenceStore:
             SqlPreference.user_id == self.identity(user_id).user_id,
         )
 
-    def read(self, *, user_id: str | None) -> PreferenceSnapshot:
-        snapshot = PreferenceSnapshot(identity=self.identity(user_id))
-        with self._session("read_shared_preferences") as session:
-            rows = session.execute(
-                select(SqlPreference.key, type_coerce(SqlPreference.value, LargeBinary))
-                .where(
-                    *self._scope(user_id),
-                    or_(
-                        SqlPreference.key == _META,
-                        SqlPreference.key.startswith(_VALUE),
-                        SqlPreference.key.startswith(_CONFLICT),
-                    ),
+    def read(
+        self, *, user_id: str | None, limit: int = PREFERENCE_PAGE_SIZE, cursor: str | None = None
+    ) -> PreferencePage:
+        if type(limit) is not int or not 1 <= limit <= PREFERENCE_PAGE_SIZE:
+            raise OmnigentError("Invalid preference page size", code=ErrorCode.INVALID_INPUT)
+        identity = self.identity(user_id)
+        continuation = None
+        if cursor is not None:
+            try:
+                if len(cursor) > 4096:
+                    raise ValueError("Cursor too long")
+                continuation = _Cursor.model_validate_json(
+                    base64.b64decode(cursor, altchars=b"-_", validate=True)
                 )
-                .order_by(SqlPreference.key)
-            ).all()
-        entries = []
-        conflicts = []
-        revision = 0
-        for key, raw in rows:
-            if key == _META:
-                metadata = _decode(raw, _Metadata)
-                self._check_authority(metadata)
-                revision = metadata.revision
-            elif key.startswith(_VALUE):
-                entries.append(_decode(raw, SharedPreferenceEntry))
-            else:
-                conflicts.append(_decode(raw, PreferenceMutation))
-        return snapshot.model_copy(
-            update={"revision": revision, "entries": entries, "conflicts": conflicts}
+            except ValueError as exc:
+                raise OmnigentError(
+                    "Invalid preference cursor", code=ErrorCode.INVALID_INPUT
+                ) from exc
+            if continuation.identity != identity:
+                raise OmnigentError(
+                    "Preference cursor identity mismatch", code=ErrorCode.INVALID_INPUT
+                )
+        scope = self._scope(user_id)
+        metadata_query = select(type_coerce(SqlPreference.value, LargeBinary)).where(
+            *scope, SqlPreference.key == _META
+        )
+        with self._session("read_shared_preferences") as session:
+            raw = session.scalar(metadata_query)
+            metadata = (
+                _Metadata(authority_id=self._authority) if raw is None else _decode(raw, _Metadata)
+            )
+            self._check_authority(metadata)
+            if continuation is not None and continuation.revision != metadata.revision:
+                raise OmnigentError(
+                    "Preference revision changed; restart pagination", code=ErrorCode.CONFLICT
+                )
+            rows = []
+            for prefix in (_CONFLICT, _VALUE):
+                if (
+                    continuation is not None
+                    and continuation.after.startswith(_VALUE)
+                    and prefix == _CONFLICT
+                ):
+                    continue
+                remaining = limit + 1 - len(rows)
+                if remaining == 0:
+                    break
+                query = select(
+                    SqlPreference.key, type_coerce(SqlPreference.value, LargeBinary)
+                ).where(
+                    *scope, SqlPreference.key >= prefix + "0", SqlPreference.key < prefix + "g"
+                )
+                if continuation is not None and continuation.after.startswith(prefix):
+                    query = query.where(SqlPreference.key > continuation.after)
+                rows.extend(
+                    session.execute(query.order_by(SqlPreference.key).limit(remaining)).all()
+                )
+            # READ COMMITTED may see a write between range reads; never label a mixed page.
+            if session.scalar(metadata_query) != raw:
+                raise OmnigentError(
+                    "Preference revision changed; restart pagination", code=ErrorCode.CONFLICT
+                )
+        next_cursor = None
+        if len(rows) > limit:
+            rows = rows[:limit]
+            next_cursor = base64.urlsafe_b64encode(
+                _Cursor(identity=identity, revision=metadata.revision, after=rows[-1][0])
+                .model_dump_json()
+                .encode()
+            ).decode()
+        return PreferencePage(
+            identity=identity,
+            revision=metadata.revision,
+            next_cursor=next_cursor,
+            entries=[
+                _decode(value, SharedPreferenceEntry)
+                for key, value in rows
+                if key.startswith(_VALUE)
+            ],
+            conflicts=[
+                _decode(value, PreferenceMutation)
+                for key, value in rows
+                if key.startswith(_CONFLICT)
+            ],
         )
 
     def _check_authority(self, metadata: _Metadata) -> None:

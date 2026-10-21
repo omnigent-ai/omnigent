@@ -87,6 +87,17 @@ def test_shared_preferences_across_replicas_and_restart(tmp_path, db_uri):
                 saved = client.get(first + path).json()
                 assert saved == client.get(second + path).json()
                 assert saved["conflicts"] == []
+                first_page = client.get(first + path, params={"limit": 2}).json()
+                pages = [first_page]
+                while pages[-1]["next_cursor"]:
+                    reply = client.get(
+                        second + path, params={"limit": 2, "cursor": pages[-1]["next_cursor"]}
+                    )
+                    assert reply.status_code == 200, reply.text
+                    pages.append(reply.json())
+                assert len(pages) == 3
+                assert all(page["revision"] == saved["revision"] for page in pages)
+                assert [entry for page in pages for entry in page["entries"]] == saved["entries"]
     with isolated_local_server(
         tmp_path / "restart", extra_args=arguments, env=server_env
     ) as restarted:
@@ -94,11 +105,16 @@ def test_shared_preferences_across_replicas_and_restart(tmp_path, db_uri):
             base_url=restarted, headers=alice, timeout=20, trust_env=False
         ) as client:
             assert client.get(path).json() == saved
+            resumed = client.get(path, params={"limit": 2, "cursor": first_page["next_cursor"]})
+            assert resumed.status_code == 200 and resumed.json() == pages[1]
             assert client.post(path + "/operations", json=resolution).json() == resolved
             removal = operation("model", "model", None, 2)
             assert client.post(path + "/operations", json=removal).json()["entry"]["version"] == 3
-            # A delayed old reply returns its receipt and cannot resurrect the deleted value.
+            # Replaying an old operation returns its receipt without resurrecting the value.
             assert client.post(path + "/operations", json=edits[0]).json() == results[0]
+            assert (
+                client.get(path, params={"cursor": first_page["next_cursor"]}).status_code == 409
+            )
             current = client.get(path).json()
             model = next(
                 item

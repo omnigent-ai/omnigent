@@ -22,7 +22,20 @@ source of an edit; it is not proof of machine identity or an authorization grant
 ## Read and edit
 
 `GET /v1/preferences/shared` returns protocol version `1`, the authenticated
-`identity`, a namespace `revision`, `entries`, and unresolved `conflicts`.
+`identity`, a namespace `revision`, `entries`, unresolved `conflicts`, and
+`next_cursor`. Pass `limit` (1–100, default 100) and the opaque `cursor` from the
+previous page until `next_cursor` is null. Conflicts precede values; each range
+uses deterministic key order. The combined entry/conflict count is at most
+`limit`. Metadata is a point lookup, and indexed key ranges exclude receipt
+history; work per page is O(limit), independent of receipt count.
+
+Every cursor binds the authenticated namespace and revision. If any edit commits
+between pages, the server returns 409: discard all collected pages and restart
+from page one. Each page also detects writes between its own range reads (or
+uses the database's consistent transaction snapshot). Only publish a complete
+snapshot from one revision; never adopt a partial page. Malformed or foreign
+cursors return 400. A cursor is not an authorization credential.
+
 Reads do not create records or initialize adoption. Each entry includes its
 `key`, `version`, `value`, and originating `installation_id`. A missing key has
 version `0`. A deleted key remains present with `value: null` and its version.

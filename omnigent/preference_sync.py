@@ -29,6 +29,7 @@ from omnigent.preferences import (
 Name = Annotated[str, Field(strict=True, min_length=1, max_length=128, pattern=r"^\S(?:.*\S)?$")]
 Version = Annotated[StrictInt, Field(ge=0, le=2**53 - 1)]
 Value = StrictStr | StrictBool | list[StrictStr] | None
+PREFERENCE_PAGE_SIZE = 100
 MAX_KEYS = 512
 MAX_OPERATIONS = 10000
 MAX_CONFLICTS = 128
@@ -105,7 +106,7 @@ class PreferenceMutation(ProtocolModel):
         if len(self.resolves) != len(set(self.resolves)):
             raise ValueError("conflict IDs must be unique")
         if len(self.model_dump_json(include={"value"}).encode()) > MAX_VALUE_BYTES:
-            raise ValueError("preference value exceeds 8192 bytes")
+            raise ValueError("encoded preference value envelope exceeds 8192 bytes")
         return self
 
 
@@ -144,3 +145,18 @@ class PreferenceSnapshot(ProtocolModel):
                 if entry.value is not None
             },
         )
+
+
+class PreferencePage(ProtocolModel):
+    """One revision-bound page; only a complete traversal forms a snapshot."""
+
+    protocol_version: Literal[1] = 1
+    identity: PreferenceNamespace
+    revision: Version = 0
+    entries: list[SharedPreferenceEntry] = Field(
+        default_factory=list, max_length=PREFERENCE_PAGE_SIZE
+    )
+    conflicts: list[PreferenceMutation] = Field(
+        default_factory=list, max_length=PREFERENCE_PAGE_SIZE
+    )
+    next_cursor: str | None

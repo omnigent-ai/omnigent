@@ -121,6 +121,9 @@ This drives two isolated CLI servers sharing a SQLite database through actual
 HTTP requests (or another isolated backend via `OMNIGENT_TEST_DB_URI`). It checks
 all preference groups, conflicting edits, explicit
 resolution, retries, user isolation, deletion, and persistence after restart.
+It also walks small pages across replicas, resumes a cursor after restart,
+and rejects continuation after another edit; a stable traversal has no missing
+or duplicated preferences.
 No services or providers are mocked; no model is called. This verifies the local
 OSS API, not managed deployment or actual native application of preferences.
 The store matrix also runs on PostgreSQL, MySQL, and CockroachDB:
@@ -129,6 +132,13 @@ The store matrix also runs on PostgreSQL, MySQL, and CockroachDB:
 uv run --no-sync pytest tests/stores/test_preference_store.py \
   tests/server/routes/test_preferences.py tests/test_preference_sync.py --reruns 0 -q
 ```
+
+The standard component matrix also checks page boundaries, malformed/foreign
+cursors, edits during and between pages, partial conflict resolution, and
+wrong-key rejection without consuming the operation ID. A SQLite query-plan/VM
+check adds 10,000 receipt rows and verifies page work stays bounded. Route tests
+cover both keyword and legacy positional authentication. These are store/HTTP
+checks; the process recipe above covers replica and restart transport.
 
 For later slices, continue live verification of each newly connected path on an
 isolated deployment. Record the candidate/runtime versions, configuration,

@@ -1333,7 +1333,6 @@ def create_app(
     permission_store: PermissionStore | None = None,
     scheduled_task_store: ScheduledTaskStore | None = None,
     project_store: ProjectStore | None = None,
-    preference_store: PreferenceStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
     account_store: Any | None = None,  # SqlAlchemyAccountStore — accounts mode only
@@ -1358,6 +1357,8 @@ def create_app(
     extension_state: ExtensionPluginState | None = None,
     base_path: str | None = None,
     host_sharded: bool = False,
+    *,
+    preference_store: PreferenceStore | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
