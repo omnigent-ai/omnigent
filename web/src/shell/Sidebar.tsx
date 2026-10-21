@@ -4608,6 +4608,10 @@ function ConversationRowImpl({
   onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
   onProjectAssigned?: (projectName: string) => void;
 }) {
+  const grids = useGridSessions();
+  const inActiveGrid = grids?.activeGrid
+    ? gridSessionIds(grids.activeGrid.layout).includes(conversation.id)
+    : false;
   const atPinCap = useContext(PinCapacityContext);
   const pinSaving = useContext(PinSavingContext);
   let pinTooltip = isPinned ? "Unpin" : "Pin";
@@ -4830,11 +4834,7 @@ function ConversationRowImpl({
     id: conversation.id,
     data: { type: "session", label, project: currentProject, isPinned, canManage: isOwner },
     disabled:
-      (!isOwner && !isFeatureEnabled(serverInfo, "grid_sessions_display_ui")) ||
-      selectionMode ||
-      isArchived ||
-      isEditing ||
-      isProvisionalRow,
+      (!isOwner && !grids?.enabled) || selectionMode || isArchived || isEditing || isProvisionalRow,
   });
   // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
   // on the same anchor still fires a click); swallow that one click so a drag
@@ -5017,12 +5017,8 @@ function ConversationRowImpl({
     <Link
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       componentId="sidebar.conversation_switcher"
-      draggable={isFeatureEnabled(serverInfo, "grid_sessions_display_ui") ? false : undefined}
-      onDragStart={
-        isFeatureEnabled(serverInfo, "grid_sessions_display_ui")
-          ? (event) => event.preventDefault()
-          : undefined
-      }
+      draggable={grids?.enabled ? false : undefined}
+      onDragStart={grids?.enabled ? (event) => event.preventDefault() : undefined}
       className={cn(
         SIDEBAR_ROW,
         "relative flex flex-col justify-center text-left text-foreground transition-colors",
@@ -5055,7 +5051,7 @@ function ConversationRowImpl({
         !selectionMode && "md:group-hover:pr-20 md:group-has-[:focus-visible]:pr-20",
         !selectionMode && menuOpen && "md:pr-20",
         selectionMode && "pr-2 pl-8",
-        !selectionMode && isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
+        !selectionMode && (isActive || inActiveGrid) && SIDEBAR_ACTIVE_HIGHLIGHT,
         selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
       )}
       onClick={(e) => {
