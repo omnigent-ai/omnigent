@@ -186,18 +186,8 @@ internal class ConnectionStatusView(
         host.visibility = if (presentation.hostChip) View.VISIBLE else View.GONE
         val animate = ValueAnimator.areAnimatorsEnabled()
         progress.visibility = if (presentation.progress && animate) View.VISIBLE else View.INVISIBLE
-        icon.visibility = if (presentation.icon == StatusIcon.NONE) View.GONE else View.VISIBLE
-        if (presentation.icon != StatusIcon.NONE) {
-            icon.setImageResource(
-                when (presentation.icon) {
-                    StatusIcon.UNREACHABLE -> R.drawable.ic_status_unreachable
-                    StatusIcon.ALERT -> R.drawable.ic_status_alert
-                    StatusIcon.CRASH -> R.drawable.ic_status_crash
-                    StatusIcon.LOCK -> R.drawable.ic_status_lock
-                    StatusIcon.NONE -> error("No icon")
-                },
-            )
-        }
+        icon.visibility = if (presentation.icon == null) View.GONE else View.VISIBLE
+        presentation.icon?.let(icon::setImageResource)
         val details =
             when (state) {
                 is ConnectionStatus.ServerUnreachable -> state.details
