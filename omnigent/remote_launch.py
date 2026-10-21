@@ -60,14 +60,10 @@ async def resolve_remote_launch_host(
     :raises LocalHostCannotLaunchError: If this machine's host can't run *harness*.
     :raises RemoteLaunchHostError: If only other machines' hosts could.
     """
-    from omnigent.harness_aliases import canonicalize_harness
     from omnigent.host import identity
 
     try:
-        hosts = await sessions.list_launch_hosts(
-            harness=harness,
-            canonicalize=lambda name: canonicalize_harness(name) or name,
-        )
+        hosts = await sessions.list_launch_hosts(harness=harness)
     except OmnigentError as exc:
         if exc.status_code == 404:
             logger.debug("server does not expose launch hosts", exc_info=True)

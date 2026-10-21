@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 import os
 import secrets
@@ -77,6 +76,7 @@ from omnigent.process_logging import (
     open_process_log_file,
     process_log_dir_reference,
 )
+from omnigent.session_host import get_session_host, route_session_request, set_session_host
 from omnigent.spec import load as load_spec
 from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
 from omnigent.spec.parser import discover_host_skills
@@ -675,70 +675,6 @@ def _is_url(target: str) -> bool:
 # Server URL client helpers
 # ---------------------------------------------------------------------------
 
-# Client-side ``session_id → host_id`` tracking, for routing a session's
-# tunnel-bound traffic to the right server replica when the server runs
-# multiple.
-#
-# A host's control tunnel and its runners' tunnels register on a single
-# replica, so the turn / resource / stream calls for a session running on that
-# host must name the host or they can reach a different replica than the runner
-# tunnel they need. The host_id is the routing key; it's populated when the CLI
-# learns a session's host (session GETs, daemon launch) and read once when a
-# client for that session is built — callers pass the session_id they already
-# have to ``_server_auth`` rather than the auth re-deriving it per request. This
-# is the Python peer of the web UI's ``sessionHost.ts``. (The host_id is
-# translated into the routing header inside ``cli_auth.databricks_request_headers``;
-# OSS only ever threads a host_id.)
-_session_hosts: dict[str, str] = {}
-
-
-def set_session_host(session_id: str, host_id: str | None) -> None:
-    """Record (or clear) the host a session is bound to.
-
-    A ``None``/empty host clears any stale mapping so a session that loses its
-    host binding stops routing to the old replica.
-
-    :param session_id: Session id, e.g. ``"conv_abc123"``.
-    :param host_id: The bound host id, e.g. ``"host_abc123"``, or ``None``.
-    """
-    if host_id:
-        _session_hosts[session_id] = host_id
-    else:
-        _session_hosts.pop(session_id, None)
-
-
-def get_session_host(session_id: str) -> str | None:
-    """Return a session's bound host id, or ``None`` when unknown.
-
-    :param session_id: Session id, e.g. ``"conv_abc123"``.
-    :returns: The host id, or ``None`` (session not seen yet, or hostless).
-    """
-    return _session_hosts.get(session_id)
-
-
-async def _route_remote_session_request(request: httpx.Request) -> None:
-    """Route each remote CLI request by its own host, without pinning the client."""
-    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, databricks_request_headers
-
-    base_path, separator, route = request.url.path.partition("/v1/sessions")
-    if not separator:
-        return
-    host_id = None
-    if (
-        not route
-        and request.method == "POST"
-        and "application/json" in request.headers.get("content-type", "")
-    ):
-        host_id = json.loads(request.content).get("host_id")
-    elif route.startswith("/"):
-        host_id = get_session_host(urllib.parse.unquote(route.split("/")[1]))
-    request.headers.pop(OMNIGENT_SLICE_KEY_HEADER, None)
-    request.headers.update(
-        databricks_request_headers(
-            str(request.url.copy_with(path=base_path, query=None)), host_id=host_id
-        )
-    )
-
 
 def _remote_headers(
     server_url: str | None = None,
@@ -1143,9 +1079,12 @@ def _chat_with_server(
             {},
             what=f"Session {source_session_id} lookup",
         )
+        host_id = snapshot.get("host_id")
+        set_session_host(source_session_id, host_id if isinstance(host_id, str) else None)
         session_agent = snapshot.get("agent_name")
         agent_name = session_agent if isinstance(session_agent, str) and session_agent else None
         if agent_name is None and fork_session_id is not None:
+            # Display only: the fork copies its source agent without a name lookup.
             agent_name = "agent"
         if agent_name is None and initial_message is not None:
             # --agent is rejected with --resume, so the generic "pass --agent"
@@ -2530,7 +2469,7 @@ def _run_headless_prompt(
             base_url=base_url,
             headers=_server_headers(runner_id=runner_id),
             auth=_server_auth(server_url=base_url, session_id=None),
-            request_hooks=[_route_remote_session_request],
+            request_hooks=[route_session_request],
         ) as client:
             # Both a local bundle and a remote registered agent go through
             # the sessions API; _query_sessions_once picks the create route
@@ -4419,7 +4358,7 @@ def _run_repl(
             base_url=base_url,
             headers=_server_headers(runner_id=runner_id),
             auth=server_auth,
-            request_hooks=[_route_remote_session_request],
+            request_hooks=[route_session_request],
         ) as client:
             # When --fork is set, call the fork endpoint before
             # entering the REPL so the user lands in the fork.

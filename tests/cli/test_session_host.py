@@ -1,4 +1,4 @@
-"""Unit tests for client-side session→host routing helpers in ``chat``."""
+"""Session host affinity and its integration with CLI authentication."""
 
 from __future__ import annotations
 
@@ -6,23 +6,18 @@ import httpx
 import pytest
 from omnigent_client import OmnigentClient
 
-from omnigent.chat import (
-    _DatabricksTokenAuth,
-    _route_remote_session_request,
-    get_session_host,
-    set_session_host,
-)
+from omnigent import session_host
+from omnigent.chat import _DatabricksTokenAuth
 from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
+from omnigent.session_host import get_session_host, route_session_request, set_session_host
 
 
 @pytest.fixture(autouse=True)
 def _clear_map() -> None:
     """Reset the module-global session→host map between tests."""
-    from omnigent import chat
-
-    chat._session_hosts.clear()
+    session_host._session_hosts.clear()
     yield
-    chat._session_hosts.clear()
+    session_host._session_hosts.clear()
 
 
 def test_set_session_host_clears_on_empty() -> None:
@@ -97,11 +92,39 @@ async def test_request_routing_follows_the_target_session(
             200, json={"id": "conv_new", "agent_id": "ag_new", "status": "idle", "created_at": 0}
         )
 
-    async with OmnigentClient(
-        mount, auth=auth, request_hooks=[_route_remote_session_request]
-    ) as client:
+    async with OmnigentClient(mount, auth=auth, request_hooks=[route_session_request]) as client:
         async with httpx.MockTransport(handler) as transport:
             with monkeypatch.context() as patcher:
                 patcher.setattr(client._http, "_transport", transport)
                 assert (await client.sessions.get("conv_new")).id == "conv_new"
                 assert OMNIGENT_SLICE_KEY_HEADER not in client._http.headers
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "body", "content_type", "expected_host"),
+    [
+        ("/v1/hosts", b"", "", "host_existing"),
+        ("/v1/sessions-other", b"", "", "host_existing"),
+        ("/v1/sessions/conv%2Fencoded/events?q=1", b"", "", "host_encoded"),
+        ("/v1/sessions", b'{"host_id":"host_launch"}', "application/json", "host_launch"),
+        ("/v1/sessions", b"[]", "application/json", "host_fallback"),
+        ("/v1/sessions", b"broken", "application/json", "host_fallback"),
+        ("/v1/sessions", b"bundle", "multipart/form-data", "host_fallback"),
+    ],
+)
+async def test_request_routing_only_interprets_session_routes(
+    monkeypatch: pytest.MonkeyPatch, path: str, body: bytes, content_type: str, expected_host: str
+) -> None:
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "host_fallback")
+    set_session_host("conv/encoded", "host_encoded")
+    request = httpx.Request(
+        "POST",
+        f"http://127.0.0.1/api/2.0/omnigent{path}",
+        content=body,
+        headers={OMNIGENT_SLICE_KEY_HEADER: "host_existing", "content-type": content_type},
+    )
+    await route_session_request(request)
+    assert request.headers[OMNIGENT_SLICE_KEY_HEADER] == expected_host
+    assert request.content == body

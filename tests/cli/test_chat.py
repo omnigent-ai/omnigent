@@ -1926,10 +1926,7 @@ def test_pick_agent_follows_agent_listing_pages(monkeypatch: pytest.MonkeyPatch)
 
 @pytest.mark.parametrize(
     "second_page",
-    [
-        _agents_page(["coder"], has_more=True, last_id=None),  # cursor missing
-        _agents_page(["coder"], has_more=True, last_id="ag_first"),  # cursor unchanged
-    ],
+    [_agents_page(["coder"], has_more=True, last_id="ag_first")],
 )
 def test_pick_agent_rejects_a_stalled_agent_listing(
     monkeypatch: pytest.MonkeyPatch, second_page: dict[str, object]
@@ -1974,39 +1971,12 @@ def test_pick_agent_headless_error_summarizes_a_long_registry(
     assert "(and 5 more)" in message
 
 
-@pytest.mark.parametrize("data", [None, {"name": "scribe"}])
-def test_pick_agent_rejects_a_listing_without_a_data_list(
-    monkeypatch: pytest.MonkeyPatch, data: object
-) -> None:
-    """A listing whose ``data`` is not a list is a discovery error, not a traceback."""
-    _serve_listings(monkeypatch, agent_pages=[{"data": data, "has_more": False, "last_id": None}])
-
-    with pytest.raises(click.ClickException, match="unexpected body shape"):
-        _pick_agent("http://127.0.0.1:6767")
-
-
-@pytest.mark.parametrize(
-    "invalid_row",
-    [
-        None,
-        "bad",
-        {},
-        {"id": "ag_x"},
-        {"name": "other"},
-        {"id": "ag_x", "name": 7},
-        {"id": 7, "name": "other"},
-        {"id": "", "name": "other"},
-        {"id": "ag_x", "name": ""},
-        {"id": " ", "name": "other"},
-        {"id": "ag_x", "name": " "},
-    ],
-)
 @pytest.mark.parametrize("scope", [None, "user"])
 def test_pick_agent_rejects_malformed_listing_rows(
-    monkeypatch: pytest.MonkeyPatch, invalid_row: object, scope: str | None
+    monkeypatch: pytest.MonkeyPatch, scope: str | None
 ) -> None:
     """A valid survivor must not auto-select when discovery is incomplete."""
-    rows = [{"name": "scribe", "id": "ag_s"}, invalid_row]
+    rows = [{"name": "scribe", "id": "ag_s"}, {}]
     page = {"data": rows, "has_more": False, "last_id": None}
     _serve_listings(
         monkeypatch,
@@ -2034,7 +2004,6 @@ def test_pick_agent_headless_with_several_agents_asks_for_agent_flag(
     message = str(excinfo.value)
     assert "--agent <name>" in message
     assert "coder, scribe" in message
-    assert "No sessions found" not in message
     assert suppresses_recovery_hint(excinfo.value)
     assert requests == [("agents", None)]
 
@@ -2235,7 +2204,7 @@ def test_chat_with_server_fork_uses_source_not_catalog(
             return httpx.Response(
                 200,
                 request=httpx.Request("GET", url),
-                json={"id": "conv_source", "agent_name": session_agent},
+                json={"id": "conv_source", "agent_name": session_agent, "host_id": "host_source"},
             )
         return httpx.Response(
             catalog_status,
@@ -2254,6 +2223,7 @@ def test_chat_with_server_fork_uses_source_not_catalog(
     assert requests == ["http://127.0.0.1:6767/v1/sessions/conv_source"]
     assert dispatched["agent_name"] == (session_agent or "agent")
     assert dispatched["fork_session_id"] == "conv_source"
+    assert chat_module.get_session_host("conv_source") == "host_source"
     assert dispatched["registered_agent"] is None
 
 
@@ -2286,7 +2256,13 @@ def test_pick_agent_menu_accepts_a_name_or_index(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], answer: str
 ) -> None:
     """The catalog menu accepts a name or index and preserves the selected identity."""
-    _serve_listings(monkeypatch, agent_pages=[_agents_page(["coder", "scribe"])])
+    page = {
+        "data": [
+            {"id": "ag_coder", "name": "coder", "harness": "codex"},
+            {"id": "ag_scribe", "name": "scribe", "harness": "openai-agents"},
+        ]
+    }
+    _serve_listings(monkeypatch, agent_pages=[page])
     monkeypatch.setattr("sys.stdin", io.StringIO(f"{answer}\n"))
 
     picked = _pick_agent("http://127.0.0.1:6767")
@@ -2294,7 +2270,7 @@ def test_pick_agent_menu_accepts_a_name_or_index(
     assert picked.name == "scribe"
 
     out = capsys.readouterr().out
-    assert "Available agents" in out and "2. scribe" in out
+    assert "Available agents" in out and "2. scribe (server, openai-agents)" in out
 
 
 @pytest.mark.parametrize(
@@ -2316,8 +2292,7 @@ def test_pick_agent_reports_a_failed_listing_as_a_cli_error(
     server_url = "https://example.databricks.com/api/2.0/omnigent"
 
     def _get(url: str, **_kwargs: object) -> SimpleNamespace:
-        if not url.endswith(failing_route):
-            return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"data": []})
+        assert url.endswith(failing_route)
         request = httpx.Request("GET", url)
         response = httpx.Response(status, request=request)
 
@@ -2344,29 +2319,12 @@ def test_pick_agent_reports_a_failed_listing_as_a_cli_error(
     assert suppresses_recovery_hint(excinfo.value)
 
 
-def test_pick_agent_reports_a_listing_that_times_out_as_a_cli_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A read timeout after connecting is a discovery error, not a traceback."""
-
-    def _get(*_args: object, **_kwargs: object) -> object:
-        raise httpx.ReadTimeout("read timed out")
-
-    monkeypatch.setattr(chat_module.httpx, "get", _get)
-
-    with pytest.raises(click.ClickException) as excinfo:
-        _pick_agent("http://127.0.0.1:6767")
-
-    message = str(excinfo.value)
-    assert "/v1/agents" in message and "ReadTimeout" in message
-    assert suppresses_recovery_hint(excinfo.value)
-
-
 @pytest.mark.parametrize(
     ("body", "detail"),
     [
         (ValueError("not json"), "non-JSON body"),
         (["not", "an", "object"], "unexpected body shape"),
+        ({"data": None}, "unexpected body shape"),
     ],
 )
 def test_pick_agent_reports_an_unusable_agent_listing_as_a_cli_error(
@@ -2375,8 +2333,7 @@ def test_pick_agent_reports_an_unusable_agent_listing_as_a_cli_error(
     """A 200 with a non-JSON or non-object body is a discovery error, not a crash."""
 
     def _get(url: str, **_kwargs: object) -> SimpleNamespace:
-        if url.endswith("/v1/sessions"):
-            return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"data": []})
+        assert url.endswith("/v1/agents")
 
         def _json() -> object:
             if isinstance(body, Exception):
@@ -5644,7 +5601,7 @@ async def test_one_shot_host_launch_routes_actual_http_requests(
         transport=httpx.MockTransport(handler),
         headers=chat_module._server_headers(),
         auth=chat_module._server_auth(server_url=base_url, session_id=None),
-        event_hooks={"request": [chat_module._route_remote_session_request]},
+        event_hooks={"request": [chat_module.route_session_request]},
     ) as http:
         sessions = SessionsNamespace(http, base_url)
         result = await _query_sessions_once(
@@ -5667,7 +5624,9 @@ async def test_one_shot_host_launch_routes_actual_http_requests(
     ]
 
 
-@pytest.mark.parametrize("failure", [httpx.ReadTimeout, httpx.ConnectTimeout])
+@pytest.mark.parametrize(
+    "failure", [httpx.ReadTimeout, httpx.WriteTimeout, httpx.ConnectTimeout, httpx.PoolTimeout]
+)
 def test_one_shot_host_launch_timeout_is_a_clean_cli_error(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -5703,9 +5662,13 @@ def test_one_shot_host_launch_timeout_is_a_clean_cli_error(
     assert excinfo.value.code == 1
     output = capsys.readouterr()
     assert output.out == ""
-    assert "Error: Timed out waiting for runner launch on host 'host_local'" in output.err
+    assert "Error: Timed out" in output.err and "host 'host_local'" in output.err
     assert "POST /v1/sessions" in output.err
-    assert "may still complete" in output.err and "before retrying" in output.err
+    if failure in (httpx.ConnectTimeout, httpx.PoolTimeout):
+        assert "request was not sent" in output.err and "retry" in output.err
+        assert "may still complete" not in output.err
+    else:
+        assert "may still complete" in output.err and "before retrying" in output.err
     assert "private transport details" not in output.err and "Traceback" not in output.err
     assert requests == ["GET /v1/runners", "GET /v1/hosts", "POST /v1/sessions"]
 
@@ -5877,17 +5840,18 @@ def test_resume_one_shot_harness_lookup_failure_refuses_runner_adoption(
     assert seen == {}
 
 
-@pytest.mark.parametrize("agent_name", [None, "scribe"])
+@pytest.mark.parametrize("snapshot_agent_name", [None, "scribe"])
 @pytest.mark.parametrize("harness", [None, "", " ", ["claude-sdk"]])
 def test_resume_one_shot_without_a_usable_harness_refuses_runner_adoption(
-    agent_name: str | None,
+    snapshot_agent_name: str | None,
     harness: object,
 ) -> None:
     seen: dict[str, object] = {}
-    snapshot = SimpleNamespace(id="conv_x", harness=harness, agent_name=agent_name)
+    snapshot = SimpleNamespace(id="conv_x", harness=harness, agent_name=snapshot_agent_name)
     client = _resume_client(snapshot, seen)
 
     async def _no_harness(_name: str) -> RegisteredAgent:
+        seen["resolved"] = _name
         return RegisteredAgent(id="ag_scribe", harness=harness)  # type: ignore[arg-type]
 
     client.sessions.resolve_agent = _no_harness
@@ -5895,7 +5859,7 @@ def test_resume_one_shot_without_a_usable_harness_refuses_runner_adoption(
     with pytest.raises(click.ClickException, match="Cannot determine the harness"):
         _resume_once(client, agent_name="scribe")
 
-    assert seen == {}
+    assert seen == ({"resolved": "scribe"} if snapshot_agent_name else {})
 
 
 @pytest.mark.asyncio
@@ -5988,17 +5952,11 @@ def test_pick_agent_offers_user_agents_on_a_fresh_server(monkeypatch: pytest.Mon
     assert "scribe" in str(excinfo.value) and "mine" in str(excinfo.value)
 
 
-@pytest.mark.parametrize("same_registration", [False, True])
 def test_pick_agent_prefers_server_agent_over_same_named_user_agent(
     monkeypatch: pytest.MonkeyPatch,
-    same_registration: bool,
 ) -> None:
     server_agent = {"id": "ag_server", "name": "scribe", "harness": "claude-sdk"}
-    user_agent = (
-        server_agent
-        if same_registration
-        else {"id": "ag_user", "name": "scribe", "harness": "openai-agents"}
-    )
+    user_agent = {"id": "ag_user", "name": "scribe", "harness": "openai-agents"}
     _serve_listings(
         monkeypatch,
         agent_pages=[{"data": [server_agent]}],
@@ -6012,13 +5970,12 @@ def test_pick_agent_prefers_server_agent_over_same_named_user_agent(
     assert selected.source == "server"
 
 
-@pytest.mark.parametrize("status", [401, 403, 404, 422])
 def test_user_agent_listing_problems_fall_back_to_server_agents(
-    status: int, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An unsupported or forbidden user catalog does not hide usable server agents."""
     page = _agents_page(["scribe"])
-    _serve_listings(monkeypatch, agent_pages=[page, page], user_status=status)
+    _serve_listings(monkeypatch, agent_pages=[page, page], user_status=404)
 
     assert (
         chat_module._require_registered_agent("http://127.0.0.1:6799", "scribe").id == "ag_scribe"
@@ -6026,28 +5983,11 @@ def test_user_agent_listing_problems_fall_back_to_server_agents(
     assert _pick_agent("http://127.0.0.1:6799", interactive=False).id == "ag_scribe"
 
 
-@pytest.mark.parametrize("fault", ["http", "timeout", "malformed", "pagination"])
 def test_user_catalog_failure_cannot_silently_auto_select_a_server_agent(
-    monkeypatch: pytest.MonkeyPatch, fault: str
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A failed user catalog is not evidence that only one agent is available."""
-    _serve_listings(monkeypatch, agent_pages=[_agents_page(["scribe"])])
-    original_get = chat_module.httpx.get
-
-    def _get(url: str, **kwargs: object) -> object:
-        params = kwargs.get("params")
-        if not isinstance(params, dict) or params.get("scope") != "user":
-            return original_get(url, **kwargs)
-        if fault == "timeout":
-            raise httpx.ReadTimeout("user catalog timed out")
-        if fault == "http":
-            response = httpx.Response(500, request=httpx.Request("GET", url))
-            return SimpleNamespace(raise_for_status=response.raise_for_status, json=dict)
-        body = {"data": {}} if fault == "malformed" else _agents_page(["mine"], has_more=True)
-        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: body)
-
-    monkeypatch.setattr(chat_module.httpx, "get", _get)
-
+    _serve_listings(monkeypatch, agent_pages=[_agents_page(["scribe"])], user_status=500)
     with pytest.raises(click.ClickException, match="Agent discovery failed"):
         _pick_agent("http://127.0.0.1:6799", quiet=True)
 

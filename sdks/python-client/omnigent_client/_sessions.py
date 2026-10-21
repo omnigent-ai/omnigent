@@ -31,6 +31,7 @@ from typing import Any, Literal
 import httpx
 from pydantic import TypeAdapter
 
+from omnigent.harness_availability import harness_launch_availability
 from omnigent.server.schemas import ServerStreamEvent
 
 from ._agent_catalog import AgentCatalogEntry, RegisteredAgent, RegisteredAgentCatalog
@@ -331,11 +332,6 @@ class SessionListItem:
         )
 
 
-# Host readiness a launch can proceed with; auth is advisory since a session
-# can supply its own credentials.
-_LAUNCHABLE_READINESS: frozenset[object] = frozenset({True, "needs-auth"})
-
-
 @dataclass(frozen=True)
 class LaunchHost:
     """
@@ -482,11 +478,8 @@ class SessionsNamespace:
             effort, e.g. ``"high"``. ``None`` uses the agent default.
         :param workspace: Optional absolute starting cwd to record on
             the session, e.g. ``"/Users/corey/projects/myapp"``.
-        :param host_id: Optional connected host to launch the session's
-            runner on, e.g. ``"a1b2c3d4e5f67890abcdef1234567890"``. The
-            server launches and binds that runner itself. The request's
-            read timeout is at least 3660 seconds to cover the server's
-            launch budget; longer or unlimited client timeouts are retained.
+        :param host_id: Launch the runner on this host; read timeout is at least
+            3660 seconds. Longer or unlimited client timeouts are retained.
         :returns: The newly created :class:`Session` snapshot.
         :raises OmnigentError: If the server returns a non-2xx status,
             or a host-targeted create times out before its outcome is known.
@@ -510,6 +503,12 @@ class SessionsNamespace:
         except httpx.TimeoutException as exc:
             if host_id is None:
                 raise
+            if isinstance(exc, (httpx.ConnectTimeout, httpx.PoolTimeout)):
+                raise OmnigentError(
+                    f"Timed out connecting to the server to launch a runner on host {host_id!r} "
+                    "(POST /v1/sessions). The launch request was not sent; "
+                    "check the server connection and retry."
+                ) from exc
             raise OmnigentError(
                 f"Timed out waiting for runner launch on host {host_id!r} "
                 "(POST /v1/sessions). The launch may still complete on the server; "
@@ -631,21 +630,14 @@ class SessionsNamespace:
         self,
         *,
         harness: str | None = None,
-        canonicalize: Callable[[str], str] | None = None,
     ) -> list[LaunchHost]:
         """
         List the caller's connected hosts a runner could be launched on, with readiness.
 
-        Creating a session with a launchable host's id makes the server launch a
-        runner there, as the web UI's new-session flow does. Sandbox hosts are
-        skipped. Readiness follows the server's launch check: ``needs-auth`` is
-        advisory; ``binary-missing``, ``version-too-low``, ``False`` or a missing
-        entry in a reported map are unavailable; no report, or no specific
-        harness, is unknown and counts as launchable.
+        Skip sandbox hosts and use ``harness_launch_availability`` so readiness
+        matches the server. Unknown readiness counts as launchable.
 
         :param harness: Harness the session needs, e.g. ``"claude-sdk"``.
-        :param canonicalize: Optional harness-name normalizer, as in
-            :meth:`resolve_online_runner`.
         :returns: Online hosts in listing order; empty when there are none.
         :raises OmnigentError: If the listing returns a non-2xx status.
         """
@@ -656,11 +648,6 @@ class SessionsNamespace:
         if not isinstance(hosts, list):
             raise OmnigentError("GET /v1/hosts returned an unexpected hosts listing")
 
-        def _norm(name: str) -> str:
-            return canonicalize(name) if canonicalize is not None else name
-
-        # Like the server's launch check, no specific harness means unknown readiness.
-        wanted = {harness, _norm(harness)} if harness not in (None, "", "auto") else set()
         result: list[LaunchHost] = []
         for item in hosts:
             if not isinstance(item, dict) or item.get("status") != "online":
@@ -672,18 +659,18 @@ class SessionsNamespace:
                 continue
             name = item.get("name")
             display = name if isinstance(name, str) and name else host_id
-            reason: str | None = None
             readiness = item.get("configured_harnesses")
-            if wanted and isinstance(readiness, dict) and readiness:
-                matches = [
-                    value
-                    for key, value in readiness.items()
-                    if isinstance(key, str) and (key in wanted or _norm(key) in wanted)
-                ]
-                if not any(value in _LAUNCHABLE_READINESS for value in matches):
-                    first = matches[0] if matches else None
-                    reason = first if isinstance(first, str) else "unconfigured"
-            result.append(LaunchHost(host_id, display, reason is None, reason))
+            available, reason = harness_launch_availability(
+                harness, readiness if isinstance(readiness, dict) else None
+            )
+            result.append(
+                LaunchHost(
+                    host_id,
+                    display,
+                    available is not False,
+                    reason if available is False else None,
+                )
+            )
         return result
 
     async def list(

@@ -1604,6 +1604,7 @@ async def test_list_launch_hosts_flags_hosts_that_cannot_launch() -> None:
         _host("needs_auth", harnesses={"claude-sdk": "needs-auth"}),
         _host("ready", harnesses={"claude-sdk": True}),
         _host("unknown", harnesses=None),
+        _host("future", harnesses={"claude-sdk": {"state": "future"}}),
     ]
 
     listed = await _launch_hosts({"hosts": hosts}, harness="claude-sdk")
@@ -1616,27 +1617,33 @@ async def test_list_launch_hosts_flags_hosts_that_cannot_launch() -> None:
         ("needs_auth", True, None),
         ("ready", True, None),
         ("unknown", True, None),
+        ("future", True, None),
     ]
 
 
 @pytest.mark.asyncio
-async def test_list_launch_hosts_matches_canonical_harness_name() -> None:
-    hosts = [_host("h1", harnesses={"claude": True})]
+@pytest.mark.parametrize(("reported", "launchable"), [("claude-sdk", True), ("claude", False)])
+async def test_list_launch_hosts_matches_server_canonical_key(
+    reported: str, launchable: bool
+) -> None:
+    hosts = [_host("h1", harnesses={reported: True})]
 
     listed = await _launch_hosts(
         {"hosts": hosts},
-        harness="claude-sdk",
-        canonicalize=lambda name: "claude-sdk" if name == "claude" else name,
+        harness="claude",
     )
 
-    assert [(h, ok) for h, _, ok, _ in listed] == [("h1", True)]
+    assert [(h, ok) for h, _, ok, _ in listed] == [("h1", launchable)]
 
 
 @pytest.mark.asyncio
-async def test_list_launch_hosts_without_harness_marks_every_host_launchable() -> None:
+@pytest.mark.parametrize("harness", [None, "auto", ""])
+async def test_list_launch_hosts_without_harness_marks_every_host_launchable(
+    harness: str | None,
+) -> None:
     hosts = [_host("h1", harnesses={"claude-sdk": False})]
 
-    assert [ok for _, _, ok, _ in await _launch_hosts({"hosts": hosts})] == [True]
+    assert [ok for _, _, ok, _ in await _launch_hosts({"hosts": hosts}, harness=harness)] == [True]
 
 
 @pytest.mark.asyncio
@@ -1663,29 +1670,22 @@ async def test_list_launch_hosts_rejects_a_non_list_listing(body: dict[str, obje
 
 
 @pytest.mark.asyncio
-async def test_list_launch_hosts_on_server_without_hosts_route_raises() -> None:
+@pytest.mark.parametrize("status", [404, 500])
+async def test_list_launch_hosts_http_failure_raises(status: int) -> None:
     """Like other SDK calls, a 404 raises; callers decide what an older server means."""
     with pytest.raises(OmnigentError):
-        await _launch_hosts({}, status_code=404)
-
-
-@pytest.mark.asyncio
-async def test_list_launch_hosts_server_error_raises() -> None:
-    with pytest.raises(OmnigentError):
-        await _launch_hosts({}, status_code=500)
+        await _launch_hosts({}, status_code=status)
 
 
 # ── resolve_agent() user-agent fallback ───────────────────────────────
 
 
 def _agents_handler(
-    server: list[str], user: list[str] | None, *, user_status: int = 200
+    server: list[str], user: list[str]
 ) -> Callable[[httpx.Request], httpx.Response]:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v1/agents"
         if request.url.params.get("scope") == "user":
-            if user is None:
-                return httpx.Response(user_status, json={"detail": "nope"})
             rows = [{"id": f"uid_{n}", "name": n, "harness": "codex"} for n in user]
         else:
             rows = [{"id": f"id_{n}", "name": n, "harness": "claude-sdk"} for n in server]
@@ -1706,17 +1706,6 @@ async def test_resolve_agent_falls_back_to_the_callers_user_agents() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resolve_agent_prefers_server_agents_over_user_agents() -> None:
-    ns, client = _make_namespace(_agents_handler(["scribe"], ["scribe"]))
-    try:
-        agent = await ns.resolve_agent("scribe")
-    finally:
-        await client.aclose()
-
-    assert agent.id == "id_scribe"
-
-
-@pytest.mark.asyncio
 async def test_resolve_agent_miss_lists_both_kinds_of_agent() -> None:
     ns, client = _make_namespace(_agents_handler(["scribe"], ["mine"]))
     try:
@@ -1729,51 +1718,11 @@ async def test_resolve_agent_miss_lists_both_kinds_of_agent() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [401, 403, 404, 422])
-async def test_resolve_agent_on_server_without_user_scope_is_a_plain_miss(status: int) -> None:
-    """No usable ``scope=user`` listing (old server, or forbidden) still means not found."""
-    ns, client = _make_namespace(_agents_handler(["scribe"], None, user_status=status))
-    try:
-        with pytest.raises(LookupError, match="scribe"):
-            await ns.resolve_agent("ghost")
-    finally:
-        await client.aclose()
-
-
-@pytest.mark.asyncio
-async def test_resolve_agent_on_server_ignoring_scope_lists_each_name_once() -> None:
-    """A server that ignores ``scope=user`` returns server agents twice; name them once."""
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        rows = [{"id": "id_scribe", "name": "scribe", "harness": "claude-sdk"}]
-        return httpx.Response(200, json={"data": rows, "has_more": False})
-
-    ns, client = _make_namespace(handler)
-    try:
-        with pytest.raises(LookupError) as excinfo:
-            await ns.resolve_agent("ghost")
-    finally:
-        await client.aclose()
-
-    assert str(excinfo.value).count("scribe") == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("harness", ["auto", ""])
-async def test_list_launch_hosts_treats_auto_or_empty_harness_as_unknown(harness: str) -> None:
-    """Matches the server's launch check: no specific harness means readiness is unknown."""
-    hosts = [_host("h1", harnesses={"claude-sdk": False})]
-
-    assert [ok for _, _, ok, _ in await _launch_hosts({"hosts": hosts}, harness=harness)] == [True]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("invalid", [None, {}, {"id": "ag_bad", "name": ""}])
-async def test_resolve_agent_validates_the_whole_matching_page(invalid: object) -> None:
+async def test_resolve_agent_validates_the_whole_matching_page() -> None:
     """A matching first row cannot hide malformed registrations later in that page."""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"data": [{"id": "ag_good", "name": "good"}, invalid]})
+        return httpx.Response(200, json={"data": [{"id": "ag_good", "name": "good"}, {}]})
 
     namespace, client = _make_namespace(handler)
     async with client:

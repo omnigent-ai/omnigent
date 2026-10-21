@@ -66,6 +66,7 @@ uv run --no-sync pytest -q tests/cli/test_chat.py tests/cli/test_cli.py \
   tests/cli/test_remote_launch.py tests/cli/test_cli_diagnostics.py \
   tests/cli/test_login_databricks.py tests/repl/test_repl_remote_agent_lookup.py \
   tests/cli/test_session_host.py tests/cli/test_cli_auth.py \
+  tests/frontends/sdk/test_agent_catalog.py \
   tests/frontends/sdk/test_sessions_namespace.py --reruns 0
 ```
 

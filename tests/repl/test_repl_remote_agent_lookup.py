@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import httpx
@@ -12,8 +14,9 @@ from omnigent_client import RegisteredAgent, SessionsNamespace
 from omnigent_client._sessions import Session
 
 import omnigent.host.identity as identity
-from omnigent.chat import _route_remote_session_request
+from omnigent import session_host
 from omnigent.repl._repl import _SessionsChatReplAdapter
+from omnigent.session_host import route_session_request
 
 
 @pytest.mark.asyncio
@@ -71,158 +74,162 @@ async def test_remote_repl_preserves_selected_catalog_identity() -> None:
     assert harnesses == ["openai-agents"]
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("scenario", "readiness", "expected_error"),
-    [
-        ("online-runner", True, None),
-        ("local-host", True, None),
-        ("mismatched-runner", True, None),
-        ("local-host", "needs-auth", None),
-        ("local-host", "binary-missing", "binary-missing"),
-        ("other-host", True, "other machines"),
-        ("no-host", True, "no online runner"),
-        ("host-listing-unsupported", True, "no online runner"),
-        ("host-listing-failed", True, "GET /v1/hosts failed.*HTTP 500"),
-        ("resume", True, None),
-    ],
-)
-async def test_remote_repl_runner_startup_uses_sdk_host_policy(
+@asynccontextmanager
+async def _remote_adapter(
     monkeypatch: pytest.MonkeyPatch,
-    scenario: str,
-    readiness: str | bool,
-    expected_error: str | None,
-) -> None:
-    """Use real SDK decoding and creation; only fresh sessions may launch a runner."""
-    monkeypatch.setattr(
-        identity,
-        "load_host_identity_if_present",
-        lambda: SimpleNamespace(host_id="host_local"),
-    )
-    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
-    monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "host_unrelated")
-    created: list[dict[str, object]] = []
-    requests: list[str] = []
-    snapshot = {
-        "id": "conv_remote",
-        "agent_id": "ag_selected",
-        "agent_name": "uploaded-only" if scenario == "resume" else "reviewer",
-        "runner_id": (
-            None
-            if scenario == "online-runner"
-            else "runner_existing"
-            if scenario == "resume"
-            else "runner_launched"
-        ),
-        "harness": "claude-sdk",
-        "status": "idle",
-        "created_at": 0,
-    }
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        requests.append(f"{request.method} {path}")
-        if path == "/v1/runners":
-            runners = (
-                [
-                    {
-                        "runner_id": "runner_existing",
-                        "harnesses": [
-                            "codex" if scenario == "mismatched-runner" else "claude-sdk"
-                        ],
-                        "online": True,
-                    }
-                ]
-                if scenario in {"online-runner", "mismatched-runner"}
-                else []
-            )
-            return httpx.Response(200, json={"data": runners})
-        if path == "/v1/hosts":
-            assert scenario not in {"online-runner", "resume"}
-            if scenario.startswith("host-listing-"):
-                status_code = 404 if scenario == "host-listing-unsupported" else 500
-                return httpx.Response(status_code, json={"detail": "lookup failed"})
-            hosts = (
-                []
-                if scenario == "no-host"
-                else [
-                    {
-                        "host_id": "host_other" if scenario == "other-host" else "host_local",
-                        "name": "devbox.local",
-                        "status": "online",
-                        "configured_harnesses": {"claude-sdk": readiness},
-                    }
-                ]
-            )
-            return httpx.Response(200, json={"hosts": hosts})
-        if path == "/v1/sessions" and request.method == "POST":
-            if created:
-                assert request.headers["X-Databricks-Omnigent-Slice-Key"] == "host_unrelated"
-            created.append(json.loads(request.content))
-            if created[-1].get("host_id"):
-                assert request.headers["X-Databricks-Omnigent-Slice-Key"] == "host_local"
-                assert request.extensions["timeout"]["read"] > 3600
-            return httpx.Response(201, json=snapshot)
-        if path == f"/v1/sessions/{snapshot['id']}" and request.method == "GET":
-            if len(created) > 1:
-                assert request.headers["X-Databricks-Omnigent-Slice-Key"] == "host_next"
-                return httpx.Response(200, json=snapshot)
-            if scenario != "resume":
-                assert created[-1]["host_id"] == "host_local"
-                assert request.headers["X-Databricks-Omnigent-Slice-Key"] == "host_local"
-            return httpx.Response(200, json=snapshot)
-        if path == "/v1/sessions/conv_remote" and request.method == "PATCH":
-            if json.loads(request.content) == {"runner_id": ""}:
-                return httpx.Response(200, json=snapshot)
-            assert scenario == "online-runner"
-            assert json.loads(request.content) == {"runner_id": "runner_existing"}
-            snapshot["runner_id"] = "runner_existing"
-            return httpx.Response(200, json=snapshot)
-        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+    handler: Callable[[httpx.Request], httpx.Response],
+    *,
+    session_id: str | None = None,
+) -> AsyncIterator[_SessionsChatReplAdapter]:
+    """Use real SDK requests and snapshots; suppress only the background stream."""
+    monkeypatch.setattr(session_host, "_session_hosts", {})
 
     async def _stream() -> None:
         return
 
     async with httpx.AsyncClient(
-        transport=httpx.MockTransport(_handler),
-        event_hooks={"request": [_route_remote_session_request]},
+        transport=httpx.MockTransport(handler),
+        event_hooks={"request": [route_session_request]},
     ) as http:
         adapter = _SessionsChatReplAdapter(
             SimpleNamespace(sessions=SessionsNamespace(http, "http://srv")),  # type: ignore[arg-type]
             "reviewer",
-            session_id="conv_remote" if scenario == "resume" else None,
+            session_id=session_id,
             registered_agent=RegisteredAgent(id="ag_selected", harness="claude"),
         )
         monkeypatch.setattr(adapter, "_stream_pump", _stream)
         try:
-            if expected_error is not None:
-                with pytest.raises(RuntimeError, match=expected_error):
-                    await adapter._ensure_session()
-                assert created == []
-                assert adapter._session_id is None
-                return
+            yield adapter
+        finally:
+            await adapter.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["online-runner", "mismatched-runner", "resume", "no-host"])
+async def test_remote_repl_runner_startup_uses_sdk_host_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+) -> None:
+    """Adopt a matching runner, launch for a mismatch, or resume without discovery."""
+    monkeypatch.setattr(
+        identity, "load_host_identity_if_present", lambda: SimpleNamespace(host_id="host_local")
+    )
+    requests: list[str] = []
+    snapshot = {
+        "id": "conv_remote",
+        "agent_id": "ag_selected",
+        "agent_name": "uploaded-only",
+        "runner_id": None if scenario == "online-runner" else "runner_existing",
+        "harness": "claude-sdk",
+        "status": "idle",
+        "created_at": 0,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        requests.append(f"{request.method} {path}")
+        if path == "/v1/runners":
+            runners = (
+                []
+                if scenario == "no-host"
+                else [
+                    {
+                        "runner_id": "runner_existing",
+                        "online": True,
+                        "harnesses": [
+                            "codex" if scenario == "mismatched-runner" else "claude-sdk"
+                        ],
+                    }
+                ]
+            )
+            return httpx.Response(200, json={"data": runners})
+        if path == "/v1/hosts":
+            assert scenario in {"no-host", "mismatched-runner"}
+            hosts = (
+                [] if scenario == "no-host" else [{"host_id": "host_local", "status": "online"}]
+            )
+            return httpx.Response(200, json={"hosts": hosts})
+        if path == "/v1/sessions" and request.method == "POST":
+            expected = {"agent_id": "ag_selected", "workspace": os.getcwd()}
+            if scenario == "mismatched-runner":
+                expected["host_id"] = "host_local"
+            assert json.loads(request.content) == expected
+            return httpx.Response(201, json=snapshot)
+        if path == "/v1/sessions/conv_remote":
+            if request.method == "PATCH":
+                assert scenario == "online-runner"
+                assert json.loads(request.content) == {"runner_id": "runner_existing"}
+                snapshot["runner_id"] = "runner_existing"
+            else:
+                assert scenario == "resume" and request.method == "GET"
+            return httpx.Response(200, json=snapshot)
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    async with _remote_adapter(
+        monkeypatch, handler, session_id="conv_remote" if scenario == "resume" else None
+    ) as adapter:
+        if scenario == "no-host":
+            with pytest.raises(RuntimeError, match="no online runner"):
+                await adapter._ensure_session()
+            assert requests == ["GET /v1/runners", "GET /v1/hosts"]
+            assert adapter.session_id is None
+        else:
             assert await adapter._ensure_session() == "conv_remote"
-            assert adapter._runner_id == snapshot["runner_id"]
+            assert adapter._runner_id == "runner_existing"
             if scenario == "resume":
                 assert requests == ["GET /v1/sessions/conv_remote"]
                 assert adapter._agent_name == "uploaded-only"
-            else:
-                expected_body: dict[str, object] = {
-                    "agent_id": "ag_selected",
-                    "workspace": os.getcwd(),
-                }
-                if scenario in {"local-host", "mismatched-runner"}:
-                    expected_body["host_id"] = "host_local"
-                assert created == [expected_body]
-                if "host_id" in expected_body:
-                    await adapter._client.sessions.get("conv_remote")
-                assert "X-Databricks-Omnigent-Slice-Key" not in http.headers
-                if scenario == "local-host" and readiness is True:
-                    await adapter.start_new_conversation()
-                    snapshot.update(id="conv_next", host_id="host_next")
-                    assert await adapter._ensure_session() == "conv_next"
-                    await adapter._client.sessions.get("conv_next")
-                    assert "host_id" not in created[-1]
-                    assert "X-Databricks-Omnigent-Slice-Key" not in http.headers
-        finally:
-            await adapter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_new_session_does_not_inherit_previous_launch_routing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Launch, /new, decode the new host, and route a subsequent request to it."""
+    monkeypatch.setattr(
+        identity, "load_host_identity_if_present", lambda: SimpleNamespace(host_id="host_local")
+    )
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
+    monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "host_unrelated")
+    first = {
+        "id": "conv_first",
+        "agent_id": "ag_selected",
+        "runner_id": "runner_launched",
+        "host_id": "host_local",
+        "harness": "claude-sdk",
+        "status": "idle",
+        "created_at": 0,
+    }
+    second = {**first, "id": "conv_next", "host_id": "host_next"}
+    responses = iter(
+        [
+            ("GET", "/v1/runners", None, {"data": []}),
+            ("GET", "/v1/hosts", None, {"hosts": [{"host_id": "host_local", "status": "online"}]}),
+            ("POST", "/v1/sessions", "host_local", first),
+            ("PATCH", "/v1/sessions/conv_first", "host_local", first),
+            ("POST", "/v1/sessions", "host_unrelated", second),
+            ("GET", "/v1/sessions/conv_next", "host_next", second),
+        ]
+    )
+    created: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        method, path, host, body = next(responses)
+        assert (request.method, request.url.path) == (method, path)
+        assert request.headers.get("X-Databricks-Omnigent-Slice-Key") == host
+        if method == "POST":
+            created.append(json.loads(request.content))
+        if method == "PATCH":
+            assert json.loads(request.content) == {"runner_id": ""}
+        return httpx.Response(200, json=body)
+
+    async with _remote_adapter(monkeypatch, handler) as adapter:
+        assert await adapter._ensure_session() == "conv_first"
+        await adapter.start_new_conversation()
+        assert await adapter._ensure_session() == "conv_next"
+        await adapter._client.sessions.get("conv_next")
+        assert created == [
+            {"agent_id": "ag_selected", "workspace": os.getcwd(), "host_id": "host_local"},
+            {"agent_id": "ag_selected", "workspace": os.getcwd()},
+        ]
+        assert next(responses, None) is None

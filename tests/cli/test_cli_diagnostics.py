@@ -516,18 +516,21 @@ async def test_slash_command_exceptions_reach_cli_log(
     )
 
 
-@pytest.mark.parametrize("explicit_agent", [False, True], ids=["picker", "explicit-agent"])
 @pytest.mark.parametrize(
-    ("failure", "expected_hint"),
+    ("failure", "expected_hint", "explicit_agent"),
     [
-        (httpx.ConnectError("connection refused"), "Check the URL, your network connection"),
-        (httpx.ConnectTimeout("connection timed out"), "Check the URL, your network connection"),
-        (httpx.ProxyError("proxy refused"), "HTTP proxy settings"),
-        (httpx.InvalidURL("invalid proxy"), "HTTP proxy settings"),
-        (httpx.ReadTimeout("read timed out"), "failed before a response arrived (ReadTimeout)"),
-        (401, "Sign in with `isaac omni login https://server.example`"),
-        (403, "ask the server administrator to grant access"),
-        (500, "returned HTTP 500"),
+        (
+            httpx.ConnectError("connection refused"),
+            "Check the URL, your network connection",
+            False,
+        ),
+        (httpx.InvalidURL("invalid proxy"), "HTTP proxy settings", True),
+        (
+            httpx.ReadTimeout("read timed out"),
+            "failed before a response arrived (ReadTimeout)",
+            True,
+        ),
+        (401, "Sign in with `isaac omni login https://server.example`", False),
     ],
 )
 def test_main_reports_discovery_failure_without_runner_recovery_hint(

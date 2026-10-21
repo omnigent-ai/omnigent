@@ -69,10 +69,10 @@ from rich.console import RenderableType
 from rich.markup import escape
 from rich.text import Text
 
-from omnigent.chat import set_session_host
 from omnigent.cli_invocation import cli_invocation
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.remote_launch import resolve_remote_launch_host
+from omnigent.session_host import set_session_host
 from omnigent.spec.types import SkillSpec
 
 if TYPE_CHECKING:

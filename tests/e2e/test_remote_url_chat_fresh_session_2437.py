@@ -571,17 +571,14 @@ def test_run_one_shot_on_fresh_server_asks_for_agent_then_answers_with_it(
     registered_agent_server: _RegisteredAgentServer,
     tmp_path: Path,
 ) -> None:
-    """``omnigent run --server <url> -p`` on a fresh server: the --agent advice, then the answer.
+    """Headless ambiguity fails without creating a session; an explicit agent replies.
 
-    Built-ins make every server multi-agent, so a headless run that names no
-    agent cannot pick one. It must fail by listing the registered agents and
-    the ``--agent`` selector; it must not tell the user that nothing can be
-    found, drop into an interactive picker it cannot answer, or append the
-    stale-host hint that ``omnigent stop`` cannot act on. Passing ``--agent``
-    then starts a session for that registered agent, adopts the server's online
-    runner and prints the reply.
+    Used and never-used registrations remain discoverable afterward.
     """
     server = registered_agent_server
+    with server.client() as client:
+        agents = client.get("/v1/agents", params={"limit": 1000}).json()["data"]
+    unused_name = next(a["name"] for a in agents if a["name"] != server.agent_name)
     assert _session_count(server.base_url) == 0
 
     proc = _run_cli(tmp_path / "cli-home", "run", "--server", server.base_url, "-p", "hi")
@@ -609,12 +606,16 @@ def test_run_one_shot_on_fresh_server_asks_for_agent_then_answers_with_it(
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert server.marker in proc.stdout, proc.stdout + proc.stderr
+    with server.client() as client:
+        runners = client.get("/v1/runners").json()["data"]
+    assert any(r["runner_id"] == server.runner_id and r["online"] for r in runners)
     assert _session_count(server.base_url) == 1
 
     proc = _run_cli(tmp_path / "cli-home", "run", "--server", server.base_url, "-p", "hi")
     output = proc.stdout + proc.stderr
     assert proc.returncode != 0, output
     assert "--agent <name>" in output and server.agent_name in output, output
+    assert unused_name in proc.stderr, output
     assert _session_count(server.base_url) == 1
 
 
