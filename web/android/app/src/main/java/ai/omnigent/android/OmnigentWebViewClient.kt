@@ -227,7 +227,8 @@ internal class OmnigentWebViewClient(
     ) {
         handler.cancel()
         val url = error.url
-        if (url != activeMainFrameUrl || url == shellStoppedUrl || failedNavigation ||
+        val mainFrameUrl = activeMainFrameUrl ?: view.url
+        if (url != mainFrameUrl || url == shellStoppedUrl || failedNavigation ||
             !acceptedMainFrame(url)
         ) {
             return

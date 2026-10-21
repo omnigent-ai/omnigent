@@ -7,6 +7,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Base64
 import org.json.JSONObject
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
@@ -15,6 +16,27 @@ import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+
+private const val UPGRADE_ERROR_BODY_LIMIT_BYTES = 8 * 1024
+
+internal fun isUpgradeRequiredErrorResponse(
+    responseCode: Int,
+    errorStream: () -> InputStream?,
+): Boolean {
+    if (responseCode != 400) return false
+    val errorBody =
+        errorStream()?.use { stream ->
+            val bytes = ByteArray(UPGRADE_ERROR_BODY_LIMIT_BYTES)
+            var count = 0
+            while (count < bytes.size) {
+                val read = stream.read(bytes, count, bytes.size - count)
+                if (read <= 0) break
+                count += read
+            }
+            String(bytes, 0, count, Charsets.UTF_8)
+        } ?: return false
+    return isUpgradeRequiredResponse(responseCode, errorBody)
+}
 
 /**
  * Legacy ticket sign-in for OIDC servers whose manifest doesn't list this app's native
@@ -184,16 +206,7 @@ class OidcLoginManager {
             conn.outputStream.use { it.write(body.toByteArray()) }
             val responseCode = conn.responseCode
             if (responseCode != 200) {
-                val errorBody =
-                    conn.errorStream
-                        ?.bufferedReader()
-                        ?.use { it.readText() }
-                        .orEmpty()
-                if (isUpgradeRequiredResponse(
-                        responseCode,
-                        errorBody,
-                    )
-                ) {
+                if (isUpgradeRequiredErrorResponse(responseCode) { conn.errorStream }) {
                     throw UpgradeRequiredException()
                 }
                 return null
