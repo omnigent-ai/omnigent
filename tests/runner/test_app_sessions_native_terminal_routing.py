@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1077,6 +1077,8 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
         ("starting", False),
         ("ready", False),
         ("detached", False),
+        ("rotated", False),
+        ("foreign_bridge", True),
     ],
 )
 async def test_message_recovers_a_live_codex_pane_with_no_backend(
@@ -1089,13 +1091,23 @@ async def test_message_recovers_a_live_codex_pane_with_no_backend(
     from omnigent.runner.native import orchestration
 
     session_id = uuid.uuid4().hex
+    source_session_id = uuid.uuid4().hex if backend_state == "rotated" else session_id
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
-    bridge_dir = codex_native_bridge.prepare_bridge_dir(session_id)
-    if backend_state in ("ready", "detached", "dead_backend", "unowned_dead_backend"):
+    bridge_dir = codex_native_bridge.prepare_bridge_dir(source_session_id)
+    if backend_state in (
+        "ready",
+        "detached",
+        "dead_backend",
+        "unowned_dead_backend",
+        "rotated",
+        "foreign_bridge",
+    ):
         codex_native_bridge.write_bridge_state(
             bridge_dir,
             codex_native_bridge.CodexNativeBridgeState(
-                session_id=session_id,
+                session_id=uuid.uuid4().hex
+                if backend_state == "foreign_bridge"
+                else source_session_id,
                 thread_id="thread_retained",
                 socket_path="ws://127.0.0.1:1",
                 codex_home=str(bridge_dir / "codex-home"),
@@ -1104,7 +1116,7 @@ async def test_message_recovers_a_live_codex_pane_with_no_backend(
     if backend_state == "failed_startup":
         codex_native_bridge.record_app_server_stopped(bridge_dir)
     backend = None
-    if backend_state in ("starting", "ready", "dead_backend", "unowned_dead_backend"):
+    if backend_state in ("starting", "ready", "dead_backend", "unowned_dead_backend", "rotated"):
         backend = SimpleNamespace(
             proc=SimpleNamespace(returncode=1 if "dead_backend" in backend_state else None),
             bridge_dir=bridge_dir,
@@ -1112,23 +1124,26 @@ async def test_message_recovers_a_live_codex_pane_with_no_backend(
         )
         monkeypatch.setitem(
             orchestration._AUTO_CODEX_APP_SERVERS,
-            session_id,
+            source_session_id,
             backend,
         )
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_BRIDGE_DIRS", {source_session_id: bridge_dir})
 
     registry = TerminalRegistry()
     instance = make_test_terminal_instance("codex", "main", tmp_path)
     close = AsyncMock()
     monkeypatch.setattr(instance, "close", close)
     with registry._lock:
-        registry._by_conversation[session_id] = {("codex", "main"): instance}
-        registry._instance_locks[(session_id, "codex", "main")] = threading.Lock()
+        registry._by_conversation[source_session_id] = {("codex", "main"): instance}
+        registry._instance_locks[(source_session_id, "codex", "main")] = threading.Lock()
     app, manager = await _build_app_for_spec(
         _harness_spec("codex-native"), terminal_registry=registry
     )
     resources = app.state.session_resource_registry
     if backend_state != "unowned_dead_backend":
-        resources._terminal_roles[(session_id, "terminal_codex_main")] = CODEX_NATIVE_TERMINAL_ROLE
+        resources._terminal_roles[(source_session_id, "terminal_codex_main")] = (
+            CODEX_NATIVE_TERMINAL_ROLE
+        )
     launches: list[str] = []
 
     async def launch(
@@ -1141,6 +1156,24 @@ async def test_message_recovers_a_live_codex_pane_with_no_backend(
 
     monkeypatch.setattr(orchestration, "_auto_create_codex_terminal", launch)
     async with _runner_client(app) as client:
+        if backend_state == "rotated":
+            transferred = await client.post(
+                f"/v1/sessions/{source_session_id}/resources/terminals/terminal_codex_main/transfer",
+                json={"target_session_id": session_id},
+            )
+            assert transferred.status_code == 200, transferred.text
+            rejected_target = uuid.uuid4().hex
+            rejected = await client.post(
+                f"/v1/sessions/{source_session_id}/resources/terminals/terminal_codex_main/transfer",
+                json={"target_session_id": rejected_target},
+            )
+            assert rejected.status_code == 404, rejected.text
+            assert rejected_target not in orchestration._AUTO_CODEX_BRIDGE_DIRS
+            state = codex_native_bridge.read_bridge_state(bridge_dir)
+            assert state is not None
+            codex_native_bridge.write_bridge_state(
+                bridge_dir, replace(state, session_id=session_id)
+            )
         response = await client.post(
             f"/v1/sessions/{session_id}/events",
             json={
@@ -1158,6 +1191,12 @@ async def test_message_recovers_a_live_codex_pane_with_no_backend(
     assert close.await_count == int(recreated)
     if backend is not None:
         assert backend.close.await_count == int(recreated)
+    if backend_state == "rotated":
+        assert registry.get(session_id, "codex", "main") is instance
+        assert orchestration._AUTO_CODEX_APP_SERVERS[source_session_id] is backend
+        assert session_id not in orchestration._AUTO_CODEX_APP_SERVERS
+        assert orchestration._AUTO_CODEX_BRIDGE_DIRS[source_session_id] == bridge_dir
+        assert orchestration._AUTO_CODEX_BRIDGE_DIRS[session_id] == bridge_dir
 
 
 @pytest.mark.asyncio

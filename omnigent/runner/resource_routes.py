@@ -854,6 +854,16 @@ def register_resource_routes(
                     }
                 },
             )
+        if (
+            resource_registry.terminal_resource_role(target_session_id, terminal_id)
+            == CODEX_NATIVE_TERMINAL_ROLE
+        ):
+            from omnigent.runner.native.orchestration import (
+                _AUTO_CODEX_BRIDGE_DIRS,
+                codex_native_bridge_dir,
+            )
+
+            _AUTO_CODEX_BRIDGE_DIRS[target_session_id] = codex_native_bridge_dir(session_id)
         return JSONResponse(
             status_code=200,
             content=session_resource_view_to_dict(resource),
