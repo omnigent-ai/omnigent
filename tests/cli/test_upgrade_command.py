@@ -72,6 +72,7 @@ def _wheel_install(monkeypatch: pytest.MonkeyPatch) -> None:
         lambda: LocalServerInfo(running=False, pid=None, port=None, url=None),
     )
     monkeypatch.setattr("omnigent.cli._stop_local_server_and_daemon", lambda *, force: False)
+    monkeypatch.setattr("omnigent.cli._capture_upgrade_host_service", lambda: None)
 
 
 def test_upgrade_up_to_date(monkeypatch: pytest.MonkeyPatch, _wheel_install: None) -> None:
@@ -100,6 +101,10 @@ def test_upgrade_check_reports_newer_and_exits_nonzero(
         raise AssertionError("--check must not run the upgrade")
 
     monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _must_not_run)
+    monkeypatch.setattr(
+        "omnigent.cli._capture_upgrade_host_service",
+        lambda: pytest.fail("--check must not inspect the host service"),
+    )
 
     result = CliRunner().invoke(cli, ["upgrade", "--check"])
 
@@ -144,6 +149,82 @@ def test_upgrade_runs_installer_and_drains_first(
     assert events == ["drained", "stop(force=False)"]
     assert ran == ["uv tool upgrade omnigent"]
     assert "Upgraded to v0.2.0" in result.output
+
+
+def test_upgrade_refreshes_installed_host_service(
+    monkeypatch: pytest.MonkeyPatch, _wheel_install: None
+) -> None:
+    from omnigent.host.service import HostService
+
+    service = HostService(
+        kind="systemd_user",
+        path=Path("/tmp/omnigent-host.service"),
+        label="omnigent-host.service",
+    )
+    monkeypatch.setattr("omnigent.cli._capture_upgrade_host_service", lambda: (service, None))
+    events: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.host.service.stop_user_host_service",
+        lambda _service: events.append("service-stop"),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.service.enable_user_host_service",
+        lambda server_url, *, environment: events.append("service-enable") or service,
+    )
+    monkeypatch.setattr(
+        "omnigent.cli._build_host_daemon_env",
+        lambda **_kwargs: {"PATH": "/new/bin"},
+    )
+    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.2.0")
+    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", lambda *_a, **_k: 0)
+    monkeypatch.setattr(
+        "omnigent.update_check._probe_installed_distribution", lambda: ("0.2.0", None)
+    )
+    monkeypatch.setattr(
+        "omnigent.cli._drain_and_stop_local_server",
+        lambda *, force: events.append("drain"),
+    )
+
+    result = CliRunner().invoke(cli, ["upgrade"])
+
+    assert result.exit_code == 0, result.output
+    assert events == ["drain", "service-stop", "service-enable"]
+    assert "Refreshed and restarted" in result.output
+
+
+def test_upgrade_failure_restarts_installed_host_service(
+    monkeypatch: pytest.MonkeyPatch, _wheel_install: None
+) -> None:
+    from omnigent.host.service import HostService
+
+    service = HostService(
+        kind="launchd",
+        path=Path("/tmp/ai.omnigent.host.plist"),
+        label="ai.omnigent.host",
+        log_path=Path("/tmp/service.log"),
+    )
+    monkeypatch.setattr("omnigent.cli._capture_upgrade_host_service", lambda: (service, None))
+    events: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.host.service.stop_user_host_service",
+        lambda _service: events.append("service-stop"),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.service.start_user_host_service",
+        lambda _service: events.append("service-start"),
+    )
+    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda *_a, **_k: "0.2.0")
+    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", lambda *_a, **_k: 3)
+    monkeypatch.setattr(
+        "omnigent.cli._drain_and_stop_local_server",
+        lambda *, force: events.append("drain"),
+    )
+
+    result = CliRunner().invoke(cli, ["upgrade"])
+
+    assert result.exit_code != 0
+    assert events == ["drain", "service-stop", "service-start"]
+    assert "Restored the host user service" in result.output
 
 
 def test_upgrade_force_skips_drain_and_force_stops(
@@ -503,6 +584,43 @@ def test_upgrade_git_install_repulls_and_verifies_commit(
     assert "Updated to git bbbbbbbbb" in result.output
 
 
+def test_upgrade_git_refreshes_installed_host_service(
+    monkeypatch: pytest.MonkeyPatch, _wheel_install: None
+) -> None:
+    from omnigent.host.service import HostService
+
+    service = HostService(
+        kind="systemd_user",
+        path=Path("/tmp/omnigent-host.service"),
+        label="omnigent-host.service",
+    )
+    monkeypatch.setattr("omnigent.update_check._read_installed_wheel_info", _git_install_info)
+    monkeypatch.setattr("omnigent.update_check._remote_git_head", lambda _url: "b" * 40)
+    monkeypatch.setattr("omnigent.cli._capture_upgrade_host_service", lambda: (service, None))
+    events: list[str] = []
+    monkeypatch.setattr(
+        "omnigent.host.service.stop_user_host_service",
+        lambda _service: events.append("service-stop"),
+    )
+    monkeypatch.setattr(
+        "omnigent.host.service.enable_user_host_service",
+        lambda server_url, *, environment: events.append("service-enable") or service,
+    )
+    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", lambda *_a, **_k: 0)
+    monkeypatch.setattr(
+        "omnigent.update_check._probe_installed_distribution", lambda: ("0.1.0", "b" * 40)
+    )
+    monkeypatch.setattr(
+        "omnigent.cli._drain_and_stop_local_server",
+        lambda *, force: events.append("drain"),
+    )
+
+    result = CliRunner().invoke(cli, ["upgrade"])
+
+    assert result.exit_code == 0, result.output
+    assert events == ["drain", "service-stop", "service-enable"]
+
+
 def test_upgrade_git_install_noop_does_not_claim_update(
     monkeypatch: pytest.MonkeyPatch, _wheel_install: None
 ) -> None:
@@ -742,6 +860,11 @@ def test_upgrade_nightly_dry_run_prints_without_running(
 
     def _must_not_run(*_a: object, **_k: object) -> int:
         raise AssertionError("--dry-run must not run the upgrade")
+
+    monkeypatch.setattr(
+        "omnigent.cli._capture_upgrade_host_service",
+        lambda: pytest.fail("--dry-run must not inspect the host service"),
+    )
 
     monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _must_not_run)
 
