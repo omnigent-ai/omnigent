@@ -123,6 +123,82 @@ class OmnigentWebViewClientTest {
     }
 
     @Test
+    fun `certificate error matches a saved mixed-case host before page start`() {
+        val savedUrl = "https://Omnigent.example.com"
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val reasons = mutableListOf<String>()
+        val client =
+            client(
+                pinnedOrigin = originOf(savedUrl)!!,
+                onMainFrameSslError = { _, reason -> reasons += reason },
+            )
+        client.beginShellLoad(savedUrl)
+        val handler = Shadow.newInstanceOf(SslErrorHandler::class.java)
+
+        client.onReceivedSslError(webView, handler, sslError("https://omnigent.example.com/"))
+
+        val shadow = Shadow.extract<ShadowSslErrorHandler>(handler)
+        assertTrue(shadow.wasCancelCalled())
+        assertFalse(shadow.wasProceedCalled())
+        assertEquals(listOf("SSL_UNTRUSTED"), reasons)
+    }
+
+    @Test
+    fun `certificate error matches a saved default port with encoded route`() {
+        val savedUrl = "https://example.com:443/route%2Fone?next=%2F"
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val reasons = mutableListOf<String>()
+        val client = client(onMainFrameSslError = { _, reason -> reasons += reason })
+        client.beginShellLoad(savedUrl)
+        val handler = Shadow.newInstanceOf(SslErrorHandler::class.java)
+
+        client.onReceivedSslError(
+            webView,
+            handler,
+            sslError("https://example.com/route%2Fone?next=%2F"),
+        )
+
+        val shadow = Shadow.extract<ShadowSslErrorHandler>(handler)
+        assertTrue(shadow.wasCancelCalled())
+        assertFalse(shadow.wasProceedCalled())
+        assertEquals(listOf("SSL_UNTRUSTED"), reasons)
+    }
+
+    @Test
+    fun `foreign subframe different route query and stale certificate errors stay ignored`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val reasons = mutableListOf<String>()
+        val client = client(onMainFrameSslError = { _, reason -> reasons += reason })
+        client.beginShellLoad("$PINNED_ORIGIN/route?next=one")
+        val rejected =
+            listOf(
+                "https://foreign.example.test/route?next=one",
+                "$PINNED_ORIGIN/subframe?next=one",
+                "$PINNED_ORIGIN/other?next=one",
+                "$PINNED_ORIGIN/route?next=two",
+            )
+        rejected.forEach { url ->
+            val handler = Shadow.newInstanceOf(SslErrorHandler::class.java)
+            client.onReceivedSslError(webView, handler, sslError(url))
+            val shadow = Shadow.extract<ShadowSslErrorHandler>(handler)
+            assertTrue(shadow.wasCancelCalled())
+            assertFalse(shadow.wasProceedCalled())
+        }
+        client.beginShellLoad("$PINNED_ORIGIN/new-route?next=one")
+        val staleHandler = Shadow.newInstanceOf(SslErrorHandler::class.java)
+        client.onReceivedSslError(
+            webView,
+            staleHandler,
+            sslError("$PINNED_ORIGIN/route?next=one"),
+        )
+
+        val staleShadow = Shadow.extract<ShadowSslErrorHandler>(staleHandler)
+        assertTrue(staleShadow.wasCancelCalled())
+        assertFalse(staleShadow.wasProceedCalled())
+        assertTrue(reasons.isEmpty())
+    }
+
+    @Test
     fun `pinned main-frame client and server errors report their status to the shell`() {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
         val reportedStatuses = mutableListOf<Int>()
@@ -628,6 +704,13 @@ class OmnigentWebViewClientTest {
 
     /** Run posted bounces (see the client's mainHandler) before asserting. */
     private fun idleMainLooper() = shadowOf(Looper.getMainLooper()).idle()
+
+    private fun sslError(url: String) =
+        SslError(
+            SslError.SSL_UNTRUSTED,
+            SslCertificate("host", "issuer", java.util.Date(), java.util.Date()),
+            url,
+        )
 
     private fun client(
         shouldInjectBridgeAtPageReady: Boolean = false,

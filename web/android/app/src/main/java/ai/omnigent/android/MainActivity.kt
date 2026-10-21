@@ -365,8 +365,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun loadShellPage(url: String) {
-        (webView.webViewClient as OmnigentWebViewClient).beginShellLoad(url)
+        beginShellLoad(url)
         webView.loadUrl(url)
+    }
+
+    private fun beginShellLoad(url: String?) {
+        (webView.webViewClient as OmnigentWebViewClient).beginShellLoad(url)
     }
 
     private fun oidcController(): OidcSessionController =
@@ -1607,6 +1611,7 @@ class MainActivity : AppCompatActivity() {
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 3 -> {
+                    beginShellLoad(webView.url)
                     webView.reload()
                     true
                 }
