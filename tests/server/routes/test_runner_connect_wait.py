@@ -456,7 +456,9 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
     pending_wait_started = asyncio.Event()
     status_poll_started = asyncio.Event()
     pending_rechecked = asyncio.Event()
-    connection_results: asyncio.Queue[object | None] = asyncio.Queue()
+    clock_checked = asyncio.Event()
+    clock_tick = object()
+    connection_results: asyncio.Queue[object] = asyncio.Queue()
     next_status: asyncio.Queue[str] = asyncio.Queue()
     current = SimpleNamespace(runner_id="runner-owned")
     connection = SimpleNamespace(host_id="host-owned")
@@ -479,7 +481,14 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
                 await ordinary_expired.wait()
                 return None
             pending_wait_started.set()
-            return await connection_results.get()
+            deadline = clock.monotonic() + timeout_s
+            while clock.monotonic() < deadline:
+                result = await connection_results.get()
+                if result is clock_tick:
+                    clock_checked.set()
+                    continue
+                return result
+            return None
         finally:
             active.remove(task)
 
@@ -488,6 +497,7 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
         status_calls += 1
         if outcome == "late_pending" and status_calls == 1:
             return "alive"
+        # Late pending follows alive, a cancelled poll, then a fresh deadline query.
         if status_calls == 1 or (outcome == "late_pending" and status_calls == 3):
             return "sign_in_pending"
         status_poll_started.set()
@@ -547,8 +557,12 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
                 next_status.put_nowait("dead")
                 assert await task is None
             else:
+                clock.now = 149.0
+                connection_results.put_nowait(clock_tick)
+                await clock_checked.wait()
+                assert not task.done(), "sign-in wait expired before its deadline"
                 clock.now = 150.0
-                connection_results.put_nowait(None)
+                connection_results.put_nowait(clock_tick)
                 assert await task is None
             assert not active
             assert len(waits) == 2
