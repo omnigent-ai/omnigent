@@ -75,6 +75,12 @@ class ConnectionStatusTest {
             """{"error":"code_challenge (S256) is required. """ +
                 """Upgrade Omnigent to sign in"}"""
         assertTrue(isUpgradeRequiredResponse(400, notice))
+        assertTrue(
+            isUpgradeRequiredResponse(
+                400,
+                "code_challenge (S256) is required. Please update your client.",
+            ),
+        )
         assertFalse(isUpgradeRequiredResponse(500, notice))
         assertFalse(isUpgradeRequiredResponse(400, "invalid challenge"))
     }
