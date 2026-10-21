@@ -8878,6 +8878,36 @@
         "title": "SetCodexGoalRequest",
         "type": "object"
       },
+      "SetReactionRequest": {
+        "description": "Body for `PUT /sessions/{id}/reactions/{response_id}`.",
+        "properties": {
+          "note": {
+            "anyOf": [
+              {
+                "maxLength": 1000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "rating": {
+            "enum": [
+              "up",
+              "down"
+            ],
+            "title": "Rating",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rating"
+        ],
+        "title": "SetReactionRequest",
+        "type": "object"
+      },
       "SetSharingRequest": {
         "description": "Body for `PUT /v1/sharing`.\n\nEvery field is optional so an admin can update each setting\nindependently; at least one must be present.",
         "properties": {
@@ -15197,6 +15227,175 @@
         "summary": "Update Policy",
         "tags": [
           "session_policies"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/reactions": {
+      "get": {
+        "description": "List the caller's reactions in a session.\n\n**Returns:** The caller's reactions, oldest first.",
+        "operationId": "list_reactions_v1_sessions__session_id__reactions_get",
+        "parameters": [
+          {
+            "description": "The session, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "title": "Response List Reactions V1 Sessions  Session Id  Reactions Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Reactions",
+        "tags": [
+          "reactions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/reactions/{response_id}": {
+      "delete": {
+        "description": "Remove the caller's reaction to a response.\n\n**Returns:** `{\"removed\": bool}` \u2014 `False` when none existed.",
+        "operationId": "clear_reaction_v1_sessions__session_id__reactions__response_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "response_id",
+            "required": true,
+            "schema": {
+              "title": "Response Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "title": "Response Clear Reaction V1 Sessions  Session Id  Reactions  Response Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Clear Reaction",
+        "tags": [
+          "reactions"
+        ]
+      },
+      "put": {
+        "description": "Create or replace the caller's reaction to a response.\n\n**Parameters**\n\n- `body` \u2014 The rating and optional note.\n\n**Returns:** The persisted reaction.",
+        "operationId": "set_reaction_v1_sessions__session_id__reactions__response_id__put",
+        "parameters": [
+          {
+            "description": "The session, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The assistant turn, e.g. `\"resp_abc\"`.",
+            "in": "path",
+            "name": "response_id",
+            "required": true,
+            "schema": {
+              "title": "Response Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetReactionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Set Reaction V1 Sessions  Session Id  Reactions  Response Id  Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Reaction",
+        "tags": [
+          "reactions"
         ]
       }
     },

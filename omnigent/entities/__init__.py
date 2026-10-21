@@ -30,6 +30,7 @@ from omnigent.entities.databricks_connection import DatabricksConnection
 from omnigent.entities.device_grant import DeviceGrant
 from omnigent.entities.file import StoredFile
 from omnigent.entities.github_connection import GithubConnection
+from omnigent.entities.message_reaction import MessageReaction
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.permission import ResolvedAccess, SessionPermission
 from omnigent.entities.policy import Policy
@@ -65,6 +66,7 @@ __all__ = [
     "ItemData",
     "LoadedAgent",
     "MessageData",
+    "MessageReaction",
     "NativeToolData",
     "NewConversationItem",
     "PagedList",

@@ -49,6 +49,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+from omnigent.stores.reaction_store.sqlalchemy_store import SqlAlchemyReactionStore
 
 # ── Controllable mock LLM ─────────────────────────────
 
@@ -630,6 +631,7 @@ def app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
             cache_dir=tmp_path / "cache",
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
+        reaction_store=SqlAlchemyReactionStore(db_uri),
     )
 
 
@@ -693,6 +695,7 @@ def policy_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         artifact_store=artifact_store,
         agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
         comment_store=SqlAlchemyCommentStore(db_uri),
+        reaction_store=SqlAlchemyReactionStore(db_uri),
         policy_store=SqlAlchemyPolicyStore(db_uri),
     )
 
@@ -729,6 +732,7 @@ def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
             cache_dir=tmp_path / "cache",
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
+        reaction_store=SqlAlchemyReactionStore(db_uri),
         permission_store=SqlAlchemyPermissionStore(db_uri),
         auth_provider=UnifiedAuthProvider(source="header"),
     )

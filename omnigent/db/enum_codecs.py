@@ -59,6 +59,13 @@ ITEM_STATUS: dict[str, int] = {
     "failed": 4,
 }
 
+# A user's thumbs reaction to an assistant response
+# (``message_reactions.rating``).
+REACTION_RATING: dict[str, int] = {
+    "up": 1,
+    "down": 2,
+}
+
 COMMENT_STATUS: dict[str, int] = {
     "draft": 1,
     "addressed": 2,
@@ -228,6 +235,16 @@ def encode_item_status(name: str) -> int:
 def decode_item_status(code: int) -> str:
     """Decode a ``conversation_items.status`` int code to its name."""
     return _decode(ITEM_STATUS, code, field="conversation_items.status")
+
+
+def encode_reaction_rating(name: str) -> int:
+    """Map a reaction rating name to its stored code."""
+    return _encode(REACTION_RATING, name, field="message_reactions.rating")
+
+
+def decode_reaction_rating(code: int) -> str:
+    """Map a stored reaction rating code back to its name."""
+    return _decode(REACTION_RATING, code, field="message_reactions.rating")
 
 
 def encode_comment_status(name: str) -> int:

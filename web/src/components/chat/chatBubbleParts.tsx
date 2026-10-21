@@ -23,9 +23,15 @@ import {
   Link2Icon,
   Loader2Icon,
   SplitIcon,
+  ThumbsDownIcon,
+  ThumbsUpIcon,
   XIcon,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
+import { useReactions, useSetReaction } from "@/hooks/useReactions";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { userColor, userColorTint, userInitials } from "@/lib/userBadge";
@@ -998,6 +1004,39 @@ function AssistantBubble({
     copyMarkdown,
   );
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(bubble.responseId);
+  // Thumbs up / down: the caller's own reaction, hydrated per session and
+  // patched optimistically. Hidden until the turn has settled.
+  // Only a settled, successful turn is rateable; an errored or streaming
+  // bubble must not fetch reactions either (its retry controls own the wire).
+  // Deployments opt in (OMNIGENT_FEATURES=message_reactions); off by default.
+  const reactionsEnabled = isFeatureEnabled(useServerInfo(), "message_reactions");
+  const canReact =
+    reactionsEnabled && !!conversationId && bubble.lifecycle === "completed" && !bubble.error;
+  const reactions = useReactions(canReact ? conversationId : null);
+  const setReaction = useSetReaction(conversationId);
+  const reaction = reactions.byResponse.get(bubble.responseId) ?? null;
+  const [noteOpen, setNoteOpen] = useState(false);
+  const [noteDraft, setNoteDraft] = useState("");
+  const toggleUp = () =>
+    setReaction.mutate({
+      responseId: bubble.responseId,
+      rating: reaction?.rating === "up" ? null : "up",
+    });
+  const toggleDown = () => {
+    if (reaction?.rating === "down") {
+      setReaction.mutate({ responseId: bubble.responseId, rating: null });
+      return;
+    }
+    // Paint the thumb immediately; the note, if any, follows from the popover.
+    setReaction.mutate({ responseId: bubble.responseId, rating: "down" });
+    setNoteDraft("");
+    setNoteOpen(true);
+  };
+  const submitNote = () => {
+    const note = noteDraft.trim();
+    if (note) setReaction.mutate({ responseId: bubble.responseId, rating: "down", note });
+    setNoteOpen(false);
+  };
   const flashing = useChatStore((s) => s.flashItemId === bubble.responseId);
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
@@ -1171,6 +1210,76 @@ function AssistantBubble({
               >
                 {isLinkCopied ? <CheckIcon size={14} /> : <Link2Icon size={14} />}
               </MessageAction>
+              {canReact && (
+                <>
+                  <MessageAction
+                    tooltip={reaction?.rating === "up" ? "Remove rating" : "Good response"}
+                    label="Good response"
+                    size="icon-xxs"
+                    data-testid="react-up"
+                    data-active={reaction?.rating === "up" ? "true" : undefined}
+                    aria-pressed={reaction?.rating === "up"}
+                    className={reaction?.rating === "up" ? "text-foreground" : undefined}
+                    onClick={toggleUp}
+                    componentId="chat.message.react_up"
+                  >
+                    <ThumbsUpIcon
+                      size={14}
+                      fill={reaction?.rating === "up" ? "currentColor" : "none"}
+                    />
+                  </MessageAction>
+                  <Popover open={noteOpen} onOpenChange={setNoteOpen}>
+                    <PopoverTrigger asChild>
+                      <MessageAction
+                        tooltip={reaction?.rating === "down" ? "Remove rating" : "Bad response"}
+                        label="Bad response"
+                        size="icon-xxs"
+                        data-testid="react-down"
+                        data-active={reaction?.rating === "down" ? "true" : undefined}
+                        aria-pressed={reaction?.rating === "down"}
+                        className={reaction?.rating === "down" ? "text-foreground" : undefined}
+                        onClick={(event) => {
+                          // The trigger would toggle the popover itself; we own it.
+                          event.preventDefault();
+                          toggleDown();
+                        }}
+                        componentId="chat.message.react_down"
+                      >
+                        <ThumbsDownIcon
+                          size={14}
+                          fill={reaction?.rating === "down" ? "currentColor" : "none"}
+                        />
+                      </MessageAction>
+                    </PopoverTrigger>
+                    <PopoverContent
+                      align="start"
+                      className="w-72 p-3"
+                      data-testid="react-down-note"
+                    >
+                      <label className="mb-2 block text-sm font-medium" htmlFor="react-note">
+                        What was wrong? <span className="text-muted-foreground">(optional)</span>
+                      </label>
+                      <textarea
+                        id="react-note"
+                        className="mb-2 w-full resize-none rounded-md border border-border bg-background p-2 text-sm"
+                        rows={3}
+                        maxLength={1000}
+                        value={noteDraft}
+                        onChange={(event) => setNoteDraft(event.target.value)}
+                        placeholder="Wrong file, missed a step, too long…"
+                      />
+                      <div className="flex justify-end gap-2">
+                        <Button size="sm" variant="ghost" onClick={() => setNoteOpen(false)}>
+                          Skip
+                        </Button>
+                        <Button size="sm" onClick={submitNote} data-testid="react-note-submit">
+                          Send
+                        </Button>
+                      </div>
+                    </PopoverContent>
+                  </Popover>
+                </>
+              )}
             </MessageActions>
             {ts && (
               <span

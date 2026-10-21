@@ -11,6 +11,8 @@ import {
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ElicitationCard } from "@/components/blocks/ApprovalCard";
 import { cn } from "@/lib/utils";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { hasCommandModifier } from "@/lib/hotkeys";
 import { isSystemUserContent } from "@/lib/systemMessage";
@@ -588,6 +590,12 @@ export function VirtualBubbleList({
   const ctxRef = useRef(ctx);
   ctxRef.current = ctx;
   const storeConvId = useChatStore((s) => s.conversationId);
+  // Keep the thumbs at full opacity on every settled reply when a deployment
+  // finds the hover affordance is being missed (OMNIGENT_FEATURES).
+  const reactionsAlwaysVisible = isFeatureEnabled(
+    useServerInfo(),
+    "message_reactions_always_visible",
+  );
   const restoringRef = useRef<string | null>(null);
   const latestSnapshotRef = useRef<{
     conversationId: string;
@@ -1022,7 +1030,8 @@ export function VirtualBubbleList({
             isLastAssistant={index === lastAssistantIndex}
             showsWorking={showsWorking && index === lastAssistantIndex}
             actionsPersistent={
-              index === lastMessageIndex && bubble.kind === "assistant" && sessionIdle
+              (index === lastMessageIndex && bubble.kind === "assistant" && sessionIdle) ||
+              (reactionsAlwaysVisible && bubble.kind === "assistant")
             }
           />
         ))}
@@ -1049,7 +1058,8 @@ export function VirtualBubbleList({
               isLastAssistant={item.index === lastAssistantIndex}
               showsWorking={showsWorking && item.index === lastAssistantIndex}
               actionsPersistent={
-                item.index === lastMessageIndex && bubble.kind === "assistant" && sessionIdle
+                (item.index === lastMessageIndex && bubble.kind === "assistant" && sessionIdle) ||
+                (reactionsAlwaysVisible && bubble.kind === "assistant")
               }
             />
           </div>

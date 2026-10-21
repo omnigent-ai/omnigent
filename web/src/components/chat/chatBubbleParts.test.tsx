@@ -1,6 +1,8 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
+import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
+import type { ServerInfo } from "@/lib/capabilities";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble } from "@/lib/renderItems";
 import { useChatStore, type ChatState } from "@/store/chatStore";
@@ -675,5 +677,123 @@ describe("AssistantBubble copy", () => {
     expect(await item.items["text/html"].text()).toBe(
       "<h2>Findings</h2>\n<p>A <strong>bold</strong> claim and <code>code</code>.</p>",
     );
+  });
+});
+
+// Reactions are a deployment opt-in; the bubble tests run with the flag on.
+// Module-level so the context value is stable across renders.
+const REACTIONS_ON = { features: { message_reactions: true } } as unknown as ServerInfo;
+
+describe("AssistantBubble reactions", () => {
+  const bubble: Extract<Bubble, { kind: "assistant" }> = {
+    kind: "assistant",
+    responseId: "resp_rated",
+    stableId: "rated",
+    lifecycle: "completed",
+    error: null,
+    items: [{ kind: "text", itemId: "rated_text", text: "An answer", final: true }],
+  };
+  let reactionFetch: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    useChatStore.setState({ conversationId: "conv_rated" });
+    reactionFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (init?.method === "PUT") {
+        const body = JSON.parse(String(init.body)) as { rating: string; note: string | null };
+        return new Response(
+          JSON.stringify({
+            conversation_id: "conv_rated",
+            response_id: "resp_rated",
+            rating: body.rating,
+            note: body.note,
+            created_by: null,
+            created_at: 1,
+            updated_at: 1,
+          }),
+          { status: 200 },
+        );
+      }
+      if (init?.method === "DELETE") return new Response(JSON.stringify({ removed: true }));
+      if (url.endsWith("/reactions")) return new Response("[]");
+      return new Response("{}");
+    });
+    vi.stubGlobal("fetch", reactionFetch);
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    useChatStore.setState({ conversationId: null });
+  });
+
+  function renderBubble(b: typeof bubble = bubble, isLastAssistant = false) {
+    return render(
+      <CapabilitiesContext.Provider value={REACTIONS_ON}>
+        <QueryClientProvider client={new QueryClient()}>
+          <BubbleView bubble={b} isLastAssistant={isLastAssistant} />
+        </QueryClientProvider>
+      </CapabilitiesContext.Provider>,
+    );
+  }
+
+  it("rates a completed response up, then clears it on a second click", async () => {
+    renderBubble();
+    const up = screen.getByTestId("react-up");
+    expect(up).toHaveAttribute("aria-pressed", "false");
+    fireEvent.click(up);
+    // Optimistic: pressed from the cache patch, before the server answers.
+    await waitFor(() =>
+      expect(screen.getByTestId("react-up")).toHaveAttribute("aria-pressed", "true"),
+    );
+    await waitFor(() =>
+      expect(reactionFetch).toHaveBeenCalledWith(
+        expect.stringContaining("/v1/sessions/conv_rated/reactions/resp_rated"),
+        expect.objectContaining({ method: "PUT" }),
+      ),
+    );
+    fireEvent.click(screen.getByTestId("react-up"));
+    await waitFor(() =>
+      expect(screen.getByTestId("react-up")).toHaveAttribute("aria-pressed", "false"),
+    );
+    await waitFor(() =>
+      expect(reactionFetch).toHaveBeenCalledWith(
+        expect.stringContaining("/reactions/resp_rated"),
+        expect.objectContaining({ method: "DELETE" }),
+      ),
+    );
+  });
+
+  it("thumbs down marks the response and offers an optional note", async () => {
+    renderBubble();
+    fireEvent.click(screen.getByTestId("react-down"));
+    await waitFor(() =>
+      expect(screen.getByTestId("react-down")).toHaveAttribute("aria-pressed", "true"),
+    );
+    expect(screen.getByTestId("react-up")).toHaveAttribute("aria-pressed", "false");
+    const note = await screen.findByPlaceholderText(/Wrong file/);
+    fireEvent.change(note, { target: { value: "It skipped the tests" } });
+    fireEvent.click(screen.getByTestId("react-note-submit"));
+    await waitFor(() => {
+      const puts = reactionFetch.mock.calls.filter(([, init]) => init?.method === "PUT");
+      const last = puts.at(-1)?.[1] as RequestInit;
+      expect(JSON.parse(String(last.body))).toEqual({
+        rating: "down",
+        note: "It skipped the tests",
+      });
+    });
+  });
+
+  it("hides the thumbs while the response is still streaming", () => {
+    renderBubble({ ...bubble, lifecycle: "streaming" }, true);
+    expect(screen.queryByTestId("react-up")).toBeNull();
+  });
+
+  it("hides the thumbs entirely when the deployment has not enabled reactions", () => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView bubble={bubble} isLastAssistant={false} />
+      </QueryClientProvider>,
+    );
+    expect(screen.queryByTestId("react-up")).toBeNull();
+    expect(screen.getByTestId("copy-message-link")).toBeInTheDocument();
   });
 });

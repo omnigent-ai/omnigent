@@ -30,6 +30,8 @@ class Feature(StrEnum):
     CLAUDE_OSC_STATUS = "claude_osc_status"
     WORKSPACE_CONTENT_SEARCH = "workspace_content_search"
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
+    MESSAGE_REACTIONS = "message_reactions"
+    MESSAGE_REACTIONS_ALWAYS_VISIBLE = "message_reactions_always_visible"
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,21 @@ class FeatureDefinition:
 
 
 FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
+    FeatureDefinition(
+        feature=Feature.MESSAGE_REACTIONS,
+        description="Thumbs up/down feedback on assistant responses, persisted per user",
+        owner="web",
+        review_by_release="0.22.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.MESSAGE_REACTIONS_ALWAYS_VISIBLE,
+        description=(
+            "Show the reaction thumbs at full opacity on every settled reply instead of "
+            "on hover only; no effect unless message_reactions is also on"
+        ),
+        owner="web",
+        review_by_release="0.22.0",
+    ),
     FeatureDefinition(
         feature=Feature.GRID_SESSIONS_DISPLAY_UI,
         description="Local session grids with up to four live conversations",

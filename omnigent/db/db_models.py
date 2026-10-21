@@ -1061,6 +1061,48 @@ class SqlConversationLabel(ConversationBase):
     updated_at: Mapped[int] = mapped_column(Integer)
 
 
+class SqlMessageReaction(OmnigentBase):
+    """SQLAlchemy model for the ``message_reactions`` table.
+
+    One row per (workspace, conversation, response, user): the thumbs-up or
+    thumbs-down a user gave an assistant response, plus an optional note.
+    Rows are removed with the owning conversation.
+
+    :param conversation_id: The conversation the response belongs to.
+    :param response_id: The assistant turn reacted to (``bubble.responseId``).
+    :param created_by: The reacting user's email; ``""`` in single-user mode
+        (part of the PK, so it cannot be ``NULL``).
+    :param rating: ``1`` = up, ``2`` = down (see ``enum_codecs.REACTION_RATING``).
+    :param note: Optional free text, e.g. what was wrong with a thumbs-down.
+    :param harness: The session's harness when the reaction was given, or ``None``.
+    :param model: The session's model when the reaction was given, or ``None``.
+    :param created_at: Unix epoch seconds the reaction was first given.
+    :param updated_at: Unix epoch microseconds of the last change.
+    """
+
+    __tablename__ = "message_reactions"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        server_default="0",
+        default=current_workspace_id,
+    )
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    response_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    created_by: Mapped[str] = mapped_column(String(128), primary_key=True, server_default="")
+    rating: Mapped[int] = mapped_column(SmallInteger)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Attribution snapshot at reaction time: a session's model can change
+    # later, so the row records what actually answered.
+    harness: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    created_at: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[int] = mapped_column(BigInteger)
+    __table_args__ = (CheckConstraint("rating IN (1, 2)", name="ck_message_reactions_rating"),)
+
+
 class SqlComment(OmnigentBase):
     """SQLAlchemy model for the ``comments`` table.
 
