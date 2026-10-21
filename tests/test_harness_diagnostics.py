@@ -8,6 +8,7 @@ import pytest
 
 from omnigent.harnesses.diagnostics import (
     bounded_diagnostic_tail,
+    contains_sign_in_material,
     detect_sign_in_prompt,
     sanitize_diagnostic_text,
     sign_in_next_step,
@@ -375,6 +376,68 @@ def test_detect_sign_in_prompt_does_not_treat_an_auth_shaped_hostname_as_the_end
     prompt = detect_sign_in_prompt(screen)
     assert prompt is not None
     assert prompt.url == authorize_url
+
+
+@pytest.mark.parametrize(
+    "screen",
+    [
+        "Enter code ABCD-1234 at https://x.example/verify\nwaiting for sign-in...\n"
+        "See https://docs.example.com/oauth/troubleshooting\n",
+        "Open the following URL to sign in:\nhttps://dbcert.example.com/x\n"
+        "Signed in as someone@example.com.\nAgent ready.\n",
+        "Sign in to continue:\n  code: HQ7M-2KPD\n",
+        "Sign in to continue\nEnter code 12345678\n",
+        "Sign in to continue:\n  code: abcd-1234\n",
+        "https://signin.example.com/device",
+        "Sign in to continue:\n\n\n\n  code: HQ7M-2KPD\n",
+        "Sign in to continue:\n  HQ7M-2KPD\n",
+        "code: HQ7M-2KPD",
+        "HQ7M-2KPD\nwaiting...\n",
+    ],
+    ids=[
+        "moved-past-prompt",
+        "completed-prompt",
+        "cued-code",
+        "cued-numeric-code",
+        "cued-lowercase-code",
+        "bare-endpoint",
+        "code-below-a-gap",
+        "unlabelled-code",
+        "labelled-code-without-cue",
+        "standalone-code",
+    ],
+)
+def test_contains_sign_in_material_outlives_an_actionable_prompt(screen: str) -> None:
+    """Material a stale or partial prompt leaves on screen still counts as sign-in material."""
+    assert contains_sign_in_material(screen)
+
+
+@pytest.mark.parametrize(
+    "screen",
+    [
+        None,
+        "",
+        "Starting MCP servers: omnigent",
+        "Loading configuration...\nLauncher: update check before starting Codex...\n",
+        "Opened https://github.com/omnigent-ai/omnigent/pull/123 for review\n",
+        "exit code 1\n",
+        "Launcher: update check before starting Claude Code... OMNI-STALL-e532148b\n",
+        "launcher: refreshing workspace login\nusing a cached token\n",
+    ],
+    ids=[
+        "none",
+        "empty",
+        "startup",
+        "launcher-status",
+        "ordinary-link",
+        "exit-code",
+        "claude-code-with-marker",
+        "login-refresh-without-code",
+    ],
+)
+def test_contains_sign_in_material_ignores_ordinary_output(screen: str | None) -> None:
+    """Ordinary startup text, plain links and exit codes may still be exported."""
+    assert not contains_sign_in_material(screen)
 
 
 def test_sign_in_next_step_names_the_agent_and_carries_no_address() -> None:
