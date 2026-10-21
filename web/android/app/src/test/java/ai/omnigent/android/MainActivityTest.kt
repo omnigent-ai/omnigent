@@ -1120,7 +1120,7 @@ class MainActivityTest {
 
                     override fun save(
                         scope: DatabricksCredentialScope,
-                        tokens: DatabricksOAuthTokens,
+                        credential: DatabricksOAuthTokens,
                     ) = Unit
 
                     override fun delete(scope: DatabricksCredentialScope) = Unit
