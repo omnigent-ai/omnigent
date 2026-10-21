@@ -1,6 +1,7 @@
 import json
 import re
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
 from markdown_it import MarkdownIt
@@ -20,7 +21,7 @@ _AGENT = Path(__file__).resolve().parents[2] / "dev" / "resolve-agent"
 def _markdown_link_targets(source: str) -> list[str]:
     tree = SyntaxTreeNode(MarkdownIt().parse(source))
     return [
-        node.attrs["href" if node.type == "link" else "src"]
+        unquote(node.attrs["href" if node.type == "link" else "src"].split("#", 1)[0])
         for node in tree.walk()
         if node.type in {"link", "image"}
     ]
@@ -35,10 +36,17 @@ def test_markdown_link_targets_exclude_code_examples() -> None:
 
 [Guide](guide.md) and ![Image](image.png)
 [Reference][ref]
+[Spaced](<guide with spaces.md#section>) and [Hash](guide%23notes.md)
 
 [ref]: reference.md
 """
-    assert _markdown_link_targets(source) == ["guide.md", "image.png", "reference.md"]
+    assert _markdown_link_targets(source) == [
+        "guide.md",
+        "image.png",
+        "reference.md",
+        "guide with spaces.md",
+        "guide#notes.md",
+    ]
 
 
 @pytest.mark.parametrize("target_repo", ["omnigent", "omnigent-internal"])
@@ -117,8 +125,8 @@ def test_otto_agent_markdown_links_resolve_from_their_own_directory(agent: str) 
     documents = {*root.rglob("*.md"), *(doc for skill in shared for doc in skill.rglob("*.md"))}
     for document in sorted(documents):
         for target in _markdown_link_targets(document.read_text()):
-            if re.match(r"[a-z][a-z0-9+.-]*:|#|/", target):
+            if not target or re.match(r"[a-z][a-z0-9+.-]*:|/", target):
                 continue
-            if not (document.parent / target.split("#")[0]).exists():
+            if not (document.parent / target).exists():
                 broken.append(f"{document.relative_to(root)} -> {target}")
     assert not broken

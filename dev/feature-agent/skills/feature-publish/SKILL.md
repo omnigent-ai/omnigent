@@ -31,6 +31,9 @@ hook changed tested files, rerun their checks. If the checkout has
 - **Direct (no publisher contract):** push the branch, open the PR, then drive it
   (below).
 
+If a publisher contract is present but does not explicitly authorize this
+session to publish, use workflow-owned mode.
+
 The gate file selects the transport; it does not grant publication authority.
 When PR writes are authorized and `.omnigent/pr-gate.json` exists, make every
 PR write (create, edit, comment, review, ready) with the `pr.py` helper CI supplies,
